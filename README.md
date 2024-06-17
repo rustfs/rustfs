@@ -4,7 +4,7 @@ RustFS is a high-performance distributed object storage software built using Rus
 
 
 # Our website
-https://RustFS.io
+https://RustFS.com/
 
 
 # Values
