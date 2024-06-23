@@ -9,5 +9,5 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-s3-object-layer = { path = "../s3-object-layer" }
+store = { path = "../store" }
 tracing-subscriber = { version = "0.3", features = ["json"] }

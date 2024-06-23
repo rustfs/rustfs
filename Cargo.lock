@@ -70,7 +70,7 @@ dependencies = [
 name = "rustfs"
 version = "0.1.0"
 dependencies = [
- "s3-object-layer",
+ "store",
  "tracing-subscriber",
 ]
 
@@ -79,10 +79,6 @@ name = "ryu"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
-
-[[package]]
-name = "s3-object-layer"
-version = "0.1.0"
 
 [[package]]
 name = "serde"
@@ -129,6 +125,10 @@ name = "smallvec"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c5e1a9a646d36c3599cd173a41282daf47c44583ad367b8e6837255952e5c67"
+
+[[package]]
+name = "store"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

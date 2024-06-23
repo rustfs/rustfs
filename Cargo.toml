@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rustfs", "s3-object-layer"]
+members = ["rustfs", "store"]
 
 [workspace.package]
 edition = "2021"
