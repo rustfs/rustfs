@@ -10,4 +10,5 @@ rust-version.workspace = true
 
 [dependencies]
 store = { path = "../store" }
-tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-subscriber = { version = "0.3.18" }
+time = { workspace = true, features = ["parsing", "formatting"] }
