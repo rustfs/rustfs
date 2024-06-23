@@ -1,8 +1,9 @@
-[package]
-name = "s3-rustfs"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = ["rustfs", "s3-object-layer"]
+
+[workspace.package]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rustfs/rustfs"
+rust-version = "1.75"
