@@ -43,7 +43,11 @@ impl Erasure {
         Ok(shards)
     }
 
-    // 所需要的总长度
+    pub fn decode_data(&self, shards: &mut Vec<Option<Vec<u8>>>) -> Result<(), Error> {
+        self.encoder.reconstruct(shards)
+    }
+
+    // 每个分片长度，所需要的总长度
     fn need_size(&self, data_size: usize) -> (usize, usize) {
         let shard_size = self.shard_size(data_size);
         (shard_size, shard_size * (self.encoder.total_shard_count()))
@@ -52,6 +56,16 @@ impl Erasure {
     fn shard_size(&self, data_size: usize) -> usize {
         (data_size + self.encoder.data_shard_count() - 1) / self.encoder.data_shard_count()
     }
+}
+
+fn shards_to_option_shards<T: Clone>(shards: &[Vec<T>]) -> Vec<Option<Vec<T>>> {
+    let mut result = Vec::with_capacity(shards.len());
+
+    for v in shards.iter() {
+        let inner: Vec<T> = v.clone();
+        result.push(Some(inner));
+    }
+    result
 }
 
 #[cfg(test)]
@@ -68,25 +82,22 @@ mod test {
         let shards = ec.encode_data(data).unwrap();
         println!("shards:{:?}", shards);
 
-        // let (data_buffer, parity_buffer) = buf.split_at(shard_size * 3);
+        let mut s: Vec<_> = shards
+            .iter()
+            .map(|d| if d.is_empty() { None } else { Some(d.clone()) })
+            .collect();
 
-        // println!(
-        //     "data_buffer: {:?},parity_buffer: {:?}",
-        //     data_buffer, parity_buffer
-        // );
+        // let mut s = shards_to_option_shards(&shards);
 
-        // let data_slices: Vec<&[u8]> = data.chunks(shard_size).collect();
-        // let mut parity_slices: Vec<&mut [u8]> = parity_buffer.chunks_mut(shard_size).collect();
+        // s[0] = None;
+        s[4] = None;
+        s[3] = None;
 
-        // println!(
-        //     "data_slices: {:?},parity_slices: {:?}",
-        //     data_slices, parity_slices
-        // );
+        println!("sss:{:?}", &s);
 
-        // ec.encoder
-        //     .encode_sep(&data_slices, &mut parity_slices)
-        //     .unwrap();
-        // ec.encoder.encode(all_shards);
-        // println!("shards:{:?}", shards);
+        ec.decode_data(&mut s).unwrap();
+        // ec.encoder.reconstruct(&mut s).unwrap();
+
+        println!("sss:{:?}", &s);
     }
 }
