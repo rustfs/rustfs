@@ -9,7 +9,11 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 url = "2.5.2"
 uuid = "1.8.0"
 reed-solomon-erasure = "6.0.0"
+transform-stream = "0.3.0"
+bytes.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+futures.workspace = true
