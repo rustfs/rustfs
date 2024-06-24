@@ -37,7 +37,7 @@ fn main() -> Result<()> {
 async fn run(opt: config::Opt) -> Result<()> {
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(storage::simple_fs::SimpleFS {});
+        let mut b = S3ServiceBuilder::new(storage::SimpleFS {});
 
         // Enable authentication
         if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {

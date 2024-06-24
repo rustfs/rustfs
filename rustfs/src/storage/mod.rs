@@ -1,1 +1,3 @@
-pub mod simple_fs;
+mod simple_fs;
+
+pub use simple_fs::SimpleFS;
