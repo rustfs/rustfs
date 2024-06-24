@@ -10,5 +10,21 @@ rust-version.workspace = true
 
 [dependencies]
 store = { path = "../store" }
-tracing-subscriber = { version = "0.3.18" }
+clap = { version = "4.5.7", features = ["derive"] }
+s3s = { version = "0.10.0" }
+anyhow = { version = "1.0.86" }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 time = { workspace = true, features = ["parsing", "formatting"] }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+] }
+hyper-util = { version = "0.1.5", features = [
+    "tokio",
+    "server-auto",
+    "server-graceful",
+] }
