@@ -3,7 +3,6 @@ mod storage;
 
 use anyhow::Result;
 use clap::Parser;
-use ecstore::store::ECStore;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
