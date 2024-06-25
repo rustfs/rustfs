@@ -47,4 +47,4 @@ pub struct Objects {
 #[async_trait::async_trait]
 trait DiskAPI: Debug + Send + Sync + 'static {}
 
-pub trait StorageAPI {}
+pub trait StorageAPI: Debug + Send + Sync + 'static {}
