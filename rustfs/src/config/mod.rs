@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::path::PathBuf;
 
 /// Default port that a rustfs server listens on.
 ///
@@ -10,10 +9,10 @@ pub const DEFAULT_PORT: u16 = 9000;
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
     #[arg(required = true)]
-    pub volumes: Vec<PathBuf>,
+    pub volumes: Vec<String>,
 
     /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
-    #[arg(long, default_value_t = format!(":{}", DEFAULT_PORT))]
+    #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_PORT))]
     pub address: String,
 
     /// Access key used for authentication.

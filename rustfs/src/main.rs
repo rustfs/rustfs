@@ -3,6 +3,7 @@ mod storage;
 
 use anyhow::Result;
 use clap::Parser;
+use ecstore::store::ECStore;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
@@ -10,7 +11,7 @@ use hyper_util::{
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use std::io::IsTerminal;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{debug, info};
 
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -35,9 +36,10 @@ fn main() -> Result<()> {
 
 #[tokio::main]
 async fn run(opt: config::Opt) -> Result<()> {
+    debug!("opt: {:?}", &opt);
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(storage::SimpleFS {});
+        let mut b = S3ServiceBuilder::new(storage::ecfs::EC::new(opt.volumes)?);
 
         // Enable authentication
         if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {
