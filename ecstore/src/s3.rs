@@ -1,0 +1,276 @@
+use s3s::dto::*;
+use s3s::s3_error;
+use s3s::S3Result;
+use s3s::S3;
+use s3s::{S3Request, S3Response};
+
+use crate::store::ECStore;
+
+#[async_trait::async_trait]
+impl S3 for ECStore {
+    #[tracing::instrument]
+    async fn create_bucket(
+        &self,
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
+        let input = req.input;
+
+        let output = CreateBucketOutput::default(); // TODO: handle other fields
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let input = req.input;
+        let (bucket, key) = match input.copy_source {
+            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Bucket {
+                ref bucket,
+                ref key,
+                ..
+            } => (bucket, key),
+        };
+
+        let output = CopyObjectOutput {
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn delete_bucket(
+        &self,
+        req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let input = req.input;
+
+        Ok(S3Response::new(DeleteBucketOutput {}))
+    }
+
+    #[tracing::instrument]
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let input = req.input;
+
+        let output = DeleteObjectOutput::default(); // TODO: handle other fields
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let input = req.input;
+
+        let output = DeleteObjectsOutput {
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<GetBucketLocationInput>,
+    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        let input = req.input;
+
+        let output = GetBucketLocationOutput::default();
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let input = req.input;
+
+        let output = GetObjectOutput {
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        let input = req.input;
+
+        Ok(S3Response::new(HeadBucketOutput::default()))
+    }
+
+    #[tracing::instrument]
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let input = req.input;
+
+        let output = HeadObjectOutput {
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn list_buckets(
+        &self,
+        _: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
+        let output = ListBucketsOutput {
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
+
+        Ok(v2_resp.map_output(|v2| ListObjectsOutput {
+            contents: v2.contents,
+            delimiter: v2.delimiter,
+            encoding_type: v2.encoding_type,
+            name: v2.name,
+            prefix: v2.prefix,
+            max_keys: v2.max_keys,
+            ..Default::default()
+        }))
+    }
+
+    #[tracing::instrument]
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let input = req.input;
+
+        let output = ListObjectsV2Output {
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn put_object(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let input = req.input;
+
+        let output = PutObjectOutput {
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let input = req.input;
+
+        let output = CreateMultipartUploadOutput {
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let UploadPartInput {
+            body,
+            upload_id,
+            part_number,
+            ..
+        } = req.input;
+
+        let output = UploadPartOutput {
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        let input = req.input;
+
+        let output = UploadPartCopyOutput {
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let ListPartsInput {
+            bucket,
+            key,
+            upload_id,
+            ..
+        } = req.input;
+
+        let output = ListPartsOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: Some(upload_id),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let CompleteMultipartUploadInput {
+            multipart_upload,
+            bucket,
+            key,
+            upload_id,
+            ..
+        } = req.input;
+
+        let output = CompleteMultipartUploadOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument]
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        Ok(S3Response::new(AbortMultipartUploadOutput {
+            ..Default::default()
+        }))
+    }
+}
