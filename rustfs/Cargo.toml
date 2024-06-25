@@ -19,12 +19,12 @@ name = "rustfs"
 
 [dependencies]
 ecstore = { path = "../ecstore" }
-time = { workspace = true, features = ["parsing", "formatting"] }
-s3s = "0.10.0"
-hyper-util = { version = "0.1.5", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
-tokio.workspace = true
 clap = { version = "4.5.7", features = ["derive"] }
-tracing.workspace = true
-tokio-util.workspace = true
+s3s = { version = "0.10.0" }
+anyhow = { version = "1.0.86" }
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
-async-trait = "0.1.80"
+time = { workspace = true, features = ["parsing", "formatting"] }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+hyper-util = { version = "0.1.5", features = ["tokio", "server-auto", "server-graceful"] }

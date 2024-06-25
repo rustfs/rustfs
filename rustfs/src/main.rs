@@ -1,53 +1,16 @@
-use ecstore::error::Result;
-use ecstore::store::ECStore;
+mod config;
+mod storage;
 
-use s3s::auth::SimpleAuth;
-use s3s::service::S3ServiceBuilder;
-
+use anyhow::Result;
+use clap::Parser;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as ConnBuilder,
+};
+use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use std::io::IsTerminal;
-use std::path::PathBuf;
-
 use tokio::net::TcpListener;
-
-use clap::{CommandFactory, Parser};
 use tracing::info;
-
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as ConnBuilder;
-
-#[derive(Debug, Parser)]
-#[command(version)]
-struct Opt {
-    /// Host name to listen on.
-    #[arg(long, default_value = "localhost")]
-    host: String,
-
-    /// Port number to listen on.
-    #[arg(long, default_value = "9010")]
-    port: u16,
-
-    /// Access key used for authentication.
-    #[arg(long, default_value = "AKEXAMPLERUSTFS")]
-    access_key: Option<String>,
-
-    /// Secret key used for authentication.
-    #[arg(long, default_value = "SKEXAMPLERUSTFS")]
-    secret_key: Option<String>,
-
-    /// Domain name used for virtual-hosted-style requests.
-    #[arg(long)]
-    domain_name: Option<String>,
-
-    #[arg(
-        required = true,
-        help = r#"DIR points to a directory on a filesystem. When you want to combine
-multiple drives into a single large system, pass one directory per
-filesystem separated by space. You may also use a '...' convention
-to abbreviate the directory arguments. Remote directories in a
-distributed setup are encoded as HTTP(s) URIs."#
-    )]
-    volumes: Vec<String>,
-}
 
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -62,28 +25,8 @@ fn setup_tracing() {
         .init();
 }
 
-fn check_cli_args(opt: &Opt) {
-    use clap::error::ErrorKind;
-
-    let mut cmd = Opt::command();
-
-    // TODO: how to specify the requirements with clap derive API?
-    if let (Some(_), None) | (None, Some(_)) = (&opt.access_key, &opt.secret_key) {
-        let msg = "access key and secret key must be specified together";
-        cmd.error(ErrorKind::MissingRequiredArgument, msg).exit();
-    }
-
-    if let Some(ref s) = opt.domain_name {
-        if s.contains('/') {
-            let msg = format!("expected domain name, found URL-like string: {s:?}");
-            cmd.error(ErrorKind::InvalidValue, msg).exit();
-        }
-    }
-}
-
-fn main() -> Result {
-    let opt = Opt::parse();
-    check_cli_args(&opt);
+fn main() -> Result<()> {
+    let opt = config::Opt::parse();
 
     setup_tracing();
 
@@ -91,13 +34,10 @@ fn main() -> Result {
 }
 
 #[tokio::main]
-async fn run(opt: Opt) -> Result {
-    // Setup S3 provider
-    let sto = ECStore::new(opt.volumes)?;
-
+async fn run(opt: config::Opt) -> Result<()> {
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(sto);
+        let mut b = S3ServiceBuilder::new(storage::SimpleFS {});
 
         // Enable authentication
         if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {
@@ -114,8 +54,7 @@ async fn run(opt: Opt) -> Result {
         b.build()
     };
 
-    // Run server
-    let listener = TcpListener::bind((opt.host.as_str(), opt.port)).await?;
+    let listener = TcpListener::bind(opt.address).await?;
     let local_addr = listener.local_addr()?;
 
     let hyper_service = service.into_shared();
