@@ -312,7 +312,6 @@ dependencies = [
  "netif",
  "reed-solomon-erasure",
  "regex",
- "s3s",
  "serde",
  "thiserror",
  "tokio",

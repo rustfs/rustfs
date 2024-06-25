@@ -16,7 +16,7 @@ pub struct ECStore {
 }
 
 impl ECStore {
-    pub fn new(endpoints: Vec<String>, address: String) -> Result<Self> {
+    pub fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
         let layouts = DisksLayout::new(endpoints)?;
 
         let (pools, _) = create_server_endpoints(address, &layouts.pools, layouts.legacy)?;

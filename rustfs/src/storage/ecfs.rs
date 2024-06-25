@@ -13,8 +13,8 @@ pub struct EC {
 }
 
 impl EC {
-    pub fn new(endpoints: Vec<String>) -> Result<Self> {
-        let store = ECStore::new(endpoints)?;
+    pub fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
+        let store = ECStore::new(address, endpoints)?;
         Ok(EC { store })
     }
 }
