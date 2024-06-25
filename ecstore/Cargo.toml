@@ -25,3 +25,4 @@ netif = "0.1.6"
 async-trait = "0.1.80"
 s3s = "0.10.0"
 tracing.workspace = true
+tracing-error = "0.2.0"

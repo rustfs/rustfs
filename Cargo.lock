@@ -323,6 +323,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-error",
  "transform-stream",
  "url",
  "uuid",
@@ -1018,11 +1019,15 @@ checksum = "719b953e2095829ee67db738b3bfa9fa368c94900df327b3f07fe6e794d2fe1f"
 name = "rustfs"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "ecstore",
  "hyper-util",
  "s3s",
+ "time",
  "tokio",
+ "tokio-util",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -1360,6 +1365,16 @@ checksum = "c06d3da6113f116aaee68e4d601191614c9053067f9ab7f6edbcb161237daa54"
 dependencies = [
  "once_cell",
  "valuable",
+]
+
+[[package]]
+name = "tracing-error"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d686ec1c0f384b1277f097b2f279a2ecc11afe8c133c1aabf036a27cb4cd206e"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

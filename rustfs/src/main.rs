@@ -1,8 +1,5 @@
-#![forbid(unsafe_code)]
-#![deny(clippy::all, clippy::pedantic)]
-
-use s3s_fs::FileSystem;
-use s3s_fs::Result;
+use ecstore::error::Result;
+use ecstore::store::ECStore;
 
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
@@ -26,23 +23,30 @@ struct Opt {
     host: String,
 
     /// Port number to listen on.
-    #[arg(long, default_value = "8014")] // The original design was finished on 2020-08-14.
+    #[arg(long, default_value = "9010")]
     port: u16,
 
     /// Access key used for authentication.
-    #[arg(long)]
+    #[arg(long, default_value = "AKEXAMPLERUSTFS")]
     access_key: Option<String>,
 
     /// Secret key used for authentication.
-    #[arg(long)]
+    #[arg(long, default_value = "SKEXAMPLERUSTFS")]
     secret_key: Option<String>,
 
     /// Domain name used for virtual-hosted-style requests.
     #[arg(long)]
     domain_name: Option<String>,
 
-    /// Root directory of stored data.
-    root: PathBuf,
+    #[arg(
+        required = true,
+        help = r#"DIR points to a directory on a filesystem. When you want to combine
+multiple drives into a single large system, pass one directory per
+filesystem separated by space. You may also use a '...' convention
+to abbreviate the directory arguments. Remote directories in a
+distributed setup are encoded as HTTP(s) URIs."#
+    )]
+    volumes: Vec<String>,
 }
 
 fn setup_tracing() {
@@ -89,11 +93,11 @@ fn main() -> Result {
 #[tokio::main]
 async fn run(opt: Opt) -> Result {
     // Setup S3 provider
-    let fs = FileSystem::new(opt.root)?;
+    let sto = ECStore::new(opt.volumes)?;
 
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(fs);
+        let mut b = S3ServiceBuilder::new(sto);
 
         // Enable authentication
         if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {
