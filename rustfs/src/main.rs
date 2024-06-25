@@ -39,7 +39,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(storage::ecfs::EC::new(
+        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(
             opt.address.clone(),
             opt.volumes.clone(),
         )?);

@@ -10,19 +10,19 @@ use anyhow::Result;
 use ecstore::store::ECStore;
 
 #[derive(Debug)]
-pub struct EC {
-    store: ECStore,
+pub struct FS {
+    pub store: ECStore,
 }
 
-impl EC {
+impl FS {
     pub fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
         let store: ECStore = ECStore::new(address, endpoints)?;
-        Ok(EC { store })
+        Ok(Self { store })
     }
 }
 
 #[async_trait::async_trait]
-impl S3 for EC {
+impl S3 for FS {
     #[tracing::instrument]
     async fn create_bucket(
         &self,
