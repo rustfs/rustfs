@@ -4,10 +4,23 @@ use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
 
-use crate::store::ECStore;
+use anyhow::Result;
+use ecstore::store::ECStore;
+
+#[derive(Debug)]
+pub struct EC {
+    store: ECStore,
+}
+
+impl EC {
+    pub fn new(endpoints: Vec<String>) -> Result<Self> {
+        let store = ECStore::new(endpoints)?;
+        Ok(EC { store })
+    }
+}
 
 #[async_trait::async_trait]
-impl S3 for ECStore {
+impl S3 for EC {
     #[tracing::instrument]
     async fn create_bucket(
         &self,

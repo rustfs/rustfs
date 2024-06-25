@@ -1,7 +1,9 @@
 use uuid::Uuid;
 
+use crate::{disks_layout::DisksLayout, endpoint::create_server_endpoints};
+
 use super::endpoint::Endpoint;
-use super::error::Result;
+use anyhow::Result;
 
 use std::fmt::Debug;
 
@@ -14,7 +16,11 @@ pub struct ECStore {
 }
 
 impl ECStore {
-    pub fn new(endpoints: Vec<String>) -> Result<Self> {
+    pub fn new(endpoints: Vec<String>, address: String) -> Result<Self> {
+        let layouts = DisksLayout::new(endpoints)?;
+
+        let (pools, _) = create_server_endpoints(address, &layouts.pools, layouts.legacy)?;
+
         Ok(ECStore {
             id: Uuid::nil(),
             pools: Vec::new(),

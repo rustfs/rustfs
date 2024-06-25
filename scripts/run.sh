@@ -10,9 +10,8 @@ if [ -z "$RUST_LOG" ]; then
 fi
 
 cargo run \
-    -- --access-key    AKEXAMPLERUSTFS    \
-    -- --secret-key    SKEXAMPLERUSTFS    \
-    -- --host          localhost       \
-    -- --port          9010            \
-    -- --domain-name   localhost:9010  \
+    -- --access-key AKEXAMPLERUSTFS    \
+    --secret-key SKEXAMPLERUSTFS    \
+    --address       0.0.0.0:9010       \
+    --domain-name   localhost:9010  \
     "$DATA_DIR"
