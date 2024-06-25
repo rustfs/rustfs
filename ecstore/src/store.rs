@@ -1,18 +1,28 @@
 use super::endpoint::Endpoint;
+use crate::endpoint::EndpointServerPools;
 
-pub struct Store {
+use std::fmt::Debug;
+
+#[derive(Debug)]
+pub struct ECStore {
     pub id: uuid::Uuid,
     pub disks: Vec<Box<dyn DiskAPI>>,
     pub pools: Vec<Sets>,
     pub peer: Vec<String>,
 }
 
-impl Store {}
+impl ECStore {
+    pub fn new(endpoints: EndpointServerPools) {
+        unimplemented!()
+    }
+}
 
+#[derive(Debug)]
 pub struct Sets {
     pub sets: Vec<Objects>,
 }
 
+#[derive(Debug)]
 pub struct Objects {
     pub endpoints: Vec<Endpoint>,
     pub disks: Vec<usize>,
@@ -22,6 +32,7 @@ pub struct Objects {
     pub default_parity_count: usize,
 }
 
-trait DiskAPI {}
+#[async_trait::async_trait]
+trait DiskAPI: Debug + Send + Sync + 'static {}
 
 pub trait StorageAPI {}

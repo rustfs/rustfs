@@ -1,5 +1,5 @@
 [package]
-name = "store"
+name = "ecstore"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -17,3 +17,11 @@ bytes.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 futures.workspace = true
+anyhow = "1.0.86"
+serde.workspace = true
+lazy_static = "1.5.0"
+regex = "1.10.5"
+netif = "0.1.6"
+async-trait = "0.1.80"
+s3s = "0.10.0"
+tracing.workspace = true
