@@ -39,7 +39,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(storage::ecfs::EC::new(opt.volumes)?);
+        let mut b = S3ServiceBuilder::new(storage::ecfs::EC::new(
+            opt.address.clone(),
+            opt.volumes.clone(),
+        )?);
 
         // Enable authentication
         if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {
