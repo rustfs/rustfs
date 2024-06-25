@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Result;
@@ -14,7 +16,7 @@ pub struct EC {
 
 impl EC {
     pub fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
-        let store = ECStore::new(address, endpoints)?;
+        let store: ECStore = ECStore::new(address, endpoints)?;
         Ok(EC { store })
     }
 }
