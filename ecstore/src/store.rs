@@ -1,19 +1,25 @@
+use uuid::Uuid;
+
 use super::endpoint::Endpoint;
-use crate::endpoint::EndpointServerPools;
+use super::error::Result;
 
 use std::fmt::Debug;
 
 #[derive(Debug)]
 pub struct ECStore {
     pub id: uuid::Uuid,
-    pub disks: Vec<Box<dyn DiskAPI>>,
+    // pub disks: Vec<Box<dyn DiskAPI>>,
     pub pools: Vec<Sets>,
     pub peer: Vec<String>,
 }
 
 impl ECStore {
-    pub fn new(endpoints: EndpointServerPools) {
-        unimplemented!()
+    pub fn new(endpoints: Vec<String>) -> Result<Self> {
+        Ok(ECStore {
+            id: Uuid::nil(),
+            pools: Vec::new(),
+            peer: Vec::new(),
+        })
     }
 }
 
