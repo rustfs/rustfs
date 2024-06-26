@@ -91,7 +91,7 @@ fn is_host_ip(ip_str: &str) -> bool {
 }
 
 impl Endpoint {
-    fn new(arg: &str) -> Result<Self, Error> {
+    pub fn new(arg: &str) -> Result<Self, Error> {
         if is_empty_path(arg) {
             return Err(Error::msg("不支持空或根endpoint"));
         }
