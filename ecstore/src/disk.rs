@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use path_absolutize::Absolutize;
 use time::OffsetDateTime;
-use tokio::{fs, sync::RwLock};
+use tokio::fs;
 use uuid::Uuid;
 
 use crate::{

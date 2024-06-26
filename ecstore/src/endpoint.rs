@@ -1,31 +1,30 @@
-use std::{collections::HashMap, net::IpAddr, path::Path, usize};
-
 use super::disks_layout::PoolDisksLayout;
 use super::utils::{
     net::{is_local_host, split_host_port},
     string::new_string_set,
 };
 use anyhow::Error;
-use url::Url;
+use std::fmt::Display;
+use std::{collections::HashMap, net::IpAddr, path::Path, usize};
+use url::{ParseError, Url};
 
 pub const DEFAULT_PORT: u16 = 9000;
 
-// #[derive(Debug, Clone)]
-// struct Node {
-//     url: url::Url,
-//     pools: Vec<usize>,
-//     is_local: bool,
-//     grid_host: String,
-// }
-
+/// enum for endpoint type.
 #[derive(PartialEq, Eq)]
 pub enum EndpointType {
-    Undefiend,
-    PathEndpointType,
-    URLEndpointType,
+    /// path style endpoint type enum.
+    Path,
+
+    /// URL style endpoint type enum.
+    Url,
+
+    /// Unknown endpoint type enum.
+    UnKnow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Ord)]
+/// holds information about a node in this cluster
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub url: url::Url,
     pub pools: Vec<i32>,
@@ -33,37 +32,62 @@ pub struct Node {
     pub grid_host: String, // TODO "scheme://host:port"
 }
 
-impl PartialOrd for Node {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.grid_host.partial_cmp(&other.grid_host)
-    }
-}
+// impl PartialOrd for Node {
+//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+//         self.grid_host.partial_cmp(&other.grid_host)
+//     }
+// }
 
+/// any type of endpoint.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub url: url::Url,
     pub is_local: bool,
+
     pub pool_idx: i32,
     pub set_idx: i32,
     pub disk_idx: i32,
 }
 
-// 检查给定路径是否为空或根路径
+impl Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.url.has_host() {
+            write!(f, "{}", self.url)
+        } else {
+            write!(f, "{}", self.url.path())
+        }
+    }
+}
+
+impl TryFrom<&str> for Endpoint {
+    /// The type returned in the event of a conversion error.
+    type Error = String;
+
+    /// Performs the conversion.
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if is_empty_path(value) {
+            return Err("empty or root endpoint is not supported".into());
+        }
+
+        // match Url::parse(value) {
+        //     Ok(u) => u,
+        //     Err(e) => match e {
+        //         ParseError::EmptyHost => Err("")
+        //     },
+        // }
+
+        unimplemented!()
+    }
+}
+
+/// check whether given path is not empty.
 fn is_empty_path(path: &str) -> bool {
-    path == "" || path == "/" || path == "\\"
+    ["", "/", "\\"].iter().any(|&v| v.eq(path))
 }
 
 // 检查给定字符串是否是IP地址
 fn is_host_ip(ip_str: &str) -> bool {
     ip_str.parse::<IpAddr>().is_ok()
-}
-
-#[tokio::test]
-async fn test_new_endpont() {
-    let arg = "./data";
-    let ep = Endpoint::new(arg).unwrap();
-
-    println!("{:?}", ep);
 }
 
 impl Endpoint {
@@ -73,16 +97,16 @@ impl Endpoint {
         }
 
         let url = Url::parse(arg).or_else(|e| match e {
-            url::ParseError::EmptyHost => Err(Error::msg("远程地址，域名不能为空")),
-            url::ParseError::IdnaError => Err(Error::msg("域名格式不正确")),
-            url::ParseError::InvalidPort => Err(Error::msg("端口格式不正确")),
-            url::ParseError::InvalidIpv4Address => Err(Error::msg("IP格式不正确")),
-            url::ParseError::InvalidIpv6Address => Err(Error::msg("IP格式不正确")),
-            url::ParseError::InvalidDomainCharacter => Err(Error::msg("域名字符格式不正确")),
+            ParseError::EmptyHost => Err(Error::msg("远程地址，域名不能为空")),
+            ParseError::IdnaError => Err(Error::msg("域名格式不正确")),
+            ParseError::InvalidPort => Err(Error::msg("端口格式不正确")),
+            ParseError::InvalidIpv4Address => Err(Error::msg("IP格式不正确")),
+            ParseError::InvalidIpv6Address => Err(Error::msg("IP格式不正确")),
+            ParseError::InvalidDomainCharacter => Err(Error::msg("域名字符格式不正确")),
             // url::ParseError::RelativeUrlWithoutBase => todo!(),
             // url::ParseError::RelativeUrlWithCannotBeABaseBase => todo!(),
             // url::ParseError::SetHostOnCannotBeABaseUrl => todo!(),
-            url::ParseError::Overflow => Err(Error::msg("长度过长")),
+            ParseError::Overflow => Err(Error::msg("长度过长")),
             _ => {
                 if is_host_ip(arg) {
                     return Err(Error::msg("无效的URL endpoint格式: 缺少 http 或 https"));
@@ -160,15 +184,11 @@ impl Endpoint {
     // }
 
     pub fn get_type(&self) -> EndpointType {
-        if self.url.scheme() == "file" {
-            return EndpointType::PathEndpointType;
+        if self.url.has_host() {
+            EndpointType::Url
+        } else {
+            EndpointType::Path
         }
-
-        EndpointType::URLEndpointType
-    }
-
-    pub fn to_string(&self) -> String {
-        self.url.as_str().to_string()
     }
 
     // pub fn get_scheme(&self) -> String {
@@ -234,7 +254,7 @@ impl Endpoints {
         self.0.as_slice()[start..end].to_vec()
     }
     pub fn from_args(args: Vec<String>) -> Result<Self, Error> {
-        let mut ep_type = EndpointType::Undefiend;
+        let mut ep_type = EndpointType::UnKnow;
         let mut scheme = String::new();
         let mut eps = Vec::new();
         let mut uniq_args = new_string_set();
@@ -369,7 +389,7 @@ impl EndpointServerPools {
 
         let mut nodes: Vec<Node> = node_map.into_iter().map(|(_, n)| n).collect();
 
-        nodes.sort_by(|a, b| a.cmp(b));
+        // nodes.sort_by(|a, b| a.cmp(b));
 
         nodes
     }
@@ -433,7 +453,7 @@ pub fn create_pool_endpoints(
         let mut endpoint = Endpoint::new(pools[0].layout[0][0].as_str())?;
         endpoint.update_islocal()?;
 
-        if endpoint.get_type() != EndpointType::PathEndpointType {
+        if endpoint.get_type() != EndpointType::Path {
             return Err(Error::msg("use path style endpoint for single node setup"));
         }
 
@@ -497,12 +517,12 @@ pub fn create_pool_endpoints(
     let erasure_type = uniq_host.to_slice().len() == 1;
 
     for eps in ret.iter() {
-        if eps.0[0].get_type() == EndpointType::PathEndpointType {
+        if eps.0[0].get_type() == EndpointType::Path {
             setup_type = SetupType::ErasureSetupType;
             break;
         }
 
-        if eps.0[0].get_type() == EndpointType::URLEndpointType {
+        if eps.0[0].get_type() == EndpointType::Url {
             if erasure_type {
                 setup_type = SetupType::ErasureSetupType;
             } else {
@@ -552,6 +572,23 @@ mod test {
     use crate::disks_layout::DisksLayout;
 
     use super::*;
+
+    #[test]
+    fn test_url() {
+        let path = "/dir/sss";
+
+        let u = url::Url::parse(path);
+
+        println!("{:#?}", u)
+    }
+
+    #[test]
+    fn test_new_endpont() {
+        let arg = "./data";
+        let ep = Endpoint::new(arg).unwrap();
+
+        println!("{:?}", ep);
+    }
 
     #[test]
     fn test_create_server_endpoints() {
