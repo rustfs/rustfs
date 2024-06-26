@@ -18,4 +18,4 @@ http = "1.1.0"
 thiserror = "1.0.61"
 time = "0.3.36"
 async-trait = "0.1.80"
-tokio = "1.38.0"
+tokio = { version = "1.38.0", features = ["full"] }

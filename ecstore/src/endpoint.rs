@@ -218,6 +218,10 @@ impl Endpoints {
         Self(Vec::new())
     }
 
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn iter(&self) -> core::slice::Iter<Endpoint> {
         self.0.iter()
     }

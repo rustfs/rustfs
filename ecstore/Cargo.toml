@@ -10,7 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 url = "2.5.2"
-uuid = "1.8.0"
+uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 reed-solomon-erasure = "6.0.0"
 transform-stream = "0.3.0"
 bytes.workspace = true
@@ -25,3 +25,6 @@ netif = "0.1.6"
 async-trait = "0.1.80"
 tracing.workspace = true
 tracing-error = "0.2.0"
+serde_json.workspace = true
+path-absolutize = "3.1.1"
+time.workspace = true
