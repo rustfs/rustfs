@@ -15,8 +15,8 @@ pub struct FS {
 }
 
 impl FS {
-    pub fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
-        let store: ECStore = ECStore::new(address, endpoints)?;
+    pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
+        let store: ECStore = ECStore::new(address, endpoints).await?;
         Ok(Self { store })
     }
 }

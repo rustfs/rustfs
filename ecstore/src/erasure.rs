@@ -73,8 +73,8 @@ mod test {
 
     use super::*;
 
-    #[tokio::test]
-    async fn test_erasure() {
+    #[test]
+    fn test_erasure() {
         let data_shards = 3;
         let parity_shards = 2;
         let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];

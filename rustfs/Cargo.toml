@@ -8,23 +8,16 @@ rust-version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-
-[[bin]]
-name = "rustfs"
-# required-features = ["binary"]
-
-
-# [features]
-# binary = ["tokio/full", "dep:clap", "dep:tracing-subscriber", "dep:hyper-util"]
-
 [dependencies]
-ecstore = { path = "../ecstore" }
-clap = { version = "4.5.7", features = ["derive"] }
-s3s = { version = "0.10.0" }
-anyhow = { version = "1.0.86" }
-tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
+async-trait.workspace = true
+tracing.workspace = true 
+anyhow.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
-async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+
+ecstore = { path = "../ecstore" }
+
+s3s = "0.10.0"
+clap = { version = "4.5.7", features = ["derive"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 hyper-util = { version = "0.1.5", features = ["tokio", "server-auto", "server-graceful"] }
