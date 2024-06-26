@@ -22,7 +22,7 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 
 pub struct DiskOption {
     pub cleanup: bool,
-    pub _health_check: bool,
+    pub health_check: bool,
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<impl DiskAPI, Error> {
