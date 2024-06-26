@@ -1,8 +1,10 @@
+mod disk;
 mod disks_layout;
 mod ellipses;
 mod endpoint;
 mod erasure;
 pub mod error;
+mod format;
 pub mod store;
 mod stream;
 mod utils;
