@@ -1,4 +1,5 @@
 mod disk;
+mod disk_api;
 mod disks_layout;
 mod ellipses;
 mod endpoint;
