@@ -601,7 +601,7 @@ mod test {
         )];
 
         for (addr, args) in cases {
-            let layouts = DisksLayout::new(args).unwrap();
+            let layouts = DisksLayout::new(&args).unwrap();
 
             println!("layouts:{:?},{}", &layouts.pools, &layouts.legacy);
 

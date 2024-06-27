@@ -18,7 +18,7 @@ pub struct DisksLayout {
 }
 
 impl DisksLayout {
-    pub fn new(args: Vec<String>) -> Result<DisksLayout, Error> {
+    pub fn new(args: &Vec<String>) -> Result<DisksLayout, Error> {
         if args.is_empty() {
             return Err(Error::msg("Invalid argument"));
         }
@@ -358,7 +358,7 @@ mod test {
 
         let mut args = Vec::new();
         args.push(pattern);
-        match DisksLayout::new(args) {
+        match DisksLayout::new(&args) {
             Ok(set) => {
                 for pool in set.pools {
                     println!("cmd: {:?}", pool.cmdline);

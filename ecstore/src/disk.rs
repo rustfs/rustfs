@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::Error;
+use bytes::Bytes;
 use futures::future::join_all;
 use path_absolutize::Absolutize;
 use time::OffsetDateTime;
@@ -12,20 +13,26 @@ use tokio::io::ErrorKind;
 use uuid::Uuid;
 
 use crate::{
+    disk_api::DiskAPI,
     endpoint::{Endpoint, Endpoints},
     format::{DistributionAlgoVersion, FormatV3},
 };
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
+pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
+pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
+pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
+
+pub type DiskStore = Box<dyn DiskAPI>;
 
 pub struct DiskOption {
     pub cleanup: bool,
     pub health_check: bool,
 }
 
-pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<impl DiskAPI, Error> {
+pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore, Error> {
     if ep.is_local {
         Ok(LocalDisk::new(ep, opt.cleanup).await?)
     } else {
@@ -37,7 +44,7 @@ pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<impl DiskAPI, E
 pub async fn init_disks(
     eps: &Endpoints,
     opt: &DiskOption,
-) -> (Vec<Option<impl DiskAPI>>, Vec<Option<Error>>) {
+) -> (Vec<Option<DiskStore>>, Vec<Option<Error>>) {
     let mut futures = Vec::with_capacity(eps.len());
 
     for ep in eps.iter() {
@@ -68,6 +75,7 @@ pub async fn init_disks(
 //     unimplemented!()
 // }
 
+#[derive(Debug)]
 pub struct LocalDisk {
     root: PathBuf,
     id: Uuid,
@@ -79,7 +87,7 @@ pub struct LocalDisk {
 }
 
 impl LocalDisk {
-    pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self, Error> {
+    pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Box<Self>, Error> {
         let root = fs::canonicalize(ep.url.path()).await?;
 
         if cleanup {
@@ -123,7 +131,7 @@ impl LocalDisk {
 
         disk.make_meta_volumes().await?;
 
-        Ok(disk)
+        Ok(Box::new(disk))
     }
 
     async fn make_meta_volumes(&self) -> Result<(), Error> {
@@ -190,25 +198,112 @@ pub async fn read_file_exists(
 
 pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Vec<u8>, Metadata), Error> {
     let p = path.as_ref();
-    let meta = fs::metadata(&p).await.map_err(|e| match e.kind() {
-        ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
-        ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
-        _ => Error::new(e),
-    })?;
+    let meta = read_file_metadata(&path).await?;
 
     let data = fs::read(&p).await?;
 
     Ok((data, meta))
 }
 
+pub async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata, Error> {
+    let meta = fs::metadata(&p).await.map_err(|e| match e.kind() {
+        ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
+        ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
+        _ => Error::new(e),
+    })?;
+
+    Ok(meta)
+}
+
+pub async fn check_volume_exists(p: impl AsRef<Path>) -> Result<(), Error> {
+    fs::metadata(&p).await.map_err(|e| match e.kind() {
+        ErrorKind::NotFound => Error::new(DiskError::VolumeNotFound),
+        ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
+        _ => Error::new(e),
+    })?;
+    Ok(())
+}
+
+fn skip_access_checks(p: impl AsRef<str>) -> bool {
+    let vols = vec![
+        RUSTFS_META_TMP_DELETED_BUCKET,
+        RUSTFS_META_TMP_BUCKET,
+        RUSTFS_META_MULTIPART_BUCKET,
+        RUSTFS_META_BUCKET,
+    ];
+
+    for v in vols.iter() {
+        if p.as_ref().starts_with(v) {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
     #[must_use]
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>, Error> {
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes, Error> {
         let p = self.get_object_path(&volume, &path)?;
         let (data, _) = read_file_all(&p).await?;
 
-        Ok(data)
+        Ok(Bytes::from(data))
+    }
+
+    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<(), Error> {
+        let p = self.get_object_path(&volume, &path)?;
+
+        // create top dir if not exists
+        fs::create_dir_all(&p.parent().unwrap_or_else(|| Path::new("."))).await?;
+
+        fs::write(&p, data).await?;
+        Ok(())
+    }
+
+    async fn rename_file(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<(), Error> {
+        if !skip_access_checks(&src_volume) {
+            check_volume_exists(&src_volume).await?;
+        }
+        if !skip_access_checks(&dst_volume) {
+            check_volume_exists(&dst_volume).await?;
+        }
+
+        let srcp = self.get_object_path(&src_volume, &src_path)?;
+        let dstp = self.get_object_path(&dst_volume, &dst_path)?;
+
+        let src_is_dir = srcp.is_dir();
+        let dst_is_dir = dstp.is_dir();
+        if !(src_is_dir && dst_is_dir || !src_is_dir && !dst_is_dir) {
+            return Err(Error::new(DiskError::FileAccessDenied));
+        }
+
+        // TODO: check path length
+
+        if src_is_dir {
+            // TODO: remove dst_dir
+        }
+
+        fs::create_dir_all(dstp.parent().unwrap_or_else(|| Path::new("."))).await?;
+
+        let mut idx = 0;
+        loop {
+            if let Err(e) = fs::rename(&srcp, &dstp).await {
+                if e.kind() == ErrorKind::NotFound && idx == 0 {
+                    idx += 1;
+                    continue;
+                }
+            };
+
+            break;
+        }
+        Ok(())
     }
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<(), Error> {
@@ -249,14 +344,6 @@ impl RemoteDisk {
     }
 }
 
-#[async_trait::async_trait]
-pub trait DiskAPI {
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>, Error>;
-
-    async fn make_volumes(&self, volume: Vec<&str>) -> Result<(), Error>;
-    async fn make_volume(&self, volume: &str) -> Result<(), Error>;
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
     #[error("file not found")]
@@ -281,6 +368,9 @@ pub enum DiskError {
 
     #[error("disk not a dir")]
     DiskNotDir,
+
+    #[error("volume not found")]
+    VolumeNotFound,
 }
 
 impl PartialEq for DiskError {
@@ -314,6 +404,10 @@ pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<(), Error> {
     //     return Err(Error::new(DiskError::XLBackend));
     // }
     Ok(())
+}
+
+pub fn quorum_unformatted_disks(errs: &Vec<Option<Error>>) -> bool {
+    count_errs(errs, &DiskError::UnformattedDisk) >= (errs.len() / 2) + 1
 }
 
 pub fn count_errs(errs: &Vec<Option<Error>>, err: &DiskError) -> usize {
@@ -367,7 +461,22 @@ mod test {
     use super::*;
 
     #[tokio::test]
-    async fn test_check_errs() {}
+    async fn test_skip_access_checks() {
+        // let arr = Vec::new();
+
+        let vols = vec![
+            RUSTFS_META_TMP_DELETED_BUCKET,
+            RUSTFS_META_TMP_BUCKET,
+            RUSTFS_META_MULTIPART_BUCKET,
+            RUSTFS_META_BUCKET,
+        ];
+
+        let paths: Vec<_> = vols.iter().map(|v| Path::new(v).join("test")).collect();
+
+        for p in paths.iter() {
+            assert!(skip_access_checks(p.to_str().unwrap()));
+        }
+    }
 
     #[tokio::test]
     async fn test_make_volume() {
@@ -383,6 +492,12 @@ mod test {
         };
 
         let disk = LocalDisk::new(&ep, false).await.unwrap();
+
+        let tmpp = disk
+            .resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET))
+            .unwrap();
+
+        println!("ppp :{:?}", &tmpp);
 
         let volumes = vec!["a", "b", "c"];
 
