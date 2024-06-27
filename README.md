@@ -1,3 +1,17 @@
+# RustFS
+[![Apache 2.0 licensed][license-badge]][license-url]
+[![Unsafe Forbidden][unsafe-forbidden-badge]][unsafe-forbidden-url]
+
+[license-badge]: https://img.shields.io/badge/license-Apache--2.0-blue.svg
+[license-url]: ./LICENSE
+[unsafe-forbidden-badge]: https://img.shields.io/badge/unsafe-forbidden-success.svg
+[unsafe-forbidden-url]: https://github.com/rust-secure-code/safety-dance/
+
+
+English | [简体中文](README-CN.md)
+
+
+
 # Who am I? 👋
 
 RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature, support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation, RustFS provides faster speed and safer distributed features for high-performance object storage.
@@ -10,7 +24,9 @@ https://RustFS.com/
 # Values
 We anticipate that RustFS will be the future storage solution for Mars.
 
+# Documentation
 
+For user manual, system design and architecture, please refer to [RustFS Documentation](https://rustfs.com/docs/).
 
 
 <!--
