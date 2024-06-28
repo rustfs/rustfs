@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::Error;
+use anyhow::{Error, Result};
 use uuid::Uuid;
 
 use crate::{
@@ -8,7 +8,7 @@ use crate::{
     disks_layout::DisksLayout,
     endpoint::EndpointServerPools,
     sets::Sets,
-    store_api::StorageAPI,
+    store_api::{MakeBucketOptions, StorageAPI},
     store_init,
 };
 
@@ -22,7 +22,7 @@ pub struct ECStore {
 }
 
 impl ECStore {
-    pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self, Error> {
+    pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
         let layouts = DisksLayout::new(&endpoints)?;
 
         let mut deployment_id = None;
@@ -88,7 +88,11 @@ impl ECStore {
 }
 
 impl StorageAPI for ECStore {
-    async fn put_object(&self, bucket: &str, objcet: &str) -> Result<(), Error> {
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        // TODO:  check valid bucket name
+        unimplemented!()
+    }
+    async fn put_object(&self, bucket: &str, objcet: &str) -> Result<()> {
         unimplemented!()
     }
 }
