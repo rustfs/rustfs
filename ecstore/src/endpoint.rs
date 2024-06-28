@@ -624,10 +624,7 @@ mod test {
     fn test_create_server_endpoints() {
         let cases = vec![(
             ":9000",
-            vec![
-                // "/Users/weisd/fs".to_string(),
-                "http://localhost:900{1...2}/export{1...64}".to_string(),
-            ],
+            vec!["http://localhost:900{1...2}/export{1...64}".to_string()],
         )];
 
         for (addr, args) in cases {
