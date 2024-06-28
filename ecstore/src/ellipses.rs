@@ -1,6 +1,6 @@
 use lazy_static::*;
 
-use anyhow::Error;
+use anyhow::{Error, Result};
 use regex::Regex;
 
 lazy_static! {
@@ -89,7 +89,7 @@ impl ArgPattern {
 }
 
 #[allow(dead_code)]
-pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern, Error> {
+pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
     let mut caps = match ELLIPSES_RE.captures(arg) {
         Some(caps) => caps,
         None => return Err(Error::msg("Invalid argument")),
@@ -175,7 +175,7 @@ pub fn has_ellipses(s: &Vec<String>) -> bool {
 // `{1...64}`
 // `{33...64}`
 #[allow(dead_code)]
-pub fn parse_ellipses_range(partten: &str) -> Result<Vec<String>, Error> {
+pub fn parse_ellipses_range(partten: &str) -> Result<Vec<String>> {
     if !partten.contains(OPEN_BRACES) {
         return Err(Error::msg("Invalid argument"));
     }

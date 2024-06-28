@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Error;
+use anyhow::{Error, Result};
 use serde::Deserialize;
 
 use super::ellipses::*;
@@ -18,7 +18,7 @@ pub struct DisksLayout {
 }
 
 impl DisksLayout {
-    pub fn new(args: &Vec<String>) -> Result<DisksLayout, Error> {
+    pub fn new(args: &Vec<String>) -> Result<DisksLayout> {
         if args.is_empty() {
             return Err(Error::msg("Invalid argument"));
         }
@@ -67,7 +67,7 @@ impl DisksLayout {
     }
 }
 
-fn get_all_sets(set_drive_count: usize, args: &Vec<String>) -> Result<Vec<Vec<String>>, Error> {
+fn get_all_sets(set_drive_count: usize, args: &Vec<String>) -> Result<Vec<Vec<String>>> {
     let set_args;
     if !has_ellipses(args) {
         let set_indexes: Vec<Vec<usize>>;
@@ -114,7 +114,7 @@ pub struct EndpointSet {
 }
 
 impl EndpointSet {
-    pub fn new(args: &Vec<String>, set_div_count: usize) -> Result<EndpointSet, Error> {
+    pub fn new(args: &Vec<String>, set_div_count: usize) -> Result<EndpointSet> {
         let mut arg_patterns = Vec::with_capacity(args.len());
         for arg in args.iter() {
             arg_patterns.push(find_ellipses_patterns(arg.as_str())?);
@@ -164,7 +164,7 @@ impl EndpointSet {
     }
 }
 
-// fn parse_endpoint_set(set_div_count: usize, args: &Vec<String>) -> Result<EndpointSet, Error> {
+// fn parse_endpoint_set(set_div_count: usize, args: &Vec<String>) -> Result<EndpointSet> {
 //     let mut arg_patterns = Vec::with_capacity(args.len());
 //     for arg in args.iter() {
 //         arg_patterns.push(find_ellipses_patterns(arg.as_str())?);
@@ -267,7 +267,7 @@ fn get_set_indexes(
     totalsizes: &Vec<usize>,
     set_div_count: usize,
     arg_patterns: &Vec<ArgPattern>,
-) -> Result<Vec<Vec<usize>>, Error> {
+) -> Result<Vec<Vec<usize>>> {
     if args.is_empty() || totalsizes.is_empty() {
         return Err(Error::msg("Invalid argument"));
     }

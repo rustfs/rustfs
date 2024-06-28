@@ -3,7 +3,7 @@ use super::utils::{
     net::{is_local_host, split_host_port},
     string::new_string_set,
 };
-use anyhow::Error;
+use anyhow::{Error, Result};
 use std::fmt::Display;
 use std::{collections::HashMap, net::IpAddr, path::Path, usize};
 use url::{ParseError, Url};
@@ -91,7 +91,7 @@ fn is_host_ip(ip_str: &str) -> bool {
 }
 
 impl Endpoint {
-    pub fn new(arg: &str) -> Result<Self, Error> {
+    pub fn new(arg: &str) -> Result<Self> {
         if is_empty_path(arg) {
             return Err(Error::msg("不支持空或根endpoint"));
         }
@@ -207,7 +207,7 @@ impl Endpoint {
         self.disk_idx = idx
     }
 
-    fn update_islocal(&mut self) -> Result<(), Error> {
+    fn update_islocal(&mut self) -> Result<()> {
         if self.url.has_host() {
             self.is_local = is_local_host(
                 self.url.host().unwrap(),
@@ -253,7 +253,7 @@ impl Endpoints {
     pub fn slice(&self, start: usize, end: usize) -> Vec<Endpoint> {
         self.0.as_slice()[start..end].to_vec()
     }
-    pub fn from_args(args: Vec<String>) -> Result<Self, Error> {
+    pub fn from_args(args: Vec<String>) -> Result<Self> {
         let mut ep_type = EndpointType::UnKnow;
         let mut scheme = String::new();
         let mut eps = Vec::new();
@@ -297,7 +297,7 @@ impl PoolEndpointList {
     }
 
     // TODO: 解析域名，判断哪个是本地地址
-    fn update_is_local(&mut self) -> Result<(), Error> {
+    fn update_is_local(&mut self) -> Result<()> {
         for eps in self.0.iter_mut() {
             for ep in eps.iter_mut() {
                 // TODO:
@@ -336,7 +336,7 @@ impl EndpointServerPools {
         server_addr: String,
         pool_args: &Vec<PoolDisksLayout>,
         legacy: bool,
-    ) -> Result<(EndpointServerPools, SetupType), Error> {
+    ) -> Result<(EndpointServerPools, SetupType)> {
         if pool_args.is_empty() {
             return Err(Error::msg("无效参数"));
         }
@@ -380,7 +380,7 @@ impl EndpointServerPools {
         self.0.push(pes)
     }
 
-    pub fn add(&mut self, eps: PoolEndpoints) -> Result<(), Error> {
+    pub fn add(&mut self, eps: PoolEndpoints) -> Result<()> {
         let mut exits = new_string_set();
         for peps in self.0.iter() {
             for ep in peps.endpoints.0.iter() {
@@ -472,7 +472,7 @@ fn is_single_drive_layout(pools_layout: &Vec<PoolDisksLayout>) -> bool {
 pub fn create_pool_endpoints(
     server_addr: String,
     pools: &Vec<PoolDisksLayout>,
-) -> Result<(Vec<Endpoints>, SetupType), Error> {
+) -> Result<(Vec<Endpoints>, SetupType)> {
     if is_empty_layout(pools) {
         return Err(Error::msg("empty layout"));
     }
@@ -571,7 +571,7 @@ fn create_server_endpoints(
     server_addr: String,
     pool_args: &Vec<PoolDisksLayout>,
     legacy: bool,
-) -> Result<(EndpointServerPools, SetupType), Error> {
+) -> Result<(EndpointServerPools, SetupType)> {
     if pool_args.is_empty() {
         return Err(Error::msg("无效参数"));
     }

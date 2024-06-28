@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Error;
+use anyhow::{Error, Result};
 use bytes::Bytes;
 use futures::future::join_all;
 use path_absolutize::Absolutize;
@@ -32,7 +32,7 @@ pub struct DiskOption {
     pub health_check: bool,
 }
 
-pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore, Error> {
+pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     if ep.is_local {
         Ok(LocalDisk::new(ep, opt.cleanup).await?)
     } else {
@@ -71,7 +71,7 @@ pub async fn init_disks(
     (storages, errors)
 }
 
-// pub async fn load_format(&self, heal: bool) -> Result<FormatV3, Error> {
+// pub async fn load_format(&self, heal: bool) -> Result<FormatV3> {
 //     unimplemented!()
 // }
 
@@ -87,7 +87,7 @@ pub struct LocalDisk {
 }
 
 impl LocalDisk {
-    pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Box<Self>, Error> {
+    pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Box<Self>> {
         let root = fs::canonicalize(ep.url.path()).await?;
 
         if cleanup {
@@ -134,7 +134,7 @@ impl LocalDisk {
         Ok(Box::new(disk))
     }
 
-    async fn make_meta_volumes(&self) -> Result<(), Error> {
+    async fn make_meta_volumes(&self) -> Result<()> {
         let buckets = format!("{}/{}", RUSTFS_META_BUCKET, BUCKET_META_PREFIX);
         let multipart = format!("{}/{}", RUSTFS_META_BUCKET, "multipart");
         let config = format!("{}/{}", RUSTFS_META_BUCKET, "config");
@@ -149,22 +149,22 @@ impl LocalDisk {
         self.make_volumes(defaults).await
     }
 
-    pub fn resolve_abs_path(&self, path: impl AsRef<Path>) -> Result<PathBuf, Error> {
+    pub fn resolve_abs_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
         Ok(path.as_ref().absolutize_virtually(&self.root)?.into_owned())
     }
 
-    pub fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf, Error> {
+    pub fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         let dir = Path::new(&bucket);
         let file_path = Path::new(&key);
         self.resolve_abs_path(dir.join(file_path))
     }
 
-    pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf, Error> {
+    pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
         let dir = Path::new(&bucket);
         self.resolve_abs_path(dir)
     }
 
-    // pub async fn load_format(&self) -> Result<Option<FormatV3>, Error> {
+    // pub async fn load_format(&self) -> Result<Option<FormatV3>> {
     //     let p = self.get_object_path(RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)?;
     //     let content = fs::read(&p).await?;
 
@@ -173,9 +173,7 @@ impl LocalDisk {
 }
 
 // 过滤 std::io::ErrorKind::NotFound
-pub async fn read_file_exists(
-    path: impl AsRef<Path>,
-) -> Result<(Vec<u8>, Option<Metadata>), Error> {
+pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<Metadata>)> {
     let p = path.as_ref();
     let (data, meta) = match read_file_all(&p).await {
         Ok((data, meta)) => (data, Some(meta)),
@@ -196,7 +194,7 @@ pub async fn read_file_exists(
     Ok((data, meta))
 }
 
-pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Vec<u8>, Metadata), Error> {
+pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Vec<u8>, Metadata)> {
     let p = path.as_ref();
     let meta = read_file_metadata(&path).await?;
 
@@ -205,7 +203,7 @@ pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Vec<u8>, Metadata)
     Ok((data, meta))
 }
 
-pub async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata, Error> {
+pub async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
     let meta = fs::metadata(&p).await.map_err(|e| match e.kind() {
         ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
         ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
@@ -215,7 +213,7 @@ pub async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata, Error> 
     Ok(meta)
 }
 
-pub async fn check_volume_exists(p: impl AsRef<Path>) -> Result<(), Error> {
+pub async fn check_volume_exists(p: impl AsRef<Path>) -> Result<()> {
     fs::metadata(&p).await.map_err(|e| match e.kind() {
         ErrorKind::NotFound => Error::new(DiskError::VolumeNotFound),
         ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
@@ -244,14 +242,14 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
     #[must_use]
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes, Error> {
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         let p = self.get_object_path(&volume, &path)?;
         let (data, _) = read_file_all(&p).await?;
 
         Ok(Bytes::from(data))
     }
 
-    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<(), Error> {
+    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         let p = self.get_object_path(&volume, &path)?;
 
         // create top dir if not exists
@@ -267,7 +265,7 @@ impl DiskAPI for LocalDisk {
         src_path: &str,
         dst_volume: &str,
         dst_path: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         if !skip_access_checks(&src_volume) {
             check_volume_exists(&src_volume).await?;
         }
@@ -306,7 +304,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    async fn make_volumes(&self, volumes: Vec<&str>) -> Result<(), Error> {
+    async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
         for vol in volumes {
             if let Err(e) = self.make_volume(vol).await {
                 match &e.downcast_ref::<DiskError>() {
@@ -319,7 +317,7 @@ impl DiskAPI for LocalDisk {
         }
         Ok(())
     }
-    async fn make_volume(&self, volume: &str) -> Result<(), Error> {
+    async fn make_volume(&self, volume: &str) -> Result<()> {
         let p = self.get_bucket_path(&volume)?;
         match File::open(&p).await {
             Ok(_) => (),
@@ -339,7 +337,7 @@ impl DiskAPI for LocalDisk {
 // pub struct RemoteDisk {}
 
 // impl RemoteDisk {
-//     pub fn new(_ep: &Endpoint, _health_check: bool) -> Result<Self, Error> {
+//     pub fn new(_ep: &Endpoint, _health_check: bool) -> Result<Self> {
 //         Ok(Self {})
 //     }
 // }
@@ -374,7 +372,7 @@ pub enum DiskError {
 }
 
 impl DiskError {
-    pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<(), Error> {
+    pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<()> {
         println!("errs: {:?}", errs);
 
         if Self::count_errs(errs, &DiskError::UnsupportedDisk) == errs.len() {

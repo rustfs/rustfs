@@ -1,4 +1,4 @@
-use anyhow::Error;
+use anyhow::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use uuid::Uuid;
@@ -165,7 +165,7 @@ impl FormatV3 {
     /// format, after successful validation.
     ///   - i'th position is the set index
     ///   - j'th position is the disk index in the current set
-    pub fn find_disk_index_by_disk_id(&self, disk_id: Uuid) -> Result<(usize, usize), Error> {
+    pub fn find_disk_index_by_disk_id(&self, disk_id: Uuid) -> Result<(usize, usize)> {
         if disk_id == Uuid::nil() {
             return Err(Error::new(disk::DiskError::DiskNotFound));
         }

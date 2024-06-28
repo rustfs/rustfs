@@ -3,11 +3,11 @@ use std::{
     net::{IpAddr, ToSocketAddrs},
 };
 
-use anyhow::Error;
+use anyhow::{Error, Result};
 use netif;
 use url::Host;
 
-pub fn split_host_port(s: &str) -> Result<(String, u16), Error> {
+pub fn split_host_port(s: &str) -> Result<(String, u16)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() == 2 {
         if let Ok(port) = parts[1].parse::<u16>() {

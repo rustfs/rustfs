@@ -1,4 +1,4 @@
-use anyhow::Error;
+use anyhow::Result;
 use uuid::Uuid;
 
 use crate::{endpoint::PoolEndpoints, format::FormatV3};
@@ -22,7 +22,7 @@ impl Sets {
         fm: &FormatV3,
         pool_idx: usize,
         partiy_count: usize,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self> {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
