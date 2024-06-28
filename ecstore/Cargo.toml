@@ -28,6 +28,8 @@ tracing-error = "0.2.0"
 serde_json.workspace = true
 path-absolutize = "3.1.1"
 time.workspace = true
+rmp-serde = "1.3.0"
+tokio-util = "0.7.11"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

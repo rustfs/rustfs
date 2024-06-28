@@ -1,6 +1,7 @@
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 
 use anyhow::{Error, Result};
@@ -25,7 +26,7 @@ pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
 
-pub type DiskStore = Box<dyn DiskAPI>;
+pub type DiskStore = Arc<Box<dyn DiskAPI>>;
 
 pub struct DiskOption {
     pub cleanup: bool,
@@ -34,7 +35,8 @@ pub struct DiskOption {
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     if ep.is_local {
-        Ok(LocalDisk::new(ep, opt.cleanup).await?)
+        let s = LocalDisk::new(ep, opt.cleanup).await?;
+        Ok(Arc::new(Box::new(s)))
     } else {
         unimplemented!()
         // Ok(Disk::Remote(RemoteDisk::new(ep, opt.health_check)?))
@@ -51,24 +53,24 @@ pub async fn init_disks(
         futures.push(new_disk(ep, opt));
     }
 
-    let mut storages = Vec::with_capacity(eps.len());
+    let mut res = Vec::with_capacity(eps.len());
     let mut errors = Vec::with_capacity(eps.len());
 
     let results = join_all(futures).await;
     for result in results {
         match result {
             Ok(s) => {
-                storages.push(Some(s));
+                res.push(Some(s));
                 errors.push(None);
             }
             Err(e) => {
-                storages.push(None);
+                res.push(None);
                 errors.push(Some(e));
             }
         }
     }
 
-    (storages, errors)
+    (res, errors)
 }
 
 // pub async fn load_format(&self, heal: bool) -> Result<FormatV3> {
@@ -87,7 +89,7 @@ pub struct LocalDisk {
 }
 
 impl LocalDisk {
-    pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Box<Self>> {
+    pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         let root = fs::canonicalize(ep.url.path()).await?;
 
         if cleanup {
@@ -131,7 +133,7 @@ impl LocalDisk {
 
         disk.make_meta_volumes().await?;
 
-        Ok(Box::new(disk))
+        Ok(disk)
     }
 
     async fn make_meta_volumes(&self) -> Result<()> {
@@ -241,6 +243,10 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
+    fn is_local(&self) -> bool {
+        true
+    }
+
     #[must_use]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         let p = self.get_object_path(&volume, &path)?;
