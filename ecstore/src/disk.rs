@@ -77,13 +77,13 @@ pub async fn init_disks(
 
 #[derive(Debug)]
 pub struct LocalDisk {
-    root: PathBuf,
-    id: Uuid,
-    format_data: Vec<u8>,
-    format_meta: Option<Metadata>,
-    format_path: PathBuf,
-    format_legacy: bool,
-    format_last_check: OffsetDateTime,
+    pub root: PathBuf,
+    pub id: Uuid,
+    pub format_data: Vec<u8>,
+    pub format_meta: Option<Metadata>,
+    pub format_path: PathBuf,
+    pub format_legacy: bool,
+    pub format_last_check: OffsetDateTime,
 }
 
 impl LocalDisk {
@@ -180,7 +180,7 @@ pub async fn read_file_exists(
     let (data, meta) = match read_file_all(&p).await {
         Ok((data, meta)) => (data, Some(meta)),
         Err(e) => {
-            if is_err(&e, &DiskError::FileNotFound) {
+            if DiskError::is_err(&e, &DiskError::FileNotFound) {
                 (Vec::new(), None)
             } else {
                 return Err(e);
@@ -336,13 +336,13 @@ impl DiskAPI for LocalDisk {
     }
 }
 
-pub struct RemoteDisk {}
+// pub struct RemoteDisk {}
 
-impl RemoteDisk {
-    pub fn new(_ep: &Endpoint, _health_check: bool) -> Result<Self, Error> {
-        Ok(Self {})
-    }
-}
+// impl RemoteDisk {
+//     pub fn new(_ep: &Endpoint, _health_check: bool) -> Result<Self, Error> {
+//         Ok(Self {})
+//     }
+// }
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
@@ -373,86 +373,87 @@ pub enum DiskError {
     VolumeNotFound,
 }
 
+impl DiskError {
+    pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<(), Error> {
+        if Self::count_errs(errs, &DiskError::UnsupportedDisk) == errs.len() {
+            return Err(Error::new(DiskError::UnsupportedDisk));
+        }
+
+        // if count_errs(errs, &DiskError::DiskAccessDenied) == errs.len() {
+        //     return Err(Error::new(DiskError::DiskAccessDenied));
+        // }
+
+        if Self::count_errs(errs, &DiskError::FileAccessDenied) == errs.len() {
+            return Err(Error::new(DiskError::FileAccessDenied));
+        }
+
+        // if count_errs(errs, &DiskError::FaultyDisk) == errs.len() {
+        //     return Err(Error::new(DiskError::FaultyDisk));
+        // }
+
+        if Self::count_errs(errs, &DiskError::DiskNotDir) == errs.len() {
+            return Err(Error::new(DiskError::DiskNotDir));
+        }
+
+        // if count_errs(errs, &DiskError::XLBackend) == errs.len() {
+        //     return Err(Error::new(DiskError::XLBackend));
+        // }
+        Ok(())
+    }
+    pub fn count_errs(errs: &Vec<Option<Error>>, err: &DiskError) -> usize {
+        return errs
+            .iter()
+            .filter(|&e| {
+                if e.is_some() {
+                    let e = e.as_ref().unwrap();
+                    let cast = e.downcast_ref::<DiskError>();
+                    if cast.is_some() {
+                        let cast = cast.unwrap();
+                        return cast == err;
+                    }
+                }
+                true
+            })
+            .count();
+    }
+
+    pub fn quorum_unformatted_disks(errs: &Vec<Option<Error>>) -> bool {
+        Self::count_errs(errs, &DiskError::UnformattedDisk) >= (errs.len() / 2) + 1
+    }
+
+    pub fn is_err(err: &Error, disk_err: &DiskError) -> bool {
+        let cast = err.downcast_ref::<DiskError>();
+        if cast.is_none() {
+            return false;
+        }
+
+        let e = cast.unwrap();
+
+        e == disk_err
+    }
+
+    // pub fn match_err(err: Error, matchs: Vec<DiskError>) -> bool {
+    //     let cast = err.downcast_ref::<DiskError>();
+    //     if cast.is_none() {
+    //         return false;
+    //     }
+
+    //     let e = cast.unwrap();
+
+    //     for i in matchs.iter() {
+    //         if e == i {
+    //             return true;
+    //         }
+    //     }
+
+    //     return false;
+    // }
+}
+
 impl PartialEq for DiskError {
     fn eq(&self, other: &Self) -> bool {
         core::mem::discriminant(self) == core::mem::discriminant(other)
     }
-}
-
-pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<(), Error> {
-    if count_errs(errs, &DiskError::UnsupportedDisk) == errs.len() {
-        return Err(Error::new(DiskError::UnsupportedDisk));
-    }
-
-    // if count_errs(errs, &DiskError::DiskAccessDenied) == errs.len() {
-    //     return Err(Error::new(DiskError::DiskAccessDenied));
-    // }
-
-    if count_errs(errs, &DiskError::FileAccessDenied) == errs.len() {
-        return Err(Error::new(DiskError::FileAccessDenied));
-    }
-
-    // if count_errs(errs, &DiskError::FaultyDisk) == errs.len() {
-    //     return Err(Error::new(DiskError::FaultyDisk));
-    // }
-
-    if count_errs(errs, &DiskError::DiskNotDir) == errs.len() {
-        return Err(Error::new(DiskError::DiskNotDir));
-    }
-
-    // if count_errs(errs, &DiskError::XLBackend) == errs.len() {
-    //     return Err(Error::new(DiskError::XLBackend));
-    // }
-    Ok(())
-}
-
-pub fn quorum_unformatted_disks(errs: &Vec<Option<Error>>) -> bool {
-    count_errs(errs, &DiskError::UnformattedDisk) >= (errs.len() / 2) + 1
-}
-
-pub fn count_errs(errs: &Vec<Option<Error>>, err: &DiskError) -> usize {
-    return errs
-        .iter()
-        .filter(|&e| {
-            if e.is_some() {
-                let e = e.as_ref().unwrap();
-                let cast = e.downcast_ref::<DiskError>();
-                if cast.is_some() {
-                    let cast = cast.unwrap();
-                    return cast == err;
-                }
-            }
-            true
-        })
-        .count();
-}
-
-pub fn is_err(err: &Error, disk_err: &DiskError) -> bool {
-    let cast = err.downcast_ref::<DiskError>();
-    if cast.is_none() {
-        return false;
-    }
-
-    let e = cast.unwrap();
-
-    e == disk_err
-}
-
-pub fn match_err(err: Error, matchs: Vec<DiskError>) -> bool {
-    let cast = err.downcast_ref::<DiskError>();
-    if cast.is_none() {
-        return false;
-    }
-
-    let e = cast.unwrap();
-
-    for i in matchs.iter() {
-        if e == i {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 #[cfg(test)]

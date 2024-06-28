@@ -311,7 +311,7 @@ impl PoolEndpointList {
 
 // PoolEndpoints represent endpoints in a given pool
 // along with its setCount and setDriveCount.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PoolEndpoints {
     // indicates if endpoints are provided in non-ellipses style
     pub legacy: bool,
@@ -329,6 +329,36 @@ pub struct EndpointServerPools(Vec<PoolEndpoints>);
 impl EndpointServerPools {
     pub fn new() -> Self {
         Self(Vec::new())
+    }
+
+    // create_server_endpoints
+    pub fn create_server_endpoints(
+        server_addr: String,
+        pool_args: &Vec<PoolDisksLayout>,
+        legacy: bool,
+    ) -> Result<(EndpointServerPools, SetupType), Error> {
+        if pool_args.is_empty() {
+            return Err(Error::msg("无效参数"));
+        }
+
+        let (pooleps, setup_type) = create_pool_endpoints(server_addr, pool_args)?;
+
+        let mut ret = EndpointServerPools::new();
+
+        for (i, eps) in pooleps.iter().enumerate() {
+            let ep = PoolEndpoints {
+                legacy: legacy,
+                set_count: pool_args[i].layout.len(),
+                drives_per_set: pool_args[i].layout[0].len(),
+                endpoints: eps.clone(),
+                cmd_line: pool_args[i].cmdline.clone(),
+                platform: String::new(),
+            };
+
+            ret.add(ep)?;
+        }
+
+        Ok((ret, setup_type))
     }
 
     pub fn first_is_local(&self) -> bool {
@@ -537,7 +567,7 @@ pub fn create_pool_endpoints(
 }
 
 // create_server_endpoints
-pub fn create_server_endpoints(
+fn create_server_endpoints(
     server_addr: String,
     pool_args: &Vec<PoolDisksLayout>,
     legacy: bool,
