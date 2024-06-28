@@ -1,5 +1,8 @@
 #!/bin/bash
-DATA_DIR="/tmp"
+
+mkdir -p ./target/volume/test{0..4}
+
+DATA_DIR="./target/volume/test{0...4}"
 
 if [ -n "$1" ]; then
 	DATA_DIR="$1"

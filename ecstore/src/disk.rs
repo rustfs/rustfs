@@ -375,6 +375,8 @@ pub enum DiskError {
 
 impl DiskError {
     pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<(), Error> {
+        println!("errs: {:?}", errs);
+
         if Self::count_errs(errs, &DiskError::UnsupportedDisk) == errs.len() {
             return Err(Error::new(DiskError::UnsupportedDisk));
         }
@@ -412,7 +414,7 @@ impl DiskError {
                         return cast == err;
                     }
                 }
-                true
+                false
             })
             .count();
     }
