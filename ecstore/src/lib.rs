@@ -1,3 +1,5 @@
+mod bucket_meta;
+mod chunk_stream;
 mod disk;
 mod disk_api;
 mod disks_layout;
@@ -6,6 +8,7 @@ mod endpoint;
 mod erasure;
 pub mod error;
 mod format;
+mod peer;
 mod sets;
 pub mod store;
 mod store_api;

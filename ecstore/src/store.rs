@@ -1,15 +1,21 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Cursor};
 
 use anyhow::{Error, Result};
+
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::{
-    disk::{self, DiskError, DiskOption, DiskStore},
+    bucket_meta::BucketMetadata,
+    disk::{self, DiskError, DiskOption, DiskStore, RUSTFS_META_BUCKET},
     disks_layout::DisksLayout,
     endpoint::EndpointServerPools,
+    peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
-    store_api::{MakeBucketOptions, StorageAPI},
+    store_api::{MakeBucketOptions, ObjectOptions, PutObjReader, StorageAPI},
     store_init,
+    stream::into_dyn,
+    utils,
 };
 
 #[derive(Debug)]
@@ -18,7 +24,8 @@ pub struct ECStore {
     // pub disks: Vec<DiskStore>,
     pub disk_map: HashMap<usize, Vec<Option<DiskStore>>>,
     pub pools: Vec<Sets>,
-    pub peer: Vec<String>,
+    pub peer_sys: S3PeerSys,
+    pub local_disks: Vec<DiskStore>,
 }
 
 impl ECStore {
@@ -34,6 +41,8 @@ impl ECStore {
         let mut disk_map = HashMap::with_capacity(endpoint_pools.len());
 
         let first_is_local = endpoint_pools.first_is_local();
+
+        let mut local_disks = Vec::new();
 
         for (i, pool_eps) in endpoint_pools.iter().enumerate() {
             // TODO: read from config parseStorageClass
@@ -71,28 +80,83 @@ impl ECStore {
                 deployment_id = Some(Uuid::new_v4());
             }
 
-            disk_map.insert(i, disks);
+            for disk in disks.iter() {
+                if disk.is_some() && disk.as_ref().unwrap().is_local() {
+                    local_disks.push(disk.as_ref().unwrap().clone());
+                }
+            }
 
-            let sets = Sets::new(pool_eps, &fm, i, partiy_count)?;
+            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, partiy_count)?;
 
             pools.push(sets);
+
+            disk_map.insert(i, disks);
         }
+
+        let peer_sys = S3PeerSys::new(&endpoint_pools, local_disks.clone());
 
         Ok(ECStore {
             id: deployment_id.unwrap(),
             disk_map,
             pools,
-            peer: Vec::new(),
+            local_disks,
+            peer_sys,
         })
+    }
+
+    fn single_pool(&self) -> bool {
+        self.pools.len() == 1
     }
 }
 
+#[async_trait::async_trait]
 impl StorageAPI for ECStore {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         // TODO:  check valid bucket name
-        unimplemented!()
+
+        // TODO: delete created bucket when error
+        self.peer_sys.make_bucket(bucket, opts).await?;
+
+        let meta = BucketMetadata::new(bucket);
+        let data = meta.marshal_msg()?;
+        let file_path = meta.save_file_path();
+
+        let stream = ReaderStream::new(Cursor::new(data));
+
+        // TODO: wrap hash reader
+
+        // let reader = PutObjReader::new(stream);
+
+        // self.put_object(
+        //     RUSTFS_META_BUCKET,
+        //     &file_path,
+        //     &reader,
+        //     &ObjectOptions { max_parity: true },
+        // )
+        // .await?;
+
+        // TODO: toObjectErr
+
+        Ok(())
     }
-    async fn put_object(&self, bucket: &str, objcet: &str) -> Result<()> {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        // checkPutObjectArgs
+
+        let object = utils::path::encode_dir_object(object);
+
+        if self.single_pool() {
+            self.pools[0]
+                .put_object(bucket, object.as_str(), data, opts)
+                .await?;
+            return Ok(());
+        }
+
         unimplemented!()
     }
 }

@@ -5,6 +5,8 @@ use bytes::Bytes;
 
 #[async_trait::async_trait]
 pub trait DiskAPI: Debug + Send + Sync + 'static {
+    fn is_local(&self) -> bool;
+
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn rename_file(
