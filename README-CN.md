@@ -1,4 +1,8 @@
-# RustFS
+# RustFS Quickstart Guide
+
+[![RustFS](https://raw.githubusercontent.com/rustfs/rustfs/33a05c50cfaf8aaf613bf98826f9e55ab50a7c89/images/logo.svg)](https://rustfs.com)
+
+
 [![Apache 2.0 licensed][license-badge]][license-url]
 [![Unsafe Forbidden][unsafe-forbidden-badge]][unsafe-forbidden-url]
 
