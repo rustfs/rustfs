@@ -7,11 +7,13 @@ lazy_static! {
     static ref ELLIPSES_RE: Regex = Regex::new(r"(.*)(\{[0-9a-z]*\.\.\.[0-9a-z]*\})(.*)").unwrap();
 }
 
-// Ellipses constants
+/// Ellipses constants
 const OPEN_BRACES: &str = "{";
 const CLOSE_BRACES: &str = "}";
 const ELLIPSES: &str = "...";
 
+/// ellipses pattern, describes the range and also the
+/// associated prefix and suffixes.
 #[derive(Debug, Default)]
 pub struct Pattern {
     pub prefix: String,
@@ -20,18 +22,16 @@ pub struct Pattern {
 }
 
 impl Pattern {
-    #[allow(dead_code)]
+    /// expands a ellipses pattern.
     pub fn expand(&self) -> Vec<String> {
         let mut ret = Vec::with_capacity(self.suffix.len());
+
         for v in self.seq.iter() {
-            if !self.prefix.is_empty() && self.suffix.is_empty() {
-                ret.push(format!("{}{}", self.prefix, v))
-            } else if self.prefix.is_empty() && !self.suffix.is_empty() {
-                ret.push(format!("{}{}", v, self.suffix))
-            } else if self.prefix.is_empty() && self.suffix.is_empty() {
-                ret.push(v.to_string())
-            } else {
-                ret.push(format!("{}{}{}", self.prefix, v, self.suffix));
+            match (self.prefix.is_empty(), self.suffix.is_empty()) {
+                (false, true) => ret.push(format!("{}{}", self.prefix, v)),
+                (true, false) => ret.push(format!("{}{}", v, self.suffix)),
+                (true, true) => ret.push(v.to_string()),
+                (false, false) => ret.push(format!("{}{}{}", self.prefix, v, self.suffix)),
             }
         }
 
@@ -39,6 +39,7 @@ impl Pattern {
     }
 }
 
+/// contains a list of patterns provided in the input.
 #[derive(Debug)]
 pub struct ArgPattern {
     pub inner: Vec<Pattern>,
@@ -50,166 +51,137 @@ impl ArgPattern {
         Self { inner }
     }
 
-    #[allow(dead_code)]
+    /// expands all the ellipses patterns in the given argument.
     pub fn expand(&self) -> Vec<Vec<String>> {
-        let mut ret = Vec::new();
-        for v in self.inner.iter() {
-            ret.push(v.expand());
-        }
+        let ret: Vec<Vec<String>> = self.inner.iter().map(|v| v.expand()).collect();
 
         Self::arg_expander(&ret)
     }
 
-    fn arg_expander(lbs: &Vec<Vec<String>>) -> Vec<Vec<String>> {
-        let mut ret = Vec::new();
+    /// recursively expands labels into its respective forms.
+    fn arg_expander(lbs: &[Vec<String>]) -> Vec<Vec<String>> {
+        // if lbs.len() <= 1 {
+        //     return lbs.iter().map(ToString).collect();
+        // }
 
-        if lbs.len() == 1 {
-            let arr = lbs.get(0).unwrap();
-            for bs in arr {
-                ret.push(vec![bs.to_string()])
-            }
+        // let mut ret = Vec::new();
 
-            return ret;
-        }
+        // let mut first = Vec::new();
+        // let mut others = Vec::with_capacity(lbs.len() - 1);
+        // for (i, v) in lbs.into_iter().enumerate() {
+        //     if i == 0 {
+        //         first = v;
+        //     } else {
+        //         others.push(v);
+        //     }
+        // }
 
-        let first = &lbs[0];
-        let (_, other) = lbs.split_at(1);
-        let others = Vec::from(other);
-        // let other = lbs[1..lbs.len()];
-        for bs in first {
-            let ots = Self::arg_expander(&others);
-            for obs in ots {
-                let mut v = obs;
-                v.push(bs.to_string());
-                ret.push(v);
-            }
-        }
-        ret
+        // let (first, others) = lbs.split_at(1);
+
+        // for bs in first {
+        //     let ots = Self::arg_expander(others);
+        //     for obs in ots {
+        //         let mut v = obs;
+        //         v.push(bs.to_string());
+        //         ret.push(v);
+        //     }
+        // }
+        // ret
+        unimplemented!()
     }
 }
 
-#[allow(dead_code)]
+/// finds all ellipses patterns, recursively and parses the ranges numerically.
 pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
-    let mut caps = match ELLIPSES_RE.captures(arg) {
+    let mut parts = match ELLIPSES_RE.captures(arg) {
         Some(caps) => caps,
-        None => return Err(Error::msg("Invalid argument")),
+        None => {
+            return Err(Error::msg(format!("Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4", arg)));
+        }
     };
 
-    if caps.len() == 0 {
-        return Err(Error::msg("Invalid format"));
-    }
-
     let mut pattens = Vec::new();
+    while let Some(prefix) = parts.get(1) {
+        let seq = parse_ellipses_range(parts[2].into())?;
 
-    loop {
-        let m = match caps.get(1) {
-            Some(m) => m,
-            None => break,
-        };
-
-        let cs = match ELLIPSES_RE.captures(m.into()) {
-            Some(cs) => cs,
+        match ELLIPSES_RE.captures(prefix.into()) {
+            Some(cs) => {
+                pattens.push(Pattern {
+                    seq,
+                    prefix: String::new(),
+                    suffix: parts[3].into(),
+                });
+                parts = cs;
+            }
             None => {
+                pattens.push(Pattern {
+                    seq,
+                    prefix: prefix.as_str().to_owned(),
+                    suffix: parts[3].into(),
+                });
                 break;
             }
         };
-
-        let seq = caps
-            .get(2)
-            .map(|m| parse_ellipses_range(m.into()).unwrap_or(Vec::new()))
-            .unwrap();
-        let suffix = caps
-            .get(3)
-            .map(|m| m.as_str().to_string())
-            .unwrap_or(String::new());
-        pattens.push(Pattern {
-            suffix,
-            seq,
-            ..Default::default()
-        });
-
-        if cs.len() > 0 {
-            caps = cs;
-            continue;
-        }
-
-        break;
     }
 
-    if caps.len() > 0 {
-        let seq = caps
-            .get(2)
-            .map(|m| parse_ellipses_range(m.into()).unwrap_or(Vec::new()))
-            .unwrap();
-        let suffix = caps
-            .get(3)
-            .map(|m| m.as_str().to_string())
-            .unwrap_or(String::new());
-        let prefix = caps
-            .get(1)
-            .map(|m| m.as_str().to_string())
-            .unwrap_or(String::new());
-        pattens.push(Pattern {
-            prefix,
-            suffix,
-            seq,
-            ..Default::default()
-        });
+    // Check if any of the prefix or suffixes now have flower braces
+    // left over, in such a case we generally think that there is
+    // perhaps a typo in users input and error out accordingly.
+    for p in pattens.iter() {
+        if p.prefix.contains(OPEN_BRACES)
+            || p.prefix.contains(CLOSE_BRACES)
+            || p.suffix.contains(OPEN_BRACES)
+            || p.suffix.contains(CLOSE_BRACES)
+        {
+            return Err(Error::msg(format!("Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4", arg)));
+        }
     }
 
     Ok(ArgPattern::new(pattens))
 }
 
-// has_ellipse return ture if has
-#[allow(dead_code)]
-pub fn has_ellipses(s: &Vec<String>) -> bool {
-    let mut ret = true;
-    for v in s {
-        ret =
-            ret && (v.contains(ELLIPSES) || (v.contains(OPEN_BRACES) && v.contains(CLOSE_BRACES)));
-    }
+/// returns true if input arg has ellipses type pattern.
+pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
+    let pattern = [ELLIPSES, OPEN_BRACES, CLOSE_BRACES];
 
-    ret
+    s.iter().any(|v| pattern.iter().any(|p| v.as_ref().contains(p)))
 }
-// Parses an ellipses range pattern of following style
-// `{1...64}`
-// `{33...64}`
-#[allow(dead_code)]
-pub fn parse_ellipses_range(partten: &str) -> Result<Vec<String>> {
-    if !partten.contains(OPEN_BRACES) {
+
+/// Parses an ellipses range pattern of following style
+///
+/// example:
+/// {1...64}
+/// {33...64}
+pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
+    if !pattern.contains(OPEN_BRACES) {
         return Err(Error::msg("Invalid argument"));
     }
-    if !partten.contains(OPEN_BRACES) {
+    if !pattern.contains(OPEN_BRACES) {
         return Err(Error::msg("Invalid argument"));
     }
 
-    let v: Vec<&str> = partten
+    let ellipses_range: Vec<&str> = pattern
         .trim_start_matches(OPEN_BRACES)
         .trim_end_matches(CLOSE_BRACES)
         .split(ELLIPSES)
         .collect();
 
-    if v.len() != 2 {
+    if ellipses_range.len() != 2 {
         return Err(Error::msg("Invalid argument"));
     }
 
-    // let start = usize::from_str_radix(v[0], 16)?;
-    // let end = usize::from_str_radix(v[1], 16)?;
-
-    let start = v[0].parse::<usize>()?;
-    let end = v[1].parse::<usize>()?;
+    // TODO: Add support for hexadecimals.
+    let start = ellipses_range[0].parse::<usize>()?;
+    let end = ellipses_range[1].parse::<usize>()?;
 
     if start > end {
-        return Err(Error::msg(
-            "Invalid argument:range start cannot be bigger than end",
-        ));
+        return Err(Error::msg("Invalid argument:range start cannot be bigger than end"));
     }
 
-    let mut ret: Vec<String> = Vec::with_capacity(end + 1);
-
-    for i in start..end + 1 {
-        if v[0].starts_with('0') && v[0].len() > 1 {
-            ret.push(format!("{:0witdth$}", i, witdth = v[0].len()));
+    let mut ret: Vec<String> = Vec::with_capacity(end - start + 1);
+    for i in start..=end {
+        if ellipses_range[0].starts_with('0') && ellipses_range[0].len() > 1 {
+            ret.push(format!("{:0width$}", i, width = ellipses_range[1].len()));
         } else {
             ret.push(format!("{}", i));
         }
@@ -224,30 +196,355 @@ mod tests {
 
     #[test]
     fn test_has_ellipses() {
-        assert_eq!(has_ellipses(vec!["/sdf".to_string()].as_ref()), false);
-        assert_eq!(has_ellipses(vec!["{1...3}".to_string()].as_ref()), true);
-    }
+        // Tests for all args without ellipses.
+        let test_cases = [
+            (1, vec!["64"], false),
+            // Found flower braces, still attempt to parse and throw an error.
+            (2, vec!["{1..64}"], true),
+            (3, vec!["{1..2..}"], true),
+            // Test for valid input.
+            (4, vec!["1...64"], true),
+            (5, vec!["{1...2O}"], true),
+            (6, vec!["..."], true),
+            (7, vec!["{-1...1}"], true),
+            (8, vec!["{0...-1}"], true),
+            (9, vec!["{1....4}"], true),
+            (10, vec!["{1...64}"], true),
+            (11, vec!["{...}"], true),
+            (12, vec!["{1...64}", "{65...128}"], true),
+            (13, vec!["http://rustfs{2...3}/export/set{1...64}"], true),
+            (
+                14,
+                vec![
+                    "http://rustfs{2...3}/export/set{1...64}",
+                    "http://rustfs{2...3}/export/set{65...128}",
+                ],
+                true,
+            ),
+            (15, vec!["mydisk-{a...z}{1...20}"], true),
+            (16, vec!["mydisk-{1...4}{1..2.}"], true),
+        ];
 
-    #[test]
-    fn test_parse_ellipses_range() {
-        let s = "{1...16}";
-
-        match parse_ellipses_range(s) {
-            Ok(res) => {
-                println!("{:?}", res)
-            }
-            Err(err) => println!("{err:?}"),
-        };
+        for (i, args, expected) in test_cases {
+            let ret = has_ellipses(&args);
+            assert_eq!(ret, expected, "Test{}: Expected {}, got {}", i, expected, ret);
+        }
     }
 
     #[test]
     fn test_find_ellipses_patterns() {
-        use std::result::Result::Ok;
-        let pattern = "http://rustfs{1...2}:9000/mnt/disk{1...16}";
-        // let pattern = "http://[2001:3984:3989::{01...f}]/disk{1...10}";
-        match find_ellipses_patterns(pattern) {
-            Ok(caps) => println!("caps{caps:?}"),
-            Err(err) => println!("{err:?}"),
+        #[derive(Default)]
+        struct TestCase<'a> {
+            num: usize,
+            pattern: &'a str,
+            success: bool,
+            want: Vec<Vec<&'a str>>,
+        }
+
+        let test_cases = [
+            TestCase {
+                num: 1,
+                pattern: "{1..64}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 2,
+                pattern: "1...64",
+                ..Default::default()
+            },
+            TestCase {
+                num: 2,
+                pattern: "...",
+                ..Default::default()
+            },
+            TestCase {
+                num: 3,
+                pattern: "{1...",
+                ..Default::default()
+            },
+            TestCase {
+                num: 4,
+                pattern: "...64}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 5,
+                pattern: "{...}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 6,
+                pattern: "{-1...1}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 7,
+                pattern: "{0...-1}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 8,
+                pattern: "{1...2O}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 9,
+                pattern: "{64...1}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 10,
+                pattern: "{1....4}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 11,
+                pattern: "mydisk-{a...z}{1...20}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 12,
+                pattern: "mydisk-{1...4}{1..2.}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 13,
+                pattern: "{1..2.}-mydisk-{1...4}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 14,
+                pattern: "{{1...4}}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 16,
+                pattern: "{4...02}",
+                ..Default::default()
+            },
+            TestCase {
+                num: 17,
+                pattern: "{f...z}",
+                ..Default::default()
+            },
+            // Test for valid input.
+            TestCase {
+                num: 18,
+                pattern: "{1...64}",
+                success: true,
+                want: vec![
+                    vec!["1"],
+                    vec!["2"],
+                    vec!["3"],
+                    vec!["4"],
+                    vec!["5"],
+                    vec!["6"],
+                    vec!["7"],
+                    vec!["8"],
+                    vec!["9"],
+                    vec!["10"],
+                    vec!["11"],
+                    vec!["12"],
+                    vec!["13"],
+                    vec!["14"],
+                    vec!["15"],
+                    vec!["16"],
+                    vec!["17"],
+                    vec!["18"],
+                    vec!["19"],
+                    vec!["20"],
+                    vec!["21"],
+                    vec!["22"],
+                    vec!["23"],
+                    vec!["24"],
+                    vec!["25"],
+                    vec!["26"],
+                    vec!["27"],
+                    vec!["28"],
+                    vec!["29"],
+                    vec!["30"],
+                    vec!["31"],
+                    vec!["32"],
+                    vec!["33"],
+                    vec!["34"],
+                    vec!["35"],
+                    vec!["36"],
+                    vec!["37"],
+                    vec!["38"],
+                    vec!["39"],
+                    vec!["40"],
+                    vec!["41"],
+                    vec!["42"],
+                    vec!["43"],
+                    vec!["44"],
+                    vec!["45"],
+                    vec!["46"],
+                    vec!["47"],
+                    vec!["48"],
+                    vec!["49"],
+                    vec!["50"],
+                    vec!["51"],
+                    vec!["52"],
+                    vec!["53"],
+                    vec!["54"],
+                    vec!["55"],
+                    vec!["56"],
+                    vec!["57"],
+                    vec!["58"],
+                    vec!["59"],
+                    vec!["60"],
+                    vec!["61"],
+                    vec!["62"],
+                    vec!["63"],
+                    vec!["64"],
+                ],
+            },
+            TestCase {
+                num: 19,
+                pattern: "{1...5} {65...70}",
+                success: true,
+                want: vec![
+                    vec!["1 ", "65"],
+                    vec!["2 ", "65"],
+                    vec!["3 ", "65"],
+                    vec!["4 ", "65"],
+                    vec!["5 ", "65"],
+                    vec!["1 ", "66"],
+                    vec!["2 ", "66"],
+                    vec!["3 ", "66"],
+                    vec!["4 ", "66"],
+                    vec!["5 ", "66"],
+                    vec!["1 ", "67"],
+                    vec!["2 ", "67"],
+                    vec!["3 ", "67"],
+                    vec!["4 ", "67"],
+                    vec!["5 ", "67"],
+                    vec!["1 ", "68"],
+                    vec!["2 ", "68"],
+                    vec!["3 ", "68"],
+                    vec!["4 ", "68"],
+                    vec!["5 ", "68"],
+                    vec!["1 ", "69"],
+                    vec!["2 ", "69"],
+                    vec!["3 ", "69"],
+                    vec!["4 ", "69"],
+                    vec!["5 ", "69"],
+                    vec!["1 ", "70"],
+                    vec!["2 ", "70"],
+                    vec!["3 ", "70"],
+                    vec!["4 ", "70"],
+                    vec!["5 ", "70"],
+                ],
+            },
+            TestCase {
+                num: 20,
+                pattern: "{01...036}",
+                success: true,
+                want: vec![
+                    vec!["001"],
+                    vec!["002"],
+                    vec!["003"],
+                    vec!["004"],
+                    vec!["005"],
+                    vec!["006"],
+                    vec!["007"],
+                    vec!["008"],
+                    vec!["009"],
+                    vec!["010"],
+                    vec!["011"],
+                    vec!["012"],
+                    vec!["013"],
+                    vec!["014"],
+                    vec!["015"],
+                    vec!["016"],
+                    vec!["017"],
+                    vec!["018"],
+                    vec!["019"],
+                    vec!["020"],
+                    vec!["021"],
+                    vec!["022"],
+                    vec!["023"],
+                    vec!["024"],
+                    vec!["025"],
+                    vec!["026"],
+                    vec!["027"],
+                    vec!["028"],
+                    vec!["029"],
+                    vec!["030"],
+                    vec!["031"],
+                    vec!["032"],
+                    vec!["033"],
+                    vec!["034"],
+                    vec!["035"],
+                    vec!["036"],
+                ],
+            },
+            TestCase {
+                num: 21,
+                pattern: "{001...036}",
+                success: true,
+                want: vec![
+                    vec!["001"],
+                    vec!["002"],
+                    vec!["003"],
+                    vec!["004"],
+                    vec!["005"],
+                    vec!["006"],
+                    vec!["007"],
+                    vec!["008"],
+                    vec!["009"],
+                    vec!["010"],
+                    vec!["011"],
+                    vec!["012"],
+                    vec!["013"],
+                    vec!["014"],
+                    vec!["015"],
+                    vec!["016"],
+                    vec!["017"],
+                    vec!["018"],
+                    vec!["019"],
+                    vec!["020"],
+                    vec!["021"],
+                    vec!["022"],
+                    vec!["023"],
+                    vec!["024"],
+                    vec!["025"],
+                    vec!["026"],
+                    vec!["027"],
+                    vec!["028"],
+                    vec!["029"],
+                    vec!["030"],
+                    vec!["031"],
+                    vec!["032"],
+                    vec!["033"],
+                    vec!["034"],
+                    vec!["035"],
+                    vec!["036"],
+                ],
+            },
+        ];
+
+        for test_case in test_cases {
+            let ret = find_ellipses_patterns(test_case.pattern);
+            match ret {
+                Ok(v) => {
+                    if !test_case.success {
+                        panic!("Test{}: Expected failure but passed instead", test_case.num);
+                    }
+
+                    let got = v.expand();
+                    if got.len() != test_case.want.len() {
+                        panic!("Test{}: Expected {}, got {}", test_case.num, test_case.want.len(), got.len());
+                    }
+
+                    assert_eq!(got, test_case.want, "Test{}: Expected {:?}, got {:?}", test_case.num, test_case.want, got);
+                }
+                Err(e) => {
+                    if test_case.success {
+                        panic!("Test{}: Expected success but failed instead {:?}", test_case.num, e);
+                    }
+                }
+            }
         }
     }
 }
