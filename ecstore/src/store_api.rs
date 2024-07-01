@@ -1,24 +1,136 @@
-use std::sync::Arc;
+use std::{default, sync::Arc};
 
 use anyhow::Result;
 use bytes::Bytes;
 use futures::Stream;
+use s3s::Body;
+use time::OffsetDateTime;
 
-use crate::stream::DynByteStream;
+pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
+pub const BLOCK_SIZE_V2: u64 = 1048576; // 1M
+
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    pub erasure: ErasureInfo,
+    pub deleted: bool,
+    // DataDir of the file
+    pub data_dir: String,
+    pub mod_time: OffsetDateTime,
+}
+
+impl Default for FileInfo {
+    fn default() -> Self {
+        Self {
+            erasure: Default::default(),
+            deleted: Default::default(),
+            data_dir: Default::default(),
+            mod_time: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+}
+
+impl FileInfo {
+    pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
+        let indexs = {
+            let cardinality = data_blocks + parity_blocks;
+            let mut nums = vec![0; cardinality];
+            let key_crc = crc32fast::hash(object.as_bytes());
+
+            let start = key_crc as usize % cardinality;
+            for i in 1..=cardinality {
+                nums[i - 1] = 1 + ((start + 1) % cardinality);
+            }
+
+            nums
+        };
+        Self {
+            erasure: ErasureInfo {
+                algorithm: ERASURE_ALGORITHM,
+                data_blocks: data_blocks,
+                parity_blocks: parity_blocks,
+                block_size: BLOCK_SIZE_V2,
+                distribution: indexs,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        if self.deleted {
+            return true;
+        }
+
+        let data_blocks = self.erasure.data_blocks;
+        let parity_blocks = self.erasure.parity_blocks;
+
+        (data_blocks >= parity_blocks)
+            && (data_blocks > 0)
+            && (parity_blocks >= 0)
+            && (self.erasure.index > 0
+                && self.erasure.index <= data_blocks + parity_blocks
+                && self.erasure.distribution.len() == (data_blocks + parity_blocks))
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+// ErasureInfo holds erasure coding and bitrot related information.
+pub struct ErasureInfo {
+    // Algorithm is the String representation of erasure-coding-algorithm
+    pub algorithm: &'static str,
+    // DataBlocks is the number of data blocks for erasure-coding
+    pub data_blocks: usize,
+    // ParityBlocks is the number of parity blocks for erasure-coding
+    pub parity_blocks: usize,
+    // BlockSize is the size of one erasure-coded block
+    pub block_size: u64,
+    // Index is the index of the current disk
+    pub index: usize,
+    // Distribution is the distribution of the data and parity blocks
+    pub distribution: Vec<usize>,
+    // Checksums holds all bitrot checksums of all erasure encoded blocks
+    pub checksums: Vec<ChecksumInfo>,
+}
+
+#[derive(Debug, Default, Clone)]
+// ChecksumInfo - carries checksums of individual scattered parts per disk.
+pub struct ChecksumInfo {
+    pub part_number: usize,
+    pub algorithm: BitrotAlgorithm,
+    pub hash: Vec<u8>,
+}
+
+#[derive(Debug, Default, Clone)]
+// BitrotAlgorithm specifies a algorithm used for bitrot protection.
+pub enum BitrotAlgorithm {
+    // SHA256 represents the SHA-256 hash function
+    SHA256,
+    // HighwayHash256 represents the HighwayHash-256 hash function
+    HighwayHash256,
+    // HighwayHash256S represents the Streaming HighwayHash-256 hash function
+    #[default]
+    HighwayHash256S,
+    // BLAKE2b512 represents the BLAKE2b-512 hash function
+    BLAKE2b512,
+}
 
 pub struct MakeBucketOptions {
     pub force_create: bool,
 }
 
 pub struct PutObjReader {
-    // pub stream: Box<dyn Stream<Item = Bytes>>,
+    pub stream: Body,
+    pub content_length: u64,
 }
 
-// impl PutObjReader {
-//     pub fn new<S: Stream>(stream: S) -> Self {
-//         PutObjReader { stream }
-//     }
-// }
+impl PutObjReader {
+    pub fn new(stream: Body, content_length: u64) -> Self {
+        PutObjReader {
+            stream,
+            content_length,
+        }
+    }
+}
 
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files

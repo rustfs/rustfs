@@ -314,6 +314,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "crc32fast",
  "futures",
  "lazy_static",
  "netif",
@@ -321,11 +322,14 @@ dependencies = [
  "reed-solomon-erasure",
  "regex",
  "rmp-serde",
+ "s3s",
  "serde",
  "serde_json",
+ "siphasher",
  "thiserror",
  "time",
  "tokio",
+ "tokio-pipe",
  "tokio-util",
  "tracing",
  "tracing-error",
@@ -1229,6 +1233,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27f6278552951f1f2b8cf9da965d10969b2efdea95a6ec47987ab46edfe263a"
 
 [[package]]
+name = "siphasher"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
+
+[[package]]
 name = "slab"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1385,6 +1395,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-pipe"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f213a84bffbd61b8fa0ba8a044b4bbe35d471d0b518867181e82bd5c15542784"
+dependencies = [
+ "libc",
+ "tokio",
 ]
 
 [[package]]

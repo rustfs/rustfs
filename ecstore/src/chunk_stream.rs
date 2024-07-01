@@ -1,3 +1,4 @@
+use anyhow::Error;
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{Stream, StreamExt};
@@ -6,13 +7,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use transform_stream::AsyncTryStream;
 
-use crate::error::StdError;
-
 pub type SyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 
 pub struct ChunkedStream {
     /// inner
-    inner: AsyncTryStream<Bytes, StdError, SyncBoxFuture<'static, Result<(), StdError>>>,
+    inner: AsyncTryStream<Bytes, Error, SyncBoxFuture<'static, Result<(), Error>>>,
 
     remaining_length: usize,
 }
@@ -20,10 +19,10 @@ pub struct ChunkedStream {
 impl ChunkedStream {
     pub fn new<S>(body: S, content_length: usize, chunk_size: usize, need_padding: bool) -> Self
     where
-        S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
+        S: Stream<Item = Result<Bytes, Error>> + Send + Sync + 'static,
     {
         let inner =
-            AsyncTryStream::<_, _, SyncBoxFuture<'static, Result<(), StdError>>>::new(|mut y| {
+            AsyncTryStream::<_, _, SyncBoxFuture<'static, Result<(), Error>>>::new(|mut y| {
                 #[allow(clippy::shadow_same)] // necessary for `pin_mut!`
                 Box::pin(async move {
                     pin_mut!(body);
@@ -90,9 +89,9 @@ impl ChunkedStream {
         mut body: Pin<&mut S>,
         prev_bytes: Bytes,
         data_size: usize,
-    ) -> Option<Result<(Vec<Bytes>, Bytes), StdError>>
+    ) -> Option<Result<(Vec<Bytes>, Bytes), Error>>
     where
-        S: Stream<Item = Result<Bytes, StdError>> + Send + 'static,
+        S: Stream<Item = Result<Bytes, Error>> + Send + 'static,
     {
         let mut bytes_buffer = Vec::new();
 
@@ -186,10 +185,7 @@ impl ChunkedStream {
         Some(Ok((bytes_buffer, remaining_bytes)))
     }
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Bytes, StdError>>> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Error>>> {
         let ans = Pin::new(&mut self.inner).poll_next(cx);
         if let Poll::Ready(Some(Ok(ref bytes))) = ans {
             self.remaining_length = self.remaining_length.saturating_sub(bytes.len());
@@ -203,7 +199,7 @@ impl ChunkedStream {
 }
 
 impl Stream for ChunkedStream {
-    type Item = Result<Bytes, StdError>;
+    type Item = Result<Bytes, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll(cx)

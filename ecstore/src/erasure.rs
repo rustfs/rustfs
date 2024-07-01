@@ -1,6 +1,14 @@
-use reed_solomon_erasure::{galois_8::ReedSolomon, Error};
+use tokio::io::AsyncWriteExt;
 
-struct Erasure {
+use anyhow::{Error, Result};
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+use reed_solomon_erasure::galois_8::ReedSolomon;
+use tokio::io::AsyncWrite;
+
+use crate::chunk_stream::ChunkedStream;
+
+pub struct Erasure {
     data_shards: usize,
     parity_shards: usize,
     encoder: ReedSolomon,
@@ -15,7 +23,50 @@ impl Erasure {
         }
     }
 
-    pub fn encode_data(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    pub async fn encode<S, W>(
+        &self,
+        body: S,
+        writers: &mut Vec<W>,
+        block_size: usize,
+        data_size: usize,
+        write_quorum: usize,
+    ) -> Result<()>
+    where
+        S: Stream<Item = Result<Bytes, Error>> + Send + Sync + 'static,
+        W: AsyncWrite + Unpin,
+    {
+        let mut stream = ChunkedStream::new(body, data_size, block_size, true);
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(data) => {
+                    let blocks = self.encode_data(data.as_ref())?;
+
+                    let mut errs = Vec::new();
+
+                    for (i, w) in writers.iter_mut().enumerate() {
+                        match w.write_all(blocks[i].as_ref()).await {
+                            Ok(_) => errs.push(None),
+                            Err(e) => errs.push(Some(e)),
+                        }
+                    }
+
+                    // TODO: reduceWriteQuorumErrs
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+
+        // loop {
+        //     match rd.next().await {
+        //         Some(res) => todo!(),
+        //         None => todo!(),
+        //     }
+        // }
+    }
+
+    pub fn encode_data(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
         let (shard_size, total_size) = self.need_size(data.len());
 
         let mut data_buffer = vec![0u8; total_size];
@@ -43,8 +94,9 @@ impl Erasure {
         Ok(shards)
     }
 
-    pub fn decode_data(&self, shards: &mut Vec<Option<Vec<u8>>>) -> Result<(), Error> {
-        self.encoder.reconstruct(shards)
+    pub fn decode_data(&self, shards: &mut Vec<Option<Vec<u8>>>) -> Result<()> {
+        self.encoder.reconstruct(shards)?;
+        Ok(())
     }
 
     // 每个分片长度，所需要的总长度
