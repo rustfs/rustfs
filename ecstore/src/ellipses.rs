@@ -46,7 +46,6 @@ pub struct ArgPattern {
 }
 
 impl ArgPattern {
-    #[allow(dead_code)]
     pub fn new(inner: Vec<Pattern>) -> Self {
         Self { inner }
     }
@@ -60,34 +59,22 @@ impl ArgPattern {
 
     /// recursively expands labels into its respective forms.
     fn arg_expander(lbs: &[Vec<String>]) -> Vec<Vec<String>> {
-        // if lbs.len() <= 1 {
-        //     return lbs.iter().map(ToString).collect();
-        // }
+        if lbs.len() == 1 {
+            return lbs[0].iter().map(|v| vec![v.to_string()]).collect();
+        }
 
-        // let mut ret = Vec::new();
+        let mut ret = Vec::new();
+        let (first, others) = lbs.split_at(1);
 
-        // let mut first = Vec::new();
-        // let mut others = Vec::with_capacity(lbs.len() - 1);
-        // for (i, v) in lbs.into_iter().enumerate() {
-        //     if i == 0 {
-        //         first = v;
-        //     } else {
-        //         others.push(v);
-        //     }
-        // }
+        for bs in first[0].iter() {
+            let ots = Self::arg_expander(others);
+            for mut obs in ots {
+                obs.push(bs.to_string());
+                ret.push(obs);
+            }
+        }
 
-        // let (first, others) = lbs.split_at(1);
-
-        // for bs in first {
-        //     let ots = Self::arg_expander(others);
-        //     for obs in ots {
-        //         let mut v = obs;
-        //         v.push(bs.to_string());
-        //         ret.push(v);
-        //     }
-        // }
-        // ret
-        unimplemented!()
+        ret
     }
 }
 
