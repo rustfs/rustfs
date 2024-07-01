@@ -1,8 +1,8 @@
-use std::{collections::HashMap, io::Cursor};
+use std::collections::HashMap;
 
 use anyhow::{Error, Result};
 
-use tokio_util::io::ReaderStream;
+use s3s::Body;
 use uuid::Uuid;
 
 use crate::{
@@ -13,9 +13,7 @@ use crate::{
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
     store_api::{MakeBucketOptions, ObjectOptions, PutObjReader, StorageAPI},
-    store_init,
-    stream::into_dyn,
-    utils,
+    store_init, utils,
 };
 
 #[derive(Debug)]
@@ -121,19 +119,19 @@ impl StorageAPI for ECStore {
         let data = meta.marshal_msg()?;
         let file_path = meta.save_file_path();
 
-        let stream = ReaderStream::new(Cursor::new(data));
-
         // TODO: wrap hash reader
 
-        // let reader = PutObjReader::new(stream);
+        let content_len = data.len() as u64;
 
-        // self.put_object(
-        //     RUSTFS_META_BUCKET,
-        //     &file_path,
-        //     &reader,
-        //     &ObjectOptions { max_parity: true },
-        // )
-        // .await?;
+        let reader = PutObjReader::new(Body::from(data), content_len);
+
+        self.put_object(
+            RUSTFS_META_BUCKET,
+            &file_path,
+            &reader,
+            &ObjectOptions { max_parity: true },
+        )
+        .await?;
 
         // TODO: toObjectErr
 
