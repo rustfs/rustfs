@@ -1,0 +1,3 @@
+max_width = 130
+fn_call_width = 90
+single_line_let_else_max_width = 100
