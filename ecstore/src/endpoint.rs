@@ -135,9 +135,7 @@ impl Endpoint {
         }
 
         if !(url.scheme() == "http" || url.scheme() == "https") {
-            return Err(Error::msg(
-                "URL endpoint格式无效: Scheme字段必须包含'http'或'https'",
-            ));
+            return Err(Error::msg("URL endpoint格式无效: Scheme字段必须包含'http'或'https'"));
         }
 
         // 检查路径
@@ -209,11 +207,7 @@ impl Endpoint {
 
     fn update_islocal(&mut self) -> Result<()> {
         if self.url.has_host() {
-            self.is_local = is_local_host(
-                self.url.host().unwrap(),
-                self.url.port().unwrap(),
-                DEFAULT_PORT,
-            );
+            self.is_local = is_local_host(self.url.host().unwrap(), self.url.port().unwrap(), DEFAULT_PORT);
         }
 
         Ok(())
@@ -351,7 +345,7 @@ impl EndpointServerPools {
                 set_count: pool_args[i].layout.len(),
                 drives_per_set: pool_args[i].layout[0].len(),
                 endpoints: eps.clone(),
-                cmd_line: pool_args[i].cmdline.clone(),
+                cmd_line: pool_args[i].cmd_line.clone(),
                 platform: String::new(),
             };
 
@@ -448,10 +442,7 @@ fn is_empty_layout(pools_layout: &Vec<PoolDisksLayout>) -> bool {
         return true;
     }
     let first_layout = &pools_layout[0];
-    if first_layout.layout.is_empty()
-        || first_layout.layout[0].is_empty()
-        || first_layout.layout[0][0].is_empty()
-    {
+    if first_layout.layout.is_empty() || first_layout.layout[0].is_empty() || first_layout.layout[0][0].is_empty() {
         return true;
     }
     false
@@ -459,20 +450,14 @@ fn is_empty_layout(pools_layout: &Vec<PoolDisksLayout>) -> bool {
 
 // 检查是否是单驱动器布局
 fn is_single_drive_layout(pools_layout: &Vec<PoolDisksLayout>) -> bool {
-    if pools_layout.len() == 1
-        && pools_layout[0].layout.len() == 1
-        && pools_layout[0].layout[0].len() == 1
-    {
+    if pools_layout.len() == 1 && pools_layout[0].layout.len() == 1 && pools_layout[0].layout[0].len() == 1 {
         true
     } else {
         false
     }
 }
 
-pub fn create_pool_endpoints(
-    server_addr: String,
-    pools: &Vec<PoolDisksLayout>,
-) -> Result<(Vec<Endpoints>, SetupType)> {
+pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) -> Result<(Vec<Endpoints>, SetupType)> {
     if is_empty_layout(pools) {
         return Err(Error::msg("empty layout"));
     }
@@ -586,7 +571,7 @@ fn create_server_endpoints(
             set_count: pool_args[i].layout.len(),
             drives_per_set: pool_args[i].layout[0].len(),
             endpoints: eps.clone(),
-            cmd_line: pool_args[i].cmdline.clone(),
+            cmd_line: pool_args[i].cmd_line.clone(),
             platform: String::new(),
         };
 
@@ -622,18 +607,14 @@ mod test {
 
     #[test]
     fn test_create_server_endpoints() {
-        let cases = vec![(
-            ":9000",
-            vec!["http://localhost:900{1...2}/export{1...64}".to_string()],
-        )];
+        let cases = vec![(":9000", vec!["http://localhost:900{1...2}/export{1...64}".to_string()])];
 
         for (addr, args) in cases {
-            let layouts = DisksLayout::new(&args).unwrap();
+            let layouts = DisksLayout::try_from(args.as_slice()).unwrap();
 
             println!("layouts:{:?},{}", &layouts.pools, &layouts.legacy);
 
-            let (server_pool, setup_type) =
-                create_server_endpoints(addr.to_string(), &layouts.pools, layouts.legacy).unwrap();
+            let (server_pool, setup_type) = create_server_endpoints(addr.to_string(), &layouts.pools, layouts.legacy).unwrap();
 
             println!("setup_type -- {:?}", setup_type);
             println!("server_pool == {:?}", server_pool);
