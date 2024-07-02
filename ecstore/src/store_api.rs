@@ -3,7 +3,7 @@ use std::{default, sync::Arc};
 use anyhow::Result;
 use bytes::Bytes;
 use futures::Stream;
-use s3s::Body;
+use s3s::{dto::StreamingBlob, Body};
 use time::OffsetDateTime;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -119,12 +119,12 @@ pub struct MakeBucketOptions {
 }
 
 pub struct PutObjReader {
-    pub stream: Body,
-    pub content_length: u64,
+    pub stream: StreamingBlob,
+    pub content_length: usize,
 }
 
 impl PutObjReader {
-    pub fn new(stream: Body, content_length: u64) -> Self {
+    pub fn new(stream: StreamingBlob, content_length: usize) -> Self {
         PutObjReader { stream, content_length }
     }
 }

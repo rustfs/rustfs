@@ -1,14 +1,30 @@
 use std::fmt::Debug;
 
+use ecstore::store_api::ObjectOptions;
+use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 use s3s::dto::*;
 use s3s::s3_error;
+use s3s::S3Error;
+use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
 
 use anyhow::Result;
 use ecstore::store::ECStore;
+use tracing::error;
+
+macro_rules! try_ {
+    ($result:expr) => {
+        match $result {
+            Ok(val) => val,
+            Err(err) => {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", err)));
+            }
+        }
+    };
+}
 
 #[derive(Debug)]
 pub struct FS {
@@ -148,6 +164,12 @@ impl S3 for FS {
         } = input;
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
+
+        let Some(content_length) = content_length else { return Err(s3_error!(IncompleteBody)) };
+
+        let reader = PutObjReader::new(body.into(), content_length as usize);
+
+        try_!(self.store.put_object(&bucket, &key, &reader, &ObjectOptions::default()).await);
 
         // self.store.put_object(bucket, object, data, opts);
 

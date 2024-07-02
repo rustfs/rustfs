@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Error, Result};
 
-use s3s::Body;
+use s3s::{dto::StreamingBlob, Body};
 use uuid::Uuid;
 
 use crate::{
@@ -32,8 +32,7 @@ impl ECStore {
 
         let mut deployment_id = None;
 
-        let (endpoint_pools, _) =
-            EndpointServerPools::create_server_endpoints(address, &layouts.pools, layouts.legacy)?;
+        let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address, &layouts.pools, layouts.legacy)?;
 
         let mut pools = Vec::with_capacity(endpoint_pools.len());
         let mut disk_map = HashMap::with_capacity(endpoint_pools.len());
@@ -121,37 +120,26 @@ impl StorageAPI for ECStore {
 
         // TODO: wrap hash reader
 
-        let content_len = data.len() as u64;
+        let content_len = data.len();
 
-        let reader = PutObjReader::new(Body::from(data), content_len);
+        let body = Body::from(data);
 
-        self.put_object(
-            RUSTFS_META_BUCKET,
-            &file_path,
-            &reader,
-            &ObjectOptions { max_parity: true },
-        )
-        .await?;
+        let reader = PutObjReader::new(StreamingBlob::from(body), content_len);
+
+        self.put_object(RUSTFS_META_BUCKET, &file_path, &reader, &ObjectOptions { max_parity: true })
+            .await?;
 
         // TODO: toObjectErr
 
         Ok(())
     }
-    async fn put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &PutObjReader,
-        opts: &ObjectOptions,
-    ) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: &PutObjReader, opts: &ObjectOptions) -> Result<()> {
         // checkPutObjectArgs
 
         let object = utils::path::encode_dir_object(object);
 
         if self.single_pool() {
-            self.pools[0]
-                .put_object(bucket, object.as_str(), data, opts)
-                .await?;
+            self.pools[0].put_object(bucket, object.as_str(), data, opts).await?;
             return Ok(());
         }
 
