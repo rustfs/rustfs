@@ -300,7 +300,15 @@ fn get_total_sizes(arg_patterns: &[ArgPattern]) -> Vec<usize> {
 
 #[cfg(test)]
 mod test {
+
     use super::*;
+    use crate::ellipses;
+
+    impl PartialEq for EndpointSet {
+        fn eq(&self, other: &Self) -> bool {
+            self.arg_patterns == other.arg_patterns && self.set_indexes == other.set_indexes
+        }
+    }
 
     #[test]
     fn test_get_divisible_size() {
@@ -335,26 +343,421 @@ mod test {
     }
 
     #[test]
-    fn test_parse_disks_layout_from_env_args() {
-        // let pattern = String::from("http://[2001:3984:3989::{001...002}]/disk{1...4}");
-        // let pattern = String::from("/export{1...10}/disk{1...10}");
-        let pattern = String::from("http://rustfs{1...2}:9000/mnt/disk{1...16}");
+    fn test_get_set_indexes() {
+        #[derive(Default)]
+        struct TestCase<'a> {
+            num: usize,
+            args: Vec<&'a str>,
+            total_sizes: Vec<usize>,
+            indexes: Vec<Vec<usize>>,
+            success: bool,
+        }
 
-        let mut args = Vec::new();
-        args.push(pattern);
-        match DisksLayout::try_from(args.as_slice()) {
-            Ok(set) => {
-                for pool in set.pools {
-                    println!("cmd: {:?}", pool.cmd_line);
+        let test_cases = [
+            TestCase {
+                num: 1,
+                args: vec!["data{1...17}/export{1...52}"],
+                total_sizes: vec![14144],
+                ..Default::default()
+            },
+            TestCase {
+                num: 2,
+                args: vec!["data{1...3}"],
+                total_sizes: vec![3],
+                indexes: vec![vec![3]],
+                success: true,
+            },
+            TestCase {
+                num: 3,
+                args: vec!["data/controller1/export{1...2}, data/controller2/export{1...4}, data/controller3/export{1...8}"],
+                total_sizes: vec![2, 4, 8],
+                indexes: vec![vec![2], vec![2, 2], vec![2, 2, 2, 2]],
+                success: true,
+            },
+            TestCase {
+                num: 4,
+                args: vec!["data{1...27}"],
+                total_sizes: vec![27],
+                indexes: vec![vec![9, 9, 9]],
+                success: true,
+            },
+            TestCase {
+                num: 5,
+                args: vec!["http://host{1...3}/data{1...180}"],
+                total_sizes: vec![540],
+                indexes: vec![vec![
+                    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+                    15, 15, 15, 15, 15, 15, 15, 15, 15,
+                ]],
+                success: true,
+            },
+            TestCase {
+                num: 6,
+                args: vec!["http://host{1...2}.rack{1...4}/data{1...180}"],
+                total_sizes: vec![1440],
+                indexes: vec![vec![
+                    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+                    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+                    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+                    16, 16, 16, 16, 16, 16, 16, 16, 16,
+                ]],
+                success: true,
+            },
+            TestCase {
+                num: 7,
+                args: vec!["http://host{1...2}/data{1...180}"],
+                total_sizes: vec![360],
+                indexes: vec![vec![
+                    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+                    12, 12, 12,
+                ]],
+                success: true,
+            },
+            TestCase {
+                num: 8,
+                args: vec!["data/controller1/export{1...4}, data/controller2/export{1...8}, data/controller3/export{1...12}"],
+                total_sizes: vec![4, 8, 12],
+                indexes: vec![vec![4], vec![4, 4], vec![4, 4, 4]],
+                success: true,
+            },
+            TestCase {
+                num: 9,
+                args: vec!["data{1...64}"],
+                total_sizes: vec![64],
+                indexes: vec![vec![16, 16, 16, 16]],
+                success: true,
+            },
+            TestCase {
+                num: 10,
+                args: vec!["data{1...24}"],
+                total_sizes: vec![24],
+                indexes: vec![vec![12, 12]],
+                success: true,
+            },
+            TestCase {
+                num: 11,
+                args: vec!["data/controller{1...11}/export{1...8}"],
+                total_sizes: vec![88],
+                indexes: vec![vec![11, 11, 11, 11, 11, 11, 11, 11]],
+                success: true,
+            },
+            TestCase {
+                num: 12,
+                args: vec!["data{1...4}"],
+                total_sizes: vec![4],
+                indexes: vec![vec![4]],
+                success: true,
+            },
+            TestCase {
+                num: 13,
+                args: vec!["data/controller1/export{1...10}, data/controller2/export{1...10}, data/controller3/export{1...10}"],
+                total_sizes: vec![10, 10, 10],
+                indexes: vec![vec![10], vec![10], vec![10]],
+                success: true,
+            },
+            TestCase {
+                num: 14,
+                args: vec!["data{1...16}/export{1...52}"],
+                total_sizes: vec![832],
+                indexes: vec![vec![
+                    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+                    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+                ]],
+                success: true,
+            },
+        ];
 
-                    for (i, set) in pool.layout.iter().enumerate() {
-                        for (j, v) in set.iter().enumerate() {
-                            println!("{:?}.{}: {:?}", i, j, v);
-                        }
+        for test_case in test_cases {
+            let mut arg_patterns = Vec::new();
+            for v in test_case.args.iter() {
+                match ellipses::find_ellipses_patterns(v) {
+                    Ok(patterns) => {
+                        arg_patterns.push(patterns);
+                    }
+                    Err(err) => {
+                        panic!("Test{}: Unexpected failure {}", test_case.num, err);
                     }
                 }
             }
-            Err(err) => println!("{err:?}"),
+
+            match get_set_indexes(test_case.args.as_slice(), test_case.total_sizes.as_slice(), arg_patterns.as_slice()) {
+                Ok(got_indexes) => {
+                    if !test_case.success {
+                        panic!("Test{}: Expected failure but passed instead", test_case.num);
+                    }
+
+                    assert_eq!(
+                        test_case.indexes, got_indexes,
+                        "Test{}: Expected {:?}, got {:?}",
+                        test_case.num, test_case.indexes, got_indexes
+                    )
+                }
+                Err(err) => {
+                    if test_case.success {
+                        panic!("Test{}: Expected success but failed instead {}", test_case.num, err);
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_sequences(start: usize, number: usize, padding_len: usize) -> Vec<String> {
+        let mut seq = Vec::new();
+        for i in start..=number {
+            if padding_len == 0 {
+                seq.push(format!("{}", i));
+            } else {
+                seq.push(format!("{:0width$}", i, width = padding_len));
+            }
+        }
+        seq
+    }
+
+    #[test]
+    fn test_into_endpoint_set() {
+        #[derive(Default)]
+        struct TestCase<'a> {
+            num: usize,
+            arg: &'a str,
+            es: EndpointSet,
+            success: bool,
+        }
+
+        let test_cases = [
+            // Tests invalid inputs.
+            TestCase {
+                num: 1,
+                arg: "...",
+                ..Default::default()
+            },
+            // No range specified.
+            TestCase {
+                num: 2,
+                arg: "{...}",
+                ..Default::default()
+            },
+            // Invalid range.
+            TestCase {
+                num: 3,
+                arg: "http://rustfs{2...3}/export/set{1...0}",
+                ..Default::default()
+            },
+            // Range cannot be smaller than 4 minimum.
+            TestCase {
+                num: 4,
+                arg: "/export{1..2}",
+                ..Default::default()
+            },
+            // Unsupported characters.
+            TestCase {
+                num: 5,
+                arg: "/export/test{1...2O}",
+                ..Default::default()
+            },
+            // Tests valid inputs.
+            TestCase {
+                num: 6,
+                arg: "{1...27}",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                        seq: get_sequences(1, 27, 0),
+                        ..Default::default()
+                    }])],
+                    set_indexes: vec![vec![9, 9, 9]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            TestCase {
+                num: 7,
+                arg: "/export/set{1...64}",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                        seq: get_sequences(1, 64, 0),
+                        prefix: "/export/set".to_owned(),
+                        ..Default::default()
+                    }])],
+                    set_indexes: vec![vec![16, 16, 16, 16]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            // Valid input for distributed setup.
+            TestCase {
+                num: 8,
+                arg: "http://rustfs{2...3}/export/set{1...64}",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![
+                        Pattern {
+                            seq: get_sequences(1, 64, 0),
+                            ..Default::default()
+                        },
+                        Pattern {
+                            seq: get_sequences(2, 3, 0),
+                            prefix: "http://rustfs".to_owned(),
+                            suffix: "/export/set".to_owned(),
+                        },
+                    ])],
+                    set_indexes: vec![vec![16, 16, 16, 16, 16, 16, 16, 16]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            // Supporting some advanced cases.
+            TestCase {
+                num: 9,
+                arg: "http://rustfs{1...64}.mydomain.net/data",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                        seq: get_sequences(1, 64, 0),
+                        prefix: "http://rustfs".to_owned(),
+                        suffix: ".mydomain.net/data".to_owned(),
+                    }])],
+                    set_indexes: vec![vec![16, 16, 16, 16]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            TestCase {
+                num: 10,
+                arg: "http://rack{1...4}.mydomain.rustfs{1...16}/data",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![
+                        Pattern {
+                            seq: get_sequences(1, 16, 0),
+                            suffix: "/data".to_owned(),
+                            ..Default::default()
+                        },
+                        Pattern {
+                            seq: get_sequences(1, 4, 0),
+                            prefix: "http://rack".to_owned(),
+                            suffix: ".mydomain.rustfs".to_owned(),
+                        },
+                    ])],
+                    set_indexes: vec![vec![16, 16, 16, 16]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            // Supporting kubernetes cases.
+            TestCase {
+                num: 11,
+                arg: "http://rustfs{0...15}.mydomain.net/data{0...1}",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![
+                        Pattern {
+                            seq: get_sequences(0, 1, 0),
+                            ..Default::default()
+                        },
+                        Pattern {
+                            seq: get_sequences(0, 15, 0),
+                            prefix: "http://rustfs".to_owned(),
+                            suffix: ".mydomain.net/data".to_owned(),
+                        },
+                    ])],
+                    set_indexes: vec![vec![16, 16]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            // No host regex, just disks.
+            TestCase {
+                num: 12,
+                arg: "http://server1/data{1...32}",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                        seq: get_sequences(1, 32, 0),
+                        prefix: "http://server1/data".to_owned(),
+                        ..Default::default()
+                    }])],
+                    set_indexes: vec![vec![16, 16]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            // No host regex, just disks with two position numerics.
+            TestCase {
+                num: 13,
+                arg: "http://server1/data{01...32}",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                        seq: get_sequences(1, 32, 2),
+                        prefix: "http://server1/data".to_owned(),
+                        ..Default::default()
+                    }])],
+                    set_indexes: vec![vec![16, 16]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            // More than 2 ellipses are supported as well.
+            TestCase {
+                num: 14,
+                arg: "http://rustfs{2...3}/export/set{1...64}/test{1...2}",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![
+                        Pattern {
+                            seq: get_sequences(1, 2, 0),
+                            ..Default::default()
+                        },
+                        Pattern {
+                            seq: get_sequences(1, 64, 0),
+                            suffix: "/test".to_owned(),
+                            ..Default::default()
+                        },
+                        Pattern {
+                            seq: get_sequences(2, 3, 0),
+                            prefix: "http://rustfs".to_owned(),
+                            suffix: "/export/set".to_owned(),
+                        },
+                    ])],
+                    set_indexes: vec![vec![16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+            // More than 1 ellipses per argument for standalone setup.
+            TestCase {
+                num: 15,
+                arg: "/export{1...10}/disk{1...10}",
+                es: EndpointSet {
+                    arg_patterns: vec![ArgPattern::new(vec![
+                        Pattern {
+                            seq: get_sequences(1, 10, 0),
+                            ..Default::default()
+                        },
+                        Pattern {
+                            seq: get_sequences(1, 10, 0),
+                            prefix: "/export".to_owned(),
+                            suffix: "/disk".to_owned(),
+                        },
+                    ])],
+                    set_indexes: vec![vec![10, 10, 10, 10, 10, 10, 10, 10, 10, 10]],
+                    ..Default::default()
+                },
+                success: true,
+            },
+        ];
+
+        for test_case in test_cases {
+            match EndpointSet::try_from([test_case.arg].as_slice()) {
+                Ok(got_es) => {
+                    if !test_case.success {
+                        panic!("Test{}: Expected failure but passed instead", test_case.num);
+                    }
+
+                    assert_eq!(
+                        test_case.es, got_es,
+                        "Test{}: Expected {:?}, got {:?}",
+                        test_case.num, test_case.es, got_es
+                    )
+                }
+                Err(err) => {
+                    if test_case.success {
+                        panic!("Test{}: Expected success but failed instead {}", test_case.num, err);
+                    }
+                }
+            }
         }
     }
 }
