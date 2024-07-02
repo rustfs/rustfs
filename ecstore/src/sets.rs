@@ -4,7 +4,6 @@ use anyhow::Result;
 
 use futures::AsyncWrite;
 use time::OffsetDateTime;
-use tokio_pipe::{PipeRead, PipeWrite};
 use uuid::Uuid;
 
 use crate::{
@@ -108,13 +107,7 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
 
-    async fn put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &PutObjReader,
-        opts: &ObjectOptions,
-    ) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: &PutObjReader, opts: &ObjectOptions) -> Result<()> {
         let disks = self.get_disks_by_key(object);
 
         let mut parity_drives = self.partiy_count;
@@ -128,25 +121,20 @@ impl StorageAPI for Sets {
             write_quorum += 1
         }
 
-        let mut fi = FileInfo::new(
-            [bucket, object].join("/").as_str(),
-            data_drives,
-            parity_drives,
-        );
+        let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
         fi.data_dir = Uuid::new_v4().to_string();
 
         let parts_metadata = vec![fi.clone(); disks.len()];
 
-        let (shuffle_disks, shuffle_parts_metadata) =
-            shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
+        let (shuffle_disks, shuffle_parts_metadata) = shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let mut writers = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
-            let (mut r, mut w) = tokio_pipe::pipe()?;
+            let (reader, writer) = tokio::io::duplex(fi.erasure.block_size);
 
-            writers.push(w);
+            writers.push(writer);
         }
 
         let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks);
@@ -161,25 +149,6 @@ impl StorageAPI for Sets {
 
         unimplemented!()
     }
-}
-
-pub struct DiskWriter<'a> {
-    disk: &'a Option<DiskStore>,
-    writer: PipeWrite,
-    reader: PipeRead,
-}
-
-impl<'a> DiskWriter<'a> {
-    pub fn new(disk: &'a Option<DiskStore>) -> Result<Self> {
-        let (mut reader, mut writer) = tokio_pipe::pipe()?;
-        Ok(Self {
-            disk,
-            reader,
-            writer,
-        })
-    }
-
-    pub fn wirter(&self) -> impl AsyncWrite {}
 }
 
 // 打乱顺序

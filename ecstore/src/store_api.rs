@@ -7,7 +7,7 @@ use s3s::Body;
 use time::OffsetDateTime;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
-pub const BLOCK_SIZE_V2: u64 = 1048576; // 1M
+pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
@@ -83,7 +83,7 @@ pub struct ErasureInfo {
     // ParityBlocks is the number of parity blocks for erasure-coding
     pub parity_blocks: usize,
     // BlockSize is the size of one erasure-coded block
-    pub block_size: u64,
+    pub block_size: usize,
     // Index is the index of the current disk
     pub index: usize,
     // Distribution is the distribution of the data and parity blocks
@@ -125,10 +125,7 @@ pub struct PutObjReader {
 
 impl PutObjReader {
     pub fn new(stream: Body, content_length: u64) -> Self {
-        PutObjReader {
-            stream,
-            content_length,
-        }
+        PutObjReader { stream, content_length }
     }
 }
 
@@ -141,11 +138,5 @@ pub struct ObjectOptions {
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
 
-    async fn put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &PutObjReader,
-        opts: &ObjectOptions,
-    ) -> Result<()>;
+    async fn put_object(&self, bucket: &str, object: &str, data: &PutObjReader, opts: &ObjectOptions) -> Result<()>;
 }
