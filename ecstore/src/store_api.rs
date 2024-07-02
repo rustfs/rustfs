@@ -129,6 +129,7 @@ impl PutObjReader {
     }
 }
 
+#[derive(Debug, Default)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,

@@ -11,6 +11,6 @@ mod format;
 mod peer;
 mod sets;
 pub mod store;
-mod store_api;
+pub mod store_api;
 mod store_init;
 mod utils;

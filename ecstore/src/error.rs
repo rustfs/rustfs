@@ -1,16 +1,17 @@
-// use s3s::S3Error;
-// use s3s::S3ErrorCode;
+use s3s::S3Error;
+use s3s::S3ErrorCode;
+use s3s::StdError;
 
 use std::panic::Location;
 
 use tracing::error;
 
-pub type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
 #[derive(Debug)]
 pub struct Error {
     source: StdError,
 }
+
+pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
 impl Error {
     #[must_use]
@@ -37,11 +38,11 @@ where
     }
 }
 
-// impl From<Error> for S3Error {
-//     fn from(e: Error) -> Self {
-//         S3Error::with_source(S3ErrorCode::InternalError, e.source)
-//     }
-// }
+impl From<Error> for S3Error {
+    fn from(e: Error) -> Self {
+        S3Error::with_source(S3ErrorCode::InternalError, e.source)
+    }
+}
 
 #[inline]
 #[track_caller]
@@ -70,5 +71,3 @@ macro_rules! try_ {
         }
     };
 }
-
-
