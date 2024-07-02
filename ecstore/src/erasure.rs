@@ -6,6 +6,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use s3s::StdError;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tracing::debug;
 
 use crate::chunk_stream::ChunkedStream;
 
@@ -51,6 +52,7 @@ impl Erasure {
                         }
                     }
 
+                    debug!("encode_data write errs:{:?}", errs);
                     // TODO: reduceWriteQuorumErrs
                 }
                 Err(e) => return Err(anyhow!(e)),
