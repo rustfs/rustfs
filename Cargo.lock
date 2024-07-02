@@ -329,7 +329,6 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
- "tokio-pipe",
  "tokio-util",
  "tracing",
  "tracing-error",
@@ -1395,16 +1394,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tokio-pipe"
-version = "0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f213a84bffbd61b8fa0ba8a044b4bbe35d471d0b518867181e82bd5c15542784"
-dependencies = [
- "libc",
- "tokio",
 ]
 
 [[package]]
