@@ -76,6 +76,11 @@ impl ArgPattern {
 
         ret
     }
+
+    /// returns the total number of sizes in the given patterns.
+    pub fn total_sizes(&self) -> usize {
+        self.inner.iter().map(|v| v.seq.len()).sum()
+    }
 }
 
 /// finds all ellipses patterns, recursively and parses the ranges numerically.
