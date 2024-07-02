@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use futures::AsyncWrite;
+use futures::{AsyncWrite, StreamExt};
 use time::OffsetDateTime;
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -107,7 +108,7 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
 
-    async fn put_object(&self, bucket: &str, object: &str, data: &PutObjReader, opts: &ObjectOptions) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: ObjectOptions) -> Result<()> {
         let disks = self.get_disks_by_key(object);
 
         let mut parity_drives = self.partiy_count;
@@ -131,15 +132,31 @@ impl StorageAPI for Sets {
 
         let mut writers = Vec::with_capacity(disks.len());
 
-        for disk in disks.iter() {
+        for disk in shuffle_disks.iter() {
             let (reader, writer) = tokio::io::duplex(fi.erasure.block_size);
+
+            let disk = disk.as_ref().unwrap().clone();
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            tokio::spawn(async move {
+                debug!("do createfile");
+                match disk
+                    .CreateFile("", bucket.as_str(), object.as_str(), data.content_length, reader)
+                    .await
+                {
+                    Ok(_) => (),
+                    Err(e) => debug!("creatfile err :{:?}", e),
+                }
+            });
 
             writers.push(writer);
         }
 
         let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks);
 
-        erasure.encode(data.stream, &mut writers, fi.erasure.block_size, data.content_length, write_quorum);
+        erasure
+            .encode(data.stream, &mut writers, fi.erasure.block_size, data.content_length, write_quorum)
+            .await?;
 
         unimplemented!()
     }

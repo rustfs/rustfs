@@ -169,7 +169,7 @@ impl S3 for FS {
 
         let reader = PutObjReader::new(body.into(), content_length as usize);
 
-        try_!(self.store.put_object(&bucket, &key, &reader, &ObjectOptions::default()).await);
+        try_!(self.store.put_object(&bucket, &key, reader, ObjectOptions::default()).await);
 
         // self.store.put_object(bucket, object, data, opts);
 

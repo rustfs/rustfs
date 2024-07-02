@@ -126,14 +126,14 @@ impl StorageAPI for ECStore {
 
         let reader = PutObjReader::new(StreamingBlob::from(body), content_len);
 
-        self.put_object(RUSTFS_META_BUCKET, &file_path, &reader, &ObjectOptions { max_parity: true })
+        self.put_object(RUSTFS_META_BUCKET, &file_path, reader, ObjectOptions { max_parity: true })
             .await?;
 
         // TODO: toObjectErr
 
         Ok(())
     }
-    async fn put_object(&self, bucket: &str, object: &str, data: &PutObjReader, opts: &ObjectOptions) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: ObjectOptions) -> Result<()> {
         // checkPutObjectArgs
 
         let object = utils::path::encode_dir_object(object);

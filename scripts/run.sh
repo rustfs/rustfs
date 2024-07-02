@@ -9,12 +9,12 @@ if [ -n "$1" ]; then
 fi
 
 if [ -z "$RUST_LOG" ]; then
-    export RUST_LOG="rustfs=debug"
+    export RUST_LOG="s3s-rustfs=debug,s3s=debug"
 fi
 
 cargo run \
     -- --access-key AKEXAMPLERUSTFS    \
     --secret-key SKEXAMPLERUSTFS    \
     --address       0.0.0.0:9010       \
-    --domain-name   localhost:9010  \
+    --domain-name   127.0.0.1:9010  \
     "$DATA_DIR"
