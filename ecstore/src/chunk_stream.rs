@@ -21,64 +21,63 @@ impl ChunkedStream {
     where
         S: Stream<Item = Result<Bytes, Error>> + Send + Sync + 'static,
     {
-        let inner =
-            AsyncTryStream::<_, _, SyncBoxFuture<'static, Result<(), Error>>>::new(|mut y| {
-                #[allow(clippy::shadow_same)] // necessary for `pin_mut!`
-                Box::pin(async move {
-                    pin_mut!(body);
-                    // 上一次没用完的数据
-                    let mut prev_bytes = Bytes::new();
-                    let mut readed_size = 0;
+        let inner = AsyncTryStream::<_, _, SyncBoxFuture<'static, Result<(), Error>>>::new(|mut y| {
+            #[allow(clippy::shadow_same)] // necessary for `pin_mut!`
+            Box::pin(async move {
+                pin_mut!(body);
+                // 上一次没用完的数据
+                let mut prev_bytes = Bytes::new();
+                let mut readed_size = 0;
 
-                    loop {
-                        let data: Vec<Bytes> = {
-                            // 读固定大小的数据
-                            match Self::read_data(body.as_mut(), prev_bytes, chunk_size).await {
-                                None => break,
-                                Some(Err(e)) => return Err(e),
-                                Some(Ok((data, remaining_bytes))) => {
-                                    prev_bytes = remaining_bytes;
-                                    data
-                                }
+                loop {
+                    let data: Vec<Bytes> = {
+                        // 读固定大小的数据
+                        match Self::read_data(body.as_mut(), prev_bytes, chunk_size).await {
+                            None => break,
+                            Some(Err(e)) => return Err(e),
+                            Some(Ok((data, remaining_bytes))) => {
+                                prev_bytes = remaining_bytes;
+                                data
                             }
-                        };
-
-                        for bytes in data {
-                            readed_size += bytes.len();
-                            // println!(
-                            //     "readed_size {}, content_length {}",
-                            //     readed_size, content_length,
-                            // );
-                            y.yield_ok(bytes).await;
                         }
+                    };
 
-                        if readed_size + prev_bytes.len() >= content_length {
-                            // println!(
-                            //     "读完了 readed_size:{} + prev_bytes.len({}) == content_length {}",
-                            //     readed_size,
-                            //     prev_bytes.len(),
-                            //     content_length,
-                            // );
-
-                            // 填充0？
-                            if !need_padding {
-                                y.yield_ok(prev_bytes).await;
-                                break;
-                            }
-
-                            let mut bytes = vec![0u8; chunk_size];
-                            let (left, _) = bytes.split_at_mut(prev_bytes.len());
-                            left.copy_from_slice(&prev_bytes);
-
-                            y.yield_ok(Bytes::from(bytes)).await;
-
-                            break;
-                        }
+                    for bytes in data {
+                        readed_size += bytes.len();
+                        // println!(
+                        //     "readed_size {}, content_length {}",
+                        //     readed_size, content_length,
+                        // );
+                        y.yield_ok(bytes).await;
                     }
 
-                    Ok(())
-                })
-            });
+                    if readed_size + prev_bytes.len() >= content_length {
+                        // println!(
+                        //     "读完了 readed_size:{} + prev_bytes.len({}) == content_length {}",
+                        //     readed_size,
+                        //     prev_bytes.len(),
+                        //     content_length,
+                        // );
+
+                        // 填充0？
+                        if !need_padding {
+                            y.yield_ok(prev_bytes).await;
+                            break;
+                        }
+
+                        let mut bytes = vec![0u8; chunk_size];
+                        let (left, _) = bytes.split_at_mut(prev_bytes.len());
+                        left.copy_from_slice(&prev_bytes);
+
+                        y.yield_ok(Bytes::from(bytes)).await;
+
+                        break;
+                    }
+                }
+
+                Ok(())
+            })
+        });
         Self {
             inner,
             remaining_length: content_length,
