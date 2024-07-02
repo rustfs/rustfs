@@ -139,13 +139,7 @@ impl StorageAPI for Sets {
 
         let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks);
 
-        // erasure.encode(
-        //     data.stream,
-        //     &mut writers,
-        //     fi.erasure.block_size,
-        //     data.content_length,
-        //     write_quorum,
-        // );
+        erasure.encode(data.stream, &mut writers, fi.erasure.block_size, data.content_length, write_quorum);
 
         unimplemented!()
     }

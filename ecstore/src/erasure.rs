@@ -1,10 +1,11 @@
-use tokio::io::AsyncWriteExt;
-
+use anyhow::anyhow;
 use anyhow::{Error, Result};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use s3s::StdError;
 use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 
 use crate::chunk_stream::ChunkedStream;
 
@@ -32,7 +33,7 @@ impl Erasure {
         write_quorum: usize,
     ) -> Result<()>
     where
-        S: Stream<Item = Result<Bytes, Error>> + Send + Sync + 'static,
+        S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
         W: AsyncWrite + Unpin,
     {
         let mut stream = ChunkedStream::new(body, data_size, block_size, true);
@@ -52,7 +53,7 @@ impl Erasure {
 
                     // TODO: reduceWriteQuorumErrs
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(anyhow!(e)),
             }
         }
 
