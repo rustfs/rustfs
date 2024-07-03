@@ -14,7 +14,7 @@ const ELLIPSES: &str = "...";
 
 /// ellipses pattern, describes the range and also the
 /// associated prefix and suffixes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pattern {
     pub prefix: String,
     pub suffix: String,
@@ -40,7 +40,7 @@ impl Pattern {
 }
 
 /// contains a list of patterns provided in the input.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ArgPattern {
     pub inner: Vec<Pattern>,
 }
@@ -75,6 +75,11 @@ impl ArgPattern {
         }
 
         ret
+    }
+
+    /// returns the total number of sizes in the given patterns.
+    pub fn total_sizes(&self) -> usize {
+        self.inner.iter().fold(1, |acc, v| acc * v.seq.len())
     }
 }
 

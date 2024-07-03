@@ -29,7 +29,7 @@ pub struct ECStore {
 
 impl ECStore {
     pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
-        let layouts = DisksLayout::new(&endpoints)?;
+        let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 
         let mut deployment_id = None;
 
