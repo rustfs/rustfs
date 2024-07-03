@@ -19,6 +19,13 @@ pub struct FileInfo {
     pub mod_time: OffsetDateTime,
 }
 
+impl FileInfo {
+    pub fn is_remote(&self) -> bool {
+        // TODO: when lifecycle
+        false
+    }
+}
+
 impl Default for FileInfo {
     fn default() -> Self {
         Self {

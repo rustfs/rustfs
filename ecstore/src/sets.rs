@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 
 use futures::{future::join_all, AsyncWrite, StreamExt};
 use time::OffsetDateTime;
@@ -91,7 +91,51 @@ impl Sets {
         }
     }
 
-    async fn rename_data(&self) -> Result<()> {
+    async fn rename_data(
+        &self,
+        disks: &Vec<Option<DiskStore>>,
+        src_bucket: &str,
+        src_object: &str,
+        file_infos: &Vec<FileInfo>,
+        dst_bucket: &str,
+        dst_object: &str,
+        // write_quorum: usize,
+    ) -> Vec<Option<Error>> {
+        let mut futures = Vec::with_capacity(disks.len());
+
+        for (i, disk) in disks.iter().enumerate() {
+            let disk = disk.as_ref().unwrap();
+            let file_info = &file_infos[i];
+            futures.push(async move {
+                disk.rename_data(src_bucket, src_object, file_info, dst_bucket, dst_object)
+                    .await
+            })
+        }
+
+        let mut errors = Vec::with_capacity(disks.len());
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(_) => {
+                    errors.push(None);
+                }
+                Err(e) => {
+                    errors.push(Some(e));
+                }
+            }
+        }
+        errors
+    }
+
+    async fn commit_rename_data_dir(
+        &self,
+        disks: &Vec<Option<DiskStore>>,
+        bucket: &str,
+        object: &str,
+        data_dir: &str,
+        // write_quorum: usize,
+    ) -> Vec<Option<Error>> {
         unimplemented!()
     }
 }
@@ -148,6 +192,8 @@ impl StorageAPI for Sets {
             let disk = disk.as_ref().unwrap().clone();
             let tmp_object = tmp_object.clone();
 
+            // TODO: save small file in fileinfo.data instead of write file;
+
             futures.push(async move {
                 disk.create_file("", RUSTFS_META_TMP_BUCKET, tmp_object.as_str(), data.content_length, reader)
                     .await
@@ -188,6 +234,21 @@ impl StorageAPI for Sets {
 
         // TODO: reduceWriteQuorumErrs
         // evalDisks
+
+        let rename_errs = self
+            .rename_data(
+                &shuffle_disks,
+                RUSTFS_META_TMP_BUCKET,
+                tmp_dir.as_str(),
+                &shuffle_parts_metadata,
+                &bucket,
+                &object,
+            )
+            .await;
+
+        // TODO: reduceWriteQuorumErrs
+
+        // self.commit_rename_data_dir(&shuffle_disks,&bucket,&object,)
 
         Ok(())
     }

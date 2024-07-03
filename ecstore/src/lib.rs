@@ -7,6 +7,7 @@ mod ellipses;
 mod endpoint;
 mod erasure;
 pub mod error;
+mod file_meta;
 mod format;
 mod peer;
 mod sets;
