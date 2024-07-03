@@ -1,17 +1,12 @@
 use super::disks_layout::{DisksLayout, PoolDisksLayout};
 use super::error::{Error, Result};
 use super::utils::{
-    net::{is_local_host, split_host_port},
+    net::{is_local_host, is_socket_addr, split_host_port},
     string::new_string_set,
 };
 use path_absolutize::Absolutize;
 use std::fmt::Display;
-use std::{
-    collections::HashMap,
-    net::{IpAddr, SocketAddr},
-    path::Path,
-    usize,
-};
+use std::{collections::HashMap, path::Path, usize};
 use url::{ParseError, Url};
 
 pub const DEFAULT_PORT: u16 = 9000;
@@ -45,7 +40,7 @@ pub struct Node {
 // }
 
 /// any type of endpoint.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Endpoint {
     pub url: url::Url,
     pub is_local: bool,
@@ -57,10 +52,10 @@ pub struct Endpoint {
 
 impl Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.url.has_host() {
-            write!(f, "{}", self.url)
-        } else {
+        if self.url.scheme() == "file" {
             write!(f, "{}", self.url.path())
+        } else {
+            write!(f, "{}", self.url)
         }
     }
 }
@@ -77,7 +72,7 @@ impl TryFrom<&str> for Endpoint {
 
         let mut is_local = false;
         let url = match Url::parse(value) {
-            Ok(url) => {
+            Ok(mut url) => {
                 // URL style of endpoint.
                 // Valid URL style endpoint is
                 // - Scheme field must contain "http" or "https"
@@ -89,6 +84,7 @@ impl TryFrom<&str> for Endpoint {
                 {
                     return Err(Error::from_string("invalid URL endpoint format"));
                 }
+
                 if is_empty_path(url.path()) {
                     return Err(Error::from_string("empty or root endpoint is not supported"));
                 }
@@ -108,7 +104,12 @@ impl TryFrom<&str> for Endpoint {
                 // Another additional benefit here is that this style also
                 // supports providing \\host\share support as well.
                 #[cfg(windows)]
-                {}
+                {
+                    let path = url.path().to_owned();
+                    if Path::new(&path[1..]).has_root() {
+                        url.set_path(&path[1..]);
+                    }
+                }
 
                 url
             }
@@ -135,7 +136,7 @@ impl TryFrom<&str> for Endpoint {
                             is_local = true;
                             url
                         }
-                        Err(err) => return Err(Error::from_string("Convert a file path into an URL failed")),
+                        Err(_) => return Err(Error::from_string("Convert a file path into an URL failed")),
                     }
                 }
                 _ => return Err(Error::from_string(format!("invalid URL endpoint format: {}", e))),
@@ -145,7 +146,9 @@ impl TryFrom<&str> for Endpoint {
         Ok(Endpoint {
             url,
             is_local,
-            ..Default::default()
+            pool_idx: None,
+            set_idx: None,
+            disk_idx: None,
         })
     }
 }
@@ -155,128 +158,34 @@ fn is_empty_path(path: &str) -> bool {
     ["", "/", "\\"].iter().any(|&v| v.eq(path))
 }
 
-// helper for validating if the provided arg is an ip address.
-fn is_socket_addr(host: &str) -> bool {
-    host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
-}
-
 impl Endpoint {
-    pub fn new(arg: &str) -> Result<Self> {
-        if is_empty_path(arg) {
-            return Err(Error::from_string("不支持空或根endpoint"));
-        }
-
-        let url = Url::parse(arg).or_else(|e| match e {
-            ParseError::EmptyHost => Err(Error::from_string("远程地址，域名不能为空")),
-            ParseError::IdnaError => Err(Error::from_string("域名格式不正确")),
-            ParseError::InvalidPort => Err(Error::from_string("端口格式不正确")),
-            ParseError::InvalidIpv4Address => Err(Error::from_string("IP格式不正确")),
-            ParseError::InvalidIpv6Address => Err(Error::from_string("IP格式不正确")),
-            ParseError::InvalidDomainCharacter => Err(Error::from_string("域名字符格式不正确")),
-            // url::ParseError::RelativeUrlWithoutBase => todo!(),
-            // url::ParseError::RelativeUrlWithCannotBeABaseBase => todo!(),
-            // url::ParseError::SetHostOnCannotBeABaseUrl => todo!(),
-            ParseError::Overflow => Err(Error::from_string("长度过长")),
-            _ => {
-                if is_host_ip(arg) {
-                    return Err(Error::from_string("无效的URL endpoint格式: 缺少 http 或 https"));
-                }
-
-                let abs_arg = Path::new(arg).canonicalize()?;
-
-                let abs = abs_arg.to_str().ok_or(Error::from_string("绝对路径错误"))?;
-                let url = Url::from_file_path(abs).unwrap();
-                Ok(url)
-            }
-        })?;
-
-        if url.scheme() == "file" {
-            return Ok(Endpoint {
-                url: url,
-                is_local: true,
-                pool_idx: -1,
-                set_idx: -1,
-                disk_idx: -1,
-            });
-        }
-
-        if url.port().is_none() {
-            return Err(Error::from_string("必须提供端口号"));
-        }
-
-        if !(url.scheme() == "http" || url.scheme() == "https") {
-            return Err(Error::from_string("URL endpoint格式无效: Scheme字段必须包含'http'或'https'"));
-        }
-
-        // 检查路径
-        let path = url.path();
-        if is_empty_path(path) {
-            return Err(Error::from_string("URL endpoint不支持空或根路径"));
-        }
-
-        // TODO: Windows 系统上的路径处理
-        #[cfg(windows)]
-        {
-            use std::env;
-            if env::consts::OS == "windows" {
-                // 处理 Windows 路径的特殊逻辑
-            }
-        }
-
-        Ok(Endpoint {
-            url: url,
-            is_local: false,
-            pool_idx: -1,
-            set_idx: -1,
-            disk_idx: -1,
-        })
-    }
-
-    // pub fn host_port_str(&self) -> String {
-    //     if self.url.has_host() && self.port() > 0 {
-    //         return format!("{}:{}", self.hostname(), self.port());
-    //     } else if self.url.has_host() && self.port() == 0 {
-    //         return self.hostname().to_string();
-    //     } else if !self.url.has_host() && self.port() > 0 {
-    //         return format!(":{}", self.port());
-    //     } else {
-    //         return String::new();
-    //     }
-    // }
-
-    // pub fn port(&self) -> u16 {
-    //     self.url.port().unwrap_or(0)
-    // }
-    // pub fn hostname(&self) -> &str {
-    //     self.url.host_str().unwrap_or("")
-    // }
-
+    /// returns type of endpoint.
     pub fn get_type(&self) -> EndpointType {
-        if self.url.has_host() {
-            EndpointType::Url
-        } else {
+        if self.url.scheme() == "file" {
             EndpointType::Path
+        } else {
+            EndpointType::Url
         }
     }
 
-    // pub fn get_scheme(&self) -> String {
-    //     self.url.scheme().to_string()
-    // }
-
-    pub fn set_pool_index(&mut self, idx: i32) {
-        self.pool_idx = idx
+    /// sets a specific pool number to this node
+    pub fn set_pool_index(&mut self, idx: usize) {
+        self.pool_idx = Some(idx)
     }
 
-    pub fn set_set_index(&mut self, idx: i32) {
-        self.set_idx = idx
+    /// sets a specific set number to this node
+    pub fn set_set_index(&mut self, idx: usize) {
+        self.set_idx = Some(idx)
     }
 
-    pub fn set_disk_index(&mut self, idx: i32) {
-        self.disk_idx = idx
+    /// sets a specific disk number to this node
+    pub fn set_disk_index(&mut self, idx: usize) {
+        self.disk_idx = Some(idx)
     }
 
-    fn update_islocal(&mut self) -> Result<()> {
-        if self.url.has_host() {
+    /// resolves the host and updates if it is local or not.
+    fn update_is_local(&mut self) -> Result<()> {
+        if self.url.scheme() != "file" {
             self.is_local = is_local_host(self.url.host().unwrap(), self.url.port().unwrap(), DEFAULT_PORT);
         }
 
@@ -323,7 +232,7 @@ impl Endpoints {
         let mut eps = Vec::new();
         let mut uniq_args = new_string_set();
         for (i, arg) in args.iter().enumerate() {
-            let endpoint = Endpoint::new(arg)?;
+            let endpoint = Endpoint::try_from(arg.as_str())?;
             if i == 0 {
                 ep_type = endpoint.get_type();
                 scheme = endpoint.url.scheme().to_string();
@@ -365,7 +274,7 @@ impl PoolEndpointList {
         for eps in self.0.iter_mut() {
             for ep in eps.iter_mut() {
                 // TODO:
-                ep.update_islocal()?
+                ep.update_is_local()?
             }
         }
 
@@ -573,9 +482,9 @@ pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) 
             let mut eps = Endpoints::from_args(set_layout.to_owned())?;
             // TODO: checkCrossDeviceMounts
             for (disk_idx, ep) in eps.0.iter_mut().enumerate() {
-                ep.set_pool_index(pool_idx as i32);
-                ep.set_set_index(set_idx as i32);
-                ep.set_disk_index(disk_idx as i32);
+                ep.set_pool_index(pool_idx);
+                ep.set_set_index(set_idx);
+                ep.set_disk_index(disk_idx);
 
                 endpoints.0.push(ep.to_owned());
             }
