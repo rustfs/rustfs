@@ -1,11 +1,17 @@
-use super::disks_layout::PoolDisksLayout;
+use super::disks_layout::{DisksLayout, PoolDisksLayout};
+use super::error::{Error, Result};
 use super::utils::{
     net::{is_local_host, split_host_port},
     string::new_string_set,
 };
-use anyhow::{Error, Result};
+use path_absolutize::Absolutize;
 use std::fmt::Display;
-use std::{collections::HashMap, net::IpAddr, path::Path, usize};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    path::Path,
+    usize,
+};
 use url::{ParseError, Url};
 
 pub const DEFAULT_PORT: u16 = 9000;
@@ -39,14 +45,14 @@ pub struct Node {
 // }
 
 /// any type of endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Endpoint {
     pub url: url::Url,
     pub is_local: bool,
 
-    pub pool_idx: i32,
-    pub set_idx: i32,
-    pub disk_idx: i32,
+    pub pool_idx: Option<usize>,
+    pub set_idx: Option<usize>,
+    pub disk_idx: Option<usize>,
 }
 
 impl Display for Endpoint {
@@ -61,22 +67,86 @@ impl Display for Endpoint {
 
 impl TryFrom<&str> for Endpoint {
     /// The type returned in the event of a conversion error.
-    type Error = String;
+    type Error = Error;
 
     /// Performs the conversion.
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         if is_empty_path(value) {
-            return Err("empty or root endpoint is not supported".into());
+            return Err(Error::from_string("empty or root endpoint is not supported"));
         }
 
-        // match Url::parse(value) {
-        //     Ok(u) => u,
-        //     Err(e) => match e {
-        //         ParseError::EmptyHost => Err("")
-        //     },
-        // }
+        let mut is_local = false;
+        let url = match Url::parse(value) {
+            Ok(url) => {
+                // URL style of endpoint.
+                // Valid URL style endpoint is
+                // - Scheme field must contain "http" or "https"
+                // - All field should be empty except Host and Path.
+                if !((url.scheme() == "http" || url.scheme() == "https")
+                    && url.username().is_empty()
+                    && url.fragment().is_none()
+                    && url.query().is_none())
+                {
+                    return Err(Error::from_string("invalid URL endpoint format"));
+                }
+                if is_empty_path(url.path()) {
+                    return Err(Error::from_string("empty or root endpoint is not supported"));
+                }
 
-        unimplemented!()
+                // On windows having a preceding SlashSeparator will cause problems, if the
+                // command line already has C:/<export-folder/ in it. Final resulting
+                // path on windows might become C:/C:/ this will cause problems
+                // of starting rustfs server properly in distributed mode on windows.
+                // As a special case make sure to trim the separator.
+
+                // NOTE: It is also perfectly fine for windows users to have a path
+                // without C:/ since at that point we treat it as relative path
+                // and obtain the full filesystem path as well. Providing C:/
+                // style is necessary to provide paths other than C:/,
+                // such as F:/, D:/ etc.
+                //
+                // Another additional benefit here is that this style also
+                // supports providing \\host\share support as well.
+                #[cfg(windows)]
+                {}
+
+                url
+            }
+            Err(e) => match e {
+                ParseError::InvalidPort => {
+                    return Err(Error::from_string("invalid URL endpoint format: port number must be between 1 to 65535"))
+                }
+                ParseError::EmptyHost => return Err(Error::from_string("invalid URL endpoint format: empty host name")),
+                ParseError::RelativeUrlWithoutBase => {
+                    // Only check if the arg is an ip address and ask for scheme since its absent.
+                    // localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
+                    // /mnt/export1. So we go ahead and start the rustfs server in FS modes in these cases.
+                    if is_socket_addr(value) {
+                        return Err(Error::from_string("invalid URL endpoint format: missing scheme http or https"));
+                    }
+
+                    let file_path = match Path::new(value).absolutize() {
+                        Ok(path) => path,
+                        Err(err) => return Err(Error::from_string(format!("absolute path failed: {}", err))),
+                    };
+
+                    match Url::from_file_path(file_path) {
+                        Ok(url) => {
+                            is_local = true;
+                            url
+                        }
+                        Err(err) => return Err(Error::from_string("Convert a file path into an URL failed")),
+                    }
+                }
+                _ => return Err(Error::from_string(format!("invalid URL endpoint format: {}", e))),
+            },
+        };
+
+        Ok(Endpoint {
+            url,
+            is_local,
+            ..Default::default()
+        })
     }
 }
 
@@ -85,36 +155,36 @@ fn is_empty_path(path: &str) -> bool {
     ["", "/", "\\"].iter().any(|&v| v.eq(path))
 }
 
-// 检查给定字符串是否是IP地址
-fn is_host_ip(ip_str: &str) -> bool {
-    ip_str.parse::<IpAddr>().is_ok()
+// helper for validating if the provided arg is an ip address.
+fn is_socket_addr(host: &str) -> bool {
+    host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
 }
 
 impl Endpoint {
     pub fn new(arg: &str) -> Result<Self> {
         if is_empty_path(arg) {
-            return Err(Error::msg("不支持空或根endpoint"));
+            return Err(Error::from_string("不支持空或根endpoint"));
         }
 
         let url = Url::parse(arg).or_else(|e| match e {
-            ParseError::EmptyHost => Err(Error::msg("远程地址，域名不能为空")),
-            ParseError::IdnaError => Err(Error::msg("域名格式不正确")),
-            ParseError::InvalidPort => Err(Error::msg("端口格式不正确")),
-            ParseError::InvalidIpv4Address => Err(Error::msg("IP格式不正确")),
-            ParseError::InvalidIpv6Address => Err(Error::msg("IP格式不正确")),
-            ParseError::InvalidDomainCharacter => Err(Error::msg("域名字符格式不正确")),
+            ParseError::EmptyHost => Err(Error::from_string("远程地址，域名不能为空")),
+            ParseError::IdnaError => Err(Error::from_string("域名格式不正确")),
+            ParseError::InvalidPort => Err(Error::from_string("端口格式不正确")),
+            ParseError::InvalidIpv4Address => Err(Error::from_string("IP格式不正确")),
+            ParseError::InvalidIpv6Address => Err(Error::from_string("IP格式不正确")),
+            ParseError::InvalidDomainCharacter => Err(Error::from_string("域名字符格式不正确")),
             // url::ParseError::RelativeUrlWithoutBase => todo!(),
             // url::ParseError::RelativeUrlWithCannotBeABaseBase => todo!(),
             // url::ParseError::SetHostOnCannotBeABaseUrl => todo!(),
-            ParseError::Overflow => Err(Error::msg("长度过长")),
+            ParseError::Overflow => Err(Error::from_string("长度过长")),
             _ => {
                 if is_host_ip(arg) {
-                    return Err(Error::msg("无效的URL endpoint格式: 缺少 http 或 https"));
+                    return Err(Error::from_string("无效的URL endpoint格式: 缺少 http 或 https"));
                 }
 
                 let abs_arg = Path::new(arg).canonicalize()?;
 
-                let abs = abs_arg.to_str().ok_or(Error::msg("绝对路径错误"))?;
+                let abs = abs_arg.to_str().ok_or(Error::from_string("绝对路径错误"))?;
                 let url = Url::from_file_path(abs).unwrap();
                 Ok(url)
             }
@@ -131,17 +201,17 @@ impl Endpoint {
         }
 
         if url.port().is_none() {
-            return Err(Error::msg("必须提供端口号"));
+            return Err(Error::from_string("必须提供端口号"));
         }
 
         if !(url.scheme() == "http" || url.scheme() == "https") {
-            return Err(Error::msg("URL endpoint格式无效: Scheme字段必须包含'http'或'https'"));
+            return Err(Error::from_string("URL endpoint格式无效: Scheme字段必须包含'http'或'https'"));
         }
 
         // 检查路径
         let path = url.path();
         if is_empty_path(path) {
-            return Err(Error::msg("URL endpoint不支持空或根路径"));
+            return Err(Error::from_string("URL endpoint不支持空或根路径"));
         }
 
         // TODO: Windows 系统上的路径处理
@@ -258,15 +328,15 @@ impl Endpoints {
                 ep_type = endpoint.get_type();
                 scheme = endpoint.url.scheme().to_string();
             } else if endpoint.get_type() != ep_type {
-                return Err(Error::msg("不支持多种endpoints风格"));
+                return Err(Error::from_string("不支持多种endpoints风格"));
             } else if endpoint.url.scheme().to_string() != scheme {
-                return Err(Error::msg("不支持多种scheme"));
+                return Err(Error::from_string("不支持多种scheme"));
             }
 
             let arg_str = endpoint.to_string();
 
             if uniq_args.contains(arg_str.as_str()) {
-                return Err(Error::msg("发现重复 endpoints"));
+                return Err(Error::from_string("发现重复 endpoints"));
             }
 
             uniq_args.add(arg_str);
@@ -316,7 +386,7 @@ pub struct PoolEndpoints {
     pub platform: String,
 }
 
-// EndpointServerPools - list of list of endpoints
+/// list of list of endpoints
 #[derive(Debug)]
 pub struct EndpointServerPools(Vec<PoolEndpoints>);
 
@@ -332,7 +402,7 @@ impl EndpointServerPools {
         legacy: bool,
     ) -> Result<(EndpointServerPools, SetupType)> {
         if pool_args.is_empty() {
-            return Err(Error::msg("无效参数"));
+            return Err(Error::from_string("无效参数"));
         }
 
         let (pooleps, setup_type) = create_pool_endpoints(server_addr, pool_args)?;
@@ -384,7 +454,7 @@ impl EndpointServerPools {
 
         for ep in eps.endpoints.0.iter() {
             if exits.contains(&ep.to_string()) {
-                return Err(Error::msg("endpoints exists"));
+                return Err(Error::from_string("endpoints exists"));
             }
         }
 
@@ -419,22 +489,23 @@ impl EndpointServerPools {
     }
 }
 
+/// enum for setup type.
 #[derive(Debug)]
 pub enum SetupType {
-    // UnknownSetupType - starts with unknown setup type.
-    UnknownSetupType,
+    /// starts with unknown setup type.
+    Unknown,
 
-    // FSSetupType - FS setup type enum.
-    FSSetupType,
+    /// FS setup type enum.
+    FS,
 
-    // ErasureSDSetupType - Erasure single drive setup enum.
-    ErasureSDSetupType,
+    /// Erasure single drive setup enum.
+    ErasureSD,
 
-    // ErasureSetupType - Erasure setup type enum.
-    ErasureSetupType,
+    /// Erasure setup type enum.
+    Erasure,
 
-    // DistErasureSetupType - Distributed Erasure setup type enum.
-    DistErasureSetupType,
+    /// Distributed Erasure setup type enum.
+    DistErasure,
 }
 
 fn is_empty_layout(pools_layout: &Vec<PoolDisksLayout>) -> bool {
@@ -457,9 +528,19 @@ fn is_single_drive_layout(pools_layout: &Vec<PoolDisksLayout>) -> bool {
     }
 }
 
+pub fn create_pool_endpoints_v2(server_addr: &str, disks_layout: &DisksLayout) -> Result<(Vec<Endpoints>, SetupType)> {
+    if disks_layout.is_empty_layout() {
+        return Err(Error::from_string("invalid number of endpoints"));
+    }
+
+    if disks_layout.is_single_drive_layout() {}
+
+    unimplemented!()
+}
+
 pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) -> Result<(Vec<Endpoints>, SetupType)> {
     if is_empty_layout(pools) {
-        return Err(Error::msg("empty layout"));
+        return Err(Error::from_string("empty layout"));
     }
 
     // TODO: CheckLocalServerAddr
@@ -469,7 +550,7 @@ pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) 
         endpoint.update_islocal()?;
 
         if endpoint.get_type() != EndpointType::Path {
-            return Err(Error::msg("use path style endpoint for single node setup"));
+            return Err(Error::from_string("use path style endpoint for single node setup"));
         }
 
         endpoint.set_pool_index(0);
@@ -481,7 +562,7 @@ pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) 
 
         // TODO: checkCrossDeviceMounts
 
-        return Ok((vec![Endpoints(endpoints)], SetupType::ErasureSDSetupType));
+        return Ok((vec![Endpoints(endpoints)], SetupType::ErasureSD));
     }
 
     let mut ret = Vec::with_capacity(pools.len());
@@ -501,7 +582,7 @@ pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) 
         }
 
         if endpoints.0.is_empty() {
-            return Err(Error::msg("invalid number of endpoints"));
+            return Err(Error::from_string("invalid number of endpoints"));
         }
 
         ret.push(endpoints);
@@ -510,7 +591,7 @@ pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) 
     // TODO:
     PoolEndpointList::from_vec(ret.clone()).update_is_local()?;
 
-    let mut setup_type = SetupType::UnknownSetupType;
+    let mut setup_type = SetupType::Unknown;
 
     // TODO: parse server port
     let (_, server_port) = split_host_port(server_addr.as_str())?;
@@ -533,15 +614,15 @@ pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) 
 
     for eps in ret.iter() {
         if eps.0[0].get_type() == EndpointType::Path {
-            setup_type = SetupType::ErasureSetupType;
+            setup_type = SetupType::Erasure;
             break;
         }
 
         if eps.0[0].get_type() == EndpointType::Url {
             if erasure_type {
-                setup_type = SetupType::ErasureSetupType;
+                setup_type = SetupType::Erasure;
             } else {
-                setup_type = SetupType::DistErasureSetupType;
+                setup_type = SetupType::DistErasure;
             }
 
             break;
@@ -551,35 +632,32 @@ pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) 
     Ok((ret, setup_type))
 }
 
-// create_server_endpoints
-fn create_server_endpoints(
-    server_addr: String,
-    pool_args: &Vec<PoolDisksLayout>,
-    legacy: bool,
-) -> Result<(EndpointServerPools, SetupType)> {
-    if pool_args.is_empty() {
-        return Err(Error::msg("无效参数"));
-    }
+/// validates and creates new endpoints from input args, supports
+/// both ellipses and without ellipses transparently.
+// fn create_server_endpoints(server_addr: String, disks_layout: &DisksLayout) -> Result<(EndpointServerPools, SetupType)> {
+//     if disks_layout.is_empty() {
+//         return Err(Error::from_string("Invalid arguments specified"));
+//     }
 
-    let (pooleps, setup_type) = create_pool_endpoints(server_addr, pool_args)?;
+//     let (pooleps, setup_type) = create_pool_endpoints(server_addr, &disks_layout.pools)?;
 
-    let mut ret = EndpointServerPools::new();
+//     let mut ret = EndpointServerPools::new();
 
-    for (i, eps) in pooleps.iter().enumerate() {
-        let ep = PoolEndpoints {
-            legacy: legacy,
-            set_count: pool_args[i].layout.len(),
-            drives_per_set: pool_args[i].layout[0].len(),
-            endpoints: eps.clone(),
-            cmd_line: pool_args[i].cmd_line.clone(),
-            platform: String::new(),
-        };
+//     for (i, eps) in pooleps.iter().enumerate() {
+//         let ep = PoolEndpoints {
+//             legacy: disks_layout.legacy,
+//             set_count: pool_args[i].layout.len(),
+//             drives_per_set: pool_args[i].layout[0].len(),
+//             endpoints: eps.clone(),
+//             cmd_line: pool_args[i].cmd_line.clone(),
+//             platform: String::new(),
+//         };
 
-        ret.add(ep)?;
-    }
+//         ret.add(ep)?;
+//     }
 
-    Ok((ret, setup_type))
-}
+//     Ok((ret, setup_type))
+// }
 
 #[cfg(test)]
 mod test {
@@ -605,21 +683,21 @@ mod test {
         println!("{:?}", ep);
     }
 
-    #[test]
-    fn test_create_server_endpoints() {
-        let cases = vec![(":9000", vec!["http://localhost:900{1...2}/export{1...64}".to_string()])];
+    // #[test]
+    // fn test_create_server_endpoints() {
+    //     let cases = vec![(":9000", vec!["http://localhost:900{1...2}/export{1...64}".to_string()])];
 
-        for (addr, args) in cases {
-            let layouts = DisksLayout::try_from(args.as_slice()).unwrap();
+    //     for (addr, args) in cases {
+    //         let layouts = DisksLayout::try_from(args.as_slice()).unwrap();
 
-            println!("layouts:{:?},{}", &layouts.pools, &layouts.legacy);
+    //         println!("layouts:{:?},{}", &layouts.pools, &layouts.legacy);
 
-            let (server_pool, setup_type) = create_server_endpoints(addr.to_string(), &layouts.pools, layouts.legacy).unwrap();
+    //         let (server_pool, setup_type) = create_server_endpoints(addr.to_string(), &layouts.pools, layouts.legacy).unwrap();
 
-            println!("setup_type -- {:?}", setup_type);
-            println!("server_pool == {:?}", server_pool);
-        }
+    //         println!("setup_type -- {:?}", setup_type);
+    //         println!("server_pool == {:?}", server_pool);
+    //     }
 
-        // create_server_endpoints(server_addr, pool_args, legacy)
-    }
+    //     // create_server_endpoints(server_addr, pool_args, legacy)
+    // }
 }
