@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 
+use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
@@ -43,6 +44,12 @@ impl S3 for FS {
     #[tracing::instrument]
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let input = req.input;
+
+        try_!(
+            self.store
+                .make_bucket(&input.bucket, &MakeBucketOptions { force_create: true })
+                .await
+        );
 
         let output = CreateBucketOutput::default(); // TODO: handle other fields
         Ok(S3Response::new(output))

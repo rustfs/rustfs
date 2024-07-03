@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use futures::{AsyncWrite, StreamExt};
+use futures::{future::join_all, AsyncWrite, StreamExt};
 use time::OffsetDateTime;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    disk::{self, DiskStore},
+    disk::{self, DiskStore, RUSTFS_META_TMP_BUCKET},
     endpoint::PoolEndpoints,
     erasure::Erasure,
     format::{DistributionAlgoVersion, FormatV3},
@@ -90,6 +90,10 @@ impl Sets {
             }
         }
     }
+
+    async fn rename_data(&self) -> Result<()> {
+        unimplemented!()
+    }
 }
 
 // #[derive(Debug)]
@@ -132,22 +136,27 @@ impl StorageAPI for Sets {
 
         let mut writers = Vec::with_capacity(disks.len());
 
+        let mut futures = Vec::with_capacity(disks.len());
+
+        let tmp_dir = Uuid::new_v4().to_string();
+
+        let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir);
+
         for disk in shuffle_disks.iter() {
             let (reader, writer) = tokio::io::duplex(fi.erasure.block_size);
 
             let disk = disk.as_ref().unwrap().clone();
-            let bucket = bucket.to_string();
-            let object = object.to_string();
-            tokio::spawn(async move {
-                debug!("do createfile");
-                match disk
-                    .CreateFile("", bucket.as_str(), object.as_str(), data.content_length, reader)
+            let tmp_object = tmp_object.clone();
+
+            futures.push(async move {
+                disk.create_file("", RUSTFS_META_TMP_BUCKET, tmp_object.as_str(), data.content_length, reader)
                     .await
-                {
-                    Ok(_) => (),
-                    Err(e) => debug!("creatfile err :{:?}", e),
-                }
             });
+            // futures.push(tokio::spawn(async move {
+            //     debug!("do createfile");
+            //     disk.CreateFile("", bucket.as_str(), object.as_str(), data.content_length, reader)
+            //         .await;
+            // }));
 
             writers.push(writer);
         }
@@ -158,7 +167,29 @@ impl StorageAPI for Sets {
             .encode(data.stream, &mut writers, fi.erasure.block_size, data.content_length, write_quorum)
             .await?;
 
-        unimplemented!()
+        // close reader in create_file
+        drop(writers);
+
+        let mut errors = Vec::with_capacity(disks.len());
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(_) => {
+                    errors.push(None);
+                }
+                Err(e) => {
+                    errors.push(Some(e));
+                }
+            }
+        }
+
+        debug!("CreateFile errs:{:?}", errors);
+
+        // TODO: reduceWriteQuorumErrs
+        // evalDisks
+
+        Ok(())
     }
 }
 

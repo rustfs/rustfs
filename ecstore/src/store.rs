@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Error, Result};
 
 use s3s::{dto::StreamingBlob, Body};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -139,6 +140,7 @@ impl StorageAPI for ECStore {
         let object = utils::path::encode_dir_object(object);
 
         if self.single_pool() {
+            println!("put_object single_pool");
             self.pools[0].put_object(bucket, object.as_str(), data, opts).await?;
             return Ok(());
         }

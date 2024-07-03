@@ -16,6 +16,7 @@ use tokio::{
     fs::{self, File},
     io::DuplexStream,
 };
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -167,7 +168,10 @@ impl LocalDisk {
     /// This is done by first writing to a temporary location and then moving the file.
     pub(crate) async fn prepare_file_write<'a>(&self, path: &'a PathBuf) -> Result<FileWriter<'a>> {
         let tmp_path = self.get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
-        let file = File::create(&path).await?;
+
+        debug!("prepare_file_write tmp_path:{:?}, path:{:?}", &tmp_path, &path);
+
+        let file = File::create(&tmp_path).await?;
         let writer = BufWriter::new(file);
         Ok(FileWriter {
             tmp_path,
@@ -308,14 +312,20 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    async fn CreateFile(&self, origvolume: &str, volume: &str, path: &str, fileSize: usize, mut r: DuplexStream) -> Result<()> {
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, fileSize: usize, mut r: DuplexStream) -> Result<()> {
         let fpath = self.get_object_path(volume, path)?;
 
-        let mut writer = self.prepare_file_write(&fpath).await?;
+        debug!("CreateFile fpath: {:?}", fpath);
 
-        io::copy(&mut r, writer.writer()).await?;
+        if let Some(_dir_path) = fpath.parent() {
+            fs::create_dir_all(&_dir_path).await?;
+        }
 
-        writer.done().await?;
+        let file = File::create(&fpath).await?;
+
+        let mut writer = BufWriter::new(file);
+
+        io::copy(&mut r, &mut writer).await?;
 
         Ok(())
     }
