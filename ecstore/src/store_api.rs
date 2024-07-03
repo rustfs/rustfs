@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures::Stream;
 use s3s::{dto::StreamingBlob, Body};
 use time::OffsetDateTime;
+use tracing::debug;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
@@ -38,7 +39,7 @@ impl FileInfo {
 
             let start = key_crc as usize % cardinality;
             for i in 1..=cardinality {
-                nums[i - 1] = 1 + ((start + 1) % cardinality);
+                nums[i - 1] = 1 + ((start + i) % cardinality);
             }
 
             nums

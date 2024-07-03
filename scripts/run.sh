@@ -9,7 +9,7 @@ if [ -n "$1" ]; then
 fi
 
 if [ -z "$RUST_LOG" ]; then
-    export RUST_LOG="s3s-rustfs=debug,s3s=debug"
+    export RUST_LOG="s3s-rustfs=debug,ecstore=debug,s3s=debug"
 fi
 
 cargo run \
