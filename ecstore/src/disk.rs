@@ -22,8 +22,13 @@ use uuid::Uuid;
 use crate::{
     disk_api::DiskAPI,
     endpoint::{Endpoint, Endpoints},
+    file_meta::FileMeta,
     format::{DistributionAlgoVersion, FormatV3},
+    store_api::FileInfo,
+    utils,
 };
+
+pub type DiskStore = Arc<Box<dyn DiskAPI>>;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
@@ -31,8 +36,7 @@ pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
-
-pub type DiskStore = Arc<Box<dyn DiskAPI>>;
+const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 pub struct DiskOption {
     pub cleanup: bool,
@@ -87,7 +91,7 @@ pub struct LocalDisk {
     pub format_data: Vec<u8>,
     pub format_meta: Option<Metadata>,
     pub format_path: PathBuf,
-    pub format_legacy: bool,
+    // pub format_legacy: bool, // drop
     pub format_last_check: OffsetDateTime,
 }
 
@@ -107,7 +111,7 @@ impl LocalDisk {
         let (format_data, format_meta) = read_file_exists(&format_path).await?;
 
         let mut id = Uuid::nil();
-        let mut format_legacy = false;
+        // let mut format_legacy = false;
         let mut format_last_check = OffsetDateTime::UNIX_EPOCH;
 
         if !format_data.is_empty() {
@@ -120,7 +124,7 @@ impl LocalDisk {
             }
 
             id = fm.erasure.this;
-            format_legacy = fm.erasure.distribution_algo == DistributionAlgoVersion::V1;
+            // format_legacy = fm.erasure.distribution_algo == DistributionAlgoVersion::V1;
             format_last_check = OffsetDateTime::now_utc();
         }
 
@@ -130,7 +134,7 @@ impl LocalDisk {
             format_meta,
             format_data: format_data,
             format_path,
-            format_legacy,
+            // format_legacy,
             format_last_check,
         };
 
@@ -275,10 +279,12 @@ impl DiskAPI for LocalDisk {
 
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         if !skip_access_checks(&src_volume) {
-            check_volume_exists(&src_volume).await?;
+            let vol_path = self.get_bucket_path(&src_volume)?;
+            check_volume_exists(&vol_path).await?;
         }
         if !skip_access_checks(&dst_volume) {
-            check_volume_exists(&dst_volume).await?;
+            let vol_path = self.get_bucket_path(&dst_volume)?;
+            check_volume_exists(&vol_path).await?;
         }
 
         let srcp = self.get_object_path(&src_volume, &src_path)?;
@@ -328,6 +334,39 @@ impl DiskAPI for LocalDisk {
         io::copy(&mut r, &mut writer).await?;
 
         Ok(())
+    }
+
+    async fn rename_data(&self, src_volume: &str, src_path: &str, fi: &FileInfo, dst_volume: &str, dst_path: &str) -> Result<()> {
+        if !skip_access_checks(&src_volume) {
+            let vol_path = self.get_bucket_path(&src_volume)?;
+            check_volume_exists(&vol_path).await?;
+        }
+        if !skip_access_checks(&dst_volume) {
+            let vol_path = self.get_bucket_path(&dst_volume)?;
+            check_volume_exists(&vol_path).await?;
+        }
+
+        let src_file_path = self.get_object_path(&src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str())?;
+        let dst_file_path = self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str())?;
+
+        // let mut data_dir = String::new();
+        // if !fi.is_remote() {
+        //     data_dir = utils::path::retain_slash(&fi.data_dir);
+        // }
+
+        // if !data_dir.is_empty() {}
+
+        let curreng_data_path = self.get_object_path(&dst_volume, &dst_path);
+
+        let meta = FileMeta::new();
+
+        let (dst_buf, _) = read_file_exists(&dst_file_path).await?;
+        if !dst_buf.is_empty() {
+            // xl.load
+            // meta.from(dst_buf);
+        }
+
+        unimplemented!()
     }
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
