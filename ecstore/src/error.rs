@@ -1,7 +1,7 @@
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::StdError;
-
+use std::fmt::Display;
 use std::panic::Location;
 
 use tracing::error;
@@ -41,6 +41,12 @@ where
 impl From<Error> for S3Error {
     fn from(e: Error) -> Self {
         S3Error::with_source(S3ErrorCode::InternalError, e.source)
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
     }
 }
 

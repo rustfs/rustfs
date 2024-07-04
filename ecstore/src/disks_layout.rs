@@ -9,8 +9,20 @@ const SET_SIZES: [usize; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 
 
 #[derive(Deserialize, Debug, Default)]
 pub struct PoolDisksLayout {
-    pub cmd_line: String,
-    pub layout: Vec<Vec<String>>,
+    cmd_line: String,
+    layout: Vec<Vec<String>>,
+}
+
+impl AsRef<Vec<Vec<String>>> for PoolDisksLayout {
+    fn as_ref(&self) -> &Vec<Vec<String>> {
+        &self.layout
+    }
+}
+
+impl AsMut<Vec<Vec<String>>> for PoolDisksLayout {
+    fn as_mut(&mut self) -> &mut Vec<Vec<String>> {
+        &mut self.layout
+    }
 }
 
 impl PoolDisksLayout {
@@ -20,12 +32,32 @@ impl PoolDisksLayout {
             layout,
         }
     }
+
+    pub fn count(&self) -> usize {
+        self.layout.len()
+    }
+
+    pub fn as_cmd_line(&self) -> &str {
+        &self.cmd_line
+    }
 }
 
 #[derive(Deserialize, Debug, Default)]
 pub struct DisksLayout {
     pub legacy: bool,
-    pub pools: Vec<PoolDisksLayout>,
+    pools: Vec<PoolDisksLayout>,
+}
+
+impl AsRef<Vec<PoolDisksLayout>> for DisksLayout {
+    fn as_ref(&self) -> &Vec<PoolDisksLayout> {
+        &self.pools
+    }
+}
+
+impl AsMut<Vec<PoolDisksLayout>> for DisksLayout {
+    fn as_mut(&mut self) -> &mut Vec<PoolDisksLayout> {
+        &mut self.pools
+    }
 }
 
 impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
@@ -81,6 +113,14 @@ impl DisksLayout {
 
     pub fn is_single_drive_layout(&self) -> bool {
         self.pools.len() == 1 && self.pools[0].layout.len() == 1 && self.pools[0].layout[0].len() == 1
+    }
+
+    pub fn get_single_drive_layout(&self) -> &str {
+        &self.pools[0].layout[0][0]
+    }
+
+    pub fn get_layout(&self, idx: usize) -> Option<&PoolDisksLayout> {
+        self.pools.get(idx)
     }
 }
 
