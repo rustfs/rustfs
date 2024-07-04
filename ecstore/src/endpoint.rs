@@ -78,6 +78,8 @@ impl TryFrom<&str> for Endpoint {
             return Err(Error::from_string("empty or root endpoint is not supported"));
         }
 
+        // TODO What if the value passed in is something like d:\data\rustfs
+
         let mut is_local = false;
         let url = match Url::parse(value) {
             #[allow(unused_mut)]
@@ -115,7 +117,7 @@ impl TryFrom<&str> for Endpoint {
                 #[cfg(windows)]
                 {
                     let path = url.path().to_owned();
-                    if Path::new(&path[1..]).has_root() {
+                    if Path::new(&path[1..]).is_absolute() {
                         url.set_path(&path[1..]);
                     }
                 }
