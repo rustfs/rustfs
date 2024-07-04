@@ -172,7 +172,7 @@ impl StorageAPI for Sets {
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
-        fi.data_dir = Uuid::new_v4().to_string();
+        fi.data_dir = Uuid::new_v4();
 
         let parts_metadata = vec![fi.clone(); disks.len()];
 

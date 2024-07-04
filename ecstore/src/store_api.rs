@@ -6,17 +6,20 @@ use futures::Stream;
 use s3s::{dto::StreamingBlob, Body};
 use time::OffsetDateTime;
 use tracing::debug;
+use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
+    pub version_id: Uuid,
     pub erasure: ErasureInfo,
     pub deleted: bool,
     // DataDir of the file
-    pub data_dir: String,
+    pub data_dir: Uuid,
     pub mod_time: OffsetDateTime,
+    pub size: usize,
 }
 
 impl FileInfo {
@@ -29,10 +32,12 @@ impl FileInfo {
 impl Default for FileInfo {
     fn default() -> Self {
         Self {
+            version_id: Uuid::nil(),
             erasure: Default::default(),
             deleted: Default::default(),
-            data_dir: Default::default(),
+            data_dir: Uuid::nil(),
             mod_time: OffsetDateTime::UNIX_EPOCH,
+            size: Default::default(),
         }
     }
 }
