@@ -33,7 +33,7 @@ impl ECStore {
 
         let mut deployment_id = None;
 
-        let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address, &layouts.pools, layouts.legacy)?;
+        let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
 
         let mut pools = Vec::with_capacity(endpoint_pools.len());
         let mut disk_map = HashMap::with_capacity(endpoint_pools.len());
