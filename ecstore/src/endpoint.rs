@@ -500,3 +500,145 @@ impl EndpointServerPools {
         nodes
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_new_endpoint() {
+        #[derive(Default)]
+        struct TestCase<'a> {
+            arg: &'a str,
+            expected_endpoint: Option<Endpoint>,
+            expected_type: Option<EndpointType>,
+            expected_err: Option<Error>,
+        }
+
+        let u2 = url::Url::parse("https://example.org/path").unwrap();
+        let u4 = url::Url::parse("http://192.168.253.200/path").unwrap();
+        let root_slash_foo = url::Url::from_file_path("d:/foo").unwrap();
+
+        let test_cases = [
+            TestCase {
+                arg: "d:/foo",
+                expected_endpoint: Some(Endpoint {
+                    url: root_slash_foo,
+                    is_local: true,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }),
+                expected_type: Some(EndpointType::Path),
+                expected_err: None,
+            },
+            TestCase {
+                arg: "https://example.org/path",
+                expected_endpoint: Some(Endpoint {
+                    url: u2,
+                    is_local: false,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }),
+                expected_type: Some(EndpointType::Url),
+                expected_err: None,
+            },
+            TestCase {
+                arg: "http://192.168.253.200/path",
+                expected_endpoint: Some(Endpoint {
+                    url: u4,
+                    is_local: false,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }),
+                expected_type: Some(EndpointType::Url),
+                expected_err: None,
+            },
+            TestCase {
+                arg: "",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+            },
+            TestCase {
+                arg: "/",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+            },
+            TestCase {
+                arg: "\\",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+            },
+            TestCase {
+                arg: "c://foo",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+            },
+            TestCase {
+                arg: "ftp://foo",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+            },
+            TestCase {
+                arg: "http://server/path?location",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+            },
+            TestCase {
+                arg: "http://:/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: invalid port number")),
+            },
+            TestCase {
+                arg: "http://:8080/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: empty host name")),
+            },
+            TestCase {
+                arg: "http://server:/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: invalid port number")),
+            },
+            TestCase {
+                arg: "https://93.184.216.34:808080/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: port number must be between 1 to 65535")),
+            },
+            TestCase {
+                arg: "http://server:8080//",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root path is not supported in URL endpoint")),
+            },
+            TestCase {
+                arg: "http://server:8080/",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root path is not supported in URL endpoint")),
+            },
+            TestCase {
+                arg: "192.168.1.210:9000",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: missing scheme http or https")),
+            },
+        ];
+
+        for test_case in test_cases {
+            let ret = Endpoint::try_from(test_case.arg);
+            println!("{:?}", ret)
+        }
+    }
+}
