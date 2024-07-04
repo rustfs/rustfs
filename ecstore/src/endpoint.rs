@@ -18,7 +18,7 @@ pub enum EndpointType {
 }
 
 /// enum for setup type.
-#[derive(Debug)]
+#[derive(PartialEq, Eq)]
 pub enum SetupType {
     /// FS setup type enum.
     FS,
@@ -80,6 +80,7 @@ impl TryFrom<&str> for Endpoint {
 
         let mut is_local = false;
         let url = match Url::parse(value) {
+            #[allow(unused_mut)]
             Ok(mut url) => {
                 // URL style of endpoint.
                 // Valid URL style endpoint is
@@ -206,6 +207,14 @@ impl Endpoint {
             _ => String::new(),
         }
     }
+
+    fn host_port(&self) -> String {
+        match (self.url.host(), self.url.port()) {
+            (Some(host), Some(port)) => format!("{}:{}", host, port),
+            (Some(host), None) => format!("{}", host),
+            _ => String::new(),
+        }
+    }
 }
 
 /// list of same type of endpoint.
@@ -235,8 +244,8 @@ impl TryFrom<&[String]> for Endpoints {
 
     /// returns new endpoint list based on input args.
     fn try_from(args: &[String]) -> Result<Self> {
-        let mut endpoint_type;
-        let mut schema;
+        let mut endpoint_type = None;
+        let mut schema = None;
         let mut endpoints = Vec::with_capacity(args.len());
         let mut uniq_set = HashSet::with_capacity(args.len());
 
@@ -249,11 +258,11 @@ impl TryFrom<&[String]> for Endpoints {
 
             // All endpoints have to be same type and scheme if applicable.
             if i == 0 {
-                endpoint_type = endpoint.get_type();
-                schema = endpoint.url.scheme();
-            } else if endpoint.get_type() != endpoint_type {
+                endpoint_type = Some(endpoint.get_type());
+                schema = Some(endpoint.url.scheme().to_owned());
+            } else if Some(endpoint.get_type()) != endpoint_type {
                 return Err(Error::from_string("mixed style endpoints are not supported"));
-            } else if endpoint.url.scheme() != schema {
+            } else if Some(endpoint.url.scheme()) != schema.as_deref() {
                 return Err(Error::from_string("mixed scheme is not supported"));
             }
 
@@ -346,9 +355,9 @@ impl PoolEndpointList {
         for pool in pool_endpoints.iter() {
             for ep in pool.as_ref() {
                 if let Some(host) = ep.url.host_str() {
-                    unique_args.insert(host);
+                    unique_args.insert(host.to_owned());
                 } else {
-                    unique_args.insert(format!("localhost:{}", server_addr.port()).as_str());
+                    unique_args.insert(format!("localhost:{}", server_addr.port()));
                 }
             }
         }
@@ -419,25 +428,25 @@ impl EndpointServerPools {
             return Err(Error::from_string("Invalid arguments specified"));
         }
 
-        let mut pool_eps = PoolEndpointList::create_pool_endpoints(server_addr, disks_layout)?;
+        let pool_eps = PoolEndpointList::create_pool_endpoints(server_addr, disks_layout)?;
 
         let mut ret: EndpointServerPools = Vec::with_capacity(pool_eps.as_ref().len()).into();
-        for (i, eps) in pool_eps.as_mut().into_iter().enumerate() {
+        for (i, eps) in pool_eps.inner.into_iter().enumerate() {
             let layout = disks_layout.get_layout(i);
             let set_count = layout.map_or(0, |v| v.count());
-            let drives_per_set = layout.map_or(0, |v| v.as_ref().get(0).map_or(0, |v| v.len()));
-            let cmd_line = layout.map_or(String::new(), |v| v.as_cmd_line().to_owned());
+            let drives_per_set = layout.map_or(0, |v| v.as_ref().first().map_or(0, |v| v.len()));
+            let cmd_line = layout.map_or(String::new(), |v| v.get_cmd_line().to_owned());
 
             let ep = PoolEndpoints {
                 legacy: disks_layout.legacy,
                 set_count,
                 drives_per_set,
-                endpoints: *eps,
+                endpoints: eps,
                 cmd_line,
                 platform: String::new(),
             };
 
-            ret.add(ep);
+            ret.add(ep)?;
         }
 
         Ok((ret, pool_eps.setup_type))
@@ -469,12 +478,11 @@ impl EndpointServerPools {
 
         for pool in self.0.iter() {
             for ep in pool.endpoints.as_ref() {
-                let host = ep.grid_host();
-                let n = node_map.entry(host).or_insert(Node {
+                let n = node_map.entry(ep.host_port()).or_insert(Node {
                     url: ep.url.clone(),
                     pools: vec![],
                     is_local: ep.is_local,
-                    grid_host: host,
+                    grid_host: ep.grid_host(),
                 });
 
                 if let Some(pool_idx) = ep.pool_idx {
@@ -485,7 +493,7 @@ impl EndpointServerPools {
             }
         }
 
-        let mut nodes: Vec<Node> = node_map.into_iter().map(|(_, n)| n).collect();
+        let mut nodes: Vec<Node> = node_map.into_values().collect();
 
         nodes.sort_by(|a, b| a.grid_host.cmp(&b.grid_host));
 

@@ -35,7 +35,7 @@ pub fn check_local_server_addr(server_addr: &str) -> Result<SocketAddr> {
         }
     }
 
-    return Err(Error::from_string("host in server address should be this server"));
+    Err(Error::from_string("host in server address should be this server"))
 }
 
 pub fn split_host_port(s: &str) -> Result<(String, u16)> {
