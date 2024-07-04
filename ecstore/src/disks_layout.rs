@@ -37,7 +37,7 @@ impl PoolDisksLayout {
         self.layout.len()
     }
 
-    pub fn as_cmd_line(&self) -> &str {
+    pub fn get_cmd_line(&self) -> &str {
         &self.cmd_line
     }
 }
