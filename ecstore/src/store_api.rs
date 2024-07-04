@@ -79,7 +79,6 @@ impl FileInfo {
 
         (data_blocks >= parity_blocks)
             && (data_blocks > 0)
-            && (parity_blocks >= 0)
             && (self.erasure.index > 0
                 && self.erasure.index <= data_blocks + parity_blocks
                 && self.erasure.distribution.len() == (data_blocks + parity_blocks))
