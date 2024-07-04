@@ -27,7 +27,7 @@ impl S3PeerSys {
     pub fn new(eps: &EndpointServerPools, local_disks: Vec<DiskStore>) -> Self {
         Self {
             clients: Self::new_clients(eps, local_disks),
-            pools_count: eps.len(),
+            pools_count: eps.as_ref().len(),
         }
     }
 
@@ -37,15 +37,11 @@ impl S3PeerSys {
             .iter()
             .map(|e| {
                 if e.is_local {
-                    let cli: Box<dyn PeerS3Client> = Box::new(LocalPeerS3Client::new(
-                        local_disks.clone(),
-                        e.clone(),
-                        e.pools.clone(),
-                    ));
+                    let cli: Box<dyn PeerS3Client> =
+                        Box::new(LocalPeerS3Client::new(local_disks.clone(), e.clone(), e.pools.clone()));
                     Arc::new(cli)
                 } else {
-                    let cli: Box<dyn PeerS3Client> =
-                        Box::new(RemotePeerS3Client::new(e.clone(), e.pools.clone()));
+                    let cli: Box<dyn PeerS3Client> = Box::new(RemotePeerS3Client::new(e.clone(), e.pools.clone()));
                     Arc::new(cli)
                 }
             })
