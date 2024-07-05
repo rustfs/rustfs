@@ -98,9 +98,20 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    async fn get_object_lock_configuration(
+        &self,
+        _req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        // mc cp step 1
+        let output = GetObjectLockConfigurationOutput::default();
+        Ok(S3Response::new(output))
+    }
+
     #[tracing::instrument]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
+
+        println!("get_object: {:?}", &input);
 
         let output = GetObjectOutput { ..Default::default() };
         Ok(S3Response::new(output))
@@ -109,6 +120,8 @@ impl S3 for FS {
     #[tracing::instrument]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
+
+        // mc cp step 2
 
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
@@ -190,6 +203,8 @@ impl S3 for FS {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
+
+        // mc cp step 3
 
         let output = CreateMultipartUploadOutput { ..Default::default() };
 
