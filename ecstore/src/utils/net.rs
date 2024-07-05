@@ -11,10 +11,10 @@ lazy_static! {
 }
 
 /// helper for validating if the provided arg is an ip address.
-pub fn is_socket_addr(host: &str) -> bool {
+pub fn is_socket_addr(addr: &str) -> bool {
     // TODO IPv6 zone information?
 
-    host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
+    addr.parse::<SocketAddr>().is_ok() || addr.parse::<IpAddr>().is_ok()
 }
 
 /// checks if server_addr is valid and local host.
