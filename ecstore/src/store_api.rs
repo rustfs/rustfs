@@ -20,6 +20,7 @@ pub struct FileInfo {
     pub data_dir: Uuid,
     pub mod_time: OffsetDateTime,
     pub size: usize,
+    pub data: Vec<u8>,
 }
 
 impl FileInfo {
@@ -38,6 +39,7 @@ impl Default for FileInfo {
             data_dir: Uuid::nil(),
             mod_time: OffsetDateTime::UNIX_EPOCH,
             size: Default::default(),
+            data: Default::default(),
         }
     }
 }

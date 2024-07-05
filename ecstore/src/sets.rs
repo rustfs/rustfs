@@ -16,6 +16,8 @@ use crate::{
     utils::hash,
 };
 
+const DEFAULT_INLINE_BLOCKS: usize = 128 * 1024;
+
 #[derive(Debug)]
 pub struct Sets {
     pub id: Uuid,
