@@ -411,6 +411,23 @@ impl PoolEndpointList {
                 }
             }
 
+            // Check whether same path is used for more than 1 local endpoints.
+            let mut local_path_set = HashSet::new();
+            for ep in endpoints.as_ref() {
+                if !ep.is_local {
+                    continue;
+                }
+
+                let path = ep.url.path();
+                if local_path_set.contains(path) {
+                    return Err(Error::from_string(format!(
+                        "path '{}' cannot be served by different address on same server",
+                        path
+                    )));
+                }
+                local_path_set.insert(path);
+            }
+
             // Here all endpoints are URL style.
             let mut ep_path_set = HashSet::new();
             let mut local_server_host_set = HashSet::new();
@@ -423,6 +440,15 @@ impl PoolEndpointList {
                     local_server_host_set.insert(ep.url.host());
                     local_port_set.insert(ep.url.port());
                     local_endpoint_count += 1;
+                }
+            }
+
+            // All endpoints are pointing to local host
+            if endpoints.as_ref().len() == local_endpoint_count {
+                // If all endpoints have same port number, Just treat it as local erasure setup
+                // using URL style endpoints.
+                if local_port_set.len() == 1 && local_server_host_set.len() > 1 {
+                    return Err(Error::from_string("all local endpoints should not have different hostnames/ips"));
                 }
             }
         }
@@ -640,6 +666,8 @@ fn url_parse_from_file_path(value: &str) -> Result<url::Url> {
 
 #[cfg(test)]
 mod test {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -925,5 +953,529 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_create_pool_endpoints() {
+        #[derive(Default)]
+        struct TestCase<'a> {
+            server_addr: &'a str,
+            args: Vec<&'a str>,
+            expected_server_addr: &'a str,
+            expected_endpoints: Option<Endpoints>,
+            expected_setup_type: Option<SetupType>,
+            expected_err: Option<Error>,
+        }
+
+        // Filter ipList by IPs those do not start with '127.'.
+        let non_loop_back_i_ps =
+            net::must_get_local_ips().map_or(vec![], |v| v.into_iter().filter(|ip| ip.is_ipv4() && ip.is_loopback()).collect());
+        if non_loop_back_i_ps.is_empty() {
+            panic!("No non-loop back IP address found for this host");
+        }
+        let non_loop_back_ip = non_loop_back_i_ps[0];
+
+        let case1_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let case1_endpoint2 = format!("http://{}/d2", non_loop_back_ip);
+        let args = vec![
+            format!("http://{}:10000/d1", non_loop_back_ip),
+            format!("http://{}:10000/d2", non_loop_back_ip),
+            "http://example.org:10000/d3".to_string(),
+            "http://example.com:10000/d4".to_string(),
+        ];
+        let (case1_ur_ls, case1_local_flags) = get_expected_endpoints(args, format!("http://{}:10000/", non_loop_back_ip));
+
+        let case2_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let case2_endpoint2 = format!("http://{}:9000/d2", non_loop_back_ip);
+        let args = vec![
+            format!("http://{}:10000/d1", non_loop_back_ip),
+            format!("http://{}:9000/d2", non_loop_back_ip),
+            "http://example.org:10000/d3".to_string(),
+            "http://example.com:10000/d4".to_string(),
+        ];
+        let (case2_ur_ls, case2_local_flags) = get_expected_endpoints(args, format!("http://{}:10000/", non_loop_back_ip));
+
+        let case3_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let args = vec![
+            format!("http://{}:80/d1", non_loop_back_ip),
+            "http://example.org:9000/d2".to_string(),
+            "http://example.com:80/d3".to_string(),
+            "http://example.net:80/d4".to_string(),
+        ];
+        let (case3_ur_ls, case3_local_flags) = get_expected_endpoints(args, format!("http://{}:80/", non_loop_back_ip));
+
+        let case4_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let args = vec![
+            format!("http://{}:9000/d1", non_loop_back_ip),
+            "http://example.org:9000/d2".to_string(),
+            "http://example.com:9000/d3".to_string(),
+            "http://example.net:9000/d4".to_string(),
+        ];
+        let (case4_ur_ls, case4_local_flags) = get_expected_endpoints(args, format!("http://{}:9000/", non_loop_back_ip));
+
+        let case5_endpoint1 = format!("http://{}:9000/d1", non_loop_back_ip);
+        let case5_endpoint2 = format!("http://{}:9001/d2", non_loop_back_ip);
+        let case5_endpoint3 = format!("http://{}:9002/d3", non_loop_back_ip);
+        let case5_endpoint4 = format!("http://{}:9003/d4", non_loop_back_ip);
+        let args = vec![
+            case5_endpoint1.clone(),
+            case5_endpoint2.clone(),
+            case5_endpoint3.clone(),
+            case5_endpoint4.clone(),
+        ];
+        let (case5_ur_ls, case5_local_flags) = get_expected_endpoints(args, format!("http://{}:9000/", non_loop_back_ip));
+
+        let case6_endpoint1 = format!("http://{}:9003/d4", non_loop_back_ip);
+        let args = vec![
+            "http://localhost:9000/d1".to_string(),
+            "http://localhost:9001/d2".to_string(),
+            "http://127.0.0.1:9002/d3".to_string(),
+            case6_endpoint1.clone(),
+        ];
+        let (case6_ur_ls, case6_local_flags) = get_expected_endpoints(args, format!("http://{}:9003/", non_loop_back_ip));
+
+        let case7_endpoint1 = format!("http://{}:9001/export", non_loop_back_ip);
+        let case7_endpoint2 = format!("http://{}:9000/export", non_loop_back_ip);
+
+        let test_cases = [
+            TestCase {
+                server_addr: "localhost",
+                expected_err: Some(Error::from_string("address localhost: missing port in address")),
+                ..Default::default()
+            },
+            // Erasure Single Drive
+            TestCase {
+                server_addr: "localhost:9000",
+                args: vec!["http://localhost/d1"],
+                expected_err: Some(Error::from_string("use path style endpoint for SD setup")),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: ":443",
+                args: vec!["/d1"],
+                expected_server_addr: ":443",
+                expected_endpoints: Some(Endpoints(vec![Endpoint {
+                    url: must_file_path("/d1"),
+                    is_local: true,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }])),
+                expected_setup_type: Some(SetupType::ErasureSD),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: "localhost:10000",
+                args: vec!["/d1"],
+                expected_server_addr: "localhost:10000",
+                expected_endpoints: Some(Endpoints(vec![Endpoint {
+                    url: must_file_path("/d1"),
+                    is_local: true,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }])),
+                expected_setup_type: Some(SetupType::ErasureSD),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: "localhost:9000",
+                args: vec![
+                    "https://127.0.0.1:9000/d1",
+                    "https://localhost:9001/d1",
+                    "https://example.com/d1",
+                    "https://example.com/d2",
+                ],
+                expected_err: Some(Error::from_string("path '/d1' can not be served by different port on same address")),
+                ..Default::default()
+            },
+            // Erasure Setup with PathEndpointType
+            TestCase {
+                server_addr: ":1234",
+                args: vec!["/d1", "/d2", "/d3", "/d4"],
+                expected_server_addr: ":1234",
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: must_file_path("/d1"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_file_path("/d2"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_file_path("/d3"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_file_path("/d4"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::Erasure),
+                ..Default::default()
+            },
+            // DistErasure Setup with URLEndpointType
+            TestCase {
+                server_addr: ":9000",
+                args: vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://localhost/d3",
+                    "http://localhost/d4",
+                ],
+                expected_server_addr: ":9000",
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: must_url("http://localhost:9000/d1"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_url("http://localhost:9000/d2"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_url("http://localhost:9000/d3"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_url("http://localhost:9000/d4"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::Erasure),
+                ..Default::default()
+            },
+            // DistErasure Setup with URLEndpointType having mixed naming to local host.
+            TestCase {
+                server_addr: "127.0.0.1:10000",
+                args: vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://127.0.0.1/d3",
+                    "http://127.0.0.1/d4",
+                ],
+                expected_err: Some(Error::from_string("all local endpoints should not have different hostnames/ips")),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: ":9001",
+                args: vec![
+                    "http://10.0.0.1:9000/export",
+                    "http://10.0.0.2:9000/export",
+                    case7_endpoint1.as_str(),
+                    "http://10.0.0.2:9001/export",
+                ],
+                expected_err: Some(Error::from_string("path '/export' can not be served by different port on same address")),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: ":9000",
+                args: vec![
+                    "http://127.0.0.1:9000/export",
+                    case7_endpoint2.as_str(),
+                    "http://10.0.0.1:9000/export",
+                    "http://10.0.0.2:9000/export",
+                ],
+                expected_err: Some(Error::from_string("path '/export' cannot be served by different address on same server")),
+                ..Default::default()
+            },
+            // DistErasure type
+            TestCase {
+                server_addr: "127.0.0.1:10000",
+                args: vec![
+                    case1_endpoint1.as_str(),
+                    case1_endpoint2.as_str(),
+                    "http://example.org/d3",
+                    "http://example.com/d4",
+                ],
+                expected_server_addr: "127.0.0.1:10000",
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case1_ur_ls[0].clone(),
+                        is_local: case1_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case1_ur_ls[1].clone(),
+                        is_local: case1_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case1_ur_ls[2].clone(),
+                        is_local: case1_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case1_ur_ls[3].clone(),
+                        is_local: case1_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: "127.0.0.1:10000",
+                args: vec![
+                    case2_endpoint1.as_str(),
+                    case2_endpoint2.as_str(),
+                    "http://example.org/d3",
+                    "http://example.com/d4",
+                ],
+                expected_server_addr: "127.0.0.1:10000",
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case2_ur_ls[0].clone(),
+                        is_local: case2_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case2_ur_ls[1].clone(),
+                        is_local: case2_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case2_ur_ls[2].clone(),
+                        is_local: case2_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case2_ur_ls[3].clone(),
+                        is_local: case2_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: ":80",
+                args: vec![
+                    case3_endpoint1.as_str(),
+                    "http://example.org:9000/d2",
+                    "http://example.com/d3",
+                    "http://example.net/d4",
+                ],
+                expected_server_addr: ":80",
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case3_ur_ls[0].clone(),
+                        is_local: case3_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case3_ur_ls[1].clone(),
+                        is_local: case3_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case3_ur_ls[2].clone(),
+                        is_local: case3_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case3_ur_ls[3].clone(),
+                        is_local: case3_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: ":9000",
+                args: vec![
+                    case4_endpoint1.as_str(),
+                    "http://example.org/d2",
+                    "http://example.com/d3",
+                    "http://example.net/d4",
+                ],
+                expected_server_addr: ":9000",
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case4_ur_ls[0].clone(),
+                        is_local: case4_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case4_ur_ls[1].clone(),
+                        is_local: case4_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case4_ur_ls[2].clone(),
+                        is_local: case4_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case4_ur_ls[3].clone(),
+                        is_local: case4_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: ":9000",
+                args: vec![
+                    case5_endpoint1.as_str(),
+                    case5_endpoint2.as_str(),
+                    case5_endpoint3.as_str(),
+                    case5_endpoint4.as_str(),
+                ],
+                expected_server_addr: ":9000",
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case5_ur_ls[0].clone(),
+                        is_local: case5_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case5_ur_ls[1].clone(),
+                        is_local: case5_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case5_ur_ls[2].clone(),
+                        is_local: case5_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case5_ur_ls[3].clone(),
+                        is_local: case5_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                server_addr: ":9003",
+                args: vec![
+                    "http://localhost:9000/d1",
+                    "http://localhost:9001/d2",
+                    "http://127.0.0.1:9002/d3",
+                    case6_endpoint1.as_str(),
+                ],
+                expected_server_addr: ":9003",
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case6_ur_ls[0].clone(),
+                        is_local: case6_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case6_ur_ls[1].clone(),
+                        is_local: case6_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case6_ur_ls[2].clone(),
+                        is_local: case6_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case6_ur_ls[3].clone(),
+                        is_local: case6_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+        ];
+    }
+
+    fn must_file_path(s: impl AsRef<Path>) -> url::Url {
+        url::Url::from_file_path(s).unwrap()
+    }
+
+    fn must_url(s: &str) -> url::Url {
+        url::Url::parse(s).unwrap()
+    }
+
+    fn get_expected_endpoints(args: Vec<String>, prefix: String) -> (Vec<url::Url>, Vec<bool>) {
+        let mut urls = vec![];
+        let mut local_flags = vec![];
+        for arg in args {
+            urls.push(url::Url::parse(&arg).unwrap());
+            local_flags.push(arg.starts_with(&prefix));
+        }
+
+        (urls, local_flags)
     }
 }
