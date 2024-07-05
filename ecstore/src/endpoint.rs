@@ -5,7 +5,13 @@ use path_absolutize::Absolutize;
 use path_clean::PathClean;
 use std::collections::HashSet;
 use std::fmt::Display;
-use std::{collections::HashMap, path::Path, usize};
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    path::Path,
+    usize,
+};
 use url::{ParseError, Url};
 
 /// enum for endpoint type.
@@ -370,12 +376,127 @@ impl PoolEndpointList {
             setup_type,
         };
 
-        pool_endpoint_list.update_is_local()?;
+        pool_endpoint_list.update_is_local(server_addr.port())?;
+
+        for endpoints in pool_endpoint_list.inner.iter() {
+            // Check whether same path is not used in endpoints of a host on different port.
+            let mut path_ip_map: HashMap<&str, Arc<HashSet<IpAddr>>> = HashMap::new();
+            let mut host_ip_cache = HashMap::new();
+            for ep in endpoints.as_ref() {
+                let mut host_ip_set = Arc::new(HashSet::<IpAddr>::new());
+
+                if let Some(host) = ep.url.host() {
+                    if let Entry::Vacant(e) = host_ip_cache.entry(host.clone()) {
+                        host_ip_set = Arc::new(
+                            net::get_host_ip(host.clone())
+                                .map_err(|e| Error::from_string(format!("host '{}' cannot resolve: {}", host, e)))?,
+                        );
+                        e.insert(host_ip_set.clone());
+                    }
+                }
+
+                let path = ep.url.path();
+                match path_ip_map.entry(path) {
+                    Entry::Occupied(e) => {
+                        if e.get().intersection(host_ip_set.as_ref()).count() > 0 {
+                            return Err(Error::from_string(format!(
+                                "same path '{}' can not be served by different port on same address",
+                                path
+                            )));
+                        }
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(host_ip_set.clone());
+                    }
+                }
+            }
+
+            // Here all endpoints are URL style.
+            let mut ep_path_set = HashSet::new();
+            let mut local_server_host_set = HashSet::new();
+            let mut local_port_set = HashSet::new();
+            let mut local_endpoint_count = 0;
+
+            for ep in endpoints.as_ref() {
+                ep_path_set.insert(ep.url.path());
+                if ep.is_local && ep.url.has_host() {
+                    local_server_host_set.insert(ep.url.host());
+                    local_port_set.insert(ep.url.port());
+                    local_endpoint_count += 1;
+                }
+            }
+        }
 
         Ok(pool_endpoint_list)
     }
 
-    fn update_is_local(&mut self) -> Result<()> {
+    /// resolves all hosts and discovers which are local
+    fn update_is_local(&mut self, local_port: u16) -> Result<()> {
+        for endpoints in self.inner.iter_mut() {
+            for ep in endpoints.as_mut() {
+                match ep.url.host() {
+                    None => {
+                        ep.is_local = true;
+                    }
+                    Some(host) => {
+                        ep.is_local = net::is_local_host(host, ep.url.port().unwrap_or_default(), local_port)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// resolves all hosts and discovers which are local
+    fn _update_is_local(&mut self, local_port: u16) -> Result<()> {
+        let mut eps_resolved = 0;
+        let mut found_local = false;
+        let mut resolved_set: HashSet<(usize, usize)> = HashSet::new();
+        let ep_count: usize = self.inner.iter().map(|v| v.as_ref().len()).sum();
+
+        loop {
+            // Break if the local endpoint is found already Or all the endpoints are resolved.
+            if found_local || eps_resolved == ep_count {
+                break;
+            }
+
+            for (i, endpoints) in self.inner.iter_mut().enumerate() {
+                for (j, ep) in endpoints.as_mut().iter_mut().enumerate() {
+                    if resolved_set.contains(&(i, j)) {
+                        // Continue if host is already resolved.
+                        continue;
+                    }
+
+                    match ep.url.host() {
+                        None => {
+                            if !found_local {
+                                found_local = true;
+                            }
+                            ep.is_local = true;
+                            eps_resolved += 1;
+                            resolved_set.insert((i, j));
+                            continue;
+                        }
+                        Some(host) => match net::is_local_host(host, ep.url.port().unwrap_or_default(), local_port) {
+                            Ok(is_local) => {
+                                if !found_local {
+                                    found_local = is_local;
+                                }
+                                ep.is_local = is_local;
+                                eps_resolved += 1;
+                                resolved_set.insert((i, j));
+                            }
+                            Err(err) => {
+                                // TODO Retry infinitely on Kubernetes and Docker swarm?
+                                return Err(err);
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
         unimplemented!()
     }
 }
