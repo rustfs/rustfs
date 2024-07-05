@@ -69,6 +69,29 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> Result<boo
     Ok(is_local_host)
 }
 
+/// returns IP address of given host.
+pub fn get_host_ip(host: Host<&str>) -> Result<HashSet<IpAddr>> {
+    match host {
+        Host::Domain(domain) => match (domain, 0)
+            .to_socket_addrs()
+            .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
+        {
+            Ok(ips) => Ok(ips),
+            Err(err) => Err(Error::new(Box::new(err))),
+        },
+        Host::Ipv4(ip) => {
+            let mut set = HashSet::with_capacity(1);
+            set.insert(IpAddr::V4(ip));
+            Ok(set)
+        }
+        Host::Ipv6(ip) => {
+            let mut set = HashSet::with_capacity(1);
+            set.insert(IpAddr::V6(ip));
+            Ok(set)
+        }
+    }
+}
+
 /// returns IPs of local interface
 fn must_get_local_ips() -> Result<Vec<IpAddr>> {
     match netif::up() {
