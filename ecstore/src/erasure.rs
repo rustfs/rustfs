@@ -32,12 +32,13 @@ impl Erasure {
         block_size: usize,
         data_size: usize,
         write_quorum: usize,
-    ) -> Result<()>
+    ) -> Result<usize>
     where
         S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
         W: AsyncWrite + Unpin,
     {
         let mut stream = ChunkedStream::new(body, data_size, block_size, true);
+        let mut total: usize = 0;
         while let Some(result) = stream.next().await {
             match result {
                 Ok(data) => {
@@ -46,6 +47,8 @@ impl Erasure {
                     let mut errs = Vec::new();
 
                     for (i, w) in writers.iter_mut().enumerate() {
+                        total += blocks[i].len();
+
                         match w.write_all(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
                             Err(e) => errs.push(Some(e)),
@@ -59,7 +62,7 @@ impl Erasure {
             }
         }
 
-        Ok(())
+        Ok(total)
 
         // loop {
         //     match rd.next().await {

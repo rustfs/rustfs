@@ -184,6 +184,43 @@ impl LocalDisk {
             clean_tmp: true,
         })
     }
+
+    pub async fn rename_all(&self, src_data_path: &PathBuf, dst_data_path: &PathBuf, skip: &PathBuf) -> Result<()> {
+        if !skip.starts_with(&src_data_path) {
+            fs::create_dir_all(dst_data_path.parent().unwrap_or(Path::new("/"))).await?;
+        }
+
+        debug!(
+            "rename_all from \n {:?} \n to \n {:?} \n skip:{:?}",
+            &src_data_path, &dst_data_path, &skip
+        );
+
+        fs::rename(&src_data_path, &dst_data_path).await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_file(&self, base_path: &PathBuf, delete_path: &PathBuf) -> Result<()> {
+        if is_root_path(base_path) || is_root_path(delete_path) {
+            return Ok(());
+        }
+
+        if !delete_path.starts_with(base_path) || base_path == delete_path {
+            return Ok(());
+        }
+
+        if delete_path.is_dir() {
+            fs::remove_dir(delete_path).await?;
+        } else {
+            fs::remove_file(delete_path).await?;
+        }
+
+        Ok(())
+    }
+}
+
+fn is_root_path(path: &PathBuf) -> bool {
+    path.components().count() == 1 && path.has_root()
 }
 
 // 过滤 std::io::ErrorKind::NotFound
@@ -337,36 +374,79 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn rename_data(&self, src_volume: &str, src_path: &str, fi: &FileInfo, dst_volume: &str, dst_path: &str) -> Result<()> {
+        let src_volume_path = self.get_bucket_path(&src_volume)?;
         if !skip_access_checks(&src_volume) {
-            let vol_path = self.get_bucket_path(&src_volume)?;
-            check_volume_exists(&vol_path).await?;
+            check_volume_exists(&src_volume_path).await?;
         }
+
+        let dst_volume_path = self.get_bucket_path(&dst_volume)?;
         if !skip_access_checks(&dst_volume) {
-            let vol_path = self.get_bucket_path(&dst_volume)?;
-            check_volume_exists(&vol_path).await?;
+            check_volume_exists(&dst_volume_path).await?;
         }
 
         let src_file_path = self.get_object_path(&src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str())?;
         let dst_file_path = self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
-        // let mut data_dir = String::new();
-        // if !fi.is_remote() {
-        //     data_dir = utils::path::retain_slash(&fi.data_dir);
-        // }
+        let (src_data_path, dst_data_path) = {
+            let mut data_dir = String::new();
+            if !fi.is_remote() {
+                data_dir = utils::path::retain_slash(fi.data_dir.to_string().as_str());
+            }
 
-        // if !data_dir.is_empty() {}
+            if !data_dir.is_empty() {
+                let src_data_path = self.get_object_path(
+                    &src_volume,
+                    utils::path::retain_slash(format!("{}/{}", &src_path, data_dir).as_str()).as_str(),
+                )?;
+                let dst_data_path = self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, data_dir).as_str())?;
 
-        let curreng_data_path = self.get_object_path(&dst_volume, &dst_path);
+                (src_data_path, dst_data_path)
+            } else {
+                (PathBuf::new(), PathBuf::new())
+            }
+        };
 
-        let meta = FileMeta::new();
+        // let curreng_data_path = self.get_object_path(&dst_volume, &dst_path);
+
+        let mut meta = FileMeta::new();
 
         let (dst_buf, _) = read_file_exists(&dst_file_path).await?;
+
+        let mut skipParent = dst_volume_path;
+        if !&dst_buf.is_empty() {
+            skipParent = PathBuf::from(&dst_file_path.parent().unwrap_or(Path::new("/")));
+        }
+
         if !dst_buf.is_empty() {
+            meta = match FileMeta::unmarshal(dst_buf) {
+                Ok(m) => m,
+                Err(e) => FileMeta::new(),
+            }
             // xl.load
             // meta.from(dst_buf);
         }
 
-        unimplemented!()
+        meta.add_version(fi.clone())?;
+
+        let fm_data = meta.marshal_msg()?;
+
+        fs::write(&src_file_path, fm_data).await?;
+
+        let no_inline = src_data_path.has_root() && fi.data.is_empty() && fi.size > 0;
+        if no_inline {
+            self.rename_all(&src_data_path, &dst_data_path, &skipParent).await?;
+        }
+
+        self.rename_all(&src_file_path, &dst_file_path, &skipParent).await?;
+
+        if src_volume != RUSTFS_META_MULTIPART_BUCKET {
+            fs::remove_dir(&src_file_path.parent().unwrap()).await?;
+        } else {
+            self.delete_file(&src_volume_path, &PathBuf::from(src_file_path.parent().unwrap()))
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
