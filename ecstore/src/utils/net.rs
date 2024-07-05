@@ -93,7 +93,7 @@ pub fn get_host_ip(host: Host<&str>) -> Result<HashSet<IpAddr>> {
 }
 
 /// returns IPs of local interface
-fn must_get_local_ips() -> Result<Vec<IpAddr>> {
+pub(crate) fn must_get_local_ips() -> Result<Vec<IpAddr>> {
     match netif::up() {
         Ok(up) => Ok(up.map(|x| x.address().to_owned()).collect()),
         Err(err) => Err(Error::from_string(format!("Unable to get IP addresses of this host: {}", err))),
