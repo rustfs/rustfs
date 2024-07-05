@@ -176,7 +176,7 @@ impl StorageAPI for Sets {
 
         let parts_metadata = vec![fi.clone(); disks.len()];
 
-        let (shuffle_disks, shuffle_parts_metadata) = shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
+        let (shuffle_disks, mut shuffle_parts_metadata) = shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let mut writers = Vec::with_capacity(disks.len());
 
@@ -209,7 +209,7 @@ impl StorageAPI for Sets {
 
         let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks);
 
-        erasure
+        let w_size = erasure
             .encode(data.stream, &mut writers, fi.erasure.block_size, data.content_length, write_quorum)
             .await?;
 
@@ -235,6 +235,11 @@ impl StorageAPI for Sets {
         // TODO: reduceWriteQuorumErrs
         // evalDisks
 
+        for fi in shuffle_parts_metadata.iter_mut() {
+            fi.mod_time = OffsetDateTime::now_utc();
+            fi.size = w_size;
+        }
+
         let rename_errs = self
             .rename_data(
                 &shuffle_disks,
@@ -247,6 +252,8 @@ impl StorageAPI for Sets {
             .await;
 
         // TODO: reduceWriteQuorumErrs
+
+        debug!("put_object rename_errs:{:?}", rename_errs);
 
         // self.commit_rename_data_dir(&shuffle_disks,&bucket,&object,)
 

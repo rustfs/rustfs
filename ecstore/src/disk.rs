@@ -341,32 +341,61 @@ impl DiskAPI for LocalDisk {
             let vol_path = self.get_bucket_path(&src_volume)?;
             check_volume_exists(&vol_path).await?;
         }
+
+        let dst_volume_path = self.get_bucket_path(&dst_volume)?;
         if !skip_access_checks(&dst_volume) {
-            let vol_path = self.get_bucket_path(&dst_volume)?;
-            check_volume_exists(&vol_path).await?;
+            check_volume_exists(&dst_volume_path).await?;
         }
 
         let src_file_path = self.get_object_path(&src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str())?;
         let dst_file_path = self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
-        // let mut data_dir = String::new();
-        // if !fi.is_remote() {
-        //     data_dir = utils::path::retain_slash(&fi.data_dir);
-        // }
+        let (src_data_path, dst_data_path) = {
+            let mut data_dir = String::new();
+            if !fi.is_remote() {
+                data_dir = utils::path::retain_slash(fi.data_dir.to_string().as_str());
+            }
 
-        // if !data_dir.is_empty() {}
+            if !data_dir.is_empty() {
+                let src_data_path = self.get_object_path(
+                    &src_volume,
+                    utils::path::retain_slash(format!("{}/{}", &src_path, data_dir).as_str()).as_str(),
+                )?;
+                let dst_data_path = self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, data_dir).as_str())?;
+
+                (src_data_path, dst_data_path)
+            } else {
+                (PathBuf::new(), PathBuf::new())
+            }
+        };
 
         let curreng_data_path = self.get_object_path(&dst_volume, &dst_path);
 
-        let meta = FileMeta::new();
+        let mut meta = FileMeta::new();
 
         let (dst_buf, _) = read_file_exists(&dst_file_path).await?;
+
+        let mut skipParent = dst_volume_path.as_path();
+        if !&dst_buf.is_empty() {
+            skipParent = skipParent.parent().unwrap_or(Path::new("/"));
+        }
+
         if !dst_buf.is_empty() {
+            meta = match FileMeta::unmarshal(dst_buf) {
+                Ok(m) => m,
+                Err(e) => FileMeta::new(),
+            }
             // xl.load
             // meta.from(dst_buf);
         }
 
-        unimplemented!()
+        meta.add_version(fi.clone())?;
+
+        let fm_data = meta.marshal_msg()?;
+
+        fs::write(&src_file_path, fm_data).await?;
+
+        Ok(())
     }
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
