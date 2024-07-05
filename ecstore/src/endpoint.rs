@@ -9,7 +9,7 @@ use std::{collections::HashMap, path::Path, usize};
 use url::{ParseError, Url};
 
 /// enum for endpoint type.
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum EndpointType {
     /// path style endpoint type enum.
     Path,
@@ -44,7 +44,7 @@ pub struct Node {
 }
 
 /// any type of endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Endpoint {
     pub url: url::Url,
     pub is_local: bool,
@@ -95,8 +95,13 @@ impl TryFrom<&str> for Endpoint {
                     return Err(Error::from_string("invalid URL endpoint format"));
                 }
 
-                if is_empty_path(Path::new(url.path()).clean()) {
-                    return Err(Error::from_string("empty or root endpoint is not supported"));
+                let path = Path::new(url.path()).clean();
+                if is_empty_path(&path) {
+                    return Err(Error::from_string("empty or root path is not supported in URL endpoint"));
+                }
+
+                if let Some(v) = path.to_str() {
+                    url.set_path(v)
                 }
 
                 // On windows having a preceding SlashSeparator will cause problems, if the
@@ -496,7 +501,8 @@ fn url_parse_from_file_path(value: &str) -> Result<url::Url> {
     // Only check if the arg is an ip address and ask for scheme since its absent.
     // localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
     // /mnt/export1. So we go ahead and start the rustfs server in FS modes in these cases.
-    if net::is_socket_addr(value) {
+    let addr: Vec<&str> = value.splitn(2, '/').collect();
+    if net::is_socket_addr(addr[0]) {
         return Err(Error::from_string("invalid URL endpoint format: missing scheme http or https"));
     }
 
@@ -507,7 +513,7 @@ fn url_parse_from_file_path(value: &str) -> Result<url::Url> {
 
     match Url::from_file_path(file_path) {
         Ok(url) => Ok(url),
-        Err(_) => return Err(Error::from_string("Convert a file path into an URL failed")),
+        Err(_) => Err(Error::from_string("Convert a file path into an URL failed")),
     }
 }
 
@@ -527,11 +533,12 @@ mod test {
 
         let u2 = url::Url::parse("https://example.org/path").unwrap();
         let u4 = url::Url::parse("http://192.168.253.200/path").unwrap();
+        let u6 = url::Url::parse("http://server:/path").unwrap();
         let root_slash_foo = url::Url::from_file_path("/foo").unwrap();
 
         let test_cases = [
             TestCase {
-                arg: "d:/foo",
+                arg: "/foo",
                 expected_endpoint: Some(Endpoint {
                     url: root_slash_foo,
                     is_local: true,
@@ -606,7 +613,7 @@ mod test {
                 arg: "http://:/path",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format: invalid port number")),
+                expected_err: Some(Error::from_string("invalid URL endpoint format: empty host name")),
             },
             TestCase {
                 arg: "http://:8080/path",
@@ -616,9 +623,15 @@ mod test {
             },
             TestCase {
                 arg: "http://server:/path",
-                expected_endpoint: None,
-                expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format: invalid port number")),
+                expected_endpoint: Some(Endpoint {
+                    url: u6,
+                    is_local: false,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }),
+                expected_type: Some(EndpointType::Url),
+                expected_err: None,
             },
             TestCase {
                 arg: "https://93.184.216.34:808080/path",
@@ -648,7 +661,148 @@ mod test {
 
         for test_case in test_cases {
             let ret = Endpoint::try_from(test_case.arg);
-            println!("{:?}", ret)
+            if test_case.expected_err.is_none() && ret.is_err() {
+                panic!("{}: error: expected = <nil>, got = {:?}", test_case.arg, ret);
+            }
+            if test_case.expected_err.is_some() && ret.is_ok() {
+                panic!("{}: error: expected = {:?}, got = <nil>", test_case.arg, test_case.expected_err);
+            }
+            match (test_case.expected_err, ret) {
+                (None, Err(e)) => panic!("{}: error: expected = <nil>, got = {}", test_case.arg, e),
+                (None, Ok(mut ep)) => {
+                    let _ = ep.update_is_local(9000);
+                    if test_case.expected_type != Some(ep.get_type()) {
+                        panic!(
+                            "{}: type: expected = {:?}, got = {:?}",
+                            test_case.arg,
+                            test_case.expected_type,
+                            ep.get_type()
+                        );
+                    }
+
+                    assert_eq!(test_case.expected_endpoint, Some(ep), "{}: endpoint", test_case.arg);
+                }
+                (Some(e), Ok(_)) => panic!("{}: error: expected = {}, got = <nil>", test_case.arg, e),
+                (Some(e), Err(e2)) => {
+                    assert_eq!(e.to_string(), e2.to_string(), "{}: error: expected = {}, got = {}", test_case.arg, e, e2)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_new_endpoints() {
+        let test_cases = [
+            (vec!["/d1", "/d2", "/d3", "/d4"], None, 1),
+            (
+                vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://localhost/d3",
+                    "http://localhost/d4",
+                ],
+                None,
+                2,
+            ),
+            (
+                vec![
+                    "http://example.org/d1",
+                    "http://example.com/d1",
+                    "http://example.net/d1",
+                    "http://example.edu/d1",
+                ],
+                None,
+                3,
+            ),
+            (
+                vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://example.org/d1",
+                    "http://example.org/d2",
+                ],
+                None,
+                4,
+            ),
+            (
+                vec![
+                    "https://localhost:9000/d1",
+                    "https://localhost:9001/d2",
+                    "https://localhost:9002/d3",
+                    "https://localhost:9003/d4",
+                ],
+                None,
+                5,
+            ),
+            // It is valid WRT endpoint list that same path is expected with different port on same server.
+            (
+                vec![
+                    "https://127.0.0.1:9000/d1",
+                    "https://127.0.0.1:9001/d1",
+                    "https://127.0.0.1:9002/d1",
+                    "https://127.0.0.1:9003/d1",
+                ],
+                None,
+                6,
+            ),
+            (vec!["d1", "d2", "d3", "d1"], Some(Error::from_string("duplicate endpoints found")), 7),
+            (vec!["d1", "d2", "d3", "./d1"], Some(Error::from_string("duplicate endpoints found")), 8),
+            (
+                vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://localhost/d1",
+                    "http://localhost/d4",
+                ],
+                Some(Error::from_string("duplicate endpoints found")),
+                9,
+            ),
+            (
+                vec!["ftp://server/d1", "http://server/d2", "http://server/d3", "http://server/d4"],
+                Some(Error::from_string("'ftp://server/d1': invalid URL endpoint format")),
+                10,
+            ),
+            (
+                vec!["d1", "http://localhost/d2", "d3", "d4"],
+                Some(Error::from_string("mixed style endpoints are not supported")),
+                11,
+            ),
+            (
+                vec![
+                    "http://example.org/d1",
+                    "https://example.com/d1",
+                    "http://example.net/d1",
+                    "https://example.edut/d1",
+                ],
+                Some(Error::from_string("mixed scheme is not supported")),
+                12,
+            ),
+            (
+                vec![
+                    "192.168.1.210:9000/tmp/dir0",
+                    "192.168.1.210:9000/tmp/dir1",
+                    "192.168.1.210:9000/tmp/dir2",
+                    "192.168.110:9000/tmp/dir3",
+                ],
+                Some(Error::from_string(
+                    "'192.168.1.210:9000/tmp/dir0': invalid URL endpoint format: missing scheme http or https",
+                )),
+                13,
+            ),
+        ];
+
+        for test_case in test_cases {
+            let args: Vec<String> = test_case.0.iter().map(|v| v.to_string()).collect();
+            let ret = Endpoints::try_from(args.as_slice());
+
+            match (test_case.1, ret) {
+                (None, Err(e)) => panic!("{}: error: expected = <nil>, got = {}", test_case.2, e),
+                (None, Ok(_)) => {}
+                (Some(e), Ok(_)) => panic!("{}: error: expected = {}, got = <nil>", test_case.2, e),
+                (Some(e), Err(e2)) => {
+                    assert_eq!(e.to_string(), e2.to_string(), "{}: error: expected = {}, got = {}", test_case.2, e, e2)
+                }
+            }
         }
     }
 }
