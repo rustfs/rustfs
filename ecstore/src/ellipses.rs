@@ -16,9 +16,9 @@ const ELLIPSES: &str = "...";
 /// associated prefix and suffixes.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pattern {
-    pub prefix: String,
-    pub suffix: String,
-    pub seq: Vec<String>,
+    pub(crate) prefix: String,
+    pub(crate) suffix: String,
+    pub(crate) seq: Vec<String>,
 }
 
 impl Pattern {
@@ -37,12 +37,28 @@ impl Pattern {
 
         ret
     }
+
+    pub fn len(&self) -> usize {
+        self.seq.len()
+    }
 }
 
 /// contains a list of patterns provided in the input.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ArgPattern {
-    pub inner: Vec<Pattern>,
+    inner: Vec<Pattern>,
+}
+
+impl AsRef<Vec<Pattern>> for ArgPattern {
+    fn as_ref(&self) -> &Vec<Pattern> {
+        &self.inner
+    }
+}
+
+impl AsMut<Vec<Pattern>> for ArgPattern {
+    fn as_mut(&mut self) -> &mut Vec<Pattern> {
+        &mut self.inner
+    }
 }
 
 impl ArgPattern {

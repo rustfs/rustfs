@@ -2,6 +2,7 @@ use super::disks_layout::DisksLayout;
 use super::error::{Error, Result};
 use super::utils::net;
 use path_absolutize::Absolutize;
+use path_clean::PathClean;
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::{collections::HashMap, path::Path, usize};
@@ -70,20 +71,18 @@ impl TryFrom<&str> for Endpoint {
     /// Performs the conversion.
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         /// check whether given path is not empty.
-        fn is_empty_path(path: &str) -> bool {
-            ["", "/", "\\"].iter().any(|&v| v.eq(path))
+        fn is_empty_path(path: impl AsRef<Path>) -> bool {
+            ["", "/", "\\"].iter().any(|&v| Path::new(v).eq(path.as_ref()))
         }
 
         if is_empty_path(value) {
             return Err(Error::from_string("empty or root endpoint is not supported"));
         }
 
-        // TODO What if the value passed in is something like d:\data\rustfs
-
         let mut is_local = false;
         let url = match Url::parse(value) {
             #[allow(unused_mut)]
-            Ok(mut url) => {
+            Ok(mut url) if url.has_host() => {
                 // URL style of endpoint.
                 // Valid URL style endpoint is
                 // - Scheme field must contain "http" or "https"
@@ -96,7 +95,7 @@ impl TryFrom<&str> for Endpoint {
                     return Err(Error::from_string("invalid URL endpoint format"));
                 }
 
-                if is_empty_path(url.path()) {
+                if is_empty_path(Path::new(url.path()).clean()) {
                     return Err(Error::from_string("empty or root endpoint is not supported"));
                 }
 
@@ -124,31 +123,20 @@ impl TryFrom<&str> for Endpoint {
 
                 url
             }
+            Ok(_) => {
+                // like d:/foo
+                is_local = true;
+                url_parse_from_file_path(value)?
+            }
             Err(e) => match e {
                 ParseError::InvalidPort => {
                     return Err(Error::from_string("invalid URL endpoint format: port number must be between 1 to 65535"))
                 }
                 ParseError::EmptyHost => return Err(Error::from_string("invalid URL endpoint format: empty host name")),
                 ParseError::RelativeUrlWithoutBase => {
-                    // Only check if the arg is an ip address and ask for scheme since its absent.
-                    // localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
-                    // /mnt/export1. So we go ahead and start the rustfs server in FS modes in these cases.
-                    if net::is_socket_addr(value) {
-                        return Err(Error::from_string("invalid URL endpoint format: missing scheme http or https"));
-                    }
-
-                    let file_path = match Path::new(value).absolutize() {
-                        Ok(path) => path,
-                        Err(err) => return Err(Error::from_string(format!("absolute path failed: {}", err))),
-                    };
-
-                    match Url::from_file_path(file_path) {
-                        Ok(url) => {
-                            is_local = true;
-                            url
-                        }
-                        Err(_) => return Err(Error::from_string("Convert a file path into an URL failed")),
-                    }
+                    // like /foo
+                    is_local = true;
+                    url_parse_from_file_path(value)?
                 }
                 _ => return Err(Error::from_string(format!("invalid URL endpoint format: {}", e))),
             },
@@ -503,6 +491,26 @@ impl EndpointServerPools {
     }
 }
 
+/// parse a file path into an URL.
+fn url_parse_from_file_path(value: &str) -> Result<url::Url> {
+    // Only check if the arg is an ip address and ask for scheme since its absent.
+    // localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
+    // /mnt/export1. So we go ahead and start the rustfs server in FS modes in these cases.
+    if net::is_socket_addr(value) {
+        return Err(Error::from_string("invalid URL endpoint format: missing scheme http or https"));
+    }
+
+    let file_path = match Path::new(value).absolutize() {
+        Ok(path) => path,
+        Err(err) => return Err(Error::from_string(format!("absolute path failed: {}", err))),
+    };
+
+    match Url::from_file_path(file_path) {
+        Ok(url) => Ok(url),
+        Err(_) => return Err(Error::from_string("Convert a file path into an URL failed")),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -519,7 +527,7 @@ mod test {
 
         let u2 = url::Url::parse("https://example.org/path").unwrap();
         let u4 = url::Url::parse("http://192.168.253.200/path").unwrap();
-        let root_slash_foo = url::Url::from_file_path("d:/foo").unwrap();
+        let root_slash_foo = url::Url::from_file_path("/foo").unwrap();
 
         let test_cases = [
             TestCase {
