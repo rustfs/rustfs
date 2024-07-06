@@ -37,7 +37,7 @@ impl PoolDisksLayout {
         self.layout.len()
     }
 
-    pub fn as_cmd_line(&self) -> &str {
+    pub fn get_cmd_line(&self) -> &str {
         &self.cmd_line
     }
 }
@@ -283,11 +283,11 @@ fn possible_set_counts_with_symmetry(set_counts: &[usize], arg_patterns: &[ArgPa
     for &ss in set_counts {
         let mut symmetry = false;
         for arg_pattern in arg_patterns {
-            for p in arg_pattern.inner.iter() {
-                if p.seq.len() > ss {
-                    symmetry = (p.seq.len() % ss) == 0;
+            for p in arg_pattern.as_ref().iter() {
+                if p.len() > ss {
+                    symmetry = (p.len() % ss) == 0;
                 } else {
-                    symmetry = (ss % p.seq.len()) == 0;
+                    symmetry = (ss % p.len()) == 0;
                 }
             }
         }
@@ -518,6 +518,13 @@ mod test {
                     16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
                     16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
                 ]],
+                success: true,
+            },
+            TestCase {
+                num: 15,
+                args: vec!["https://node{1...3}.example.net/mnt/drive{1...8}"],
+                total_sizes: vec![24],
+                indexes: vec![vec![12, 12]],
                 success: true,
             },
         ];
