@@ -25,7 +25,7 @@ pub enum EndpointType {
 }
 
 /// enum for setup type.
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum SetupType {
     /// FS setup type enum.
     FS,
@@ -666,7 +666,6 @@ fn url_parse_from_file_path(value: &str) -> Result<url::Url> {
 
 #[cfg(test)]
 mod test {
-    use std::path::PathBuf;
 
     use super::*;
 
@@ -959,9 +958,9 @@ mod test {
     fn test_create_pool_endpoints() {
         #[derive(Default)]
         struct TestCase<'a> {
+            num: usize,
             server_addr: &'a str,
             args: Vec<&'a str>,
-            expected_server_addr: &'a str,
             expected_endpoints: Option<Endpoints>,
             expected_setup_type: Option<SetupType>,
             expected_err: Option<Error>,
@@ -1039,21 +1038,23 @@ mod test {
 
         let test_cases = [
             TestCase {
+                num: 1,
                 server_addr: "localhost",
                 expected_err: Some(Error::from_string("address localhost: missing port in address")),
                 ..Default::default()
             },
             // Erasure Single Drive
             TestCase {
+                num: 2,
                 server_addr: "localhost:9000",
                 args: vec!["http://localhost/d1"],
                 expected_err: Some(Error::from_string("use path style endpoint for SD setup")),
                 ..Default::default()
             },
             TestCase {
+                num: 3,
                 server_addr: ":443",
                 args: vec!["/d1"],
-                expected_server_addr: ":443",
                 expected_endpoints: Some(Endpoints(vec![Endpoint {
                     url: must_file_path("/d1"),
                     is_local: true,
@@ -1065,9 +1066,9 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 4,
                 server_addr: "localhost:10000",
                 args: vec!["/d1"],
-                expected_server_addr: "localhost:10000",
                 expected_endpoints: Some(Endpoints(vec![Endpoint {
                     url: must_file_path("/d1"),
                     is_local: true,
@@ -1079,6 +1080,7 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 5,
                 server_addr: "localhost:9000",
                 args: vec![
                     "https://127.0.0.1:9000/d1",
@@ -1091,9 +1093,9 @@ mod test {
             },
             // Erasure Setup with PathEndpointType
             TestCase {
+                num: 6,
                 server_addr: ":1234",
                 args: vec!["/d1", "/d2", "/d3", "/d4"],
-                expected_server_addr: ":1234",
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
                         url: must_file_path("/d1"),
@@ -1129,6 +1131,7 @@ mod test {
             },
             // DistErasure Setup with URLEndpointType
             TestCase {
+                num: 7,
                 server_addr: ":9000",
                 args: vec![
                     "http://localhost/d1",
@@ -1136,7 +1139,6 @@ mod test {
                     "http://localhost/d3",
                     "http://localhost/d4",
                 ],
-                expected_server_addr: ":9000",
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
                         url: must_url("http://localhost:9000/d1"),
@@ -1172,6 +1174,7 @@ mod test {
             },
             // DistErasure Setup with URLEndpointType having mixed naming to local host.
             TestCase {
+                num: 8,
                 server_addr: "127.0.0.1:10000",
                 args: vec![
                     "http://localhost/d1",
@@ -1183,6 +1186,7 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 9,
                 server_addr: ":9001",
                 args: vec![
                     "http://10.0.0.1:9000/export",
@@ -1194,6 +1198,7 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 10,
                 server_addr: ":9000",
                 args: vec![
                     "http://127.0.0.1:9000/export",
@@ -1206,6 +1211,7 @@ mod test {
             },
             // DistErasure type
             TestCase {
+                num: 11,
                 server_addr: "127.0.0.1:10000",
                 args: vec![
                     case1_endpoint1.as_str(),
@@ -1213,7 +1219,6 @@ mod test {
                     "http://example.org/d3",
                     "http://example.com/d4",
                 ],
-                expected_server_addr: "127.0.0.1:10000",
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
                         url: case1_ur_ls[0].clone(),
@@ -1248,6 +1253,7 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 12,
                 server_addr: "127.0.0.1:10000",
                 args: vec![
                     case2_endpoint1.as_str(),
@@ -1255,7 +1261,6 @@ mod test {
                     "http://example.org/d3",
                     "http://example.com/d4",
                 ],
-                expected_server_addr: "127.0.0.1:10000",
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
                         url: case2_ur_ls[0].clone(),
@@ -1290,6 +1295,7 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 13,
                 server_addr: ":80",
                 args: vec![
                     case3_endpoint1.as_str(),
@@ -1297,7 +1303,6 @@ mod test {
                     "http://example.com/d3",
                     "http://example.net/d4",
                 ],
-                expected_server_addr: ":80",
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
                         url: case3_ur_ls[0].clone(),
@@ -1332,6 +1337,7 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 14,
                 server_addr: ":9000",
                 args: vec![
                     case4_endpoint1.as_str(),
@@ -1339,7 +1345,6 @@ mod test {
                     "http://example.com/d3",
                     "http://example.net/d4",
                 ],
-                expected_server_addr: ":9000",
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
                         url: case4_ur_ls[0].clone(),
@@ -1374,6 +1379,7 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 15,
                 server_addr: ":9000",
                 args: vec![
                     case5_endpoint1.as_str(),
@@ -1381,7 +1387,6 @@ mod test {
                     case5_endpoint3.as_str(),
                     case5_endpoint4.as_str(),
                 ],
-                expected_server_addr: ":9000",
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
                         url: case5_ur_ls[0].clone(),
@@ -1416,6 +1421,7 @@ mod test {
                 ..Default::default()
             },
             TestCase {
+                num: 16,
                 server_addr: ":9003",
                 args: vec![
                     "http://localhost:9000/d1",
@@ -1423,7 +1429,6 @@ mod test {
                     "http://127.0.0.1:9002/d3",
                     case6_endpoint1.as_str(),
                 ],
-                expected_server_addr: ":9003",
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
                         url: case6_ur_ls[0].clone(),
@@ -1458,10 +1463,65 @@ mod test {
                 ..Default::default()
             },
         ];
+
+        for test_case in test_cases {
+            let disks_layout = match DisksLayout::try_from(test_case.args.as_slice()) {
+                Ok(v) => v,
+                Err(e) => panic!("Test {}: unexpected error: {}", test_case.num, e),
+            };
+
+            match (
+                test_case.expected_err,
+                PoolEndpointList::create_pool_endpoints(test_case.server_addr, &disks_layout),
+            ) {
+                (None, Err(err)) => panic!("Test {}: error: expected = <nil>, got = {}", test_case.num, err),
+                (Some(err), Ok(_)) => panic!("Test {}: error: expected = {}, got = <nil>", test_case.num, err),
+                (Some(e), Err(e2)) => {
+                    assert_eq!(
+                        e.to_string(),
+                        e2.to_string(),
+                        "Test {}: error: expected = {}, got = {}",
+                        test_case.num,
+                        e,
+                        e2
+                    )
+                }
+                (None, Ok(pools)) => {
+                    if Some(&pools.setup_type) != test_case.expected_setup_type.as_ref() {
+                        panic!(
+                            "Test {}: setupType: expected = {:?}, got = {:?}",
+                            test_case.num, test_case.expected_setup_type, &pools.setup_type
+                        )
+                    }
+
+                    let left_len = test_case.expected_endpoints.as_ref().map(|v| v.as_ref().len());
+                    let right_len = pools.as_ref().first().map(|v| v.as_ref().len());
+
+                    if left_len != right_len {
+                        panic!("Test {}: endpoints: expected = {:?}, got = {:?}", test_case.num, left_len, right_len);
+                    }
+
+                    for (i, ep) in pools.as_ref()[0].as_ref().iter().enumerate() {
+                        assert_eq!(
+                            ep.to_string(),
+                            test_case.expected_endpoints.as_ref().unwrap().as_ref()[i].to_string(),
+                            "Test {}: endpoints: expected = {}, got = {}",
+                            test_case.num,
+                            test_case.expected_endpoints.as_ref().unwrap().as_ref()[i],
+                            ep
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fn must_file_path(s: impl AsRef<Path>) -> url::Url {
-        url::Url::from_file_path(s).unwrap()
+        let url = url::Url::from_file_path(s.as_ref());
+
+        assert!(url.is_ok(), "failed to convert path to URL: {}", s.as_ref().display());
+
+        url.unwrap()
     }
 
     fn must_url(s: &str) -> url::Url {
