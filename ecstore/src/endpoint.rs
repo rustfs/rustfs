@@ -602,7 +602,7 @@ impl EndpointServerPools {
                 drives_per_set,
                 endpoints: eps,
                 cmd_line,
-                platform: String::new(),
+                platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
             };
 
             ret.add(ep)?;
@@ -1561,5 +1561,53 @@ mod test {
         }
 
         (urls, local_flags)
+    }
+
+    #[test]
+    fn test_create_server_endpoints() {
+        let test_cases = [
+            // Invalid input.
+            ("", vec![], false),
+            // Range cannot be negative.
+            ("0.0.0.0:9000", vec!["/export1{-1...1}"], false),
+            // Range cannot start bigger than end.
+            ("0.0.0.0:9000", vec!["/export1{64...1}"], false),
+            // Range can only be numeric.
+            ("0.0.0.0:9000", vec!["/export1{a...z}"], false),
+            // Duplicate disks not allowed.
+            ("0.0.0.0:9000", vec!["/export1{1...32}", "/export1{1...32}"], false),
+            // Same host cannot export same disk on two ports - special case localhost.
+            ("0.0.0.0:9001", vec!["http://localhost:900{1...2}/export{1...64}"], false),
+            // Valid inputs.
+            ("0.0.0.0:9000", vec!["/export1"], true),
+            ("0.0.0.0:9000", vec!["/export1", "/export2", "/export3", "/export4"], true),
+            ("0.0.0.0:9000", vec!["/export1{1...64}"], true),
+            ("0.0.0.0:9000", vec!["/export1{01...64}"], true),
+            ("0.0.0.0:9000", vec!["/export1{1...32}", "/export1{33...64}"], true),
+            ("0.0.0.0:9001", vec!["http://localhost:9001/export{1...64}"], true),
+            ("0.0.0.0:9001", vec!["http://localhost:9001/export{01...64}"], true),
+        ];
+
+        for (i, test_case) in test_cases.iter().enumerate() {
+            let disks_layout = match DisksLayout::try_from(test_case.1.as_slice()) {
+                Ok(v) => v,
+                Err(e) => {
+                    if test_case.2 {
+                        panic!("Test {}: unexpected error: {}", i + 1, e);
+                    }
+                    continue;
+                }
+            };
+
+            let ret = EndpointServerPools::create_server_endpoints(test_case.0, &disks_layout);
+
+            if let Err(err) = ret {
+                if test_case.2 {
+                    panic!("Test {}: Expected success but failed instead {}", i + 1, err)
+                }
+            } else if !test_case.2 {
+                panic!("Test {}: expected failure but passed instead", i + 1);
+            }
+        }
     }
 }
