@@ -52,7 +52,7 @@ pub struct Node {
 }
 
 /// any type of endpoint.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Endpoint {
     pub url: url::Url,
     pub is_local: bool,
@@ -221,7 +221,7 @@ impl Endpoint {
 }
 
 /// list of same type of endpoint.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Endpoints(Vec<Endpoint>);
 
 impl AsRef<Vec<Endpoint>> for Endpoints {
@@ -546,7 +546,7 @@ impl PoolEndpointList {
 
 /// represent endpoints in a given pool
 /// along with its setCount and setDriveCount.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PoolEndpoints {
     // indicates if endpoints are provided in non-ellipses style
     pub legacy: bool,
@@ -558,7 +558,7 @@ pub struct PoolEndpoints {
 }
 
 /// list of list of endpoints
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EndpointServerPools(Vec<PoolEndpoints>);
 
 impl From<Vec<PoolEndpoints>> for EndpointServerPools {
@@ -629,6 +629,14 @@ impl EndpointServerPools {
         self.0.push(eps);
 
         Ok(())
+    }
+
+    /// returns true if the first endpoint is local.
+    pub fn first_local(&self) -> bool {
+        self.0
+            .first()
+            .and_then(|v| v.endpoints.as_ref().first())
+            .map_or(false, |v| v.is_local)
     }
 
     /// returns a sorted list of nodes in this cluster

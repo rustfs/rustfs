@@ -29,20 +29,21 @@ pub struct ECStore {
 
 impl ECStore {
     pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
-        let layouts = DisksLayout::try_from(endpoints.as_slice())?;
+        let layouts = DisksLayout::try_from(endpoints.as_slice()).map_err(|v| Error::msg(v))?;
 
         let mut deployment_id = None;
 
-        let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
+        let (endpoint_pools, _) =
+            EndpointServerPools::create_server_endpoints(address.as_str(), &layouts).map_err(|v| Error::msg(v))?;
 
-        let mut pools = Vec::with_capacity(endpoint_pools.len());
-        let mut disk_map = HashMap::with_capacity(endpoint_pools.len());
+        let mut pools = Vec::with_capacity(endpoint_pools.as_ref().len());
+        let mut disk_map = HashMap::with_capacity(endpoint_pools.as_ref().len());
 
-        let first_is_local = endpoint_pools.first_is_local();
+        let first_is_local = endpoint_pools.first_local();
 
         let mut local_disks = Vec::new();
 
-        for (i, pool_eps) in endpoint_pools.iter().enumerate() {
+        for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
             // TODO: read from config parseStorageClass
             let partiy_count = store_init::default_partiy_count(pool_eps.drives_per_set);
 
