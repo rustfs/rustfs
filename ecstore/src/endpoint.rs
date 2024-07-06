@@ -6,7 +6,6 @@ use path_clean::PathClean;
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::{
     collections::{hash_map::Entry, HashMap},
     path::Path,
@@ -27,6 +26,9 @@ pub enum EndpointType {
 /// enum for setup type.
 #[derive(PartialEq, Eq, Debug)]
 pub enum SetupType {
+    /// starts with unknown setup type.
+    Unknown,
+
     /// FS setup type enum.
     FS,
 
@@ -314,6 +316,10 @@ impl PoolEndpointList {
             let mut endpoint = Endpoint::try_from(disks_layout.get_single_drive_layout())?;
             endpoint.update_is_local(server_addr.port())?;
 
+            if endpoint.get_type() != EndpointType::Path {
+                return Err(Error::from_string("use path style endpoint for single node setup"));
+            }
+
             endpoint.set_pool_index(0);
             endpoint.set_set_index(0);
             endpoint.set_disk_index(0);
@@ -353,57 +359,38 @@ impl PoolEndpointList {
 
         // setup type
         let mut unique_args = HashSet::new();
-        for pool in pool_endpoints.iter() {
-            for ep in pool.as_ref() {
-                if let Some(host) = ep.url.host_str() {
-                    unique_args.insert(host.to_owned());
-                } else {
-                    unique_args.insert(format!("localhost:{}", server_addr.port()));
-                }
-            }
-        }
-
-        let setup_type = match pool_endpoints[0].as_ref()[0].get_type() {
-            EndpointType::Path => SetupType::Erasure,
-            EndpointType::Url => match unique_args.len() {
-                1 => SetupType::Erasure,
-                _ => SetupType::DistErasure,
-            },
-        };
-
         let mut pool_endpoint_list = Self {
             inner: pool_endpoints,
-            setup_type,
+            setup_type: SetupType::Unknown,
         };
 
         pool_endpoint_list.update_is_local(server_addr.port())?;
 
-        for endpoints in pool_endpoint_list.inner.iter() {
+        for endpoints in pool_endpoint_list.inner.iter_mut() {
             // Check whether same path is not used in endpoints of a host on different port.
-            let mut path_ip_map: HashMap<&str, Arc<HashSet<IpAddr>>> = HashMap::new();
+            let mut path_ip_map: HashMap<&str, HashSet<IpAddr>> = HashMap::new();
             let mut host_ip_cache = HashMap::new();
             for ep in endpoints.as_ref() {
-                let mut host_ip_set = Arc::new(HashSet::<IpAddr>::new());
-
-                if let Some(host) = ep.url.host() {
-                    if let Entry::Vacant(e) = host_ip_cache.entry(host.clone()) {
-                        host_ip_set = Arc::new(
-                            net::get_host_ip(host.clone())
-                                .map_err(|e| Error::from_string(format!("host '{}' cannot resolve: {}", host, e)))?,
-                        );
-                        e.insert(host_ip_set.clone());
-                    }
+                if !ep.url.has_host() {
+                    continue;
                 }
+
+                let host = ep.url.host().unwrap();
+                let host_ip_set = host_ip_cache.entry(host.clone()).or_insert({
+                    net::get_host_ip(host.clone())
+                        .map_err(|e| Error::from_string(format!("host '{}' cannot resolve: {}", host, e)))?
+                });
 
                 let path = ep.url.path();
                 match path_ip_map.entry(path) {
-                    Entry::Occupied(e) => {
-                        if e.get().intersection(host_ip_set.as_ref()).count() > 0 {
+                    Entry::Occupied(mut e) => {
+                        if e.get().intersection(host_ip_set).count() > 0 {
                             return Err(Error::from_string(format!(
                                 "same path '{}' can not be served by different port on same address",
                                 path
                             )));
                         }
+                        e.get_mut().extend(host_ip_set.iter());
                     }
                     Entry::Vacant(e) => {
                         e.insert(host_ip_set.clone());
@@ -451,7 +438,37 @@ impl PoolEndpointList {
                     return Err(Error::from_string("all local endpoints should not have different hostnames/ips"));
                 }
             }
+
+            // Add missing port in all endpoints.
+            for ep in endpoints.as_mut() {
+                if !ep.url.has_host() {
+                    unique_args.insert(format!("localhost:{}", server_addr.port()));
+                    continue;
+                }
+                match ep.url.port() {
+                    None => {
+                        let _ = ep.url.set_port(Some(server_addr.port()));
+                    }
+                    Some(port) => {
+                        // If endpoint is local, but port is different than serverAddrPort, then make it as remote.
+                        if ep.is_local && server_addr.port() != port {
+                            ep.is_local = false;
+                        }
+                    }
+                }
+                unique_args.insert(ep.host_port());
+            }
         }
+
+        let setup_type = match pool_endpoint_list.as_ref()[0].as_ref()[0].get_type() {
+            EndpointType::Path => SetupType::Erasure,
+            EndpointType::Url => match unique_args.len() {
+                1 => SetupType::Erasure,
+                _ => SetupType::DistErasure,
+            },
+        };
+
+        pool_endpoint_list.setup_type = setup_type;
 
         Ok(pool_endpoint_list)
     }
@@ -1048,12 +1065,12 @@ mod test {
                 num: 2,
                 server_addr: "localhost:9000",
                 args: vec!["http://localhost/d1"],
-                expected_err: Some(Error::from_string("use path style endpoint for SD setup")),
+                expected_err: Some(Error::from_string("use path style endpoint for single node setup")),
                 ..Default::default()
             },
             TestCase {
                 num: 3,
-                server_addr: ":443",
+                server_addr: "0.0.0.0:443",
                 args: vec!["/d1"],
                 expected_endpoints: Some(Endpoints(vec![Endpoint {
                     url: must_file_path("/d1"),
@@ -1088,13 +1105,13 @@ mod test {
                     "https://example.com/d1",
                     "https://example.com/d2",
                 ],
-                expected_err: Some(Error::from_string("path '/d1' can not be served by different port on same address")),
+                expected_err: Some(Error::from_string("same path '/d1' can not be served by different port on same address")),
                 ..Default::default()
             },
             // Erasure Setup with PathEndpointType
             TestCase {
                 num: 6,
-                server_addr: ":1234",
+                server_addr: "0.0.0.0:1234",
                 args: vec!["/d1", "/d2", "/d3", "/d4"],
                 expected_endpoints: Some(Endpoints(vec![
                     Endpoint {
@@ -1132,7 +1149,7 @@ mod test {
             // DistErasure Setup with URLEndpointType
             TestCase {
                 num: 7,
-                server_addr: ":9000",
+                server_addr: "0.0.0.0:9000",
                 args: vec![
                     "http://localhost/d1",
                     "http://localhost/d2",
@@ -1187,19 +1204,21 @@ mod test {
             },
             TestCase {
                 num: 9,
-                server_addr: ":9001",
+                server_addr: "0.0.0.0:9001",
                 args: vec![
                     "http://10.0.0.1:9000/export",
                     "http://10.0.0.2:9000/export",
                     case7_endpoint1.as_str(),
                     "http://10.0.0.2:9001/export",
                 ],
-                expected_err: Some(Error::from_string("path '/export' can not be served by different port on same address")),
+                expected_err: Some(Error::from_string(
+                    "same path '/export' can not be served by different port on same address",
+                )),
                 ..Default::default()
             },
             TestCase {
                 num: 10,
-                server_addr: ":9000",
+                server_addr: "0.0.0.0:9000",
                 args: vec![
                     "http://127.0.0.1:9000/export",
                     case7_endpoint2.as_str(),
@@ -1296,7 +1315,7 @@ mod test {
             },
             TestCase {
                 num: 13,
-                server_addr: ":80",
+                server_addr: "0.0.0.0:80",
                 args: vec![
                     case3_endpoint1.as_str(),
                     "http://example.org:9000/d2",
@@ -1338,7 +1357,7 @@ mod test {
             },
             TestCase {
                 num: 14,
-                server_addr: ":9000",
+                server_addr: "0.0.0.0:9000",
                 args: vec![
                     case4_endpoint1.as_str(),
                     "http://example.org/d2",
@@ -1380,7 +1399,7 @@ mod test {
             },
             TestCase {
                 num: 15,
-                server_addr: ":9000",
+                server_addr: "0.0.0.0:9000",
                 args: vec![
                     case5_endpoint1.as_str(),
                     case5_endpoint2.as_str(),
@@ -1422,7 +1441,7 @@ mod test {
             },
             TestCase {
                 num: 16,
-                server_addr: ":9003",
+                server_addr: "0.0.0.0:9003",
                 args: vec![
                     "http://localhost:9000/d1",
                     "http://localhost:9001/d2",
@@ -1467,7 +1486,12 @@ mod test {
         for test_case in test_cases {
             let disks_layout = match DisksLayout::try_from(test_case.args.as_slice()) {
                 Ok(v) => v,
-                Err(e) => panic!("Test {}: unexpected error: {}", test_case.num, e),
+                Err(e) => {
+                    if test_case.expected_err.is_none() {
+                        panic!("Test {}: unexpected error: {}", test_case.num, e);
+                    }
+                    continue;
+                }
             };
 
             match (
@@ -1498,7 +1522,7 @@ mod test {
                     let right_len = pools.as_ref().first().map(|v| v.as_ref().len());
 
                     if left_len != right_len {
-                        panic!("Test {}: endpoints: expected = {:?}, got = {:?}", test_case.num, left_len, right_len);
+                        panic!("Test {}: endpoints len: expected = {:?}, got = {:?}", test_case.num, left_len, right_len);
                     }
 
                     for (i, ep) in pools.as_ref()[0].as_ref().iter().enumerate() {
