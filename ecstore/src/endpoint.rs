@@ -9,7 +9,6 @@ use std::net::IpAddr;
 use std::{
     collections::{hash_map::Entry, HashMap},
     path::Path,
-    usize,
 };
 use url::{ParseError, Url};
 
