@@ -1,5 +1,7 @@
 use std::fmt::Debug;
 
+use ecstore::disk_api::DiskError;
+use ecstore::store_api::BucketOptions;
 use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::PutObjReader;
@@ -121,7 +123,14 @@ impl S3 for FS {
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
 
-        // mc cp step 2
+        if let Err(e) = self.store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
+            if DiskError::is_err(&e, &DiskError::VolumeNotFound) {
+                return Err(s3_error!(NoSuchBucket));
+            } else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            }
+        }
+        // mc cp step 2 GetBucketInfo
 
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
