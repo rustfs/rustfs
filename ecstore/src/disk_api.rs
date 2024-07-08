@@ -27,6 +27,16 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn make_volume(&self, volume: &str) -> Result<()>;
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
+
+    async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
+    async fn read_version(
+        &self,
+        org_volume: &str,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        opts: ReadOptions,
+    ) -> Result<FileInfo>;
 }
 
 pub struct VolumeInfo {
@@ -34,10 +44,19 @@ pub struct VolumeInfo {
     pub created: OffsetDateTime,
 }
 
+pub struct ReadOptions {
+    pub read_data: bool,
+    // pub healing: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
     #[error("file not found")]
     FileNotFound,
+
+    #[error("file version not found")]
+    FileVersionNotFound,
+
     #[error("disk not found")]
     DiskNotFound,
 

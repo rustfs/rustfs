@@ -21,6 +21,7 @@ pub struct FileInfo {
     pub mod_time: OffsetDateTime,
     pub size: usize,
     pub data: Vec<u8>,
+    pub fresh: bool, // indicates this is a first time call to write FileInfo.
 }
 
 impl FileInfo {
@@ -40,6 +41,7 @@ impl Default for FileInfo {
             mod_time: OffsetDateTime::UNIX_EPOCH,
             size: Default::default(),
             data: Default::default(),
+            fresh: Default::default(),
         }
     }
 }
@@ -157,10 +159,30 @@ pub struct BucketInfo {
     pub created: OffsetDateTime,
 }
 
+pub struct MultipartUploadResult {
+    pub upload_id: String,
+}
+
+pub struct PartInfo {
+    pub part_num: usize,
+    pub last_mod: OffsetDateTime,
+    pub size: usize,
+}
+
 #[async_trait::async_trait]
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
 
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: ObjectOptions) -> Result<()>;
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()>;
+    async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: usize,
+        data: PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<PartInfo>;
+    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;
 }

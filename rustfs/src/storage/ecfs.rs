@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use ecstore::disk_api::DiskError;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::MakeBucketOptions;
+use ecstore::store_api::MultipartUploadResult;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
@@ -95,6 +96,14 @@ impl S3 for FS {
     #[tracing::instrument]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
         let input = req.input;
+
+        if let Err(e) = self.store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
+            if DiskError::is_err(&e, &DiskError::VolumeNotFound) {
+                return Err(s3_error!(NoSuchBucket));
+            } else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            }
+        }
 
         let output = GetBucketLocationOutput::default();
         Ok(S3Response::new(output))
@@ -198,7 +207,7 @@ impl S3 for FS {
 
         let reader = PutObjReader::new(body.into(), content_length as usize);
 
-        try_!(self.store.put_object(&bucket, &key, reader, ObjectOptions::default()).await);
+        try_!(self.store.put_object(&bucket, &key, reader, &ObjectOptions::default()).await);
 
         // self.store.put_object(bucket, object, data, opts);
 
@@ -211,11 +220,22 @@ impl S3 for FS {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let input = req.input;
+        let CreateMultipartUploadInput { bucket, key, .. } = req.input;
 
         // mc cp step 3
 
-        let output = CreateMultipartUploadOutput { ..Default::default() };
+        let MultipartUploadResult { upload_id, .. } = try_!(
+            self.store
+                .new_multipart_upload(&bucket, &key, &ObjectOptions::default())
+                .await
+        );
+
+        let output = CreateMultipartUploadOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            upload_id: Some(upload_id),
+            ..Default::default()
+        };
 
         Ok(S3Response::new(output))
     }
@@ -226,8 +246,14 @@ impl S3 for FS {
             body,
             upload_id,
             part_number,
+            content_length,
             ..
         } = req.input;
+
+        let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
+        let content_length = content_length.ok_or_else(|| s3_error!(IncompleteBody))?;
+
+        // mc cp step 4
 
         let output = UploadPartOutput { ..Default::default() };
         Ok(S3Response::new(output))

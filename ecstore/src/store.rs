@@ -14,7 +14,9 @@ use crate::{
     endpoint::EndpointServerPools,
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
-    store_api::{BucketInfo, BucketOptions, MakeBucketOptions, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{
+        BucketInfo, BucketOptions, MakeBucketOptions, MultipartUploadResult, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+    },
     store_init, utils,
 };
 
@@ -128,7 +130,7 @@ impl StorageAPI for ECStore {
 
         let reader = PutObjReader::new(StreamingBlob::from(body), content_len);
 
-        self.put_object(RUSTFS_META_BUCKET, &file_path, reader, ObjectOptions { max_parity: true })
+        self.put_object(RUSTFS_META_BUCKET, &file_path, reader, &ObjectOptions { max_parity: true })
             .await?;
 
         // TODO: toObjectErr
@@ -140,17 +142,39 @@ impl StorageAPI for ECStore {
 
         Ok(info)
     }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: ObjectOptions) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()> {
         // checkPutObjectArgs
 
         let object = utils::path::encode_dir_object(object);
 
         if self.single_pool() {
-            println!("put_object single_pool");
-            self.pools[0].put_object(bucket, object.as_str(), data, opts).await?;
-            return Ok(());
+            return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
+        unimplemented!()
+    }
+
+    async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: usize,
+        data: PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<PartInfo> {
+        if self.single_pool() {
+            return self.pools[0]
+                .put_object_part(bucket, object, upload_id, part_id, data, opts)
+                .await;
+        }
+        unimplemented!()
+    }
+
+    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
+        if self.single_pool() {
+            return self.pools[0].new_multipart_upload(bucket, object, opts).await;
+        }
         unimplemented!()
     }
 }

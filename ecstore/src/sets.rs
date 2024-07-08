@@ -1,19 +1,24 @@
 use std::sync::Arc;
 
 use anyhow::{Error, Result};
-
 use futures::{future::join_all, AsyncWrite, StreamExt};
 use time::OffsetDateTime;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    disk::{self, DiskStore, RUSTFS_META_TMP_BUCKET},
+    disk::{self, DiskStore, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET},
     endpoint::PoolEndpoints,
     erasure::Erasure,
     format::{DistributionAlgoVersion, FormatV3},
-    store_api::{BucketInfo, BucketOptions, FileInfo, MakeBucketOptions, ObjectOptions, PutObjReader, StorageAPI},
-    utils::hash,
+    store_api::{
+        BucketInfo, BucketOptions, FileInfo, MakeBucketOptions, MultipartUploadResult, ObjectOptions, PartInfo, PutObjReader,
+        StorageAPI,
+    },
+    utils::{
+        crypto::{base64_decode, base64_encode, hex, sha256},
+        hash,
+    },
 };
 
 const DEFAULT_INLINE_BLOCKS: usize = 128 * 1024;
@@ -142,6 +147,61 @@ impl Sets {
     }
 }
 
+async fn write_unique_file_info(
+    disks: &Vec<Option<DiskStore>>,
+    org_bucket: &str,
+    bucket: &str,
+    prefix: &str,
+    files: &Vec<FileInfo>,
+    // write_quorum: usize,
+) -> Vec<Option<Error>> {
+    let mut futures = Vec::with_capacity(disks.len());
+
+    for (i, disk) in disks.iter().enumerate() {
+        let disk = disk.as_ref().unwrap();
+        let mut file_info = files[i].clone();
+        file_info.erasure.index = i + 1;
+        futures.push(async move { disk.write_metadata(org_bucket, bucket, prefix, file_info).await })
+    }
+
+    let mut errors = Vec::with_capacity(disks.len());
+
+    let results = join_all(futures).await;
+    for result in results {
+        match result {
+            Ok(_) => {
+                errors.push(None);
+            }
+            Err(e) => {
+                errors.push(Some(e));
+            }
+        }
+    }
+    errors
+}
+
+fn get_upload_id_dir(bucket: &str, object: &str, upload_id: &str) -> String {
+    let upload_uuid = match base64_decode(upload_id.as_bytes()) {
+        Ok(res) => {
+            let decoded_str = String::from_utf8(res).expect("Failed to convert decoded bytes to a UTF-8 string");
+            let parts: Vec<&str> = decoded_str.splitn(2, '.').collect();
+            if parts.len() == 2 {
+                parts[1].to_string()
+            } else {
+                upload_id.to_string()
+            }
+        }
+        Err(_) => upload_id.to_string(),
+    };
+
+    format!("{}/{}", get_multipart_sha_dir(bucket, object), upload_uuid)
+}
+
+fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
+    let path = format!("{}/{}", bucket, object);
+    hex(sha256(path.as_bytes()).as_ref())
+}
+
 // #[derive(Debug)]
 // pub struct Objects {
 //     pub endpoints: Vec<Endpoint>,
@@ -162,7 +222,7 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
 
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: ObjectOptions) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()> {
         let disks = self.get_disks_by_key(object);
 
         let mut parity_drives = self.partiy_count;
@@ -264,6 +324,71 @@ impl StorageAPI for Sets {
         // self.commit_rename_data_dir(&shuffle_disks,&bucket,&object,)
 
         Ok(())
+    }
+
+    async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: usize,
+        data: PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<PartInfo> {
+        let upload_path = get_upload_id_dir(bucket, object, upload_id);
+
+        // TODO: checkUploadIDExists
+
+        unimplemented!()
+    }
+
+    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
+        let disks = self.get_disks_by_key(object);
+
+        let mut parity_drives = self.partiy_count;
+        if opts.max_parity {
+            parity_drives = disks.len() / 2;
+        }
+
+        let data_drives = disks.len() - parity_drives;
+        let mut write_quorum = data_drives;
+        if data_drives == parity_drives {
+            write_quorum += 1
+        }
+
+        let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
+
+        fi.data_dir = Uuid::new_v4();
+        fi.fresh = true;
+
+        let parts_metadata = vec![fi.clone(); disks.len()];
+
+        let (shuffle_disks, mut shuffle_parts_metadata) = shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
+
+        for fi in shuffle_parts_metadata.iter_mut() {
+            fi.mod_time = OffsetDateTime::now_utc();
+        }
+
+        let upload_uuid = format!("{}x{}", Uuid::new_v4(), fi.mod_time);
+
+        let upload_id = base64_encode(format!("{}.{}", "globalDeploymentID", upload_uuid).as_bytes());
+
+        let upload_path = get_upload_id_dir(bucket, object, upload_uuid.as_str());
+
+        let errs = write_unique_file_info(
+            &shuffle_disks,
+            bucket,
+            RUSTFS_META_MULTIPART_BUCKET,
+            upload_path.as_str(),
+            &shuffle_parts_metadata,
+        )
+        .await;
+
+        debug!("write_unique_file_info errs :{:?}", &errs);
+        // TODO: reduceWriteQuorumErrs
+        // evalDisks
+
+        Ok(MultipartUploadResult { upload_id })
     }
 }
 
