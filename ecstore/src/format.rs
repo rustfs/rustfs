@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use uuid::Uuid;
 
-use crate::disk;
+use crate::{disk, disk_api::DiskError};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum FormatMetaVersion {
@@ -167,7 +167,7 @@ impl FormatV3 {
     ///   - j'th position is the disk index in the current set
     pub fn find_disk_index_by_disk_id(&self, disk_id: Uuid) -> Result<(usize, usize)> {
         if disk_id == Uuid::nil() {
-            return Err(Error::new(disk::DiskError::DiskNotFound));
+            return Err(Error::new(DiskError::DiskNotFound));
         }
         if disk_id == Uuid::max() {
             return Err(Error::msg("disk offline"));

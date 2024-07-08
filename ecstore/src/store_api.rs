@@ -149,9 +149,18 @@ pub struct ObjectOptions {
     pub max_parity: bool,
 }
 
+pub struct BucketOptions {}
+
+#[derive(Debug, Clone)]
+pub struct BucketInfo {
+    pub name: String,
+    pub created: OffsetDateTime,
+}
+
 #[async_trait::async_trait]
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
 
     async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: ObjectOptions) -> Result<()>;
 }

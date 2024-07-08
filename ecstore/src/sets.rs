@@ -12,7 +12,7 @@ use crate::{
     endpoint::PoolEndpoints,
     erasure::Erasure,
     format::{DistributionAlgoVersion, FormatV3},
-    store_api::{FileInfo, MakeBucketOptions, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{BucketInfo, BucketOptions, FileInfo, MakeBucketOptions, ObjectOptions, PutObjReader, StorageAPI},
     utils::hash,
 };
 
@@ -155,6 +155,10 @@ impl Sets {
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        unimplemented!()
+    }
+
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()
     }
 

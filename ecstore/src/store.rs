@@ -8,12 +8,13 @@ use uuid::Uuid;
 
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::{self, DiskError, DiskOption, DiskStore, RUSTFS_META_BUCKET},
+    disk::{self, DiskOption, DiskStore, RUSTFS_META_BUCKET},
+    disk_api::DiskError,
     disks_layout::DisksLayout,
     endpoint::EndpointServerPools,
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
-    store_api::{MakeBucketOptions, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{BucketInfo, BucketOptions, MakeBucketOptions, ObjectOptions, PutObjReader, StorageAPI},
     store_init, utils,
 };
 
@@ -133,6 +134,11 @@ impl StorageAPI for ECStore {
         // TODO: toObjectErr
 
         Ok(())
+    }
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        let info = self.peer_sys.get_bucket_info(bucket, opts).await?;
+
+        Ok(info)
     }
     async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: ObjectOptions) -> Result<()> {
         // checkPutObjectArgs

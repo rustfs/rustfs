@@ -3,7 +3,8 @@ use futures::future::join_all;
 use uuid::Uuid;
 
 use crate::{
-    disk::{DiskError, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET},
+    disk::{DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET},
+    disk_api::DiskError,
     format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
 };
 
@@ -163,10 +164,7 @@ pub fn default_partiy_count(drive: usize) -> usize {
     }
 }
 // read_format_file_all 读取所有foramt.json
-async fn read_format_file_all(
-    disks: &Vec<Option<DiskStore>>,
-    heal: bool,
-) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
+async fn read_format_file_all(disks: &Vec<Option<DiskStore>>, heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
     let mut futures = Vec::with_capacity(disks.len());
 
     for ep in disks.iter() {
@@ -216,10 +214,7 @@ async fn read_format_file(disk: &Option<DiskStore>, _heal: bool) -> Result<Forma
     Ok(fm)
 }
 
-async fn save_format_file_all(
-    disks: &Vec<Option<DiskStore>>,
-    formats: &Vec<Option<FormatV3>>,
-) -> Vec<Option<Error>> {
+async fn save_format_file_all(disks: &Vec<Option<DiskStore>>, formats: &Vec<Option<FormatV3>>) -> Vec<Option<Error>> {
     let mut futures = Vec::with_capacity(disks.len());
 
     for (i, ep) in disks.iter().enumerate() {
@@ -255,16 +250,10 @@ async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -
     let tmpfile = Uuid::new_v4().to_string();
 
     let disk = disk.as_ref().unwrap();
-    disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data)
-        .await?;
+    disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data).await?;
 
-    disk.rename_file(
-        RUSTFS_META_BUCKET,
-        tmpfile.as_str(),
-        RUSTFS_META_BUCKET,
-        FORMAT_CONFIG_FILE,
-    )
-    .await?;
+    disk.rename_file(RUSTFS_META_BUCKET, tmpfile.as_str(), RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
+        .await?;
 
     // let mut disk = disk;
 

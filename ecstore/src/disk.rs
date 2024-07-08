@@ -20,7 +20,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    disk_api::DiskAPI,
+    disk_api::{DiskAPI, DiskError, VolumeInfo},
     endpoint::{Endpoint, Endpoints},
     file_meta::FileMeta,
     format::{DistributionAlgoVersion, FormatV3},
@@ -477,6 +477,21 @@ impl DiskAPI for LocalDisk {
 
         Err(Error::new(DiskError::VolumeExists))
     }
+
+    async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
+        let p = self.get_bucket_path(volume)?;
+
+        let m = read_file_metadata(&p).await?;
+        let modtime = match m.modified() {
+            Ok(md) => OffsetDateTime::from(md),
+            Err(_) => return Err(Error::msg("Not supported modified on this platform")),
+        };
+
+        Ok(VolumeInfo {
+            name: volume.to_string(),
+            created: modtime,
+        })
+    }
 }
 
 // pub async fn copy_bytes<S, W>(mut stream: S, writer: &mut W) -> Result<u64>
@@ -504,120 +519,6 @@ impl DiskAPI for LocalDisk {
 //         Ok(Self {})
 //     }
 // }
-
-#[derive(Debug, thiserror::Error)]
-pub enum DiskError {
-    #[error("file not found")]
-    FileNotFound,
-    #[error("disk not found")]
-    DiskNotFound,
-
-    #[error("disk access denied")]
-    FileAccessDenied,
-
-    #[error("InconsistentDisk")]
-    InconsistentDisk,
-
-    #[error("volume already exists")]
-    VolumeExists,
-
-    #[error("unformatted disk error")]
-    UnformattedDisk,
-
-    #[error("unsupport disk")]
-    UnsupportedDisk,
-
-    #[error("disk not a dir")]
-    DiskNotDir,
-
-    #[error("volume not found")]
-    VolumeNotFound,
-}
-
-impl DiskError {
-    pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<()> {
-        println!("errs: {:?}", errs);
-
-        if Self::count_errs(errs, &DiskError::UnsupportedDisk) == errs.len() {
-            return Err(Error::new(DiskError::UnsupportedDisk));
-        }
-
-        // if count_errs(errs, &DiskError::DiskAccessDenied) == errs.len() {
-        //     return Err(Error::new(DiskError::DiskAccessDenied));
-        // }
-
-        if Self::count_errs(errs, &DiskError::FileAccessDenied) == errs.len() {
-            return Err(Error::new(DiskError::FileAccessDenied));
-        }
-
-        // if count_errs(errs, &DiskError::FaultyDisk) == errs.len() {
-        //     return Err(Error::new(DiskError::FaultyDisk));
-        // }
-
-        if Self::count_errs(errs, &DiskError::DiskNotDir) == errs.len() {
-            return Err(Error::new(DiskError::DiskNotDir));
-        }
-
-        // if count_errs(errs, &DiskError::XLBackend) == errs.len() {
-        //     return Err(Error::new(DiskError::XLBackend));
-        // }
-        Ok(())
-    }
-    pub fn count_errs(errs: &Vec<Option<Error>>, err: &DiskError) -> usize {
-        return errs
-            .iter()
-            .filter(|&e| {
-                if e.is_some() {
-                    let e = e.as_ref().unwrap();
-                    let cast = e.downcast_ref::<DiskError>();
-                    if cast.is_some() {
-                        let cast = cast.unwrap();
-                        return cast == err;
-                    }
-                }
-                false
-            })
-            .count();
-    }
-
-    pub fn quorum_unformatted_disks(errs: &Vec<Option<Error>>) -> bool {
-        Self::count_errs(errs, &DiskError::UnformattedDisk) >= (errs.len() / 2) + 1
-    }
-
-    pub fn is_err(err: &Error, disk_err: &DiskError) -> bool {
-        let cast = err.downcast_ref::<DiskError>();
-        if cast.is_none() {
-            return false;
-        }
-
-        let e = cast.unwrap();
-
-        e == disk_err
-    }
-
-    // pub fn match_err(err: Error, matchs: Vec<DiskError>) -> bool {
-    //     let cast = err.downcast_ref::<DiskError>();
-    //     if cast.is_none() {
-    //         return false;
-    //     }
-
-    //     let e = cast.unwrap();
-
-    //     for i in matchs.iter() {
-    //         if e == i {
-    //             return true;
-    //         }
-    //     }
-
-    //     return false;
-    // }
-}
-
-impl PartialEq for DiskError {
-    fn eq(&self, other: &Self) -> bool {
-        core::mem::discriminant(self) == core::mem::discriminant(other)
-    }
-}
 
 pub(crate) struct FileWriter<'a> {
     tmp_path: PathBuf,
