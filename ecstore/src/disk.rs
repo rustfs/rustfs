@@ -20,7 +20,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    disk_api::{DiskAPI, DiskError, VolumeInfo},
+    disk_api::{DiskAPI, DiskError, ReadOptions, VolumeInfo},
     endpoint::{Endpoint, Endpoints},
     file_meta::FileMeta,
     format::{DistributionAlgoVersion, FormatV3},
@@ -217,6 +217,48 @@ impl LocalDisk {
 
         Ok(())
     }
+
+    async fn read_raw(
+        &self,
+        bucket: &str,
+        volume_dir: impl AsRef<Path>,
+        path: impl AsRef<Path>,
+        read_data: bool,
+    ) -> Result<(Vec<u8>, OffsetDateTime)> {
+        let meta_path = path.as_ref().join(Path::new(STORAGE_FORMAT_FILE));
+        if read_data {
+            self.read_all_data(bucket, volume_dir, meta_path).await
+        } else {
+            self.read_metadata_with_dmtime(meta_path).await
+        }
+    }
+
+    async fn read_metadata_with_dmtime(&self, path: impl AsRef<Path>) -> Result<(Vec<u8>, OffsetDateTime)> {
+        let (data, meta) = read_file_all(path).await?;
+
+        let modtime = match meta.modified() {
+            Ok(md) => OffsetDateTime::from(md),
+            Err(_) => return Err(Error::msg("Not supported modified on this platform")),
+        };
+
+        Ok((data, modtime))
+    }
+
+    async fn read_all_data(
+        &self,
+        bucket: &str,
+        volume_dir: impl AsRef<Path>,
+        path: impl AsRef<Path>,
+    ) -> Result<(Vec<u8>, OffsetDateTime)> {
+        let (data, meta) = read_file_all(path).await?;
+
+        let modtime = match meta.modified() {
+            Ok(md) => OffsetDateTime::from(md),
+            Err(_) => return Err(Error::msg("Not supported modified on this platform")),
+        };
+
+        Ok((data, modtime))
+    }
 }
 
 fn is_root_path(path: &PathBuf) -> bool {
@@ -243,6 +285,14 @@ pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Vec<u8>, Option
     // }
 
     Ok((data, meta))
+}
+
+pub async fn write_all_internal(p: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Result<()> {
+    // create top dir if not exists
+    fs::create_dir_all(&p.as_ref().parent().unwrap_or_else(|| Path::new("."))).await?;
+
+    fs::write(&p, data).await?;
+    Ok(())
 }
 
 pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Vec<u8>, Metadata)> {
@@ -307,10 +357,8 @@ impl DiskAPI for LocalDisk {
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         let p = self.get_object_path(&volume, &path)?;
 
-        // create top dir if not exists
-        fs::create_dir_all(&p.parent().unwrap_or_else(|| Path::new("."))).await?;
+        write_all_internal(p, data).await?;
 
-        fs::write(&p, data).await?;
         Ok(())
     }
 
@@ -418,7 +466,7 @@ impl DiskAPI for LocalDisk {
         }
 
         if !dst_buf.is_empty() {
-            meta = match FileMeta::unmarshal(dst_buf) {
+            meta = match FileMeta::unmarshal(&dst_buf) {
                 Ok(m) => m,
                 Err(e) => FileMeta::new(),
             }
@@ -491,6 +539,44 @@ impl DiskAPI for LocalDisk {
             name: volume.to_string(),
             created: modtime,
         })
+    }
+
+    async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        let p = self.get_object_path(&volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())?;
+
+        let mut meta = FileMeta::new();
+        if !fi.fresh {
+            let (buf, _) = read_file_exists(&p).await?;
+            if !buf.is_empty() {
+                meta = FileMeta::unmarshal(&buf)?;
+            }
+        }
+
+        meta.add_version(fi)?;
+
+        let fm_data = meta.marshal_msg()?;
+
+        write_all_internal(p, fm_data).await?;
+
+        return Ok(());
+    }
+
+    async fn read_version(
+        &self,
+        org_volume: &str,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        opts: ReadOptions,
+    ) -> Result<FileInfo> {
+        let file_path = self.get_object_path(volume, path)?;
+        let file_dir = self.get_bucket_path(volume)?;
+
+        let read_data = opts.read_data;
+
+        let (data, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
+
+        unimplemented!()
     }
 }
 

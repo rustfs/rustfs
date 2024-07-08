@@ -33,6 +33,9 @@ tokio-util = { version = "0.7.11", features = ["io"] }
 s3s = "0.10.0"
 crc32fast = "1.4.2"
 siphasher = "1.0.1"
+base64-simd = "0.8.0"
+sha2 = "0.10.8"
+hex-simd = "0.8.0"
 
 
 [dev-dependencies]
