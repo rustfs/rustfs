@@ -1,5 +1,5 @@
 use super::ellipses::*;
-use anyhow::{Error, Result};
+use super::error::{Error, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -9,8 +9,20 @@ const SET_SIZES: [usize; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 
 
 #[derive(Deserialize, Debug, Default)]
 pub struct PoolDisksLayout {
-    pub cmd_line: String,
-    pub layout: Vec<Vec<String>>,
+    cmd_line: String,
+    layout: Vec<Vec<String>>,
+}
+
+impl AsRef<Vec<Vec<String>>> for PoolDisksLayout {
+    fn as_ref(&self) -> &Vec<Vec<String>> {
+        &self.layout
+    }
+}
+
+impl AsMut<Vec<Vec<String>>> for PoolDisksLayout {
+    fn as_mut(&mut self) -> &mut Vec<Vec<String>> {
+        &mut self.layout
+    }
 }
 
 impl PoolDisksLayout {
@@ -20,12 +32,32 @@ impl PoolDisksLayout {
             layout,
         }
     }
+
+    pub fn count(&self) -> usize {
+        self.layout.len()
+    }
+
+    pub fn get_cmd_line(&self) -> &str {
+        &self.cmd_line
+    }
 }
 
 #[derive(Deserialize, Debug, Default)]
 pub struct DisksLayout {
     pub legacy: bool,
-    pub pools: Vec<PoolDisksLayout>,
+    pools: Vec<PoolDisksLayout>,
+}
+
+impl AsRef<Vec<PoolDisksLayout>> for DisksLayout {
+    fn as_ref(&self) -> &Vec<PoolDisksLayout> {
+        &self.pools
+    }
+}
+
+impl AsMut<Vec<PoolDisksLayout>> for DisksLayout {
+    fn as_mut(&mut self) -> &mut Vec<PoolDisksLayout> {
+        &mut self.pools
+    }
 }
 
 impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
@@ -33,7 +65,7 @@ impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
 
     fn try_from(args: &[T]) -> Result<Self, Self::Error> {
         if args.is_empty() {
-            return Err(Error::msg("Invalid argument"));
+            return Err(Error::from_string("Invalid argument"));
         }
 
         let is_ellipses = args.iter().any(|v| has_ellipses(&[v]));
@@ -54,7 +86,9 @@ impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
         let mut layout = Vec::with_capacity(args.len());
         for arg in args.iter() {
             if !has_ellipses(&[arg]) && args.len() > 1 {
-                return Err(Error::msg("all args must have ellipses for pool expansion (Invalid arguments specified)"));
+                return Err(Error::from_string(
+                    "all args must have ellipses for pool expansion (Invalid arguments specified)",
+                ));
             }
 
             let set_args = get_all_sets(is_ellipses, &[arg])?;
@@ -66,6 +100,27 @@ impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
             legacy: false,
             pools: layout,
         })
+    }
+}
+
+impl DisksLayout {
+    pub fn is_empty_layout(&self) -> bool {
+        self.pools.is_empty()
+            || self.pools[0].layout.is_empty()
+            || self.pools[0].layout[0].is_empty()
+            || self.pools[0].layout[0][0].is_empty()
+    }
+
+    pub fn is_single_drive_layout(&self) -> bool {
+        self.pools.len() == 1 && self.pools[0].layout.len() == 1 && self.pools[0].layout[0].len() == 1
+    }
+
+    pub fn get_single_drive_layout(&self) -> &str {
+        &self.pools[0].layout[0][0]
+    }
+
+    pub fn get_layout(&self, idx: usize) -> Option<&PoolDisksLayout> {
+        self.pools.get(idx)
     }
 }
 
@@ -95,7 +150,7 @@ fn get_all_sets<T: AsRef<str>>(is_ellipses: bool, args: &[T]) -> Result<Vec<Vec<
     for args in set_args.iter() {
         for arg in args {
             if unique_args.contains(arg) {
-                return Err(Error::msg(format!("Input args {} has duplicate ellipses", arg)));
+                return Err(Error::from_string(format!("Input args {} has duplicate ellipses", arg)));
             }
             unique_args.insert(arg);
         }
@@ -228,11 +283,11 @@ fn possible_set_counts_with_symmetry(set_counts: &[usize], arg_patterns: &[ArgPa
     for &ss in set_counts {
         let mut symmetry = false;
         for arg_pattern in arg_patterns {
-            for p in arg_pattern.inner.iter() {
-                if p.seq.len() > ss {
-                    symmetry = (p.seq.len() % ss) == 0;
+            for p in arg_pattern.as_ref().iter() {
+                if p.len() > ss {
+                    symmetry = (p.len() % ss) == 0;
                 } else {
-                    symmetry = (ss % p.seq.len()) == 0;
+                    symmetry = (ss % p.len()) == 0;
                 }
             }
         }
@@ -254,20 +309,20 @@ fn possible_set_counts_with_symmetry(set_counts: &[usize], arg_patterns: &[ArgPa
 /// indexes (total sets)
 fn get_set_indexes<T: AsRef<str>>(args: &[T], total_sizes: &[usize], arg_patterns: &[ArgPattern]) -> Result<Vec<Vec<usize>>> {
     if args.is_empty() || total_sizes.is_empty() {
-        return Err(Error::msg("Invalid argument"));
+        return Err(Error::from_string("Invalid argument"));
     }
 
     for &size in total_sizes {
         // Check if total_sizes has minimum range upto set_size
         if size < SET_SIZES[0] {
-            return Err(Error::msg(format!("Incorrect number of endpoints provided, size {}", size)));
+            return Err(Error::from_string(format!("Incorrect number of endpoints provided, size {}", size)));
         }
     }
 
     let common_size = get_divisible_size(total_sizes);
     let mut set_counts = possible_set_counts(common_size);
     if set_counts.is_empty() {
-        return Err(Error::msg(format!(
+        return Err(Error::from_string(format!(
             "Incorrect number of endpoints provided, number of drives {} is not divisible by any supported erasure set sizes {}",
             common_size, 0
         )));
@@ -278,13 +333,13 @@ fn get_set_indexes<T: AsRef<str>>(args: &[T], total_sizes: &[usize], arg_pattern
     // Returns possible set counts with symmetry.
     set_counts = possible_set_counts_with_symmetry(&set_counts, arg_patterns);
     if set_counts.is_empty() {
-        return Err(Error::msg("No symmetric distribution detected with input endpoints provided"));
+        return Err(Error::from_string("No symmetric distribution detected with input endpoints provided"));
     }
 
     // Final set size with all the symmetry accounted for.
     let set_size = common_set_drive_count(common_size, &set_counts);
     if !is_valid_set_size(set_size) {
-        return Err(Error::msg("Incorrect number of endpoints provided3"));
+        return Err(Error::from_string("Incorrect number of endpoints provided3"));
     }
 
     Ok(total_sizes
@@ -465,6 +520,13 @@ mod test {
                 ]],
                 success: true,
             },
+            TestCase {
+                num: 15,
+                args: vec!["https://node{1...3}.example.net/mnt/drive{1...8}"],
+                total_sizes: vec![24],
+                indexes: vec![vec![12, 12]],
+                success: true,
+            },
         ];
 
         for test_case in test_cases {
@@ -475,7 +537,7 @@ mod test {
                         arg_patterns.push(patterns);
                     }
                     Err(err) => {
-                        panic!("Test{}: Unexpected failure {}", test_case.num, err);
+                        panic!("Test{}: Unexpected failure {:?}", test_case.num, err);
                     }
                 }
             }
@@ -494,7 +556,7 @@ mod test {
                 }
                 Err(err) => {
                     if test_case.success {
-                        panic!("Test{}: Expected success but failed instead {}", test_case.num, err);
+                        panic!("Test{}: Expected success but failed instead {:?}", test_case.num, err);
                     }
                 }
             }
@@ -754,7 +816,7 @@ mod test {
                 }
                 Err(err) => {
                     if test_case.success {
-                        panic!("Test{}: Expected success but failed instead {}", test_case.num, err);
+                        panic!("Test{}: Expected success but failed instead {:?}", test_case.num, err);
                     }
                 }
             }

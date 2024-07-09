@@ -54,14 +54,14 @@ pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
 }
 
 pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<Error>>) {
-    let mut futures = Vec::with_capacity(eps.len());
+    let mut futures = Vec::with_capacity(eps.as_ref().len());
 
-    for ep in eps.iter() {
+    for ep in eps.as_ref().iter() {
         futures.push(new_disk(ep, opt));
     }
 
-    let mut res = Vec::with_capacity(eps.len());
-    let mut errors = Vec::with_capacity(eps.len());
+    let mut res = Vec::with_capacity(eps.as_ref().len());
+    let mut errors = Vec::with_capacity(eps.as_ref().len());
 
     let results = join_all(futures).await;
     for result in results {
@@ -119,7 +119,7 @@ impl LocalDisk {
             let fm = FormatV3::try_from(s)?;
             let (set_idx, disk_idx) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
 
-            if set_idx as i32 != ep.set_idx || disk_idx as i32 != ep.disk_idx {
+            if Some(set_idx) != ep.set_idx || Some(disk_idx) != ep.disk_idx {
                 return Err(Error::new(DiskError::InconsistentDisk));
             }
 
@@ -685,7 +685,7 @@ mod test {
         let p = "./testv";
         fs::create_dir_all(&p).await.unwrap();
 
-        let ep = match Endpoint::new(&p) {
+        let ep = match Endpoint::try_from(p) {
             Ok(e) => e,
             Err(e) => {
                 println!("{e}");

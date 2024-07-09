@@ -1,310 +1,550 @@
-use super::disks_layout::PoolDisksLayout;
-use super::utils::{
-    net::{is_local_host, split_host_port},
-    string::new_string_set,
-};
-use anyhow::{Error, Result};
+use super::disks_layout::DisksLayout;
+use super::error::{Error, Result};
+use super::utils::net;
+use path_absolutize::Absolutize;
+use path_clean::PathClean;
+use std::collections::HashSet;
 use std::fmt::Display;
-use std::{collections::HashMap, net::IpAddr, path::Path, usize};
+use std::net::IpAddr;
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    path::Path,
+};
 use url::{ParseError, Url};
 
-pub const DEFAULT_PORT: u16 = 9000;
-
 /// enum for endpoint type.
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum EndpointType {
     /// path style endpoint type enum.
     Path,
 
     /// URL style endpoint type enum.
     Url,
+}
 
-    /// Unknown endpoint type enum.
-    UnKnow,
+/// enum for setup type.
+#[derive(PartialEq, Eq, Debug)]
+pub enum SetupType {
+    /// starts with unknown setup type.
+    Unknown,
+
+    /// FS setup type enum.
+    FS,
+
+    /// Erasure single drive setup enum.
+    ErasureSD,
+
+    /// Erasure setup type enum.
+    Erasure,
+
+    /// Distributed Erasure setup type enum.
+    DistErasure,
 }
 
 /// holds information about a node in this cluster
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub url: url::Url,
-    pub pools: Vec<i32>,
+    pub pools: Vec<usize>,
     pub is_local: bool,
-    pub grid_host: String, // TODO "scheme://host:port"
+    pub grid_host: String,
 }
 
-// impl PartialOrd for Node {
-//     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-//         self.grid_host.partial_cmp(&other.grid_host)
-//     }
-// }
-
 /// any type of endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Endpoint {
     pub url: url::Url,
     pub is_local: bool,
 
-    pub pool_idx: i32,
-    pub set_idx: i32,
-    pub disk_idx: i32,
+    pub pool_idx: Option<usize>,
+    pub set_idx: Option<usize>,
+    pub disk_idx: Option<usize>,
 }
 
 impl Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.url.has_host() {
-            write!(f, "{}", self.url)
-        } else {
+        if self.url.scheme() == "file" {
             write!(f, "{}", self.url.path())
+        } else {
+            write!(f, "{}", self.url)
         }
     }
 }
 
 impl TryFrom<&str> for Endpoint {
     /// The type returned in the event of a conversion error.
-    type Error = String;
+    type Error = Error;
 
     /// Performs the conversion.
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if is_empty_path(value) {
-            return Err("empty or root endpoint is not supported".into());
+        /// check whether given path is not empty.
+        fn is_empty_path(path: impl AsRef<Path>) -> bool {
+            ["", "/", "\\"].iter().any(|&v| Path::new(v).eq(path.as_ref()))
         }
 
-        // match Url::parse(value) {
-        //     Ok(u) => u,
-        //     Err(e) => match e {
-        //         ParseError::EmptyHost => Err("")
-        //     },
-        // }
+        if is_empty_path(value) {
+            return Err(Error::from_string("empty or root endpoint is not supported"));
+        }
+
+        let mut is_local = false;
+        let url = match Url::parse(value) {
+            #[allow(unused_mut)]
+            Ok(mut url) if url.has_host() => {
+                // URL style of endpoint.
+                // Valid URL style endpoint is
+                // - Scheme field must contain "http" or "https"
+                // - All field should be empty except Host and Path.
+                if !((url.scheme() == "http" || url.scheme() == "https")
+                    && url.username().is_empty()
+                    && url.fragment().is_none()
+                    && url.query().is_none())
+                {
+                    return Err(Error::from_string("invalid URL endpoint format"));
+                }
+
+                let path = Path::new(url.path()).clean();
+                if is_empty_path(&path) {
+                    return Err(Error::from_string("empty or root path is not supported in URL endpoint"));
+                }
+
+                if let Some(v) = path.to_str() {
+                    url.set_path(v)
+                }
+
+                // On windows having a preceding SlashSeparator will cause problems, if the
+                // command line already has C:/<export-folder/ in it. Final resulting
+                // path on windows might become C:/C:/ this will cause problems
+                // of starting rustfs server properly in distributed mode on windows.
+                // As a special case make sure to trim the separator.
+
+                // NOTE: It is also perfectly fine for windows users to have a path
+                // without C:/ since at that point we treat it as relative path
+                // and obtain the full filesystem path as well. Providing C:/
+                // style is necessary to provide paths other than C:/,
+                // such as F:/, D:/ etc.
+                //
+                // Another additional benefit here is that this style also
+                // supports providing \\host\share support as well.
+                #[cfg(windows)]
+                {
+                    let path = url.path().to_owned();
+                    if Path::new(&path[1..]).is_absolute() {
+                        url.set_path(&path[1..]);
+                    }
+                }
+
+                url
+            }
+            Ok(_) => {
+                // like d:/foo
+                is_local = true;
+                url_parse_from_file_path(value)?
+            }
+            Err(e) => match e {
+                ParseError::InvalidPort => {
+                    return Err(Error::from_string("invalid URL endpoint format: port number must be between 1 to 65535"))
+                }
+                ParseError::EmptyHost => return Err(Error::from_string("invalid URL endpoint format: empty host name")),
+                ParseError::RelativeUrlWithoutBase => {
+                    // like /foo
+                    is_local = true;
+                    url_parse_from_file_path(value)?
+                }
+                _ => return Err(Error::from_string(format!("invalid URL endpoint format: {}", e))),
+            },
+        };
+
+        Ok(Endpoint {
+            url,
+            is_local,
+            pool_idx: None,
+            set_idx: None,
+            disk_idx: None,
+        })
+    }
+}
+
+impl Endpoint {
+    /// returns type of endpoint.
+    pub fn get_type(&self) -> EndpointType {
+        if self.url.scheme() == "file" {
+            EndpointType::Path
+        } else {
+            EndpointType::Url
+        }
+    }
+
+    /// sets a specific pool number to this node
+    pub fn set_pool_index(&mut self, idx: usize) {
+        self.pool_idx = Some(idx)
+    }
+
+    /// sets a specific set number to this node
+    pub fn set_set_index(&mut self, idx: usize) {
+        self.set_idx = Some(idx)
+    }
+
+    /// sets a specific disk number to this node
+    pub fn set_disk_index(&mut self, idx: usize) {
+        self.disk_idx = Some(idx)
+    }
+
+    /// resolves the host and updates if it is local or not.
+    fn update_is_local(&mut self, local_port: u16) -> Result<()> {
+        match (self.url.scheme(), self.url.host()) {
+            (v, Some(host)) if v != "file" => {
+                self.is_local = net::is_local_host(host, self.url.port().unwrap_or_default(), local_port)?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// returns the host to be used for grid connections.
+    fn grid_host(&self) -> String {
+        match (self.url.host(), self.url.port()) {
+            (Some(host), Some(port)) => format!("{}://{}:{}", self.url.scheme(), host, port),
+            (Some(host), None) => format!("{}://{}", self.url.scheme(), host),
+            _ => String::new(),
+        }
+    }
+
+    fn host_port(&self) -> String {
+        match (self.url.host(), self.url.port()) {
+            (Some(host), Some(port)) => format!("{}:{}", host, port),
+            (Some(host), None) => format!("{}", host),
+            _ => String::new(),
+        }
+    }
+}
+
+/// list of same type of endpoint.
+#[derive(Debug, Default, Clone)]
+pub struct Endpoints(Vec<Endpoint>);
+
+impl AsRef<Vec<Endpoint>> for Endpoints {
+    fn as_ref(&self) -> &Vec<Endpoint> {
+        &self.0
+    }
+}
+
+impl AsMut<Vec<Endpoint>> for Endpoints {
+    fn as_mut(&mut self) -> &mut Vec<Endpoint> {
+        &mut self.0
+    }
+}
+
+impl From<Vec<Endpoint>> for Endpoints {
+    fn from(v: Vec<Endpoint>) -> Self {
+        Self(v)
+    }
+}
+
+impl TryFrom<&[String]> for Endpoints {
+    type Error = Error;
+
+    /// returns new endpoint list based on input args.
+    fn try_from(args: &[String]) -> Result<Self> {
+        let mut endpoint_type = None;
+        let mut schema = None;
+        let mut endpoints = Vec::with_capacity(args.len());
+        let mut uniq_set = HashSet::with_capacity(args.len());
+
+        // Loop through args and adds to endpoint list.
+        for (i, arg) in args.iter().enumerate() {
+            let endpoint = match Endpoint::try_from(arg.as_str()) {
+                Ok(ep) => ep,
+                Err(e) => return Err(Error::from_string(format!("'{}': {}", arg, e))),
+            };
+
+            // All endpoints have to be same type and scheme if applicable.
+            if i == 0 {
+                endpoint_type = Some(endpoint.get_type());
+                schema = Some(endpoint.url.scheme().to_owned());
+            } else if Some(endpoint.get_type()) != endpoint_type {
+                return Err(Error::from_string("mixed style endpoints are not supported"));
+            } else if Some(endpoint.url.scheme()) != schema.as_deref() {
+                return Err(Error::from_string("mixed scheme is not supported"));
+            }
+
+            // Check for duplicate endpoints.
+            let endpoint_str = endpoint.to_string();
+            if uniq_set.contains(&endpoint_str) {
+                return Err(Error::from_string("duplicate endpoints found"));
+            }
+
+            uniq_set.insert(endpoint_str);
+            endpoints.push(endpoint);
+        }
+
+        Ok(Endpoints(endpoints))
+    }
+}
+
+/// a temporary type to holds the list of endpoints
+pub struct PoolEndpointList {
+    inner: Vec<Endpoints>,
+    setup_type: SetupType,
+}
+
+impl AsRef<Vec<Endpoints>> for PoolEndpointList {
+    fn as_ref(&self) -> &Vec<Endpoints> {
+        &self.inner
+    }
+}
+
+impl AsMut<Vec<Endpoints>> for PoolEndpointList {
+    fn as_mut(&mut self) -> &mut Vec<Endpoints> {
+        &mut self.inner
+    }
+}
+
+impl PoolEndpointList {
+    /// creates a list of endpoints per pool, resolves their relevant
+    /// hostnames and discovers those are local or remote.
+    pub fn create_pool_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<Self> {
+        if disks_layout.is_empty_layout() {
+            return Err(Error::from_string("invalid number of endpoints"));
+        }
+
+        let server_addr = net::check_local_server_addr(server_addr)?;
+
+        // For single arg, return single drive EC setup.
+        if disks_layout.is_single_drive_layout() {
+            let mut endpoint = Endpoint::try_from(disks_layout.get_single_drive_layout())?;
+            endpoint.update_is_local(server_addr.port())?;
+
+            if endpoint.get_type() != EndpointType::Path {
+                return Err(Error::from_string("use path style endpoint for single node setup"));
+            }
+
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(0);
+
+            // TODO Check for cross device mounts if any.
+
+            return Ok(Self {
+                inner: vec![Endpoints::from(vec![endpoint])],
+                setup_type: SetupType::ErasureSD,
+            });
+        }
+
+        let mut pool_endpoints = Vec::<Endpoints>::with_capacity(disks_layout.as_ref().len());
+        for (pool_idx, pool) in disks_layout.as_ref().iter().enumerate() {
+            let mut endpoints = Endpoints::default();
+            for (set_idx, set_layout) in pool.as_ref().iter().enumerate() {
+                // Convert args to endpoints
+                let mut eps = Endpoints::try_from(set_layout.as_slice())?;
+
+                // TODO Check for cross device mounts if any.
+
+                for (disk_idx, ep) in eps.as_mut().iter_mut().enumerate() {
+                    ep.set_pool_index(pool_idx);
+                    ep.set_set_index(set_idx);
+                    ep.set_disk_index(disk_idx);
+                }
+
+                endpoints.as_mut().append(eps.as_mut());
+            }
+
+            if endpoints.as_ref().is_empty() {
+                return Err(Error::from_string("invalid number of endpoints"));
+            }
+
+            pool_endpoints.push(endpoints);
+        }
+
+        // setup type
+        let mut unique_args = HashSet::new();
+        let mut pool_endpoint_list = Self {
+            inner: pool_endpoints,
+            setup_type: SetupType::Unknown,
+        };
+
+        pool_endpoint_list.update_is_local(server_addr.port())?;
+
+        for endpoints in pool_endpoint_list.inner.iter_mut() {
+            // Check whether same path is not used in endpoints of a host on different port.
+            let mut path_ip_map: HashMap<&str, HashSet<IpAddr>> = HashMap::new();
+            let mut host_ip_cache = HashMap::new();
+            for ep in endpoints.as_ref() {
+                if !ep.url.has_host() {
+                    continue;
+                }
+
+                let host = ep.url.host().unwrap();
+                let host_ip_set = host_ip_cache.entry(host.clone()).or_insert({
+                    net::get_host_ip(host.clone())
+                        .map_err(|e| Error::from_string(format!("host '{}' cannot resolve: {}", host, e)))?
+                });
+
+                let path = ep.url.path();
+                match path_ip_map.entry(path) {
+                    Entry::Occupied(mut e) => {
+                        if e.get().intersection(host_ip_set).count() > 0 {
+                            return Err(Error::from_string(format!(
+                                "same path '{}' can not be served by different port on same address",
+                                path
+                            )));
+                        }
+                        e.get_mut().extend(host_ip_set.iter());
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(host_ip_set.clone());
+                    }
+                }
+            }
+
+            // Check whether same path is used for more than 1 local endpoints.
+            let mut local_path_set = HashSet::new();
+            for ep in endpoints.as_ref() {
+                if !ep.is_local {
+                    continue;
+                }
+
+                let path = ep.url.path();
+                if local_path_set.contains(path) {
+                    return Err(Error::from_string(format!(
+                        "path '{}' cannot be served by different address on same server",
+                        path
+                    )));
+                }
+                local_path_set.insert(path);
+            }
+
+            // Here all endpoints are URL style.
+            let mut ep_path_set = HashSet::new();
+            let mut local_server_host_set = HashSet::new();
+            let mut local_port_set = HashSet::new();
+            let mut local_endpoint_count = 0;
+
+            for ep in endpoints.as_ref() {
+                ep_path_set.insert(ep.url.path());
+                if ep.is_local && ep.url.has_host() {
+                    local_server_host_set.insert(ep.url.host());
+                    local_port_set.insert(ep.url.port());
+                    local_endpoint_count += 1;
+                }
+            }
+
+            // All endpoints are pointing to local host
+            if endpoints.as_ref().len() == local_endpoint_count {
+                // If all endpoints have same port number, Just treat it as local erasure setup
+                // using URL style endpoints.
+                if local_port_set.len() == 1 && local_server_host_set.len() > 1 {
+                    return Err(Error::from_string("all local endpoints should not have different hostnames/ips"));
+                }
+            }
+
+            // Add missing port in all endpoints.
+            for ep in endpoints.as_mut() {
+                if !ep.url.has_host() {
+                    unique_args.insert(format!("localhost:{}", server_addr.port()));
+                    continue;
+                }
+                match ep.url.port() {
+                    None => {
+                        let _ = ep.url.set_port(Some(server_addr.port()));
+                    }
+                    Some(port) => {
+                        // If endpoint is local, but port is different than serverAddrPort, then make it as remote.
+                        if ep.is_local && server_addr.port() != port {
+                            ep.is_local = false;
+                        }
+                    }
+                }
+                unique_args.insert(ep.host_port());
+            }
+        }
+
+        let setup_type = match pool_endpoint_list.as_ref()[0].as_ref()[0].get_type() {
+            EndpointType::Path => SetupType::Erasure,
+            EndpointType::Url => match unique_args.len() {
+                1 => SetupType::Erasure,
+                _ => SetupType::DistErasure,
+            },
+        };
+
+        pool_endpoint_list.setup_type = setup_type;
+
+        Ok(pool_endpoint_list)
+    }
+
+    /// resolves all hosts and discovers which are local
+    fn update_is_local(&mut self, local_port: u16) -> Result<()> {
+        for endpoints in self.inner.iter_mut() {
+            for ep in endpoints.as_mut() {
+                match ep.url.host() {
+                    None => {
+                        ep.is_local = true;
+                    }
+                    Some(host) => {
+                        ep.is_local = net::is_local_host(host, ep.url.port().unwrap_or_default(), local_port)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// resolves all hosts and discovers which are local
+    fn _update_is_local(&mut self, local_port: u16) -> Result<()> {
+        let mut eps_resolved = 0;
+        let mut found_local = false;
+        let mut resolved_set: HashSet<(usize, usize)> = HashSet::new();
+        let ep_count: usize = self.inner.iter().map(|v| v.as_ref().len()).sum();
+
+        loop {
+            // Break if the local endpoint is found already Or all the endpoints are resolved.
+            if found_local || eps_resolved == ep_count {
+                break;
+            }
+
+            for (i, endpoints) in self.inner.iter_mut().enumerate() {
+                for (j, ep) in endpoints.as_mut().iter_mut().enumerate() {
+                    if resolved_set.contains(&(i, j)) {
+                        // Continue if host is already resolved.
+                        continue;
+                    }
+
+                    match ep.url.host() {
+                        None => {
+                            if !found_local {
+                                found_local = true;
+                            }
+                            ep.is_local = true;
+                            eps_resolved += 1;
+                            resolved_set.insert((i, j));
+                            continue;
+                        }
+                        Some(host) => match net::is_local_host(host, ep.url.port().unwrap_or_default(), local_port) {
+                            Ok(is_local) => {
+                                if !found_local {
+                                    found_local = is_local;
+                                }
+                                ep.is_local = is_local;
+                                eps_resolved += 1;
+                                resolved_set.insert((i, j));
+                            }
+                            Err(err) => {
+                                // TODO Retry infinitely on Kubernetes and Docker swarm?
+                                return Err(err);
+                            }
+                        },
+                    }
+                }
+            }
+        }
 
         unimplemented!()
     }
 }
 
-/// check whether given path is not empty.
-fn is_empty_path(path: &str) -> bool {
-    ["", "/", "\\"].iter().any(|&v| v.eq(path))
-}
-
-// 检查给定字符串是否是IP地址
-fn is_host_ip(ip_str: &str) -> bool {
-    ip_str.parse::<IpAddr>().is_ok()
-}
-
-impl Endpoint {
-    pub fn new(arg: &str) -> Result<Self> {
-        if is_empty_path(arg) {
-            return Err(Error::msg("不支持空或根endpoint"));
-        }
-
-        let url = Url::parse(arg).or_else(|e| match e {
-            ParseError::EmptyHost => Err(Error::msg("远程地址，域名不能为空")),
-            ParseError::IdnaError => Err(Error::msg("域名格式不正确")),
-            ParseError::InvalidPort => Err(Error::msg("端口格式不正确")),
-            ParseError::InvalidIpv4Address => Err(Error::msg("IP格式不正确")),
-            ParseError::InvalidIpv6Address => Err(Error::msg("IP格式不正确")),
-            ParseError::InvalidDomainCharacter => Err(Error::msg("域名字符格式不正确")),
-            // url::ParseError::RelativeUrlWithoutBase => todo!(),
-            // url::ParseError::RelativeUrlWithCannotBeABaseBase => todo!(),
-            // url::ParseError::SetHostOnCannotBeABaseUrl => todo!(),
-            ParseError::Overflow => Err(Error::msg("长度过长")),
-            _ => {
-                if is_host_ip(arg) {
-                    return Err(Error::msg("无效的URL endpoint格式: 缺少 http 或 https"));
-                }
-
-                let abs_arg = Path::new(arg).canonicalize()?;
-
-                let abs = abs_arg.to_str().ok_or(Error::msg("绝对路径错误"))?;
-                let url = Url::from_file_path(abs).unwrap();
-                Ok(url)
-            }
-        })?;
-
-        if url.scheme() == "file" {
-            return Ok(Endpoint {
-                url: url,
-                is_local: true,
-                pool_idx: -1,
-                set_idx: -1,
-                disk_idx: -1,
-            });
-        }
-
-        if url.port().is_none() {
-            return Err(Error::msg("必须提供端口号"));
-        }
-
-        if !(url.scheme() == "http" || url.scheme() == "https") {
-            return Err(Error::msg("URL endpoint格式无效: Scheme字段必须包含'http'或'https'"));
-        }
-
-        // 检查路径
-        let path = url.path();
-        if is_empty_path(path) {
-            return Err(Error::msg("URL endpoint不支持空或根路径"));
-        }
-
-        // TODO: Windows 系统上的路径处理
-        #[cfg(windows)]
-        {
-            use std::env;
-            if env::consts::OS == "windows" {
-                // 处理 Windows 路径的特殊逻辑
-            }
-        }
-
-        Ok(Endpoint {
-            url: url,
-            is_local: false,
-            pool_idx: -1,
-            set_idx: -1,
-            disk_idx: -1,
-        })
-    }
-
-    // pub fn host_port_str(&self) -> String {
-    //     if self.url.has_host() && self.port() > 0 {
-    //         return format!("{}:{}", self.hostname(), self.port());
-    //     } else if self.url.has_host() && self.port() == 0 {
-    //         return self.hostname().to_string();
-    //     } else if !self.url.has_host() && self.port() > 0 {
-    //         return format!(":{}", self.port());
-    //     } else {
-    //         return String::new();
-    //     }
-    // }
-
-    // pub fn port(&self) -> u16 {
-    //     self.url.port().unwrap_or(0)
-    // }
-    // pub fn hostname(&self) -> &str {
-    //     self.url.host_str().unwrap_or("")
-    // }
-
-    pub fn get_type(&self) -> EndpointType {
-        if self.url.has_host() {
-            EndpointType::Url
-        } else {
-            EndpointType::Path
-        }
-    }
-
-    // pub fn get_scheme(&self) -> String {
-    //     self.url.scheme().to_string()
-    // }
-
-    pub fn set_pool_index(&mut self, idx: i32) {
-        self.pool_idx = idx
-    }
-
-    pub fn set_set_index(&mut self, idx: i32) {
-        self.set_idx = idx
-    }
-
-    pub fn set_disk_index(&mut self, idx: i32) {
-        self.disk_idx = idx
-    }
-
-    fn update_islocal(&mut self) -> Result<()> {
-        if self.url.has_host() {
-            self.is_local = is_local_host(self.url.host().unwrap(), self.url.port().unwrap(), DEFAULT_PORT);
-        }
-
-        Ok(())
-    }
-
-    fn grid_host(&self) -> String {
-        let host = self.url.host_str().unwrap_or("");
-        let port = self.url.port().unwrap_or(0);
-        if port > 0 {
-            format!("{}://{}:{}", self.url.scheme(), host, port)
-        } else {
-            format!("{}://{}", self.url.scheme(), host)
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Endpoints(Vec<Endpoint>);
-
-impl Endpoints {
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn iter(&self) -> core::slice::Iter<Endpoint> {
-        self.0.iter()
-    }
-
-    pub fn iter_mut(&mut self) -> core::slice::IterMut<Endpoint> {
-        self.0.iter_mut()
-    }
-
-    pub fn slice(&self, start: usize, end: usize) -> Vec<Endpoint> {
-        self.0.as_slice()[start..end].to_vec()
-    }
-    pub fn from_args(args: Vec<String>) -> Result<Self> {
-        let mut ep_type = EndpointType::UnKnow;
-        let mut scheme = String::new();
-        let mut eps = Vec::new();
-        let mut uniq_args = new_string_set();
-        for (i, arg) in args.iter().enumerate() {
-            let endpoint = Endpoint::new(arg)?;
-            if i == 0 {
-                ep_type = endpoint.get_type();
-                scheme = endpoint.url.scheme().to_string();
-            } else if endpoint.get_type() != ep_type {
-                return Err(Error::msg("不支持多种endpoints风格"));
-            } else if endpoint.url.scheme().to_string() != scheme {
-                return Err(Error::msg("不支持多种scheme"));
-            }
-
-            let arg_str = endpoint.to_string();
-
-            if uniq_args.contains(arg_str.as_str()) {
-                return Err(Error::msg("发现重复 endpoints"));
-            }
-
-            uniq_args.add(arg_str);
-
-            eps.push(endpoint.clone());
-        }
-
-        Ok(Endpoints(eps))
-    }
-}
-
-#[warn(dead_code)]
-pub struct PoolEndpointList(Vec<Endpoints>);
-
-impl PoolEndpointList {
-    fn from_vec(v: Vec<Endpoints>) -> Self {
-        Self(v)
-    }
-
-    pub fn push(&mut self, es: Endpoints) {
-        self.0.push(es)
-    }
-
-    // TODO: 解析域名，判断哪个是本地地址
-    fn update_is_local(&mut self) -> Result<()> {
-        for eps in self.0.iter_mut() {
-            for ep in eps.iter_mut() {
-                // TODO:
-                ep.update_islocal()?
-            }
-        }
-
-        Ok(())
-    }
-}
-
-// PoolEndpoints represent endpoints in a given pool
-// along with its setCount and setDriveCount.
+/// represent endpoints in a given pool
+/// along with its setCount and setDriveCount.
 #[derive(Debug, Clone)]
 pub struct PoolEndpoints {
     // indicates if endpoints are provided in non-ellipses style
@@ -316,310 +556,1065 @@ pub struct PoolEndpoints {
     pub platform: String,
 }
 
-// EndpointServerPools - list of list of endpoints
-#[derive(Debug)]
+/// list of list of endpoints
+#[derive(Debug, Clone)]
 pub struct EndpointServerPools(Vec<PoolEndpoints>);
 
-impl EndpointServerPools {
-    pub fn new() -> Self {
-        Self(Vec::new())
+impl From<Vec<PoolEndpoints>> for EndpointServerPools {
+    fn from(v: Vec<PoolEndpoints>) -> Self {
+        Self(v)
     }
+}
 
-    // create_server_endpoints
-    pub fn create_server_endpoints(
-        server_addr: String,
-        pool_args: &Vec<PoolDisksLayout>,
-        legacy: bool,
-    ) -> Result<(EndpointServerPools, SetupType)> {
-        if pool_args.is_empty() {
-            return Err(Error::msg("无效参数"));
+impl AsRef<Vec<PoolEndpoints>> for EndpointServerPools {
+    fn as_ref(&self) -> &Vec<PoolEndpoints> {
+        &self.0
+    }
+}
+
+impl AsMut<Vec<PoolEndpoints>> for EndpointServerPools {
+    fn as_mut(&mut self) -> &mut Vec<PoolEndpoints> {
+        &mut self.0
+    }
+}
+
+impl EndpointServerPools {
+    /// validates and creates new endpoints from input args, supports
+    /// both ellipses and without ellipses transparently.
+    pub fn create_server_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<(EndpointServerPools, SetupType)> {
+        if disks_layout.as_ref().is_empty() {
+            return Err(Error::from_string("Invalid arguments specified"));
         }
 
-        let (pooleps, setup_type) = create_pool_endpoints(server_addr, pool_args)?;
+        let pool_eps = PoolEndpointList::create_pool_endpoints(server_addr, disks_layout)?;
 
-        let mut ret = EndpointServerPools::new();
+        let mut ret: EndpointServerPools = Vec::with_capacity(pool_eps.as_ref().len()).into();
+        for (i, eps) in pool_eps.inner.into_iter().enumerate() {
+            let layout = disks_layout.get_layout(i);
+            let set_count = layout.map_or(0, |v| v.count());
+            let drives_per_set = layout.map_or(0, |v| v.as_ref().first().map_or(0, |v| v.len()));
+            let cmd_line = layout.map_or(String::new(), |v| v.get_cmd_line().to_owned());
 
-        for (i, eps) in pooleps.iter().enumerate() {
             let ep = PoolEndpoints {
-                legacy: legacy,
-                set_count: pool_args[i].layout.len(),
-                drives_per_set: pool_args[i].layout[0].len(),
-                endpoints: eps.clone(),
-                cmd_line: pool_args[i].cmd_line.clone(),
-                platform: String::new(),
+                legacy: disks_layout.legacy,
+                set_count,
+                drives_per_set,
+                endpoints: eps,
+                cmd_line,
+                platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
             };
 
             ret.add(ep)?;
         }
 
-        Ok((ret, setup_type))
+        Ok((ret, pool_eps.setup_type))
     }
 
-    pub fn first_is_local(&self) -> bool {
-        if self.0.is_empty() {
-            return false;
-        }
-        return self.0[0].endpoints.0[0].is_local;
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn iter(&self) -> core::slice::Iter<'_, PoolEndpoints> {
-        return self.0.iter();
-    }
-
-    pub fn push(&mut self, pes: PoolEndpoints) {
-        self.0.push(pes)
-    }
-
+    /// add pool endpoints
     pub fn add(&mut self, eps: PoolEndpoints) -> Result<()> {
-        let mut exits = new_string_set();
+        let mut exits = HashSet::new();
         for peps in self.0.iter() {
-            for ep in peps.endpoints.0.iter() {
-                exits.add(ep.to_string());
+            for ep in peps.endpoints.as_ref() {
+                exits.insert(ep.to_string());
             }
         }
 
-        for ep in eps.endpoints.0.iter() {
+        for ep in eps.endpoints.as_ref() {
             if exits.contains(&ep.to_string()) {
-                return Err(Error::msg("endpoints exists"));
+                return Err(Error::from_string("duplicate endpoints found"));
             }
         }
 
         self.0.push(eps);
+
         Ok(())
     }
 
+    /// returns true if the first endpoint is local.
+    pub fn first_local(&self) -> bool {
+        self.0
+            .first()
+            .and_then(|v| v.endpoints.as_ref().first())
+            .map_or(false, |v| v.is_local)
+    }
+
+    /// returns a sorted list of nodes in this cluster
     pub fn get_nodes(&self) -> Vec<Node> {
         let mut node_map = HashMap::new();
 
-        for pool in self.iter() {
-            for ep in pool.endpoints.iter() {
-                let mut node = Node {
+        for pool in self.0.iter() {
+            for ep in pool.endpoints.as_ref() {
+                let n = node_map.entry(ep.host_port()).or_insert(Node {
                     url: ep.url.clone(),
                     pools: vec![],
                     is_local: ep.is_local,
                     grid_host: ep.grid_host(),
-                };
-                if !node.pools.contains(&ep.pool_idx) {
-                    node.pools.push(ep.pool_idx)
-                }
+                });
 
-                node_map.insert(node.grid_host.clone(), node);
+                if let Some(pool_idx) = ep.pool_idx {
+                    if !n.pools.contains(&pool_idx) {
+                        n.pools.push(pool_idx);
+                    }
+                }
             }
         }
 
-        let mut nodes: Vec<Node> = node_map.into_iter().map(|(_, n)| n).collect();
+        let mut nodes: Vec<Node> = node_map.into_values().collect();
 
-        // nodes.sort_by(|a, b| a.cmp(b));
+        nodes.sort_by(|a, b| a.grid_host.cmp(&b.grid_host));
 
         nodes
     }
 }
 
-#[derive(Debug)]
-pub enum SetupType {
-    // UnknownSetupType - starts with unknown setup type.
-    UnknownSetupType,
-
-    // FSSetupType - FS setup type enum.
-    FSSetupType,
-
-    // ErasureSDSetupType - Erasure single drive setup enum.
-    ErasureSDSetupType,
-
-    // ErasureSetupType - Erasure setup type enum.
-    ErasureSetupType,
-
-    // DistErasureSetupType - Distributed Erasure setup type enum.
-    DistErasureSetupType,
-}
-
-fn is_empty_layout(pools_layout: &Vec<PoolDisksLayout>) -> bool {
-    if pools_layout.is_empty() {
-        return true;
-    }
-    let first_layout = &pools_layout[0];
-    if first_layout.layout.is_empty() || first_layout.layout[0].is_empty() || first_layout.layout[0][0].is_empty() {
-        return true;
-    }
-    false
-}
-
-// 检查是否是单驱动器布局
-fn is_single_drive_layout(pools_layout: &Vec<PoolDisksLayout>) -> bool {
-    if pools_layout.len() == 1 && pools_layout[0].layout.len() == 1 && pools_layout[0].layout[0].len() == 1 {
-        true
-    } else {
-        false
-    }
-}
-
-pub fn create_pool_endpoints(server_addr: String, pools: &Vec<PoolDisksLayout>) -> Result<(Vec<Endpoints>, SetupType)> {
-    if is_empty_layout(pools) {
-        return Err(Error::msg("empty layout"));
+/// parse a file path into an URL.
+fn url_parse_from_file_path(value: &str) -> Result<url::Url> {
+    // Only check if the arg is an ip address and ask for scheme since its absent.
+    // localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
+    // /mnt/export1. So we go ahead and start the rustfs server in FS modes in these cases.
+    let addr: Vec<&str> = value.splitn(2, '/').collect();
+    if net::is_socket_addr(addr[0]) {
+        return Err(Error::from_string("invalid URL endpoint format: missing scheme http or https"));
     }
 
-    // TODO: CheckLocalServerAddr
+    let file_path = match Path::new(value).absolutize() {
+        Ok(path) => path,
+        Err(err) => return Err(Error::from_string(format!("absolute path failed: {}", err))),
+    };
 
-    if is_single_drive_layout(pools) {
-        let mut endpoint = Endpoint::new(pools[0].layout[0][0].as_str())?;
-        endpoint.update_islocal()?;
-
-        if endpoint.get_type() != EndpointType::Path {
-            return Err(Error::msg("use path style endpoint for single node setup"));
-        }
-
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(0);
-
-        let mut endpoints = Vec::new();
-        endpoints.push(endpoint);
-
-        // TODO: checkCrossDeviceMounts
-
-        return Ok((vec![Endpoints(endpoints)], SetupType::ErasureSDSetupType));
+    match Url::from_file_path(file_path) {
+        Ok(url) => Ok(url),
+        Err(_) => Err(Error::from_string("Convert a file path into an URL failed")),
     }
-
-    let mut ret = Vec::with_capacity(pools.len());
-
-    for (pool_idx, pool) in pools.iter().enumerate() {
-        let mut endpoints = Endpoints::new();
-        for (set_idx, set_layout) in pool.layout.iter().enumerate() {
-            let mut eps = Endpoints::from_args(set_layout.to_owned())?;
-            // TODO: checkCrossDeviceMounts
-            for (disk_idx, ep) in eps.0.iter_mut().enumerate() {
-                ep.set_pool_index(pool_idx as i32);
-                ep.set_set_index(set_idx as i32);
-                ep.set_disk_index(disk_idx as i32);
-
-                endpoints.0.push(ep.to_owned());
-            }
-        }
-
-        if endpoints.0.is_empty() {
-            return Err(Error::msg("invalid number of endpoints"));
-        }
-
-        ret.push(endpoints);
-    }
-
-    // TODO:
-    PoolEndpointList::from_vec(ret.clone()).update_is_local()?;
-
-    let mut setup_type = SetupType::UnknownSetupType;
-
-    // TODO: parse server port
-    let (_, server_port) = split_host_port(server_addr.as_str())?;
-
-    let mut uniq_host = new_string_set();
-
-    for (_i, eps) in ret.iter_mut().enumerate() {
-        // TODO: 一些验证，参考原m
-
-        for ep in eps.0.iter() {
-            if !ep.url.has_host() {
-                uniq_host.add(format!("localhost:{}", server_port));
-            } else {
-                // uniq_host.add(ep.url.domain().)
-            }
-        }
-    }
-
-    let erasure_type = uniq_host.to_slice().len() == 1;
-
-    for eps in ret.iter() {
-        if eps.0[0].get_type() == EndpointType::Path {
-            setup_type = SetupType::ErasureSetupType;
-            break;
-        }
-
-        if eps.0[0].get_type() == EndpointType::Url {
-            if erasure_type {
-                setup_type = SetupType::ErasureSetupType;
-            } else {
-                setup_type = SetupType::DistErasureSetupType;
-            }
-
-            break;
-        }
-    }
-
-    Ok((ret, setup_type))
-}
-
-// create_server_endpoints
-fn create_server_endpoints(
-    server_addr: String,
-    pool_args: &Vec<PoolDisksLayout>,
-    legacy: bool,
-) -> Result<(EndpointServerPools, SetupType)> {
-    if pool_args.is_empty() {
-        return Err(Error::msg("无效参数"));
-    }
-
-    let (pooleps, setup_type) = create_pool_endpoints(server_addr, pool_args)?;
-
-    let mut ret = EndpointServerPools::new();
-
-    for (i, eps) in pooleps.iter().enumerate() {
-        let ep = PoolEndpoints {
-            legacy: legacy,
-            set_count: pool_args[i].layout.len(),
-            drives_per_set: pool_args[i].layout[0].len(),
-            endpoints: eps.clone(),
-            cmd_line: pool_args[i].cmd_line.clone(),
-            platform: String::new(),
-        };
-
-        ret.add(ep)?;
-    }
-
-    Ok((ret, setup_type))
 }
 
 #[cfg(test)]
 mod test {
 
-    use crate::disks_layout::DisksLayout;
-
     use super::*;
 
     #[test]
-    fn test_url() {
-        let path = "/dir/sss";
+    fn test_new_endpoint() {
+        #[derive(Default)]
+        struct TestCase<'a> {
+            arg: &'a str,
+            expected_endpoint: Option<Endpoint>,
+            expected_type: Option<EndpointType>,
+            expected_err: Option<Error>,
+        }
 
-        let u = url::Url::parse(path);
+        let u2 = url::Url::parse("https://example.org/path").unwrap();
+        let u4 = url::Url::parse("http://192.168.253.200/path").unwrap();
+        let u6 = url::Url::parse("http://server:/path").unwrap();
+        let root_slash_foo = url::Url::from_file_path("/foo").unwrap();
 
-        println!("{:#?}", u)
+        let test_cases = [
+            TestCase {
+                arg: "/foo",
+                expected_endpoint: Some(Endpoint {
+                    url: root_slash_foo,
+                    is_local: true,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }),
+                expected_type: Some(EndpointType::Path),
+                expected_err: None,
+            },
+            TestCase {
+                arg: "https://example.org/path",
+                expected_endpoint: Some(Endpoint {
+                    url: u2,
+                    is_local: false,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }),
+                expected_type: Some(EndpointType::Url),
+                expected_err: None,
+            },
+            TestCase {
+                arg: "http://192.168.253.200/path",
+                expected_endpoint: Some(Endpoint {
+                    url: u4,
+                    is_local: false,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }),
+                expected_type: Some(EndpointType::Url),
+                expected_err: None,
+            },
+            TestCase {
+                arg: "",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+            },
+            TestCase {
+                arg: "/",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+            },
+            TestCase {
+                arg: "\\",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+            },
+            TestCase {
+                arg: "c://foo",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+            },
+            TestCase {
+                arg: "ftp://foo",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+            },
+            TestCase {
+                arg: "http://server/path?location",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+            },
+            TestCase {
+                arg: "http://:/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: empty host name")),
+            },
+            TestCase {
+                arg: "http://:8080/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: empty host name")),
+            },
+            TestCase {
+                arg: "http://server:/path",
+                expected_endpoint: Some(Endpoint {
+                    url: u6,
+                    is_local: false,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }),
+                expected_type: Some(EndpointType::Url),
+                expected_err: None,
+            },
+            TestCase {
+                arg: "https://93.184.216.34:808080/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: port number must be between 1 to 65535")),
+            },
+            TestCase {
+                arg: "http://server:8080//",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root path is not supported in URL endpoint")),
+            },
+            TestCase {
+                arg: "http://server:8080/",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("empty or root path is not supported in URL endpoint")),
+            },
+            TestCase {
+                arg: "192.168.1.210:9000",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::from_string("invalid URL endpoint format: missing scheme http or https")),
+            },
+        ];
+
+        for test_case in test_cases {
+            let ret = Endpoint::try_from(test_case.arg);
+            if test_case.expected_err.is_none() && ret.is_err() {
+                panic!("{}: error: expected = <nil>, got = {:?}", test_case.arg, ret);
+            }
+            if test_case.expected_err.is_some() && ret.is_ok() {
+                panic!("{}: error: expected = {:?}, got = <nil>", test_case.arg, test_case.expected_err);
+            }
+            match (test_case.expected_err, ret) {
+                (None, Err(e)) => panic!("{}: error: expected = <nil>, got = {}", test_case.arg, e),
+                (None, Ok(mut ep)) => {
+                    let _ = ep.update_is_local(9000);
+                    if test_case.expected_type != Some(ep.get_type()) {
+                        panic!(
+                            "{}: type: expected = {:?}, got = {:?}",
+                            test_case.arg,
+                            test_case.expected_type,
+                            ep.get_type()
+                        );
+                    }
+
+                    assert_eq!(test_case.expected_endpoint, Some(ep), "{}: endpoint", test_case.arg);
+                }
+                (Some(e), Ok(_)) => panic!("{}: error: expected = {}, got = <nil>", test_case.arg, e),
+                (Some(e), Err(e2)) => {
+                    assert_eq!(e.to_string(), e2.to_string(), "{}: error: expected = {}, got = {}", test_case.arg, e, e2)
+                }
+            }
+        }
     }
 
     #[test]
-    fn test_new_endpont() {
-        let arg = "./data";
-        let ep = Endpoint::new(arg).unwrap();
+    fn test_new_endpoints() {
+        let test_cases = [
+            (vec!["/d1", "/d2", "/d3", "/d4"], None, 1),
+            (
+                vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://localhost/d3",
+                    "http://localhost/d4",
+                ],
+                None,
+                2,
+            ),
+            (
+                vec![
+                    "http://example.org/d1",
+                    "http://example.com/d1",
+                    "http://example.net/d1",
+                    "http://example.edu/d1",
+                ],
+                None,
+                3,
+            ),
+            (
+                vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://example.org/d1",
+                    "http://example.org/d2",
+                ],
+                None,
+                4,
+            ),
+            (
+                vec![
+                    "https://localhost:9000/d1",
+                    "https://localhost:9001/d2",
+                    "https://localhost:9002/d3",
+                    "https://localhost:9003/d4",
+                ],
+                None,
+                5,
+            ),
+            // It is valid WRT endpoint list that same path is expected with different port on same server.
+            (
+                vec![
+                    "https://127.0.0.1:9000/d1",
+                    "https://127.0.0.1:9001/d1",
+                    "https://127.0.0.1:9002/d1",
+                    "https://127.0.0.1:9003/d1",
+                ],
+                None,
+                6,
+            ),
+            (vec!["d1", "d2", "d3", "d1"], Some(Error::from_string("duplicate endpoints found")), 7),
+            (vec!["d1", "d2", "d3", "./d1"], Some(Error::from_string("duplicate endpoints found")), 8),
+            (
+                vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://localhost/d1",
+                    "http://localhost/d4",
+                ],
+                Some(Error::from_string("duplicate endpoints found")),
+                9,
+            ),
+            (
+                vec!["ftp://server/d1", "http://server/d2", "http://server/d3", "http://server/d4"],
+                Some(Error::from_string("'ftp://server/d1': invalid URL endpoint format")),
+                10,
+            ),
+            (
+                vec!["d1", "http://localhost/d2", "d3", "d4"],
+                Some(Error::from_string("mixed style endpoints are not supported")),
+                11,
+            ),
+            (
+                vec![
+                    "http://example.org/d1",
+                    "https://example.com/d1",
+                    "http://example.net/d1",
+                    "https://example.edut/d1",
+                ],
+                Some(Error::from_string("mixed scheme is not supported")),
+                12,
+            ),
+            (
+                vec![
+                    "192.168.1.210:9000/tmp/dir0",
+                    "192.168.1.210:9000/tmp/dir1",
+                    "192.168.1.210:9000/tmp/dir2",
+                    "192.168.110:9000/tmp/dir3",
+                ],
+                Some(Error::from_string(
+                    "'192.168.1.210:9000/tmp/dir0': invalid URL endpoint format: missing scheme http or https",
+                )),
+                13,
+            ),
+        ];
 
-        println!("{:?}", ep);
+        for test_case in test_cases {
+            let args: Vec<String> = test_case.0.iter().map(|v| v.to_string()).collect();
+            let ret = Endpoints::try_from(args.as_slice());
+
+            match (test_case.1, ret) {
+                (None, Err(e)) => panic!("{}: error: expected = <nil>, got = {}", test_case.2, e),
+                (None, Ok(_)) => {}
+                (Some(e), Ok(_)) => panic!("{}: error: expected = {}, got = <nil>", test_case.2, e),
+                (Some(e), Err(e2)) => {
+                    assert_eq!(e.to_string(), e2.to_string(), "{}: error: expected = {}, got = {}", test_case.2, e, e2)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_pool_endpoints() {
+        #[derive(Default)]
+        struct TestCase<'a> {
+            num: usize,
+            server_addr: &'a str,
+            args: Vec<&'a str>,
+            expected_endpoints: Option<Endpoints>,
+            expected_setup_type: Option<SetupType>,
+            expected_err: Option<Error>,
+        }
+
+        // Filter ipList by IPs those do not start with '127.'.
+        let non_loop_back_i_ps =
+            net::must_get_local_ips().map_or(vec![], |v| v.into_iter().filter(|ip| ip.is_ipv4() && ip.is_loopback()).collect());
+        if non_loop_back_i_ps.is_empty() {
+            panic!("No non-loop back IP address found for this host");
+        }
+        let non_loop_back_ip = non_loop_back_i_ps[0];
+
+        let case1_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let case1_endpoint2 = format!("http://{}/d2", non_loop_back_ip);
+        let args = vec![
+            format!("http://{}:10000/d1", non_loop_back_ip),
+            format!("http://{}:10000/d2", non_loop_back_ip),
+            "http://example.org:10000/d3".to_string(),
+            "http://example.com:10000/d4".to_string(),
+        ];
+        let (case1_ur_ls, case1_local_flags) = get_expected_endpoints(args, format!("http://{}:10000/", non_loop_back_ip));
+
+        let case2_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let case2_endpoint2 = format!("http://{}:9000/d2", non_loop_back_ip);
+        let args = vec![
+            format!("http://{}:10000/d1", non_loop_back_ip),
+            format!("http://{}:9000/d2", non_loop_back_ip),
+            "http://example.org:10000/d3".to_string(),
+            "http://example.com:10000/d4".to_string(),
+        ];
+        let (case2_ur_ls, case2_local_flags) = get_expected_endpoints(args, format!("http://{}:10000/", non_loop_back_ip));
+
+        let case3_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let args = vec![
+            format!("http://{}:80/d1", non_loop_back_ip),
+            "http://example.org:9000/d2".to_string(),
+            "http://example.com:80/d3".to_string(),
+            "http://example.net:80/d4".to_string(),
+        ];
+        let (case3_ur_ls, case3_local_flags) = get_expected_endpoints(args, format!("http://{}:80/", non_loop_back_ip));
+
+        let case4_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let args = vec![
+            format!("http://{}:9000/d1", non_loop_back_ip),
+            "http://example.org:9000/d2".to_string(),
+            "http://example.com:9000/d3".to_string(),
+            "http://example.net:9000/d4".to_string(),
+        ];
+        let (case4_ur_ls, case4_local_flags) = get_expected_endpoints(args, format!("http://{}:9000/", non_loop_back_ip));
+
+        let case5_endpoint1 = format!("http://{}:9000/d1", non_loop_back_ip);
+        let case5_endpoint2 = format!("http://{}:9001/d2", non_loop_back_ip);
+        let case5_endpoint3 = format!("http://{}:9002/d3", non_loop_back_ip);
+        let case5_endpoint4 = format!("http://{}:9003/d4", non_loop_back_ip);
+        let args = vec![
+            case5_endpoint1.clone(),
+            case5_endpoint2.clone(),
+            case5_endpoint3.clone(),
+            case5_endpoint4.clone(),
+        ];
+        let (case5_ur_ls, case5_local_flags) = get_expected_endpoints(args, format!("http://{}:9000/", non_loop_back_ip));
+
+        let case6_endpoint1 = format!("http://{}:9003/d4", non_loop_back_ip);
+        let args = vec![
+            "http://localhost:9000/d1".to_string(),
+            "http://localhost:9001/d2".to_string(),
+            "http://127.0.0.1:9002/d3".to_string(),
+            case6_endpoint1.clone(),
+        ];
+        let (case6_ur_ls, case6_local_flags) = get_expected_endpoints(args, format!("http://{}:9003/", non_loop_back_ip));
+
+        let case7_endpoint1 = format!("http://{}:9001/export", non_loop_back_ip);
+        let case7_endpoint2 = format!("http://{}:9000/export", non_loop_back_ip);
+
+        let test_cases = [
+            TestCase {
+                num: 1,
+                server_addr: "localhost",
+                expected_err: Some(Error::from_string("address localhost: missing port in address")),
+                ..Default::default()
+            },
+            // Erasure Single Drive
+            TestCase {
+                num: 2,
+                server_addr: "localhost:9000",
+                args: vec!["http://localhost/d1"],
+                expected_err: Some(Error::from_string("use path style endpoint for single node setup")),
+                ..Default::default()
+            },
+            TestCase {
+                num: 3,
+                server_addr: "0.0.0.0:443",
+                args: vec!["/d1"],
+                expected_endpoints: Some(Endpoints(vec![Endpoint {
+                    url: must_file_path("/d1"),
+                    is_local: true,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }])),
+                expected_setup_type: Some(SetupType::ErasureSD),
+                ..Default::default()
+            },
+            TestCase {
+                num: 4,
+                server_addr: "localhost:10000",
+                args: vec!["/d1"],
+                expected_endpoints: Some(Endpoints(vec![Endpoint {
+                    url: must_file_path("/d1"),
+                    is_local: true,
+                    pool_idx: None,
+                    set_idx: None,
+                    disk_idx: None,
+                }])),
+                expected_setup_type: Some(SetupType::ErasureSD),
+                ..Default::default()
+            },
+            TestCase {
+                num: 5,
+                server_addr: "localhost:9000",
+                args: vec![
+                    "https://127.0.0.1:9000/d1",
+                    "https://localhost:9001/d1",
+                    "https://example.com/d1",
+                    "https://example.com/d2",
+                ],
+                expected_err: Some(Error::from_string("same path '/d1' can not be served by different port on same address")),
+                ..Default::default()
+            },
+            // Erasure Setup with PathEndpointType
+            TestCase {
+                num: 6,
+                server_addr: "0.0.0.0:1234",
+                args: vec!["/d1", "/d2", "/d3", "/d4"],
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: must_file_path("/d1"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_file_path("/d2"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_file_path("/d3"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_file_path("/d4"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::Erasure),
+                ..Default::default()
+            },
+            // DistErasure Setup with URLEndpointType
+            TestCase {
+                num: 7,
+                server_addr: "0.0.0.0:9000",
+                args: vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://localhost/d3",
+                    "http://localhost/d4",
+                ],
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: must_url("http://localhost:9000/d1"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_url("http://localhost:9000/d2"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_url("http://localhost:9000/d3"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: must_url("http://localhost:9000/d4"),
+                        is_local: true,
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::Erasure),
+                ..Default::default()
+            },
+            // DistErasure Setup with URLEndpointType having mixed naming to local host.
+            TestCase {
+                num: 8,
+                server_addr: "127.0.0.1:10000",
+                args: vec![
+                    "http://localhost/d1",
+                    "http://localhost/d2",
+                    "http://127.0.0.1/d3",
+                    "http://127.0.0.1/d4",
+                ],
+                expected_err: Some(Error::from_string("all local endpoints should not have different hostnames/ips")),
+                ..Default::default()
+            },
+            TestCase {
+                num: 9,
+                server_addr: "0.0.0.0:9001",
+                args: vec![
+                    "http://10.0.0.1:9000/export",
+                    "http://10.0.0.2:9000/export",
+                    case7_endpoint1.as_str(),
+                    "http://10.0.0.2:9001/export",
+                ],
+                expected_err: Some(Error::from_string(
+                    "same path '/export' can not be served by different port on same address",
+                )),
+                ..Default::default()
+            },
+            TestCase {
+                num: 10,
+                server_addr: "0.0.0.0:9000",
+                args: vec![
+                    "http://127.0.0.1:9000/export",
+                    case7_endpoint2.as_str(),
+                    "http://10.0.0.1:9000/export",
+                    "http://10.0.0.2:9000/export",
+                ],
+                expected_err: Some(Error::from_string("path '/export' cannot be served by different address on same server")),
+                ..Default::default()
+            },
+            // DistErasure type
+            TestCase {
+                num: 11,
+                server_addr: "127.0.0.1:10000",
+                args: vec![
+                    case1_endpoint1.as_str(),
+                    case1_endpoint2.as_str(),
+                    "http://example.org/d3",
+                    "http://example.com/d4",
+                ],
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case1_ur_ls[0].clone(),
+                        is_local: case1_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case1_ur_ls[1].clone(),
+                        is_local: case1_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case1_ur_ls[2].clone(),
+                        is_local: case1_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case1_ur_ls[3].clone(),
+                        is_local: case1_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                num: 12,
+                server_addr: "127.0.0.1:10000",
+                args: vec![
+                    case2_endpoint1.as_str(),
+                    case2_endpoint2.as_str(),
+                    "http://example.org/d3",
+                    "http://example.com/d4",
+                ],
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case2_ur_ls[0].clone(),
+                        is_local: case2_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case2_ur_ls[1].clone(),
+                        is_local: case2_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case2_ur_ls[2].clone(),
+                        is_local: case2_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case2_ur_ls[3].clone(),
+                        is_local: case2_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                num: 13,
+                server_addr: "0.0.0.0:80",
+                args: vec![
+                    case3_endpoint1.as_str(),
+                    "http://example.org:9000/d2",
+                    "http://example.com/d3",
+                    "http://example.net/d4",
+                ],
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case3_ur_ls[0].clone(),
+                        is_local: case3_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case3_ur_ls[1].clone(),
+                        is_local: case3_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case3_ur_ls[2].clone(),
+                        is_local: case3_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case3_ur_ls[3].clone(),
+                        is_local: case3_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                num: 14,
+                server_addr: "0.0.0.0:9000",
+                args: vec![
+                    case4_endpoint1.as_str(),
+                    "http://example.org/d2",
+                    "http://example.com/d3",
+                    "http://example.net/d4",
+                ],
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case4_ur_ls[0].clone(),
+                        is_local: case4_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case4_ur_ls[1].clone(),
+                        is_local: case4_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case4_ur_ls[2].clone(),
+                        is_local: case4_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case4_ur_ls[3].clone(),
+                        is_local: case4_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                num: 15,
+                server_addr: "0.0.0.0:9000",
+                args: vec![
+                    case5_endpoint1.as_str(),
+                    case5_endpoint2.as_str(),
+                    case5_endpoint3.as_str(),
+                    case5_endpoint4.as_str(),
+                ],
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case5_ur_ls[0].clone(),
+                        is_local: case5_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case5_ur_ls[1].clone(),
+                        is_local: case5_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case5_ur_ls[2].clone(),
+                        is_local: case5_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case5_ur_ls[3].clone(),
+                        is_local: case5_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+            TestCase {
+                num: 16,
+                server_addr: "0.0.0.0:9003",
+                args: vec![
+                    "http://localhost:9000/d1",
+                    "http://localhost:9001/d2",
+                    "http://127.0.0.1:9002/d3",
+                    case6_endpoint1.as_str(),
+                ],
+                expected_endpoints: Some(Endpoints(vec![
+                    Endpoint {
+                        url: case6_ur_ls[0].clone(),
+                        is_local: case6_local_flags[0],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case6_ur_ls[1].clone(),
+                        is_local: case6_local_flags[1],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case6_ur_ls[2].clone(),
+                        is_local: case6_local_flags[2],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                    Endpoint {
+                        url: case6_ur_ls[3].clone(),
+                        is_local: case6_local_flags[3],
+                        pool_idx: None,
+                        set_idx: None,
+                        disk_idx: None,
+                    },
+                ])),
+                expected_setup_type: Some(SetupType::DistErasure),
+                ..Default::default()
+            },
+        ];
+
+        for test_case in test_cases {
+            let disks_layout = match DisksLayout::try_from(test_case.args.as_slice()) {
+                Ok(v) => v,
+                Err(e) => {
+                    if test_case.expected_err.is_none() {
+                        panic!("Test {}: unexpected error: {}", test_case.num, e);
+                    }
+                    continue;
+                }
+            };
+
+            match (
+                test_case.expected_err,
+                PoolEndpointList::create_pool_endpoints(test_case.server_addr, &disks_layout),
+            ) {
+                (None, Err(err)) => panic!("Test {}: error: expected = <nil>, got = {}", test_case.num, err),
+                (Some(err), Ok(_)) => panic!("Test {}: error: expected = {}, got = <nil>", test_case.num, err),
+                (Some(e), Err(e2)) => {
+                    assert_eq!(
+                        e.to_string(),
+                        e2.to_string(),
+                        "Test {}: error: expected = {}, got = {}",
+                        test_case.num,
+                        e,
+                        e2
+                    )
+                }
+                (None, Ok(pools)) => {
+                    if Some(&pools.setup_type) != test_case.expected_setup_type.as_ref() {
+                        panic!(
+                            "Test {}: setupType: expected = {:?}, got = {:?}",
+                            test_case.num, test_case.expected_setup_type, &pools.setup_type
+                        )
+                    }
+
+                    let left_len = test_case.expected_endpoints.as_ref().map(|v| v.as_ref().len());
+                    let right_len = pools.as_ref().first().map(|v| v.as_ref().len());
+
+                    if left_len != right_len {
+                        panic!("Test {}: endpoints len: expected = {:?}, got = {:?}", test_case.num, left_len, right_len);
+                    }
+
+                    for (i, ep) in pools.as_ref()[0].as_ref().iter().enumerate() {
+                        assert_eq!(
+                            ep.to_string(),
+                            test_case.expected_endpoints.as_ref().unwrap().as_ref()[i].to_string(),
+                            "Test {}: endpoints: expected = {}, got = {}",
+                            test_case.num,
+                            test_case.expected_endpoints.as_ref().unwrap().as_ref()[i],
+                            ep
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fn must_file_path(s: impl AsRef<Path>) -> url::Url {
+        let url = url::Url::from_file_path(s.as_ref());
+
+        assert!(url.is_ok(), "failed to convert path to URL: {}", s.as_ref().display());
+
+        url.unwrap()
+    }
+
+    fn must_url(s: &str) -> url::Url {
+        url::Url::parse(s).unwrap()
+    }
+
+    fn get_expected_endpoints(args: Vec<String>, prefix: String) -> (Vec<url::Url>, Vec<bool>) {
+        let mut urls = vec![];
+        let mut local_flags = vec![];
+        for arg in args {
+            urls.push(url::Url::parse(&arg).unwrap());
+            local_flags.push(arg.starts_with(&prefix));
+        }
+
+        (urls, local_flags)
     }
 
     #[test]
     fn test_create_server_endpoints() {
-        let cases = vec![(":9000", vec!["http://localhost:900{1...2}/export{1...64}".to_string()])];
+        let test_cases = [
+            // Invalid input.
+            ("", vec![], false),
+            // Range cannot be negative.
+            ("0.0.0.0:9000", vec!["/export1{-1...1}"], false),
+            // Range cannot start bigger than end.
+            ("0.0.0.0:9000", vec!["/export1{64...1}"], false),
+            // Range can only be numeric.
+            ("0.0.0.0:9000", vec!["/export1{a...z}"], false),
+            // Duplicate disks not allowed.
+            ("0.0.0.0:9000", vec!["/export1{1...32}", "/export1{1...32}"], false),
+            // Same host cannot export same disk on two ports - special case localhost.
+            ("0.0.0.0:9001", vec!["http://localhost:900{1...2}/export{1...64}"], false),
+            // Valid inputs.
+            ("0.0.0.0:9000", vec!["/export1"], true),
+            ("0.0.0.0:9000", vec!["/export1", "/export2", "/export3", "/export4"], true),
+            ("0.0.0.0:9000", vec!["/export1{1...64}"], true),
+            ("0.0.0.0:9000", vec!["/export1{01...64}"], true),
+            ("0.0.0.0:9000", vec!["/export1{1...32}", "/export1{33...64}"], true),
+            ("0.0.0.0:9001", vec!["http://localhost:9001/export{1...64}"], true),
+            ("0.0.0.0:9001", vec!["http://localhost:9001/export{01...64}"], true),
+        ];
 
-        for (addr, args) in cases {
-            let layouts = DisksLayout::try_from(args.as_slice()).unwrap();
+        for (i, test_case) in test_cases.iter().enumerate() {
+            let disks_layout = match DisksLayout::try_from(test_case.1.as_slice()) {
+                Ok(v) => v,
+                Err(e) => {
+                    if test_case.2 {
+                        panic!("Test {}: unexpected error: {}", i + 1, e);
+                    }
+                    continue;
+                }
+            };
 
-            println!("layouts:{:?},{}", &layouts.pools, &layouts.legacy);
+            let ret = EndpointServerPools::create_server_endpoints(test_case.0, &disks_layout);
 
-            let (server_pool, setup_type) = create_server_endpoints(addr.to_string(), &layouts.pools, layouts.legacy).unwrap();
-
-            println!("setup_type -- {:?}", setup_type);
-            println!("server_pool == {:?}", server_pool);
+            if let Err(err) = ret {
+                if test_case.2 {
+                    panic!("Test {}: Expected success but failed instead {}", i + 1, err)
+                }
+            } else if !test_case.2 {
+                panic!("Test {}: expected failure but passed instead", i + 1);
+            }
         }
-
-        // create_server_endpoints(server_addr, pool_args, legacy)
     }
 }

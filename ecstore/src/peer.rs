@@ -17,7 +17,7 @@ type Client = Arc<Box<dyn PeerS3Client>>;
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
-    fn get_pools(&self) -> Vec<i32>;
+    fn get_pools(&self) -> Vec<usize>;
 }
 
 #[derive(Debug)]
@@ -30,7 +30,7 @@ impl S3PeerSys {
     pub fn new(eps: &EndpointServerPools, local_disks: Vec<DiskStore>) -> Self {
         Self {
             clients: Self::new_clients(eps, local_disks),
-            pools_count: eps.len(),
+            pools_count: eps.as_ref().len(),
         }
     }
 
@@ -56,7 +56,7 @@ impl S3PeerSys {
 
 #[async_trait]
 impl PeerS3Client for S3PeerSys {
-    fn get_pools(&self) -> Vec<i32> {
+    fn get_pools(&self) -> Vec<usize> {
         unimplemented!()
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
@@ -83,7 +83,7 @@ impl PeerS3Client for S3PeerSys {
             let mut per_pool_errs = Vec::with_capacity(self.clients.len());
             for (j, cli) in self.clients.iter().enumerate() {
                 let pools = cli.get_pools();
-                let idx = i as i32;
+                let idx = i;
                 if pools.contains(&idx) {
                     per_pool_errs.push(errors[j].as_ref());
                 }
@@ -123,7 +123,7 @@ impl PeerS3Client for S3PeerSys {
             let mut per_pool_errs = Vec::with_capacity(self.clients.len());
             for (j, cli) in self.clients.iter().enumerate() {
                 let pools = cli.get_pools();
-                let idx = i as i32;
+                let idx = i;
                 if pools.contains(&idx) {
                     per_pool_errs.push(errors[j].as_ref());
                 }
@@ -142,11 +142,11 @@ impl PeerS3Client for S3PeerSys {
 pub struct LocalPeerS3Client {
     pub local_disks: Vec<DiskStore>,
     pub node: Node,
-    pub pools: Vec<i32>,
+    pub pools: Vec<usize>,
 }
 
 impl LocalPeerS3Client {
-    fn new(local_disks: Vec<DiskStore>, node: Node, pools: Vec<i32>) -> Self {
+    fn new(local_disks: Vec<DiskStore>, node: Node, pools: Vec<usize>) -> Self {
         Self {
             local_disks,
             node,
@@ -157,7 +157,7 @@ impl LocalPeerS3Client {
 
 #[async_trait]
 impl PeerS3Client for LocalPeerS3Client {
-    fn get_pools(&self) -> Vec<i32> {
+    fn get_pools(&self) -> Vec<usize> {
         self.pools.clone()
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
@@ -234,18 +234,18 @@ impl PeerS3Client for LocalPeerS3Client {
 #[derive(Debug)]
 pub struct RemotePeerS3Client {
     pub node: Node,
-    pub pools: Vec<i32>,
+    pub pools: Vec<usize>,
 }
 
 impl RemotePeerS3Client {
-    fn new(node: Node, pools: Vec<i32>) -> Self {
+    fn new(node: Node, pools: Vec<usize>) -> Self {
         Self { node, pools }
     }
 }
 
 #[async_trait]
 impl PeerS3Client for RemotePeerS3Client {
-    fn get_pools(&self) -> Vec<i32> {
+    fn get_pools(&self) -> Vec<usize> {
         unimplemented!()
     }
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
