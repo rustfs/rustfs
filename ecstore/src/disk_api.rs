@@ -13,9 +13,10 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn is_local(&self) -> bool;
 
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
-    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
+    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize, r: DuplexStream) -> Result<()>;
+    async fn append_file(&self, volume: &str, path: &str, r: DuplexStream) -> Result<()>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -36,7 +37,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         volume: &str,
         path: &str,
         version_id: Uuid,
-        opts: ReadOptions,
+        opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
 }
@@ -48,7 +49,7 @@ pub struct VolumeInfo {
 
 pub struct ReadOptions {
     pub read_data: bool,
-    // pub healing: bool,
+    pub healing: bool,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -243,16 +243,30 @@ impl S3 for FS {
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         let UploadPartInput {
             body,
-            // upload_id,
-            // part_number,
+            bucket,
+            key,
+            upload_id,
+            part_number,
             content_length,
             ..
         } = req.input;
 
-        let _body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
-        let _content_length = content_length.ok_or_else(|| s3_error!(IncompleteBody))?;
+        let part_id = part_number as usize;
+
+        // let upload_id =
+
+        let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
+        let content_length = content_length.ok_or_else(|| s3_error!(IncompleteBody))?;
 
         // mc cp step 4
+        let data = PutObjReader::new(body.into(), content_length as usize);
+        let opts = ObjectOptions::default();
+
+        try_!(
+            self.store
+                .put_object_part(&bucket, &key, &upload_id, part_id, data, &opts)
+                .await
+        );
 
         let output = UploadPartOutput { ..Default::default() };
         Ok(S3Response::new(output))
