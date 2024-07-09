@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use anyhow::{Error, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -11,16 +11,16 @@ use tracing::debug;
 use crate::chunk_stream::ChunkedStream;
 
 pub struct Erasure {
-    data_shards: usize,
-    parity_shards: usize,
+    // data_shards: usize,
+    // parity_shards: usize,
     encoder: ReedSolomon,
 }
 
 impl Erasure {
     pub fn new(data_shards: usize, parity_shards: usize) -> Self {
         Erasure {
-            data_shards,
-            parity_shards,
+            // data_shards,
+            // parity_shards,
             encoder: ReedSolomon::new(data_shards, parity_shards).unwrap(),
         }
     }
@@ -31,7 +31,7 @@ impl Erasure {
         writers: &mut Vec<W>,
         block_size: usize,
         data_size: usize,
-        write_quorum: usize,
+        _write_quorum: usize,
     ) -> Result<usize>
     where
         S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
@@ -116,15 +116,15 @@ impl Erasure {
     }
 }
 
-fn shards_to_option_shards<T: Clone>(shards: &[Vec<T>]) -> Vec<Option<Vec<T>>> {
-    let mut result = Vec::with_capacity(shards.len());
+// fn shards_to_option_shards<T: Clone>(shards: &[Vec<T>]) -> Vec<Option<Vec<T>>> {
+//     let mut result = Vec::with_capacity(shards.len());
 
-    for v in shards.iter() {
-        let inner: Vec<T> = v.clone();
-        result.push(Some(inner));
-    }
-    result
-}
+//     for v in shards.iter() {
+//         let inner: Vec<T> = v.clone();
+//         result.push(Some(inner));
+//     }
+//     result
+// }
 
 #[cfg(test)]
 mod test {

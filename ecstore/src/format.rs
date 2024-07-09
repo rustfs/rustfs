@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use uuid::Uuid;
 
-use crate::{disk, disk_api::DiskError};
+use crate::disk_api::DiskError;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum FormatMetaVersion {

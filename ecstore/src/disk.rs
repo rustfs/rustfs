@@ -1,17 +1,15 @@
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
 use anyhow::{Error, Result};
 use bytes::Bytes;
-use futures::{future::join_all, Stream};
+use futures::future::join_all;
 use path_absolutize::Absolutize;
-use s3s::StdError;
 use time::OffsetDateTime;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeekExt};
-use tokio::io::{AsyncWrite, BufWriter, ErrorKind};
+use tokio::io::{self, BufWriter, ErrorKind};
 use tokio::{
     fs::{self, File},
     io::DuplexStream,
@@ -23,7 +21,7 @@ use crate::{
     disk_api::{DiskAPI, DiskError, ReadOptions, VolumeInfo},
     endpoint::{Endpoint, Endpoints},
     file_meta::FileMeta,
-    format::{DistributionAlgoVersion, FormatV3},
+    format::FormatV3,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
@@ -48,6 +46,7 @@ pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
         Ok(Arc::new(Box::new(s)))
     } else {
+        let _ = opt.health_check;
         unimplemented!()
         // Ok(Disk::Remote(RemoteDisk::new(ep, opt.health_check)?))
     }
@@ -168,22 +167,22 @@ impl LocalDisk {
         self.resolve_abs_path(dir)
     }
 
-    /// Write to the filesystem atomically.
-    /// This is done by first writing to a temporary location and then moving the file.
-    pub(crate) async fn prepare_file_write<'a>(&self, path: &'a PathBuf) -> Result<FileWriter<'a>> {
-        let tmp_path = self.get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
+    // /// Write to the filesystem atomically.
+    // /// This is done by first writing to a temporary location and then moving the file.
+    // pub(crate) async fn prepare_file_write<'a>(&self, path: &'a PathBuf) -> Result<FileWriter<'a>> {
+    //     let tmp_path = self.get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
-        debug!("prepare_file_write tmp_path:{:?}, path:{:?}", &tmp_path, &path);
+    //     debug!("prepare_file_write tmp_path:{:?}, path:{:?}", &tmp_path, &path);
 
-        let file = File::create(&tmp_path).await?;
-        let writer = BufWriter::new(file);
-        Ok(FileWriter {
-            tmp_path,
-            dest_path: path,
-            writer,
-            clean_tmp: true,
-        })
-    }
+    //     let file = File::create(&tmp_path).await?;
+    //     let writer = BufWriter::new(file);
+    //     Ok(FileWriter {
+    //         tmp_path,
+    //         dest_path: path,
+    //         writer,
+    //         clean_tmp: true,
+    //     })
+    // }
 
     pub async fn rename_all(&self, src_data_path: &PathBuf, dst_data_path: &PathBuf, skip: &PathBuf) -> Result<()> {
         if !skip.starts_with(&src_data_path) {
@@ -247,8 +246,8 @@ impl LocalDisk {
 
     async fn read_all_data(
         &self,
-        bucket: &str,
-        volume_dir: impl AsRef<Path>,
+        _bucket: &str,
+        _volume_dir: impl AsRef<Path>,
         path: impl AsRef<Path>,
     ) -> Result<(Vec<u8>, OffsetDateTime)> {
         let (data, meta) = read_file_all(path).await?;
@@ -404,7 +403,14 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, fileSize: usize, mut r: DuplexStream) -> Result<()> {
+    async fn create_file(
+        &self,
+        _origvolume: &str,
+        volume: &str,
+        path: &str,
+        _file_size: usize,
+        mut r: DuplexStream,
+    ) -> Result<()> {
         let fpath = self.get_object_path(volume, path)?;
 
         debug!("CreateFile fpath: {:?}", fpath);
@@ -461,15 +467,15 @@ impl DiskAPI for LocalDisk {
 
         let (dst_buf, _) = read_file_exists(&dst_file_path).await?;
 
-        let mut skipParent = dst_volume_path;
+        let mut skip_parent = dst_volume_path;
         if !&dst_buf.is_empty() {
-            skipParent = PathBuf::from(&dst_file_path.parent().unwrap_or(Path::new("/")));
+            skip_parent = PathBuf::from(&dst_file_path.parent().unwrap_or(Path::new("/")));
         }
 
         if !dst_buf.is_empty() {
             meta = match FileMeta::unmarshal(&dst_buf) {
                 Ok(m) => m,
-                Err(e) => FileMeta::new(),
+                Err(_) => FileMeta::new(),
             }
             // xl.load
             // meta.from(dst_buf);
@@ -483,10 +489,10 @@ impl DiskAPI for LocalDisk {
 
         let no_inline = src_data_path.has_root() && fi.data.is_none() && fi.size > 0;
         if no_inline {
-            self.rename_all(&src_data_path, &dst_data_path, &skipParent).await?;
+            self.rename_all(&src_data_path, &dst_data_path, &skip_parent).await?;
         }
 
-        self.rename_all(&src_file_path, &dst_file_path, &skipParent).await?;
+        self.rename_all(&src_file_path, &dst_file_path, &skip_parent).await?;
 
         if src_volume != RUSTFS_META_MULTIPART_BUCKET {
             fs::remove_dir(&src_file_path.parent().unwrap()).await?;
@@ -542,7 +548,7 @@ impl DiskAPI for LocalDisk {
         })
     }
 
-    async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+    async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         let p = self.get_object_path(&volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())?;
 
         let mut meta = FileMeta::new();
@@ -564,7 +570,7 @@ impl DiskAPI for LocalDisk {
 
     async fn read_version(
         &self,
-        org_volume: &str,
+        _org_volume: &str,
         volume: &str,
         path: &str,
         version_id: Uuid,
@@ -618,44 +624,44 @@ impl DiskAPI for LocalDisk {
 //     }
 // }
 
-pub(crate) struct FileWriter<'a> {
-    tmp_path: PathBuf,
-    dest_path: &'a Path,
-    writer: BufWriter<File>,
-    clean_tmp: bool,
-}
+// pub(crate) struct FileWriter<'a> {
+//     tmp_path: PathBuf,
+//     dest_path: &'a Path,
+//     writer: BufWriter<File>,
+//     clean_tmp: bool,
+// }
 
-impl<'a> FileWriter<'a> {
-    pub(crate) fn tmp_path(&self) -> &Path {
-        &self.tmp_path
-    }
+// impl<'a> FileWriter<'a> {
+//     pub(crate) fn tmp_path(&self) -> &Path {
+//         &self.tmp_path
+//     }
 
-    pub(crate) fn dest_path(&self) -> &'a Path {
-        self.dest_path
-    }
+//     pub(crate) fn dest_path(&self) -> &'a Path {
+//         self.dest_path
+//     }
 
-    pub(crate) fn writer(&mut self) -> &mut BufWriter<File> {
-        &mut self.writer
-    }
+//     pub(crate) fn writer(&mut self) -> &mut BufWriter<File> {
+//         &mut self.writer
+//     }
 
-    pub(crate) async fn done(mut self) -> Result<()> {
-        if let Some(final_dir_path) = self.dest_path().parent() {
-            fs::create_dir_all(&final_dir_path).await?;
-        }
+//     pub(crate) async fn done(mut self) -> Result<()> {
+//         if let Some(final_dir_path) = self.dest_path().parent() {
+//             fs::create_dir_all(&final_dir_path).await?;
+//         }
 
-        fs::rename(&self.tmp_path, self.dest_path()).await?;
-        self.clean_tmp = false;
-        Ok(())
-    }
-}
+//         fs::rename(&self.tmp_path, self.dest_path()).await?;
+//         self.clean_tmp = false;
+//         Ok(())
+//     }
+// }
 
-impl<'a> Drop for FileWriter<'a> {
-    fn drop(&mut self) {
-        if self.clean_tmp {
-            let _ = std::fs::remove_file(&self.tmp_path);
-        }
-    }
-}
+// impl<'a> Drop for FileWriter<'a> {
+//     fn drop(&mut self) {
+//         if self.clean_tmp {
+//             let _ = std::fs::remove_file(&self.tmp_path);
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod test {
