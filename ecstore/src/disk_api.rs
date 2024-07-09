@@ -4,8 +4,9 @@ use anyhow::{Error, Result};
 use bytes::Bytes;
 use time::OffsetDateTime;
 use tokio::io::DuplexStream;
+use uuid::Uuid;
 
-use crate::store_api::FileInfo;
+use crate::store_api::{FileInfo, RawFileInfo};
 
 #[async_trait::async_trait]
 pub trait DiskAPI: Debug + Send + Sync + 'static {
@@ -34,9 +35,10 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         org_volume: &str,
         volume: &str,
         path: &str,
-        version_id: &str,
+        version_id: Uuid,
         opts: ReadOptions,
     ) -> Result<FileInfo>;
+    async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
 }
 
 pub struct VolumeInfo {

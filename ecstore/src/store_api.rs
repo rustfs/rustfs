@@ -13,6 +13,8 @@ pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
+    pub name: String,
+    pub volume: String,
     pub version_id: Uuid,
     pub erasure: ErasureInfo,
     pub deleted: bool,
@@ -20,7 +22,7 @@ pub struct FileInfo {
     pub data_dir: Uuid,
     pub mod_time: OffsetDateTime,
     pub size: usize,
-    pub data: Vec<u8>,
+    pub data: Option<Vec<u8>>,
     pub fresh: bool, // indicates this is a first time call to write FileInfo.
 }
 
@@ -42,6 +44,8 @@ impl Default for FileInfo {
             size: Default::default(),
             data: Default::default(),
             fresh: Default::default(),
+            name: Default::default(),
+            volume: Default::default(),
         }
     }
 }
@@ -62,7 +66,7 @@ impl FileInfo {
         };
         Self {
             erasure: ErasureInfo {
-                algorithm: ERASURE_ALGORITHM,
+                algorithm: String::from(ERASURE_ALGORITHM),
                 data_blocks: data_blocks,
                 parity_blocks: parity_blocks,
                 block_size: BLOCK_SIZE_V2,
@@ -89,11 +93,15 @@ impl FileInfo {
     }
 }
 
+pub struct RawFileInfo {
+    pub buf: Vec<u8>,
+}
+
 #[derive(Debug, Default, Clone)]
 // ErasureInfo holds erasure coding and bitrot related information.
 pub struct ErasureInfo {
     // Algorithm is the String representation of erasure-coding-algorithm
-    pub algorithm: &'static str,
+    pub algorithm: String,
     // DataBlocks is the number of data blocks for erasure-coding
     pub data_blocks: usize,
     // ParityBlocks is the number of parity blocks for erasure-coding
