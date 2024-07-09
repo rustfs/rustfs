@@ -24,7 +24,7 @@ use crate::{
     endpoint::{Endpoint, Endpoints},
     file_meta::FileMeta,
     format::{DistributionAlgoVersion, FormatV3},
-    store_api::FileInfo,
+    store_api::{FileInfo, RawFileInfo},
     utils,
 };
 
@@ -218,6 +218,7 @@ impl LocalDisk {
         Ok(())
     }
 
+    /// read xl.meta raw data
     async fn read_raw(
         &self,
         bucket: &str,
@@ -480,7 +481,7 @@ impl DiskAPI for LocalDisk {
 
         fs::write(&src_file_path, fm_data).await?;
 
-        let no_inline = src_data_path.has_root() && fi.data.is_empty() && fi.size > 0;
+        let no_inline = src_data_path.has_root() && fi.data.is_none() && fi.size > 0;
         if no_inline {
             self.rename_all(&src_data_path, &dst_data_path, &skipParent).await?;
         }
@@ -566,7 +567,7 @@ impl DiskAPI for LocalDisk {
         org_volume: &str,
         volume: &str,
         path: &str,
-        version_id: &str,
+        version_id: Uuid,
         opts: ReadOptions,
     ) -> Result<FileInfo> {
         let file_path = self.get_object_path(volume, path)?;
@@ -576,7 +577,18 @@ impl DiskAPI for LocalDisk {
 
         let (data, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
 
-        unimplemented!()
+        let meta = FileMeta::unmarshal(&data)?;
+
+        let fi = meta.into_fileinfo(volume, path, version_id, false, true)?;
+        Ok(fi)
+    }
+    async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
+        let file_path = self.get_object_path(volume, path)?;
+        let file_dir = self.get_bucket_path(volume)?;
+
+        let (buf, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
+
+        Ok(RawFileInfo { buf })
     }
 }
 
