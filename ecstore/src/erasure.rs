@@ -49,6 +49,8 @@ impl Erasure {
                     for (i, w) in writers.iter_mut().enumerate() {
                         total += blocks[i].len();
 
+                        debug!("encode write {}", blocks[i].len());
+
                         match w.write_all(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
                             Err(e) => errs.push(Some(e)),

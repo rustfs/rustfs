@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use path_absolutize::Absolutize;
 use time::OffsetDateTime;
-use tokio::io::{self, BufWriter, ErrorKind};
+use tokio::io::{self, AsyncWriteExt, BufWriter, ErrorKind};
 use tokio::{
     fs::{self, File},
     io::DuplexStream,
@@ -354,7 +354,7 @@ impl DiskAPI for LocalDisk {
         Ok(Bytes::from(data))
     }
 
-    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
+    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
         let p = self.get_object_path(&volume, &path)?;
 
         write_all_internal(p, data).await?;
@@ -420,6 +420,22 @@ impl DiskAPI for LocalDisk {
         }
 
         let file = File::create(&fpath).await?;
+
+        let mut writer = BufWriter::new(file);
+
+        io::copy(&mut r, &mut writer).await?;
+
+        Ok(())
+    }
+    async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<()> {
+        let p = self.get_object_path(&volume, &path)?;
+
+        let mut file = File::options()
+            .create(true)
+            .write(true)
+            .append(true) // 设置为追加模式
+            .open(p)
+            .await?;
 
         let mut writer = BufWriter::new(file);
 
@@ -574,7 +590,7 @@ impl DiskAPI for LocalDisk {
         volume: &str,
         path: &str,
         version_id: Uuid,
-        opts: ReadOptions,
+        opts: &ReadOptions,
     ) -> Result<FileInfo> {
         let file_path = self.get_object_path(volume, path)?;
         let file_dir = self.get_bucket_path(volume)?;

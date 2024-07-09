@@ -26,6 +26,18 @@ impl FileInfo {
         // TODO: when lifecycle
         false
     }
+
+    pub fn write_quorum(&self, quorum: usize) -> usize {
+        if self.deleted {
+            return quorum;
+        }
+
+        if self.erasure.data_blocks == self.erasure.parity_blocks {
+            return self.erasure.data_blocks + 1;
+        }
+
+        self.erasure.data_blocks
+    }
 }
 
 impl Default for FileInfo {
