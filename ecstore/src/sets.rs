@@ -202,6 +202,14 @@ fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
     hex(sha256(path.as_bytes()).as_ref())
 }
 
+async fn check_upload_idexists() -> Result<()> {
+    unimplemented!()
+}
+
+async fn read_all_file_info() -> Result<()> {
+    unimplemented!()
+}
+
 // #[derive(Debug)]
 // pub struct Objects {
 //     pub endpoints: Vec<Endpoint>,
