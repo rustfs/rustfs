@@ -17,7 +17,6 @@ use s3s::{S3Request, S3Response};
 
 use anyhow::Result;
 use ecstore::store::ECStore;
-use tracing::error;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -54,14 +53,14 @@ impl S3 for FS {
                 .await
         );
 
-        let output = CreateBucketOutput::default(); // TODO: handle other fields
+        let output = CreateBucketOutput::default();
         Ok(S3Response::new(output))
     }
 
     #[tracing::instrument]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let input = req.input;
-        let (bucket, key) = match input.copy_source {
+        let (_bucket, _key) = match input.copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket { ref bucket, ref key, .. } => (bucket, key),
         };
@@ -72,22 +71,22 @@ impl S3 for FS {
 
     #[tracing::instrument]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let input = req.input;
+        let _input = req.input;
 
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
     #[tracing::instrument]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let input = req.input;
+        let _input = req.input;
 
-        let output = DeleteObjectOutput::default(); // TODO: handle other fields
+        let output = DeleteObjectOutput::default();
         Ok(S3Response::new(output))
     }
 
     #[tracing::instrument]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let input = req.input;
+        let _input = req.input;
 
         let output = DeleteObjectsOutput { ..Default::default() };
         Ok(S3Response::new(output))
@@ -146,7 +145,7 @@ impl S3 for FS {
 
     #[tracing::instrument]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
-        let input = req.input;
+        let _input = req.input;
 
         let output = HeadObjectOutput { ..Default::default() };
         Ok(S3Response::new(output))
@@ -175,7 +174,7 @@ impl S3 for FS {
 
     #[tracing::instrument]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let input = req.input;
+        let _input = req.input;
 
         let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))
@@ -196,7 +195,7 @@ impl S3 for FS {
             body,
             bucket,
             key,
-            metadata,
+            // metadata,
             content_length,
             ..
         } = input;
@@ -244,14 +243,14 @@ impl S3 for FS {
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         let UploadPartInput {
             body,
-            upload_id,
-            part_number,
+            // upload_id,
+            // part_number,
             content_length,
             ..
         } = req.input;
 
-        let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
-        let content_length = content_length.ok_or_else(|| s3_error!(IncompleteBody))?;
+        let _body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
+        let _content_length = content_length.ok_or_else(|| s3_error!(IncompleteBody))?;
 
         // mc cp step 4
 
@@ -261,7 +260,7 @@ impl S3 for FS {
 
     #[tracing::instrument]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        let input = req.input;
+        let _input = req.input;
 
         let output = UploadPartCopyOutput { ..Default::default() };
 
@@ -289,10 +288,10 @@ impl S3 for FS {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let CompleteMultipartUploadInput {
-            multipart_upload,
+            // multipart_upload,
             bucket,
             key,
-            upload_id,
+            // upload_id,
             ..
         } = req.input;
 
@@ -307,7 +306,7 @@ impl S3 for FS {
     #[tracing::instrument]
     async fn abort_multipart_upload(
         &self,
-        req: S3Request<AbortMultipartUploadInput>,
+        _req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
     }

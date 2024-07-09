@@ -15,7 +15,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, fileSize: usize, r: DuplexStream) -> Result<()>;
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize, r: DuplexStream) -> Result<()>;
     async fn rename_data(
         &self,
         src_volume: &str,

@@ -1,11 +1,6 @@
-use std::{default, sync::Arc};
-
 use anyhow::Result;
-use bytes::Bytes;
-use futures::Stream;
-use s3s::{dto::StreamingBlob, Body};
+use s3s::dto::StreamingBlob;
 use time::OffsetDateTime;
-use tracing::debug;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";

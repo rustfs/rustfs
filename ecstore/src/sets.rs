@@ -1,13 +1,11 @@
-use std::sync::Arc;
-
 use anyhow::{Error, Result};
-use futures::{future::join_all, AsyncWrite, StreamExt};
+use futures::future::join_all;
 use time::OffsetDateTime;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    disk::{self, DiskStore, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET},
+    disk::{DiskStore, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET},
     endpoint::PoolEndpoints,
     erasure::Erasure,
     format::{DistributionAlgoVersion, FormatV3},
@@ -20,8 +18,6 @@ use crate::{
         hash,
     },
 };
-
-const DEFAULT_INLINE_BLOCKS: usize = 128 * 1024;
 
 #[derive(Debug)]
 pub struct Sets {
@@ -135,16 +131,16 @@ impl Sets {
         errors
     }
 
-    async fn commit_rename_data_dir(
-        &self,
-        disks: &Vec<Option<DiskStore>>,
-        bucket: &str,
-        object: &str,
-        data_dir: &str,
-        // write_quorum: usize,
-    ) -> Vec<Option<Error>> {
-        unimplemented!()
-    }
+    // async fn commit_rename_data_dir(
+    //     &self,
+    //     disks: &Vec<Option<DiskStore>>,
+    //     bucket: &str,
+    //     object: &str,
+    //     data_dir: &str,
+    //     // write_quorum: usize,
+    // ) -> Vec<Option<Error>> {
+    //     unimplemented!()
+    // }
 }
 
 async fn write_unique_file_info(
@@ -202,14 +198,6 @@ fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
     hex(sha256(path.as_bytes()).as_ref())
 }
 
-async fn check_upload_idexists() -> Result<()> {
-    unimplemented!()
-}
-
-async fn read_all_file_info() -> Result<()> {
-    unimplemented!()
-}
-
 // #[derive(Debug)]
 // pub struct Objects {
 //     pub endpoints: Vec<Endpoint>,
@@ -222,11 +210,11 @@ async fn read_all_file_info() -> Result<()> {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
-    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+    async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
     }
 
-    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+    async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()
     }
 
@@ -339,11 +327,11 @@ impl StorageAPI for Sets {
         bucket: &str,
         object: &str,
         upload_id: &str,
-        part_id: usize,
-        data: PutObjReader,
-        opts: &ObjectOptions,
+        _part_id: usize,
+        _data: PutObjReader,
+        _opts: &ObjectOptions,
     ) -> Result<PartInfo> {
-        let upload_path = get_upload_id_dir(bucket, object, upload_id);
+        let _upload_path = get_upload_id_dir(bucket, object, upload_id);
 
         // TODO: checkUploadIDExists
 
@@ -363,6 +351,8 @@ impl StorageAPI for Sets {
         if data_drives == parity_drives {
             write_quorum += 1
         }
+
+        let _ = write_quorum;
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 

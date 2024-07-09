@@ -2,7 +2,6 @@ use anyhow::{Error, Result};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::{fmt::Debug, sync::Arc};
-use tracing::debug;
 
 use crate::{
     disk::DiskStore,
@@ -141,15 +140,15 @@ impl PeerS3Client for S3PeerSys {
 #[derive(Debug)]
 pub struct LocalPeerS3Client {
     pub local_disks: Vec<DiskStore>,
-    pub node: Node,
+    // pub node: Node,
     pub pools: Vec<usize>,
 }
 
 impl LocalPeerS3Client {
-    fn new(local_disks: Vec<DiskStore>, node: Node, pools: Vec<usize>) -> Self {
+    fn new(local_disks: Vec<DiskStore>, _node: Node, pools: Vec<usize>) -> Self {
         Self {
             local_disks,
-            node,
+            // node,
             pools,
         }
     }
@@ -192,7 +191,7 @@ impl PeerS3Client for LocalPeerS3Client {
 
         Ok(())
     }
-    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+    async fn get_bucket_info(&self, bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         let mut futures = Vec::with_capacity(self.local_disks.len());
         for disk in self.local_disks.iter() {
             futures.push(disk.stat_volume(bucket));
@@ -233,13 +232,14 @@ impl PeerS3Client for LocalPeerS3Client {
 
 #[derive(Debug)]
 pub struct RemotePeerS3Client {
-    pub node: Node,
-    pub pools: Vec<usize>,
+    // pub node: Node,
+    // pub pools: Vec<usize>,
 }
 
 impl RemotePeerS3Client {
-    fn new(node: Node, pools: Vec<usize>) -> Self {
-        Self { node, pools }
+    fn new(_node: Node, _pools: Vec<usize>) -> Self {
+        // Self { node, pools }
+        Self {}
     }
 }
 
@@ -251,7 +251,7 @@ impl PeerS3Client for RemotePeerS3Client {
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
     }
-    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+    async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()
     }
 }
