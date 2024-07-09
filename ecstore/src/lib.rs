@@ -10,6 +10,7 @@ pub mod error;
 mod file_meta;
 mod format;
 mod peer;
+pub mod set_disk;
 mod sets;
 pub mod store;
 pub mod store_api;
