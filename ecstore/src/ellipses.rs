@@ -1,6 +1,6 @@
 use lazy_static::*;
 
-use anyhow::{Error, Result};
+use super::error::{Error, Result};
 use regex::Regex;
 
 lazy_static! {
@@ -16,9 +16,9 @@ const ELLIPSES: &str = "...";
 /// associated prefix and suffixes.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pattern {
-    pub prefix: String,
-    pub suffix: String,
-    pub seq: Vec<String>,
+    pub(crate) prefix: String,
+    pub(crate) suffix: String,
+    pub(crate) seq: Vec<String>,
 }
 
 impl Pattern {
@@ -37,12 +37,28 @@ impl Pattern {
 
         ret
     }
+
+    pub fn len(&self) -> usize {
+        self.seq.len()
+    }
 }
 
 /// contains a list of patterns provided in the input.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ArgPattern {
-    pub inner: Vec<Pattern>,
+    inner: Vec<Pattern>,
+}
+
+impl AsRef<Vec<Pattern>> for ArgPattern {
+    fn as_ref(&self) -> &Vec<Pattern> {
+        &self.inner
+    }
+}
+
+impl AsMut<Vec<Pattern>> for ArgPattern {
+    fn as_mut(&mut self) -> &mut Vec<Pattern> {
+        &mut self.inner
+    }
 }
 
 impl ArgPattern {
@@ -88,7 +104,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
     let mut parts = match ELLIPSES_RE.captures(arg) {
         Some(caps) => caps,
         None => {
-            return Err(Error::msg(format!("Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4", arg)));
+            return Err(Error::from_string(format!("Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4", arg)));
         }
     };
 
@@ -125,7 +141,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
             || p.suffix.contains(OPEN_BRACES)
             || p.suffix.contains(CLOSE_BRACES)
         {
-            return Err(Error::msg(format!("Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4", arg)));
+            return Err(Error::from_string(format!("Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4", arg)));
         }
     }
 
@@ -146,10 +162,10 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
 /// {33...64}
 pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
     if !pattern.contains(OPEN_BRACES) {
-        return Err(Error::msg("Invalid argument"));
+        return Err(Error::from_string("Invalid argument"));
     }
     if !pattern.contains(OPEN_BRACES) {
-        return Err(Error::msg("Invalid argument"));
+        return Err(Error::from_string("Invalid argument"));
     }
 
     let ellipses_range: Vec<&str> = pattern
@@ -159,7 +175,7 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
         .collect();
 
     if ellipses_range.len() != 2 {
-        return Err(Error::msg("Invalid argument"));
+        return Err(Error::from_string("Invalid argument"));
     }
 
     // TODO: Add support for hexadecimals.
@@ -167,7 +183,7 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
     let end = ellipses_range[1].parse::<usize>()?;
 
     if start > end {
-        return Err(Error::msg("Invalid argument:range start cannot be bigger than end"));
+        return Err(Error::from_string("Invalid argument:range start cannot be bigger than end"));
     }
 
     let mut ret: Vec<String> = Vec::with_capacity(end - start + 1);

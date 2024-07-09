@@ -1,70 +1,103 @@
+use crate::error::{Error, Result};
+use lazy_static::lazy_static;
 use std::{
-    collections::HashMap,
-    net::{IpAddr, ToSocketAddrs},
+    collections::HashSet,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
 };
-
-use anyhow::{Error, Result};
-use netif;
 use url::Host;
 
-pub fn split_host_port(s: &str) -> Result<(String, u16)> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() == 2 {
-        if let Ok(port) = parts[1].parse::<u16>() {
-            return Ok((parts[0].to_string(), port));
-        }
-    }
-    Err(Error::msg("Invalid address format or port number"))
+lazy_static! {
+    static ref LOCAL_IPS: Vec<IpAddr> = must_get_local_ips().unwrap();
 }
 
-// is_local_host 判断是否是本地ip
-pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> bool {
-    let local_ips = must_get_local_ips();
+/// helper for validating if the provided arg is an ip address.
+pub fn is_socket_addr(addr: &str) -> bool {
+    // TODO IPv6 zone information?
 
-    let local_map =
-        local_ips
-            .iter()
-            .map(|ip| ip.to_string())
-            .fold(HashMap::new(), |mut acc, item| {
-                *acc.entry(item).or_insert(true) = true;
-                acc
-            });
+    addr.parse::<SocketAddr>().is_ok() || addr.parse::<IpAddr>().is_ok()
+}
 
+/// checks if server_addr is valid and local host.
+pub fn check_local_server_addr(server_addr: &str) -> Result<SocketAddr> {
+    let addr: Vec<SocketAddr> = match server_addr.to_socket_addrs() {
+        Ok(addr) => addr.collect(),
+        Err(err) => return Err(Error::new(Box::new(err))),
+    };
+
+    // 0.0.0.0 is a wildcard address and refers to local network
+    // addresses. I.e, 0.0.0.0:9000 like ":9000" refers to port
+    // 9000 on localhost.
+    for a in addr {
+        if a.ip().is_unspecified() {
+            return Ok(a);
+        }
+
+        let host = match a {
+            SocketAddr::V4(a) => Host::<&str>::Ipv4(*a.ip()),
+            SocketAddr::V6(a) => Host::Ipv6(*a.ip()),
+        };
+
+        if is_local_host(host, 0, 0)? {
+            return Ok(a);
+        }
+    }
+
+    Err(Error::from_string("host in server address should be this server"))
+}
+
+/// checks if the given parameter correspond to one of
+/// the local IP of the current machine
+pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> Result<bool> {
+    let local_set: HashSet<IpAddr> = LOCAL_IPS.iter().copied().collect();
     let is_local_host = match host {
         Host::Domain(domain) => {
-            let ips: Vec<String> = (domain, 0)
-                .to_socket_addrs()
-                .unwrap_or(Vec::new().into_iter())
-                .map(|addr| addr.ip().to_string())
-                .collect();
+            let ips = match (domain, 0).to_socket_addrs().map(|v| v.map(|v| v.ip()).collect::<Vec<_>>()) {
+                Ok(ips) => ips,
+                Err(err) => return Err(Error::new(Box::new(err))),
+            };
 
-            let mut isok = false;
-            for ip in ips.iter() {
-                if local_map.contains_key(ip) {
-                    isok = true;
-                    break;
-                }
-            }
-            isok
+            ips.iter().any(|ip| local_set.contains(ip))
         }
-        Host::Ipv4(ip) => local_map.contains_key(&ip.to_string()),
-        Host::Ipv6(ip) => local_map.contains_key(&ip.to_string()),
+        Host::Ipv4(ip) => local_set.contains(&IpAddr::V4(ip)),
+        Host::Ipv6(ip) => local_set.contains(&IpAddr::V6(ip)),
     };
 
     if port > 0 {
-        return is_local_host && port == local_port;
+        return Ok(is_local_host && port == local_port);
     }
 
-    is_local_host
+    Ok(is_local_host)
 }
 
-pub fn must_get_local_ips() -> Vec<IpAddr> {
-    let mut v: Vec<IpAddr> = Vec::new();
-    if let Some(up) = netif::up().ok() {
-        v = up.map(|x| x.address().to_owned()).collect();
+/// returns IP address of given host.
+pub fn get_host_ip(host: Host<&str>) -> Result<HashSet<IpAddr>> {
+    match host {
+        Host::Domain(domain) => match (domain, 0)
+            .to_socket_addrs()
+            .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
+        {
+            Ok(ips) => Ok(ips),
+            Err(err) => Err(Error::new(Box::new(err))),
+        },
+        Host::Ipv4(ip) => {
+            let mut set = HashSet::with_capacity(1);
+            set.insert(IpAddr::V4(ip));
+            Ok(set)
+        }
+        Host::Ipv6(ip) => {
+            let mut set = HashSet::with_capacity(1);
+            set.insert(IpAddr::V6(ip));
+            Ok(set)
+        }
     }
+}
 
-    v
+/// returns IPs of local interface
+pub(crate) fn must_get_local_ips() -> Result<Vec<IpAddr>> {
+    match netif::up() {
+        Ok(up) => Ok(up.map(|x| x.address().to_owned()).collect()),
+        Err(err) => Err(Error::from_string(format!("Unable to get IP addresses of this host: {}", err))),
+    }
 }
 
 #[cfg(test)]
@@ -74,21 +107,55 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_must_get_local_ips() {
-        let ips = must_get_local_ips();
-        for ip in ips.iter() {
-            println!("{:?}", ip)
+    fn test_is_socket_addr() {
+        let test_cases = [
+            ("localhost", false),
+            ("localhost:9000", false),
+            ("example.com", false),
+            ("http://192.168.1.0", false),
+            ("http://192.168.1.0:9000", false),
+            ("192.168.1.0", true),
+            ("[2001:db8::1]:9000", true),
+        ];
+
+        for (addr, expected) in test_cases {
+            let ret = is_socket_addr(addr);
+            assert_eq!(expected, ret, "addr: {}, expected: {}, got: {}", addr, expected, ret);
         }
     }
 
     #[test]
-    fn test_is_local_host() {
-        // let host = Host::Ipv4(Ipv4Addr::new(192, 168, 0, 233));
-        let host = Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1));
-        // let host = Host::Domain("localhost");
-        let port = 0;
-        let local_port = 9000;
-        let is = is_local_host(host, port, local_port);
-        assert!(is)
+    fn test_check_local_server_addr() {
+        let test_cases = [
+            (":54321", Ok(())),
+            ("localhost:54321", Ok(())),
+            ("0.0.0.0:9000", Ok(())),
+            (":0", Ok(())),
+            ("localhost", Err(Error::from_string("invalid socket address"))),
+            ("", Err(Error::from_string("invalid socket address"))),
+            (
+                "example.org:54321",
+                Err(Error::from_string("host in server address should be this server")),
+            ),
+            (":-10", Err(Error::from_string("invalid port value"))),
+        ];
+
+        for test_case in test_cases {
+            let ret = check_local_server_addr(test_case.0);
+            if test_case.1.is_ok() && ret.is_err() {
+                panic!("{}: error: expected = <nil>, got = {:?}", test_case.0, ret);
+            }
+            if test_case.1.is_err() && ret.is_ok() {
+                panic!("{}: error: expected = {:?}, got = <nil>", test_case.0, test_case.1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_must_get_local_ips() {
+        let local_ips = must_get_local_ips().unwrap();
+        let local_set: HashSet<IpAddr> = local_ips.into_iter().collect();
+
+        assert!(local_set.contains(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
     }
 }
