@@ -346,6 +346,10 @@ impl DiskAPI for LocalDisk {
         true
     }
 
+    fn id(&self) -> Uuid {
+        self.id
+    }
+
     #[must_use]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         let p = self.get_object_path(&volume, &path)?;
@@ -427,19 +431,33 @@ impl DiskAPI for LocalDisk {
 
         Ok(())
     }
-    async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<()> {
+    async fn append_file(&self, volume: &str, path: &str, buf: &[u8]) -> Result<()> {
         let p = self.get_object_path(&volume, &path)?;
 
+        debug!("append_file start {} {:?}", self.id(), &p);
+
+        if let Some(dir_path) = p.parent() {
+            fs::create_dir_all(&dir_path).await?;
+        }
+
+        debug!("append_file open {} {:?}", self.id(), &p);
+
         let mut file = File::options()
+            .read(true)
             .create(true)
             .write(true)
-            .append(true) // 设置为追加模式
-            .open(p)
+            // .append(true)
+            .open(&p)
             .await?;
 
-        let mut writer = BufWriter::new(file);
+        debug!("append_file opened {} {:?}", self.id(), &p);
 
-        io::copy(&mut r, &mut writer).await?;
+        // let mut writer = BufWriter::new(file);
+
+        file.write(&buf).await?;
+
+        debug!("append_file end {} {}", self.id(), path);
+        // io::copy(&mut r, &mut file).await?;
 
         Ok(())
     }

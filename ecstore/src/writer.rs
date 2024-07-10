@@ -1,8 +1,9 @@
 use std::{io, task::Poll};
 
-use futures::Future;
+use futures::{ready, Future};
 use tokio::io::AsyncWrite;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::disk::DiskStore;
 
@@ -14,13 +15,18 @@ pub struct AppendWriter<'a> {
 
 impl<'a> AppendWriter<'a> {
     pub fn new(disk: DiskStore, volume: &'a str, path: &'a str) -> Self {
+        debug!("AppendWriter new {}: {}/{}", disk.id(), volume, path);
         Self { disk, volume, path }
     }
 
     async fn async_write(&self, buf: &[u8]) -> Result<(), std::io::Error> {
-        debug!("async_write {}: {}", &self.path, buf.len());
+        debug!("async_write {}: {}: {}", self.disk.id(), &self.path, buf.len());
 
-        unimplemented!()
+        self.disk
+            .append_file(&self.volume, &self.path, buf)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
     }
 }
 
@@ -31,10 +37,40 @@ impl<'a> AsyncWrite for AppendWriter<'a> {
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         let mut fut = Box::pin(self.async_write(buf));
+        debug!("AsyncWrite poll_write {}, buf:{}", self.disk.id(), buf.len());
+
+        // while let Poll::Ready(e) = fut.as_mut().poll(cx) {
+        //     let a = match e {
+        //         Ok(_) => {
+        //             debug!("Ready ok {}", self.disk.id());
+        //             Poll::Ready(Ok(buf.len()))
+        //         }
+        //         Err(e) => {
+        //             debug!("Ready err {}", self.disk.id());
+        //             Poll::Ready(Err(e))
+        //         }
+        //     };
+
+        //     return a;
+        // }
+
+        // Poll::Pending
 
         match fut.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(_) => Poll::Ready(Ok(buf.len())),
+            Poll::Pending => {
+                debug!("Pending {}", self.disk.id());
+                Poll::Pending
+            }
+            Poll::Ready(e) => match e {
+                Ok(_) => {
+                    debug!("Ready ok {}", self.disk.id());
+                    Poll::Ready(Ok(buf.len()))
+                }
+                Err(e) => {
+                    debug!("Ready err {}", self.disk.id());
+                    Poll::Ready(Err(e))
+                }
+            },
         }
     }
 

@@ -37,13 +37,13 @@ impl ChunkedStream {
                             None => break,
                             Some(Err(e)) => return Err(e),
                             Some(Ok((data, remaining_bytes))) => {
-                                debug!(
-                                    "content_length:{},readed_size:{}, read_data data:{}, remaining_bytes: {} ",
-                                    content_length,
-                                    readed_size,
-                                    data.len(),
-                                    remaining_bytes.len()
-                                );
+                                // debug!(
+                                //     "content_length:{},readed_size:{}, read_data data:{}, remaining_bytes: {} ",
+                                //     content_length,
+                                //     readed_size,
+                                //     data.len(),
+                                //     remaining_bytes.len()
+                                // );
 
                                 prev_bytes = remaining_bytes;
                                 data
@@ -107,7 +107,7 @@ impl ChunkedStream {
 
         // 只执行一次
         let mut push_data_bytes = |mut bytes: Bytes| {
-            debug!("read from body {} split per {}, prev_bytes: {}", bytes.len(), data_size, prev_bytes.len());
+            // debug!("read from body {} split per {}, prev_bytes: {}", bytes.len(), data_size, prev_bytes.len());
 
             if bytes.is_empty() {
                 return None;
@@ -132,12 +132,12 @@ impl ChunkedStream {
                     combined.extend_from_slice(&prev_bytes);
                     combined.extend_from_slice(&data);
 
-                    debug!(
-                        "取到的长度大于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}",
-                        need_size,
-                        combined.len(),
-                        bytes.len(),
-                    );
+                    // debug!(
+                    //     "取到的长度大于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}",
+                    //     need_size,
+                    //     combined.len(),
+                    //     bytes.len(),
+                    // );
 
                     bytes_buffer.push(Bytes::from(combined));
                 } else {
@@ -145,12 +145,12 @@ impl ChunkedStream {
                     combined.extend_from_slice(&prev_bytes);
                     combined.extend_from_slice(&bytes);
 
-                    debug!(
-                        "取到的长度小于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}，直接返回",
-                        need_size,
-                        combined.len(),
-                        bytes.len(),
-                    );
+                    // debug!(
+                    //     "取到的长度小于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}，直接返回",
+                    //     need_size,
+                    //     combined.len(),
+                    //     bytes.len(),
+                    // );
 
                     return Some(Bytes::from(combined));
                 }
