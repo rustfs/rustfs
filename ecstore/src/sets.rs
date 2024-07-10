@@ -1,23 +1,15 @@
-use anyhow::{Error, Result};
-use futures::future::join_all;
-use time::OffsetDateTime;
-use tracing::debug;
+use anyhow::Result;
 use uuid::Uuid;
 
 use crate::{
-    disk::{DiskStore, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET},
+    disk::DiskStore,
     endpoint::PoolEndpoints,
-    erasure::Erasure,
     format::{DistributionAlgoVersion, FormatV3},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, FileInfo, MakeBucketOptions, MultipartUploadResult, ObjectOptions, PartInfo, PutObjReader,
-        StorageAPI,
+        BucketInfo, BucketOptions, MakeBucketOptions, MultipartUploadResult, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
-    utils::{
-        crypto::{base64_decode, base64_encode, hex, sha256},
-        hash,
-    },
+    utils::hash,
 };
 
 #[derive(Debug)]

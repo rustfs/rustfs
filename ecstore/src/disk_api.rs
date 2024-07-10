@@ -1,9 +1,9 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, pin::Pin};
 
 use anyhow::{Error, Result};
 use bytes::Bytes;
 use time::OffsetDateTime;
-use tokio::io::DuplexStream;
+use tokio::io::AsyncWrite;
 use uuid::Uuid;
 
 use crate::store_api::{FileInfo, RawFileInfo};
@@ -16,8 +16,8 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize, r: DuplexStream) -> Result<()>;
-    async fn append_file(&self, volume: &str, path: &str, r: DuplexStream) -> Result<()>;
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
+    async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -51,6 +51,43 @@ pub struct VolumeInfo {
 pub struct ReadOptions {
     pub read_data: bool,
     pub healing: bool,
+}
+
+pub struct FileWriter {
+    pub inner: Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>,
+}
+
+impl AsyncWrite for FileWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl FileWriter {
+    pub fn new<W>(inner: W) -> Self
+    where
+        W: AsyncWrite + Send + Sync + 'static,
+    {
+        Self { inner: Box::pin(inner) }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -9,16 +9,13 @@ use bytes::Bytes;
 use futures::future::join_all;
 use path_absolutize::Absolutize;
 use time::OffsetDateTime;
-use tokio::io::{self, AsyncWriteExt, BufWriter, ErrorKind};
-use tokio::{
-    fs::{self, File},
-    io::DuplexStream,
-};
+use tokio::fs::{self, File};
+use tokio::io::ErrorKind;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    disk_api::{DiskAPI, DiskError, ReadOptions, VolumeInfo},
+    disk_api::{DiskAPI, DiskError, FileWriter, ReadOptions, VolumeInfo},
     endpoint::{Endpoint, Endpoints},
     file_meta::FileMeta,
     format::FormatV3,
@@ -407,14 +404,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    async fn create_file(
-        &self,
-        _origvolume: &str,
-        volume: &str,
-        path: &str,
-        _file_size: usize,
-        mut r: DuplexStream,
-    ) -> Result<()> {
+    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
         let fpath = self.get_object_path(volume, path)?;
 
         debug!("CreateFile fpath: {:?}", fpath);
@@ -425,39 +415,44 @@ impl DiskAPI for LocalDisk {
 
         let file = File::create(&fpath).await?;
 
-        let mut writer = BufWriter::new(file);
+        Ok(FileWriter::new(file))
 
-        io::copy(&mut r, &mut writer).await?;
+        // let mut writer = BufWriter::new(file);
 
-        Ok(())
+        // io::copy(&mut r, &mut writer).await?;
+
+        // Ok(())
     }
-    async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<()> {
+    // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
+    async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         let p = self.get_object_path(&volume, &path)?;
 
         debug!("append_file start {} {:?}", self.id(), &p);
 
-        // if let Some(dir_path) = p.parent() {
-        //     fs::create_dir_all(&dir_path).await?;
-        // }
+        if let Some(dir_path) = p.parent() {
+            fs::create_dir_all(&dir_path).await?;
+        }
 
         // debug!("append_file open {} {:?}", self.id(), &p);
 
-        let mut file = File::options()
+        let file = File::options()
             .read(true)
             .create(true)
             .write(true)
-            // .append(true)
+            .append(true)
             .open(&p)
             .await?;
 
-        let mut writer = BufWriter::new(file);
+        Ok(FileWriter::new(file))
 
-        io::copy(&mut r, &mut writer).await?;
+        // let mut writer = BufWriter::new(file);
 
-        debug!("append_file end {} {}", self.id(), path);
+        // io::copy(&mut r, &mut writer).await?;
+
+        // debug!("append_file end {} {}", self.id(), path);
         // io::copy(&mut r, &mut file).await?;
 
-        Ok(())
+        // Ok(())
     }
 
     async fn rename_data(&self, src_volume: &str, src_path: &str, fi: &FileInfo, dst_volume: &str, dst_path: &str) -> Result<()> {

@@ -54,35 +54,35 @@ impl Erasure {
                     for (i, w) in writers.iter_mut().enumerate() {
                         total += blocks[i].len();
 
-                        debug!(
-                            "{} {}-{} encode write {} , total:{}, readed:{}",
-                            self.id,
-                            idx,
-                            i,
-                            blocks[i].len(),
-                            data_size,
-                            total
-                        );
+                        // debug!(
+                        //     "{} {}-{} encode write {} , total:{}, readed:{}",
+                        //     self.id,
+                        //     idx,
+                        //     i,
+                        //     blocks[i].len(),
+                        //     data_size,
+                        //     total
+                        // );
 
-                        match w.write(blocks[i].as_ref()).await {
+                        match w.write_all(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
                             Err(e) => errs.push(Some(e)),
                         }
                     }
 
-                    debug!("{} encode_data write errs:{:?}", self.id, errs);
-                    // TODO: reduceWriteQuorumErrs
-                    for err in errs.iter() {
-                        if err.is_some() {
-                            return Err(Error::msg("message"));
-                        }
-                    }
+                    // debug!("{} encode_data write errs:{:?}", self.id, errs);
+                    // // TODO: reduceWriteQuorumErrs
+                    // for err in errs.iter() {
+                    //     if err.is_some() {
+                    //         return Err(Error::msg("message"));
+                    //     }
+                    // }
                 }
                 Err(e) => return Err(anyhow!(e)),
             }
         }
 
-        debug!("{} encode_data done  {}", self.id, total);
+        // debug!("{} encode_data done  {}", self.id, total);
 
         Ok(total)
 

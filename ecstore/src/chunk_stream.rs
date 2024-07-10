@@ -5,7 +5,6 @@ use s3s::StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tracing::debug;
 use transform_stream::AsyncTryStream;
 
 pub type SyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
@@ -37,13 +36,13 @@ impl ChunkedStream {
                             None => break,
                             Some(Err(e)) => return Err(e),
                             Some(Ok((data, remaining_bytes))) => {
-                                debug!(
-                                    "content_length:{},readed_size:{}, read_data data:{}, remaining_bytes: {} ",
-                                    content_length,
-                                    readed_size,
-                                    data.len(),
-                                    remaining_bytes.len()
-                                );
+                                // debug!(
+                                //     "content_length:{},readed_size:{}, read_data data:{}, remaining_bytes: {} ",
+                                //     content_length,
+                                //     readed_size,
+                                //     data.len(),
+                                //     remaining_bytes.len()
+                                // );
 
                                 prev_bytes = remaining_bytes;
                                 data
@@ -53,17 +52,17 @@ impl ChunkedStream {
 
                     for bytes in data {
                         readed_size += bytes.len();
-                        println!("readed_size {}, content_length {}", readed_size, content_length,);
+                        // debug!("readed_size {}, content_length {}", readed_size, content_length,);
                         y.yield_ok(bytes).await;
                     }
 
                     if readed_size + prev_bytes.len() >= content_length {
-                        println!(
-                            "读完了 readed_size:{} + prev_bytes.len({}) == content_length {}",
-                            readed_size,
-                            prev_bytes.len(),
-                            content_length,
-                        );
+                        // debug!(
+                        //     "读完了 readed_size:{} + prev_bytes.len({}) == content_length {}",
+                        //     readed_size,
+                        //     prev_bytes.len(),
+                        //     content_length,
+                        // );
 
                         // 填充0？
                         if !need_padding {
@@ -81,7 +80,7 @@ impl ChunkedStream {
                     }
                 }
 
-                debug!("chunked stream exit");
+                // debug!("chunked stream exit");
 
                 Ok(())
             })
@@ -104,7 +103,7 @@ impl ChunkedStream {
 
         // 只执行一次
         let mut push_data_bytes = |mut bytes: Bytes| {
-            debug!("read from body {} split per {}, prev_bytes: {}", bytes.len(), data_size, prev_bytes.len());
+            // debug!("read from body {} split per {}, prev_bytes: {}", bytes.len(), data_size, prev_bytes.len());
 
             if bytes.is_empty() {
                 return None;
@@ -117,24 +116,24 @@ impl ChunkedStream {
             // 合并上一次数据
             if !prev_bytes.is_empty() {
                 let need_size = data_size.wrapping_sub(prev_bytes.len());
-                println!(
-                    " 上一次有剩余{},从这一次中取{},共：{}",
-                    prev_bytes.len(),
-                    need_size,
-                    prev_bytes.len() + need_size
-                );
+                // debug!(
+                //     " 上一次有剩余{},从这一次中取{},共：{}",
+                //     prev_bytes.len(),
+                //     need_size,
+                //     prev_bytes.len() + need_size
+                // );
                 if bytes.len() >= need_size {
                     let data = bytes.split_to(need_size);
                     let mut combined = Vec::new();
                     combined.extend_from_slice(&prev_bytes);
                     combined.extend_from_slice(&data);
 
-                    debug!(
-                        "取到的长度大于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}",
-                        need_size,
-                        combined.len(),
-                        bytes.len(),
-                    );
+                    // debug!(
+                    //     "取到的长度大于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}",
+                    //     need_size,
+                    //     combined.len(),
+                    //     bytes.len(),
+                    // );
 
                     bytes_buffer.push(Bytes::from(combined));
                 } else {
@@ -142,12 +141,12 @@ impl ChunkedStream {
                     combined.extend_from_slice(&prev_bytes);
                     combined.extend_from_slice(&bytes);
 
-                    debug!(
-                        "取到的长度小于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}，直接返回",
-                        need_size,
-                        combined.len(),
-                        bytes.len(),
-                    );
+                    // debug!(
+                    //     "取到的长度小于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}，直接返回",
+                    //     need_size,
+                    //     combined.len(),
+                    //     bytes.len(),
+                    // );
 
                     return Some(Bytes::from(combined));
                 }
