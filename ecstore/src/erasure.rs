@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use anyhow::Error;
 use anyhow::Result;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -7,6 +8,7 @@ use s3s::StdError;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::chunk_stream::ChunkedStream;
 
@@ -14,6 +16,7 @@ pub struct Erasure {
     // data_shards: usize,
     // parity_shards: usize,
     encoder: ReedSolomon,
+    id: Uuid,
 }
 
 impl Erasure {
@@ -22,6 +25,7 @@ impl Erasure {
             // data_shards,
             // parity_shards,
             encoder: ReedSolomon::new(data_shards, parity_shards).unwrap(),
+            id: Uuid::new_v4(),
         }
     }
 
@@ -50,7 +54,15 @@ impl Erasure {
                     for (i, w) in writers.iter_mut().enumerate() {
                         total += blocks[i].len();
 
-                        debug!("{}-{} encode write {} , total:{}", idx, i, blocks[i].len(), total);
+                        debug!(
+                            "{} {}-{} encode write {} , total:{}, readed:{}",
+                            self.id,
+                            idx,
+                            i,
+                            blocks[i].len(),
+                            data_size,
+                            total
+                        );
 
                         match w.write(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
@@ -58,12 +70,19 @@ impl Erasure {
                         }
                     }
 
-                    debug!("encode_data write errs:{:?}", errs);
+                    debug!("{} encode_data write errs:{:?}", self.id, errs);
                     // TODO: reduceWriteQuorumErrs
+                    for err in errs.iter() {
+                        if err.is_some() {
+                            return Err(Error::msg("message"));
+                        }
+                    }
                 }
                 Err(e) => return Err(anyhow!(e)),
             }
         }
+
+        debug!("{} encode_data done  {}", self.id, total);
 
         Ok(total)
 
