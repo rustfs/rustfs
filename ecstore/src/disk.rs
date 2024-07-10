@@ -431,16 +431,16 @@ impl DiskAPI for LocalDisk {
 
         Ok(())
     }
-    async fn append_file(&self, volume: &str, path: &str, buf: &[u8]) -> Result<()> {
+    async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<()> {
         let p = self.get_object_path(&volume, &path)?;
 
         debug!("append_file start {} {:?}", self.id(), &p);
 
-        if let Some(dir_path) = p.parent() {
-            fs::create_dir_all(&dir_path).await?;
-        }
+        // if let Some(dir_path) = p.parent() {
+        //     fs::create_dir_all(&dir_path).await?;
+        // }
 
-        debug!("append_file open {} {:?}", self.id(), &p);
+        // debug!("append_file open {} {:?}", self.id(), &p);
 
         let mut file = File::options()
             .read(true)
@@ -450,11 +450,9 @@ impl DiskAPI for LocalDisk {
             .open(&p)
             .await?;
 
-        debug!("append_file opened {} {:?}", self.id(), &p);
+        let mut writer = BufWriter::new(file);
 
-        // let mut writer = BufWriter::new(file);
-
-        file.write(&buf).await?;
+        io::copy(&mut r, &mut writer).await?;
 
         debug!("append_file end {} {}", self.id(), path);
         // io::copy(&mut r, &mut file).await?;

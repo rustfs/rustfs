@@ -1,7 +1,7 @@
 use std::{io, task::Poll};
 
 use futures::{ready, Future};
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncWrite, BufWriter};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -22,10 +22,10 @@ impl<'a> AppendWriter<'a> {
     async fn async_write(&self, buf: &[u8]) -> Result<(), std::io::Error> {
         debug!("async_write {}: {}: {}", self.disk.id(), &self.path, buf.len());
 
-        self.disk
-            .append_file(&self.volume, &self.path, buf)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        // self.disk
+        //     .append_file(&self.volume, &self.path, buf)
+        //     .await
+        //     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         Ok(())
     }
 }
