@@ -39,19 +39,20 @@ impl Erasure {
     {
         let mut stream = ChunkedStream::new(body, data_size, block_size, true);
         let mut total: usize = 0;
+        let mut idx = 0;
         while let Some(result) = stream.next().await {
             match result {
                 Ok(data) => {
                     let blocks = self.encode_data(data.as_ref())?;
 
                     let mut errs = Vec::new();
-
+                    idx += 1;
                     for (i, w) in writers.iter_mut().enumerate() {
                         total += blocks[i].len();
 
-                        debug!("encode write {}", blocks[i].len());
+                        debug!("{}-{} encode write {} , total:{}", idx, i, blocks[i].len(), total);
 
-                        match w.write_all(blocks[i].as_ref()).await {
+                        match w.write(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
                             Err(e) => errs.push(Some(e)),
                         }
