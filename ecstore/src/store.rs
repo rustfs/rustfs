@@ -14,7 +14,8 @@ use crate::{
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOptions, MakeBucketOptions, MultipartUploadResult, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init, utils,
 };
@@ -174,6 +175,21 @@ impl StorageAPI for ECStore {
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         if self.single_pool() {
             return self.pools[0].new_multipart_upload(bucket, object, opts).await;
+        }
+        unimplemented!()
+    }
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        if self.single_pool() {
+            return self.pools[0]
+                .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+                .await;
         }
         unimplemented!()
     }

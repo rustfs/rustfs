@@ -7,7 +7,8 @@ use crate::{
     format::{DistributionAlgoVersion, FormatV3},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, MakeBucketOptions, MultipartUploadResult, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo,
+        PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -148,5 +149,18 @@ impl StorageAPI for Sets {
 
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object)
+            .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+            .await
     }
 }

@@ -41,6 +41,41 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
+    async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
+}
+
+pub struct ReadMultipleReq {
+    pub bucket: String,
+    pub prefix: String,
+    pub files: Vec<String>,
+    pub max_size: usize,
+    pub metadata_only: bool,
+    pub abort404: bool,
+    pub max_results: usize,
+}
+
+pub struct ReadMultipleResp {
+    pub bucket: String,
+    pub prefix: String,
+    pub file: String,
+    pub exists: bool,
+    pub error: String,
+    pub data: Vec<u8>,
+    pub mod_time: OffsetDateTime,
+}
+
+impl Default for ReadMultipleResp {
+    fn default() -> Self {
+        Self {
+            bucket: Default::default(),
+            prefix: Default::default(),
+            file: Default::default(),
+            exists: Default::default(),
+            error: Default::default(),
+            data: Default::default(),
+            mod_time: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
 }
 
 pub struct VolumeInfo {

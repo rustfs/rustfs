@@ -1,12 +1,15 @@
 use anyhow::Result;
+use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
 
-#[derive(Debug, Clone)]
+// #[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct FileInfo {
     pub name: String,
     pub volume: String,
@@ -19,6 +22,7 @@ pub struct FileInfo {
     pub size: usize,
     pub data: Option<Vec<u8>>,
     pub fresh: bool, // indicates this is a first time call to write FileInfo.
+    pub parts: Vec<ObjectPartInfo>,
 }
 
 impl FileInfo {
@@ -38,6 +42,14 @@ impl FileInfo {
 
         self.erasure.data_blocks
     }
+
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        self.serialize(&mut Serializer::new(&mut buf))?;
+
+        Ok(buf)
+    }
 }
 
 impl Default for FileInfo {
@@ -53,6 +65,7 @@ impl Default for FileInfo {
             fresh: Default::default(),
             name: Default::default(),
             volume: Default::default(),
+            parts: Default::default(),
         }
     }
 }
@@ -100,11 +113,32 @@ impl FileInfo {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+pub struct ObjectPartInfo {
+    // pub etag: Option<String>,
+    pub number: usize,
+    pub size: usize,
+    // pub actual_size: usize,
+    pub mod_time: OffsetDateTime,
+    // pub index: Option<Vec<u8>>,
+    // pub checksums: Option<std::collections::HashMap<String, String>>,
+}
+
+impl Default for ObjectPartInfo {
+    fn default() -> Self {
+        Self {
+            number: Default::default(),
+            size: Default::default(),
+            mod_time: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+}
+
 pub struct RawFileInfo {
     pub buf: Vec<u8>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
 // ErasureInfo holds erasure coding and bitrot related information.
 pub struct ErasureInfo {
     // Algorithm is the String representation of erasure-coding-algorithm
@@ -123,7 +157,7 @@ pub struct ErasureInfo {
     pub checksums: Vec<ChecksumInfo>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
 // ChecksumInfo - carries checksums of individual scattered parts per disk.
 pub struct ChecksumInfo {
     pub part_number: usize,
@@ -131,7 +165,7 @@ pub struct ChecksumInfo {
     pub hash: Vec<u8>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
 // BitrotAlgorithm specifies a algorithm used for bitrot protection.
 pub enum BitrotAlgorithm {
     // SHA256 represents the SHA-256 hash function
@@ -184,6 +218,10 @@ pub struct PartInfo {
     pub size: usize,
 }
 
+pub struct CompletePart {}
+
+pub struct ObjectInfo {}
+
 #[async_trait::async_trait]
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
@@ -200,4 +238,12 @@ pub trait StorageAPI {
         opts: &ObjectOptions,
     ) -> Result<PartInfo>;
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo>;
 }

@@ -15,7 +15,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    disk_api::{DiskAPI, DiskError, FileWriter, ReadOptions, VolumeInfo},
+    disk_api::{DiskAPI, DiskError, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, VolumeInfo},
     endpoint::{Endpoint, Endpoints},
     file_meta::FileMeta,
     format::FormatV3,
@@ -623,72 +623,56 @@ impl DiskAPI for LocalDisk {
 
         Ok(RawFileInfo { buf })
     }
+    async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
+        let mut results = Vec::new();
+        let mut found = 0;
+
+        for v in req.files.iter() {
+            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", req.prefix, v).as_str())?;
+            let mut res = ReadMultipleResp::default();
+            // if req.metadata_only {}
+            match read_file_all(fpath).await {
+                Ok((data, meta)) => {
+                    found += 1;
+
+                    if req.max_size > 0 && data.len() > req.max_size {
+                        res.exists = true;
+                        res.error = format!("max size ({}) exceeded: {}", req.max_size, data.len());
+                        results.push(res);
+                        break;
+                    }
+
+                    res.exists = true;
+                    res.data = data;
+                    res.mod_time = match meta.modified() {
+                        Ok(md) => OffsetDateTime::from(md),
+                        Err(_) => return Err(Error::msg("Not supported modified on this platform")),
+                    };
+                    results.push(res);
+
+                    if req.max_results > 0 && found >= req.max_results {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if !(DiskError::is_err(&e, &DiskError::FileNotFound) || DiskError::is_err(&e, &DiskError::VolumeNotFound)) {
+                        res.exists = true;
+                        res.error = e.to_string();
+                    }
+
+                    if req.abort404 && !res.exists {
+                        results.push(res);
+                        break;
+                    }
+
+                    results.push(res);
+                }
+            }
+        }
+
+        Ok(results)
+    }
 }
-
-// pub async fn copy_bytes<S, W>(mut stream: S, writer: &mut W) -> Result<u64>
-// where
-//     S: Stream<Item = Result<Bytes, StdError>> + Unpin,
-//     W: AsyncWrite + Unpin,
-// {
-//     let mut nwritten: u64 = 0;
-//     while let Some(result) = stream.next().await {
-//         let bytes = match result {
-//             Ok(x) => x,
-//             Err(e) => return Err(Error::new(e)),
-//         };
-//         writer.write_all(&bytes).await?;
-//         nwritten += bytes.len() as u64;
-//     }
-//     writer.flush().await?;
-//     Ok(nwritten)
-// }
-
-// pub struct RemoteDisk {}
-
-// impl RemoteDisk {
-//     pub fn new(_ep: &Endpoint, _health_check: bool) -> Result<Self> {
-//         Ok(Self {})
-//     }
-// }
-
-// pub(crate) struct FileWriter<'a> {
-//     tmp_path: PathBuf,
-//     dest_path: &'a Path,
-//     writer: BufWriter<File>,
-//     clean_tmp: bool,
-// }
-
-// impl<'a> FileWriter<'a> {
-//     pub(crate) fn tmp_path(&self) -> &Path {
-//         &self.tmp_path
-//     }
-
-//     pub(crate) fn dest_path(&self) -> &'a Path {
-//         self.dest_path
-//     }
-
-//     pub(crate) fn writer(&mut self) -> &mut BufWriter<File> {
-//         &mut self.writer
-//     }
-
-//     pub(crate) async fn done(mut self) -> Result<()> {
-//         if let Some(final_dir_path) = self.dest_path().parent() {
-//             fs::create_dir_all(&final_dir_path).await?;
-//         }
-
-//         fs::rename(&self.tmp_path, self.dest_path()).await?;
-//         self.clean_tmp = false;
-//         Ok(())
-//     }
-// }
-
-// impl<'a> Drop for FileWriter<'a> {
-//     fn drop(&mut self) {
-//         if self.clean_tmp {
-//             let _ = std::fs::remove_file(&self.tmp_path);
-//         }
-//     }
-// }
 
 #[cfg(test)]
 mod test {
