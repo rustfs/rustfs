@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-use anyhow::Error;
 use anyhow::Result;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -7,7 +6,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use s3s::StdError;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
+// use tracing::debug;
 use uuid::Uuid;
 
 use crate::chunk_stream::ChunkedStream;

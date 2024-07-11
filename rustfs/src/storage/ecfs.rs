@@ -302,12 +302,14 @@ impl S3 for FS {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let CompleteMultipartUploadInput {
-            // multipart_upload,
+            multipart_upload,
             bucket,
             key,
-            // upload_id,
+            upload_id,
             ..
         } = req.input;
+
+        // mc cp step 5
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
