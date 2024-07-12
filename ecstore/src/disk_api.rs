@@ -13,6 +13,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn is_local(&self) -> bool;
     fn id(&self) -> Uuid;
 
+    async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
@@ -37,13 +38,20 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         org_volume: &str,
         volume: &str,
         path: &str,
-        version_id: Uuid,
+        version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DeleteOptions {
+    pub recursive: bool,
+    pub immediate: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReadMultipleReq {
     pub bucket: String,
     pub prefix: String,
@@ -54,6 +62,7 @@ pub struct ReadMultipleReq {
     pub max_results: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct ReadMultipleResp {
     pub bucket: String,
     pub prefix: String,

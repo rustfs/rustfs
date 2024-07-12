@@ -2,6 +2,7 @@ use std::fmt::Debug;
 
 use ecstore::disk_api::DiskError;
 use ecstore::store_api::BucketOptions;
+use ecstore::store_api::CompletePart;
 use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::MultipartUploadResult;
 use ecstore::store_api::ObjectOptions;
@@ -310,6 +311,22 @@ impl S3 for FS {
         } = req.input;
 
         // mc cp step 5
+
+        let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
+
+        let opts = &ObjectOptions::default();
+
+        let mut uploaded_parts = Vec::new();
+
+        for part in multipart_upload.parts.into_iter().flatten() {
+            uploaded_parts.push(CompletePart::from(part));
+        }
+
+        try_!(
+            self.store
+                .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
+                .await
+        );
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),

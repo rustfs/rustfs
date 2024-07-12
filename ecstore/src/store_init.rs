@@ -275,4 +275,7 @@ pub enum ErasureError {
 
     #[error("first disk wiat")]
     FirstDiskWait,
+
+    #[error("invalid part id {0}")]
+    InvalidPart(usize),
 }

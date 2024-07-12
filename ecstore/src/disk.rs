@@ -11,11 +11,11 @@ use path_absolutize::Absolutize;
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::ErrorKind;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    disk_api::{DiskAPI, DiskError, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, VolumeInfo},
+    disk_api::{DeleteOptions, DiskAPI, DiskError, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, VolumeInfo},
     endpoint::{Endpoint, Endpoints},
     file_meta::FileMeta,
     format::FormatV3,
@@ -196,7 +196,7 @@ impl LocalDisk {
         Ok(())
     }
 
-    pub async fn delete_file(&self, base_path: &PathBuf, delete_path: &PathBuf) -> Result<()> {
+    pub async fn delete_file(&self, base_path: &PathBuf, delete_path: &PathBuf, recursive: bool, _immediate: bool) -> Result<()> {
         if is_root_path(base_path) || is_root_path(delete_path) {
             return Ok(());
         }
@@ -205,10 +205,24 @@ impl LocalDisk {
             return Ok(());
         }
 
+        if recursive {
+            let trash_path = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+            fs::create_dir_all(&trash_path).await?;
+            fs::rename(&delete_path, &trash_path).await?;
+
+            // TODO: immediate
+
+            return Ok(());
+        }
+
         if delete_path.is_dir() {
             fs::remove_dir(delete_path).await?;
         } else {
             fs::remove_file(delete_path).await?;
+        }
+
+        if let Some(dir_path) = delete_path.parent() {
+            Box::pin(self.delete_file(base_path, &PathBuf::from(dir_path), false, false)).await?;
         }
 
         Ok(())
@@ -363,6 +377,31 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
+    async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
+        let vol_path = self.get_bucket_path(&volume)?;
+        if !skip_access_checks(&volume) {
+            check_volume_exists(&vol_path).await?;
+        }
+
+        let fpath = self.get_object_path(&volume, &path)?;
+
+        self.delete_file(&vol_path, &fpath, opt.recursive, opt.immediate).await?;
+
+        // if opt.recursive {
+        //     let trash_path = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+        //     fs::create_dir_all(&trash_path).await?;
+        //     fs::rename(&fpath, &trash_path).await?;
+
+        //     // TODO: immediate
+
+        //     return Ok(());
+        // }
+
+        // fs::remove_file(fpath).await?;
+
+        Ok(())
+    }
+
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         if !skip_access_checks(&src_volume) {
             let vol_path = self.get_bucket_path(&src_volume)?;
@@ -426,8 +465,6 @@ impl DiskAPI for LocalDisk {
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         let p = self.get_object_path(&volume, &path)?;
-
-        debug!("append_file start {} {:?}", self.id(), &p);
 
         if let Some(dir_path) = p.parent() {
             fs::create_dir_all(&dir_path).await?;
@@ -524,7 +561,7 @@ impl DiskAPI for LocalDisk {
         if src_volume != RUSTFS_META_MULTIPART_BUCKET {
             fs::remove_dir(&src_file_path.parent().unwrap()).await?;
         } else {
-            self.delete_file(&src_volume_path, &PathBuf::from(src_file_path.parent().unwrap()))
+            self.delete_file(&src_volume_path, &PathBuf::from(src_file_path.parent().unwrap()), true, false)
                 .await?;
         }
 
@@ -600,7 +637,7 @@ impl DiskAPI for LocalDisk {
         _org_volume: &str,
         volume: &str,
         path: &str,
-        version_id: Uuid,
+        version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
         let file_path = self.get_object_path(volume, path)?;
@@ -628,10 +665,16 @@ impl DiskAPI for LocalDisk {
         let mut found = 0;
 
         for v in req.files.iter() {
-            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", req.prefix, v).as_str())?;
-            let mut res = ReadMultipleResp::default();
+            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", &req.prefix, v).as_str())?;
+            let mut res = ReadMultipleResp {
+                bucket: req.bucket.clone(),
+                prefix: req.prefix.clone(),
+                file: v.clone(),
+                ..Default::default()
+            };
+
             // if req.metadata_only {}
-            match read_file_all(fpath).await {
+            match read_file_all(&fpath).await {
                 Ok((data, meta)) => {
                     found += 1;
 
