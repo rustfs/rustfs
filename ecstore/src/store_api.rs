@@ -23,6 +23,7 @@ pub struct FileInfo {
     pub data: Option<Vec<u8>>,
     pub fresh: bool, // indicates this is a first time call to write FileInfo.
     pub parts: Vec<ObjectPartInfo>,
+    pub is_latest: bool,
 }
 
 impl FileInfo {
@@ -50,6 +51,46 @@ impl FileInfo {
 
         Ok(buf)
     }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: FileInfo = rmp_serde::from_slice(&buf)?;
+        Ok(t)
+    }
+
+    pub fn add_object_part(&mut self, num: usize, part_size: usize, mod_time: OffsetDateTime) {
+        let part = ObjectPartInfo {
+            number: num,
+            size: part_size,
+            mod_time,
+        };
+
+        for p in self.parts.iter_mut() {
+            if p.number == num {
+                *p = part;
+                return;
+            }
+        }
+
+        self.parts.push(part);
+
+        self.parts.sort_by(|a, b| a.number.cmp(&b.number));
+    }
+
+    pub fn into_object_info(&self, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+        ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            is_dir: object.starts_with("/"),
+            parity_blocks: self.erasure.parity_blocks,
+            data_blocks: self.erasure.data_blocks,
+            version_id: self.version_id,
+            deleted: self.deleted,
+            mod_time: self.mod_time,
+            size: self.size,
+            parts: self.parts.clone(),
+            is_latest: self.is_latest,
+        }
+    }
 }
 
 impl Default for FileInfo {
@@ -66,6 +107,7 @@ impl Default for FileInfo {
             name: Default::default(),
             volume: Default::default(),
             parts: Default::default(),
+            is_latest: Default::default(),
         }
     }
 }
@@ -194,10 +236,20 @@ impl PutObjReader {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
+    pub mod_time: OffsetDateTime,
+}
+
+impl Default for ObjectOptions {
+    fn default() -> Self {
+        Self {
+            max_parity: Default::default(),
+            mod_time: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
 }
 
 pub struct BucketOptions {}
@@ -218,9 +270,31 @@ pub struct PartInfo {
     pub size: usize,
 }
 
-pub struct CompletePart {}
+pub struct CompletePart {
+    pub part_num: usize,
+}
 
-pub struct ObjectInfo {}
+impl From<s3s::dto::CompletedPart> for CompletePart {
+    fn from(value: s3s::dto::CompletedPart) -> Self {
+        Self {
+            part_num: value.part_number.unwrap_or_default() as usize,
+        }
+    }
+}
+
+pub struct ObjectInfo {
+    pub bucket: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub parity_blocks: usize,
+    pub data_blocks: usize,
+    pub version_id: Uuid,
+    pub deleted: bool,
+    pub mod_time: OffsetDateTime,
+    pub size: usize,
+    pub parts: Vec<ObjectPartInfo>,
+    pub is_latest: bool,
+}
 
 #[async_trait::async_trait]
 pub trait StorageAPI {
