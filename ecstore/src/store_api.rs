@@ -282,6 +282,7 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
     }
 }
 
+#[derive(Debug)]
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
@@ -300,7 +301,7 @@ pub struct ObjectInfo {
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
-
+    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()>;
     async fn put_object_part(
         &self,

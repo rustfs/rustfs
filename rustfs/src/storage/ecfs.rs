@@ -18,6 +18,8 @@ use s3s::{S3Request, S3Response};
 
 use anyhow::Result;
 use ecstore::store::ECStore;
+use tracing::debug;
+use tracing::info;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -95,6 +97,7 @@ impl S3 for FS {
 
     #[tracing::instrument]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        // mc get  1
         let input = req.input;
 
         if let Err(e) = self.store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
@@ -146,7 +149,27 @@ impl S3 for FS {
 
     #[tracing::instrument]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
-        let _input = req.input;
+        // mc get 2
+        let HeadObjectInput {
+            bucket,
+            checksum_mode,
+            expected_bucket_owner,
+            if_match,
+            if_modified_since,
+            if_none_match,
+            if_unmodified_since,
+            key,
+            part_number,
+            range,
+            request_payer,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
+            version_id,
+        } = &req.input;
+
+        let info = try_!(self.store.get_object_info(bucket, key, &ObjectOptions::default()).await);
+        debug!("info {:?}", info);
 
         let output = HeadObjectOutput { ..Default::default() };
         Ok(S3Response::new(output))
