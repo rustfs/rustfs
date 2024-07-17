@@ -15,7 +15,9 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    disk_api::{DeleteOptions, DiskAPI, DiskError, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, VolumeInfo},
+    disk_api::{
+        DeleteOptions, DiskAPI, DiskError, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, VolumeInfo,
+    },
     endpoint::{Endpoint, Endpoints},
     file_meta::FileMeta,
     format::FormatV3,
@@ -197,6 +199,8 @@ impl LocalDisk {
     }
 
     pub async fn delete_file(&self, base_path: &PathBuf, delete_path: &PathBuf, recursive: bool, _immediate: bool) -> Result<()> {
+        debug!("delete_file {:?}", &delete_path);
+
         if is_root_path(base_path) || is_root_path(delete_path) {
             return Ok(());
         }
@@ -403,9 +407,9 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        let src_volume_path = self.get_bucket_path(&src_volume)?;
         if !skip_access_checks(&src_volume) {
-            let vol_path = self.get_bucket_path(&src_volume)?;
-            check_volume_exists(&vol_path).await?;
+            check_volume_exists(&src_volume_path).await?;
         }
         if !skip_access_checks(&dst_volume) {
             let vol_path = self.get_bucket_path(&dst_volume)?;
@@ -440,6 +444,12 @@ impl DiskAPI for LocalDisk {
 
             break;
         }
+
+        if let Some(dir_path) = srcp.parent() {
+            self.delete_file(&src_volume_path, &PathBuf::from(dir_path), false, false)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -492,7 +502,14 @@ impl DiskAPI for LocalDisk {
         // Ok(())
     }
 
-    async fn rename_data(&self, src_volume: &str, src_path: &str, fi: &FileInfo, dst_volume: &str, dst_path: &str) -> Result<()> {
+    async fn rename_data(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
         let src_volume_path = self.get_bucket_path(&src_volume)?;
         if !skip_access_checks(&src_volume) {
             check_volume_exists(&src_volume_path).await?;
@@ -565,7 +582,9 @@ impl DiskAPI for LocalDisk {
                 .await?;
         }
 
-        Ok(())
+        Ok(RenameDataResp {
+            old_data_dir: fi.data_dir.to_string(),
+        })
     }
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {

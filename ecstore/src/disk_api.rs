@@ -26,7 +26,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         file_info: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
-    ) -> Result<()>;
+    ) -> Result<RenameDataResp>;
 
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn make_volume(&self, volume: &str) -> Result<()>;
@@ -43,6 +43,10 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
+}
+
+pub struct RenameDataResp {
+    pub old_data_dir: String,
 }
 
 #[derive(Debug, Clone, Default)]
