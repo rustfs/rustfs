@@ -1,5 +1,3 @@
-use std::fmt::Debug;
-
 use ecstore::disk_api::DiskError;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
@@ -8,6 +6,7 @@ use ecstore::store_api::MultipartUploadResult;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
+use http::header::HeaderValue;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -15,6 +14,7 @@ use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
+use std::fmt::Debug;
 
 use anyhow::Result;
 use ecstore::store::ECStore;
@@ -123,6 +123,7 @@ impl S3 for FS {
 
     #[tracing::instrument]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        // mc get 3
         let input = req.input;
 
         println!("get_object: {:?}", &input);
@@ -166,12 +167,24 @@ impl S3 for FS {
             sse_customer_key,
             sse_customer_key_md5,
             version_id,
-        } = &req.input;
+        } = req.input;
 
-        let info = try_!(self.store.get_object_info(bucket, key, &ObjectOptions::default()).await);
+        let info = try_!(self.store.get_object_info(&bucket, &key, &ObjectOptions::default()).await);
         debug!("info {:?}", info);
 
-        let output = HeadObjectOutput { ..Default::default() };
+        let content_type = {
+            let m = HeaderValue::from_static("hello");
+
+            ContentType::try_from_header_value(m)?
+        };
+
+        let output = HeadObjectOutput {
+            content_length: Some(try_!(i64::try_from(info.size))),
+            content_type: Some(content_type),
+            last_modified: Some(info.mod_time.into()),
+            // metadata: object_metadata,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
@@ -219,7 +232,7 @@ impl S3 for FS {
             body,
             bucket,
             key,
-            // metadata,
+            metadata,
             content_length,
             ..
         } = input;
@@ -243,9 +256,13 @@ impl S3 for FS {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let CreateMultipartUploadInput { bucket, key, .. } = req.input;
+        let CreateMultipartUploadInput {
+            bucket, key, metadata, ..
+        } = req.input;
 
         // mc cp step 3
+
+        debug!("create_multipart_upload meta {:?}", &metadata);
 
         let MultipartUploadResult { upload_id, .. } = try_!(
             self.store

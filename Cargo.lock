@@ -1091,6 +1091,7 @@ dependencies = [
  "async-trait",
  "clap",
  "ecstore",
+ "http",
  "hyper-util",
  "s3s",
  "time",
