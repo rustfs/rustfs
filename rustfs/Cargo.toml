@@ -22,3 +22,4 @@ clap = { version = "4.5.7", features = ["derive"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 hyper-util = { version = "0.1.5", features = ["tokio", "server-auto", "server-graceful"] }
 http.workspace = true
+mime = "0.3.17"

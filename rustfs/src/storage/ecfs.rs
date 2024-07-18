@@ -6,7 +6,6 @@ use ecstore::store_api::MultipartUploadResult;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
-use http::header::HeaderValue;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -15,6 +14,7 @@ use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
+use std::str::FromStr;
 
 use anyhow::Result;
 use ecstore::store::ECStore;
@@ -172,11 +172,7 @@ impl S3 for FS {
         let info = try_!(self.store.get_object_info(&bucket, &key, &ObjectOptions::default()).await);
         debug!("info {:?}", info);
 
-        let content_type = {
-            let m = HeaderValue::from_static("hello");
-
-            ContentType::try_from_header_value(m)?
-        };
+        let content_type = try_!(ContentType::from_str("application/x-msdownload"));
 
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(info.size))),
