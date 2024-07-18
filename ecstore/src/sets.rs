@@ -1,4 +1,5 @@
 use anyhow::Result;
+use http::HeaderMap;
 use uuid::Uuid;
 
 use crate::{
@@ -7,8 +8,8 @@ use crate::{
     format::{DistributionAlgoVersion, FormatV3},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, FileInfo, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions,
-        PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, FileInfo, GetObjectReader, HTTPRangeSpec, MakeBucketOptions,
+        MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -131,6 +132,18 @@ impl StorageAPI for Sets {
 
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
+    }
+    async fn get_Object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: HTTPRangeSpec,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectReader> {
+        self.get_disks_by_key(object)
+            .get_Object_reader(bucket, object, range, h, opts)
+            .await
     }
     async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()> {
         self.get_disks_by_key(object).put_object(bucket, object, data, opts).await

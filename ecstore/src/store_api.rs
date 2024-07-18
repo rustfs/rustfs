@@ -1,4 +1,5 @@
 use anyhow::Result;
+use http::HeaderMap;
 use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
 use serde::{Deserialize, Serialize};
@@ -236,6 +237,13 @@ impl PutObjReader {
     }
 }
 
+pub struct GetObjectReader {
+    pub stream: StreamingBlob,
+    pub object_info: ObjectInfo,
+}
+
+pub struct HTTPRangeSpec {}
+
 #[derive(Debug)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -302,6 +310,14 @@ pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+    async fn get_Object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: HTTPRangeSpec,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectReader>;
     async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()>;
     async fn put_object_part(
         &self,

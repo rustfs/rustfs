@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Error, Result};
 
+use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
 use uuid::Uuid;
 
@@ -14,8 +15,8 @@ use crate::{
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo,
-        PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, MakeBucketOptions, MultipartUploadResult,
+        ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
     store_init, utils,
 };
@@ -156,6 +157,22 @@ impl StorageAPI for ECStore {
 
         if self.single_pool() {
             return self.pools[0].get_object_info(bucket, object.as_str(), opts).await;
+        }
+
+        unimplemented!()
+    }
+    async fn get_Object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: HTTPRangeSpec,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectReader> {
+        let object = utils::path::encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].get_Object_reader(bucket, object.as_str(), range, h, opts).await;
         }
 
         unimplemented!()
