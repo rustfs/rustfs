@@ -161,7 +161,7 @@ impl StorageAPI for ECStore {
 
         unimplemented!()
     }
-    async fn get_Object_reader(
+    async fn get_object_reader(
         &self,
         bucket: &str,
         object: &str,
@@ -172,7 +172,7 @@ impl StorageAPI for ECStore {
         let object = utils::path::encode_dir_object(object);
 
         if self.single_pool() {
-            return self.pools[0].get_Object_reader(bucket, object.as_str(), range, h, opts).await;
+            return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, opts).await;
         }
 
         unimplemented!()

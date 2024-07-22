@@ -92,6 +92,24 @@ impl FileInfo {
             is_latest: self.is_latest,
         }
     }
+    // to_part_offset 取offset 所在的part index, 返回part index, offset
+    pub fn to_part_offset(&self, offset: i64) -> Result<(usize, i64)> {
+        if offset == 0 {
+            return Ok((0, 0));
+        }
+
+        let mut part_offset = offset;
+        for (i, part) in self.parts.iter().enumerate() {
+            let part_index = i;
+            if part_offset < part.size as i64 {
+                return Ok((part_index, part_offset));
+            }
+
+            part_offset -= part.size as i64
+        }
+
+        Err(Error::msg("part not found"))
+    }
 }
 
 impl Default for FileInfo {
@@ -342,6 +360,7 @@ pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
     pub mod_time: OffsetDateTime,
+    pub part_number: usize,
 }
 
 impl Default for ObjectOptions {
@@ -349,6 +368,7 @@ impl Default for ObjectOptions {
         Self {
             max_parity: Default::default(),
             mod_time: OffsetDateTime::UNIX_EPOCH,
+            part_number: Default::default(),
         }
     }
 }
@@ -403,7 +423,7 @@ pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
-    async fn get_Object_reader(
+    async fn get_object_reader(
         &self,
         bucket: &str,
         object: &str,
