@@ -133,7 +133,7 @@ impl StorageAPI for Sets {
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
     }
-    async fn get_Object_reader(
+    async fn get_object_reader(
         &self,
         bucket: &str,
         object: &str,
@@ -142,7 +142,7 @@ impl StorageAPI for Sets {
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
         self.get_disks_by_key(object)
-            .get_Object_reader(bucket, object, range, h, opts)
+            .get_object_reader(bucket, object, range, h, opts)
             .await
     }
     async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()> {
