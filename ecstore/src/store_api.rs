@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Error, Result};
 use http::HeaderMap;
 use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
@@ -242,7 +242,100 @@ pub struct GetObjectReader {
     pub object_info: ObjectInfo,
 }
 
-pub struct HTTPRangeSpec {}
+impl GetObjectReader {
+    pub fn new(stream: StreamingBlob, object_info: ObjectInfo) -> Self {
+        GetObjectReader { stream, object_info }
+    }
+}
+
+pub struct HTTPRangeSpec {
+    pub is_shuffix_length: bool,
+    pub start: i64,
+    pub end: i64,
+}
+
+impl HTTPRangeSpec {
+    pub fn nil() -> Self {
+        Self {
+            is_shuffix_length: false,
+            start: -1,
+            end: -1,
+        }
+    }
+
+    pub fn is_nil(&self) -> bool {
+        self.start == -1 && self.end == -1
+    }
+    pub fn from_object_info(oi: &ObjectInfo, part_number: usize) -> Self {
+        let mut l = oi.parts.len();
+        if part_number < l {
+            l = part_number;
+        }
+
+        let mut start = 0;
+        let mut end = -1;
+        for i in 0..l {
+            start = end + 1;
+            end = start + oi.parts[i].size as i64 - 1
+        }
+
+        HTTPRangeSpec {
+            is_shuffix_length: false,
+            start: start,
+            end: end,
+        }
+    }
+
+    pub fn get_offset_length(&self, res_size: i64) -> Result<(i64, i64)> {
+        if self.start == 0 && self.end == 0 {
+            return Ok((0, res_size));
+        }
+
+        let len = self.get_length(res_size)?;
+        let mut start = self.start;
+        if self.is_shuffix_length {
+            start = self.start + res_size
+        }
+        Ok((start, len))
+    }
+    pub fn get_length(&self, res_size: i64) -> Result<i64> {
+        if self.is_nil() {
+            return Ok(res_size);
+        }
+
+        if self.is_shuffix_length {
+            let specified_len = -self.start; // 假设 h.start 是一个 i64 类型
+            let mut range_length = specified_len;
+
+            if specified_len > res_size {
+                range_length = res_size;
+            }
+
+            return Ok(range_length);
+        }
+
+        if self.start > res_size {
+            return Err(Error::msg("The requested range is not satisfiable"));
+        }
+
+        if self.end > -1 {
+            let mut end = self.end;
+            if res_size <= end {
+                end = res_size - 1;
+            }
+
+            let range_length = end - self.start - 1;
+            return Ok(range_length);
+        }
+
+        if self.end == -1 {
+            let range_length = res_size - self.start;
+            return Ok(range_length);
+        }
+
+        Err(Error::msg("range value invaild"))
+    }
+}
 
 #[derive(Debug)]
 pub struct ObjectOptions {
