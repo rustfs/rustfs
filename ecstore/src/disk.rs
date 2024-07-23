@@ -1,5 +1,6 @@
 use std::{
     fs::Metadata,
+    io::SeekFrom,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -9,8 +10,11 @@ use bytes::Bytes;
 use futures::future::join_all;
 use path_absolutize::Absolutize;
 use time::OffsetDateTime;
-use tokio::fs::{self, File};
-use tokio::io::ErrorKind;
+use tokio::io::{AsyncReadExt, ErrorKind};
+use tokio::{
+    fs::{self, File},
+    io::AsyncSeekExt,
+};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -501,7 +505,20 @@ impl DiskAPI for LocalDisk {
 
         // Ok(())
     }
+    async fn read_file(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
+        let p = self.get_object_path(&volume, &path)?;
+        let mut file = File::options().read(true).open(&p).await?;
 
+        file.seek(SeekFrom::Start(offset as u64)).await?;
+
+        let mut buffer = vec![0; length];
+
+        let bytes_read = file.read(&mut buffer).await?;
+
+        buffer.truncate(bytes_read);
+
+        Ok((buffer, bytes_read))
+    }
     async fn rename_data(
         &self,
         src_volume: &str,
