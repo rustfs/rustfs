@@ -19,6 +19,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
+    async fn read_file(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<(Vec<u8>, usize)>;
     async fn rename_data(
         &self,
         src_volume: &str,

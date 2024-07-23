@@ -15,14 +15,16 @@ pub struct Erasure {
     // data_shards: usize,
     // parity_shards: usize,
     encoder: ReedSolomon,
+    block_size: usize,
     id: Uuid,
 }
 
 impl Erasure {
-    pub fn new(data_shards: usize, parity_shards: usize) -> Self {
+    pub fn new(data_shards: usize, parity_shards: usize, block_size: usize) -> Self {
         Erasure {
             // data_shards,
             // parity_shards,
+            block_size,
             encoder: ReedSolomon::new(data_shards, parity_shards).unwrap(),
             id: Uuid::new_v4(),
         }
@@ -32,7 +34,7 @@ impl Erasure {
         &self,
         body: S,
         writers: &mut Vec<W>,
-        block_size: usize,
+        // block_size: usize,
         data_size: usize,
         _write_quorum: usize,
     ) -> Result<usize>
@@ -40,7 +42,7 @@ impl Erasure {
         S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
         W: AsyncWrite + Unpin,
     {
-        let mut stream = ChunkedStream::new(body, data_size, block_size, true);
+        let mut stream = ChunkedStream::new(body, data_size, self.block_size, true);
         let mut total: usize = 0;
         let mut idx = 0;
         while let Some(result) = stream.next().await {
@@ -93,6 +95,14 @@ impl Erasure {
         // }
     }
 
+    pub async fn decode<R, W>(&self, writer: W, readers: Vec<R>, offset: usize, length: usize, total_length: usize) -> Result<()>
+    where
+        R: ReadAt,
+        W: AsyncWrite + Unpin,
+    {
+        unimplemented!()
+    }
+
     pub fn encode_data(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
         let (shard_size, total_size) = self.need_size(data.len());
 
@@ -137,6 +147,20 @@ impl Erasure {
     }
 }
 
+pub trait ReadAt {
+    async fn read_at(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<(Vec<u8>, usize)>;
+}
+
+pub struct ShardReader<R> {
+    readers: Vec<R>,
+}
+
+impl<R: ReadAt> ShardReader<R> {
+    pub fn new(readers: Vec<R>, offset: usize, total_length: usize) -> Self {
+        Self { readers }
+    }
+}
+
 // fn shards_to_option_shards<T: Clone>(shards: &[Vec<T>]) -> Vec<Option<Vec<T>>> {
 //     let mut result = Vec::with_capacity(shards.len());
 
@@ -157,7 +181,7 @@ mod test {
         let data_shards = 3;
         let parity_shards = 2;
         let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-        let ec = Erasure::new(data_shards, parity_shards);
+        let ec = Erasure::new(data_shards, parity_shards, 1);
         let shards = ec.encode_data(data).unwrap();
         println!("shards:{:?}", shards);
 
