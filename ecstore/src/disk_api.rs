@@ -1,12 +1,18 @@
-use std::{fmt::Debug, pin::Pin};
+use std::{fmt::Debug, io::SeekFrom, pin::Pin};
 
 use anyhow::{Error, Result};
 use bytes::Bytes;
 use time::OffsetDateTime;
-use tokio::io::AsyncWrite;
+use tokio::{
+    fs::File,
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite},
+};
 use uuid::Uuid;
 
-use crate::store_api::{FileInfo, RawFileInfo};
+use crate::{
+    erasure::ReadAt,
+    store_api::{FileInfo, RawFileInfo},
+};
 
 #[async_trait::async_trait]
 pub trait DiskAPI: Debug + Send + Sync + 'static {
@@ -19,7 +25,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
-    async fn read_file(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<(Vec<u8>, usize)>;
+    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -136,6 +142,30 @@ impl FileWriter {
         W: AsyncWrite + Send + Sync + 'static,
     {
         Self { inner: Box::pin(inner) }
+    }
+}
+
+pub struct FileReader {
+    pub inner: File,
+}
+
+impl FileReader {
+    pub fn new(inner: File) -> Self {
+        Self { inner }
+    }
+}
+
+impl ReadAt for FileReader {
+    async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
+        self.inner.seek(SeekFrom::Start(offset as u64)).await?;
+
+        let mut buffer = vec![0; length];
+
+        let bytes_read = self.inner.read(&mut buffer).await?;
+
+        buffer.truncate(bytes_read);
+
+        Ok((buffer, bytes_read))
     }
 }
 

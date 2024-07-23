@@ -20,9 +20,11 @@ use uuid::Uuid;
 
 use crate::{
     disk_api::{
-        DeleteOptions, DiskAPI, DiskError, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, VolumeInfo,
+        DeleteOptions, DiskAPI, DiskError, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+        RenameDataResp, VolumeInfo,
     },
     endpoint::{Endpoint, Endpoints},
+    erasure::ReadAt,
     file_meta::FileMeta,
     format::FormatV3,
     store_api::{FileInfo, RawFileInfo},
@@ -505,19 +507,21 @@ impl DiskAPI for LocalDisk {
 
         // Ok(())
     }
-    async fn read_file(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
+    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         let p = self.get_object_path(&volume, &path)?;
-        let mut file = File::options().read(true).open(&p).await?;
+        let file = File::options().read(true).open(&p).await?;
 
-        file.seek(SeekFrom::Start(offset as u64)).await?;
+        Ok(FileReader::new(file))
 
-        let mut buffer = vec![0; length];
+        // file.seek(SeekFrom::Start(offset as u64)).await?;
 
-        let bytes_read = file.read(&mut buffer).await?;
+        // let mut buffer = vec![0; length];
 
-        buffer.truncate(bytes_read);
+        // let bytes_read = file.read(&mut buffer).await?;
 
-        Ok((buffer, bytes_read))
+        // buffer.truncate(bytes_read);
+
+        // Ok((buffer, bytes_read))
     }
     async fn rename_data(
         &self,
