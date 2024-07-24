@@ -1,11 +1,16 @@
+use bytes::Bytes;
 use ecstore::disk_api::DiskError;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
+use ecstore::store_api::HTTPRangeSpec;
 use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::MultipartUploadResult;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
+use futures::pin_mut;
+use futures::{Stream, StreamExt};
+use http::HeaderMap;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -15,11 +20,12 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use time::OffsetDateTime;
+use transform_stream::AsyncTryStream;
 
 use anyhow::Result;
 use ecstore::store::ECStore;
 use tracing::debug;
-use tracing::info;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -43,10 +49,13 @@ impl FS {
         Ok(Self { store })
     }
 }
-
 #[async_trait::async_trait]
 impl S3 for FS {
-    #[tracing::instrument]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, req),
+        fields(start_time=?time::OffsetDateTime::now_utc())
+    )]
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let input = req.input;
 
@@ -60,7 +69,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let input = req.input;
         let (_bucket, _key) = match input.copy_source {
@@ -72,14 +81,14 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let _input = req.input;
 
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let _input = req.input;
 
@@ -87,7 +96,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let _input = req.input;
 
@@ -95,7 +104,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
         // mc get  1
         let input = req.input;
@@ -121,18 +130,44 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, req),
+        fields(start_time=?time::OffsetDateTime::now_utc())
+    )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         // mc get 3
-        let input = req.input;
 
-        println!("get_object: {:?}", &input);
+        let GetObjectInput { bucket, key, .. } = req.input;
 
-        let output = GetObjectOutput { ..Default::default() };
+        let range = HTTPRangeSpec::nil();
+
+        let h = HeaderMap::new();
+        let opts = &ObjectOptions {
+            max_parity: false,
+            mod_time: OffsetDateTime::UNIX_EPOCH,
+            part_number: 0,
+        };
+
+        let reader = try_!(
+            self.store
+                .get_object_reader(bucket.as_str(), key.as_str(), range, h, opts)
+                .await
+        );
+
+        // let body = bytes_stream(reader.stream, 100);
+
+        let output = GetObjectOutput {
+            body: Some(reader.stream),
+            content_length: Some(reader.object_info.size as i64),
+            ..Default::default()
+        };
+
+        debug!("get_object response {:?}", output);
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
 
@@ -148,7 +183,7 @@ impl S3 for FS {
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         // mc get 2
         let HeadObjectInput {
@@ -184,13 +219,13 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn list_buckets(&self, _: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         let output = ListBucketsOutput { ..Default::default() };
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
@@ -205,7 +240,7 @@ impl S3 for FS {
         }))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         let _input = req.input;
 
@@ -213,7 +248,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let input = req.input;
 
@@ -247,7 +282,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn create_multipart_upload(
         &self,
         req: S3Request<CreateMultipartUploadInput>,
@@ -276,7 +311,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         let UploadPartInput {
             body,
@@ -309,7 +344,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let _input = req.input;
 
@@ -318,7 +353,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
         let ListPartsInput {
             bucket, key, upload_id, ..
@@ -333,7 +368,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -372,11 +407,31 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn abort_multipart_upload(
         &self,
         _req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
     }
+}
+
+pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    AsyncTryStream::<Bytes, E, _>::new(|mut y| async move {
+        pin_mut!(stream);
+        let mut remaining: usize = content_length;
+        while let Some(result) = stream.next().await {
+            let mut bytes = result?;
+            if bytes.len() > remaining {
+                bytes.truncate(remaining);
+            }
+            remaining -= bytes.len();
+            y.yield_ok(bytes).await;
+        }
+        Ok(())
+    })
 }

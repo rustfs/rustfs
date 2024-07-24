@@ -1091,8 +1091,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "clap",
  "ecstore",
+ "futures",
  "http",
  "hyper-util",
  "mime",
@@ -1101,6 +1103,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "transform-stream",
 ]
 
 [[package]]

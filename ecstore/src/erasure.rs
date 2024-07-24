@@ -9,6 +9,9 @@ use s3s::dto::StreamingBlob;
 use s3s::StdError;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tokio::io::DuplexStream;
+use tracing::debug;
+use tracing::warn;
 // use tracing::debug;
 use uuid::Uuid;
 
@@ -49,14 +52,16 @@ impl Erasure {
     {
         let mut stream = ChunkedStream::new(body, total_size, self.block_size, true);
         let mut total: usize = 0;
-        // let mut idx = 0;
+        let mut idx = 0;
         while let Some(result) = stream.next().await {
             match result {
                 Ok(data) => {
                     let blocks = self.encode_data(data.as_ref())?;
 
+                    warn!("encode shard size: {}/{} from block_size {} ", blocks[0].len(), blocks.len(), data.len());
+
                     let mut errs = Vec::new();
-                    // idx += 1;
+                    idx += 1;
                     for (i, w) in writers.iter_mut().enumerate() {
                         total += blocks[i].len();
 
@@ -88,7 +93,7 @@ impl Erasure {
             }
         }
 
-        // debug!("{} encode_data done  {}", self.id, total);
+        warn!(" encode_data done shard block num {}", idx);
 
         Ok(total)
 
@@ -102,7 +107,7 @@ impl Erasure {
 
     pub async fn decode(
         &self,
-        writer: &StreamingBlob,
+        writer: &mut DuplexStream,
         readers: Vec<Option<FileReader>>,
         offset: usize,
         length: usize,
@@ -117,6 +122,9 @@ impl Erasure {
         let start_block = offset / self.block_size;
         let end_block = (offset + length) / self.block_size;
 
+        warn!("decode block from {} to {}", start_block, end_block);
+
+        let mut bytes_writed = 0;
         for block_idx in start_block..=end_block {
             let mut block_offset = 0;
             let mut block_length = 0;
@@ -138,15 +146,77 @@ impl Erasure {
                 break;
             }
 
+            warn!("decode block_offset {},block_length {} ", block_offset, block_length);
+
             let mut bufs = reader.read().await?;
 
             self.decode_data(&mut bufs)?;
+
+            let writed_n = self
+                .write_data_blocks(writer, bufs, self.data_shards, block_offset, block_length)
+                .await?;
+
+            bytes_writed += writed_n;
         }
-        unimplemented!()
+
+        if bytes_writed != length {
+            warn!("bytes_writed != length ");
+            return Err(Error::msg("erasure decode less data"));
+        }
+
+        Ok(bytes_writed)
     }
 
-    fn write_data_blocks() -> Result<()> {
-        unimplemented!()
+    async fn write_data_blocks(
+        &self,
+        writer: &mut DuplexStream,
+        bufs: Vec<Option<Vec<u8>>>,
+        data_blocks: usize,
+        offset: usize,
+        length: usize,
+    ) -> Result<usize> {
+        if bufs.len() < data_blocks {
+            return Err(Error::msg("read bufs not match data_blocks"));
+        }
+
+        let data_len: usize = bufs
+            .iter()
+            .take(data_blocks)
+            .filter(|v| v.is_some())
+            .map(|v| v.as_ref().unwrap().len())
+            .sum();
+        if data_len < length {
+            return Err(Error::msg(format!("write_data_blocks data_len < length {} < {}", data_len, length)));
+        }
+
+        let mut offset = offset;
+
+        debug!("write_data_blocks offset {}, length {}", offset, length);
+
+        let mut write = length;
+        let mut total_writed = 0;
+
+        for opt_buf in bufs.iter().take(data_blocks) {
+            let buf = opt_buf.as_ref().unwrap();
+
+            if offset >= buf.len() {
+                offset -= buf.len();
+                continue;
+            }
+
+            let buf = &buf[offset..];
+
+            offset = 0;
+
+            // if write < buf.len() {}
+
+            let n = writer.write(buf).await?;
+
+            write -= n;
+            total_writed += n;
+        }
+
+        Ok(total_writed)
     }
 
     pub fn encode_data(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -239,6 +309,8 @@ impl ShardReader {
     pub async fn read(&mut self) -> Result<Vec<Option<Vec<u8>>>> {
         // let mut disks = self.readers;
 
+        warn!("shard reader read offset {}, shard_size {}", self.offset, self.shard_size);
+
         let reader_length = self.readers.len();
 
         let mut futures = Vec::with_capacity(reader_length);
@@ -270,6 +342,9 @@ impl ShardReader {
                 }
             }
         }
+
+        // debug!("ec decode read ress {:?}", &ress);
+        debug!("ec decode read errors {:?}", &errors);
 
         if !self.can_decode(&ress) {
             return Err(Error::msg("shard reader read faild"));

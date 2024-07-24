@@ -509,6 +509,8 @@ impl DiskAPI for LocalDisk {
     }
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         let p = self.get_object_path(&volume, &path)?;
+
+        debug!("read_file {:?}", &p);
         let file = File::options().read(true).open(&p).await?;
 
         Ok(FileReader::new(file))
