@@ -10,7 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-tracing.workspace = true 
+tracing.workspace = true
 anyhow.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
@@ -23,3 +23,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 hyper-util = { version = "0.1.5", features = ["tokio", "server-auto", "server-graceful"] }
 http.workspace = true
 mime = "0.3.17"
+bytes.workspace = true
+transform-stream = "0.3.0"
+futures.workspace = true
+# pin-utils = "0.1.0"

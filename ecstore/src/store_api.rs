@@ -1,9 +1,11 @@
 use anyhow::{Error, Result};
+
 use http::HeaderMap;
 use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tokio::io::{AsyncRead, DuplexStream};
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -58,11 +60,12 @@ impl FileInfo {
         Ok(t)
     }
 
-    pub fn add_object_part(&mut self, num: usize, part_size: usize, mod_time: OffsetDateTime) {
+    pub fn add_object_part(&mut self, num: usize, part_size: usize, mod_time: OffsetDateTime, actual_size: usize) {
         let part = ObjectPartInfo {
             number: num,
             size: part_size,
             mod_time,
+            actual_size,
         };
 
         for p in self.parts.iter_mut() {
@@ -179,7 +182,7 @@ pub struct ObjectPartInfo {
     // pub etag: Option<String>,
     pub number: usize,
     pub size: usize,
-    // pub actual_size: usize,
+    pub actual_size: usize, // 源数据大小
     pub mod_time: OffsetDateTime,
     // pub index: Option<Vec<u8>>,
     // pub checksums: Option<std::collections::HashMap<String, String>>,
@@ -191,6 +194,7 @@ impl Default for ObjectPartInfo {
             number: Default::default(),
             size: Default::default(),
             mod_time: OffsetDateTime::UNIX_EPOCH,
+            actual_size: Default::default(),
         }
     }
 }
@@ -260,11 +264,11 @@ pub struct GetObjectReader {
     pub object_info: ObjectInfo,
 }
 
-impl GetObjectReader {
-    pub fn new(stream: StreamingBlob, object_info: ObjectInfo) -> Self {
-        GetObjectReader { stream, object_info }
-    }
-}
+// impl GetObjectReader {
+//     pub fn new(stream: StreamingBlob, object_info: ObjectInfo) -> Self {
+//         GetObjectReader { stream, object_info }
+//     }
+// }
 
 pub struct HTTPRangeSpec {
     pub is_shuffix_length: bool,
