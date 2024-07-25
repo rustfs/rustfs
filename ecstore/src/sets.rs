@@ -122,6 +122,9 @@ impl Sets {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        unimplemented!()
+    }
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
     }

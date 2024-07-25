@@ -227,7 +227,22 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn list_buckets(&self, _: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
-        let output = ListBucketsOutput { ..Default::default() };
+        // mc ls
+
+        let bucket_infos = try_!(self.store.list_bucket(&BucketOptions {}).await);
+
+        let buckets: Vec<Bucket> = bucket_infos
+            .iter()
+            .map(|v| Bucket {
+                creation_date: Some(Timestamp::from(v.created)),
+                name: Some(v.name.clone()),
+            })
+            .collect();
+
+        let output = ListBucketsOutput {
+            buckets: Some(buckets),
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 

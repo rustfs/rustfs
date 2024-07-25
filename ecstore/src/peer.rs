@@ -1,11 +1,12 @@
 use anyhow::{Error, Result};
 use async_trait::async_trait;
 use futures::future::join_all;
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use tracing::warn;
 
 use crate::{
     disk::DiskStore,
-    disk_api::DiskError,
+    disk_api::{DiskError, VolumeInfo},
     endpoint::{EndpointServerPools, Node},
     store_api::{BucketInfo, BucketOptions, MakeBucketOptions},
 };
@@ -15,6 +16,7 @@ type Client = Arc<Box<dyn PeerS3Client>>;
 #[async_trait]
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
     fn get_pools(&self) -> Vec<usize>;
 }
@@ -57,6 +59,51 @@ impl S3PeerSys {
 impl PeerS3Client for S3PeerSys {
     fn get_pools(&self) -> Vec<usize> {
         unimplemented!()
+    }
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        let mut futures = Vec::with_capacity(self.clients.len());
+        for cli in self.clients.iter() {
+            futures.push(cli.list_bucket(opts));
+        }
+
+        let mut errors = Vec::with_capacity(self.clients.len());
+        let mut ress = Vec::with_capacity(self.clients.len());
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(res) => {
+                    ress.push(Some(res));
+                    errors.push(None);
+                }
+                Err(e) => {
+                    ress.push(None);
+                    errors.push(Some(e));
+                }
+            }
+        }
+        // TODO: reduceWriteQuorumErrs
+        // for i in 0..self.pools_count {}
+
+        let mut uniq_map: HashMap<&String, &BucketInfo> = HashMap::new();
+
+        for res in ress.iter() {
+            if res.is_none() {
+                continue;
+            }
+
+            let buckets = res.as_ref().unwrap();
+
+            for bucket in buckets.iter() {
+                if !uniq_map.contains_key(&bucket.name) {
+                    uniq_map.insert(&bucket.name, bucket);
+                }
+            }
+        }
+
+        let buckets: Vec<BucketInfo> = uniq_map.values().map(|&v| v.clone()).collect();
+
+        Ok(buckets)
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
@@ -159,6 +206,50 @@ impl PeerS3Client for LocalPeerS3Client {
     fn get_pools(&self) -> Vec<usize> {
         self.pools.clone()
     }
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        let mut futures = Vec::with_capacity(self.local_disks.len());
+        for disk in self.local_disks.iter() {
+            futures.push(disk.list_volumes());
+        }
+
+        let results = join_all(futures).await;
+
+        let mut ress = Vec::new();
+        let mut errs = Vec::new();
+
+        for result in results {
+            match result {
+                Ok(res) => {
+                    ress.push(res);
+                    errs.push(None);
+                }
+                Err(e) => errs.push(Some(e)),
+            }
+        }
+
+        warn!("list_bucket errs {:?}", &errs);
+
+        let mut uniq_map: HashMap<&String, &VolumeInfo> = HashMap::new();
+
+        for info_list in ress.iter() {
+            for info in info_list.iter() {
+                // TODO: check name valid
+                if !uniq_map.contains_key(&info.name) {
+                    uniq_map.insert(&info.name, info);
+                }
+            }
+        }
+
+        let buckets: Vec<BucketInfo> = uniq_map
+            .values()
+            .map(|&v| BucketInfo {
+                name: v.name.clone(),
+                created: v.created,
+            })
+            .collect();
+
+        Ok(buckets)
+    }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.local_disks.len());
         for disk in self.local_disks.iter() {
@@ -246,6 +337,9 @@ impl RemotePeerS3Client {
 #[async_trait]
 impl PeerS3Client for RemotePeerS3Client {
     fn get_pools(&self) -> Vec<usize> {
+        unimplemented!()
+    }
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()
     }
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {

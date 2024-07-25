@@ -1,6 +1,7 @@
 use std::{
     fs::Metadata,
     io::SeekFrom,
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -638,7 +639,35 @@ impl DiskAPI for LocalDisk {
 
         Err(Error::new(DiskError::VolumeExists))
     }
+    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
+        let mut entries = fs::read_dir(&self.root).await?;
 
+        let mut volumes = Vec::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            if let Ok(metadata) = entry.metadata().await {
+                let vec = entry.file_name().into_vec();
+
+                if !metadata.is_dir() {
+                    continue;
+                }
+
+                let name = match String::from_utf8(vec) {
+                    Ok(s) => s,
+                    Err(_) => return Err(Error::msg("Not supported utf8 file name on this platform")),
+                };
+
+                let created = match metadata.created() {
+                    Ok(md) => OffsetDateTime::from(md),
+                    Err(_) => return Err(Error::msg("Not supported created on this platform")),
+                };
+
+                volumes.push(VolumeInfo { name, created });
+            }
+        }
+
+        Ok(volumes)
+    }
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         let p = self.get_bucket_path(volume)?;
 
