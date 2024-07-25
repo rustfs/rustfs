@@ -10,25 +10,65 @@
             "name": "Debug executable 'rustfs'",
             "cargo": {
                 "args": [
-                    "run",
-                    "--",
-                    "--access-key",
-                    "AKEXAMPLERUSTFS",
-                    "--secret-key",
-                    "SKEXAMPLERUSTFS",
-                    "--address",
-                    "0.0.0.0:9010",
-                    "--domain-name",
-                    "127.0.0.1:9010",
-                    "./target/volume/test{0...4}"
+                    "build",
+                    "--bin=rustfs",
+                    "--package=rustfs"
                 ],
-                // "filter": {
-                //     "name": "rustfs",
-                //     "kind": "bin"
-                // }
+                "filter": {
+                    "name": "rustfs",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--access-key",
+                "rustfs",
+                "--secret-key",
+                "rustfs",
+                "--address",
+                "0.0.0.0:9010",
+                "--domain-name",
+                "127.0.0.1:9010",
+                "/tmp/rustfs/test{0...4}"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'rustfs'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=rustfs",
+                    "--package=rustfs"
+                ],
+                "filter": {
+                    "name": "rustfs",
+                    "kind": "bin"
+                }
             },
             "args": [],
             "cwd": "${workspaceFolder}"
         },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in library 'ecstore'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--lib",
+                    "--package=ecstore"
+                ],
+                "filter": {
+                    "name": "ecstore",
+                    "kind": "lib"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
     ]
 }
