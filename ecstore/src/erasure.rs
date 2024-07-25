@@ -64,32 +64,22 @@ impl Erasure {
                     }
 
                     idx += 1;
-                    // warn!("encode {} get data {}", idx, data.len());
+                    debug!("encode {} get data {}", idx, data.len());
 
                     let blocks = self.encode_data(data.as_ref())?;
 
-                    // warn!(
-                    //     "encode shard {} size: {}/{} from block_size {}, total_size {} ",
-                    //     idx,
-                    //     blocks[0].len(),
-                    //     blocks.len(),
-                    //     data.len(),
-                    //     total_size
-                    // );
+                    debug!(
+                        "encode shard {} size: {}/{} from block_size {}, total_size {} ",
+                        idx,
+                        blocks[0].len(),
+                        blocks.len(),
+                        data.len(),
+                        total_size
+                    );
 
                     let mut errs = Vec::new();
 
                     for (i, w) in writers.iter_mut().enumerate() {
-                        // debug!(
-                        //     "{} {}-{} encode write {} , total:{}, readed:{}",
-                        //     self.id,
-                        //     idx,
-                        //     i,
-                        //     blocks[i].len(),
-                        //     data_size,
-                        //     total
-                        // );
-
                         match w.write_all(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
                             Err(e) => errs.push(Some(e)),
@@ -108,7 +98,7 @@ impl Erasure {
             }
         }
 
-        // warn!(" encode_data done shard block num {}", idx);
+        // debug!(" encode_data done shard block num {}", idx);
 
         Ok(total)
 
@@ -134,12 +124,12 @@ impl Erasure {
 
         let mut reader = ShardReader::new(readers, self, offset, total_length);
 
-        // warn!("ShardReader {:?}", &reader);
+        // debug!("ShardReader {:?}", &reader);
 
         let start_block = offset / self.block_size;
         let end_block = (offset + length) / self.block_size;
 
-        // warn!("decode block from {} to {}", start_block, end_block);
+        // debug!("decode block from {} to {}", start_block, end_block);
 
         let mut bytes_writed = 0;
 
@@ -161,11 +151,11 @@ impl Erasure {
             }
 
             if block_length == 0 {
-                // warn!("block_length == 0 break");
+                // debug!("block_length == 0 break");
                 break;
             }
 
-            // warn!("decode {} block_offset {},block_length {} ", block_idx, block_offset, block_length);
+            debug!("decode {} block_offset {},block_length {} ", block_idx, block_offset, block_length);
 
             let mut bufs = reader.read().await?;
 
@@ -177,11 +167,11 @@ impl Erasure {
 
             bytes_writed += writed_n;
 
-            // warn!("decode {} writed_n {}, total_writed: {} ", block_idx, writed_n, bytes_writed);
+            debug!("decode {} writed_n {}, total_writed: {} ", block_idx, writed_n, bytes_writed);
         }
 
         if bytes_writed != length {
-            // warn!("bytes_writed != length: {} != {} ", bytes_writed, length);
+            // debug!("bytes_writed != length: {} != {} ", bytes_writed, length);
             return Err(Error::msg("erasure decode less data"));
         }
 
@@ -212,7 +202,7 @@ impl Erasure {
 
         let mut offset = offset;
 
-        // warn!("write_data_blocks offset {}, length {}", offset, length);
+        // debug!("write_data_blocks offset {}, length {}", offset, length);
 
         let mut write = length;
         let mut total_writed = 0;
@@ -229,14 +219,14 @@ impl Erasure {
 
             offset = 0;
 
-            // warn!("write_data_blocks write buf len {}", buf.len());
+            // debug!("write_data_blocks write buf len {}", buf.len());
 
             if write < buf.len() {
                 let buf = &buf[..write];
 
-                // warn!("write_data_blocks write buf less len {}", buf.len());
+                // debug!("write_data_blocks write buf less len {}", buf.len());
                 writer.write_all(buf).await?;
-                // warn!("write_data_blocks write done len {}", buf.len());
+                // debug!("write_data_blocks write done len {}", buf.len());
                 total_writed += buf.len();
                 break;
             }
@@ -244,7 +234,7 @@ impl Erasure {
             writer.write_all(buf).await?;
             let n = buf.len();
 
-            // warn!("write_data_blocks write done len {}", n);
+            // debug!("write_data_blocks write done len {}", n);
             write -= n;
             total_writed += n;
         }
@@ -352,7 +342,7 @@ impl ShardReader {
             return Ok(vec![None; reader_length]);
         }
 
-        // warn!("shard reader read offset {}, shard_size {}", self.offset, read_length);
+        // debug!("shard reader read offset {}, shard_size {}", self.offset, read_length);
 
         let mut futures = Vec::with_capacity(reader_length);
         let mut errors = Vec::with_capacity(reader_length);
@@ -385,7 +375,7 @@ impl ShardReader {
         }
 
         // debug!("ec decode read ress {:?}", &ress);
-        debug!("ec decode read errors {:?}", &errors);
+        warn!("ec decode read errors {:?}", &errors);
 
         if !self.can_decode(&ress) {
             return Err(Error::msg("shard reader read faild"));

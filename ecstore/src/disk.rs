@@ -529,7 +529,7 @@ impl DiskAPI for LocalDisk {
         &self,
         src_volume: &str,
         src_path: &str,
-        fi: &FileInfo,
+        fi: FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
@@ -656,6 +656,8 @@ impl DiskAPI for LocalDisk {
 
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         let p = self.get_object_path(&volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())?;
+
+        warn!("write_metadata {:?} {:?}", &p, &fi);
 
         let mut meta = FileMeta::new();
         if !fi.fresh {

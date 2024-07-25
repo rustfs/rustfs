@@ -30,7 +30,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: &FileInfo,
+        file_info: FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp>;
