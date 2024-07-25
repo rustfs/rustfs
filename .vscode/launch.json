@@ -21,14 +21,14 @@
             },
             "args": [
                 "--access-key",
-                "rustfs",
+                "AKEXAMPLERUSTFS",
                 "--secret-key",
-                "rustfs",
+                "SKEXAMPLERUSTFS",
                 "--address",
                 "0.0.0.0:9010",
                 "--domain-name",
                 "127.0.0.1:9010",
-                "/tmp/rustfs/test{0...4}"
+                "./target/volume/test{0...4}"
             ],
             "cwd": "${workspaceFolder}"
         },
