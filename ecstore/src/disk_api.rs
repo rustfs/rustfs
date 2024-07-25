@@ -145,6 +145,7 @@ impl FileWriter {
     }
 }
 
+#[derive(Debug)]
 pub struct FileReader {
     pub inner: File,
 }

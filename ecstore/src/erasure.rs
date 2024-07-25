@@ -56,15 +56,20 @@ impl Erasure {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(data) => {
+                    total += data.len();
                     let blocks = self.encode_data(data.as_ref())?;
 
-                    warn!("encode shard size: {}/{} from block_size {} ", blocks[0].len(), blocks.len(), data.len());
+                    warn!(
+                        "encode shard size: {}/{} from block_size {}, total_size {} ",
+                        blocks[0].len(),
+                        blocks.len(),
+                        data.len(),
+                        total_size
+                    );
 
                     let mut errs = Vec::new();
                     idx += 1;
                     for (i, w) in writers.iter_mut().enumerate() {
-                        total += blocks[i].len();
-
                         // debug!(
                         //     "{} {}-{} encode write {} , total:{}, readed:{}",
                         //     self.id,
@@ -119,12 +124,15 @@ impl Erasure {
 
         let mut reader = ShardReader::new(readers, self, offset, total_length);
 
+        warn!("ShardReader {:?}", &reader);
+
         let start_block = offset / self.block_size;
         let end_block = (offset + length) / self.block_size;
 
         warn!("decode block from {} to {}", start_block, end_block);
 
         let mut bytes_writed = 0;
+        let mut idx = 0;
         for block_idx in start_block..=end_block {
             let mut block_offset = 0;
             let mut block_length = 0;
@@ -146,7 +154,7 @@ impl Erasure {
                 break;
             }
 
-            warn!("decode block_offset {},block_length {} ", block_offset, block_length);
+            warn!("decode {} block_offset {},block_length {} ", idx, block_offset, block_length);
 
             let mut bufs = reader.read().await?;
 
@@ -157,10 +165,11 @@ impl Erasure {
                 .await?;
 
             bytes_writed += writed_n;
+            idx += 1;
         }
 
         if bytes_writed != length {
-            warn!("bytes_writed != length ");
+            warn!("bytes_writed != length: {} != {} ", bytes_writed, length);
             return Err(Error::msg("erasure decode less data"));
         }
 
@@ -191,7 +200,7 @@ impl Erasure {
 
         let mut offset = offset;
 
-        debug!("write_data_blocks offset {}, length {}", offset, length);
+        warn!("write_data_blocks offset {}, length {}", offset, length);
 
         let mut write = length;
         let mut total_writed = 0;
@@ -287,6 +296,7 @@ pub trait ReadAt {
     async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)>;
 }
 
+#[derive(Debug)]
 pub struct ShardReader {
     readers: Vec<Option<FileReader>>, // 磁盘
     data_block_count: usize,          // 总的分片数量
