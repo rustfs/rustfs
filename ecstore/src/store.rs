@@ -114,6 +114,11 @@ impl ECStore {
 
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        let buckets = self.peer_sys.list_bucket(opts).await?;
+
+        Ok(buckets)
+    }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         // TODO:  check valid bucket name
 
