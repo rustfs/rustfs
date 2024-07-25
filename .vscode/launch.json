@@ -1,0 +1,34 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'rustfs'",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--",
+                    "--access-key",
+                    "AKEXAMPLERUSTFS",
+                    "--secret-key",
+                    "SKEXAMPLERUSTFS",
+                    "--address",
+                    "0.0.0.0:9010",
+                    "--domain-name",
+                    "127.0.0.1:9010",
+                    "./target/volume/test{0...4}"
+                ],
+                // "filter": {
+                //     "name": "rustfs",
+                //     "kind": "bin"
+                // }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+    ]
+}
