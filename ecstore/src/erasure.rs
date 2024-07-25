@@ -50,25 +50,35 @@ impl Erasure {
         S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
         W: AsyncWrite + Unpin,
     {
-        let mut stream = ChunkedStream::new(body, total_size, self.block_size, true);
+        let mut stream = ChunkedStream::new(body, total_size, self.block_size, false);
         let mut total: usize = 0;
         let mut idx = 0;
         while let Some(result) = stream.next().await {
             match result {
                 Ok(data) => {
                     total += data.len();
+
+                    // EOF
+                    if data.is_empty() {
+                        break;
+                    }
+
+                    idx += 1;
+                    // warn!("encode {} get data {}", idx, data.len());
+
                     let blocks = self.encode_data(data.as_ref())?;
 
-                    warn!(
-                        "encode shard size: {}/{} from block_size {}, total_size {} ",
-                        blocks[0].len(),
-                        blocks.len(),
-                        data.len(),
-                        total_size
-                    );
+                    // warn!(
+                    //     "encode shard {} size: {}/{} from block_size {}, total_size {} ",
+                    //     idx,
+                    //     blocks[0].len(),
+                    //     blocks.len(),
+                    //     data.len(),
+                    //     total_size
+                    // );
 
                     let mut errs = Vec::new();
-                    idx += 1;
+
                     for (i, w) in writers.iter_mut().enumerate() {
                         // debug!(
                         //     "{} {}-{} encode write {} , total:{}, readed:{}",
@@ -98,7 +108,7 @@ impl Erasure {
             }
         }
 
-        warn!(" encode_data done shard block num {}", idx);
+        // warn!(" encode_data done shard block num {}", idx);
 
         Ok(total)
 
@@ -124,15 +134,15 @@ impl Erasure {
 
         let mut reader = ShardReader::new(readers, self, offset, total_length);
 
-        warn!("ShardReader {:?}", &reader);
+        // warn!("ShardReader {:?}", &reader);
 
         let start_block = offset / self.block_size;
         let end_block = (offset + length) / self.block_size;
 
-        warn!("decode block from {} to {}", start_block, end_block);
+        // warn!("decode block from {} to {}", start_block, end_block);
 
         let mut bytes_writed = 0;
-        let mut idx = 0;
+
         for block_idx in start_block..=end_block {
             let mut block_offset = 0;
             let mut block_length = 0;
@@ -151,10 +161,11 @@ impl Erasure {
             }
 
             if block_length == 0 {
+                // warn!("block_length == 0 break");
                 break;
             }
 
-            warn!("decode {} block_offset {},block_length {} ", idx, block_offset, block_length);
+            // warn!("decode {} block_offset {},block_length {} ", block_idx, block_offset, block_length);
 
             let mut bufs = reader.read().await?;
 
@@ -165,11 +176,12 @@ impl Erasure {
                 .await?;
 
             bytes_writed += writed_n;
-            idx += 1;
+
+            // warn!("decode {} writed_n {}, total_writed: {} ", block_idx, writed_n, bytes_writed);
         }
 
         if bytes_writed != length {
-            warn!("bytes_writed != length: {} != {} ", bytes_writed, length);
+            // warn!("bytes_writed != length: {} != {} ", bytes_writed, length);
             return Err(Error::msg("erasure decode less data"));
         }
 
@@ -200,7 +212,7 @@ impl Erasure {
 
         let mut offset = offset;
 
-        warn!("write_data_blocks offset {}, length {}", offset, length);
+        // warn!("write_data_blocks offset {}, length {}", offset, length);
 
         let mut write = length;
         let mut total_writed = 0;
@@ -217,10 +229,22 @@ impl Erasure {
 
             offset = 0;
 
-            // if write < buf.len() {}
+            // warn!("write_data_blocks write buf len {}", buf.len());
 
-            let n = writer.write(buf).await?;
+            if write < buf.len() {
+                let buf = &buf[..write];
 
+                // warn!("write_data_blocks write buf less len {}", buf.len());
+                writer.write_all(buf).await?;
+                // warn!("write_data_blocks write done len {}", buf.len());
+                total_writed += buf.len();
+                break;
+            }
+
+            writer.write_all(buf).await?;
+            let n = buf.len();
+
+            // warn!("write_data_blocks write done len {}", n);
             write -= n;
             total_writed += n;
         }
@@ -279,16 +303,16 @@ impl Erasure {
             return 0;
         }
 
-        let mut num_shards = total_size / self.block_size;
+        let num_shards = total_size / self.block_size;
         let last_block_size = total_size % self.block_size;
-        // let last_shard_size = (last_block_size + self.data_shards - 1) / self.data_shards;
-        // num_shards * self.shard_size(self.block_size) + last_shard_size
+        let last_shard_size = (last_block_size + self.data_shards - 1) / self.data_shards;
+        num_shards * self.shard_size(self.block_size) + last_shard_size
 
-        // 因为写入的时候ec需要补全，所以最后一个长度应该也是一样的
-        if last_block_size != 0 {
-            num_shards += 1
-        }
-        num_shards * self.shard_size(self.block_size)
+        // // 因为写入的时候ec需要补全，所以最后一个长度应该也是一样的
+        // if last_block_size != 0 {
+        //     num_shards += 1
+        // }
+        // num_shards * self.shard_size(self.block_size)
     }
 }
 
@@ -318,10 +342,17 @@ impl ShardReader {
 
     pub async fn read(&mut self) -> Result<Vec<Option<Vec<u8>>>> {
         // let mut disks = self.readers;
-
-        warn!("shard reader read offset {}, shard_size {}", self.offset, self.shard_size);
-
         let reader_length = self.readers.len();
+        let mut read_length = self.shard_size;
+        if self.offset + read_length > self.shard_file_size {
+            read_length = self.shard_file_size - self.offset
+        }
+
+        if read_length == 0 {
+            return Ok(vec![None; reader_length]);
+        }
+
+        // warn!("shard reader read offset {}, shard_size {}", self.offset, read_length);
 
         let mut futures = Vec::with_capacity(reader_length);
         let mut errors = Vec::with_capacity(reader_length);
@@ -336,7 +367,7 @@ impl ShardReader {
             }
 
             let disk: &mut FileReader = disk.as_mut().unwrap();
-            futures.push(disk.read_at(self.offset, self.shard_size));
+            futures.push(disk.read_at(self.offset, read_length));
         }
 
         let results = join_all(futures).await;

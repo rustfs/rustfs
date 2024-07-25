@@ -155,11 +155,16 @@ impl S3 for FS {
                 .await
         );
 
-        // let body = bytes_stream(reader.stream, 100);
+        let info = reader.object_info;
+
+        let content_type = try_!(ContentType::from_str("application/x-msdownload"));
+        let last_modified = Timestamp::from(info.mod_time);
 
         let output = GetObjectOutput {
             body: Some(reader.stream),
-            content_length: Some(reader.object_info.size as i64),
+            content_length: Some(info.size as i64),
+            last_modified: Some(last_modified),
+            content_type: Some(content_type),
             ..Default::default()
         };
 
@@ -208,11 +213,12 @@ impl S3 for FS {
         debug!("info {:?}", info);
 
         let content_type = try_!(ContentType::from_str("application/x-msdownload"));
+        let last_modified = Timestamp::from(info.mod_time);
 
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(info.size))),
             content_type: Some(content_type),
-            last_modified: Some(info.mod_time.into()),
+            last_modified: Some(last_modified),
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -267,6 +273,8 @@ impl S3 for FS {
             content_length,
             ..
         } = input;
+
+        debug!("put_object metadata {:?}", metadata);
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 

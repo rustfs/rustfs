@@ -6,6 +6,7 @@ use s3s::dto::StreamingBlob;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, DuplexStream};
+use tracing::warn;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
