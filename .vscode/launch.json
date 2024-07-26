@@ -19,6 +19,9 @@
                     "kind": "bin"
                 }
             },
+            "env": {
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug"
+            },
             "args": [
                 "--access-key",
                 "AKEXAMPLERUSTFS",

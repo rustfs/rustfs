@@ -1,4 +1,5 @@
 use futures::future::join_all;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -99,6 +100,7 @@ fn get_format_file_in_quorum(formats: &Vec<Option<FormatV3>>) -> Result<FormatV3
     let (max_drives, max_count) = countmap.iter().max_by_key(|&(_, c)| c).unwrap_or((&0, &0));
 
     if *max_drives == 0 || *max_count < formats.len() / 2 {
+        warn!("*max_drives == 0 || *max_count < formats.len() / 2");
         return Err(Error::new(ErasureError::ErasureReadQuorum));
     }
 

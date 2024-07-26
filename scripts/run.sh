@@ -1,7 +1,9 @@
 #!/bin/bash
 
+mkdir -p ./target/volume/test
 mkdir -p ./target/volume/test{0..4}
 
+# DATA_DIR="./target/volume/test"
 DATA_DIR="./target/volume/test{0...4}"
 
 if [ -n "$1" ]; then
@@ -9,7 +11,7 @@ if [ -n "$1" ]; then
 fi
 
 if [ -z "$RUST_LOG" ]; then
-    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug"
+    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug"
 fi
 
 cargo run \
