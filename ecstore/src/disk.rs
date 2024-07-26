@@ -1,6 +1,6 @@
 use std::{
     fs::Metadata,
-    io::SeekFrom,
+    io::{self, SeekFrom},
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -218,8 +218,14 @@ impl LocalDisk {
 
         if recursive {
             let trash_path = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
-            fs::create_dir_all(&trash_path).await?;
-            fs::rename(&delete_path, &trash_path).await?;
+            // fs::create_dir_all(&trash_path).await?;
+            fs::rename(&delete_path, &trash_path).await.map_err(|err| {
+                // 使用文件路径自定义错误信息
+                io::Error::new(
+                    err.kind(),
+                    format!("Failed to rename file '{:?}' to '{:?}': {}", &delete_path, &trash_path, err),
+                )
+            })?;
 
             // TODO: immediate
 
@@ -526,6 +532,40 @@ impl DiskAPI for LocalDisk {
 
         // Ok((buffer, bytes_read))
     }
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: usize) -> Result<Vec<String>> {
+        let p = self.get_bucket_path(&volume)?;
+
+        let mut entries = fs::read_dir(&p).await?;
+
+        let mut volumes = Vec::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            if let Ok(metadata) = entry.metadata().await {
+                let vec = entry.file_name().into_vec();
+
+                // if !metadata.is_dir() {
+                //     continue;
+                // }
+
+                let name = match String::from_utf8(vec) {
+                    Ok(s) => s,
+                    Err(_) => return Err(Error::msg("Not supported utf8 file name on this platform")),
+                };
+
+                // let created = match metadata.created() {
+                //     Ok(md) => OffsetDateTime::from(md),
+                //     Err(_) => return Err(Error::msg("Not supported created on this platform")),
+                // };
+
+                volumes.push(name);
+            }
+        }
+
+        Ok(volumes)
+    }
+    async fn walk_dir(&self) -> Result<Vec<FileInfo>> {
+        unimplemented!()
+    }
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -648,9 +688,9 @@ impl DiskAPI for LocalDisk {
             if let Ok(metadata) = entry.metadata().await {
                 let vec = entry.file_name().into_vec();
 
-                if !metadata.is_dir() {
-                    continue;
-                }
+                // if !metadata.is_dir() {
+                //     continue;
+                // }
 
                 let name = match String::from_utf8(vec) {
                     Ok(s) => s,

@@ -26,6 +26,10 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
+    // 读目录下的所有文件、目录
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: usize) -> Result<Vec<String>>;
+    // 读目录下的所有xl.meta
+    async fn walk_dir(&self) -> Result<Vec<FileInfo>>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -206,8 +210,6 @@ pub enum DiskError {
 
 impl DiskError {
     pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<()> {
-        println!("errs: {:?}", errs);
-
         if Self::count_errs(errs, &DiskError::UnsupportedDisk) == errs.len() {
             return Err(Error::new(DiskError::UnsupportedDisk));
         }

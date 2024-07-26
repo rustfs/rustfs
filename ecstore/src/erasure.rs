@@ -29,6 +29,10 @@ pub struct Erasure {
 
 impl Erasure {
     pub fn new(data_shards: usize, parity_shards: usize, block_size: usize) -> Self {
+        warn!(
+            "Erasure new data_shards {},parity_shards {} block_size {} ",
+            data_shards, parity_shards, block_size
+        );
         Erasure {
             data_shards,
             parity_shards,
