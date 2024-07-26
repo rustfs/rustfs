@@ -21,7 +21,7 @@
 - [ ] 文件操作
   - [x] 上传 PutObject
   - [ ] 大文件上传
-    - [ ] 创建分片上传 CreateMultipartUpload
+    - [x] 创建分片上传 CreateMultipartUpload
     - [x] 上传分片 PubObjectPart
     - [x] 提交完成 CompleteMultipartUpload
     - [ ] 取消上传
