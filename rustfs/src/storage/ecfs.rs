@@ -433,8 +433,18 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn abort_multipart_upload(
         &self,
-        _req: S3Request<AbortMultipartUploadInput>,
+        req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let AbortMultipartUploadInput {
+            bucket, key, upload_id, ..
+        } = req.input;
+
+        let opts = &ObjectOptions::default();
+        try_!(
+            self.store
+                .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
+                .await
+        );
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
     }
 }

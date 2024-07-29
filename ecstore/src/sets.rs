@@ -169,7 +169,11 @@ impl StorageAPI for Sets {
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
     }
-
+    async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object)
+            .abort_multipart_upload(bucket, object, upload_id, opts)
+            .await
+    }
     async fn complete_multipart_upload(
         &self,
         bucket: &str,

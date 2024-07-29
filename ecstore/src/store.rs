@@ -217,6 +217,13 @@ impl StorageAPI for ECStore {
         }
         unimplemented!()
     }
+    async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
+        if self.single_pool() {
+            return self.pools[0].abort_multipart_upload(bucket, object, upload_id, opts).await;
+        }
+
+        unimplemented!()
+    }
     async fn complete_multipart_upload(
         &self,
         bucket: &str,

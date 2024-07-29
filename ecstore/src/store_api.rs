@@ -448,6 +448,7 @@ pub trait StorageAPI {
         opts: &ObjectOptions,
     ) -> Result<PartInfo>;
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;
+    async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()>;
     async fn complete_multipart_upload(
         &self,
         bucket: &str,
