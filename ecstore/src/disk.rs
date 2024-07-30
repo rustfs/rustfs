@@ -828,6 +828,14 @@ impl DiskAPI for LocalDisk {
 
         Ok(results)
     }
+
+    async fn delete_volume(&self, volume: &str) -> Result<()> {
+        let p = self.get_bucket_path(&volume)?;
+
+        fs::remove_dir_all(&p).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -877,6 +885,34 @@ mod test {
         disk.make_volumes(volumes.clone()).await.unwrap();
 
         disk.make_volumes(volumes.clone()).await.unwrap();
+
+        fs::remove_dir_all(&p).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_volume() {
+        let p = "./testv";
+        fs::create_dir_all(&p).await.unwrap();
+
+        let ep = match Endpoint::try_from(p) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("{e}");
+                return;
+            }
+        };
+
+        let disk = LocalDisk::new(&ep, false).await.unwrap();
+
+        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
+
+        println!("ppp :{:?}", &tmpp);
+
+        let volumes = vec!["a", "b", "c"];
+
+        disk.make_volumes(volumes.clone()).await.unwrap();
+
+        disk.delete_volume("a").await.unwrap();
 
         fs::remove_dir_all(&p).await.unwrap();
     }
