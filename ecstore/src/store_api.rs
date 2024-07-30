@@ -249,6 +249,7 @@ pub struct MakeBucketOptions {
     pub force_create: bool,
 }
 
+#[derive(Debug)]
 pub struct PutObjReader {
     pub stream: StreamingBlob,
     pub content_length: usize,
@@ -426,6 +427,7 @@ pub struct ObjectInfo {
 #[async_trait::async_trait]
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
+    async fn delete_bucket(&self, bucket: &str) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;

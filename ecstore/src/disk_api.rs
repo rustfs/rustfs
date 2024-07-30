@@ -40,6 +40,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<RenameDataResp>;
 
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
+    async fn delete_volume(&self, volume: &str) -> Result<()>;
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
     async fn make_volume(&self, volume: &str) -> Result<()>;
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;

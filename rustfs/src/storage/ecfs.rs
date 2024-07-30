@@ -83,7 +83,9 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let _input = req.input;
+        let input = req.input;
+
+        try_!(self.store.delete_bucket(&input.bucket).await);
 
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
