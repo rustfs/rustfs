@@ -17,6 +17,7 @@ type Client = Arc<Box<dyn PeerS3Client>>;
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
+    async fn delete_bucket(&self, bucket: &str) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
     fn get_pools(&self) -> Vec<usize>;
 }
@@ -57,8 +58,42 @@ impl S3PeerSys {
 
 #[async_trait]
 impl PeerS3Client for S3PeerSys {
-    fn get_pools(&self) -> Vec<usize> {
-        unimplemented!()
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        let mut futures = Vec::with_capacity(self.clients.len());
+        for cli in self.clients.iter() {
+            futures.push(cli.make_bucket(bucket, opts));
+        }
+
+        let mut errors = Vec::with_capacity(self.clients.len());
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(_) => {
+                    errors.push(None);
+                }
+                Err(e) => {
+                    errors.push(Some(e));
+                }
+            }
+        }
+
+        for i in 0..self.pools_count {
+            let mut per_pool_errs = Vec::with_capacity(self.clients.len());
+            for (j, cli) in self.clients.iter().enumerate() {
+                let pools = cli.get_pools();
+                let idx = i;
+                if pools.contains(&idx) {
+                    per_pool_errs.push(errors[j].as_ref());
+                }
+
+                // TODO: reduceWriteQuorumErrs
+            }
+        }
+
+        // TODO:
+
+        Ok(())
     }
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         let mut futures = Vec::with_capacity(self.clients.len());
@@ -105,15 +140,16 @@ impl PeerS3Client for S3PeerSys {
 
         Ok(buckets)
     }
-    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
-            futures.push(cli.make_bucket(bucket, opts));
+            futures.push(cli.delete_bucket(bucket));
         }
 
         let mut errors = Vec::with_capacity(self.clients.len());
 
         let results = join_all(futures).await;
+
         for result in results {
             match result {
                 Ok(_) => {
@@ -125,20 +161,7 @@ impl PeerS3Client for S3PeerSys {
             }
         }
 
-        for i in 0..self.pools_count {
-            let mut per_pool_errs = Vec::with_capacity(self.clients.len());
-            for (j, cli) in self.clients.iter().enumerate() {
-                let pools = cli.get_pools();
-                let idx = i;
-                if pools.contains(&idx) {
-                    per_pool_errs.push(errors[j].as_ref());
-                }
-
-                // TODO: reduceWriteQuorumErrs
-            }
-        }
-
-        // TODO:
+        // TODO: reduceWriteQuorumErrs
 
         Ok(())
     }
@@ -181,6 +204,10 @@ impl PeerS3Client for S3PeerSys {
         ress.iter()
             .find_map(|op| op.as_ref().map(|v| v.clone()))
             .ok_or(Error::new(DiskError::VolumeNotFound))
+    }
+
+    fn get_pools(&self) -> Vec<usize> {
+        unimplemented!()
     }
 }
 
@@ -282,6 +309,7 @@ impl PeerS3Client for LocalPeerS3Client {
 
         Ok(())
     }
+
     async fn get_bucket_info(&self, bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         let mut futures = Vec::with_capacity(self.local_disks.len());
         for disk in self.local_disks.iter() {
@@ -319,6 +347,29 @@ impl PeerS3Client for LocalPeerS3Client {
             })
             .ok_or(Error::new(DiskError::VolumeNotFound))
     }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        let mut futures = Vec::with_capacity(self.local_disks.len());
+
+        for disk in self.local_disks.iter() {
+            futures.push(disk.delete_volume(bucket));
+        }
+
+        let results = join_all(futures).await;
+
+        let mut errs = Vec::new();
+
+        for res in results {
+            match res {
+                Ok(_) => errs.push(None),
+                Err(e) => errs.push(Some(e)),
+            }
+        }
+
+        // TODO: reduceWriteQuorumErrs
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -346,6 +397,10 @@ impl PeerS3Client for RemotePeerS3Client {
         unimplemented!()
     }
     async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+        unimplemented!()
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         unimplemented!()
     }
 }
