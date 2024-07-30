@@ -186,4 +186,8 @@ impl StorageAPI for Sets {
             .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
             .await
     }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        unimplemented!()
+    }
 }

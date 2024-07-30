@@ -4,6 +4,7 @@ use anyhow::{Error, Result};
 
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -238,5 +239,11 @@ impl StorageAPI for ECStore {
                 .await;
         }
         unimplemented!()
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        self.peer_sys.delete_bucket(bucket).await?;
+
+        Ok(())
     }
 }
