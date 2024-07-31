@@ -24,7 +24,7 @@
     - [x] 创建分片上传 CreateMultipartUpload
     - [x] 上传分片 PubObjectPart
     - [x] 提交完成 CompleteMultipartUpload
-    - [ ] 取消上传
+    - [x] 取消上传
   - [x] 下载 GetObject
   - [ ] 复制 CopyObject
   - [ ] 详情 HeadObject
