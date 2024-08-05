@@ -1,7 +1,7 @@
 use crate::{
     bucket_meta::BucketMetadata,
     disk::error::DiskError,
-    disk::{self, DiskOption, DiskStore, RUSTFS_META_BUCKET},
+    disk::{DiskOption, DiskStore, RUSTFS_META_BUCKET},
     disks_layout::DisksLayout,
     endpoints::EndpointServerPools,
     error::{Error, Result},
@@ -47,7 +47,7 @@ impl ECStore {
             // TODO: read from config parseStorageClass
             let partiy_count = store_init::default_partiy_count(pool_eps.drives_per_set);
 
-            let (disks, errs) = disk::init_disks(
+            let (disks, errs) = crate::store_init::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
