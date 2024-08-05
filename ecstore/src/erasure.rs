@@ -1,3 +1,4 @@
+use crate::error::StdError;
 use anyhow::anyhow;
 use anyhow::Error;
 use anyhow::Result;
@@ -6,7 +7,6 @@ use futures::future::join_all;
 use futures::{Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use s3s::dto::StreamingBlob;
-use s3s::StdError;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;

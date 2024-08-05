@@ -1,7 +1,7 @@
+use crate::error::StdError;
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{Stream, StreamExt};
-use s3s::StdError;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};

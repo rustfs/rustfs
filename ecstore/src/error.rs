@@ -1,79 +1,68 @@
-use s3s::S3Error;
-use s3s::S3ErrorCode;
-use s3s::StdError;
-use std::fmt::Display;
-use std::panic::Location;
+use tracing_error::{SpanTrace, SpanTraceStatus};
 
-use tracing::error;
-
-#[derive(Debug)]
-pub struct Error {
-    source: StdError,
-}
+pub type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug)]
+pub struct Error {
+    inner: Box<dyn std::error::Error + Send + Sync + 'static>,
+    span_trace: SpanTrace,
+}
+
 impl Error {
+    /// Create a new error from a `std::error::Error`.
     #[must_use]
     #[track_caller]
     pub fn new(source: StdError) -> Self {
-        log(&*source);
-        Self { source }
+        Self {
+            inner: source,
+            span_trace: SpanTrace::capture(),
+        }
     }
 
+    /// Create a new error from a string.
     #[must_use]
     #[track_caller]
     pub fn from_string(s: impl Into<String>) -> Self {
         Self::new(s.into().into())
     }
-}
 
-impl<E> From<E> for Error
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    #[track_caller]
-    fn from(source: E) -> Self {
-        Self::new(Box::new(source))
+    /// Returns `true` if the inner type is the same as `T`.
+    #[inline]
+    pub fn is<T: std::error::Error + 'static>(&self) -> bool {
+        self.inner.is::<T>()
+    }
+
+    /// Returns some reference to the inner value if it is of type `T`, or
+    /// `None` if it isn't.
+    #[inline]
+    pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<&T> {
+        self.inner.downcast_ref()
+    }
+
+    /// Returns some mutable reference to the inner value if it is of type `T`, or
+    /// `None` if it isn't.
+    #[inline]
+    pub fn downcast_mut<T: std::error::Error + 'static>(&mut self) -> Option<&mut T> {
+        self.inner.downcast_mut()
     }
 }
 
-impl From<Error> for S3Error {
-    fn from(e: Error) -> Self {
-        S3Error::with_source(S3ErrorCode::InternalError, e.source)
+impl<T: std::error::Error + Send + Sync + 'static> From<T> for Error {
+    fn from(e: T) -> Self {
+        Self::new(e.into())
     }
 }
 
-impl Display for Error {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)
-    }
-}
+        write!(f, "{}", self.inner)?;
 
-#[inline]
-#[track_caller]
-pub(crate) fn log(source: &dyn std::error::Error) {
-    if cfg!(feature = "binary") {
-        let location = Location::caller();
-        let span_trace = tracing_error::SpanTrace::capture();
-
-        error!(
-            target: "s3s_fs_internal_error",
-            %location,
-            error=%source,
-            "span trace:\n{span_trace}"
-        );
-    }
-}
-
-macro_rules! try_ {
-    ($result:expr) => {
-        match $result {
-            Ok(val) => val,
-            Err(err) => {
-                $crate::error::log(&err);
-                return Err(::s3s::S3Error::internal_error(err));
-            }
+        if self.span_trace.status() != SpanTraceStatus::EMPTY {
+            write!(f, "\nspan_trace:\n{}", self.span_trace)?;
         }
-    };
+
+        Ok(())
+    }
 }
