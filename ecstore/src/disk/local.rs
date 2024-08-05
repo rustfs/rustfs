@@ -2,76 +2,23 @@ use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     DeleteOptions, DiskAPI, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, VolumeInfo,
 };
+use crate::{
+    error::{Error, Result},
+    file_meta::FileMeta,
+    store_api::{FileInfo, RawFileInfo},
+    utils,
+};
 use bytes::Bytes;
-use futures::future::join_all;
 use path_absolutize::Absolutize;
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::ErrorKind;
 use tracing::{debug, warn};
 use uuid::Uuid;
-
-use crate::{
-    endpoints::Endpoints,
-    error::{Error, Result},
-    file_meta::FileMeta,
-    store_api::{FileInfo, RawFileInfo},
-    utils,
-};
-
-pub type DiskStore = Arc<Box<dyn DiskAPI>>;
-
-pub struct DiskOption {
-    pub cleanup: bool,
-    pub health_check: bool,
-}
-
-pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
-    if ep.is_local {
-        let s = LocalDisk::new(ep, opt.cleanup).await?;
-        Ok(Arc::new(Box::new(s)))
-    } else {
-        let _ = opt.health_check;
-        unimplemented!()
-        // Ok(Disk::Remote(RemoteDisk::new(ep, opt.health_check)?))
-    }
-}
-
-pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<Error>>) {
-    let mut futures = Vec::with_capacity(eps.as_ref().len());
-
-    for ep in eps.as_ref().iter() {
-        futures.push(new_disk(ep, opt));
-    }
-
-    let mut res = Vec::with_capacity(eps.as_ref().len());
-    let mut errors = Vec::with_capacity(eps.as_ref().len());
-
-    let results = join_all(futures).await;
-    for result in results {
-        match result {
-            Ok(s) => {
-                res.push(Some(s));
-                errors.push(None);
-            }
-            Err(e) => {
-                res.push(None);
-                errors.push(Some(e));
-            }
-        }
-    }
-
-    (res, errors)
-}
-
-// pub async fn load_format(&self, heal: bool) -> Result<FormatV3> {
-//     unimplemented!()
-// }
 
 #[derive(Debug)]
 pub struct LocalDisk {

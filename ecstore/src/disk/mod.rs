@@ -3,8 +3,6 @@ pub mod error;
 pub mod format;
 mod local;
 
-pub use local::{init_disks, DiskOption, DiskStore};
-
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
@@ -19,13 +17,25 @@ use crate::{
     store_api::{FileInfo, RawFileInfo},
 };
 use bytes::Bytes;
-use std::{fmt::Debug, io::SeekFrom, pin::Pin};
+use std::{fmt::Debug, io::SeekFrom, pin::Pin, sync::Arc};
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWrite},
 };
 use uuid::Uuid;
+
+pub type DiskStore = Arc<Box<dyn DiskAPI>>;
+
+pub async fn new_disk(ep: &endpoint::Endpoint, opt: &DiskOption) -> Result<DiskStore> {
+    if ep.is_local {
+        let s = local::LocalDisk::new(ep, opt.cleanup).await?;
+        Ok(Arc::new(Box::new(s)))
+    } else {
+        let _ = opt.health_check;
+        unimplemented!()
+    }
+}
 
 #[async_trait::async_trait]
 pub trait DiskAPI: Debug + Send + Sync + 'static {
@@ -69,6 +79,11 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
+}
+
+pub struct DiskOption {
+    pub cleanup: bool,
+    pub health_check: bool,
 }
 
 pub struct RenameDataResp {
