@@ -27,7 +27,7 @@ pub async fn do_init_format_file(
 
     check_format_erasure_values(&formats, set_drive_count)?;
 
-    if first_disk && should_init_erasure_disks(&errs) {
+    if first_disk && DiskError::should_init_erasure_disks(&errs) {
         //  UnformattedDisk, not format file create
         // new format and save
         let fms = init_format_files(&disks, set_count, set_drive_count, deployment_id);
@@ -113,10 +113,6 @@ fn get_format_file_in_quorum(formats: &Vec<Option<FormatV3>>) -> Result<FormatV3
     format.erasure.this = Uuid::nil();
 
     Ok(format)
-}
-
-fn should_init_erasure_disks(errs: &Vec<Option<Error>>) -> bool {
-    DiskError::count_errs(errs, &DiskError::UnformattedDisk) == errs.len()
 }
 
 fn check_format_erasure_values(

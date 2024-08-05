@@ -3,7 +3,6 @@ mod chunk_stream;
 pub mod disk;
 pub mod disk_api;
 mod disks_layout;
-mod ellipses;
 mod endpoint;
 mod erasure;
 pub mod error;

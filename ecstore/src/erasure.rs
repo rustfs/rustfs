@@ -3,7 +3,6 @@ use bytes::Bytes;
 use futures::future::join_all;
 use futures::{Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use s3s::dto::StreamingBlob;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;

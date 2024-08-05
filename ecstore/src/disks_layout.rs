@@ -1,5 +1,5 @@
-use super::ellipses::*;
 use super::error::{Error, Result};
+use crate::utils::ellipses::*;
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -163,7 +163,7 @@ fn get_all_sets<T: AsRef<str>>(is_ellipses: bool, args: &[T]) -> Result<Vec<Vec<
 /// methods to get the sets of endpoints.
 #[derive(Debug, Default)]
 pub struct EndpointSet {
-    pub arg_patterns: Vec<ArgPattern>,
+    pub _arg_patterns: Vec<ArgPattern>,
     pub endpoints: Vec<String>,
     pub set_indexes: Vec<Vec<usize>>,
 }
@@ -190,7 +190,7 @@ impl<T: AsRef<str>> TryFrom<&[T]> for EndpointSet {
 
         Ok(EndpointSet {
             set_indexes,
-            arg_patterns,
+            _arg_patterns: arg_patterns,
             endpoints,
         })
     }
@@ -357,11 +357,11 @@ fn get_total_sizes(arg_patterns: &[ArgPattern]) -> Vec<usize> {
 mod test {
 
     use super::*;
-    use crate::ellipses;
+    use crate::utils::ellipses;
 
     impl PartialEq for EndpointSet {
         fn eq(&self, other: &Self) -> bool {
-            self.arg_patterns == other.arg_patterns && self.set_indexes == other.set_indexes
+            self._arg_patterns == other._arg_patterns && self.set_indexes == other.set_indexes
         }
     }
 
@@ -621,7 +621,7 @@ mod test {
                 num: 6,
                 arg: "{1...27}",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                    _arg_patterns: vec![ArgPattern::new(vec![Pattern {
                         seq: get_sequences(1, 27, 0),
                         ..Default::default()
                     }])],
@@ -634,7 +634,7 @@ mod test {
                 num: 7,
                 arg: "/export/set{1...64}",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                    _arg_patterns: vec![ArgPattern::new(vec![Pattern {
                         seq: get_sequences(1, 64, 0),
                         prefix: "/export/set".to_owned(),
                         ..Default::default()
@@ -649,7 +649,7 @@ mod test {
                 num: 8,
                 arg: "http://rustfs{2...3}/export/set{1...64}",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![
+                    _arg_patterns: vec![ArgPattern::new(vec![
                         Pattern {
                             seq: get_sequences(1, 64, 0),
                             ..Default::default()
@@ -670,7 +670,7 @@ mod test {
                 num: 9,
                 arg: "http://rustfs{1...64}.mydomain.net/data",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                    _arg_patterns: vec![ArgPattern::new(vec![Pattern {
                         seq: get_sequences(1, 64, 0),
                         prefix: "http://rustfs".to_owned(),
                         suffix: ".mydomain.net/data".to_owned(),
@@ -684,7 +684,7 @@ mod test {
                 num: 10,
                 arg: "http://rack{1...4}.mydomain.rustfs{1...16}/data",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![
+                    _arg_patterns: vec![ArgPattern::new(vec![
                         Pattern {
                             seq: get_sequences(1, 16, 0),
                             suffix: "/data".to_owned(),
@@ -706,7 +706,7 @@ mod test {
                 num: 11,
                 arg: "http://rustfs{0...15}.mydomain.net/data{0...1}",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![
+                    _arg_patterns: vec![ArgPattern::new(vec![
                         Pattern {
                             seq: get_sequences(0, 1, 0),
                             ..Default::default()
@@ -727,7 +727,7 @@ mod test {
                 num: 12,
                 arg: "http://server1/data{1...32}",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                    _arg_patterns: vec![ArgPattern::new(vec![Pattern {
                         seq: get_sequences(1, 32, 0),
                         prefix: "http://server1/data".to_owned(),
                         ..Default::default()
@@ -742,7 +742,7 @@ mod test {
                 num: 13,
                 arg: "http://server1/data{01...32}",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![Pattern {
+                    _arg_patterns: vec![ArgPattern::new(vec![Pattern {
                         seq: get_sequences(1, 32, 2),
                         prefix: "http://server1/data".to_owned(),
                         ..Default::default()
@@ -757,7 +757,7 @@ mod test {
                 num: 14,
                 arg: "http://rustfs{2...3}/export/set{1...64}/test{1...2}",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![
+                    _arg_patterns: vec![ArgPattern::new(vec![
                         Pattern {
                             seq: get_sequences(1, 2, 0),
                             ..Default::default()
@@ -783,7 +783,7 @@ mod test {
                 num: 15,
                 arg: "/export{1...10}/disk{1...10}",
                 es: EndpointSet {
-                    arg_patterns: vec![ArgPattern::new(vec![
+                    _arg_patterns: vec![ArgPattern::new(vec![
                         Pattern {
                             seq: get_sequences(1, 10, 0),
                             ..Default::default()

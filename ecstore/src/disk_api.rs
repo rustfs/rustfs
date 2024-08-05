@@ -4,13 +4,13 @@ use bytes::Bytes;
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite},
 };
 use uuid::Uuid;
 
 use crate::{
     erasure::ReadAt,
-    error::{Error, Result},
+    error::Result,
     store_api::{FileInfo, RawFileInfo},
 };
 
