@@ -1,4 +1,4 @@
-use super::{error::DiskError, format::FormatV3};
+use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     DeleteOptions, DiskAPI, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, VolumeInfo,
 };
@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    endpoint::{Endpoint, Endpoints},
+    endpoints::Endpoints,
     error::{Error, Result},
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},

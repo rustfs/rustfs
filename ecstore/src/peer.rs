@@ -6,7 +6,7 @@ use tracing::warn;
 use crate::{
     disk::VolumeInfo,
     disk::{error::DiskError, DiskStore},
-    endpoint::{EndpointServerPools, Node},
+    endpoints::{EndpointServerPools, Node},
     error::{Error, Result},
     store_api::{BucketInfo, BucketOptions, MakeBucketOptions},
 };

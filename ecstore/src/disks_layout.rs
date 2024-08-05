@@ -1,4 +1,4 @@
-use super::error::{Error, Result};
+use crate::error::{Error, Result};
 use crate::utils::ellipses::*;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -13,51 +13,31 @@ pub struct PoolDisksLayout {
     layout: Vec<Vec<String>>,
 }
 
-impl AsRef<Vec<Vec<String>>> for PoolDisksLayout {
-    fn as_ref(&self) -> &Vec<Vec<String>> {
-        &self.layout
-    }
-}
-
-impl AsMut<Vec<Vec<String>>> for PoolDisksLayout {
-    fn as_mut(&mut self) -> &mut Vec<Vec<String>> {
-        &mut self.layout
-    }
-}
-
 impl PoolDisksLayout {
-    pub fn new(args: impl Into<String>, layout: Vec<Vec<String>>) -> Self {
+    fn new(args: impl Into<String>, layout: Vec<Vec<String>>) -> Self {
         PoolDisksLayout {
             cmd_line: args.into(),
             layout,
         }
     }
 
-    pub fn count(&self) -> usize {
+    fn count(&self) -> usize {
         self.layout.len()
     }
 
-    pub fn get_cmd_line(&self) -> &str {
+    fn get_cmd_line(&self) -> &str {
         &self.cmd_line
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Vec<String>> {
+        self.layout.iter()
     }
 }
 
 #[derive(Deserialize, Debug, Default)]
 pub struct DisksLayout {
     pub legacy: bool,
-    pools: Vec<PoolDisksLayout>,
-}
-
-impl AsRef<Vec<PoolDisksLayout>> for DisksLayout {
-    fn as_ref(&self) -> &Vec<PoolDisksLayout> {
-        &self.pools
-    }
-}
-
-impl AsMut<Vec<PoolDisksLayout>> for DisksLayout {
-    fn as_mut(&mut self) -> &mut Vec<PoolDisksLayout> {
-        &mut self.pools
-    }
+    pub pools: Vec<PoolDisksLayout>,
 }
 
 impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
@@ -119,8 +99,19 @@ impl DisksLayout {
         &self.pools[0].layout[0][0]
     }
 
-    pub fn get_layout(&self, idx: usize) -> Option<&PoolDisksLayout> {
-        self.pools.get(idx)
+    /// returns the total number of sets in the layout.
+    pub fn get_set_count(&self, i: usize) -> usize {
+        self.pools.get(i).map_or(0, |v| v.count())
+    }
+
+    /// returns the total number of drives in the layout.
+    pub fn get_drives_per_set(&self, i: usize) -> usize {
+        self.pools.get(i).map_or(0, |v| v.layout.first().map_or(0, |v| v.len()))
+    }
+
+    /// returns the command line for the given index.
+    pub fn get_cmd_line(&self, i: usize) -> String {
+        self.pools.get(i).map_or(String::new(), |v| v.get_cmd_line().to_owned())
     }
 }
 
@@ -162,10 +153,10 @@ fn get_all_sets<T: AsRef<str>>(is_ellipses: bool, args: &[T]) -> Result<Vec<Vec<
 /// represents parsed ellipses values, also provides
 /// methods to get the sets of endpoints.
 #[derive(Debug, Default)]
-pub struct EndpointSet {
-    pub _arg_patterns: Vec<ArgPattern>,
-    pub endpoints: Vec<String>,
-    pub set_indexes: Vec<Vec<usize>>,
+struct EndpointSet {
+    _arg_patterns: Vec<ArgPattern>,
+    endpoints: Vec<String>,
+    set_indexes: Vec<Vec<usize>>,
 }
 
 impl<T: AsRef<str>> TryFrom<&[T]> for EndpointSet {
@@ -357,7 +348,6 @@ fn get_total_sizes(arg_patterns: &[ArgPattern]) -> Vec<usize> {
 mod test {
 
     use super::*;
-    use crate::utils::ellipses;
 
     impl PartialEq for EndpointSet {
         fn eq(&self, other: &Self) -> bool {
@@ -532,7 +522,7 @@ mod test {
         for test_case in test_cases {
             let mut arg_patterns = Vec::new();
             for v in test_case.args.iter() {
-                match ellipses::find_ellipses_patterns(v) {
+                match find_ellipses_patterns(v) {
                     Ok(patterns) => {
                         arg_patterns.push(patterns);
                     }

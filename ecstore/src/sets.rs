@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::{
     disk::format::{DistributionAlgoVersion, FormatV3},
     disk::DiskStore,
-    endpoint::PoolEndpoints,
+    endpoints::PoolEndpoints,
     error::Result,
     set_disk::SetDisks,
     store_api::{
