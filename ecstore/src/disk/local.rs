@@ -1,15 +1,13 @@
-use std::{
-    fs::Metadata,
-    io::{self, SeekFrom},
-    os::unix::ffi::OsStringExt,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-
-use anyhow::{Error, Result};
+use super::{error::DiskError, format::FormatV3};
 use bytes::Bytes;
 use futures::future::join_all;
 use path_absolutize::Absolutize;
+use std::{
+    fs::Metadata,
+    io::{self, SeekFrom},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, ErrorKind};
 use tokio::{
@@ -21,26 +19,18 @@ use uuid::Uuid;
 
 use crate::{
     disk_api::{
-        DeleteOptions, DiskAPI, DiskError, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        RenameDataResp, VolumeInfo,
+        DeleteOptions, DiskAPI, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+        VolumeInfo,
     },
     endpoint::{Endpoint, Endpoints},
     erasure::ReadAt,
+    error::{Error, Result},
     file_meta::FileMeta,
-    format::FormatV3,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
 
 pub type DiskStore = Arc<Box<dyn DiskAPI>>;
-
-pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
-pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
-pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
-pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
-pub const BUCKET_META_PREFIX: &str = "buckets";
-pub const FORMAT_CONFIG_FILE: &str = "format.json";
-const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 pub struct DiskOption {
     pub cleanup: bool,
@@ -108,8 +98,8 @@ impl LocalDisk {
             // TODO: 删除tmp数据
         }
 
-        let format_path = Path::new(RUSTFS_META_BUCKET)
-            .join(Path::new(FORMAT_CONFIG_FILE))
+        let format_path = Path::new(super::RUSTFS_META_BUCKET)
+            .join(Path::new(super::FORMAT_CONFIG_FILE))
             .absolutize_virtually(&root)?
             .into_owned();
 
@@ -125,7 +115,7 @@ impl LocalDisk {
             let (set_idx, disk_idx) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
 
             if Some(set_idx) != ep.set_idx || Some(disk_idx) != ep.disk_idx {
-                return Err(Error::new(DiskError::InconsistentDisk));
+                return Err(Error::from(DiskError::InconsistentDisk));
             }
 
             id = fm.erasure.this;
@@ -149,10 +139,10 @@ impl LocalDisk {
     }
 
     async fn make_meta_volumes(&self) -> Result<()> {
-        let buckets = format!("{}/{}", RUSTFS_META_BUCKET, BUCKET_META_PREFIX);
-        let multipart = format!("{}/{}", RUSTFS_META_BUCKET, "multipart");
-        let config = format!("{}/{}", RUSTFS_META_BUCKET, "config");
-        let tmp = format!("{}/{}", RUSTFS_META_BUCKET, "tmp");
+        let buckets = format!("{}/{}", super::RUSTFS_META_BUCKET, super::BUCKET_META_PREFIX);
+        let multipart = format!("{}/{}", super::RUSTFS_META_BUCKET, "multipart");
+        let config = format!("{}/{}", super::RUSTFS_META_BUCKET, "config");
+        let tmp = format!("{}/{}", super::RUSTFS_META_BUCKET, "tmp");
         let defaults = vec![buckets.as_str(), multipart.as_str(), config.as_str(), tmp.as_str()];
 
         self.make_volumes(defaults).await
@@ -217,7 +207,7 @@ impl LocalDisk {
         }
 
         if recursive {
-            let trash_path = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+            let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
             // fs::create_dir_all(&trash_path).await?;
             fs::rename(&delete_path, &trash_path).await.map_err(|err| {
                 // 使用文件路径自定义错误信息
@@ -253,7 +243,7 @@ impl LocalDisk {
         path: impl AsRef<Path>,
         read_data: bool,
     ) -> Result<(Vec<u8>, OffsetDateTime)> {
-        let meta_path = path.as_ref().join(Path::new(STORAGE_FORMAT_FILE));
+        let meta_path = path.as_ref().join(Path::new(super::STORAGE_FORMAT_FILE));
         if read_data {
             self.read_all_data(bucket, volume_dir, meta_path).await
         } else {
@@ -299,7 +289,7 @@ pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Vec<u8>, Option
     let (data, meta) = match read_file_all(&p).await {
         Ok((data, meta)) => (data, Some(meta)),
         Err(e) => {
-            if DiskError::is_err(&e, &DiskError::FileNotFound) {
+            if DiskError::FileNotFound.is(&e) {
                 (Vec::new(), None)
             } else {
                 return Err(e);
@@ -334,9 +324,9 @@ pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Vec<u8>, Metadata)
 
 pub async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
     let meta = fs::metadata(&p).await.map_err(|e| match e.kind() {
-        ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
-        ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
-        _ => Error::new(e),
+        ErrorKind::NotFound => Error::from(DiskError::FileNotFound),
+        ErrorKind::PermissionDenied => Error::from(DiskError::FileAccessDenied),
+        _ => Error::from(e),
     })?;
 
     Ok(meta)
@@ -344,19 +334,19 @@ pub async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
 
 pub async fn check_volume_exists(p: impl AsRef<Path>) -> Result<()> {
     fs::metadata(&p).await.map_err(|e| match e.kind() {
-        ErrorKind::NotFound => Error::new(DiskError::VolumeNotFound),
-        ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
-        _ => Error::new(e),
+        ErrorKind::NotFound => Error::from(DiskError::VolumeNotFound),
+        ErrorKind::PermissionDenied => Error::from(DiskError::FileAccessDenied),
+        _ => Error::from(e),
     })?;
     Ok(())
 }
 
 fn skip_access_checks(p: impl AsRef<str>) -> bool {
     let vols = vec![
-        RUSTFS_META_TMP_DELETED_BUCKET,
-        RUSTFS_META_TMP_BUCKET,
-        RUSTFS_META_MULTIPART_BUCKET,
-        RUSTFS_META_BUCKET,
+        super::RUSTFS_META_TMP_DELETED_BUCKET,
+        super::RUSTFS_META_TMP_BUCKET,
+        super::RUSTFS_META_MULTIPART_BUCKET,
+        super::RUSTFS_META_BUCKET,
     ];
 
     for v in vols.iter() {
@@ -435,7 +425,7 @@ impl DiskAPI for LocalDisk {
         let src_is_dir = srcp.is_dir();
         let dst_is_dir = dstp.is_dir();
         if !(src_is_dir && dst_is_dir || !src_is_dir && !dst_is_dir) {
-            return Err(Error::new(DiskError::FileAccessDenied));
+            return Err(Error::from(DiskError::FileAccessDenied));
         }
 
         // TODO: check path length
@@ -541,16 +531,11 @@ impl DiskAPI for LocalDisk {
 
         while let Some(entry) = entries.next_entry().await? {
             if let Ok(metadata) = entry.metadata().await {
-                let vec = entry.file_name().into_vec();
-
                 // if !metadata.is_dir() {
                 //     continue;
                 // }
 
-                let name = match String::from_utf8(vec) {
-                    Ok(s) => s,
-                    Err(_) => return Err(Error::msg("Not supported utf8 file name on this platform")),
-                };
+                let name = entry.file_name().to_string_lossy().to_string();
 
                 // let created = match metadata.created() {
                 //     Ok(md) => OffsetDateTime::from(md),
@@ -584,8 +569,10 @@ impl DiskAPI for LocalDisk {
             check_volume_exists(&dst_volume_path).await?;
         }
 
-        let src_file_path = self.get_object_path(&src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str())?;
-        let dst_file_path = self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str())?;
+        let src_file_path =
+            self.get_object_path(&src_volume, format!("{}/{}", &src_path, super::STORAGE_FORMAT_FILE).as_str())?;
+        let dst_file_path =
+            self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, super::STORAGE_FORMAT_FILE).as_str())?;
 
         let (src_data_path, dst_data_path) = {
             let mut data_dir = String::new();
@@ -639,7 +626,7 @@ impl DiskAPI for LocalDisk {
 
         self.rename_all(&src_file_path, &dst_file_path, &skip_parent).await?;
 
-        if src_volume != RUSTFS_META_MULTIPART_BUCKET {
+        if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
             fs::remove_dir(&src_file_path.parent().unwrap()).await?;
         } else {
             self.delete_file(&src_volume_path, &PathBuf::from(src_file_path.parent().unwrap()), true, false)
@@ -673,11 +660,11 @@ impl DiskAPI for LocalDisk {
                     fs::create_dir_all(&p).await?;
                     return Ok(());
                 }
-                _ => return Err(Error::new(e)),
+                _ => return Err(Error::from(e)),
             },
         }
 
-        Err(Error::new(DiskError::VolumeExists))
+        Err(Error::from(DiskError::VolumeExists))
     }
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
         let mut entries = fs::read_dir(&self.root).await?;
@@ -686,16 +673,11 @@ impl DiskAPI for LocalDisk {
 
         while let Some(entry) = entries.next_entry().await? {
             if let Ok(metadata) = entry.metadata().await {
-                let vec = entry.file_name().into_vec();
-
                 // if !metadata.is_dir() {
                 //     continue;
                 // }
 
-                let name = match String::from_utf8(vec) {
-                    Ok(s) => s,
-                    Err(_) => return Err(Error::msg("Not supported utf8 file name on this platform")),
-                };
+                let name = entry.file_name().to_string_lossy().to_string();
 
                 let created = match metadata.created() {
                     Ok(md) => OffsetDateTime::from(md),
@@ -724,7 +706,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
-        let p = self.get_object_path(&volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())?;
+        let p = self.get_object_path(&volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;
 
         warn!("write_metadata {:?} {:?}", &p, &fi);
 
@@ -811,7 +793,7 @@ impl DiskAPI for LocalDisk {
                     }
                 }
                 Err(e) => {
-                    if !(DiskError::is_err(&e, &DiskError::FileNotFound) || DiskError::is_err(&e, &DiskError::VolumeNotFound)) {
+                    if !(DiskError::FileNotFound.is(&e) || DiskError::VolumeNotFound.is(&e)) {
                         res.exists = true;
                         res.error = e.to_string();
                     }
@@ -848,10 +830,10 @@ mod test {
         // let arr = Vec::new();
 
         let vols = vec![
-            RUSTFS_META_TMP_DELETED_BUCKET,
-            RUSTFS_META_TMP_BUCKET,
-            RUSTFS_META_MULTIPART_BUCKET,
-            RUSTFS_META_BUCKET,
+            super::super::RUSTFS_META_TMP_DELETED_BUCKET,
+            super::super::RUSTFS_META_TMP_BUCKET,
+            super::super::RUSTFS_META_MULTIPART_BUCKET,
+            super::super::RUSTFS_META_BUCKET,
         ];
 
         let paths: Vec<_> = vols.iter().map(|v| Path::new(v).join("test")).collect();
@@ -876,7 +858,9 @@ mod test {
 
         let disk = LocalDisk::new(&ep, false).await.unwrap();
 
-        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
+        let tmpp = disk
+            .resolve_abs_path(Path::new(super::super::RUSTFS_META_TMP_DELETED_BUCKET))
+            .unwrap();
 
         println!("ppp :{:?}", &tmpp);
 
@@ -904,7 +888,9 @@ mod test {
 
         let disk = LocalDisk::new(&ep, false).await.unwrap();
 
-        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
+        let tmpp = disk
+            .resolve_abs_path(Path::new(super::super::RUSTFS_META_TMP_DELETED_BUCKET))
+            .unwrap();
 
         println!("ppp :{:?}", &tmpp);
 

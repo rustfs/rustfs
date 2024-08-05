@@ -1,6 +1,6 @@
 mod bucket_meta;
 mod chunk_stream;
-mod disk;
+pub mod disk;
 pub mod disk_api;
 mod disks_layout;
 mod ellipses;
@@ -8,7 +8,6 @@ mod endpoint;
 mod erasure;
 pub mod error;
 mod file_meta;
-mod format;
 mod peer;
 pub mod set_disk;
 mod sets;

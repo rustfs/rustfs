@@ -1,7 +1,4 @@
-use crate::error::StdError;
-use anyhow::anyhow;
-use anyhow::Error;
-use anyhow::Result;
+use crate::error::{Error, Result, StdError};
 use bytes::Bytes;
 use futures::future::join_all;
 use futures::{Stream, StreamExt};
@@ -16,7 +13,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::chunk_stream::ChunkedStream;
-use crate::disk_api::DiskError;
+use crate::disk::error::DiskError;
 use crate::disk_api::FileReader;
 
 pub struct Erasure {
@@ -98,7 +95,7 @@ impl Erasure {
                     //     }
                     // }
                 }
-                Err(e) => return Err(anyhow!(e)),
+                Err(e) => return Err(Error::from_std_error(e)),
             }
         }
 

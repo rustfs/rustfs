@@ -1,8 +1,8 @@
 mod config;
 mod storage;
 
-use anyhow::Result;
 use clap::Parser;
+use ecstore::error::Result;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
@@ -38,9 +38,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(
-            storage::ecfs::FS::new(opt.address.clone(), opt.volumes.clone()).await?,
-        );
+        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), opt.volumes.clone()).await?);
 
         // Enable authentication
         if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {

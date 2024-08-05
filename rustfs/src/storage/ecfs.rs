@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use ecstore::disk_api::DiskError;
+use ecstore::disk::error::DiskError;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
 use ecstore::store_api::HTTPRangeSpec;
@@ -23,7 +23,7 @@ use std::str::FromStr;
 use time::OffsetDateTime;
 use transform_stream::AsyncTryStream;
 
-use anyhow::Result;
+use ecstore::error::Result;
 use ecstore::store::ECStore;
 use tracing::debug;
 
@@ -112,7 +112,7 @@ impl S3 for FS {
         let input = req.input;
 
         if let Err(e) = self.store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
-            if DiskError::is_err(&e, &DiskError::VolumeNotFound) {
+            if DiskError::VolumeNotFound.is(&e) {
                 return Err(s3_error!(NoSuchBucket));
             } else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
@@ -179,7 +179,7 @@ impl S3 for FS {
         let input = req.input;
 
         if let Err(e) = self.store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
-            if DiskError::is_err(&e, &DiskError::VolumeNotFound) {
+            if DiskError::VolumeNotFound.is(&e) {
                 return Err(s3_error!(NoSuchBucket));
             } else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));

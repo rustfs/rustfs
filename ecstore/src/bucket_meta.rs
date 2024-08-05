@@ -2,7 +2,7 @@ use rmp_serde::Serializer;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::disk::BUCKET_META_PREFIX;
 
@@ -40,12 +40,7 @@ impl BucketMetadata {
     }
 
     pub fn save_file_path(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            BUCKET_META_PREFIX,
-            self.name.as_str(),
-            BUCKET_METADATA_FILE
-        )
+        format!("{}/{}/{}", BUCKET_META_PREFIX, self.name.as_str(), BUCKET_METADATA_FILE)
         // PathBuf::new()
         //     .join(BUCKET_META_PREFIX)
         //     .join(self.name.as_str())
