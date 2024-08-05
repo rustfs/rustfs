@@ -3,12 +3,11 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    disk::error::DiskError,
+    disk::format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
     disk::{DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET},
-    disk_api::DiskError,
-    format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
+    error::{Error, Result},
 };
-
-use anyhow::{Error, Result};
 
 use std::{
     collections::{hash_map::Entry, HashMap},

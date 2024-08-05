@@ -1,11 +1,11 @@
-use anyhow::Result;
 use http::HeaderMap;
 use uuid::Uuid;
 
 use crate::{
+    disk::format::{DistributionAlgoVersion, FormatV3},
     disk::DiskStore,
     endpoint::PoolEndpoints,
-    format::{DistributionAlgoVersion, FormatV3},
+    error::Result,
     set_disk::SetDisks,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, FileInfo, GetObjectReader, HTTPRangeSpec, MakeBucketOptions,

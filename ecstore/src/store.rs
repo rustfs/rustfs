@@ -1,18 +1,10 @@
-use std::collections::HashMap;
-
-use anyhow::{Error, Result};
-
-use http::HeaderMap;
-use s3s::{dto::StreamingBlob, Body};
-use tracing::debug;
-use uuid::Uuid;
-
 use crate::{
     bucket_meta::BucketMetadata,
+    disk::error::DiskError,
     disk::{self, DiskOption, DiskStore, RUSTFS_META_BUCKET},
-    disk_api::DiskError,
     disks_layout::DisksLayout,
     endpoint::EndpointServerPools,
+    error::{Error, Result},
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
     store_api::{
@@ -21,6 +13,11 @@ use crate::{
     },
     store_init, utils,
 };
+use http::HeaderMap;
+use s3s::{dto::StreamingBlob, Body};
+use std::collections::HashMap;
+use tracing::debug;
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct ECStore {
@@ -34,12 +31,11 @@ pub struct ECStore {
 
 impl ECStore {
     pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
-        let layouts = DisksLayout::try_from(endpoints.as_slice()).map_err(|v| Error::msg(v))?;
+        let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 
         let mut deployment_id = None;
 
-        let (endpoint_pools, _) =
-            EndpointServerPools::create_server_endpoints(address.as_str(), &layouts).map_err(|v| Error::msg(v))?;
+        let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
 
         let mut pools = Vec::with_capacity(endpoint_pools.as_ref().len());
         let mut disk_map = HashMap::with_capacity(endpoint_pools.as_ref().len());

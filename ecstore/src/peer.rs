@@ -1,13 +1,13 @@
-use anyhow::{Error, Result};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tracing::warn;
 
 use crate::{
-    disk::DiskStore,
-    disk_api::{DiskError, VolumeInfo},
+    disk::{error::DiskError, DiskStore},
+    disk_api::VolumeInfo,
     endpoint::{EndpointServerPools, Node},
+    error::{Error, Result},
     store_api::{BucketInfo, BucketOptions, MakeBucketOptions},
 };
 
@@ -284,7 +284,7 @@ impl PeerS3Client for LocalPeerS3Client {
                 match disk.make_volume(bucket).await {
                     Ok(_) => Ok(()),
                     Err(e) => {
-                        if opts.force_create && DiskError::is_err(&e, &DiskError::VolumeExists) {
+                        if opts.force_create && DiskError::VolumeExists.is(&e) {
                             return Ok(());
                         }
 

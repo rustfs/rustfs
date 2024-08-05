@@ -14,9 +14,16 @@ impl Error {
     /// Create a new error from a `std::error::Error`.
     #[must_use]
     #[track_caller]
-    pub fn new(source: StdError) -> Self {
+    pub fn new<T: std::error::Error + Send + Sync + 'static>(source: T) -> Self {
+        Self::from_std_error(source.into())
+    }
+
+    /// Create a new error from a `std::error::Error`.
+    #[must_use]
+    #[track_caller]
+    pub fn from_std_error(inner: StdError) -> Self {
         Self {
-            inner: source,
+            inner,
             span_trace: SpanTrace::capture(),
         }
     }
@@ -25,7 +32,14 @@ impl Error {
     #[must_use]
     #[track_caller]
     pub fn from_string(s: impl Into<String>) -> Self {
-        Self::new(s.into().into())
+        Self::msg(s)
+    }
+
+    /// Create a new error from a string.
+    #[must_use]
+    #[track_caller]
+    pub fn msg(s: impl Into<String>) -> Self {
+        Self::from_std_error(s.into().into())
     }
 
     /// Returns `true` if the inner type is the same as `T`.
@@ -51,7 +65,7 @@ impl Error {
 
 impl<T: std::error::Error + Send + Sync + 'static> From<T> for Error {
     fn from(e: T) -> Self {
-        Self::new(e.into())
+        Self::new(e)
     }
 }
 

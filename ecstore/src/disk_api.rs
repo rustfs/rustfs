@@ -1,6 +1,5 @@
 use std::{fmt::Debug, io::SeekFrom, pin::Pin};
 
-use anyhow::{Error, Result};
 use bytes::Bytes;
 use time::OffsetDateTime;
 use tokio::{
@@ -11,6 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     erasure::ReadAt,
+    error::{Error, Result},
     store_api::{FileInfo, RawFileInfo},
 };
 
@@ -173,121 +173,5 @@ impl ReadAt for FileReader {
         buffer.truncate(bytes_read);
 
         Ok((buffer, bytes_read))
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum DiskError {
-    #[error("file not found")]
-    FileNotFound,
-
-    #[error("file version not found")]
-    FileVersionNotFound,
-
-    #[error("disk not found")]
-    DiskNotFound,
-
-    #[error("disk access denied")]
-    FileAccessDenied,
-
-    #[error("InconsistentDisk")]
-    InconsistentDisk,
-
-    #[error("volume already exists")]
-    VolumeExists,
-
-    #[error("unformatted disk error")]
-    UnformattedDisk,
-
-    #[error("unsupport disk")]
-    UnsupportedDisk,
-
-    #[error("disk not a dir")]
-    DiskNotDir,
-
-    #[error("volume not found")]
-    VolumeNotFound,
-}
-
-impl DiskError {
-    pub fn check_disk_fatal_errs(errs: &Vec<Option<Error>>) -> Result<()> {
-        if Self::count_errs(errs, &DiskError::UnsupportedDisk) == errs.len() {
-            return Err(Error::new(DiskError::UnsupportedDisk));
-        }
-
-        // if count_errs(errs, &DiskError::DiskAccessDenied) == errs.len() {
-        //     return Err(Error::new(DiskError::DiskAccessDenied));
-        // }
-
-        if Self::count_errs(errs, &DiskError::FileAccessDenied) == errs.len() {
-            return Err(Error::new(DiskError::FileAccessDenied));
-        }
-
-        // if count_errs(errs, &DiskError::FaultyDisk) == errs.len() {
-        //     return Err(Error::new(DiskError::FaultyDisk));
-        // }
-
-        if Self::count_errs(errs, &DiskError::DiskNotDir) == errs.len() {
-            return Err(Error::new(DiskError::DiskNotDir));
-        }
-
-        // if count_errs(errs, &DiskError::XLBackend) == errs.len() {
-        //     return Err(Error::new(DiskError::XLBackend));
-        // }
-        Ok(())
-    }
-    pub fn count_errs(errs: &Vec<Option<Error>>, err: &DiskError) -> usize {
-        return errs
-            .iter()
-            .filter(|&e| {
-                if e.is_some() {
-                    let e = e.as_ref().unwrap();
-                    let cast = e.downcast_ref::<DiskError>();
-                    if cast.is_some() {
-                        let cast = cast.unwrap();
-                        return cast == err;
-                    }
-                }
-                false
-            })
-            .count();
-    }
-
-    pub fn quorum_unformatted_disks(errs: &Vec<Option<Error>>) -> bool {
-        Self::count_errs(errs, &DiskError::UnformattedDisk) >= (errs.len() / 2) + 1
-    }
-
-    pub fn is_err(err: &Error, disk_err: &DiskError) -> bool {
-        let cast = err.downcast_ref::<DiskError>();
-        if cast.is_none() {
-            return false;
-        }
-
-        let e = cast.unwrap();
-
-        e == disk_err
-    }
-
-    // pub fn match_err(err: Error, matchs: Vec<DiskError>) -> bool {
-    //     let cast = err.downcast_ref::<DiskError>();
-    //     if cast.is_none() {
-    //         return false;
-    //     }
-
-    //     let e = cast.unwrap();
-
-    //     for i in matchs.iter() {
-    //         if e == i {
-    //             return true;
-    //         }
-    //     }
-
-    //     return false;
-    // }
-}
-
-impl PartialEq for DiskError {
-    fn eq(&self, other: &Self) -> bool {
-        core::mem::discriminant(self) == core::mem::discriminant(other)
     }
 }
