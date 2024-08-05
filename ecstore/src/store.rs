@@ -16,7 +16,6 @@ use crate::{
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
 use std::collections::HashMap;
-use tracing::debug;
 use uuid::Uuid;
 
 #[derive(Debug)]

@@ -1,6 +1,5 @@
+use crate::error::{Error, Result};
 use lazy_static::*;
-
-use super::error::{Error, Result};
 use regex::Regex;
 
 lazy_static! {

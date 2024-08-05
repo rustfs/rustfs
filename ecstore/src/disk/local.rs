@@ -4,16 +4,12 @@ use futures::future::join_all;
 use path_absolutize::Absolutize;
 use std::{
     fs::Metadata,
-    io::{self, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
 };
 use time::OffsetDateTime;
-use tokio::io::{AsyncReadExt, ErrorKind};
-use tokio::{
-    fs::{self, File},
-    io::AsyncSeekExt,
-};
+use tokio::fs::{self, File};
+use tokio::io::ErrorKind;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -23,7 +19,6 @@ use crate::{
         VolumeInfo,
     },
     endpoint::{Endpoint, Endpoints},
-    erasure::ReadAt,
     error::{Error, Result},
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
@@ -127,7 +122,7 @@ impl LocalDisk {
             root,
             id,
             format_meta,
-            format_data: format_data,
+            format_data,
             format_path,
             // format_legacy,
             format_last_check,
@@ -181,7 +176,7 @@ impl LocalDisk {
     // }
 
     pub async fn rename_all(&self, src_data_path: &PathBuf, dst_data_path: &PathBuf, skip: &PathBuf) -> Result<()> {
-        if !skip.starts_with(&src_data_path) {
+        if !skip.starts_with(src_data_path) {
             fs::create_dir_all(dst_data_path.parent().unwrap_or(Path::new("/"))).await?;
         }
 
@@ -211,7 +206,7 @@ impl LocalDisk {
             // fs::create_dir_all(&trash_path).await?;
             fs::rename(&delete_path, &trash_path).await.map_err(|err| {
                 // 使用文件路径自定义错误信息
-                io::Error::new(
+                std::io::Error::new(
                     err.kind(),
                     format!("Failed to rename file '{:?}' to '{:?}': {}", &delete_path, &trash_path, err),
                 )
@@ -279,8 +274,8 @@ impl LocalDisk {
     }
 }
 
-fn is_root_path(path: &PathBuf) -> bool {
-    path.components().count() == 1 && path.has_root()
+fn is_root_path(path: impl AsRef<Path>) -> bool {
+    path.as_ref().components().count() == 1 && path.as_ref().has_root()
 }
 
 // 过滤 std::io::ErrorKind::NotFound
@@ -342,7 +337,7 @@ pub async fn check_volume_exists(p: impl AsRef<Path>) -> Result<()> {
 }
 
 fn skip_access_checks(p: impl AsRef<str>) -> bool {
-    let vols = vec![
+    let vols = [
         super::RUSTFS_META_TMP_DELETED_BUCKET,
         super::RUSTFS_META_TMP_BUCKET,
         super::RUSTFS_META_MULTIPART_BUCKET,
@@ -370,14 +365,14 @@ impl DiskAPI for LocalDisk {
 
     #[must_use]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
-        let p = self.get_object_path(&volume, &path)?;
+        let p = self.get_object_path(volume, path)?;
         let (data, _) = read_file_all(&p).await?;
 
         Ok(Bytes::from(data))
     }
 
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
-        let p = self.get_object_path(&volume, &path)?;
+        let p = self.get_object_path(volume, path)?;
 
         write_all_internal(p, data).await?;
 
@@ -385,12 +380,12 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        let vol_path = self.get_bucket_path(&volume)?;
-        if !skip_access_checks(&volume) {
+        let vol_path = self.get_bucket_path(volume)?;
+        if !skip_access_checks(volume) {
             check_volume_exists(&vol_path).await?;
         }
 
-        let fpath = self.get_object_path(&volume, &path)?;
+        let fpath = self.get_object_path(volume, path)?;
 
         self.delete_file(&vol_path, &fpath, opt.recursive, opt.immediate).await?;
 
@@ -410,17 +405,17 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
-        let src_volume_path = self.get_bucket_path(&src_volume)?;
-        if !skip_access_checks(&src_volume) {
+        let src_volume_path = self.get_bucket_path(src_volume)?;
+        if !skip_access_checks(src_volume) {
             check_volume_exists(&src_volume_path).await?;
         }
-        if !skip_access_checks(&dst_volume) {
-            let vol_path = self.get_bucket_path(&dst_volume)?;
+        if !skip_access_checks(dst_volume) {
+            let vol_path = self.get_bucket_path(dst_volume)?;
             check_volume_exists(&vol_path).await?;
         }
 
-        let srcp = self.get_object_path(&src_volume, &src_path)?;
-        let dstp = self.get_object_path(&dst_volume, &dst_path)?;
+        let srcp = self.get_object_path(src_volume, src_path)?;
+        let dstp = self.get_object_path(dst_volume, dst_path)?;
 
         let src_is_dir = srcp.is_dir();
         let dst_is_dir = dstp.is_dir();
@@ -477,7 +472,7 @@ impl DiskAPI for LocalDisk {
     }
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        let p = self.get_object_path(&volume, &path)?;
+        let p = self.get_object_path(volume, path)?;
 
         if let Some(dir_path) = p.parent() {
             fs::create_dir_all(&dir_path).await?;
@@ -505,7 +500,7 @@ impl DiskAPI for LocalDisk {
         // Ok(())
     }
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        let p = self.get_object_path(&volume, &path)?;
+        let p = self.get_object_path(volume, path)?;
 
         debug!("read_file {:?}", &p);
         let file = File::options().read(true).open(&p).await?;
@@ -523,7 +518,7 @@ impl DiskAPI for LocalDisk {
         // Ok((buffer, bytes_read))
     }
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: usize) -> Result<Vec<String>> {
-        let p = self.get_bucket_path(&volume)?;
+        let p = self.get_bucket_path(volume)?;
 
         let mut entries = fs::read_dir(&p).await?;
 
@@ -559,20 +554,18 @@ impl DiskAPI for LocalDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        let src_volume_path = self.get_bucket_path(&src_volume)?;
-        if !skip_access_checks(&src_volume) {
+        let src_volume_path = self.get_bucket_path(src_volume)?;
+        if !skip_access_checks(src_volume) {
             check_volume_exists(&src_volume_path).await?;
         }
 
-        let dst_volume_path = self.get_bucket_path(&dst_volume)?;
-        if !skip_access_checks(&dst_volume) {
+        let dst_volume_path = self.get_bucket_path(dst_volume)?;
+        if !skip_access_checks(dst_volume) {
             check_volume_exists(&dst_volume_path).await?;
         }
 
-        let src_file_path =
-            self.get_object_path(&src_volume, format!("{}/{}", &src_path, super::STORAGE_FORMAT_FILE).as_str())?;
-        let dst_file_path =
-            self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, super::STORAGE_FORMAT_FILE).as_str())?;
+        let src_file_path = self.get_object_path(src_volume, format!("{}/{}", &src_path, super::STORAGE_FORMAT_FILE).as_str())?;
+        let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", &dst_path, super::STORAGE_FORMAT_FILE).as_str())?;
 
         let (src_data_path, dst_data_path) = {
             let mut data_dir = String::new();
@@ -582,10 +575,10 @@ impl DiskAPI for LocalDisk {
 
             if !data_dir.is_empty() {
                 let src_data_path = self.get_object_path(
-                    &src_volume,
+                    src_volume,
                     utils::path::retain_slash(format!("{}/{}", &src_path, data_dir).as_str()).as_str(),
                 )?;
-                let dst_data_path = self.get_object_path(&dst_volume, format!("{}/{}", &dst_path, data_dir).as_str())?;
+                let dst_data_path = self.get_object_path(dst_volume, format!("{}/{}", &dst_path, data_dir).as_str())?;
 
                 (src_data_path, dst_data_path)
             } else {
@@ -652,7 +645,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
     async fn make_volume(&self, volume: &str) -> Result<()> {
-        let p = self.get_bucket_path(&volume)?;
+        let p = self.get_bucket_path(volume)?;
         match File::open(&p).await {
             Ok(_) => (),
             Err(e) => match e.kind() {
@@ -706,7 +699,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
-        let p = self.get_object_path(&volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;
+        let p = self.get_object_path(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;
 
         warn!("write_metadata {:?} {:?}", &p, &fi);
 
@@ -812,7 +805,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn delete_volume(&self, volume: &str) -> Result<()> {
-        let p = self.get_bucket_path(&volume)?;
+        let p = self.get_bucket_path(volume)?;
 
         fs::remove_dir_all(&p).await?;
 
@@ -829,7 +822,7 @@ mod test {
     async fn test_skip_access_checks() {
         // let arr = Vec::new();
 
-        let vols = vec![
+        let vols = [
             super::super::RUSTFS_META_TMP_DELETED_BUCKET,
             super::super::RUSTFS_META_TMP_BUCKET,
             super::super::RUSTFS_META_MULTIPART_BUCKET,
