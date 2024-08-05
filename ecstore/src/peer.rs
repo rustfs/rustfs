@@ -4,8 +4,8 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tracing::warn;
 
 use crate::{
+    disk::VolumeInfo,
     disk::{error::DiskError, DiskStore},
-    disk_api::VolumeInfo,
     endpoint::{EndpointServerPools, Node},
     error::{Error, Result},
     store_api::{BucketInfo, BucketOptions, MakeBucketOptions},
