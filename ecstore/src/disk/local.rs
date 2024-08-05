@@ -1,4 +1,7 @@
 use super::{error::DiskError, format::FormatV3};
+use super::{
+    DeleteOptions, DiskAPI, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, VolumeInfo,
+};
 use bytes::Bytes;
 use futures::future::join_all;
 use path_absolutize::Absolutize;
@@ -14,10 +17,6 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    disk_api::{
-        DeleteOptions, DiskAPI, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-        VolumeInfo,
-    },
     endpoint::{Endpoint, Endpoints},
     error::{Error, Result},
     file_meta::FileMeta,

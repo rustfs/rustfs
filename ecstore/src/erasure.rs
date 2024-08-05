@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::chunk_stream::ChunkedStream;
 use crate::disk::error::DiskError;
-use crate::disk_api::FileReader;
+use crate::disk::FileReader;
 
 pub struct Erasure {
     data_shards: usize,

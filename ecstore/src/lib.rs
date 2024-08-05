@@ -1,7 +1,6 @@
 mod bucket_meta;
 mod chunk_stream;
 pub mod disk;
-pub mod disk_api;
 mod disks_layout;
 mod endpoint;
 mod erasure;
