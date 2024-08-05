@@ -2,7 +2,7 @@ mod bucket_meta;
 mod chunk_stream;
 pub mod disk;
 mod disks_layout;
-mod endpoint;
+mod endpoints;
 mod erasure;
 pub mod error;
 mod file_meta;

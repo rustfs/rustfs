@@ -3,7 +3,7 @@ use crate::{
     disk::error::DiskError,
     disk::{self, DiskOption, DiskStore, RUSTFS_META_BUCKET},
     disks_layout::DisksLayout,
-    endpoint::EndpointServerPools,
+    endpoints::EndpointServerPools,
     error::{Error, Result},
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
