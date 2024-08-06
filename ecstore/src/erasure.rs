@@ -17,10 +17,10 @@ use crate::disk::FileReader;
 
 pub struct Erasure {
     data_shards: usize,
-    parity_shards: usize,
+    _parity_shards: usize,
     encoder: ReedSolomon,
     block_size: usize,
-    id: Uuid,
+    _id: Uuid,
 }
 
 impl Erasure {
@@ -31,17 +31,17 @@ impl Erasure {
         );
         Erasure {
             data_shards,
-            parity_shards,
+            _parity_shards: parity_shards,
             block_size,
             encoder: ReedSolomon::new(data_shards, parity_shards).unwrap(),
-            id: Uuid::new_v4(),
+            _id: Uuid::new_v4(),
         }
     }
 
     pub async fn encode<S, W>(
         &self,
         body: S,
-        writers: &mut Vec<W>,
+        writers: &mut [W],
         // block_size: usize,
         total_size: usize,
         _write_quorum: usize,
@@ -134,21 +134,16 @@ impl Erasure {
         let mut bytes_writed = 0;
 
         for block_idx in start_block..=end_block {
-            let mut block_offset = 0;
-            let mut block_length = 0;
-            if start_block == end_block {
-                block_offset = offset % self.block_size;
-                block_length = length;
+            let (block_offset, block_length) = if start_block == end_block {
+                (offset % self.block_size, length)
             } else if block_idx == start_block {
-                block_offset = offset % self.block_size;
-                block_length = self.block_size - block_offset;
+                let block_offset = offset % self.block_size;
+                (block_offset, self.block_size - block_offset)
             } else if block_idx == end_block {
-                block_offset = 0;
-                block_length = (offset + length) % self.block_size;
+                (0, (offset + length) % self.block_size)
             } else {
-                block_offset = 0;
-                block_length = self.block_size;
-            }
+                (0, self.block_size)
+            };
 
             if block_length == 0 {
                 // debug!("block_length == 0 break");
@@ -272,7 +267,7 @@ impl Erasure {
         Ok(shards)
     }
 
-    pub fn decode_data(&self, shards: &mut Vec<Option<Vec<u8>>>) -> Result<()> {
+    pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> Result<()> {
         self.encoder.reconstruct(shards)?;
         Ok(())
     }
@@ -385,7 +380,8 @@ impl ShardReader {
 
         Ok(ress)
     }
-    fn can_decode(&self, bufs: &Vec<Option<Vec<u8>>>) -> bool {
+
+    fn can_decode(&self, bufs: &[Option<Vec<u8>>]) -> bool {
         bufs.iter().filter(|v| v.is_some()).count() > self.data_block_count
     }
 }

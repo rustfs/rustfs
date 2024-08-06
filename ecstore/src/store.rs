@@ -68,7 +68,7 @@ impl ECStore {
             .await?;
 
             if deployment_id.is_none() {
-                deployment_id = Some(fm.id.clone());
+                deployment_id = Some(fm.id);
             }
 
             if deployment_id != Some(fm.id) {

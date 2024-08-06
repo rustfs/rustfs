@@ -4,8 +4,6 @@ use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tokio::io::{AsyncRead, DuplexStream};
-use tracing::warn;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -56,7 +54,7 @@ impl FileInfo {
     }
 
     pub fn unmarshal(buf: &[u8]) -> Result<Self> {
-        let t: FileInfo = rmp_serde::from_slice(&buf)?;
+        let t: FileInfo = rmp_serde::from_slice(buf)?;
         Ok(t)
     }
 
@@ -80,7 +78,7 @@ impl FileInfo {
         self.parts.sort_by(|a, b| a.number.cmp(&b.number));
     }
 
-    pub fn into_object_info(&self, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+    pub fn into_object_info(&self, bucket: &str, object: &str, _versioned: bool) -> ObjectInfo {
         ObjectInfo {
             bucket: bucket.to_string(),
             name: object.to_string(),
@@ -151,8 +149,8 @@ impl FileInfo {
         Self {
             erasure: ErasureInfo {
                 algorithm: String::from(ERASURE_ALGORITHM),
-                data_blocks: data_blocks,
-                parity_blocks: parity_blocks,
+                data_blocks,
+                parity_blocks,
                 block_size: BLOCK_SIZE_V2,
                 distribution: indexs,
                 ..Default::default()
@@ -272,7 +270,7 @@ pub struct GetObjectReader {
 // }
 
 pub struct HTTPRangeSpec {
-    pub is_shuffix_length: bool,
+    pub is_suffix_length: bool,
     pub start: i64,
     pub end: i64,
 }
@@ -280,7 +278,7 @@ pub struct HTTPRangeSpec {
 impl HTTPRangeSpec {
     pub fn nil() -> Self {
         Self {
-            is_shuffix_length: false,
+            is_suffix_length: false,
             start: -1,
             end: -1,
         }
@@ -303,9 +301,9 @@ impl HTTPRangeSpec {
         }
 
         HTTPRangeSpec {
-            is_shuffix_length: false,
-            start: start,
-            end: end,
+            is_suffix_length: false,
+            start,
+            end,
         }
     }
 
@@ -316,7 +314,7 @@ impl HTTPRangeSpec {
 
         let len = self.get_length(res_size)?;
         let mut start = self.start;
-        if self.is_shuffix_length {
+        if self.is_suffix_length {
             start = self.start + res_size
         }
         Ok((start, len))
@@ -326,7 +324,7 @@ impl HTTPRangeSpec {
             return Ok(res_size);
         }
 
-        if self.is_shuffix_length {
+        if self.is_suffix_length {
             let specified_len = -self.start; // 假设 h.start 是一个 i64 类型
             let mut range_length = specified_len;
 
