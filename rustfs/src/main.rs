@@ -11,6 +11,8 @@ use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use std::io::IsTerminal;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
+use tracing_error::ErrorLayer;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -18,11 +20,14 @@ fn setup_tracing() {
     let env_filter = EnvFilter::from_default_env();
     let enable_color = std::io::stdout().is_terminal();
 
-    tracing_subscriber::fmt()
+    let subscriber = fmt()
         .pretty()
         .with_env_filter(env_filter)
         .with_ansi(enable_color)
-        .init();
+        .finish()
+        .with(ErrorLayer::default());
+
+    subscriber.try_init().expect("failed to set global default subscriber");
 }
 
 fn main() -> Result<()> {
