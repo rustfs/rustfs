@@ -10,13 +10,13 @@ pub fn hex(data: impl AsRef<[u8]>) -> String {
     hex_simd::encode_to_string(data, hex_simd::AsciiCase::Lower)
 }
 
-#[cfg(not(all(feature = "openssl", not(windows))))]
+#[cfg(windows)]
 pub fn sha256(data: &[u8]) -> impl AsRef<[u8; 32]> {
     use sha2::{Digest, Sha256};
     <Sha256 as Digest>::digest(data)
 }
 
-#[cfg(all(feature = "openssl", not(windows)))]
+#[cfg(not(windows))]
 pub fn sha256(data: &[u8]) -> impl AsRef<[u8]> {
     use openssl::hash::{Hasher, MessageDigest};
     let mut h = Hasher::new(MessageDigest::sha256()).unwrap();

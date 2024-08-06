@@ -193,23 +193,7 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         // mc get 2
-        let HeadObjectInput {
-            bucket,
-            checksum_mode,
-            expected_bucket_owner,
-            if_match,
-            if_modified_since,
-            if_none_match,
-            if_unmodified_since,
-            key,
-            part_number,
-            range,
-            request_payer,
-            sse_customer_algorithm,
-            sse_customer_key,
-            sse_customer_key_md5,
-            version_id,
-        } = req.input;
+        let HeadObjectInput { bucket, key, .. } = req.input;
 
         let info = try_!(self.store.get_object_info(&bucket, &key, &ObjectOptions::default()).await);
         debug!("info {:?}", info);
@@ -297,7 +281,7 @@ impl S3 for FS {
 
         let Some(content_length) = content_length else { return Err(s3_error!(IncompleteBody)) };
 
-        let reader = PutObjReader::new(body.into(), content_length as usize);
+        let reader = PutObjReader::new(body, content_length as usize);
 
         try_!(self.store.put_object(&bucket, &key, reader, &ObjectOptions::default()).await);
 
@@ -356,7 +340,7 @@ impl S3 for FS {
         let content_length = content_length.ok_or_else(|| s3_error!(IncompleteBody))?;
 
         // mc cp step 4
-        let data = PutObjReader::new(body.into(), content_length as usize);
+        let data = PutObjReader::new(body, content_length as usize);
         let opts = ObjectOptions::default();
 
         try_!(
@@ -451,6 +435,7 @@ impl S3 for FS {
     }
 }
 
+#[allow(dead_code)]
 pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,

@@ -8,8 +8,8 @@ use crate::{
     error::Result,
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, FileInfo, GetObjectReader, HTTPRangeSpec, MakeBucketOptions,
-        MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, MakeBucketOptions, MultipartUploadResult,
+        ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -66,7 +66,7 @@ impl Sets {
         }
 
         let sets = Self {
-            id: fm.id.clone(),
+            id: fm.id,
             // sets: todo!(),
             disk_set,
             pool_idx,
@@ -122,7 +122,7 @@ impl Sets {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
-    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()
     }
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
@@ -187,7 +187,7 @@ impl StorageAPI for Sets {
             .await
     }
 
-    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+    async fn delete_bucket(&self, _bucket: &str) -> Result<()> {
         unimplemented!()
     }
 }

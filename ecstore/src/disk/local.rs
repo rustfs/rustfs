@@ -24,11 +24,11 @@ use uuid::Uuid;
 pub struct LocalDisk {
     pub root: PathBuf,
     pub id: Uuid,
-    pub format_data: Vec<u8>,
-    pub format_meta: Option<Metadata>,
-    pub format_path: PathBuf,
+    pub _format_data: Vec<u8>,
+    pub _format_meta: Option<Metadata>,
+    pub _format_path: PathBuf,
     // pub format_legacy: bool, // drop
-    pub format_last_check: OffsetDateTime,
+    pub _format_last_check: OffsetDateTime,
 }
 
 impl LocalDisk {
@@ -67,11 +67,11 @@ impl LocalDisk {
         let disk = Self {
             root,
             id,
-            format_meta,
-            format_data,
-            format_path,
+            _format_meta: format_meta,
+            _format_data: format_data,
+            _format_path: format_path,
             // format_legacy,
-            format_last_check,
+            _format_last_check: format_last_check,
         };
 
         disk.make_meta_volumes().await?;
@@ -463,7 +463,7 @@ impl DiskAPI for LocalDisk {
 
         // Ok((buffer, bytes_read))
     }
-    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: usize) -> Result<Vec<String>> {
+    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: usize) -> Result<Vec<String>> {
         let p = self.get_bucket_path(volume)?;
 
         let mut entries = fs::read_dir(&p).await?;
@@ -471,7 +471,7 @@ impl DiskAPI for LocalDisk {
         let mut volumes = Vec::new();
 
         while let Some(entry) = entries.next_entry().await? {
-            if let Ok(metadata) = entry.metadata().await {
+            if let Ok(_metadata) = entry.metadata().await {
                 // if !metadata.is_dir() {
                 //     continue;
                 // }

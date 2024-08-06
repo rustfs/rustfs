@@ -202,7 +202,7 @@ impl PeerS3Client for S3PeerSys {
         }
 
         ress.iter()
-            .find_map(|op| op.as_ref().map(|v| v.clone()))
+            .find_map(|op| op.clone())
             .ok_or(Error::new(DiskError::VolumeNotFound))
     }
 
@@ -233,7 +233,7 @@ impl PeerS3Client for LocalPeerS3Client {
     fn get_pools(&self) -> Vec<usize> {
         self.pools.clone()
     }
-    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         let mut futures = Vec::with_capacity(self.local_disks.len());
         for disk in self.local_disks.iter() {
             futures.push(disk.list_volumes());
@@ -390,7 +390,7 @@ impl PeerS3Client for RemotePeerS3Client {
     fn get_pools(&self) -> Vec<usize> {
         unimplemented!()
     }
-    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()
     }
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
@@ -400,7 +400,7 @@ impl PeerS3Client for RemotePeerS3Client {
         unimplemented!()
     }
 
-    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+    async fn delete_bucket(&self, _bucket: &str) -> Result<()> {
         unimplemented!()
     }
 }

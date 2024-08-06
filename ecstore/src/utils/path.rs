@@ -18,6 +18,7 @@ pub fn encode_dir_object(object: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn decode_dir_object(object: &str) -> String {
     if has_suffix(object, GLOBAL_DIR_SUFFIX) {
         format!("{}{}", object.trim_end_matches(GLOBAL_DIR_SUFFIX), SLASH_SEPARATOR)
