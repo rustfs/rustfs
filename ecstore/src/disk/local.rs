@@ -365,7 +365,7 @@ impl DiskAPI for LocalDisk {
 
         let src_is_dir = srcp.is_dir();
         let dst_is_dir = dstp.is_dir();
-        if !(src_is_dir && dst_is_dir || !src_is_dir && !dst_is_dir) {
+        if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
             return Err(Error::from(DiskError::FileAccessDenied));
         }
 
