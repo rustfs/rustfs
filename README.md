@@ -25,11 +25,37 @@ https://RustFS.com/
 
 
 # Values
-We anticipate that RustFS will be the future storage solution for Mars.
+Help all of humanity reduce storage costs and achieve data security.
 
 # Documentation
 
 For user manual, system design and architecture, please refer to [RustFS Documentation](https://rustfs.com/docs/).
+
+
+# How to install RustFS
+
+1. Linux Install
+
+   Select the version corresponding to the operating CPU and download the installation package.
+
+2. Windows Install
+
+   Download the windows installation package and double click to open it.
+   
+
+3. MacOS Install
+
+   Download the corresponding version for MacOS CPU, drag and drop it into the Apple app, and double-click to open it and run it.
+
+# Jobs
+
+  We welcome open source enthusiasts who are committed to changing the world's storage architecture to join us.
+
+
+
+# Invest in us
+
+Our email is hello@rustfs.com
 
 
 <!--
