@@ -17,8 +17,8 @@ use crate::disk::FileReader;
 
 pub struct Erasure {
     data_shards: usize,
-    _parity_shards: usize,
-    encoder: ReedSolomon,
+    parity_shards: usize,
+    encoder: Option<ReedSolomon>,
     block_size: usize,
     _id: Uuid,
 }
@@ -29,11 +29,16 @@ impl Erasure {
             "Erasure new data_shards {},parity_shards {} block_size {} ",
             data_shards, parity_shards, block_size
         );
+        let mut encoder = None;
+        if parity_shards > 0 {
+            encoder = Some(ReedSolomon::new(data_shards, parity_shards).unwrap());
+        }
+
         Erasure {
             data_shards,
-            _parity_shards: parity_shards,
+            parity_shards: parity_shards,
             block_size,
-            encoder: ReedSolomon::new(data_shards, parity_shards).unwrap(),
+            encoder: encoder,
             _id: Uuid::new_v4(),
         }
     }
@@ -154,7 +159,9 @@ impl Erasure {
 
             let mut bufs = reader.read().await?;
 
-            self.decode_data(&mut bufs)?;
+            if self.parity_shards > 0 {
+                self.decode_data(&mut bufs)?;
+            }
 
             let writed_n = self
                 .write_data_blocks(writer, bufs, self.data_shards, block_offset, block_length)
@@ -237,6 +244,10 @@ impl Erasure {
         Ok(total_writed)
     }
 
+    pub fn total_shard_count(&self) -> usize {
+        self.data_shards + self.parity_shards
+    }
+
     pub fn encode_data(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
         let (shard_size, total_size) = self.need_size(data.len());
 
@@ -252,11 +263,14 @@ impl Erasure {
             // ec encode, 结果会写进 data_buffer
             let data_slices: Vec<&mut [u8]> = data_buffer.chunks_mut(shard_size).collect();
 
-            self.encoder.encode(data_slices)?;
+            // partiy 数量大于0 才ec
+            if self.parity_shards > 0 {
+                self.encoder.as_ref().unwrap().encode(data_slices)?;
+            }
         }
 
         // 分片
-        let mut shards = Vec::with_capacity(self.encoder.total_shard_count());
+        let mut shards = Vec::with_capacity(self.total_shard_count());
 
         let slices: Vec<&[u8]> = data_buffer.chunks(shard_size).collect();
 
@@ -268,19 +282,22 @@ impl Erasure {
     }
 
     pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> Result<()> {
-        self.encoder.reconstruct(shards)?;
+        if self.parity_shards > 0 {
+            self.encoder.as_ref().unwrap().reconstruct(shards)?;
+        }
+
         Ok(())
     }
 
     // 每个分片长度，所需要的总长度
     fn need_size(&self, data_size: usize) -> (usize, usize) {
         let shard_size = self.shard_size(data_size);
-        (shard_size, shard_size * (self.encoder.total_shard_count()))
+        (shard_size, shard_size * (self.total_shard_count()))
     }
 
     // 算出每个分片大小
     fn shard_size(&self, data_size: usize) -> usize {
-        (data_size + self.encoder.data_shard_count() - 1) / self.encoder.data_shard_count()
+        (data_size + self.data_shards - 1) / self.data_shards
     }
     // returns final erasure size from original size.
     fn shard_file_size(&self, total_size: usize) -> usize {
@@ -309,16 +326,18 @@ pub trait ReadAt {
 pub struct ShardReader {
     readers: Vec<Option<FileReader>>, // 磁盘
     data_block_count: usize,          // 总的分片数量
-    shard_size: usize,                // 每个分片的块大小 一次读取一块
-    shard_file_size: usize,           // 分片文件总长度
-    offset: usize,                    // 在分片中的offset
+    parity_block_count: usize,
+    shard_size: usize,      // 每个分片的块大小 一次读取一块
+    shard_file_size: usize, // 分片文件总长度
+    offset: usize,          // 在分片中的offset
 }
 
 impl ShardReader {
     pub fn new(readers: Vec<Option<FileReader>>, ec: &Erasure, offset: usize, total_length: usize) -> Self {
         Self {
             readers,
-            data_block_count: ec.encoder.data_shard_count(),
+            data_block_count: ec.data_shards,
+            parity_block_count: ec.parity_shards,
             shard_size: ec.shard_size(ec.block_size),
             shard_file_size: ec.shard_file_size(total_length),
             offset: (offset / ec.block_size) * ec.shard_size(ec.block_size),
@@ -382,7 +401,12 @@ impl ShardReader {
     }
 
     fn can_decode(&self, bufs: &[Option<Vec<u8>>]) -> bool {
-        bufs.iter().filter(|v| v.is_some()).count() > self.data_block_count
+        let c = bufs.iter().filter(|v| v.is_some()).count();
+        if self.parity_block_count > 0 {
+            c > self.data_block_count
+        } else {
+            c == self.data_block_count
+        }
     }
 }
 
