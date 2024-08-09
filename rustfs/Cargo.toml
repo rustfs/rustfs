@@ -35,4 +35,5 @@ hyper-util = { version = "0.1.5", features = [
 ] }
 mime = "0.3.17"
 transform-stream = "0.3.0"
+netif = "0.1.6"
 # pin-utils = "0.1.0"
