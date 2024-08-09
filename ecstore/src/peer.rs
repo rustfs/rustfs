@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use futures::future::join_all;
+use regex::Regex;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tracing::warn;
 
 use crate::{
-    disk::VolumeInfo,
-    disk::{error::DiskError, DiskStore},
+    disk::{self, error::DiskError, DiskStore, VolumeInfo},
     endpoints::{EndpointServerPools, Node},
     error::{Error, Result},
     store_api::{BucketInfo, BucketOptions, MakeBucketOptions},
@@ -260,7 +260,9 @@ impl PeerS3Client for LocalPeerS3Client {
 
         for info_list in ress.iter() {
             for info in info_list.iter() {
-                // TODO: check name valid
+                if is_reserved_or_invalid_bucket(&info.name, false) {
+                    continue;
+                }
                 if !uniq_map.contains_key(&info.name) {
                     uniq_map.insert(&info.name, info);
                 }
@@ -403,4 +405,61 @@ impl PeerS3Client for RemotePeerS3Client {
     async fn delete_bucket(&self, _bucket: &str) -> Result<()> {
         unimplemented!()
     }
+}
+
+// 检查桶名是否有效
+fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
+    if bucket_name.trim().is_empty() {
+        return Err(Error::from_string("Bucket name cannot be empty"));
+    }
+    if bucket_name.len() < 3 {
+        return Err(Error::from_string("Bucket name cannot be shorter than 3 characters"));
+    }
+    if bucket_name.len() > 63 {
+        return Err(Error::from_string("Bucket name cannot be longer than 63 characters"));
+    }
+
+    let ip_address_regex = Regex::new(r"^(\d+\.){3}\d+$").unwrap();
+    if ip_address_regex.is_match(bucket_name) {
+        return Err(Error::from_string("Bucket name cannot be an IP address"));
+    }
+
+    let valid_bucket_name_regex = if strict {
+        Regex::new(r"^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$").unwrap()
+    } else {
+        Regex::new(r"^[A-Za-z0-9][A-Za-z0-9\.\-_:]{1,61}[A-Za-z0-9]$").unwrap()
+    };
+
+    if !valid_bucket_name_regex.is_match(bucket_name) {
+        return Err(Error::from_string("Bucket name contains invalid characters"));
+    }
+
+    // 检查包含 "..", ".-", "-."
+    if bucket_name.contains("..") || bucket_name.contains(".-") || bucket_name.contains("-.") {
+        return Err(Error::from_string("Bucket name contains invalid characters"));
+    }
+
+    Ok(())
+}
+
+// 检查是否为  元数据桶
+fn is_meta_bucket(bucket_name: &str) -> bool {
+    bucket_name == disk::RUSTFS_META_BUCKET
+}
+
+// 检查是否为 保留桶
+fn is_reserved_bucket(bucket_name: &str) -> bool {
+    bucket_name == "rustfs"
+}
+
+// 检查桶名是否为保留名或无效名
+fn is_reserved_or_invalid_bucket(bucket_entry: &str, strict: bool) -> bool {
+    if bucket_entry == "" {
+        return true;
+    }
+
+    let bucket_entry = bucket_entry.trim_end_matches('/');
+    let result = check_bucket_name(&bucket_entry, strict).is_err();
+
+    result || is_meta_bucket(&bucket_entry) || is_reserved_bucket(&bucket_entry)
 }

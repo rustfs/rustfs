@@ -1,7 +1,6 @@
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::error::DiskError,
-    disk::{DiskOption, DiskStore, RUSTFS_META_BUCKET},
+    disk::{error::DiskError, DiskOption, DiskStore, RUSTFS_META_BUCKET},
     disks_layout::DisksLayout,
     endpoints::EndpointServerPools,
     error::{Error, Result},
