@@ -410,18 +410,18 @@ impl PeerS3Client for RemotePeerS3Client {
 // 检查桶名是否有效
 fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
     if bucket_name.trim().is_empty() {
-        return Err(Error::from_string("Bucket name cannot be empty"));
+        return Err(Error::msg("Bucket name cannot be empty"));
     }
     if bucket_name.len() < 3 {
-        return Err(Error::from_string("Bucket name cannot be shorter than 3 characters"));
+        return Err(Error::msg("Bucket name cannot be shorter than 3 characters"));
     }
     if bucket_name.len() > 63 {
-        return Err(Error::from_string("Bucket name cannot be longer than 63 characters"));
+        return Err(Error::msg("Bucket name cannot be longer than 63 characters"));
     }
 
     let ip_address_regex = Regex::new(r"^(\d+\.){3}\d+$").unwrap();
     if ip_address_regex.is_match(bucket_name) {
-        return Err(Error::from_string("Bucket name cannot be an IP address"));
+        return Err(Error::msg("Bucket name cannot be an IP address"));
     }
 
     let valid_bucket_name_regex = if strict {
@@ -431,12 +431,12 @@ fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
     };
 
     if !valid_bucket_name_regex.is_match(bucket_name) {
-        return Err(Error::from_string("Bucket name contains invalid characters"));
+        return Err(Error::msg("Bucket name contains invalid characters"));
     }
 
     // 检查包含 "..", ".-", "-."
     if bucket_name.contains("..") || bucket_name.contains(".-") || bucket_name.contains("-.") {
-        return Err(Error::from_string("Bucket name contains invalid characters"));
+        return Err(Error::msg("Bucket name contains invalid characters"));
     }
 
     Ok(())
