@@ -45,21 +45,21 @@ async fn run(opt: config::Opt) -> Result<()> {
     let listener = TcpListener::bind(opt.address.clone()).await?;
     let local_addr: SocketAddr = listener.local_addr()?;
 
-    let mut domain_name = {
-        netif::up()?
-            .map(|x| x.address().to_owned())
-            .filter(|v| v.is_ipv4())
-            // .filter(|v| v.is_ipv4() && !v.is_loopback() && !v.is_unspecified())
-            .map(|v| format!("{}", v))
-            .next()
-            .and_then(|ip| {
-                if let SocketAddr::V4(ipv4) = local_addr {
-                    Some(format!("{}:{}", ip, ipv4.port()))
-                } else {
-                    None
-                }
-            })
-    };
+    // let mut domain_name = {
+    //     netif::up()?
+    //         .map(|x| x.address().to_owned())
+    //         .filter(|v| v.is_ipv4())
+    //         // .filter(|v| v.is_ipv4() && !v.is_loopback() && !v.is_unspecified())
+    //         .map(|v| format!("{}", v))
+    //         .next()
+    //         .and_then(|ip| {
+    //             if let SocketAddr::V4(ipv4) = local_addr {
+    //                 Some(format!("{}:{}", ip, ipv4.port()))
+    //             } else {
+    //                 None
+    //             }
+    //         })
+    // };
 
     // Setup S3 service
     let service = {
@@ -79,16 +79,17 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         // Enable parsing virtual-hosted-style requests
         if let Some(dm) = opt.domain_name {
-            domain_name = Some(dm)
+            info!("virtual-hosted-style requests are enabled use domain_name {}", &dm);
+            b.set_base_domain(dm);
         }
 
-        if domain_name.is_some() {
-            info!(
-                "virtual-hosted-style requests are enabled use domain_name {}",
-                domain_name.as_ref().unwrap()
-            );
-            b.set_base_domain(domain_name.unwrap());
-        }
+        // if domain_name.is_some() {
+        //     info!(
+        //         "virtual-hosted-style requests are enabled use domain_name {}",
+        //         domain_name.as_ref().unwrap()
+        //     );
+        //     b.set_base_domain(domain_name.unwrap());
+        // }
 
         b.build()
     };
