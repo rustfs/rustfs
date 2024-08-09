@@ -48,6 +48,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let mut domain_name = {
         netif::up()?
             .map(|x| x.address().to_owned())
+            .filter(|v| v.is_ipv4())
             // .filter(|v| v.is_ipv4() && !v.is_loopback() && !v.is_unspecified())
             .map(|v| format!("{}", v))
             .next()
