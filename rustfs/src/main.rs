@@ -8,7 +8,7 @@ use hyper_util::{
     server::conn::auto::Builder as ConnBuilder,
 };
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
-use std::io::IsTerminal;
+use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 use tracing_error::ErrorLayer;
@@ -41,27 +41,56 @@ fn main() -> Result<()> {
 #[tokio::main]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
+
+    let listener = TcpListener::bind(opt.address.clone()).await?;
+    let local_addr: SocketAddr = listener.local_addr()?;
+
+    let mut domain_name = {
+        netif::up()?
+            .map(|x| x.address().to_owned())
+            // .filter(|v| v.is_ipv4() && !v.is_loopback() && !v.is_unspecified())
+            .map(|v| format!("{}", v))
+            .next()
+            .and_then(|ip| {
+                if let SocketAddr::V4(ipv4) = local_addr {
+                    Some(format!("{}:{}", ip, ipv4.port()))
+                } else {
+                    None
+                }
+            })
+    };
+
     // Setup S3 service
     let service = {
         let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), opt.volumes.clone()).await?);
 
+        let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
+        let mut secret_key = String::from_str(config::DEFAULT_SECRET_KEY).unwrap();
+
         // Enable authentication
         if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {
-            b.set_auth(SimpleAuth::from_single(ak, sk));
-            info!("authentication is enabled");
+            access_key = ak;
+            secret_key = sk;
         }
 
+        info!("authentication is enabled {}, {}", &access_key, &secret_key);
+        b.set_auth(SimpleAuth::from_single(access_key, secret_key));
+
         // Enable parsing virtual-hosted-style requests
-        if let Some(domain_name) = opt.domain_name {
-            b.set_base_domain(domain_name);
-            info!("virtual-hosted-style requests are enabled");
+        if let Some(dm) = opt.domain_name {
+            domain_name = Some(dm)
+        }
+
+        if domain_name.is_some() {
+            info!(
+                "virtual-hosted-style requests are enabled use domain_name {}",
+                domain_name.as_ref().unwrap()
+            );
+            b.set_base_domain(domain_name.unwrap());
         }
 
         b.build()
     };
-
-    let listener = TcpListener::bind(opt.address).await?;
-    let local_addr = listener.local_addr()?;
 
     let hyper_service = service.into_shared();
 

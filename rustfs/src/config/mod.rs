@@ -4,6 +4,8 @@ use clap::Parser;
 ///
 /// Used if no port is specified.
 pub const DEFAULT_PORT: u16 = 9000;
+pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
+pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
 #[derive(Debug, Parser)]
 pub struct Opt {
