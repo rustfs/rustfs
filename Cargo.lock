@@ -325,6 +325,7 @@ dependencies = [
  "path-clean",
  "reed-solomon-erasure",
  "regex",
+ "rmp",
  "rmp-serde",
  "s3s",
  "serde",
