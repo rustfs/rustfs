@@ -19,7 +19,7 @@ pub struct FileInfo {
     pub deleted: bool,
     // DataDir of the file
     pub data_dir: Uuid,
-    pub mod_time: OffsetDateTime,
+    pub mod_time: Option<OffsetDateTime>,
     pub size: usize,
     pub data: Option<Vec<u8>>,
     pub fresh: bool, // indicates this is a first time call to write FileInfo.
@@ -58,7 +58,7 @@ impl FileInfo {
         Ok(t)
     }
 
-    pub fn add_object_part(&mut self, num: usize, part_size: usize, mod_time: OffsetDateTime, actual_size: usize) {
+    pub fn add_object_part(&mut self, num: usize, part_size: usize, mod_time: Option<OffsetDateTime>, actual_size: usize) {
         let part = ObjectPartInfo {
             number: num,
             size: part_size,
@@ -120,7 +120,7 @@ impl Default for FileInfo {
             erasure: Default::default(),
             deleted: Default::default(),
             data_dir: Uuid::nil(),
-            mod_time: OffsetDateTime::UNIX_EPOCH,
+            mod_time: None,
             size: Default::default(),
             data: Default::default(),
             fresh: Default::default(),
@@ -175,27 +175,27 @@ impl FileInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
     // pub etag: Option<String>,
     pub number: usize,
     pub size: usize,
     pub actual_size: usize, // 源数据大小
-    pub mod_time: OffsetDateTime,
+    pub mod_time: Option<OffsetDateTime>,
     // pub index: Option<Vec<u8>>,
     // pub checksums: Option<std::collections::HashMap<String, String>>,
 }
 
-impl Default for ObjectPartInfo {
-    fn default() -> Self {
-        Self {
-            number: Default::default(),
-            size: Default::default(),
-            mod_time: OffsetDateTime::UNIX_EPOCH,
-            actual_size: Default::default(),
-        }
-    }
-}
+// impl Default for ObjectPartInfo {
+//     fn default() -> Self {
+//         Self {
+//             number: Default::default(),
+//             size: Default::default(),
+//             mod_time: OffsetDateTime::UNIX_EPOCH,
+//             actual_size: Default::default(),
+//         }
+//     }
+// }
 
 pub struct RawFileInfo {
     pub buf: Vec<u8>,
@@ -358,30 +358,30 @@ impl HTTPRangeSpec {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
-    pub mod_time: OffsetDateTime,
+    pub mod_time: Option<OffsetDateTime>,
     pub part_number: usize,
 }
 
-impl Default for ObjectOptions {
-    fn default() -> Self {
-        Self {
-            max_parity: Default::default(),
-            mod_time: OffsetDateTime::UNIX_EPOCH,
-            part_number: Default::default(),
-        }
-    }
-}
+// impl Default for ObjectOptions {
+//     fn default() -> Self {
+//         Self {
+//             max_parity: Default::default(),
+//             mod_time: OffsetDateTime::UNIX_EPOCH,
+//             part_number: Default::default(),
+//         }
+//     }
+// }
 
 pub struct BucketOptions {}
 
 #[derive(Debug, Clone)]
 pub struct BucketInfo {
     pub name: String,
-    pub created: OffsetDateTime,
+    pub created: Option<OffsetDateTime>,
 }
 
 pub struct MultipartUploadResult {
@@ -390,7 +390,7 @@ pub struct MultipartUploadResult {
 
 pub struct PartInfo {
     pub part_num: usize,
-    pub last_mod: OffsetDateTime,
+    pub last_mod: Option<OffsetDateTime>,
     pub size: usize,
 }
 
@@ -415,7 +415,7 @@ pub struct ObjectInfo {
     pub data_blocks: usize,
     pub version_id: Uuid,
     pub deleted: bool,
-    pub mod_time: OffsetDateTime,
+    pub mod_time: Option<OffsetDateTime>,
     pub size: usize,
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,

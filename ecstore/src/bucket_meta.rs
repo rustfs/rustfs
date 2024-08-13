@@ -10,24 +10,24 @@ pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
 pub const BUCKET_METADATA_FORMAT: u16 = 1;
 pub const BUCKET_METADATA_VERSION: u16 = 1;
 
-#[derive(Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Deserialize, Serialize, Default)]
 pub struct BucketMetadata {
     format: u16,
     version: u16,
     pub name: String,
-    pub created: OffsetDateTime,
+    pub created: Option<OffsetDateTime>,
 }
 
-impl Default for BucketMetadata {
-    fn default() -> Self {
-        Self {
-            format: Default::default(),
-            version: Default::default(),
-            name: Default::default(),
-            created: OffsetDateTime::now_utc(),
-        }
-    }
-}
+// impl Default for BucketMetadata {
+//     fn default() -> Self {
+//         Self {
+//             format: Default::default(),
+//             version: Default::default(),
+//             name: Default::default(),
+//             created: OffsetDateTime::now_utc(),
+//         }
+//     }
+// }
 
 impl BucketMetadata {
     pub fn new(name: &str) -> Self {

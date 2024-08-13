@@ -20,7 +20,6 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
-use time::OffsetDateTime;
 use transform_stream::AsyncTryStream;
 
 use ecstore::error::Result;
@@ -145,11 +144,7 @@ impl S3 for FS {
         let range = HTTPRangeSpec::nil();
 
         let h = HeaderMap::new();
-        let opts = &ObjectOptions {
-            max_parity: false,
-            mod_time: OffsetDateTime::UNIX_EPOCH,
-            part_number: 0,
-        };
+        let opts = &ObjectOptions::default();
 
         let reader = try_!(
             self.store
@@ -160,12 +155,12 @@ impl S3 for FS {
         let info = reader.object_info;
 
         let content_type = try_!(ContentType::from_str("application/x-msdownload"));
-        let last_modified = Timestamp::from(info.mod_time);
+        let last_modified = info.mod_time.map(|v| Timestamp::from(v));
 
         let output = GetObjectOutput {
             body: Some(reader.stream),
             content_length: Some(info.size as i64),
-            last_modified: Some(last_modified),
+            last_modified: last_modified,
             content_type: Some(content_type),
             ..Default::default()
         };
@@ -199,12 +194,12 @@ impl S3 for FS {
         debug!("info {:?}", info);
 
         let content_type = try_!(ContentType::from_str("application/x-msdownload"));
-        let last_modified = Timestamp::from(info.mod_time);
+        let last_modified = info.mod_time.map(|v| Timestamp::from(v));
 
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(info.size))),
             content_type: Some(content_type),
-            last_modified: Some(last_modified),
+            last_modified: last_modified,
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -220,7 +215,7 @@ impl S3 for FS {
         let buckets: Vec<Bucket> = bucket_infos
             .iter()
             .map(|v| Bucket {
-                creation_date: Some(Timestamp::from(v.created)),
+                creation_date: v.created.map(|v| Timestamp::from(v)),
                 name: Some(v.name.clone()),
             })
             .collect();
