@@ -107,7 +107,7 @@ pub struct ReadMultipleReq {
     pub max_results: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReadMultipleResp {
     pub bucket: String,
     pub prefix: String,
@@ -115,26 +115,26 @@ pub struct ReadMultipleResp {
     pub exists: bool,
     pub error: String,
     pub data: Vec<u8>,
-    pub mod_time: OffsetDateTime,
+    pub mod_time: Option<OffsetDateTime>,
 }
 
-impl Default for ReadMultipleResp {
-    fn default() -> Self {
-        Self {
-            bucket: String::new(),
-            prefix: String::new(),
-            file: String::new(),
-            exists: false,
-            error: String::new(),
-            data: Vec::new(),
-            mod_time: OffsetDateTime::UNIX_EPOCH,
-        }
-    }
-}
+// impl Default for ReadMultipleResp {
+//     fn default() -> Self {
+//         Self {
+//             bucket: String::new(),
+//             prefix: String::new(),
+//             file: String::new(),
+//             exists: false,
+//             error: String::new(),
+//             data: Vec::new(),
+//             mod_time: OffsetDateTime::UNIX_EPOCH,
+//         }
+//     }
+// }
 
 pub struct VolumeInfo {
     pub name: String,
-    pub created: OffsetDateTime,
+    pub created: Option<OffsetDateTime>,
 }
 
 pub struct ReadOptions {

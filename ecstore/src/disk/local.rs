@@ -28,7 +28,7 @@ pub struct LocalDisk {
     pub _format_meta: Option<Metadata>,
     pub _format_path: PathBuf,
     // pub format_legacy: bool, // drop
-    pub _format_last_check: OffsetDateTime,
+    pub _format_last_check: Option<OffsetDateTime>,
 }
 
 impl LocalDisk {
@@ -48,7 +48,7 @@ impl LocalDisk {
 
         let mut id = Uuid::nil();
         // let mut format_legacy = false;
-        let mut format_last_check = OffsetDateTime::UNIX_EPOCH;
+        let mut format_last_check = None;
 
         if !format_data.is_empty() {
             let s = format_data.as_slice();
@@ -61,7 +61,7 @@ impl LocalDisk {
 
             id = fm.erasure.this;
             // format_legacy = fm.erasure.distribution_algo == DistributionAlgoVersion::V1;
-            format_last_check = OffsetDateTime::now_utc();
+            format_last_check = Some(OffsetDateTime::now_utc());
         }
 
         let disk = Self {
@@ -619,8 +619,11 @@ impl DiskAPI for LocalDisk {
                 let name = entry.file_name().to_string_lossy().to_string();
 
                 let created = match metadata.created() {
-                    Ok(md) => OffsetDateTime::from(md),
-                    Err(_) => return Err(Error::msg("Not supported created on this platform")),
+                    Ok(md) => Some(OffsetDateTime::from(md)),
+                    Err(_) => {
+                        warn!("Not supported created on this platform");
+                        None
+                    }
                 };
 
                 volumes.push(VolumeInfo { name, created });
@@ -634,8 +637,11 @@ impl DiskAPI for LocalDisk {
 
         let m = read_file_metadata(&p).await?;
         let modtime = match m.modified() {
-            Ok(md) => OffsetDateTime::from(md),
-            Err(_) => return Err(Error::msg("Not supported modified on this platform")),
+            Ok(md) => Some(OffsetDateTime::from(md)),
+            Err(_) => {
+                warn!("Not supported modified on this platform");
+                None
+            }
         };
 
         Ok(VolumeInfo {
@@ -722,8 +728,11 @@ impl DiskAPI for LocalDisk {
                     res.exists = true;
                     res.data = data;
                     res.mod_time = match meta.modified() {
-                        Ok(md) => OffsetDateTime::from(md),
-                        Err(_) => return Err(Error::msg("Not supported modified on this platform")),
+                        Ok(md) => Some(OffsetDateTime::from(md)),
+                        Err(_) => {
+                            warn!("Not supported modified on this platform");
+                            None
+                        }
                     };
                     results.push(res);
 
