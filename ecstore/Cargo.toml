@@ -39,6 +39,8 @@ hex-simd = "0.8.0"
 path-clean = "1.0.1"
 tokio-stream = "0.1.15"
 rmp = "0.8.14"
+byteorder = "1.5.0"
+xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 
 [target.'cfg(not(windows))'.dependencies]
 openssl = "0.10.66"
