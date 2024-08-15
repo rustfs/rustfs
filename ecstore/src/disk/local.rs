@@ -136,43 +136,72 @@ impl LocalDisk {
         Ok(())
     }
 
+    // #[tracing::instrument(skip(self))]
     pub async fn delete_file(&self, base_path: &PathBuf, delete_path: &PathBuf, recursive: bool, _immediate: bool) -> Result<()> {
-        debug!("delete_file {:?}", &delete_path);
+        debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
 
         if is_root_path(base_path) || is_root_path(delete_path) {
+            debug!("delete_file skip {:?}", &delete_path);
             return Ok(());
         }
 
         if !delete_path.starts_with(base_path) || base_path == delete_path {
+            debug!("delete_file skip {:?}", &delete_path);
             return Ok(());
         }
 
         if recursive {
             let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
-            // fs::create_dir_all(&trash_path).await?;
-            fs::rename(&delete_path, &trash_path).await.map_err(|err| {
-                // 使用文件路径自定义错误信息
-                std::io::Error::new(
-                    err.kind(),
-                    format!("Failed to rename file '{:?}' to '{:?}': {}", &delete_path, &trash_path, err),
-                )
-            })?;
+
+            if let Some(dir_path) = trash_path.parent() {
+                fs::create_dir_all(dir_path).await?;
+            }
+
+            debug!("delete_file ranme to trash {:?} to {:?}", &delete_path, &trash_path);
+
+            if let Err(err) = fs::rename(&delete_path, &trash_path).await {
+                match err.kind() {
+                    ErrorKind::NotFound => (),
+                    _ => {
+                        warn!("delete_file rename {:?} err {:?}", &delete_path, &err);
+                        return Err(Error::from(err));
+                    }
+                }
+            }
 
             // TODO: immediate
-
-            return Ok(());
-        }
-
-        if delete_path.is_dir() {
-            fs::remove_dir(delete_path).await?;
         } else {
-            fs::remove_file(delete_path).await?;
+            if delete_path.is_dir() {
+                if let Err(err) = fs::remove_dir(&delete_path).await {
+                    match err.kind() {
+                        ErrorKind::NotFound => (),
+                        // ErrorKind::DirectoryNotEmpty => (),
+                        kind => {
+                            if kind.to_string() != "directory not empty" {
+                                warn!("delete_file remove_dir {:?} err {}", &delete_path, kind.to_string());
+                                return Err(Error::from(err));
+                            }
+                        }
+                    }
+                }
+            } else {
+                if let Err(err) = fs::remove_file(&delete_path).await {
+                    match err.kind() {
+                        ErrorKind::NotFound => (),
+                        _ => {
+                            warn!("delete_file remove_file {:?}  err {:?}", &delete_path, &err);
+                            return Err(Error::from(err));
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(dir_path) = delete_path.parent() {
             Box::pin(self.delete_file(base_path, &PathBuf::from(dir_path), false, false)).await?;
         }
 
+        debug!("delete_file done {:?}", &delete_path);
         Ok(())
     }
 
@@ -492,6 +521,8 @@ impl DiskAPI for LocalDisk {
     async fn walk_dir(&self) -> Result<Vec<FileInfo>> {
         unimplemented!()
     }
+
+    // #[tracing::instrument(skip(self))]
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -510,9 +541,11 @@ impl DiskAPI for LocalDisk {
             check_volume_exists(&dst_volume_path).await?;
         }
 
+        // xl.meta路径
         let src_file_path = self.get_object_path(src_volume, format!("{}/{}", &src_path, super::STORAGE_FORMAT_FILE).as_str())?;
         let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", &dst_path, super::STORAGE_FORMAT_FILE).as_str())?;
 
+        // data_dir 路径
         let (src_data_path, dst_data_path) = {
             let mut data_dir = String::new();
             if !fi.is_remote() {
@@ -532,38 +565,65 @@ impl DiskAPI for LocalDisk {
             }
         };
 
-        // let curreng_data_path = self.get_object_path(&dst_volume, &dst_path);
-
+        // 读旧xl.meta
         let mut meta = FileMeta::new();
 
         let (dst_buf, _) = read_file_exists(&dst_file_path).await?;
+        if !dst_buf.is_empty() {
+            // 有旧文件，加载
+            match meta.unmarshal_msg(&dst_buf) {
+                Ok(_) => {}
+                Err(_) => meta = FileMeta::new(),
+            }
+        }
 
-        let mut skip_parent = dst_volume_path;
-        if !&dst_buf.is_empty() {
+        warn!("get meta {:?}", &meta);
+
+        let mut skip_parent = dst_volume_path.clone();
+        if !dst_buf.is_empty() {
             skip_parent = PathBuf::from(&dst_file_path.parent().unwrap_or(Path::new("/")));
         }
 
-        if !dst_buf.is_empty() {
-            meta = match FileMeta::unmarshal(&dst_buf) {
-                Ok(m) => m,
-                Err(_) => FileMeta::new(),
-            }
-            // xl.load
-            // meta.from(dst_buf);
-        }
+        // 查找版本是否已存在
+        let old_data_dir = meta
+            .find_version(fi.version_id)
+            .map(|(_, version)| {
+                version.get_data_dir().filter(|data_dir| {
+                    warn!("get data dir {}", &data_dir);
+                    meta.shard_data_dir_count(&fi.version_id, data_dir) == 0
+                })
+            })
+            .unwrap_or_default();
 
+        // 添加版本，写入xl.meta文件
         meta.add_version(fi.clone())?;
 
         let fm_data = meta.marshal_msg()?;
 
-        fs::write(&src_file_path, fm_data).await?;
+        // 写入xl.meta
+        write_all_internal(&src_file_path, fm_data).await?;
 
         let no_inline = src_data_path.has_root() && fi.data.is_none() && fi.size > 0;
         if no_inline {
             self.rename_all(&src_data_path, &dst_data_path, &skip_parent).await?;
         }
 
-        self.rename_all(&src_file_path, &dst_file_path, &skip_parent).await?;
+        warn!("old_data_dir {:?}", old_data_dir);
+        // 有旧目录，把old xl.meta存到旧目录里
+        if old_data_dir.is_some() {
+            self.write_all(
+                &dst_volume,
+                format!("{}/{}/{}", &dst_path, &old_data_dir.unwrap().to_string(), super::STORAGE_FORMAT_FILE).as_str(),
+                dst_buf,
+            )
+            .await?;
+        }
+
+        if let Err(e) = self.rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
+            // 如果 失败删除目标目录
+            let _ = self.delete_file(&dst_volume_path, &dst_data_path, false, false).await;
+            return Err(e);
+        }
 
         if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
             fs::remove_dir(&src_file_path.parent().unwrap()).await?;
@@ -573,7 +633,7 @@ impl DiskAPI for LocalDisk {
         }
 
         Ok(RenameDataResp {
-            old_data_dir: fi.data_dir.to_string(),
+            old_data_dir: old_data_dir,
         })
     }
 
@@ -659,7 +719,10 @@ impl DiskAPI for LocalDisk {
         if !fi.fresh {
             let (buf, _) = read_file_exists(&p).await?;
             if !buf.is_empty() {
-                meta = FileMeta::unmarshal(&buf)?;
+                let _ = meta.unmarshal_msg(&buf).map_err(|_| {
+                    meta = FileMeta::new();
+                    ()
+                });
             }
         }
 
@@ -687,7 +750,8 @@ impl DiskAPI for LocalDisk {
 
         let (data, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
 
-        let meta = FileMeta::unmarshal(&data)?;
+        let mut meta = FileMeta::default();
+        meta.unmarshal_msg(&data)?;
 
         let fi = meta.into_fileinfo(volume, path, version_id, false, true)?;
         Ok(fi)
