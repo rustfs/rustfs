@@ -384,16 +384,19 @@ pub struct BucketInfo {
     pub created: Option<OffsetDateTime>,
 }
 
+#[derive(Debug)]
 pub struct MultipartUploadResult {
     pub upload_id: String,
 }
 
+#[derive(Debug)]
 pub struct PartInfo {
     pub part_num: usize,
     pub last_mod: Option<OffsetDateTime>,
     pub size: usize,
 }
 
+#[derive(Debug)]
 pub struct CompletePart {
     pub part_num: usize,
 }

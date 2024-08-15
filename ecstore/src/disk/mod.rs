@@ -87,7 +87,7 @@ pub struct DiskOption {
 }
 
 pub struct RenameDataResp {
-    pub old_data_dir: String,
+    pub old_data_dir: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Default)]
