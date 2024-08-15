@@ -454,12 +454,12 @@ fn is_reserved_bucket(bucket_name: &str) -> bool {
 
 // 检查桶名是否为保留名或无效名
 fn is_reserved_or_invalid_bucket(bucket_entry: &str, strict: bool) -> bool {
-    if bucket_entry == "" {
+    if bucket_entry.is_empty() {
         return true;
     }
 
     let bucket_entry = bucket_entry.trim_end_matches('/');
-    let result = check_bucket_name(&bucket_entry, strict).is_err();
+    let result = check_bucket_name(bucket_entry, strict).is_err();
 
-    result || is_meta_bucket(&bucket_entry) || is_reserved_bucket(&bucket_entry)
+    result || is_meta_bucket(bucket_entry) || is_reserved_bucket(bucket_entry)
 }
