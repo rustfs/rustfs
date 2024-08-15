@@ -155,12 +155,12 @@ impl S3 for FS {
         let info = reader.object_info;
 
         let content_type = try_!(ContentType::from_str("application/x-msdownload"));
-        let last_modified = info.mod_time.map(|v| Timestamp::from(v));
+        let last_modified = info.mod_time.map(Timestamp::from);
 
         let output = GetObjectOutput {
             body: Some(reader.stream),
             content_length: Some(info.size as i64),
-            last_modified: last_modified,
+            last_modified,
             content_type: Some(content_type),
             ..Default::default()
         };
@@ -194,12 +194,12 @@ impl S3 for FS {
         debug!("info {:?}", info);
 
         let content_type = try_!(ContentType::from_str("application/x-msdownload"));
-        let last_modified = info.mod_time.map(|v| Timestamp::from(v));
+        let last_modified = info.mod_time.map(Timestamp::from);
 
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(info.size))),
             content_type: Some(content_type),
-            last_modified: last_modified,
+            last_modified,
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -215,7 +215,7 @@ impl S3 for FS {
         let buckets: Vec<Bucket> = bucket_infos
             .iter()
             .map(|v| Bucket {
-                creation_date: v.created.map(|v| Timestamp::from(v)),
+                creation_date: v.created.map(Timestamp::from),
                 name: Some(v.name.clone()),
             })
             .collect();
