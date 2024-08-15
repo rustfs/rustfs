@@ -159,6 +159,7 @@ impl LocalDisk {
 
             debug!("delete_file ranme to trash {:?} to {:?}", &delete_path, &trash_path);
 
+            // TODO: 清空回收站
             if let Err(err) = fs::rename(&delete_path, &trash_path).await {
                 match err.kind() {
                     ErrorKind::NotFound => (),
@@ -168,6 +169,9 @@ impl LocalDisk {
                     }
                 }
             }
+
+            // FIXME: 先清空回收站吧，有时间再添加判断逻辑
+            let _ = fs::remove_dir_all(&trash_path).await;
 
             // TODO: immediate
         } else {
