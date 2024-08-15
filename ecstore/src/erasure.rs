@@ -36,9 +36,9 @@ impl Erasure {
 
         Erasure {
             data_shards,
-            parity_shards: parity_shards,
+            parity_shards,
             block_size,
-            encoder: encoder,
+            encoder,
             _id: Uuid::new_v4(),
         }
     }
