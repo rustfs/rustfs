@@ -26,3 +26,4 @@ time = { version = "0.3.36", features = [
 ] }
 async-trait = "0.1.80"
 tokio = { version = "1.38.0", features = ["fs"] }
+futures-util = "0.3.30"

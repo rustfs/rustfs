@@ -1156,6 +1156,7 @@ dependencies = [
  "clap",
  "ecstore",
  "futures",
+ "futures-util",
  "http",
  "hyper-util",
  "mime",
