@@ -10,6 +10,7 @@ use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
+use futures_util::TryStreamExt;
 use http::HeaderMap;
 use s3s::dto::*;
 use s3s::s3_error;
@@ -19,7 +20,9 @@ use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::task::Poll;
 use transform_stream::AsyncTryStream;
 
 use ecstore::error::Result;
@@ -450,3 +453,15 @@ where
         Ok(())
     })
 }
+
+// Consumes this body object to return a bytes stream.
+// pub fn into_bytes_stream(mut body: StreamingBlob) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+//     futures_util::stream::poll_fn(move |ctx| loop {
+//         match Pin::new(&mut body).poll_next(ctx) {
+//             Poll::Ready(Some(Ok(data))) => return Poll::Ready(Some(Ok(data))),
+//             Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))),
+//             Poll::Ready(None) => return Poll::Ready(None),
+//             Poll::Pending => return Poll::Pending,
+//         }
+//     })
+// }

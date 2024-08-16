@@ -22,7 +22,7 @@ tracing-error.workspace = true
 http.workspace = true
 bytes.workspace = true
 futures.workspace = true
-
+futures-util.workspace = true
 
 ecstore = { path = "../ecstore" }
 s3s = "0.10.0"
