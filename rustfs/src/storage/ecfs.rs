@@ -247,7 +247,30 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let _input = req.input;
+        let ListObjectsV2Input {
+            bucket,
+            continuation_token,
+            delimiter,
+            fetch_owner,
+            max_keys,
+            prefix,
+            start_after,
+            ..
+        } = req.input;
+
+        let _object_infos = try_!(
+            self.store
+                .list_objects_v2(
+                    &bucket,
+                    &prefix.unwrap_or_default(),
+                    &continuation_token.unwrap_or_default(),
+                    &delimiter.unwrap_or_default(),
+                    max_keys.unwrap_or_default(),
+                    fetch_owner.unwrap_or_default(),
+                    &start_after.unwrap_or_default()
+                )
+                .await
+        );
 
         let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))

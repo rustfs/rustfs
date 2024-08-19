@@ -1,20 +1,22 @@
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::{error::DiskError, DiskOption, DiskStore, RUSTFS_META_BUCKET},
+    disk::{error::DiskError, DiskOption, DiskStore, MetaCacheEntry, WalkDirOptions, RUSTFS_META_BUCKET},
     disks_layout::DisksLayout,
     endpoints::EndpointServerPools,
     error::{Error, Result},
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, MakeBucketOptions, MultipartUploadResult,
-        ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, ListObjectsInfo, ListObjectsV2Info,
+        MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
     store_init, utils,
 };
+use futures::future::join_all;
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -105,6 +107,82 @@ impl ECStore {
     fn single_pool(&self) -> bool {
         self.pools.len() == 1
     }
+
+    async fn list_path(&self, opts: &ListPathOptions) -> Result<()> {
+        let (sender, rec) = mpsc::channel(64);
+        self.listMerged(opts, sender).await?;
+        Ok(())
+    }
+
+    // 读所有
+    async fn listMerged(&self, opts: &ListPathOptions, results: mpsc::Sender<MetaCacheEntry>) -> Result<()> {
+        let opts = WalkDirOptions {
+            bucket: opts.bucket.clone(),
+            ..Default::default()
+        };
+
+        let (mut wr, mut rd) = tokio::io::duplex(1024);
+
+        let wr = Arc::new(wr);
+
+        let mut futures = Vec::new();
+
+        for sets in self.pools.iter() {
+            for set in sets.disk_set.iter() {
+                for disk in set.disks.iter() {
+                    if disk.is_none() {
+                        continue;
+                    }
+
+                    let disk = disk.as_ref().unwrap();
+                    let opts = opts.clone();
+                    let wr = wr.clone();
+                    futures.push(disk.walk_dir(opts, wr));
+                    // tokio::spawn(async move { disk.walk_dir(opts, wr).await });
+                }
+            }
+        }
+
+        let results = join_all(futures).await;
+
+        let mut errs = Vec::new();
+
+        for res in results {
+            match res {
+                Ok(_) => errs.push(None),
+                Err(e) => errs.push(Some(e)),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct ListPathOptions {
+    pub id: String,
+
+    // Bucket of the listing.
+    pub bucket: String,
+
+    // Directory inside the bucket.
+    // When unset listPath will set this based on Prefix
+    pub base_dir: String,
+
+    // Scan/return only content with prefix.
+    pub prefix: String,
+
+    // FilterPrefix will return only results with this prefix when scanning.
+    // Should never contain a slash.
+    // Prefix should still be set.
+    pub filter_prefix: String,
+
+    // Marker to resume listing.
+    // The response will be the first entry >= this object name.
+    pub marker: String,
+
+    // Limit the number of results.
+    pub limit: i32,
 }
 
 #[async_trait::async_trait]
@@ -151,6 +229,27 @@ impl StorageAPI for ECStore {
         let info = self.peer_sys.get_bucket_info(bucket, opts).await?;
 
         Ok(info)
+    }
+
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: &str,
+        delimiter: &str,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: &str,
+    ) -> Result<ListObjectsV2Info> {
+        let opts = ListPathOptions {
+            bucket: bucket.to_string(),
+            limit: max_keys,
+            ..Default::default()
+        };
+
+        self.list_path(&opts).await?;
+
+        Ok(ListObjectsV2Info::default())
     }
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let object = utils::path::encode_dir_object(object);

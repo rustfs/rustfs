@@ -424,12 +424,67 @@ pub struct ObjectInfo {
     pub is_latest: bool,
 }
 
+#[derive(Debug)]
+pub struct ListObjectsInfo {
+    // Indicates whether the returned list objects response is truncated. A
+    // value of true indicates that the list was truncated. The list can be truncated
+    // if the number of objects exceeds the limit allowed or specified
+    // by max keys.
+    pub is_truncated: bool,
+
+    // When response is truncated (the IsTruncated element value in the response
+    // is true), you can use the key name in this field as marker in the subsequent
+    // request to get next set of objects.
+    pub next_marker: String,
+
+    // List of objects info for this request.
+    pub objects: Vec<ObjectInfo>,
+
+    // List of prefixes for this request.
+    pub prefixes: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct ListObjectsV2Info {
+    // Indicates whether the returned list objects response is truncated. A
+    // value of true indicates that the list was truncated. The list can be truncated
+    // if the number of objects exceeds the limit allowed or specified
+    // by max keys.
+    pub is_truncated: bool,
+
+    // When response is truncated (the IsTruncated element value in the response
+    // is true), you can use the key name in this field as marker in the subsequent
+    // request to get next set of objects.
+    //
+    // NOTE: This element is returned only if you have delimiter request parameter
+    // specified.
+    pub continuation_token: String,
+    pub next_continuation_token: String,
+
+    // List of objects info for this request.
+    pub objects: Vec<ObjectInfo>,
+
+    // List of prefixes for this request.
+    pub prefixes: Vec<String>,
+}
+
 #[async_trait::async_trait]
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
+
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: &str,
+        delimiter: &str,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: &str,
+    ) -> Result<ListObjectsV2Info>;
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn get_object_reader(
         &self,
