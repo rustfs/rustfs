@@ -2,14 +2,16 @@ use http::HeaderMap;
 use uuid::Uuid;
 
 use crate::{
-    disk::format::{DistributionAlgoVersion, FormatV3},
-    disk::DiskStore,
+    disk::{
+        format::{DistributionAlgoVersion, FormatV3},
+        DiskStore,
+    },
     endpoints::PoolEndpoints,
     error::Result,
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, MakeBucketOptions, MultipartUploadResult,
-        ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, ListObjectsInfo, ListObjectsV2Info,
+        MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -130,6 +132,19 @@ impl StorageAPI for Sets {
     }
 
     async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+        unimplemented!()
+    }
+
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: &str,
+        delimiter: &str,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: &str,
+    ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
 

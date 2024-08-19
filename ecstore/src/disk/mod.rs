@@ -14,6 +14,7 @@ const STORAGE_FORMAT_FILE: &str = "xl.meta";
 use crate::{
     erasure::ReadAt,
     error::Result,
+    file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
 };
 use bytes::Bytes;
@@ -21,7 +22,7 @@ use std::{fmt::Debug, io::SeekFrom, pin::Pin, sync::Arc};
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, DuplexStream},
 };
 use uuid::Uuid;
 
@@ -50,9 +51,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     // 读目录下的所有文件、目录
-    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: usize) -> Result<Vec<String>>;
-    // 读目录下的所有xl.meta
-    async fn walk_dir(&self) -> Result<Vec<FileInfo>>;
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
+    // 并发边读边写 TODO: wr io.Writer
+    async fn walk_dir(&self, opts: WalkDirOptions, wr: Arc<DuplexStream>) -> Result<()>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -79,6 +80,48 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct WalkDirOptions {
+    // Bucket to scanner
+    pub bucket: String,
+    // Directory inside the bucket.
+    pub base_dir: String,
+    // Do a full recursive scan.
+    pub recursive: bool,
+
+    // ReportNotFound will return errFileNotFound if all disks reports the BaseDir cannot be found.
+    pub report_notfound: bool,
+
+    // FilterPrefix will only return results with given prefix within folder.
+    // Should never contain a slash.
+    pub filter_prefix: String,
+
+    // ForwardTo will forward to the given object path.
+    pub forward_to: String,
+
+    // Limit the number of returned objects if > 0.
+    pub limit: i32,
+
+    // DiskID contains the disk ID of the disk.
+    // Leave empty to not check disk ID.
+    pub disk_id: String,
+}
+
+#[derive(Debug, Default)]
+pub struct MetaCacheEntry {
+    // name is the full name of the object including prefixes
+    name: String,
+    // Metadata. If none is present it is not an object but only a prefix.
+    // Entries without metadata will only be present in non-recursive scans.
+    metadata: Vec<u8>,
+
+    // cached contains the metadata if decoded.
+    cached: Option<FileMeta>,
+
+    // Indicates the entry can be reused and only one reference to metadata is expected.
+    reusable: bool,
 }
 
 pub struct DiskOption {

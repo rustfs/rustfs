@@ -1,7 +1,9 @@
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
-    DeleteOptions, DiskAPI, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, VolumeInfo,
+    DeleteOptions, DiskAPI, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    RenameDataResp, VolumeInfo, WalkDirOptions,
 };
+use crate::disk::STORAGE_FORMAT_FILE;
 use crate::{
     error::{Error, Result},
     file_meta::FileMeta,
@@ -10,13 +12,15 @@ use crate::{
 };
 use bytes::Bytes;
 use path_absolutize::Absolutize;
+use std::sync::Arc;
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::ErrorKind;
+use tokio::io::{DuplexStream, ErrorKind};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -496,7 +500,7 @@ impl DiskAPI for LocalDisk {
 
         // Ok((buffer, bytes_read))
     }
-    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: usize) -> Result<Vec<String>> {
+    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
         let p = self.get_bucket_path(volume)?;
 
         let mut entries = fs::read_dir(&p).await?;
@@ -522,8 +526,50 @@ impl DiskAPI for LocalDisk {
 
         Ok(volumes)
     }
-    async fn walk_dir(&self) -> Result<Vec<FileInfo>> {
-        unimplemented!()
+    async fn walk_dir(&self, opts: WalkDirOptions, wr: Arc<DuplexStream>) -> Result<()> {
+        let mut entries = self.list_dir("", &opts.bucket, &opts.base_dir, -1).await?;
+
+        entries.sort();
+
+        // 已读计数
+        let objs_returned = 0;
+
+        let bucket = opts.bucket.as_str();
+
+        // 第一层过滤
+        for entry in entries.iter() {
+            // check limit
+            if opts.limit > 0 && objs_returned >= opts.limit {
+                return Ok(());
+            }
+            // check prefix
+            if !opts.filter_prefix.is_empty() && !entry.starts_with(&opts.filter_prefix) {
+                continue;
+            }
+
+            warn!("walk_dir entry {}", entry);
+
+            let mut meta = MetaCacheEntry {
+                name: entry.clone(),
+                ..Default::default()
+            };
+
+            let fpath = self.get_object_path(bucket, format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE).as_str())?;
+
+            let (fdata, _) = match self.read_metadata_with_dmtime(&fpath).await {
+                Ok(res) => res,
+                Err(e) => {
+                    // TODO: check err
+                    (Vec::new(), OffsetDateTime::UNIX_EPOCH)
+                }
+            };
+
+            meta.metadata = fdata;
+
+            // TODO: FIXME:
+        }
+
+        Ok(())
     }
 
     // #[tracing::instrument(skip(self))]
