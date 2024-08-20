@@ -14,7 +14,7 @@ We will continue to keep the benefits of MinIO for RustFS.
 ... ...
 
 | RustFS | MinIO | Ceph | 
-
+| - | - | - |
 | Simple Deployment | Simple Deployment | Difficult Deployment |
 | One-Click Startup | One-Click Startup | Complex Startup Processes |
 | Simple Scaling | Simple Scaling | Very high IO pressure to rebalance | No Meta Data Center Risk | No Meta Data Center Risk | No Meta Data Center Risk
