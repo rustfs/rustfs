@@ -22,13 +22,13 @@ RustFS is a high-performance distributed object storage software built using Rus
 
 # FAQ
 
-1. [Why are we rewriting MinIO in Rust?](/rustfs/rustfs/docs/en/why-rust.md)
-2. [What's good about MinIO will you keep?](/rustfs/rustfs/docs/en/why-good.md )
-3. [Why did you choose to rewrite MinIO instead of Ceph?](/rustfs/rustfs/docs/en/why-ceph.md )
-4. [Why object storage instead of block storage?](/rustfs/rustfs/docs/en/why-object-storage.md)
-5. [What languages are supported for communication?](/rustfs/rustfs/docs/zh/why-language.md)
-6. [What are the options for open source protocols?](/rustfs/rustfs/docs/en/how-opensource.md )
-7. [How to join RustFS Open Source?](/rustfs/rustfs/docs/en/howtojoin.md)
+1. [Why are we rewriting MinIO in Rust?](/docs/en/why-rust.md)
+2. [What's good about MinIO will you keep?](/docs/en/why-good.md )
+3. [Why did you choose to rewrite MinIO instead of Ceph?](/docs/en/why-ceph.md )
+4. [Why object storage instead of block storage?](/docs/en/why-object-storage.md)
+5. [What languages are supported for communication?](/docs/zh/why-language.md)
+6. [What are the options for open source protocols?](/docs/en/how-opensource.md )
+7. [How to join RustFS Open Source?](/docs/en/howtojoin.md)
 
 
 # Our website
