@@ -65,6 +65,10 @@ https://RustFS.com/
 
   我们欢迎致力于改变世界存储架构的开源爱好者加入我们。
 
+  可以通过邮箱：hello@rustfs.com 加入我们；
+
+   也可以添加微信，微信ID为：mys3io （普通用户请勿扰）
+
 # 投资我们
 
 我们的电子邮件是 hello@rustfs.com

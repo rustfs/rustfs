@@ -58,10 +58,12 @@ For user manual, system design and architecture, please refer to [RustFS Documen
 
    Download the corresponding version for MacOS CPU, drag and drop it into the Apple app, and double-click to open it and run it.
 
-# Jobs
+# Join us   
 
-  We welcome open source enthusiasts who are committed to changing the world's storage architecture to join us.
 
+You can join us by email: hello@rustfs.com;
+
+You can also add WeChat, WeChat ID: mys3io (ordinary users please do not add this WeChat)
 
 
 # Invest in us
