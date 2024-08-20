@@ -409,7 +409,7 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
@@ -424,7 +424,7 @@ pub struct ObjectInfo {
     pub is_latest: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ListObjectsInfo {
     // Indicates whether the returned list objects response is truncated. A
     // value of true indicates that the list was truncated. The list can be truncated

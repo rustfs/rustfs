@@ -10,7 +10,6 @@ use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
-use futures_util::TryStreamExt;
 use http::HeaderMap;
 use s3s::dto::*;
 use s3s::s3_error;
@@ -20,9 +19,8 @@ use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
-use std::pin::Pin;
 use std::str::FromStr;
-use std::task::Poll;
+use tracing::warn;
 use transform_stream::AsyncTryStream;
 
 use ecstore::error::Result;
@@ -258,13 +256,16 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        let _object_infos = try_!(
+        let prefix = prefix.unwrap_or_default();
+        let delimiter = delimiter.unwrap_or_default();
+
+        let object_infos = try_!(
             self.store
                 .list_objects_v2(
                     &bucket,
-                    &prefix.unwrap_or_default(),
+                    &prefix,
                     &continuation_token.unwrap_or_default(),
-                    &delimiter.unwrap_or_default(),
+                    &delimiter,
                     max_keys.unwrap_or_default(),
                     fetch_owner.unwrap_or_default(),
                     &start_after.unwrap_or_default()
@@ -272,7 +273,41 @@ impl S3 for FS {
                 .await
         );
 
-        let output = ListObjectsV2Output { ..Default::default() };
+        warn!("object_infos {:?}", object_infos);
+
+        let objects: Vec<Object> = object_infos
+            .objects
+            .iter()
+            .filter(|v| !v.name.is_empty())
+            .map(|v| {
+                let mut obj = Object::default();
+                obj.key = Some(v.name.to_owned());
+                obj.last_modified = v.mod_time.map(Timestamp::from);
+                obj.size = Some(v.size as i64);
+
+                if fetch_owner.is_some_and(|v| v) {
+                    obj.owner = Some(Owner {
+                        display_name: Some("rustfs".to_owned()),
+                        id: Some("v0.1".to_owned()),
+                    });
+                }
+                obj
+            })
+            .collect();
+
+        let key_count = objects.len() as i32;
+
+        let output = ListObjectsV2Output {
+            key_count: Some(key_count),
+            max_keys: Some(key_count),
+            contents: Some(objects),
+            delimiter: Some(delimiter),
+            name: Some(bucket),
+            prefix: Some(prefix),
+            ..Default::default()
+        };
+
+        // let output = ListObjectsV2Output { ..Default::default() };
         Ok(S3Response::new(output))
     }
 

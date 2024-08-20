@@ -1,6 +1,6 @@
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::{error::DiskError, DiskOption, DiskStore, MetaCacheEntry, WalkDirOptions, RUSTFS_META_BUCKET},
+    disk::{error::DiskError, DiskOption, DiskStore, WalkDirOptions, RUSTFS_META_BUCKET},
     disks_layout::DisksLayout,
     endpoints::EndpointServerPools,
     error::{Error, Result},
@@ -15,8 +15,8 @@ use crate::{
 use futures::future::join_all;
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc;
+use std::collections::{HashMap, HashSet};
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -108,22 +108,24 @@ impl ECStore {
         self.pools.len() == 1
     }
 
-    async fn list_path(&self, opts: &ListPathOptions) -> Result<()> {
-        let (sender, rec) = mpsc::channel(64);
-        self.listMerged(opts, sender).await?;
-        Ok(())
+    async fn list_path(&self, opts: &ListPathOptions) -> Result<ListObjectsInfo> {
+        let objects = self.list_merged(opts).await?;
+
+        let info = ListObjectsInfo {
+            objects,
+            ..Default::default()
+        };
+        Ok(info)
     }
 
     // 读所有
-    async fn listMerged(&self, opts: &ListPathOptions, results: mpsc::Sender<MetaCacheEntry>) -> Result<()> {
+    async fn list_merged(&self, opts: &ListPathOptions) -> Result<Vec<ObjectInfo>> {
         let opts = WalkDirOptions {
             bucket: opts.bucket.clone(),
             ..Default::default()
         };
 
-        let (mut wr, mut rd) = tokio::io::duplex(1024);
-
-        let wr = Arc::new(wr);
+        // let (mut wr, mut rd) = tokio::io::duplex(1024);
 
         let mut futures = Vec::new();
 
@@ -136,8 +138,8 @@ impl ECStore {
 
                     let disk = disk.as_ref().unwrap();
                     let opts = opts.clone();
-                    let wr = wr.clone();
-                    futures.push(disk.walk_dir(opts, wr));
+                    // let mut wr = &mut wr;
+                    futures.push(disk.walk_dir(opts));
                     // tokio::spawn(async move { disk.walk_dir(opts, wr).await });
                 }
             }
@@ -146,20 +148,52 @@ impl ECStore {
         let results = join_all(futures).await;
 
         let mut errs = Vec::new();
+        let mut ress = Vec::new();
+        let mut uniq = HashSet::new();
 
         for res in results {
             match res {
-                Ok(_) => errs.push(None),
+                Ok(entrys) => {
+                    for entry in entrys {
+                        if !uniq.contains(&entry.name) {
+                            uniq.insert(entry.name.clone());
+                            // TODO: 过滤
+                            if opts.limit > 0 && ress.len() as i32 >= opts.limit {
+                                return Ok(ress);
+                            }
+
+                            if entry.is_object() {
+                                let fi = entry.to_fileinfo(&opts.bucket)?;
+                                if fi.is_some() {
+                                    ress.push(fi.unwrap().into_object_info(&opts.bucket, &entry.name, false));
+                                }
+                                continue;
+                            }
+
+                            if entry.is_dir() {
+                                ress.push(ObjectInfo {
+                                    is_dir: true,
+                                    bucket: opts.bucket.clone(),
+                                    name: entry.name,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                    errs.push(None);
+                }
                 Err(e) => errs.push(Some(e)),
             }
         }
 
-        Ok(())
+        warn!("list_merged errs {:?}", errs);
+
+        Ok(ress)
     }
 }
 
 #[derive(Debug, Default)]
-struct ListPathOptions {
+pub struct ListPathOptions {
     pub id: String,
 
     // Bucket of the listing.
@@ -234,12 +268,12 @@ impl StorageAPI for ECStore {
     async fn list_objects_v2(
         &self,
         bucket: &str,
-        prefix: &str,
+        _prefix: &str,
         continuation_token: &str,
-        delimiter: &str,
+        _delimiter: &str,
         max_keys: i32,
-        fetch_owner: bool,
-        start_after: &str,
+        _fetch_owner: bool,
+        _start_after: &str,
     ) -> Result<ListObjectsV2Info> {
         let opts = ListPathOptions {
             bucket: bucket.to_string(),
@@ -247,9 +281,19 @@ impl StorageAPI for ECStore {
             ..Default::default()
         };
 
-        self.list_path(&opts).await?;
+        let info = self.list_path(&opts).await?;
 
-        Ok(ListObjectsV2Info::default())
+        warn!("list_objects_v2 info {:?}", info);
+
+        let v2 = ListObjectsV2Info {
+            is_truncated: info.is_truncated,
+            continuation_token: continuation_token.to_owned(),
+            next_continuation_token: info.next_marker,
+            objects: info.objects,
+            prefixes: info.prefixes,
+        };
+
+        Ok(v2)
     }
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let object = utils::path::encode_dir_object(object);
