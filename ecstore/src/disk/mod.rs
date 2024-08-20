@@ -22,7 +22,7 @@ use std::{fmt::Debug, io::SeekFrom, pin::Pin, sync::Arc};
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, DuplexStream},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite},
 };
 use uuid::Uuid;
 
@@ -53,7 +53,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // 读目录下的所有文件、目录
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
     // 并发边读边写 TODO: wr io.Writer
-    async fn walk_dir(&self, opts: WalkDirOptions, wr: Arc<DuplexStream>) -> Result<()>;
+    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -112,16 +112,71 @@ pub struct WalkDirOptions {
 #[derive(Debug, Default)]
 pub struct MetaCacheEntry {
     // name is the full name of the object including prefixes
-    name: String,
+    pub name: String,
     // Metadata. If none is present it is not an object but only a prefix.
     // Entries without metadata will only be present in non-recursive scans.
-    metadata: Vec<u8>,
+    pub metadata: Vec<u8>,
 
     // cached contains the metadata if decoded.
     cached: Option<FileMeta>,
 
     // Indicates the entry can be reused and only one reference to metadata is expected.
-    reusable: bool,
+    _reusable: bool,
+}
+
+impl MetaCacheEntry {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut wr = Vec::new();
+        rmp::encode::write_bool(&mut wr, true)?;
+
+        rmp::encode::write_str(&mut wr, &self.name)?;
+
+        rmp::encode::write_bin(&mut wr, &self.metadata)?;
+
+        Ok(wr)
+    }
+    pub fn is_dir(&self) -> bool {
+        self.metadata.is_empty() && self.name.ends_with("/")
+    }
+    pub fn is_object(&self) -> bool {
+        !self.metadata.is_empty()
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub fn to_fileinfo(&self, bucket: &str) -> Result<Option<FileInfo>> {
+        if self.is_dir() {
+            return Ok(Some(FileInfo {
+                volume: bucket.to_owned(),
+                name: self.name.clone(),
+                ..Default::default()
+            }));
+        }
+
+        if self.cached.is_some() {
+            let fm = self.cached.as_ref().unwrap();
+            if fm.versions.is_empty() {
+                return Ok(Some(FileInfo {
+                    volume: bucket.to_owned(),
+                    name: self.name.clone(),
+                    deleted: true,
+                    is_latest: true,
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    ..Default::default()
+                }));
+            }
+
+            let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
+
+            return Ok(Some(fi));
+        }
+
+        let mut fm = FileMeta::new();
+        fm.unmarshal_msg(&self.metadata)?;
+
+        let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
+
+        return Ok(Some(fi));
+    }
 }
 
 pub struct DiskOption {

@@ -12,15 +12,13 @@ use crate::{
 };
 use bytes::Bytes;
 use path_absolutize::Absolutize;
-use std::sync::Arc;
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{DuplexStream, ErrorKind};
-use tokio::sync::mpsc;
+use tokio::io::ErrorKind;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -526,7 +524,8 @@ impl DiskAPI for LocalDisk {
 
         Ok(volumes)
     }
-    async fn walk_dir(&self, opts: WalkDirOptions, wr: Arc<DuplexStream>) -> Result<()> {
+
+    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
         let mut entries = self.list_dir("", &opts.bucket, &opts.base_dir, -1).await?;
 
         entries.sort();
@@ -536,11 +535,13 @@ impl DiskAPI for LocalDisk {
 
         let bucket = opts.bucket.as_str();
 
+        let mut metas = Vec::new();
+
         // 第一层过滤
         for entry in entries.iter() {
             // check limit
             if opts.limit > 0 && objs_returned >= opts.limit {
-                return Ok(());
+                return Ok(metas);
             }
             // check prefix
             if !opts.filter_prefix.is_empty() && !entry.starts_with(&opts.filter_prefix) {
@@ -558,7 +559,7 @@ impl DiskAPI for LocalDisk {
 
             let (fdata, _) = match self.read_metadata_with_dmtime(&fpath).await {
                 Ok(res) => res,
-                Err(e) => {
+                Err(_) => {
                     // TODO: check err
                     (Vec::new(), OffsetDateTime::UNIX_EPOCH)
                 }
@@ -566,10 +567,10 @@ impl DiskAPI for LocalDisk {
 
             meta.metadata = fdata;
 
-            // TODO: FIXME:
+            metas.push(meta);
         }
 
-        Ok(())
+        Ok(metas)
     }
 
     // #[tracing::instrument(skip(self))]

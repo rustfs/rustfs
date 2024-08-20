@@ -10,8 +10,8 @@ use crate::{
     error::Result,
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, ListObjectsInfo, ListObjectsV2Info,
-        MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, ListObjectsV2Info, MakeBucketOptions,
+        MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -137,13 +137,13 @@ impl StorageAPI for Sets {
 
     async fn list_objects_v2(
         &self,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: &str,
-        delimiter: &str,
-        max_keys: i32,
-        fetch_owner: bool,
-        start_after: &str,
+        _bucket: &str,
+        _prefix: &str,
+        _continuation_token: &str,
+        _delimiter: &str,
+        _max_keys: i32,
+        _fetch_owner: bool,
+        _start_after: &str,
     ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
