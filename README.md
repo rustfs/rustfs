@@ -63,7 +63,7 @@ For user manual, system design and architecture, please refer to [RustFS Documen
 
 You can join us by email: hello@rustfs.com;
 
-You can also add WeChat, WeChat ID: mys3io (ordinary users please do not add this WeChat)
+You can also add WeChat, WeChat ID: mys3io (Developer applications only)
 
 
 # Invest in us

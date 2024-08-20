@@ -67,7 +67,7 @@ https://RustFS.com/
 
   可以通过邮箱：hello@rustfs.com 加入我们；
 
-   也可以添加微信，微信ID为：mys3io （普通用户请勿扰）
+   也可以添加微信，微信ID为：mys3io （只接受开发者申请）
 
 # 投资我们
 
