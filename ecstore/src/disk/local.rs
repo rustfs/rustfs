@@ -548,7 +548,7 @@ impl DiskAPI for LocalDisk {
                 continue;
             }
 
-            warn!("walk_dir entry {}", entry);
+            // warn!("walk_dir entry {}", entry);
 
             let mut meta = MetaCacheEntry {
                 name: entry.clone(),

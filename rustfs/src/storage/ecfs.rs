@@ -273,7 +273,7 @@ impl S3 for FS {
                 .await
         );
 
-        warn!("object_infos {:?}", object_infos);
+        // warn!("object_infos {:?}", object_infos);
 
         let objects: Vec<Object> = object_infos
             .objects
