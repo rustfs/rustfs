@@ -283,7 +283,7 @@ impl StorageAPI for ECStore {
 
         let info = self.list_path(&opts).await?;
 
-        warn!("list_objects_v2 info {:?}", info);
+        // warn!("list_objects_v2 info {:?}", info);
 
         let v2 = ListObjectsV2Info {
             is_truncated: info.is_truncated,
