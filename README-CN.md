@@ -20,6 +20,16 @@
 
 RustFS 是一个使用 Rust 编程语言构建的高性能分布式对象存储软件，Rust 是全球最受欢迎的编程语言之一。它与 MinIO 一样，拥有一系列优势，如简洁性、与 S3 兼容、开源特性，以及对数据湖、人工智能和大数据的支持。此外，与其他存储系统相比，RustFS 具有更好的、更用户友好的开源许可证，因为它是在 Apache 许可证下构建的。由于 Rust 是其基础，RustFS 为高性能对象存储提供了更快的速度和更安全的分布式特性。
 
+# 常见问题解答？
+
+1. [为什么我们要用Rust重写MinIO？] (/rustfs/rustfs/docs/zh/why-rust.md)
+2. [MinIO的优点你们会继续保持吗？] (/rustfs/rustfs/docs/zh/why-good.md )
+3. [为什么选择重写MinIO不是重写Ceph?] (/rustfs/rustfs/docs/zh/why-ceph.md)
+4. [为什么是对象存储而不是块存储？] (/rustfs/rustfs/docs/zh/why-object-storage.md)
+5. [们支持哪些语言交流？] (/rustfs/rustfs/docs/zh/why-language.md)
+6. [开源协议的选择？] (/rustfs/rustfs/docs/zh/how-opensource.md  )
+7. [如何加入RustFS开源？] (/rustfs/rustfs/docs/zh/howtojoin.md)
+
 
 # 我们的网站
 https://RustFS.com/
