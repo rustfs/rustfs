@@ -1,3 +1,4 @@
+use futures::future::join_all;
 use http::HeaderMap;
 use uuid::Uuid;
 
@@ -110,6 +111,22 @@ impl Sets {
     // ) -> Vec<Option<Error>> {
     //     unimplemented!()
     // }
+
+    async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
+        let mut futures = Vec::new();
+        let opt = ObjectOptions {
+            delete_prefix: true,
+            ..Default::default()
+        };
+
+        for set in self.disk_set.iter() {
+            futures.push(set.delete_object(bucket, object, opt.clone()));
+        }
+
+        let _results = join_all(futures).await;
+
+        Ok(())
+    }
 }
 
 // #[derive(Debug)]
@@ -134,7 +151,14 @@ impl StorageAPI for Sets {
     async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()
     }
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        if opts.delete_prefix {
+            self.delete_prefix(bucket, object).await?;
+            return Ok(ObjectInfo::default());
+        }
 
+        self.get_disks_by_key(object).delete_object(bucket, object, opts).await
+    }
     async fn list_objects_v2(
         &self,
         _bucket: &str,

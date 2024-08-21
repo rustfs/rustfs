@@ -86,7 +86,7 @@ impl FileInfo {
             parity_blocks: self.erasure.parity_blocks,
             data_blocks: self.erasure.data_blocks,
             version_id: self.version_id,
-            deleted: self.deleted,
+            delete_marker: self.deleted,
             mod_time: self.mod_time,
             size: self.size,
             parts: self.parts.clone(),
@@ -358,12 +358,15 @@ impl HTTPRangeSpec {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
     pub mod_time: Option<OffsetDateTime>,
     pub part_number: usize,
+
+    pub delete_prefix: bool,
+    pub version_id: String,
 }
 
 // impl Default for ObjectOptions {
@@ -413,13 +416,13 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
+    pub mod_time: Option<OffsetDateTime>,
+    pub size: usize,
     pub is_dir: bool,
     pub parity_blocks: usize,
     pub data_blocks: usize,
     pub version_id: Uuid,
-    pub deleted: bool,
-    pub mod_time: Option<OffsetDateTime>,
-    pub size: usize,
+    pub delete_marker: bool,
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
 }
@@ -474,7 +477,7 @@ pub trait StorageAPI {
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
-
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
     async fn list_objects_v2(
         &self,
         bucket: &str,
