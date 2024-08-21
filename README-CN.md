@@ -1,6 +1,6 @@
 # RustFS Quickstart Guide
 
-[![RustFS](https://raw.githubusercontent.com/33a05c50cfaf8aaf613bf98826f9e55ab50a7c89/images/logo.svg)](https://rustfs.com)
+[![RustFS](https://raw.githubusercontent.com/rustfs/rustfs/33a05c50cfaf8aaf613bf98826f9e55ab50a7c89/images/logo.svg)](https://rustfs.com)
 
 
 [![Apache 2.0 licensed][license-badge]][license-url]
@@ -56,7 +56,6 @@ https://RustFS.com/
 12. [如何开发管理端API？](/docs/cn/core/management-api.md)
 13. [如何向我们报告Bug和提交新功能建议?](/docs/cn/core/report-bug.md)
 14. [附录：RustFS使用的EC是哪一种？（可以不用学习）](/docs/cn/core/rustfs-ec.md)
-15. [附录：如何开发RustFS插件？（待补充）](/docs/cn/core/rustfs-plugin.md)
 
 # 如何安装 RustFS
 
