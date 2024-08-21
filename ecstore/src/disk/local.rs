@@ -877,6 +877,7 @@ impl DiskAPI for LocalDisk {
     async fn delete_volume(&self, volume: &str) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
+        // TODO: 不能用递归删除，如果目录下面有文件，返回errVolumeNotEmpty
         fs::remove_dir_all(&p).await?;
 
         Ok(())

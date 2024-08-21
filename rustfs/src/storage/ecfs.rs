@@ -20,7 +20,6 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
-use tracing::warn;
 use transform_stream::AsyncTryStream;
 
 use ecstore::error::Result;

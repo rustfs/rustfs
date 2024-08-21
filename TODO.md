@@ -17,6 +17,8 @@
   - [x] 创建 CreateBucket
   - [x] 列表 ListBuckets
     - [ ] 桶下面的文件列表 ListObjects
+      - [x] 简单实现功能
+      - [ ] 优化并发读取
   - [ ] 删除
   - [x] 详情 HeadBucket
 - [ ] 文件操作

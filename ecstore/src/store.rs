@@ -1,6 +1,6 @@
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::{error::DiskError, DiskOption, DiskStore, WalkDirOptions, RUSTFS_META_BUCKET},
+    disk::{error::DiskError, DeleteOptions, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     disks_layout::DisksLayout,
     endpoints::EndpointServerPools,
     error::{Error, Result},
@@ -16,7 +16,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
 use std::collections::{HashMap, HashSet};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -189,6 +189,43 @@ impl ECStore {
         warn!("list_merged errs {:?}", errs);
 
         Ok(ress)
+    }
+
+    async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
+        let mut futures = Vec::new();
+        for sets in self.pools.iter() {
+            for set in sets.disk_set.iter() {
+                for disk in set.disks.iter() {
+                    if disk.is_none() {
+                        continue;
+                    }
+
+                    let disk = disk.as_ref().unwrap();
+                    futures.push(disk.delete(
+                        bucket,
+                        prefix,
+                        DeleteOptions {
+                            recursive: true,
+                            immediate: false,
+                        },
+                    ));
+                }
+            }
+        }
+        let results = join_all(futures).await;
+
+        let mut errs = Vec::new();
+
+        for res in results {
+            match res {
+                Ok(_) => errs.push(None),
+                Err(e) => errs.push(Some(e)),
+            }
+        }
+
+        debug!("store delete_all errs {:?}", errs);
+
+        Ok(())
     }
 }
 
@@ -381,6 +418,9 @@ impl StorageAPI for ECStore {
     async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         self.peer_sys.delete_bucket(bucket).await?;
 
+        // 删除meta
+        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
+            .await?;
         Ok(())
     }
 }
