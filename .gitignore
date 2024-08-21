@@ -1,0 +1,12 @@
+/target
+.DS_Store
+.idea
+.vscode
+.git
+**/*.swp
+**/*.test
+*.syso
+.vscode/
+*.tar.bz2
+.bin/
+*.gz
