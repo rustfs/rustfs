@@ -27,7 +27,7 @@ RustFS 是一个使用 Rust 编程语言构建的高性能分布式对象存储�
 3. [为什么选择重写MinIO不是重写Ceph?](/docs/cn/why-ceph.md)
 4. [为什么是对象存储而不是块存储？](/docs/cn/why-object-storage.md)
 5. [们支持哪些语言交流？](/docs/cn/why-language.md)
-6. [开源协议的选择？](/docs/cn/how-opensource.md  )
+6. [开源协议的选择？](/docs/cn/how-opensource.md)
 7. [如何加入RustFS开源？](/docs/cn/howtojoin.md)
 
 
@@ -40,10 +40,23 @@ https://RustFS.com/
 帮助全人类降低存储成本，实现数据安全。
 
 
-# 文档
+# 开发者文档
 
-有关用户手册、系统设计和架构，请访问： [RustFS 文档](https://rustfs.com/docs/).
-
+1. [对象存储的基本概念](/docs/cn/core/start.md)
+2. [多副本和EC的区别?](/docs/cn/core/ec.md)
+3. [集中存储和分布式存储的区别?](/docs/cn/core/distributed.md)
+4. [分布式存储的模式有哪些？](/docs/cn/core/modes.md)
+5. [静态EC与动态EC的优缺点?](/docs/cn/core/ec-modes.md)
+6. [RustFS的启动模式](/docs/cn/core/start-modes.md)
+7. [磁盘、EC、条带、池](/docs/cn/core/disk-ec-stripes-pools.md)
+8. [RustFS的代码分层](/docs/cn/core/code-layer.md)
+9. [RustFS启动流程](/docs/cn/core/start-process.md)
+10. [我们的代码规范?](/docs/cn/core/code-style.md)
+11. [如何开发S3 API？](/docs/cn/core/s3-api.md)
+12. [如何开发管理端API？](/docs/cn/core/management-api.md)
+13. [如何向我们报告Bug和提交新功能建议?](/docs/cn/core/report-bug.md)
+14. [附录：RustFS使用的EC是哪一种？（可以不用学习）](/docs/cn/core/rustfs-ec.md)
+15. [附录：如何开发RustFS插件？（待补充）](/docs/cn/core/rustfs-plugin.md)
 
 # 如何安装 RustFS
 

@@ -38,9 +38,26 @@ https://RustFS.com/
 # Values
 Help all of humanity reduce storage costs and achieve data security.
 
-# Documentation
 
-For user manual, system design and architecture, please refer to [RustFS Documentation](https://rustfs.com/docs/).
+
+# Developer documentation
+
+1. [Basic concepts of object storage](/docs/en/core/start.md)
+2. [Difference between multicopy and EC?](/docs/en/core/ec.md)
+3. [Difference between centralized and distributed storage?](/docs/en/core/distributed.md)
+4. [What are the models of distributed storage?](/docs/en/core/modes.md)
+5. [Advantages and disadvantages of static versus dynamic EC?](/docs/en/core/ec-modes.md)
+6. [Startup modes for RustFS](/docs/en/core/start-modes.md)
+7. [Disks, EC, Stripes, Pools](/docs/en/core/disk-ec-stripes-pools.md)
+8. [Code Layers for RustFS](/docs/en/core/code-layer.md)
+9. [RustFS start-up process](/docs/en/core/start-process.md)
+10. [Our code specification?](/docs/en/core/code-style.md)
+11. [How to develop S3 API?](/docs/en/core/s3-api.md)
+12. [How to develop the management API?](/docs/en/core/management-api.md)
+13. [How to report bugs and submit new feature suggestions to us?](/docs/en/core/report-bug.md)
+14. [Appendix: Which EC does RustFS use? (can be learned without it)](/docs/en/core/rustfs-ec.md)
+15. [Appendix: How to develop RustFS plugin? (to be added)](/docs/en/core/rustfs-plugin.md)
+
 
 
 # How to install RustFS
