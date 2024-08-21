@@ -16,6 +16,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
 use std::collections::{HashMap, HashSet};
+use time::OffsetDateTime;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -227,6 +228,77 @@ impl ECStore {
 
         Ok(())
     }
+    async fn delete_prefix(&self, _bucket: &str, _object: &str) -> Result<()> {
+        unimplemented!()
+    }
+
+    async fn get_pool_info_existing_with_opts(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(PoolObjInfo, Vec<Error>)> {
+        let mut futures = Vec::new();
+
+        for pool in self.pools.iter() {
+            futures.push(pool.get_object_info(bucket, object, opts));
+        }
+
+        let results = join_all(futures).await;
+
+        let mut ress = Vec::new();
+
+        let mut i = 0;
+
+        // join_all结果跟输入顺序一致
+        for res in results {
+            let index = i;
+
+            match res {
+                Ok(r) => {
+                    ress.push(PoolObjInfo {
+                        index,
+                        object_info: r,
+                        err: None,
+                    });
+                }
+                Err(e) => {
+                    ress.push(PoolObjInfo {
+                        index,
+                        err: Some(e),
+                        ..Default::default()
+                    });
+                }
+            }
+            i += 1;
+        }
+
+        ress.sort_by(|a, b| {
+            let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+
+            at.cmp(&bt)
+        });
+
+        for res in ress {
+            // check
+            if res.err.is_none() {
+                // TODO: let errs = self.poolsWithObject()
+                return Ok((res, Vec::new()));
+            }
+        }
+
+        let ret = PoolObjInfo::default();
+
+        Ok((ret, Vec::new()))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PoolObjInfo {
+    pub index: usize,
+    pub object_info: ObjectInfo,
+    pub err: Option<Error>,
 }
 
 #[derive(Debug, Default)]
@@ -302,6 +374,31 @@ impl StorageAPI for ECStore {
         Ok(info)
     }
 
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        if opts.delete_prefix {
+            self.delete_prefix(bucket, &object).await?;
+            return Ok(ObjectInfo::default());
+        }
+
+        let object = utils::path::encode_dir_object(object);
+        let object = object.as_str();
+
+        // 查询在哪个pool
+        let (mut pinfo, errs) = self.get_pool_info_existing_with_opts(bucket, object, &opts).await?;
+        if pinfo.object_info.delete_marker && opts.version_id.is_empty() {
+            pinfo.object_info.name = utils::path::decode_dir_object(object);
+            return Ok(pinfo.object_info);
+        }
+
+        if !errs.is_empty() {
+            // TODO: deleteObjectFromAllPools
+        }
+
+        let mut obj = self.pools[pinfo.index].delete_object(bucket, object, opts.clone()).await?;
+        obj.name = utils::path::decode_dir_object(object);
+
+        Ok(obj)
+    }
     async fn list_objects_v2(
         &self,
         bucket: &str,
