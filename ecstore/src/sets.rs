@@ -8,11 +8,11 @@ use crate::{
         DiskStore,
     },
     endpoints::PoolEndpoints,
-    error::Result,
+    error::{Error, Result},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, ListObjectsV2Info, MakeBucketOptions,
-        MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsV2Info,
+        MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -149,6 +149,15 @@ impl StorageAPI for Sets {
     }
 
     async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+        unimplemented!()
+    }
+    async fn delete_objects(
+        &self,
+        _bucket: &str,
+        _objects: Vec<ObjectToDelete>,
+        _opts: ObjectOptions,
+    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
+        // FIXME:
         unimplemented!()
     }
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {

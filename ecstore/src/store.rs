@@ -7,8 +7,9 @@ use crate::{
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, ListObjectsInfo, ListObjectsV2Info,
-        MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsInfo,
+        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init, utils,
 };
@@ -373,7 +374,124 @@ impl StorageAPI for ECStore {
 
         Ok(info)
     }
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
+        // encode object name
+        let objects: Vec<ObjectToDelete> = objects
+            .iter()
+            .map(|v| {
+                let mut v = v.clone();
+                v.object_name = utils::path::encode_dir_object(v.object_name.as_str());
+                v
+            })
+            .collect();
 
+        // 默认返回值
+        let mut del_objects = vec![DeletedObject::default(); objects.len()];
+
+        let mut del_errs = Vec::with_capacity(objects.len());
+        for _ in 0..objects.len() {
+            del_errs.push(None)
+        }
+
+        // TODO: limte 限制并发数量
+        let opt = ObjectOptions::default();
+        // 取所有poolObjInfo
+        let mut futures = Vec::new();
+        for obj in objects.iter() {
+            futures.push(self.get_pool_info_existing_with_opts(bucket, &obj.object_name, &opt));
+        }
+
+        let results = join_all(futures).await;
+
+        // 记录pool Index 对应的objects pool_idx -> objects idx
+        let mut pool_index_objects = HashMap::new();
+
+        let mut i = 0;
+        for res in results {
+            match res {
+                Ok((pinfo, _)) => {
+                    if pinfo.object_info.delete_marker && opts.version_id.is_empty() {
+                        del_objects[i] = DeletedObject {
+                            delete_marker: pinfo.object_info.delete_marker,
+                            delete_marker_version_id: pinfo.object_info.version_id.to_string(),
+                            object_name: utils::path::decode_dir_object(&pinfo.object_info.name),
+                            delete_marker_mtime: pinfo.object_info.mod_time,
+                            ..Default::default()
+                        };
+                    }
+
+                    if !pool_index_objects.contains_key(&pinfo.index) {
+                        pool_index_objects.insert(pinfo.index, vec![i]);
+                    } else {
+                        // let mut vals = pool_index_objects.
+                        if let Some(val) = pool_index_objects.get_mut(&pinfo.index) {
+                            val.push(i);
+                        }
+                    }
+                }
+                Err(e) => {
+                    //TODO: check not found
+
+                    del_errs[i] = Some(e)
+                }
+            }
+
+            i += 1;
+        }
+
+        if !pool_index_objects.is_empty() {
+            for sets in self.pools.iter() {
+                //  取pool idx 对应的 objects index
+                let vals = pool_index_objects.get(&sets.pool_idx);
+                if vals.is_none() {
+                    continue;
+                }
+
+                let obj_idxs = vals.unwrap();
+                //  取对应obj,理论上不会none
+                let objs: Vec<ObjectToDelete> = obj_idxs
+                    .iter()
+                    .filter_map(|&idx| {
+                        if let Some(obj) = objects.get(idx) {
+                            Some(obj.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if objs.is_empty() {
+                    continue;
+                }
+
+                let (pdel_objs, perrs) = sets.delete_objects(bucket, objs, opts.clone()).await?;
+
+                // perrs的顺序理论上跟obj_idxs顺序一致
+                let mut i = 0;
+                for err in perrs {
+                    let obj_idx = obj_idxs[i];
+
+                    if err.is_some() {
+                        del_errs[obj_idx] = err;
+                    }
+
+                    let mut dobj = pdel_objs.get(i).unwrap().clone();
+                    dobj.object_name = utils::path::decode_dir_object(&dobj.object_name);
+
+                    del_objects[obj_idx] = dobj;
+
+                    i += 1;
+                }
+            }
+        }
+
+        Ok((del_objects, del_errs))
+    }
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix {
             self.delete_prefix(bucket, &object).await?;
