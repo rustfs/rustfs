@@ -471,6 +471,22 @@ pub struct ListObjectsV2Info {
     pub prefixes: Vec<String>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ObjectToDelete {
+    pub object_name: String,
+}
+#[derive(Debug, Default, Clone)]
+pub struct DeletedObject {
+    pub delete_marker: bool,
+    pub delete_marker_version_id: String,
+    pub object_name: String,
+    pub version_id: String,
+    // MTime of DeleteMarker on source that needs to be propagated to replica
+    pub delete_marker_mtime: Option<OffsetDateTime>,
+    // to support delete marker replication
+    // pub replication_state: ReplicationState,
+}
+
 #[async_trait::async_trait]
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
@@ -478,6 +494,12 @@ pub trait StorageAPI {
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
     async fn list_objects_v2(
         &self,
         bucket: &str,
