@@ -1,7 +1,7 @@
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
-    DeleteOptions, DiskAPI, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    RenameDataResp, VolumeInfo, WalkDirOptions,
+    DeleteOptions, DiskAPI, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp,
+    ReadOptions, RenameDataResp, VolumeInfo, WalkDirOptions,
 };
 use crate::disk::STORAGE_FORMAT_FILE;
 use crate::{
@@ -138,8 +138,34 @@ impl LocalDisk {
         Ok(())
     }
 
+    pub async fn move_to_trash(&self, delete_path: &PathBuf, _recursive: bool, _immediate_purge: bool) -> Result<()> {
+        let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+        // TODO: 清空回收站
+        if let Err(err) = fs::rename(&delete_path, &trash_path).await {
+            match err.kind() {
+                ErrorKind::NotFound => (),
+                _ => {
+                    warn!("delete_file rename {:?} err {:?}", &delete_path, &err);
+                    return Err(Error::from(err));
+                }
+            }
+        }
+
+        // FIXME: 先清空回收站吧，有时间再添加判断逻辑
+        let _ = fs::remove_dir_all(&trash_path).await;
+
+        // TODO: immediate
+        Ok(())
+    }
+
     // #[tracing::instrument(skip(self))]
-    pub async fn delete_file(&self, base_path: &PathBuf, delete_path: &PathBuf, recursive: bool, _immediate: bool) -> Result<()> {
+    pub async fn delete_file(
+        &self,
+        base_path: &PathBuf,
+        delete_path: &PathBuf,
+        recursive: bool,
+        immediate_purge: bool,
+    ) -> Result<()> {
         debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
 
         if is_root_path(base_path) || is_root_path(delete_path) {
@@ -153,29 +179,7 @@ impl LocalDisk {
         }
 
         if recursive {
-            let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
-
-            if let Some(dir_path) = trash_path.parent() {
-                fs::create_dir_all(dir_path).await?;
-            }
-
-            debug!("delete_file ranme to trash {:?} to {:?}", &delete_path, &trash_path);
-
-            // TODO: 清空回收站
-            if let Err(err) = fs::rename(&delete_path, &trash_path).await {
-                match err.kind() {
-                    ErrorKind::NotFound => (),
-                    _ => {
-                        warn!("delete_file rename {:?} err {:?}", &delete_path, &err);
-                        return Err(Error::from(err));
-                    }
-                }
-            }
-
-            // FIXME: 先清空回收站吧，有时间再添加判断逻辑
-            let _ = fs::remove_dir_all(&trash_path).await;
-
-            // TODO: immediate
+            self.move_to_trash(delete_path, recursive, immediate_purge).await?;
         } else {
             if delete_path.is_dir() {
                 if let Err(err) = fs::remove_dir(&delete_path).await {
@@ -252,6 +256,51 @@ impl LocalDisk {
         };
 
         Ok((data, modtime))
+    }
+
+    async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &Vec<FileInfo>) -> Result<()> {
+        let volume_dir = self.get_bucket_path(volume)?;
+        let xlpath = self.get_object_path(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;
+
+        let (data, _) = match self.read_all_data(volume, volume_dir.as_path(), &xlpath).await {
+            Ok(res) => res,
+            Err(_err) => {
+                //  TODO: check if not found return err
+
+                (Vec::new(), OffsetDateTime::UNIX_EPOCH)
+            }
+        };
+
+        if data.is_empty() {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        let mut fm = FileMeta::default();
+
+        fm.unmarshal_msg(&data)?;
+
+        for fi in fis {
+            let data_dir = fm.delete_version(fi)?;
+
+            if data_dir.is_some() {
+                let dir_path = self.get_object_path(volume, format!("{}/{}", path, data_dir.unwrap().to_string()).as_str())?;
+
+                self.move_to_trash(&dir_path, true, false).await?;
+            }
+        }
+
+        // 没有版本了，删除xl.meta
+        if fm.versions.is_empty() {
+            self.delete_file(&volume_dir, &xlpath, true, false).await?;
+        }
+
+        // 更新xl.meta
+        let buf = fm.marshal_msg()?;
+
+        self.write_all(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str(), buf)
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -814,6 +863,24 @@ impl DiskAPI for LocalDisk {
         let (buf, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
 
         Ok(RawFileInfo { buf })
+    }
+    async fn delete_versions(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        _opts: DeleteOptions,
+    ) -> Result<Vec<Option<Error>>> {
+        let mut errs = Vec::with_capacity(versions.len());
+
+        for (i, ver) in versions.iter().enumerate() {
+            if let Err(e) = self.delete_versions_internal(volume, ver.name.as_str(), &ver.versions).await {
+                errs[i] = Some(e);
+            } else {
+                errs[i] = None;
+            }
+        }
+
+        Ok(errs)
     }
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
         let mut results = Vec::new();

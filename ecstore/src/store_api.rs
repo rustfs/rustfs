@@ -27,7 +27,66 @@ pub struct FileInfo {
     pub is_latest: bool,
 }
 
+impl Default for FileInfo {
+    fn default() -> Self {
+        Self {
+            version_id: Uuid::nil(),
+            erasure: Default::default(),
+            deleted: Default::default(),
+            data_dir: Uuid::nil(),
+            mod_time: None,
+            size: Default::default(),
+            data: Default::default(),
+            fresh: Default::default(),
+            name: Default::default(),
+            volume: Default::default(),
+            parts: Default::default(),
+            is_latest: Default::default(),
+        }
+    }
+}
+
 impl FileInfo {
+    pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
+        let indexs = {
+            let cardinality = data_blocks + parity_blocks;
+            let mut nums = vec![0; cardinality];
+            let key_crc = crc32fast::hash(object.as_bytes());
+
+            let start = key_crc as usize % cardinality;
+            for i in 1..=cardinality {
+                nums[i - 1] = 1 + ((start + i) % cardinality);
+            }
+
+            nums
+        };
+        Self {
+            erasure: ErasureInfo {
+                algorithm: String::from(ERASURE_ALGORITHM),
+                data_blocks,
+                parity_blocks,
+                block_size: BLOCK_SIZE_V2,
+                distribution: indexs,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        if self.deleted {
+            return true;
+        }
+
+        let data_blocks = self.erasure.data_blocks;
+        let parity_blocks = self.erasure.parity_blocks;
+
+        (data_blocks >= parity_blocks)
+            && (data_blocks > 0)
+            && (self.erasure.index > 0
+                && self.erasure.index <= data_blocks + parity_blocks
+                && self.erasure.distribution.len() == (data_blocks + parity_blocks))
+    }
     pub fn is_remote(&self) -> bool {
         // TODO: when lifecycle
         false
@@ -110,68 +169,6 @@ impl FileInfo {
         }
 
         Err(Error::msg("part not found"))
-    }
-}
-
-impl Default for FileInfo {
-    fn default() -> Self {
-        Self {
-            version_id: Uuid::nil(),
-            erasure: Default::default(),
-            deleted: Default::default(),
-            data_dir: Uuid::nil(),
-            mod_time: None,
-            size: Default::default(),
-            data: Default::default(),
-            fresh: Default::default(),
-            name: Default::default(),
-            volume: Default::default(),
-            parts: Default::default(),
-            is_latest: Default::default(),
-        }
-    }
-}
-
-impl FileInfo {
-    pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
-        let indexs = {
-            let cardinality = data_blocks + parity_blocks;
-            let mut nums = vec![0; cardinality];
-            let key_crc = crc32fast::hash(object.as_bytes());
-
-            let start = key_crc as usize % cardinality;
-            for i in 1..=cardinality {
-                nums[i - 1] = 1 + ((start + i) % cardinality);
-            }
-
-            nums
-        };
-        Self {
-            erasure: ErasureInfo {
-                algorithm: String::from(ERASURE_ALGORITHM),
-                data_blocks,
-                parity_blocks,
-                block_size: BLOCK_SIZE_V2,
-                distribution: indexs,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    pub fn is_valid(&self) -> bool {
-        if self.deleted {
-            return true;
-        }
-
-        let data_blocks = self.erasure.data_blocks;
-        let parity_blocks = self.erasure.parity_blocks;
-
-        (data_blocks >= parity_blocks)
-            && (data_blocks > 0)
-            && (self.erasure.index > 0
-                && self.erasure.index <= data_blocks + parity_blocks
-                && self.erasure.distribution.len() == (data_blocks + parity_blocks))
     }
 }
 
@@ -474,6 +471,7 @@ pub struct ListObjectsV2Info {
 #[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
+    pub version_id: Option<Uuid>,
 }
 #[derive(Debug, Default, Clone)]
 pub struct DeletedObject {
