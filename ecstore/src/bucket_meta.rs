@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rmp_serde::Serializer;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -15,6 +17,9 @@ pub struct BucketMetadata {
     format: u16,
     version: u16,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tagging: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created: Option<OffsetDateTime>,
 }
 
@@ -53,5 +58,9 @@ impl BucketMetadata {
         self.serialize(&mut Serializer::new(&mut buf))?;
 
         Ok(buf)
+    }
+
+    pub fn unmarshal_from(buffer: &[u8]) -> Result<Self> {
+        Ok(rmp_serde::from_slice(buffer)?)
     }
 }

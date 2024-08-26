@@ -1,4 +1,4 @@
-mod bucket_meta;
+pub mod bucket_meta;
 mod chunk_stream;
 pub mod disk;
 pub mod disks_layout;
