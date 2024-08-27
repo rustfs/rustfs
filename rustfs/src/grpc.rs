@@ -1,3 +1,4 @@
+use ecstore::{disk::DiskStore, peer::LocalPeerS3Client};
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
 
@@ -10,10 +11,13 @@ use protos::{
 };
 
 #[derive(Debug)]
-struct NodeService {}
+struct NodeService {
+    pub local_peer: LocalPeerS3Client,
+}
 
-pub fn make_server() -> NodeServer<impl Node> {
-    NodeServer::new(NodeService {})
+pub fn make_server(local_disks: Vec<DiskStore>) -> NodeServer<impl Node> {
+    let local_peer = LocalPeerS3Client::new(local_disks, None, None);
+    NodeServer::new(NodeService { local_peer })
 }
 
 #[tonic::async_trait]
@@ -48,8 +52,9 @@ impl Node for NodeService {
     async fn make_bucket(&self, request: Request<MakeBucketRequest>) -> Result<Response<MakeBucketResponse>, Status> {
         debug!("make bucket");
 
-        let req = request.into_inner();
+        let _req = request.into_inner();
 
+        // match self.local_peer.make_bucket(&name, &MakeBucketOptions::default()).await {}
         unimplemented!()
     }
 }

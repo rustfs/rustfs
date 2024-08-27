@@ -242,6 +242,7 @@ pub enum BitrotAlgorithm {
     BLAKE2b512,
 }
 
+#[derive(Debug, Default)]
 pub struct MakeBucketOptions {
     pub force_create: bool,
 }

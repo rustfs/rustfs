@@ -4,7 +4,7 @@ mod service;
 mod storage;
 
 use clap::Parser;
-use ecstore::error::Result;
+use ecstore::{error::Result, store::ECStore};
 use grpc::make_server;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -66,9 +66,12 @@ async fn run(opt: config::Opt) -> Result<()> {
     //         })
     // };
 
+    let store: ECStore = ECStore::new(opt.address.clone(), opt.volumes.clone()).await?;
+    let local_disks = store.local_disks();
+
     // Setup S3 service
     let service = {
-        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), opt.volumes.clone()).await?);
+        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(store).await?);
 
         let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
         let mut secret_key = String::from_str(config::DEFAULT_SECRET_KEY).unwrap();
@@ -101,7 +104,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     let hyper_service = service.into_shared();
 
-    let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, make_server()));
+    let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, make_server(local_disks)));
 
     let http_server = ConnBuilder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
