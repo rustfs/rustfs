@@ -21,7 +21,6 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
-use tracing::info;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
@@ -94,9 +93,57 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let _input = req.input;
+        let DeleteObjectInput {
+            bucket, key, version_id, ..
+        } = req.input;
 
-        let output = DeleteObjectOutput::default();
+        let version_id = version_id
+            .as_ref()
+            .map(|v| match Uuid::parse_str(v) {
+                Ok(id) => Some(id),
+                Err(_) => None,
+            })
+            .unwrap_or_default();
+        let dobj = ObjectToDelete {
+            object_name: key,
+            version_id,
+        };
+
+        let objects: Vec<ObjectToDelete> = vec![dobj];
+
+        let (dobjs, _errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
+
+        // TODO: let errors;
+
+        let (delete_marker, version_id) = {
+            if let Some((a, b)) = dobjs
+                .iter()
+                .map(|v| {
+                    let delete_marker = {
+                        if v.delete_marker {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    };
+
+                    let version_id = v.version_id.clone();
+
+                    (delete_marker, version_id)
+                })
+                .next()
+            {
+                (a, b)
+            } else {
+                (None, None)
+            }
+        };
+
+        let output = DeleteObjectOutput {
+            delete_marker,
+            version_id,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
@@ -125,7 +172,7 @@ impl S3 for FS {
             })
             .collect();
 
-        let (dobjs, errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
+        let (dobjs, _errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
         // info!("delete_objects res {:?} {:?}", &dobjs, errs);
 
         let deleted = dobjs
