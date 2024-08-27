@@ -26,7 +26,7 @@ pub trait PeerS3Client: Debug + Sync + Send + 'static {
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
-    fn get_pools(&self) -> Vec<usize>;
+    fn get_pools(&self) -> Option<Vec<usize>>;
 }
 
 #[derive(Debug)]
@@ -50,10 +50,10 @@ impl S3PeerSys {
             .map(|e| {
                 if e.is_local {
                     let cli: Box<dyn PeerS3Client> =
-                        Box::new(LocalPeerS3Client::new(local_disks.clone(), e.clone(), e.pools.clone()));
+                        Box::new(LocalPeerS3Client::new(local_disks.clone(), Some(e.clone()), Some(e.pools.clone())));
                     Arc::new(cli)
                 } else {
-                    let cli: Box<dyn PeerS3Client> = Box::new(RemotePeerS3Client::new(e.clone(), e.pools.clone()));
+                    let cli: Box<dyn PeerS3Client> = Box::new(RemotePeerS3Client::new(Some(e.clone()), Some(e.pools.clone())));
                     Arc::new(cli)
                 }
             })
@@ -89,7 +89,7 @@ impl S3PeerSys {
             for (j, cli) in self.clients.iter().enumerate() {
                 let pools = cli.get_pools();
                 let idx = i;
-                if pools.contains(&idx) {
+                if pools.unwrap_or_default().contains(&idx) {
                     per_pool_errs.push(errors[j].as_ref());
                 }
 
@@ -199,7 +199,7 @@ impl S3PeerSys {
             for (j, cli) in self.clients.iter().enumerate() {
                 let pools = cli.get_pools();
                 let idx = i;
-                if pools.contains(&idx) {
+                if pools.unwrap_or_default().contains(&idx) {
                     per_pool_errs.push(errors[j].as_ref());
                 }
 
@@ -212,7 +212,7 @@ impl S3PeerSys {
             .ok_or(Error::new(DiskError::VolumeNotFound))
     }
 
-    pub fn get_pools(&self) -> Vec<usize> {
+    pub fn get_pools(&self) -> Option<Vec<usize>> {
         unimplemented!()
     }
 }
@@ -221,11 +221,11 @@ impl S3PeerSys {
 pub struct LocalPeerS3Client {
     pub local_disks: Vec<DiskStore>,
     // pub node: Node,
-    pub pools: Vec<usize>,
+    pub pools: Option<Vec<usize>>,
 }
 
 impl LocalPeerS3Client {
-    fn new(local_disks: Vec<DiskStore>, _node: Node, pools: Vec<usize>) -> Self {
+    pub fn new(local_disks: Vec<DiskStore>, _node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         Self {
             local_disks,
             // node,
@@ -236,7 +236,7 @@ impl LocalPeerS3Client {
 
 #[async_trait]
 impl PeerS3Client for LocalPeerS3Client {
-    fn get_pools(&self) -> Vec<usize> {
+    fn get_pools(&self) -> Option<Vec<usize>> {
         self.pools.clone()
     }
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
@@ -384,14 +384,15 @@ impl PeerS3Client for LocalPeerS3Client {
 
 #[derive(Debug)]
 pub struct RemotePeerS3Client {
-    pub _node: Node,
-    pub pools: Vec<usize>,
+    pub _node: Option<Node>,
+    pub pools: Option<Vec<usize>>,
     pub channel: Channel,
 }
 
 impl RemotePeerS3Client {
-    fn new(node: Node, pools: Vec<usize>) -> Self {
-        let connector = Endpoint::from_shared(format!("{}", node.url.clone().as_str())).unwrap();
+    fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
+        let connector =
+            Endpoint::from_shared(format!("{}", node.as_ref().map(|v| { v.url.to_string() }).unwrap_or_default())).unwrap();
         let channel = tokio::runtime::Runtime::new().unwrap().block_on(connector.connect()).unwrap();
         Self {
             _node: node,
@@ -403,7 +404,7 @@ impl RemotePeerS3Client {
 
 #[async_trait]
 impl PeerS3Client for RemotePeerS3Client {
-    fn get_pools(&self) -> Vec<usize> {
+    fn get_pools(&self) -> Option<Vec<usize>> {
         self.pools.clone()
     }
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {

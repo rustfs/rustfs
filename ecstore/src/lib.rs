@@ -6,7 +6,7 @@ mod endpoints;
 mod erasure;
 pub mod error;
 mod file_meta;
-mod peer;
+pub mod peer;
 pub mod set_disk;
 mod sets;
 pub mod store;

@@ -4,7 +4,7 @@ use crate::{
     disks_layout::DisksLayout,
     endpoints::EndpointServerPools,
     error::{Error, Result},
-    peer::{PeerS3Client, S3PeerSys},
+    peer::S3PeerSys,
     sets::Sets,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, ListObjectsInfo, ListObjectsV2Info,
@@ -102,6 +102,10 @@ impl ECStore {
             local_disks,
             peer_sys,
         })
+    }
+
+    pub fn local_disks(&self) -> Vec<DiskStore> {
+        self.local_disks.clone()
     }
 
     fn single_pool(&self) -> bool {
