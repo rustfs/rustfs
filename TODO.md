@@ -29,7 +29,7 @@
     - [x] 提交完成 CompleteMultipartUpload
     - [x] 取消上传 AbortMultipartUpload
   - [x] 下载 GetObject
-  - [ ] 删除 DeleteObjects
+  - [x] 删除 DeleteObjects
   - [ ] 版本控制
   - [ ] 对象锁
   - [ ] 复制 CopyObject
