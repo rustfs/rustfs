@@ -1,0 +1,19 @@
+syntax = "proto3";
+package node_service;
+
+/* -------------------------------------------------------------------- */
+message PingRequest {
+  uint64 version = 1;
+  bytes body = 2;
+}
+
+message PingResponse {
+  uint64 version = 1;
+  bytes body = 2;
+}
+
+/* -------------------------------------------------------------------- */
+
+service NodeService {
+  rpc Ping(PingRequest) returns (PingResponse) {};
+}

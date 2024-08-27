@@ -1,13 +1,18 @@
 mod config;
+mod grpc;
+mod service;
 mod storage;
 
 use clap::Parser;
 use ecstore::error::Result;
+use grpc::make_server;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
+    service::TowerToHyperService,
 };
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
+use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
 use tracing::{debug, info};
@@ -96,6 +101,8 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     let hyper_service = service.into_shared();
 
+    let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, make_server()));
+
     let http_server = ConnBuilder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
@@ -119,7 +126,7 @@ async fn run(opt: config::Opt) -> Result<()> {
             }
         };
 
-        let conn = http_server.serve_connection(TokioIo::new(socket), hyper_service.clone());
+        let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
         let conn = graceful.watch(conn.into_owned());
         tokio::spawn(async move {
             let _ = conn.await;

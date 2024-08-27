@@ -10,6 +10,24 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+ecstore.workspace = true
+flatbuffers.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+mime.workspace = true
+netif.workspace = true
+pin-project-lite.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+protos.workspace = true
+protobuf.workspace = true
+s3s.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = [
@@ -18,22 +36,13 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
 ] }
+tonic = { version = "0.12.1", features = ["gzip"] }
+tonic-reflection.workspace = true
+tower.workspace = true
 tracing-error.workspace = true
-http.workspace = true
-bytes.workspace = true
-futures.workspace = true
-futures-util.workspace = true
+tracing-subscriber.workspace = true
+transform-stream.workspace = true
 
-ecstore = { path = "../ecstore" }
-s3s = "0.10.0"
-clap = { version = "4.5.7", features = ["derive"] }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
-hyper-util = { version = "0.1.5", features = [
-    "tokio",
-    "server-auto",
-    "server-graceful",
-] }
-mime = "0.3.17"
-transform-stream = "0.3.0"
-netif = "0.1.6"
-# pin-utils = "0.1.0"
+[build-dependencies]
+prost-build.workspace = true
+tonic-build.workspace = true
