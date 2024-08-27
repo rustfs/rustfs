@@ -650,7 +650,7 @@ impl DiskAPI for LocalDisk {
         let (src_data_path, dst_data_path) = {
             let mut data_dir = String::new();
             if !fi.is_remote() {
-                data_dir = utils::path::retain_slash(fi.data_dir.to_string().as_str());
+                data_dir = utils::path::retain_slash(fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str());
             }
 
             if !data_dir.is_empty() {
@@ -689,10 +689,9 @@ impl DiskAPI for LocalDisk {
         let old_data_dir = meta
             .find_version(fi.version_id)
             .map(|(_, version)| {
-                version.get_data_dir().filter(|data_dir| {
-                    warn!("get data dir {}", &data_dir);
-                    meta.shard_data_dir_count(&fi.version_id, data_dir) == 0
-                })
+                version
+                    .get_data_dir()
+                    .filter(|data_dir| meta.shard_data_dir_count(&fi.version_id, &Some(data_dir.clone())) == 0)
             })
             .unwrap_or_default();
 

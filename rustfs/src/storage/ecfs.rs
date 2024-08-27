@@ -102,7 +102,7 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        info!("delete_objects args {:?}", req.input);
+        // info!("delete_objects args {:?}", req.input);
 
         let DeleteObjectsInput { bucket, delete, .. } = req.input;
 
@@ -126,9 +126,31 @@ impl S3 for FS {
             .collect();
 
         let (dobjs, errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
-        info!("delete_objects res {:?} {:?}", &dobjs, errs);
+        // info!("delete_objects res {:?} {:?}", &dobjs, errs);
 
-        let output = DeleteObjectsOutput { ..Default::default() };
+        let deleted = dobjs
+            .iter()
+            .map(|v| DeletedObject {
+                delete_marker: {
+                    if v.delete_marker {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                },
+                delete_marker_version_id: v.delete_marker_version_id.clone(),
+                key: Some(v.object_name.clone()),
+                version_id: v.version_id.clone(),
+            })
+            .collect();
+
+        // TODO: let errors;
+
+        let output = DeleteObjectsOutput {
+            deleted: Some(deleted),
+            // errors,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
