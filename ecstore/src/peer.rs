@@ -1,7 +1,14 @@
 use async_trait::async_trait;
 use futures::future::join_all;
+use protos::proto_gen::node_service::MakeBucketRequest;
+use protos::{
+    node_service_time_out_client, proto_gen::node_service::MakeBucketOptions as proto_MakeBucketOptions,
+    DEFAULT_GRPC_SERVER_MESSAGE_LEN,
+};
 use regex::Regex;
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+use tonic::transport::{Channel, Endpoint};
+use tonic::Request;
 use tracing::warn;
 
 use crate::{
@@ -56,9 +63,8 @@ impl S3PeerSys {
     }
 }
 
-#[async_trait]
-impl PeerS3Client for S3PeerSys {
-    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+impl S3PeerSys {
+    pub async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
             futures.push(cli.make_bucket(bucket, opts));
@@ -95,7 +101,7 @@ impl PeerS3Client for S3PeerSys {
 
         Ok(())
     }
-    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+    pub async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
             futures.push(cli.list_bucket(opts));
@@ -140,7 +146,7 @@ impl PeerS3Client for S3PeerSys {
 
         Ok(buckets)
     }
-    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+    pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
             futures.push(cli.delete_bucket(bucket));
@@ -165,7 +171,7 @@ impl PeerS3Client for S3PeerSys {
 
         Ok(())
     }
-    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+    pub async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
             futures.push(cli.get_bucket_info(bucket, opts));
@@ -206,7 +212,7 @@ impl PeerS3Client for S3PeerSys {
             .ok_or(Error::new(DiskError::VolumeNotFound))
     }
 
-    fn get_pools(&self) -> Vec<usize> {
+    pub fn get_pools(&self) -> Vec<usize> {
         unimplemented!()
     }
 }
@@ -378,27 +384,50 @@ impl PeerS3Client for LocalPeerS3Client {
 
 #[derive(Debug)]
 pub struct RemotePeerS3Client {
-    // pub node: Node,
-    // pub pools: Vec<usize>,
+    pub _node: Node,
+    pub pools: Vec<usize>,
+    pub channel: Channel,
 }
 
 impl RemotePeerS3Client {
-    fn new(_node: Node, _pools: Vec<usize>) -> Self {
-        // Self { node, pools }
-        Self {}
+    fn new(node: Node, pools: Vec<usize>) -> Self {
+        let connector = Endpoint::from_shared(format!("{}", node.url.clone().as_str())).unwrap();
+        let channel = tokio::runtime::Runtime::new().unwrap().block_on(connector.connect()).unwrap();
+        Self {
+            _node: node,
+            pools,
+            channel,
+        }
     }
 }
 
 #[async_trait]
 impl PeerS3Client for RemotePeerS3Client {
     fn get_pools(&self) -> Vec<usize> {
-        unimplemented!()
+        self.pools.clone()
     }
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()
     }
-    async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
-        unimplemented!()
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        let mut client = node_service_time_out_client(
+            self.channel.clone(),
+            Duration::new(30, 0), // TODO: use config setting
+            DEFAULT_GRPC_SERVER_MESSAGE_LEN,
+            // grpc_enable_gzip,
+            false, // TODO: use config setting
+        );
+        let request = Request::new(MakeBucketRequest {
+            name: bucket.to_string(),
+            options: Some(proto_MakeBucketOptions {
+                force_create: opts.force_create,
+            }),
+        });
+        let _response = client.make_bucket(request).await?.into_inner();
+
+        // TODO: deal with error
+
+        Ok(())
     }
     async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()

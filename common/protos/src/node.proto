@@ -12,8 +12,23 @@ message PingResponse {
   bytes body = 2;
 }
 
+message MakeBucketOptions {
+  bool force_create = 1;
+}
+
+message MakeBucketRequest {
+  string name = 1;
+  MakeBucketOptions options = 2;
+}
+
+message MakeBucketResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
 /* -------------------------------------------------------------------- */
 
 service NodeService {
   rpc Ping(PingRequest) returns (PingResponse) {};
+  rpc MakeBucket(MakeBucketRequest) returns (MakeBucketResponse) {};
 }
