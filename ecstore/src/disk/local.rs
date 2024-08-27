@@ -292,6 +292,7 @@ impl LocalDisk {
         // 没有版本了，删除xl.meta
         if fm.versions.is_empty() {
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
+            return Ok(());
         }
 
         // 更新xl.meta
@@ -871,6 +872,9 @@ impl DiskAPI for LocalDisk {
         _opts: DeleteOptions,
     ) -> Result<Vec<Option<Error>>> {
         let mut errs = Vec::with_capacity(versions.len());
+        for _ in 0..versions.len() {
+            errs.push(None);
+        }
 
         for (i, ver) in versions.iter().enumerate() {
             if let Err(e) = self.delete_versions_internal(volume, ver.name.as_str(), &ver.versions).await {
