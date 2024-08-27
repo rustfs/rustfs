@@ -6,6 +6,7 @@ use ecstore::store_api::HTTPRangeSpec;
 use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::MultipartUploadResult;
 use ecstore::store_api::ObjectOptions;
+use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
@@ -20,7 +21,9 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use tracing::info;
 use transform_stream::AsyncTryStream;
+use uuid::Uuid;
 
 use ecstore::error::Result;
 use ecstore::store::ECStore;
@@ -99,7 +102,31 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let _input = req.input;
+        info!("delete_objects args {:?}", req.input);
+
+        let DeleteObjectsInput { bucket, delete, .. } = req.input;
+
+        let objects: Vec<ObjectToDelete> = delete
+            .objects
+            .iter()
+            .map(|v| {
+                let version_id = v
+                    .version_id
+                    .as_ref()
+                    .map(|v| match Uuid::parse_str(v) {
+                        Ok(id) => Some(id),
+                        Err(_) => None,
+                    })
+                    .unwrap_or_default();
+                ObjectToDelete {
+                    object_name: v.key.clone(),
+                    version_id: version_id,
+                }
+            })
+            .collect();
+
+        let (dobjs, errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
+        info!("delete_objects res {:?} {:?}", &dobjs, errs);
 
         let output = DeleteObjectsOutput { ..Default::default() };
         Ok(S3Response::new(output))
