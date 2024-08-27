@@ -10,15 +10,15 @@ pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
 
 // #[derive(Debug, Clone)]
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct FileInfo {
     pub name: String,
     pub volume: String,
-    pub version_id: Uuid,
+    pub version_id: Option<Uuid>,
     pub erasure: ErasureInfo,
     pub deleted: bool,
     // DataDir of the file
-    pub data_dir: Uuid,
+    pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
     pub size: usize,
     pub data: Option<Vec<u8>>,
@@ -27,24 +27,24 @@ pub struct FileInfo {
     pub is_latest: bool,
 }
 
-impl Default for FileInfo {
-    fn default() -> Self {
-        Self {
-            version_id: Uuid::nil(),
-            erasure: Default::default(),
-            deleted: Default::default(),
-            data_dir: Uuid::nil(),
-            mod_time: None,
-            size: Default::default(),
-            data: Default::default(),
-            fresh: Default::default(),
-            name: Default::default(),
-            volume: Default::default(),
-            parts: Default::default(),
-            is_latest: Default::default(),
-        }
-    }
-}
+// impl Default for FileInfo {
+//     fn default() -> Self {
+//         Self {
+//             version_id: Default::default(),
+//             erasure: Default::default(),
+//             deleted: Default::default(),
+//             data_dir: Default::default(),
+//             mod_time: None,
+//             size: Default::default(),
+//             data: Default::default(),
+//             fresh: Default::default(),
+//             name: Default::default(),
+//             volume: Default::default(),
+//             parts: Default::default(),
+//             is_latest: Default::default(),
+//         }
+//     }
+// }
 
 impl FileInfo {
     pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
@@ -418,7 +418,7 @@ pub struct ObjectInfo {
     pub is_dir: bool,
     pub parity_blocks: usize,
     pub data_blocks: usize,
-    pub version_id: Uuid,
+    pub version_id: Option<Uuid>,
     pub delete_marker: bool,
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
@@ -476,9 +476,9 @@ pub struct ObjectToDelete {
 #[derive(Debug, Default, Clone)]
 pub struct DeletedObject {
     pub delete_marker: bool,
-    pub delete_marker_version_id: String,
+    pub delete_marker_version_id: Option<String>,
     pub object_name: String,
-    pub version_id: String,
+    pub version_id: Option<String>,
     // MTime of DeleteMarker on source that needs to be propagated to replica
     pub delete_marker_mtime: Option<OffsetDateTime>,
     // to support delete marker replication

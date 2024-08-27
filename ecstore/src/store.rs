@@ -418,7 +418,7 @@ impl StorageAPI for ECStore {
                     if pinfo.object_info.delete_marker && opts.version_id.is_empty() {
                         del_objects[i] = DeletedObject {
                             delete_marker: pinfo.object_info.delete_marker,
-                            delete_marker_version_id: pinfo.object_info.version_id.to_string(),
+                            delete_marker_version_id: pinfo.object_info.version_id.map(|v| v.to_string()),
                             object_name: utils::path::decode_dir_object(&pinfo.object_info.name),
                             delete_marker_mtime: pinfo.object_info.mod_time,
                             ..Default::default()
