@@ -5,7 +5,7 @@ use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
         node_service_server::{NodeService as Node, NodeServiceServer as NodeServer},
-        PingRequest, PingResponse,
+        MakeBucketRequest, MakeBucketResponse, PingRequest, PingResponse,
     },
 };
 
@@ -43,5 +43,13 @@ impl Node for NodeService {
             version: 1,
             body: finished_data.to_vec(),
         }))
+    }
+
+    async fn make_bucket(&self, request: Request<MakeBucketRequest>) -> Result<Response<MakeBucketResponse>, Status> {
+        debug!("make bucket");
+
+        let req = request.into_inner();
+
+        unimplemented!()
     }
 }

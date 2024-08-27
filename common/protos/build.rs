@@ -40,8 +40,8 @@ fn main() -> Result<(), AnyError> {
     let project_root_dir = env::current_dir()?;
     let proto_dir = project_root_dir.join("src");
     let proto_files = &["node.proto"];
-    let proto_out_dir = project_root_dir.join("src").join("proto_gen");
-    let flatbuffer_out_dir = project_root_dir.join("src").join("flatbuffers_generated");
+    let proto_out_dir = project_root_dir.join("src").join("generated").join("proto_gen");
+    let flatbuffer_out_dir = project_root_dir.join("src").join("generated").join("flatbuffers_generated");
     let descriptor_set_path = PathBuf::from(env::var(ENV_OUT_DIR).unwrap()).join("proto-descriptor.bin");
 
     tonic_build::configure()
@@ -54,13 +54,17 @@ fn main() -> Result<(), AnyError> {
         .map_err(|e| format!("Failed to generate protobuf file: {e}."))?;
 
     // protos/gen/mod.rs
-    let generated_mod_rs_path = project_root_dir.join("src").join("proto_gen").join("mod.rs");
+    let generated_mod_rs_path = project_root_dir
+        .join("src")
+        .join("generated")
+        .join("proto_gen")
+        .join("mod.rs");
 
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
     writeln!(&mut generated_mod_rs, "pub mod node_service;")?;
     generated_mod_rs.flush()?;
 
-    let generated_mod_rs_path = project_root_dir.join("src").join("lib.rs");
+    let generated_mod_rs_path = project_root_dir.join("src").join("generated").join("mod.rs");
 
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
     writeln!(&mut generated_mod_rs, "#![allow(unused_imports)]")?;
