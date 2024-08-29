@@ -17,22 +17,64 @@ pub struct PingResponse {
     pub body: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct MakeBucketOptions {
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBucketRequest {
+    #[prost(string, tag = "1")]
+    pub options: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListBucketResponse {
     #[prost(bool, tag = "1")]
-    pub force_create: bool,
+    pub success: bool,
+    #[prost(string, repeated, tag = "2")]
+    pub bucket_infos: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MakeBucketRequest {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "2")]
-    pub options: ::core::option::Option<MakeBucketOptions>,
+    #[prost(string, tag = "2")]
+    pub options: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MakeBucketResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetBucketInfoRequest {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub options: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetBucketInfoResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub bucket_info: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteBucketRequest {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteBucketResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
     #[prost(string, optional, tag = "2")]
@@ -503,6 +545,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "Ping"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn list_bucket(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListBucketRequest>,
+        ) -> std::result::Result<tonic::Response<super::ListBucketResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ListBucket");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ListBucket"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn make_bucket(
             &mut self,
             request: impl tonic::IntoRequest<super::MakeBucketRequest>,
@@ -516,6 +573,36 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "MakeBucket"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_bucket_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetBucketInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetBucketInfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetBucketInfo");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetBucketInfo"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_bucket(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteBucketRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteBucketResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/DeleteBucket");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "DeleteBucket"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn read_all(
@@ -803,10 +890,22 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::PingRequest>,
         ) -> std::result::Result<tonic::Response<super::PingResponse>, tonic::Status>;
+        async fn list_bucket(
+            &self,
+            request: tonic::Request<super::ListBucketRequest>,
+        ) -> std::result::Result<tonic::Response<super::ListBucketResponse>, tonic::Status>;
         async fn make_bucket(
             &self,
             request: tonic::Request<super::MakeBucketRequest>,
         ) -> std::result::Result<tonic::Response<super::MakeBucketResponse>, tonic::Status>;
+        async fn get_bucket_info(
+            &self,
+            request: tonic::Request<super::GetBucketInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetBucketInfoResponse>, tonic::Status>;
+        async fn delete_bucket(
+            &self,
+            request: tonic::Request<super::DeleteBucketRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteBucketResponse>, tonic::Status>;
         async fn read_all(
             &self,
             request: tonic::Request<super::ReadAllRequest>,
@@ -979,6 +1078,34 @@ pub mod node_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/node_service.NodeService/ListBucket" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListBucketSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ListBucketRequest> for ListBucketSvc<T> {
+                        type Response = super::ListBucketResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ListBucketRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::list_bucket(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListBucketSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/node_service.NodeService/MakeBucket" => {
                     #[allow(non_camel_case_types)]
                     struct MakeBucketSvc<T: NodeService>(pub Arc<T>);
@@ -998,6 +1125,62 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = MakeBucketSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetBucketInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetBucketInfoSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetBucketInfoRequest> for GetBucketInfoSvc<T> {
+                        type Response = super::GetBucketInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetBucketInfoRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_bucket_info(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetBucketInfoSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/DeleteBucket" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteBucketSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::DeleteBucketRequest> for DeleteBucketSvc<T> {
+                        type Response = super::DeleteBucketResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::DeleteBucketRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::delete_bucket(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteBucketSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

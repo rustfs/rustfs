@@ -2,7 +2,7 @@ use ecstore::{
     disk::{DeleteOptions, DiskStore, ReadMultipleReq, ReadOptions, WalkDirOptions},
     erasure::{ReadAt, Write},
     peer::{LocalPeerS3Client, PeerS3Client},
-    store_api::{FileInfo, MakeBucketOptions},
+    store_api::{BucketOptions, FileInfo, MakeBucketOptions},
 };
 use tokio::fs;
 use tonic::{Request, Response, Status};
@@ -12,7 +12,8 @@ use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
         node_service_server::{NodeService as Node, NodeServiceServer as NodeServer},
-        DeleteRequest, DeleteResponse, DeleteVolumeRequest, DeleteVolumeResponse, ListDirRequest, ListDirResponse,
+        DeleteBucketRequest, DeleteBucketResponse, DeleteRequest, DeleteResponse, DeleteVolumeRequest, DeleteVolumeResponse,
+        GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse,
         ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse,
         MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest,
         ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest,
@@ -79,23 +80,117 @@ impl Node for NodeService {
         }))
     }
 
+    async fn list_bucket(&self, request: Request<ListBucketRequest>) -> Result<Response<ListBucketResponse>, Status> {
+        debug!("list bucket");
+
+        let request = request.into_inner();
+        let options = match serde_json::from_str::<BucketOptions>(&request.options) {
+            Ok(options) => options,
+            Err(err) => {
+                return Ok(tonic::Response::new(ListBucketResponse {
+                    success: false,
+                    bucket_infos: Vec::new(),
+                    error_info: Some(format!("decode BucketOptions failed: {}", err.to_string())),
+                }))
+            }
+        };
+        match self.local_peer.list_bucket(&options).await {
+            Ok(bucket_infos) => {
+                let bucket_infos = bucket_infos
+                    .into_iter()
+                    .filter_map(|bucket_info| serde_json::to_string(&bucket_info).ok())
+                    .collect();
+                Ok(tonic::Response::new(ListBucketResponse {
+                    success: true,
+                    bucket_infos,
+                    error_info: None,
+                }))
+            }
+
+            Err(err) => Ok(tonic::Response::new(ListBucketResponse {
+                success: false,
+                bucket_infos: Vec::new(),
+                error_info: Some(format!("make failed: {}", err.to_string())),
+            })),
+        }
+    }
+
     async fn make_bucket(&self, request: Request<MakeBucketRequest>) -> Result<Response<MakeBucketResponse>, Status> {
         debug!("make bucket");
 
-        let make_bucket_request = request.into_inner();
-        let options = if let Some(opts) = make_bucket_request.options {
-            MakeBucketOptions {
-                force_create: opts.force_create,
+        let request = request.into_inner();
+        let options = match serde_json::from_str::<MakeBucketOptions>(&request.options) {
+            Ok(options) => options,
+            Err(err) => {
+                return Ok(tonic::Response::new(MakeBucketResponse {
+                    success: false,
+                    error_info: Some(format!("decode MakeBucketOptions failed: {}", err.to_string())),
+                }))
             }
-        } else {
-            MakeBucketOptions::default()
         };
-        match self.local_peer.make_bucket(&make_bucket_request.name, &options).await {
+        match self.local_peer.make_bucket(&request.name, &options).await {
             Ok(_) => Ok(tonic::Response::new(MakeBucketResponse {
                 success: true,
                 error_info: None,
             })),
             Err(err) => Ok(tonic::Response::new(MakeBucketResponse {
+                success: false,
+                error_info: Some(format!("make failed: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn get_bucket_info(&self, request: Request<GetBucketInfoRequest>) -> Result<Response<GetBucketInfoResponse>, Status> {
+        debug!("get bucket info");
+
+        let request = request.into_inner();
+        let options = match serde_json::from_str::<BucketOptions>(&request.options) {
+            Ok(options) => options,
+            Err(err) => {
+                return Ok(tonic::Response::new(GetBucketInfoResponse {
+                    success: false,
+                    bucket_info: String::new(),
+                    error_info: Some(format!("decode BucketOptions failed: {}", err.to_string())),
+                }))
+            }
+        };
+        match self.local_peer.get_bucket_info(&request.bucket, &options).await {
+            Ok(bucket_info) => {
+                let bucket_info = match serde_json::to_string(&bucket_info) {
+                    Ok(bucket_info) => bucket_info,
+                    Err(err) => {
+                        return Ok(tonic::Response::new(GetBucketInfoResponse {
+                            success: false,
+                            bucket_info: String::new(),
+                            error_info: Some(format!("encode BucketInfo failed: {}", err.to_string())),
+                        }));
+                    }
+                };
+                Ok(tonic::Response::new(GetBucketInfoResponse {
+                    success: true,
+                    bucket_info,
+                    error_info: None,
+                }))
+            }
+
+            Err(err) => Ok(tonic::Response::new(GetBucketInfoResponse {
+                success: false,
+                bucket_info: String::new(),
+                error_info: Some(format!("make failed: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn delete_bucket(&self, request: Request<DeleteBucketRequest>) -> Result<Response<DeleteBucketResponse>, Status> {
+        debug!("make bucket");
+
+        let request = request.into_inner();
+        match self.local_peer.delete_bucket(&request.bucket).await {
+            Ok(_) => Ok(tonic::Response::new(DeleteBucketResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(tonic::Response::new(DeleteBucketResponse {
                 success: false,
                 error_info: Some(format!("make failed: {}", err.to_string())),
             })),
