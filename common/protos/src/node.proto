@@ -26,9 +26,259 @@ message MakeBucketResponse {
   optional string error_info = 2;
 }
 
+message ReadAllRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+}
+
+message ReadAllResponse {
+  bool success = 1;
+  bytes data = 2;
+  optional string error_info = 3;
+}
+
+message WriteAllRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+  bytes data = 4;
+}
+
+message WriteAllResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message DeleteRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+  string options = 4;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message RenameFileRequst {
+  string disk = 1;
+  string src_volume = 2;
+  string src_path = 3;
+  string dst_volume = 4;
+  string dst_path = 5;
+}
+
+message RenameFileResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message WriteRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+  bool is_append = 4;
+  bytes data = 5;
+}
+
+message WriteResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+// message AppendRequest {
+//   string disk = 1;  // indicate which one in the disks
+//   string volume = 2;
+//   string path = 3;
+//   bytes data = 4;
+// }
+// 
+// message AppendResponse {
+//   bool success = 1;
+//   optional string error_info = 2;
+// }
+
+message ReadAtRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+  int64 offset = 4;
+  int64 length = 5;
+}
+
+message ReadAtResponse {
+  bool success = 1;
+  bytes data = 2;
+  int64 read_size = 3;
+  optional string error_info = 4;
+}
+
+message ListDirRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+}
+
+message ListDirResponse {
+  bool success = 1;
+  repeated string volumes = 2;
+  optional string error_info = 3;
+}
+
+message WalkDirRequest {
+  string disk = 1;  // indicate which one in the disks
+  string walk_dir_options = 2;
+}
+
+message WalkDirResponse {
+  bool success = 1;
+  repeated string meta_cache_entry = 2;
+  optional string error_info = 3;
+}
+
+message RenameDataRequest {
+  string disk = 1;  // indicate which one in the disks
+  string src_volume = 2;
+  string src_path = 3;
+  string file_info = 4;
+  string dst_volume = 5;
+  string dst_path = 6;
+}
+
+message RenameDataResponse {
+  bool success = 1;
+  string rename_data_resp = 2;
+  optional string error_info = 3;
+}
+
+message MakeVolumesRequest {
+  string disk = 1;  // indicate which one in the disks
+  repeated string volumes = 2;
+}
+
+message MakeVolumesResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message MakeVolumeRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+}
+
+message MakeVolumeResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message ListVolumesRequest {
+  string disk = 1;  // indicate which one in the disks
+}
+
+message ListVolumesResponse {
+  bool success = 1;
+  repeated string volume_infos = 2;
+  optional string error_info = 3;
+}
+
+message StatVolumeRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+}
+
+message StatVolumeResponse {
+  bool success = 1;
+  string volume_info = 2;
+  optional string error_info = 3;
+}
+
+message WriteMetadataRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+  string file_info = 4;
+}
+
+message WriteMetadataResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message ReadVersionRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  string version_id = 4;
+  string opts = 5;
+}
+
+message ReadVersionResponse {
+  bool success = 1;
+  string file_info = 2;
+  optional string error_info = 3;
+}
+
+message ReadXLRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  bool read_data = 4;
+}
+
+message ReadXLResponse {
+  bool success = 1;
+  string raw_file_info = 2;
+  optional string error_info = 3;
+}
+
+message ReadMultipleRequest {
+  string disk = 1;
+  string read_multiple_req = 2;
+}
+
+message ReadMultipleResponse {
+  bool success = 1;
+  repeated string read_multiple_resps = 2;
+  optional string error_info = 3;
+}
+
+message DeleteVolumeRequest {
+  string disk = 1;
+  string volume = 2;
+}
+
+message DeleteVolumeResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
 /* -------------------------------------------------------------------- */
 
 service NodeService {
+/* -------------------------------meta service-------------------------- */
   rpc Ping(PingRequest) returns (PingResponse) {};
   rpc MakeBucket(MakeBucketRequest) returns (MakeBucketResponse) {};
+
+/* -------------------------------disk service-------------------------- */
+
+  rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {};
+  rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {};
+  rpc Delete(DeleteRequest) returns (DeleteResponse) {};
+  rpc RenameFile(RenameFileRequst) returns (RenameFileResponse) {};
+  rpc Write(WriteRequest) returns (WriteResponse) {};
+//  rpc Append(AppendRequest) returns (AppendResponse) {};
+  rpc ReadAt(ReadAtRequest) returns (ReadAtResponse) {};
+  rpc ListDir(ListDirRequest) returns (ListDirResponse) {};
+  rpc WalkDir(WalkDirRequest) returns (WalkDirResponse) {};
+  rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {};
+  rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {};
+  rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {};
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {};
+  rpc StatVolume(StatVolumeRequest) returns (StatVolumeResponse) {};
+  rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {};
+  rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {};
+  rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {};
+  rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
 }

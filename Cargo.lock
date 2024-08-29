@@ -407,8 +407,10 @@ dependencies = [
 name = "e2e_test"
 version = "0.0.1"
 dependencies = [
+ "ecstore",
  "flatbuffers",
  "protos",
+ "serde_json",
  "tokio",
  "tonic",
 ]
@@ -1550,6 +1552,7 @@ dependencies = [
  "protobuf",
  "protos",
  "s3s",
+ "serde_json",
  "time",
  "tokio",
  "tonic",

@@ -1,14 +1,21 @@
 #![cfg(test)]
 
+use ecstore::disk::VolumeInfo;
 use protos::{
     models::{PingBody, PingBodyBuilder},
-    proto_gen::node_service::{node_service_client::NodeServiceClient, PingRequest, PingResponse},
+    proto_gen::node_service::{
+        node_service_client::NodeServiceClient, ListVolumesRequest, MakeVolumeRequest, PingRequest, PingResponse,
+    },
 };
 use std::error::Error;
 use tonic::Request;
 
+async fn get_client() -> Result<NodeServiceClient<tonic::transport::Channel>, Box<dyn Error>> {
+    Ok(NodeServiceClient::connect("http://localhost:9000").await?)
+}
+
 #[tokio::test]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn ping() -> Result<(), Box<dyn Error>> {
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
     let payload = fbb.create_vector(b"hello world");
 
@@ -42,5 +49,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("ping_resp:body(flatbuffer): {:?}", ping_response_body);
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn make_volume() -> Result<(), Box<dyn Error>> {
+    let mut client = get_client().await?;
+    let request = Request::new(MakeVolumeRequest {
+        disk: "data".to_string(),
+        volume: "dandan".to_string(),
+    });
+
+    let response = client.make_volume(request).await?.into_inner();
+    if response.success {
+        println!("success");
+    } else {
+        println!("failed: {:?}", response.error_info);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_volumes() -> Result<(), Box<dyn Error>> {
+    let mut client = get_client().await?;
+    let request = Request::new(ListVolumesRequest {
+        disk: "data".to_string(),
+    });
+
+    let response = client.list_volumes(request).await?.into_inner();
+    let volume_infos: Vec<VolumeInfo> = response
+        .volume_infos
+        .into_iter()
+        .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
+        .collect();
+
+    println!("{:?}", volume_infos);
     Ok(())
 }

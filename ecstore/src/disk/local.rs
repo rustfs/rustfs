@@ -3,7 +3,7 @@ use super::{
     DeleteOptions, DiskAPI, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions,
     RenameDataResp, VolumeInfo, WalkDirOptions,
 };
-use crate::disk::STORAGE_FORMAT_FILE;
+use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::{
     error::{Error, Result},
     file_meta::FileMeta,
@@ -344,6 +344,10 @@ impl DiskAPI for LocalDisk {
         self.id
     }
 
+    fn path(&self) -> PathBuf {
+        self.root.clone()
+    }
+
     #[must_use]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         let p = self.get_object_path(volume, path)?;
@@ -443,7 +447,8 @@ impl DiskAPI for LocalDisk {
 
         let file = File::create(&fpath).await?;
 
-        Ok(FileWriter::new(file))
+        Ok(FileWriter::Local(LocalFileWriter::new(file)))
+        // Ok(FileWriter::new(file))
 
         // let mut writer = BufWriter::new(file);
 
@@ -469,7 +474,8 @@ impl DiskAPI for LocalDisk {
             .open(&p)
             .await?;
 
-        Ok(FileWriter::new(file))
+        Ok(FileWriter::Local(LocalFileWriter::new(file)))
+        // Ok(FileWriter::new(file))
 
         // let mut writer = BufWriter::new(file);
 
@@ -486,7 +492,7 @@ impl DiskAPI for LocalDisk {
         debug!("read_file {:?}", &p);
         let file = File::options().read(true).open(&p).await?;
 
-        Ok(FileReader::new(file))
+        Ok(FileReader::Local(LocalFileReader::new(file)))
 
         // file.seek(SeekFrom::Start(offset as u64)).await?;
 
@@ -683,9 +689,7 @@ impl DiskAPI for LocalDisk {
                 .await?;
         }
 
-        Ok(RenameDataResp {
-            old_data_dir: old_data_dir,
-        })
+        Ok(RenameDataResp { old_data_dir })
     }
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {

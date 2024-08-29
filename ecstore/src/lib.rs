@@ -3,7 +3,7 @@ mod chunk_stream;
 pub mod disk;
 mod disks_layout;
 mod endpoints;
-mod erasure;
+pub mod erasure;
 pub mod error;
 mod file_meta;
 pub mod peer;

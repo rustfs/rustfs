@@ -28,6 +28,7 @@ prost-types.workspace = true
 protos.workspace = true
 protobuf.workspace = true
 s3s.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = [
