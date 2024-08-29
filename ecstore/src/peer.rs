@@ -1,10 +1,7 @@
 use async_trait::async_trait;
 use futures::future::join_all;
-use protos::proto_gen::node_service::MakeBucketRequest;
-use protos::{
-    node_service_time_out_client, proto_gen::node_service::MakeBucketOptions as proto_MakeBucketOptions,
-    DEFAULT_GRPC_SERVER_MESSAGE_LEN,
-};
+use protos::proto_gen::node_service::{DeleteBucketRequest, GetBucketInfoRequest, ListBucketRequest, MakeBucketRequest};
+use protos::{node_service_time_out_client, DEFAULT_GRPC_SERVER_MESSAGE_LEN};
 use regex::Regex;
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 use tonic::transport::{Channel, Endpoint};
@@ -407,10 +404,27 @@ impl PeerS3Client for RemotePeerS3Client {
     fn get_pools(&self) -> Option<Vec<usize>> {
         self.pools.clone()
     }
-    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        unimplemented!()
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        let options = serde_json::to_string(opts)?;
+        let mut client = node_service_time_out_client(
+            self.channel.clone(),
+            Duration::new(30, 0), // TODO: use config setting
+            DEFAULT_GRPC_SERVER_MESSAGE_LEN,
+            // grpc_enable_gzip,
+            false, // TODO: use config setting
+        );
+        let request = Request::new(ListBucketRequest { options });
+        let response = client.list_bucket(request).await?.into_inner();
+        let bucket_infos = response
+            .bucket_infos
+            .into_iter()
+            .filter_map(|json_str| serde_json::from_str::<BucketInfo>(&json_str).ok())
+            .collect();
+
+        Ok(bucket_infos)
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        let options = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(
             self.channel.clone(),
             Duration::new(30, 0), // TODO: use config setting
@@ -420,9 +434,7 @@ impl PeerS3Client for RemotePeerS3Client {
         );
         let request = Request::new(MakeBucketRequest {
             name: bucket.to_string(),
-            options: Some(proto_MakeBucketOptions {
-                force_create: opts.force_create,
-            }),
+            options,
         });
         let _response = client.make_bucket(request).await?.into_inner();
 
@@ -430,12 +442,39 @@ impl PeerS3Client for RemotePeerS3Client {
 
         Ok(())
     }
-    async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
-        unimplemented!()
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        let options = serde_json::to_string(opts)?;
+        let mut client = node_service_time_out_client(
+            self.channel.clone(),
+            Duration::new(30, 0), // TODO: use config setting
+            DEFAULT_GRPC_SERVER_MESSAGE_LEN,
+            // grpc_enable_gzip,
+            false, // TODO: use config setting
+        );
+        let request = Request::new(GetBucketInfoRequest {
+            bucket: bucket.to_string(),
+            options,
+        });
+        let response = client.get_bucket_info(request).await?.into_inner();
+        let bucket_info = serde_json::from_str::<BucketInfo>(&response.bucket_info)?;
+
+        Ok(bucket_info)
     }
 
-    async fn delete_bucket(&self, _bucket: &str) -> Result<()> {
-        unimplemented!()
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        let mut client = node_service_time_out_client(
+            self.channel.clone(),
+            Duration::new(30, 0), // TODO: use config setting
+            DEFAULT_GRPC_SERVER_MESSAGE_LEN,
+            // grpc_enable_gzip,
+            false, // TODO: use config setting
+        );
+        let request = Request::new(DeleteBucketRequest {
+            bucket: bucket.to_string(),
+        });
+        let _response = client.delete_bucket(request).await?.into_inner();
+
+        Ok(())
     }
 }
 

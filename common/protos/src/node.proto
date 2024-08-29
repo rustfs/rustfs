@@ -12,16 +12,42 @@ message PingResponse {
   bytes body = 2;
 }
 
-message MakeBucketOptions {
-  bool force_create = 1;
+message ListBucketRequest {
+  string options = 1;
+}
+
+message ListBucketResponse {
+  bool success = 1;
+  repeated string bucket_infos = 2;
+  optional string error_info = 3;
 }
 
 message MakeBucketRequest {
   string name = 1;
-  MakeBucketOptions options = 2;
+  string options = 2;
 }
 
 message MakeBucketResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message GetBucketInfoRequest {
+  string bucket = 1;
+  string options = 2;
+}
+
+message GetBucketInfoResponse {
+  bool success = 1;
+  string bucket_info = 2;
+  optional string error_info = 3;
+}
+
+message DeleteBucketRequest {
+  string bucket = 1;
+}
+
+message DeleteBucketResponse {
   bool success = 1;
   optional string error_info = 2;
 }
@@ -258,7 +284,10 @@ message DeleteVolumeResponse {
 service NodeService {
 /* -------------------------------meta service-------------------------- */
   rpc Ping(PingRequest) returns (PingResponse) {};
+  rpc ListBucket(ListBucketRequest) returns (ListBucketResponse) {};
   rpc MakeBucket(MakeBucketRequest) returns (MakeBucketResponse) {};
+  rpc GetBucketInfo(GetBucketInfoRequest) returns (GetBucketInfoResponse) {};
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse) {};
 
 /* -------------------------------disk service-------------------------- */
 
