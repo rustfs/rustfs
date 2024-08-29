@@ -197,6 +197,7 @@ pub struct ObjectPartInfo {
 //     }
 // }
 
+#[derive(Serialize, Deserialize)]
 pub struct RawFileInfo {
     pub buf: Vec<u8>,
 }
