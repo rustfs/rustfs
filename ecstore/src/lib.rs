@@ -7,6 +7,7 @@ mod erasure;
 pub mod error;
 mod file_meta;
 mod peer;
+mod quorum;
 pub mod set_disk;
 mod sets;
 pub mod store;
