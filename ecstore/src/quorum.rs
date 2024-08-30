@@ -54,8 +54,7 @@ fn reduce_errs(errs: &Vec<Option<Error>>, ignored_errs: &[CheckErrorFn]) -> (usi
 
     if let Some(c) = error_counts.get(&max_err) {
         if let Some(&err) = error_map.get(&max_err) {
-            // return (*c, Some(err.clone()));
-            return (*c, None);
+            return (*c, Some(err.clone()));
         }
 
         return (*c, None);
