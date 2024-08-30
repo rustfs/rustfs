@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::RwLock, time::Duration};
 
 use bytes::Bytes;
 use protos::{
@@ -16,6 +16,7 @@ use tonic::{
     Request,
 };
 use tower::timeout::Timeout;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -30,29 +31,51 @@ use super::{
 
 #[derive(Debug)]
 pub struct RemoteDisk {
-    channel: Channel,
+    channel: RwLock<Option<Channel>>,
+    url: url::Url,
     pub root: PathBuf,
 }
 
 impl RemoteDisk {
     pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
-        let connector = tonic_Endpoint::from_shared(format!(
-            "{}://{}{}",
-            ep.url.scheme(),
-            ep.url.host_str().unwrap(),
-            ep.url.port().unwrap()
-        ))
-        .unwrap();
-        let channel = tokio::runtime::Runtime::new().unwrap().block_on(connector.connect()).unwrap();
-
         let root = fs::canonicalize(ep.url.path()).await?;
 
-        Ok(Self { channel, root })
+        Ok(Self { 
+            channel: RwLock::new(None),
+            url: ep.url.clone(),
+            root
+        })
     }
 
     fn get_client(&self) -> NodeServiceClient<Timeout<Channel>> {
+        let channel = {
+            let read_lock = self.channel.read().unwrap();
+            
+            if let Some(ref channel) = *read_lock {
+                channel.clone()
+            } else {
+                let addr = format!(
+                    "{}://{}:{}",
+                    self.url.scheme(),
+                    self.url.host_str().unwrap(),
+                    self.url.port().unwrap()
+                );
+                info!("disk url: {:?}", addr);
+                let connector = tonic_Endpoint::from_shared(addr).unwrap();
+                
+                let new_channel = tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(connector.connect())
+                    .unwrap();
+                
+                *self.channel.write().unwrap() = Some(new_channel.clone());
+                
+                new_channel
+            }
+        };
+
         node_service_time_out_client(
-            self.channel.clone(),
+            channel,
             Duration::new(30, 0), // TODO: use config setting
             DEFAULT_GRPC_SERVER_MESSAGE_LEN,
             // grpc_enable_gzip,
