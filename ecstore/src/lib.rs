@@ -10,6 +10,7 @@ mod peer;
 mod quorum;
 pub mod set_disk;
 mod sets;
+mod storage_class;
 pub mod store;
 pub mod store_api;
 mod store_init;

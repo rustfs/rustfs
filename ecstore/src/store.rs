@@ -6,6 +6,7 @@ use crate::{
     error::{Error, Result},
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
+    storage_class::default_partiy_count,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsInfo,
         ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
@@ -48,7 +49,9 @@ impl ECStore {
 
         for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
             // TODO: read from config parseStorageClass
-            let partiy_count = store_init::default_partiy_count(pool_eps.drives_per_set);
+            let partiy_count = default_partiy_count(pool_eps.drives_per_set);
+
+            // validate_parity(partiy_count, pool_eps.drives_per_set)?;
 
             let (disks, errs) = crate::store_init::init_disks(
                 &pool_eps.endpoints,
