@@ -39,38 +39,11 @@ impl<'a> AsyncWrite for AppendWriter<'a> {
         let mut fut = Box::pin(self.async_write(buf));
         debug!("AsyncWrite poll_write {}, buf:{}", self.disk.id(), buf.len());
 
-        // while let Poll::Ready(e) = fut.as_mut().poll(cx) {
-        //     let a = match e {
-        //         Ok(_) => {
-        //             debug!("Ready ok {}", self.disk.id());
-        //             Poll::Ready(Ok(buf.len()))
-        //         }
-        //         Err(e) => {
-        //             debug!("Ready err {}", self.disk.id());
-        //             Poll::Ready(Err(e))
-        //         }
-        //     };
-
-        //     return a;
-        // }
-
-        // Poll::Pending
-
-        match fut.as_mut().poll(cx) {
-            Poll::Pending => {
-                debug!("Pending {}", self.disk.id());
-                Poll::Pending
-            }
-            Poll::Ready(e) => match e {
-                Ok(_) => {
-                    debug!("Ready ok {}", self.disk.id());
-                    Poll::Ready(Ok(buf.len()))
-                }
-                Err(e) => {
-                    debug!("Ready err {}", self.disk.id());
-                    Poll::Ready(Err(e))
-                }
-            },
+        let mut fut = self.get_mut().async_write(buf);
+        match futures::future::poll_fn(|cx| fut.as_mut().poll(cx)).start(cx) {
+            Ready(Ok(n)) => Ready(Ok(n)),
+            Ready(Err(e)) => Ready(Err(e)),
+            Pending => Pending,
         }
     }
 

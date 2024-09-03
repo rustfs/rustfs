@@ -182,7 +182,9 @@ impl LocalDisk {
             self.move_to_trash(delete_path, recursive, immediate_purge).await?;
         } else {
             if delete_path.is_dir() {
+                debug!("delete_file remove_dir {:?}", &delete_path);
                 if let Err(err) = fs::remove_dir(&delete_path).await {
+                    debug!("delete_file remove_dir err {:?} err: {:?}", &delete_path, err);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         // ErrorKind::DirectoryNotEmpty => (),
@@ -194,6 +196,7 @@ impl LocalDisk {
                         }
                     }
                 }
+                debug!("delete_file remove_dir done {:?}", &delete_path);
             } else {
                 if let Err(err) = fs::remove_file(&delete_path).await {
                     match err.kind() {
@@ -483,6 +486,13 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
+        let volpath = self.get_bucket_path(&volume)?;
+        // check exists
+        fs::metadata(&volpath).await.map_err(|e| match e.kind() {
+            ErrorKind::NotFound => Error::new(DiskError::VolumeNotFound),
+            _ => Error::new(e),
+        })?;
+
         let fpath = self.get_object_path(volume, path)?;
 
         debug!("CreateFile fpath: {:?}", fpath);
@@ -677,8 +687,6 @@ impl DiskAPI for LocalDisk {
                 Err(_) => meta = FileMeta::new(),
             }
         }
-
-        warn!("get meta {:?}", &meta);
 
         let mut skip_parent = dst_volume_path.clone();
         if !dst_buf.is_empty() {
