@@ -15,6 +15,10 @@ pub fn is_file_not_found(e: &Error) -> bool {
     DiskError::FileNotFound.is(e)
 }
 
+pub fn object_ignored_errs() -> Vec<CheckErrorFn> {
+    vec![is_file_not_found]
+}
+
 // 用于检查错误是否被忽略的函数
 fn is_err_ignored(err: &Error, ignored_errs: &[CheckErrorFn]) -> bool {
     ignored_errs.iter().any(|&ignored_err| ignored_err(err))
@@ -76,7 +80,7 @@ fn reduce_quorum_errs(errs: &Vec<Option<Error>>, ignored_errs: &[CheckErrorFn], 
 
 // 根据读quorum验证错误数量
 pub fn reduce_read_quorum_errs(
-    errs: &Vec<Option<Error>>,
+    errs: &mut Vec<Option<Error>>,
     ignored_errs: &[CheckErrorFn],
     read_quorum: usize,
 ) -> Result<usize, Error> {

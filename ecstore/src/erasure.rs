@@ -1,4 +1,5 @@
 use crate::error::{Error, Result, StdError};
+use crate::quorum::{object_ignored_errs, reduce_write_quorum_errs};
 use bytes::Bytes;
 use futures::future::join_all;
 use futures::{Stream, StreamExt};
@@ -49,7 +50,7 @@ impl Erasure {
         writers: &mut [W],
         // block_size: usize,
         total_size: usize,
-        _write_quorum: usize,
+        write_quorum: usize,
     ) -> Result<usize>
     where
         S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
@@ -87,17 +88,15 @@ impl Erasure {
                     for (i, w) in writers.iter_mut().enumerate() {
                         match w.write_all(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
-                            Err(e) => errs.push(Some(e)),
+                            Err(e) => errs.push(Some(Error::new(e))),
                         }
                     }
 
-                    // debug!("{} encode_data write errs:{:?}", self.id, errs);
-                    // // TODO: reduceWriteQuorumErrs
-                    // for err in errs.iter() {
-                    //     if err.is_some() {
-                    //         return Err(Error::msg("message"));
-                    //     }
-                    // }
+                    let err_idx = reduce_write_quorum_errs(&errs, object_ignored_errs().as_slice(), write_quorum)?;
+                    if errs[err_idx].is_some() {
+                        let err = errs[err_idx].take().unwrap();
+                        return Err(err);
+                    }
                 }
                 Err(e) => return Err(Error::from_std_error(e)),
             }
