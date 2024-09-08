@@ -31,10 +31,13 @@ fn setup_tracing() {
 }
 
 fn main() -> Result<()> {
+    //解析获得到的参数
     let opt = config::Opt::parse();
 
+    //设置trace
     setup_tracing();
 
+    //运行参数
     run(opt)
 }
 
@@ -42,7 +45,9 @@ fn main() -> Result<()> {
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
+    //监听地址,端口从参数中获取
     let listener = TcpListener::bind(opt.address.clone()).await?;
+    //获取监听地址
     let local_addr: SocketAddr = listener.local_addr()?;
 
     // let mut domain_name = {
@@ -62,9 +67,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     // };
 
     // Setup S3 service
+    // 本项目使用s3s库来实现s3服务
     let service = {
         let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), opt.volumes.clone()).await?);
-
+        //设置AK和SK
+        //其中部份内容从config配置文件中读取
         let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
         let mut secret_key = String::from_str(config::DEFAULT_SECRET_KEY).unwrap();
 
@@ -73,7 +80,7 @@ async fn run(opt: config::Opt) -> Result<()> {
             access_key = ak;
             secret_key = sk;
         }
-
+        //显示info信息
         info!("authentication is enabled {}, {}", &access_key, &secret_key);
         b.set_auth(SimpleAuth::from_single(access_key, secret_key));
 
