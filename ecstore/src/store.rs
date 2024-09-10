@@ -1,7 +1,6 @@
 use crate::{
     bucket_meta::BucketMetadata,
     disk::{error::DiskError, DeleteOptions, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-    disks_layout::DisksLayout,
     endpoints::EndpointServerPools,
     error::{Error, Result},
     peer::{PeerS3Client, S3PeerSys},
@@ -16,10 +15,30 @@ use crate::{
 use futures::future::join_all;
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use time::OffsetDateTime;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref GLOBAL_OBJECT_API: Arc<Mutex<Option<ECStore>>> = Arc::new(Mutex::new(None));
+}
+
+pub fn new_object_layer_fn() -> Arc<Mutex<Option<ECStore>>> {
+    // 这里不需要显式地锁定和解锁，因为 Arc 提供了必要的线程安全性
+    GLOBAL_OBJECT_API.clone()
+}
+
+async fn set_object_layer(o: ECStore) {
+    let mut global_object_api = GLOBAL_OBJECT_API.lock().await;
+    *global_object_api = Some(o);
+}
 
 #[derive(Debug)]
 pub struct ECStore {
@@ -32,7 +51,7 @@ pub struct ECStore {
 }
 
 impl ECStore {
-    pub async fn new(address: String, endpoint_pools: EndpointServerPools) -> Result<Self> {
+    pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<()> {
         // let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 
         let mut deployment_id = None;
@@ -97,13 +116,17 @@ impl ECStore {
 
         let peer_sys = S3PeerSys::new(&endpoint_pools, local_disks.clone());
 
-        Ok(ECStore {
+        let ec = ECStore {
             id: deployment_id.unwrap(),
             disk_map,
             pools,
             local_disks,
             peer_sys,
-        })
+        };
+
+        set_object_layer(ec).await;
+
+        Ok(())
     }
 
     fn single_pool(&self) -> bool {
