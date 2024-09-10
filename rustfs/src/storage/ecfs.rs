@@ -45,9 +45,9 @@ pub struct FS {
 }
 
 impl FS {
-    pub async fn new() -> Result<Self> {
+    pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
-        Ok(Self {})
+        Self {}
     }
 }
 #[async_trait::async_trait]
