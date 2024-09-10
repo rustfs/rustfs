@@ -2,7 +2,7 @@ mod config;
 mod storage;
 
 use clap::Parser;
-use ecstore::{disks_layout::DisksLayout, endpoints::EndpointServerPools, error::Result};
+use ecstore::{endpoints::EndpointServerPools, error::Result, store::ECStore};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
@@ -10,7 +10,7 @@ use hyper_util::{
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -66,12 +66,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     //         })
     // };
 
+    // 用于rpc
     let (endpoint_pools, _) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())?;
 
     // Setup S3 service
     // 本项目使用s3s库来实现s3服务
     let service = {
-        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), endpoint_pools).await?);
+        // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), endpoint_pools).await?);
+        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new().await?);
         //设置AK和SK
         //其中部份内容从config配置文件中读取
         let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
@@ -134,6 +136,10 @@ async fn run(opt: config::Opt) -> Result<()> {
             let _ = conn.await;
         });
     }
+
+    warn!(" init store");
+    // init store
+    ECStore::new(opt.address.clone(), endpoint_pools.clone()).await?;
 
     tokio::select! {
         () = graceful.shutdown() => {
