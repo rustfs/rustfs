@@ -36,8 +36,8 @@
   - [ ] 详情 HeadObject
   - [ ] 对象预先签名（get、put、head、post）
 
-  
 ## 扩展功能
+
 - [ ] 用户管理
 - [ ] Policy管理
 - [ ] AK/SK分配管理

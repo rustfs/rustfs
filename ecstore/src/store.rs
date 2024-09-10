@@ -32,12 +32,12 @@ pub struct ECStore {
 }
 
 impl ECStore {
-    pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
-        let layouts = DisksLayout::try_from(endpoints.as_slice())?;
+    pub async fn new(address: String, endpoint_pools: EndpointServerPools) -> Result<Self> {
+        // let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 
         let mut deployment_id = None;
 
-        let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
+        // let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
 
         let mut pools = Vec::with_capacity(endpoint_pools.as_ref().len());
         let mut disk_map = HashMap::with_capacity(endpoint_pools.as_ref().len());

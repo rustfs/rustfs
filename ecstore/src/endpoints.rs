@@ -408,6 +408,11 @@ impl AsMut<Vec<PoolEndpoints>> for EndpointServerPools {
 }
 
 impl EndpointServerPools {
+    pub fn from_volumes(server_addr: &str, endpoints: Vec<String>) -> Result<(EndpointServerPools, SetupType)> {
+        let layouts = DisksLayout::try_from(endpoints.as_slice())?;
+
+        Self::create_server_endpoints(server_addr, &layouts)
+    }
     /// validates and creates new endpoints from input args, supports
     /// both ellipses and without ellipses transparently.
     pub fn create_server_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<(EndpointServerPools, SetupType)> {

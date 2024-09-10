@@ -2,7 +2,7 @@ mod config;
 mod storage;
 
 use clap::Parser;
-use ecstore::error::Result;
+use ecstore::{disks_layout::DisksLayout, endpoints::EndpointServerPools, error::Result};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
@@ -66,10 +66,12 @@ async fn run(opt: config::Opt) -> Result<()> {
     //         })
     // };
 
+    let (endpoint_pools, _) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())?;
+
     // Setup S3 service
     // 本项目使用s3s库来实现s3服务
     let service = {
-        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), opt.volumes.clone()).await?);
+        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), endpoint_pools).await?);
         //设置AK和SK
         //其中部份内容从config配置文件中读取
         let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
