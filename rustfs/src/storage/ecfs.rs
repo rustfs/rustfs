@@ -6,6 +6,7 @@ use ecstore::store_api::HTTPRangeSpec;
 use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::MultipartUploadResult;
 use ecstore::store_api::ObjectOptions;
+use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
@@ -21,6 +22,7 @@ use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
 use transform_stream::AsyncTryStream;
+use uuid::Uuid;
 
 use ecstore::error::Result;
 use ecstore::store::ECStore;
@@ -91,17 +93,111 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let _input = req.input;
+        let DeleteObjectInput {
+            bucket, key, version_id, ..
+        } = req.input;
 
-        let output = DeleteObjectOutput::default();
+        let version_id = version_id
+            .as_ref()
+            .map(|v| match Uuid::parse_str(v) {
+                Ok(id) => Some(id),
+                Err(_) => None,
+            })
+            .unwrap_or_default();
+        let dobj = ObjectToDelete {
+            object_name: key,
+            version_id,
+        };
+
+        let objects: Vec<ObjectToDelete> = vec![dobj];
+
+        let (dobjs, _errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
+
+        // TODO: let errors;
+
+        let (delete_marker, version_id) = {
+            if let Some((a, b)) = dobjs
+                .iter()
+                .map(|v| {
+                    let delete_marker = {
+                        if v.delete_marker {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    };
+
+                    let version_id = v.version_id.clone();
+
+                    (delete_marker, version_id)
+                })
+                .next()
+            {
+                (a, b)
+            } else {
+                (None, None)
+            }
+        };
+
+        let output = DeleteObjectOutput {
+            delete_marker,
+            version_id,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let _input = req.input;
+        // info!("delete_objects args {:?}", req.input);
 
-        let output = DeleteObjectsOutput { ..Default::default() };
+        let DeleteObjectsInput { bucket, delete, .. } = req.input;
+
+        let objects: Vec<ObjectToDelete> = delete
+            .objects
+            .iter()
+            .map(|v| {
+                let version_id = v
+                    .version_id
+                    .as_ref()
+                    .map(|v| match Uuid::parse_str(v) {
+                        Ok(id) => Some(id),
+                        Err(_) => None,
+                    })
+                    .unwrap_or_default();
+                ObjectToDelete {
+                    object_name: v.key.clone(),
+                    version_id: version_id,
+                }
+            })
+            .collect();
+
+        let (dobjs, _errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
+        // info!("delete_objects res {:?} {:?}", &dobjs, errs);
+
+        let deleted = dobjs
+            .iter()
+            .map(|v| DeletedObject {
+                delete_marker: {
+                    if v.delete_marker {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                },
+                delete_marker_version_id: v.delete_marker_version_id.clone(),
+                key: Some(v.object_name.clone()),
+                version_id: v.version_id.clone(),
+            })
+            .collect();
+
+        // TODO: let errors;
+
+        let output = DeleteObjectsOutput {
+            deleted: Some(deleted),
+            // errors,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
