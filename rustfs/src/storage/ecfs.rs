@@ -24,6 +24,7 @@ use std::str::FromStr;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
+use ecstore::endpoints::EndpointServerPools;
 use ecstore::error::Result;
 use ecstore::store::ECStore;
 use tracing::debug;
@@ -45,8 +46,8 @@ pub struct FS {
 }
 
 impl FS {
-    pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
-        let store: ECStore = ECStore::new(address, endpoints).await?;
+    pub async fn new(address: String, endpoint_pools: EndpointServerPools) -> Result<Self> {
+        let store: ECStore = ECStore::new(address, endpoint_pools).await?;
         Ok(Self { store })
     }
 }
