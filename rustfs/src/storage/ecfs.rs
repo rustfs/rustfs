@@ -1,11 +1,13 @@
 use bytes::Bytes;
 use ecstore::disk::error::DiskError;
+use ecstore::store::new_object_layer_fn;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
 use ecstore::store_api::HTTPRangeSpec;
 use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::MultipartUploadResult;
 use ecstore::store_api::ObjectOptions;
+use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
@@ -21,9 +23,9 @@ use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
 use transform_stream::AsyncTryStream;
+use uuid::Uuid;
 
 use ecstore::error::Result;
-use ecstore::store::ECStore;
 use tracing::debug;
 
 macro_rules! try_ {
@@ -39,12 +41,13 @@ macro_rules! try_ {
 
 #[derive(Debug)]
 pub struct FS {
-    pub store: ECStore,
+    // pub store: ECStore,
 }
 
 impl FS {
-    pub async fn new(store: ECStore) -> Result<Self> {
-        Ok(Self { store })
+    pub fn new() -> Self {
+        // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
+        Self {}
     }
 }
 #[async_trait::async_trait]
@@ -57,8 +60,15 @@ impl S3 for FS {
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let input = req.input;
 
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
         try_!(
-            self.store
+            store
                 .make_bucket(&input.bucket, &MakeBucketOptions { force_create: true })
                 .await
         );
@@ -83,24 +93,137 @@ impl S3 for FS {
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
 
-        try_!(self.store.delete_bucket(&input.bucket).await);
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+        try_!(store.delete_bucket(&input.bucket).await);
 
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let _input = req.input;
+        let DeleteObjectInput {
+            bucket, key, version_id, ..
+        } = req.input;
 
-        let output = DeleteObjectOutput::default();
+        let version_id = version_id
+            .as_ref()
+            .map(|v| match Uuid::parse_str(v) {
+                Ok(id) => Some(id),
+                Err(_) => None,
+            })
+            .unwrap_or_default();
+        let dobj = ObjectToDelete {
+            object_name: key,
+            version_id,
+        };
+
+        let objects: Vec<ObjectToDelete> = vec![dobj];
+
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+        let (dobjs, _errs) = try_!(store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
+
+        // TODO: let errors;
+
+        let (delete_marker, version_id) = {
+            if let Some((a, b)) = dobjs
+                .iter()
+                .map(|v| {
+                    let delete_marker = {
+                        if v.delete_marker {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    };
+
+                    let version_id = v.version_id.clone();
+
+                    (delete_marker, version_id)
+                })
+                .next()
+            {
+                (a, b)
+            } else {
+                (None, None)
+            }
+        };
+
+        let output = DeleteObjectOutput {
+            delete_marker,
+            version_id,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let _input = req.input;
+        // info!("delete_objects args {:?}", req.input);
 
-        let output = DeleteObjectsOutput { ..Default::default() };
+        let DeleteObjectsInput { bucket, delete, .. } = req.input;
+
+        let objects: Vec<ObjectToDelete> = delete
+            .objects
+            .iter()
+            .map(|v| {
+                let version_id = v
+                    .version_id
+                    .as_ref()
+                    .map(|v| match Uuid::parse_str(v) {
+                        Ok(id) => Some(id),
+                        Err(_) => None,
+                    })
+                    .unwrap_or_default();
+                ObjectToDelete {
+                    object_name: v.key.clone(),
+                    version_id: version_id,
+                }
+            })
+            .collect();
+
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        let (dobjs, _errs) = try_!(store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
+        // info!("delete_objects res {:?} {:?}", &dobjs, errs);
+
+        let deleted = dobjs
+            .iter()
+            .map(|v| DeletedObject {
+                delete_marker: {
+                    if v.delete_marker {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                },
+                delete_marker_version_id: v.delete_marker_version_id.clone(),
+                key: Some(v.object_name.clone()),
+                version_id: v.version_id.clone(),
+            })
+            .collect();
+
+        // TODO: let errors;
+
+        let output = DeleteObjectsOutput {
+            deleted: Some(deleted),
+            // errors,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
@@ -109,7 +232,14 @@ impl S3 for FS {
         // mc get  1
         let input = req.input;
 
-        if let Err(e) = self.store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
             if DiskError::VolumeNotFound.is(&e) {
                 return Err(s3_error!(NoSuchBucket));
             } else {
@@ -145,11 +275,14 @@ impl S3 for FS {
         let h = HeaderMap::new();
         let opts = &ObjectOptions::default();
 
-        let reader = try_!(
-            self.store
-                .get_object_reader(bucket.as_str(), key.as_str(), range, h, opts)
-                .await
-        );
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        let reader = try_!(store.get_object_reader(bucket.as_str(), key.as_str(), range, h, opts).await);
 
         let info = reader.object_info;
 
@@ -172,7 +305,14 @@ impl S3 for FS {
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
 
-        if let Err(e) = self.store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
             if DiskError::VolumeNotFound.is(&e) {
                 return Err(s3_error!(NoSuchBucket));
             } else {
@@ -189,7 +329,14 @@ impl S3 for FS {
         // mc get 2
         let HeadObjectInput { bucket, key, .. } = req.input;
 
-        let info = try_!(self.store.get_object_info(&bucket, &key, &ObjectOptions::default()).await);
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        let info = try_!(store.get_object_info(&bucket, &key, &ObjectOptions::default()).await);
         debug!("info {:?}", info);
 
         let content_type = try_!(ContentType::from_str("application/x-msdownload"));
@@ -209,7 +356,14 @@ impl S3 for FS {
     async fn list_buckets(&self, _: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         // mc ls
 
-        let bucket_infos = try_!(self.store.list_bucket(&BucketOptions {}).await);
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        let bucket_infos = try_!(store.list_bucket(&BucketOptions {}).await);
 
         let buckets: Vec<Bucket> = bucket_infos
             .iter()
@@ -257,8 +411,15 @@ impl S3 for FS {
         let prefix = prefix.unwrap_or_default();
         let delimiter = delimiter.unwrap_or_default();
 
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
         let object_infos = try_!(
-            self.store
+            store
                 .list_objects_v2(
                     &bucket,
                     &prefix,
@@ -337,9 +498,16 @@ impl S3 for FS {
 
         let reader = PutObjReader::new(body, content_length as usize);
 
-        try_!(self.store.put_object(&bucket, &key, reader, &ObjectOptions::default()).await);
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
 
-        // self.store.put_object(bucket, object, data, opts);
+        try_!(store.put_object(&bucket, &key, reader, &ObjectOptions::default()).await);
+
+        // store.put_object(bucket, object, data, opts);
 
         let output = PutObjectOutput { ..Default::default() };
         Ok(S3Response::new(output))
@@ -358,11 +526,15 @@ impl S3 for FS {
 
         debug!("create_multipart_upload meta {:?}", &metadata);
 
-        let MultipartUploadResult { upload_id, .. } = try_!(
-            self.store
-                .new_multipart_upload(&bucket, &key, &ObjectOptions::default())
-                .await
-        );
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        let MultipartUploadResult { upload_id, .. } =
+            try_!(store.new_multipart_upload(&bucket, &key, &ObjectOptions::default()).await);
 
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
@@ -397,11 +569,14 @@ impl S3 for FS {
         let data = PutObjReader::new(body, content_length as usize);
         let opts = ObjectOptions::default();
 
-        try_!(
-            self.store
-                .put_object_part(&bucket, &key, &upload_id, part_id, data, &opts)
-                .await
-        );
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        try_!(store.put_object_part(&bucket, &key, &upload_id, part_id, data, &opts).await);
 
         let output = UploadPartOutput { ..Default::default() };
         Ok(S3Response::new(output))
@@ -456,8 +631,15 @@ impl S3 for FS {
             uploaded_parts.push(CompletePart::from(part));
         }
 
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
         try_!(
-            self.store
+            store
                 .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
                 .await
         );
@@ -479,9 +661,16 @@ impl S3 for FS {
             bucket, key, upload_id, ..
         } = req.input;
 
+        let layer = new_object_layer_fn();
+        let lock = layer.lock().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
         let opts = &ObjectOptions::default();
         try_!(
-            self.store
+            store
                 .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
                 .await
         );

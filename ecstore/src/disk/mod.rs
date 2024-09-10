@@ -14,7 +14,7 @@ const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 use crate::{
     erasure::{ReadAt, Write},
-    error::Result,
+    error::{Error, Result},
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
 };
@@ -85,7 +85,29 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
+    async fn delete_versions(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Result<Vec<Option<Error>>>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FileInfoVersions {
+    // Name of the volume.
+    pub volume: String,
+
+    // Name of the file.
+    pub name: String,
+
+    // Represents the latest mod time of the
+    // latest version.
+    pub latest_mod_time: Option<OffsetDateTime>,
+
+    pub versions: Vec<FileInfo>,
+    pub free_versions: Vec<FileInfo>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use futures::future::join_all;
 use http::HeaderMap;
 use uuid::Uuid;
 
@@ -7,11 +10,11 @@ use crate::{
         DiskStore,
     },
     endpoints::PoolEndpoints,
-    error::Result,
+    error::{Error, Result},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, GetObjectReader, HTTPRangeSpec, ListObjectsV2Info, MakeBucketOptions,
-        MultipartUploadResult, ObjectInfo, ObjectOptions, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsV2Info,
+        MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -110,6 +113,22 @@ impl Sets {
     // ) -> Vec<Option<Error>> {
     //     unimplemented!()
     // }
+
+    async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
+        let mut futures = Vec::new();
+        let opt = ObjectOptions {
+            delete_prefix: true,
+            ..Default::default()
+        };
+
+        for set in self.disk_set.iter() {
+            futures.push(set.delete_object(bucket, object, opt.clone()));
+        }
+
+        let _results = join_all(futures).await;
+
+        Ok(())
+    }
 }
 
 // #[derive(Debug)]
@@ -121,6 +140,12 @@ impl Sets {
 //     pub set_drive_count: usize,
 //     pub default_parity_count: usize,
 // }
+
+struct DelObj {
+    // set_idx: usize,
+    orig_idx: usize,
+    obj: ObjectToDelete,
+}
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
@@ -134,7 +159,77 @@ impl StorageAPI for Sets {
     async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()
     }
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)> {
+        // 默认返回值
+        let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
+        let mut del_errs = Vec::with_capacity(objects.len());
+        for _ in 0..objects.len() {
+            del_errs.push(None)
+        }
+
+        let mut set_obj_map = HashMap::new();
+
+        // hash key
+        let mut i = 0;
+        for obj in objects.iter() {
+            let idx = self.get_hashed_set_index(obj.object_name.as_str());
+
+            if !set_obj_map.contains_key(&idx) {
+                set_obj_map.insert(
+                    idx,
+                    vec![DelObj {
+                        // set_idx: idx,
+                        orig_idx: i,
+                        obj: obj.clone(),
+                    }],
+                );
+            } else {
+                if let Some(val) = set_obj_map.get_mut(&idx) {
+                    val.push(DelObj {
+                        // set_idx: idx,
+                        orig_idx: i,
+                        obj: obj.clone(),
+                    });
+                }
+            }
+
+            i += 1;
+        }
+
+        // TODO: 并发
+        for (k, v) in set_obj_map {
+            let disks = self.get_disks(k);
+            let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
+            let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await?;
+
+            let mut i = 0;
+            for err in errs {
+                let obj = v.get(i).unwrap();
+
+                del_errs[obj.orig_idx] = err;
+
+                del_objects[obj.orig_idx] = dobjects.get(i).unwrap().clone();
+
+                i += 1;
+            }
+        }
+
+        Ok((del_objects, del_errs))
+    }
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        if opts.delete_prefix {
+            self.delete_prefix(bucket, object).await?;
+            return Ok(ObjectInfo::default());
+        }
+
+        self.get_disks_by_key(object).delete_object(bucket, object, opts).await
+    }
     async fn list_objects_v2(
         &self,
         _bucket: &str,

@@ -20,13 +20,14 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::{
-    error::Result,
+    error::{Error, Result},
     store_api::{FileInfo, RawFileInfo},
 };
 
 use super::{
-    endpoint::Endpoint, DeleteOptions, DiskAPI, DiskOption, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter, RenameDataResp, VolumeInfo, WalkDirOptions,
+    endpoint::Endpoint, DeleteOptions, DiskAPI, DiskOption, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter, RenameDataResp, VolumeInfo,
+    WalkDirOptions,
 };
 
 #[derive(Debug)]
@@ -40,36 +41,28 @@ impl RemoteDisk {
     pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
         let root = fs::canonicalize(ep.url.path()).await?;
 
-        Ok(Self { 
+        Ok(Self {
             channel: RwLock::new(None),
             url: ep.url.clone(),
-            root
+            root,
         })
     }
 
     fn get_client(&self) -> NodeServiceClient<Timeout<Channel>> {
         let channel = {
             let read_lock = self.channel.read().unwrap();
-            
+
             if let Some(ref channel) = *read_lock {
                 channel.clone()
             } else {
-                let addr = format!(
-                    "{}://{}:{}",
-                    self.url.scheme(),
-                    self.url.host_str().unwrap(),
-                    self.url.port().unwrap()
-                );
+                let addr = format!("{}://{}:{}", self.url.scheme(), self.url.host_str().unwrap(), self.url.port().unwrap());
                 info!("disk url: {:?}", addr);
                 let connector = tonic_Endpoint::from_shared(addr).unwrap();
-                
-                let new_channel = tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(connector.connect())
-                    .unwrap();
-                
+
+                let new_channel = tokio::runtime::Runtime::new().unwrap().block_on(connector.connect()).unwrap();
+
                 *self.channel.write().unwrap() = Some(new_channel.clone());
-                
+
                 new_channel
             }
         };
@@ -345,6 +338,15 @@ impl DiskAPI for RemoteDisk {
         let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
 
         Ok(raw_file_info)
+    }
+
+    async fn delete_versions(
+        &self,
+        _volume: &str,
+        _versions: Vec<FileInfoVersions>,
+        _opts: DeleteOptions,
+    ) -> Result<Vec<Option<Error>>> {
+        unimplemented!()
     }
 
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
