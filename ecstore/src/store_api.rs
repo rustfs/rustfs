@@ -10,15 +10,15 @@ pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
 
 // #[derive(Debug, Clone)]
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct FileInfo {
     pub name: String,
     pub volume: String,
-    pub version_id: Uuid,
+    pub version_id: Option<Uuid>,
     pub erasure: ErasureInfo,
     pub deleted: bool,
     // DataDir of the file
-    pub data_dir: Uuid,
+    pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
     pub size: usize,
     pub data: Option<Vec<u8>>,
@@ -27,7 +27,66 @@ pub struct FileInfo {
     pub is_latest: bool,
 }
 
+// impl Default for FileInfo {
+//     fn default() -> Self {
+//         Self {
+//             version_id: Default::default(),
+//             erasure: Default::default(),
+//             deleted: Default::default(),
+//             data_dir: Default::default(),
+//             mod_time: None,
+//             size: Default::default(),
+//             data: Default::default(),
+//             fresh: Default::default(),
+//             name: Default::default(),
+//             volume: Default::default(),
+//             parts: Default::default(),
+//             is_latest: Default::default(),
+//         }
+//     }
+// }
+
 impl FileInfo {
+    pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
+        let indexs = {
+            let cardinality = data_blocks + parity_blocks;
+            let mut nums = vec![0; cardinality];
+            let key_crc = crc32fast::hash(object.as_bytes());
+
+            let start = key_crc as usize % cardinality;
+            for i in 1..=cardinality {
+                nums[i - 1] = 1 + ((start + i) % cardinality);
+            }
+
+            nums
+        };
+        Self {
+            erasure: ErasureInfo {
+                algorithm: String::from(ERASURE_ALGORITHM),
+                data_blocks,
+                parity_blocks,
+                block_size: BLOCK_SIZE_V2,
+                distribution: indexs,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        if self.deleted {
+            return true;
+        }
+
+        let data_blocks = self.erasure.data_blocks;
+        let parity_blocks = self.erasure.parity_blocks;
+
+        (data_blocks >= parity_blocks)
+            && (data_blocks > 0)
+            && (self.erasure.index > 0
+                && self.erasure.index <= data_blocks + parity_blocks
+                && self.erasure.distribution.len() == (data_blocks + parity_blocks))
+    }
     pub fn is_remote(&self) -> bool {
         // TODO: when lifecycle
         false
@@ -86,7 +145,7 @@ impl FileInfo {
             parity_blocks: self.erasure.parity_blocks,
             data_blocks: self.erasure.data_blocks,
             version_id: self.version_id,
-            deleted: self.deleted,
+            delete_marker: self.deleted,
             mod_time: self.mod_time,
             size: self.size,
             parts: self.parts.clone(),
@@ -110,68 +169,6 @@ impl FileInfo {
         }
 
         Err(Error::msg("part not found"))
-    }
-}
-
-impl Default for FileInfo {
-    fn default() -> Self {
-        Self {
-            version_id: Uuid::nil(),
-            erasure: Default::default(),
-            deleted: Default::default(),
-            data_dir: Uuid::nil(),
-            mod_time: None,
-            size: Default::default(),
-            data: Default::default(),
-            fresh: Default::default(),
-            name: Default::default(),
-            volume: Default::default(),
-            parts: Default::default(),
-            is_latest: Default::default(),
-        }
-    }
-}
-
-impl FileInfo {
-    pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
-        let indexs = {
-            let cardinality = data_blocks + parity_blocks;
-            let mut nums = vec![0; cardinality];
-            let key_crc = crc32fast::hash(object.as_bytes());
-
-            let start = key_crc as usize % cardinality;
-            for i in 1..=cardinality {
-                nums[i - 1] = 1 + ((start + i) % cardinality);
-            }
-
-            nums
-        };
-        Self {
-            erasure: ErasureInfo {
-                algorithm: String::from(ERASURE_ALGORITHM),
-                data_blocks,
-                parity_blocks,
-                block_size: BLOCK_SIZE_V2,
-                distribution: indexs,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    pub fn is_valid(&self) -> bool {
-        if self.deleted {
-            return true;
-        }
-
-        let data_blocks = self.erasure.data_blocks;
-        let parity_blocks = self.erasure.parity_blocks;
-
-        (data_blocks >= parity_blocks)
-            && (data_blocks > 0)
-            && (self.erasure.index > 0
-                && self.erasure.index <= data_blocks + parity_blocks
-                && self.erasure.distribution.len() == (data_blocks + parity_blocks))
     }
 }
 
@@ -358,12 +355,15 @@ impl HTTPRangeSpec {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
     pub mod_time: Option<OffsetDateTime>,
     pub part_number: usize,
+
+    pub delete_prefix: bool,
+    pub version_id: String,
 }
 
 // impl Default for ObjectOptions {
@@ -413,13 +413,13 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
+    pub mod_time: Option<OffsetDateTime>,
+    pub size: usize,
     pub is_dir: bool,
     pub parity_blocks: usize,
     pub data_blocks: usize,
-    pub version_id: Uuid,
-    pub deleted: bool,
-    pub mod_time: Option<OffsetDateTime>,
-    pub size: usize,
+    pub version_id: Option<Uuid>,
+    pub delete_marker: bool,
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
 }
@@ -468,13 +468,36 @@ pub struct ListObjectsV2Info {
     pub prefixes: Vec<String>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ObjectToDelete {
+    pub object_name: String,
+    pub version_id: Option<Uuid>,
+}
+#[derive(Debug, Default, Clone)]
+pub struct DeletedObject {
+    pub delete_marker: bool,
+    pub delete_marker_version_id: Option<String>,
+    pub object_name: String,
+    pub version_id: Option<String>,
+    // MTime of DeleteMarker on source that needs to be propagated to replica
+    pub delete_marker_mtime: Option<OffsetDateTime>,
+    // to support delete marker replication
+    // pub replication_state: ReplicationState,
+}
+
 #[async_trait::async_trait]
 pub trait StorageAPI {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
-
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
     async fn list_objects_v2(
         &self,
         bucket: &str,

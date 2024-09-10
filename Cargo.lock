@@ -1168,6 +1168,7 @@ dependencies = [
  "tracing-error",
  "tracing-subscriber",
  "transform-stream",
+ "uuid",
 ]
 
 [[package]]

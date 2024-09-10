@@ -23,7 +23,7 @@ http.workspace = true
 bytes.workspace = true
 futures.workspace = true
 futures-util.workspace = true
-
+uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
 s3s = "0.10.0"
 clap = { version = "4.5.7", features = ["derive"] }
