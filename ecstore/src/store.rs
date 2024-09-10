@@ -28,6 +28,7 @@ use lazy_static::lazy_static;
 
 lazy_static! {
     pub static ref GLOBAL_OBJECT_API: Arc<Mutex<Option<ECStore>>> = Arc::new(Mutex::new(None));
+    pub static ref GLOBAL_LOCAL_DISK: Arc<Mutex<Vec<Option<DiskStore>>>> = Arc::new(Mutex::new(Vec::new()));
 }
 
 pub fn new_object_layer_fn() -> Arc<Mutex<Option<ECStore>>> {
@@ -129,9 +130,11 @@ impl ECStore {
         Ok(())
     }
 
-    pub fn local_disks(&self) -> Vec<DiskStore> {
-        self.local_disks.clone()
-    }
+    pub fn init_local_disks() {}
+
+    // pub fn local_disks(&self) -> Vec<DiskStore> {
+    //     self.local_disks.clone()
+    // }
 
     fn single_pool(&self) -> bool {
         self.pools.len() == 1
