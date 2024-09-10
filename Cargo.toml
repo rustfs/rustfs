@@ -4,7 +4,7 @@ members = ["rustfs", "ecstore", "e2e_test", "common/protos"]
 
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
 rust-version = "1.75"
 version = "0.0.1"

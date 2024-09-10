@@ -1,5 +1,6 @@
 use ecstore::{
     disk::{DeleteOptions, DiskStore, ReadMultipleReq, ReadOptions, WalkDirOptions},
+    endpoints::EndpointServerPools,
     erasure::{ReadAt, Write},
     peer::{LocalPeerS3Client, PeerS3Client},
     store_api::{BucketOptions, FileInfo, MakeBucketOptions},
@@ -28,7 +29,9 @@ struct NodeService {
     pub local_peer: LocalPeerS3Client,
 }
 
-pub fn make_server(local_disks: Vec<DiskStore>) -> NodeServer<impl Node> {
+pub fn make_server(endpoint_pools: EndpointServerPools) -> NodeServer<impl Node> {
+    // TODO: 参考minio创建 https://github.com/rustfs/s3-rustfs/issues/30#issuecomment-2339664516
+    let local_disks = Vec::new();
     let local_peer = LocalPeerS3Client::new(local_disks, None, None);
     NodeServer::new(NodeService { local_peer })
 }
