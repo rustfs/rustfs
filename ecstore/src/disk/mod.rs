@@ -46,8 +46,10 @@ pub async fn new_disk(ep: &endpoint::Endpoint, opt: &DiskOption) -> Result<DiskS
 #[async_trait::async_trait]
 pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn is_local(&self) -> bool;
-    fn id(&self) -> Uuid;
     fn path(&self) -> PathBuf;
+    async fn close(&self) -> Result<()>;
+    async fn get_disk_id(&self) -> Option<Uuid>;
+    async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()>;
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;

@@ -1,11 +1,10 @@
 use ecstore::{
     disk::{DeleteOptions, DiskStore, ReadMultipleReq, ReadOptions, WalkDirOptions},
-    endpoints::EndpointServerPools,
     erasure::{ReadAt, Write},
     peer::{LocalPeerS3Client, PeerS3Client},
+    store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, FileInfo, MakeBucketOptions},
 };
-use tokio::fs;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
 
@@ -29,28 +28,29 @@ struct NodeService {
     pub local_peer: LocalPeerS3Client,
 }
 
-pub fn make_server(endpoint_pools: EndpointServerPools) -> NodeServer<impl Node> {
-    // TODO: 参考minio创建 https://github.com/rustfs/s3-rustfs/issues/30#issuecomment-2339664516
-    let local_disks = Vec::new();
-    let local_peer = LocalPeerS3Client::new(local_disks, None, None);
+pub fn make_server() -> NodeServer<impl Node> {
+    // let local_disks = all_local_disk().await;
+    let local_peer = LocalPeerS3Client::new(None, None);
     NodeServer::new(NodeService { local_peer })
 }
 
 impl NodeService {
     async fn find_disk(&self, disk_path: &String) -> Option<DiskStore> {
-        let disk_path = match fs::canonicalize(disk_path).await {
-            Ok(disk_path) => disk_path,
-            Err(_) => return None,
-        };
-        self.local_peer.local_disks.iter().find(|&x| x.path() == disk_path).cloned()
+        find_local_disk(disk_path).await
+        // let disk_path = match fs::canonicalize(disk_path).await {
+        //     Ok(disk_path) => disk_path,
+        //     Err(_) => return None,
+        // };
+        // self.local_peer.local_disks.iter().find(|&x| x.path() == disk_path).cloned()
     }
 
-    fn all_disk(&self) -> Vec<String> {
-        self.local_peer
-            .local_disks
-            .iter()
-            .map(|disk| disk.path().to_string_lossy().to_string())
-            .collect()
+    async fn all_disk(&self) -> Vec<String> {
+        all_local_disk_path().await
+        // self.local_peer
+        //     .local_disks
+        //     .iter()
+        //     .map(|disk| disk.path().to_string_lossy().to_string())
+        //     .collect()
     }
 }
 
@@ -501,7 +501,7 @@ impl Node for NodeService {
         } else {
             Ok(tonic::Response::new(MakeVolumesResponse {
                 success: false,
-                error_info: Some(format!("can not find disk, all disks: {:?}", self.all_disk())),
+                error_info: Some(format!("can not find disk, all disks: {:?}", self.all_disk().await)),
             }))
         }
     }
@@ -522,7 +522,7 @@ impl Node for NodeService {
         } else {
             Ok(tonic::Response::new(MakeVolumeResponse {
                 success: false,
-                error_info: Some(format!("can not find disk, all disks: {:?}", self.all_disk())),
+                error_info: Some(format!("can not find disk, all disks: {:?}", self.all_disk().await)),
             }))
         }
     }

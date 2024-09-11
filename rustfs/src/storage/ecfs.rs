@@ -61,7 +61,7 @@ impl S3 for FS {
         let input = req.input;
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -94,7 +94,7 @@ impl S3 for FS {
         let input = req.input;
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -125,7 +125,7 @@ impl S3 for FS {
         let objects: Vec<ObjectToDelete> = vec![dobj];
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -192,7 +192,7 @@ impl S3 for FS {
             .collect();
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -233,7 +233,7 @@ impl S3 for FS {
         let input = req.input;
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -276,7 +276,7 @@ impl S3 for FS {
         let opts = &ObjectOptions::default();
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -306,7 +306,7 @@ impl S3 for FS {
         let input = req.input;
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -330,7 +330,7 @@ impl S3 for FS {
         let HeadObjectInput { bucket, key, .. } = req.input;
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -357,7 +357,7 @@ impl S3 for FS {
         // mc ls
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -412,7 +412,7 @@ impl S3 for FS {
         let delimiter = delimiter.unwrap_or_default();
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -499,7 +499,7 @@ impl S3 for FS {
         let reader = PutObjReader::new(body, content_length as usize);
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -527,7 +527,7 @@ impl S3 for FS {
         debug!("create_multipart_upload meta {:?}", &metadata);
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -570,7 +570,7 @@ impl S3 for FS {
         let opts = ObjectOptions::default();
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -632,7 +632,7 @@ impl S3 for FS {
         }
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
@@ -662,7 +662,7 @@ impl S3 for FS {
         } = req.input;
 
         let layer = new_object_layer_fn();
-        let lock = layer.lock().await;
+        let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),

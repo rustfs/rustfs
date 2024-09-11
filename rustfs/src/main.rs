@@ -4,7 +4,11 @@ mod service;
 mod storage;
 
 use clap::Parser;
-use ecstore::{endpoints::EndpointServerPools, error::Result, store::ECStore};
+use ecstore::{
+    endpoints::EndpointServerPools,
+    error::Result,
+    store::{init_local_disks, update_erasure_type, ECStore},
+};
 use grpc::make_server;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -72,7 +76,13 @@ async fn run(opt: config::Opt) -> Result<()> {
     // };
 
     // 用于rpc
-    let (endpoint_pools, _) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())?;
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())?;
+
+    update_erasure_type(setup_type).await;
+
+    // 初始化本地磁盘
+    init_local_disks(endpoint_pools.clone()).await?;
+
     // Setup S3 service
     // 本项目使用s3s库来实现s3服务
     let service = {
@@ -108,7 +118,8 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         b.build()
     };
-    let rpc_service = make_server(endpoint_pools.clone());
+
+    let rpc_service = make_server();
 
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
