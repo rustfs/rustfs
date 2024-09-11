@@ -50,9 +50,13 @@ pub async fn do_init_format_file(
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
 ) -> Result<FormatV3, Error> {
+    warn!("do_init_format_file  id: {:?}, first_disk: {}", deployment_id, first_disk);
+
     let (formats, errs) = read_format_file_all(disks, false).await;
 
     DiskError::check_disk_fatal_errs(&errs)?;
+
+    warn!("read_format_file_all errs {:?}", &errs);
 
     check_format_erasure_values(&formats, set_drive_count)?;
 
