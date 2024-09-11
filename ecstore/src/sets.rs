@@ -12,6 +12,7 @@ use crate::{
     endpoints::PoolEndpoints,
     error::{Error, Result},
     set_disk::SetDisks,
+    store::{GLOBAL_IsDistErasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsV2Info,
         MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
@@ -35,7 +36,7 @@ pub struct Sets {
 }
 
 impl Sets {
-    pub fn new(
+    pub async fn new(
         disks: Vec<Option<DiskStore>>,
         endpoints: &PoolEndpoints,
         fm: &FormatV3,
@@ -51,11 +52,32 @@ impl Sets {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
-                if disks[idx].is_none() {
+                let mut disk = disks[idx].clone();
+                if disk.is_none() {
                     set_drive.push(None);
-                } else {
-                    let disk = disks[idx].clone();
+                    continue;
+                }
+
+                if disk.as_ref().unwrap().is_local() && *GLOBAL_IsDistErasure.read().await {
+                    let local_disk = {
+                        let local_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.read().await;
+                        local_set_drives[pool_idx][i][j].clone()
+                    };
+
+                    if local_disk.is_none() {
+                        set_drive.push(None);
+                        continue;
+                    }
+
+                    let _ = disk.as_ref().unwrap().close().await;
+
+                    disk = local_disk;
+                }
+
+                if let Some(_disk_id) = disk.as_ref().unwrap().get_disk_id().await {
                     set_drive.push(disk);
+                } else {
+                    set_drive.push(None);
                 }
             }
 

@@ -8,8 +8,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tracing::warn;
 
+use crate::store::all_local_disk;
 use crate::{
-    disk::{self, error::DiskError, DiskStore, VolumeInfo},
+    disk::{self, error::DiskError, VolumeInfo},
     endpoints::{EndpointServerPools, Node},
     error::{Error, Result},
     store_api::{BucketInfo, BucketOptions, MakeBucketOptions},
@@ -33,21 +34,20 @@ pub struct S3PeerSys {
 }
 
 impl S3PeerSys {
-    pub fn new(eps: &EndpointServerPools, local_disks: Vec<DiskStore>) -> Self {
+    pub fn new(eps: &EndpointServerPools) -> Self {
         Self {
-            clients: Self::new_clients(eps, local_disks),
+            clients: Self::new_clients(eps),
             pools_count: eps.as_ref().len(),
         }
     }
 
-    fn new_clients(eps: &EndpointServerPools, local_disks: Vec<DiskStore>) -> Vec<Client> {
+    fn new_clients(eps: &EndpointServerPools) -> Vec<Client> {
         let nodes = eps.get_nodes();
         let v: Vec<Client> = nodes
             .iter()
             .map(|e| {
                 if e.is_local {
-                    let cli: Box<dyn PeerS3Client> =
-                        Box::new(LocalPeerS3Client::new(local_disks.clone(), Some(e.clone()), Some(e.pools.clone())));
+                    let cli: Box<dyn PeerS3Client> = Box::new(LocalPeerS3Client::new(Some(e.clone()), Some(e.pools.clone())));
                     Arc::new(cli)
                 } else {
                     let cli: Box<dyn PeerS3Client> = Box::new(RemotePeerS3Client::new(Some(e.clone()), Some(e.pools.clone())));
@@ -216,15 +216,15 @@ impl S3PeerSys {
 
 #[derive(Debug)]
 pub struct LocalPeerS3Client {
-    pub local_disks: Vec<DiskStore>,
+    // pub local_disks: Vec<DiskStore>,
     // pub node: Node,
     pub pools: Option<Vec<usize>>,
 }
 
 impl LocalPeerS3Client {
-    pub fn new(local_disks: Vec<DiskStore>, _node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
+    pub fn new(_node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         Self {
-            local_disks,
+            // local_disks,
             // node,
             pools,
         }
@@ -237,8 +237,10 @@ impl PeerS3Client for LocalPeerS3Client {
         self.pools.clone()
     }
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        let mut futures = Vec::with_capacity(self.local_disks.len());
-        for disk in self.local_disks.iter() {
+        let local_disks = all_local_disk().await;
+
+        let mut futures = Vec::with_capacity(local_disks.len());
+        for disk in local_disks.iter() {
             futures.push(disk.list_volumes());
         }
 
@@ -283,8 +285,9 @@ impl PeerS3Client for LocalPeerS3Client {
         Ok(buckets)
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        let mut futures = Vec::with_capacity(self.local_disks.len());
-        for disk in self.local_disks.iter() {
+        let local_disks = all_local_disk().await;
+        let mut futures = Vec::with_capacity(local_disks.len());
+        for disk in local_disks.iter() {
             futures.push(async move {
                 match disk.make_volume(bucket).await {
                     Ok(_) => Ok(()),
@@ -316,15 +319,16 @@ impl PeerS3Client for LocalPeerS3Client {
     }
 
     async fn get_bucket_info(&self, bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
-        let mut futures = Vec::with_capacity(self.local_disks.len());
-        for disk in self.local_disks.iter() {
+        let local_disks = all_local_disk().await;
+        let mut futures = Vec::with_capacity(local_disks.len());
+        for disk in local_disks.iter() {
             futures.push(disk.stat_volume(bucket));
         }
 
         let results = join_all(futures).await;
 
-        let mut ress = Vec::with_capacity(self.local_disks.len());
-        let mut errs = Vec::with_capacity(self.local_disks.len());
+        let mut ress = Vec::with_capacity(local_disks.len());
+        let mut errs = Vec::with_capacity(local_disks.len());
 
         for res in results {
             match res {
@@ -354,9 +358,10 @@ impl PeerS3Client for LocalPeerS3Client {
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<()> {
-        let mut futures = Vec::with_capacity(self.local_disks.len());
+        let local_disks = all_local_disk().await;
+        let mut futures = Vec::with_capacity(local_disks.len());
 
-        for disk in self.local_disks.iter() {
+        for disk in local_disks.iter() {
             futures.push(disk.delete_volume(bucket));
         }
 

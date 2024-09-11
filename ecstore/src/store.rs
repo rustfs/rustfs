@@ -1,7 +1,9 @@
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::{error::DiskError, DeleteOptions, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-    endpoints::EndpointServerPools,
+    disk::{
+        error::DiskError, new_disk, DeleteOptions, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
+    },
+    endpoints::{EndpointServerPools, SetupType},
     error::{Error, Result},
     peer::S3PeerSys,
     sets::Sets,
@@ -20,24 +22,124 @@ use std::{
     sync::Arc,
 };
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::{fs, sync::RwLock};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use lazy_static::lazy_static;
 
 lazy_static! {
-    pub static ref GLOBAL_OBJECT_API: Arc<Mutex<Option<ECStore>>> = Arc::new(Mutex::new(None));
-    pub static ref GLOBAL_LOCAL_DISK: Arc<Mutex<Vec<Option<DiskStore>>>> = Arc::new(Mutex::new(Vec::new()));
+    pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
 }
 
-pub fn new_object_layer_fn() -> Arc<Mutex<Option<ECStore>>> {
-    // 这里不需要显式地锁定和解锁，因为 Arc 提供了必要的线程安全性
+pub async fn update_erasure_type(setup_type: SetupType) {
+    let mut is_erasure = GLOBAL_IsErasure.write().await;
+    *is_erasure = setup_type == SetupType::Erasure;
+
+    let mut is_dist_erasure = GLOBAL_IsDistErasure.write().await;
+    *is_dist_erasure = setup_type == SetupType::DistErasure;
+
+    if *is_dist_erasure {
+        *is_erasure = true
+    }
+
+    let mut is_erasure_sd = GLOBAL_IsErasureSD.write().await;
+    *is_erasure_sd = setup_type == SetupType::ErasureSD;
+}
+
+lazy_static! {
+    pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
+    pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<Vec<Vec<Vec<Option<DiskStore>>>>>> =
+        Arc::new(RwLock::new(Vec::new()));
+}
+
+pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
+    let disk_path = match fs::canonicalize(disk_path).await {
+        Ok(disk_path) => disk_path,
+        Err(_) => return None,
+    };
+
+    let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
+
+    let path = disk_path.to_string_lossy().to_string();
+    if disk_map.contains_key(&path) {
+        let a = disk_map[&path].as_ref().cloned();
+
+        return a;
+    }
+    None
+}
+
+pub async fn all_local_disk_path() -> Vec<String> {
+    let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
+    disk_map.keys().map(|v| v.clone()).collect()
+}
+
+pub async fn all_local_disk() -> Vec<DiskStore> {
+    let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
+    disk_map
+        .values()
+        .filter(|v| v.is_some())
+        .map(|v| v.as_ref().unwrap().clone())
+        .collect()
+}
+
+// init_local_disks 初始化本地磁盘，server启动前必须初始化成功
+pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
+    let opt = &DiskOption {
+        cleanup: true,
+        health_check: true,
+    };
+
+    let mut global_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.write().await;
+    for pool_eps in endpoint_pools.as_ref().iter() {
+        let mut set_count_drives = Vec::with_capacity(pool_eps.set_count);
+        for _ in 0..pool_eps.set_count {
+            set_count_drives.push(vec![None; pool_eps.drives_per_set]);
+        }
+
+        global_set_drives.push(set_count_drives);
+    }
+
+    let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
+
+    for pool_eps in endpoint_pools.as_ref().iter() {
+        let mut set_drives = HashMap::new();
+        for ep in pool_eps.endpoints.as_ref().iter() {
+            if !ep.is_local {
+                continue;
+            }
+
+            let disk = new_disk(ep, opt).await?;
+
+            let path = disk.path().to_string_lossy().to_string();
+
+            global_local_disk_map.insert(path, Some(disk.clone()));
+
+            set_drives.insert(ep.disk_idx, Some(disk.clone()));
+
+            if ep.pool_idx.is_some() && ep.set_idx.is_some() && ep.disk_idx.is_some() {
+                global_set_drives[ep.pool_idx.unwrap()][ep.set_idx.unwrap()][ep.disk_idx.unwrap()] = Some(disk.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+lazy_static! {
+    pub static ref GLOBAL_OBJECT_API: Arc<RwLock<Option<ECStore>>> = Arc::new(RwLock::new(None));
+    pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
+}
+
+pub fn new_object_layer_fn() -> Arc<RwLock<Option<ECStore>>> {
     GLOBAL_OBJECT_API.clone()
 }
 
 async fn set_object_layer(o: ECStore) {
-    let mut global_object_api = GLOBAL_OBJECT_API.lock().await;
+    let mut global_object_api = GLOBAL_OBJECT_API.write().await;
     *global_object_api = Some(o);
 }
 
@@ -48,7 +150,7 @@ pub struct ECStore {
     pub disk_map: HashMap<usize, Vec<Option<DiskStore>>>,
     pub pools: Vec<Sets>,
     pub peer_sys: S3PeerSys,
-    pub local_disks: Vec<DiskStore>,
+    // pub local_disks: Vec<DiskStore>,
 }
 
 impl ECStore {
@@ -108,20 +210,28 @@ impl ECStore {
                 }
             }
 
-            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, partiy_count)?;
+            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, partiy_count).await?;
 
             pools.push(sets);
 
             disk_map.insert(i, disks);
         }
 
-        let peer_sys = S3PeerSys::new(&endpoint_pools, local_disks.clone());
+        // 替换本地磁盘
+        if !*GLOBAL_IsDistErasure.read().await {
+            let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
+            for disk in local_disks {
+                let path = disk.path().to_string_lossy().to_string();
+                global_local_disk_map.insert(path, Some(disk.clone()));
+            }
+        }
+
+        let peer_sys = S3PeerSys::new(&endpoint_pools);
 
         let ec = ECStore {
             id: deployment_id.unwrap(),
             disk_map,
             pools,
-            local_disks,
             peer_sys,
         };
 

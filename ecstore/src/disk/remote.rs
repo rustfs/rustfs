@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::RwLock, time::Duration};
 
 use bytes::Bytes;
+use futures::lock::Mutex;
 use protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
@@ -32,6 +33,7 @@ use super::{
 
 #[derive(Debug)]
 pub struct RemoteDisk {
+    id: Mutex<Option<Uuid>>,
     channel: RwLock<Option<Channel>>,
     url: url::Url,
     pub root: PathBuf,
@@ -45,6 +47,7 @@ impl RemoteDisk {
             channel: RwLock::new(None),
             url: ep.url.clone(),
             root,
+            id: Mutex::new(None),
         })
     }
 
@@ -83,13 +86,21 @@ impl DiskAPI for RemoteDisk {
     fn is_local(&self) -> bool {
         false
     }
-
-    fn id(&self) -> Uuid {
-        Uuid::nil()
+    async fn close(&self) -> Result<()> {
+        Ok(())
     }
-
     fn path(&self) -> PathBuf {
         self.root.clone()
+    }
+
+    async fn get_disk_id(&self) -> Option<Uuid> {
+        self.id.lock().await.clone()
+    }
+    async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
+        let mut lock = self.id.lock().await;
+        *lock = id;
+
+        Ok(())
     }
 
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {

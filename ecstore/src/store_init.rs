@@ -1,7 +1,9 @@
 use crate::{
-    disk::error::DiskError,
-    disk::format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
-    disk::{new_disk, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET},
+    disk::{
+        error::DiskError,
+        format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
+        new_disk, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
+    },
     endpoints::Endpoints,
     error::{Error, Result},
 };
@@ -10,6 +12,7 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Debug,
 };
+
 use tracing::warn;
 use uuid::Uuid;
 
@@ -188,17 +191,22 @@ pub fn default_partiy_count(drive: usize) -> usize {
 async fn read_format_file_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
     let mut futures = Vec::with_capacity(disks.len());
 
-    for ep in disks.iter() {
-        futures.push(read_format_file(ep, heal));
+    for disk in disks.iter() {
+        futures.push(read_format_file(disk, heal));
     }
 
     let mut datas = Vec::with_capacity(disks.len());
     let mut errors = Vec::with_capacity(disks.len());
 
     let results = join_all(futures).await;
+    let mut i = 0;
     for result in results {
         match result {
             Ok(s) => {
+                if !heal {
+                    let _ = disks[i].as_ref().unwrap().set_disk_id(Some(s.erasure.this.clone())).await;
+                }
+
                 datas.push(Some(s));
                 errors.push(None);
             }
@@ -207,6 +215,8 @@ async fn read_format_file_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<O
                 errors.push(Some(e));
             }
         }
+
+        i += 1;
     }
 
     (datas, errors)
@@ -238,8 +248,8 @@ async fn read_format_file(disk: &Option<DiskStore>, _heal: bool) -> Result<Forma
 async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<FormatV3>]) -> Vec<Option<Error>> {
     let mut futures = Vec::with_capacity(disks.len());
 
-    for (i, ep) in disks.iter().enumerate() {
-        futures.push(save_format_file(ep, &formats[i]));
+    for (i, disk) in disks.iter().enumerate() {
+        futures.push(save_format_file(disk, &formats[i]));
     }
 
     let mut errors = Vec::with_capacity(disks.len());
@@ -277,9 +287,7 @@ async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -
     disk.rename_file(RUSTFS_META_BUCKET, tmpfile.as_str(), RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
         .await?;
 
-    // let mut disk = disk;
-
-    // disk.set_disk_id(format.erasure.this);
+    disk.set_disk_id(Some(format.erasure.this)).await?;
 
     Ok(())
 }
