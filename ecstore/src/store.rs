@@ -192,6 +192,8 @@ impl ECStore {
             )
             .await?;
 
+            // TODO: 失败 重试 等试 3次
+
             if deployment_id.is_none() {
                 deployment_id = Some(fm.id);
             }
