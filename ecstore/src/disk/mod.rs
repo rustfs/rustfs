@@ -28,7 +28,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 use tonic::{transport::Channel, Request};
-use tower::timeout::Timeout;
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Box<dyn DiskAPI>>;
@@ -96,7 +95,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FileInfoVersions {
     // Name of the volume.
     pub volume: String,
@@ -350,17 +349,11 @@ pub struct RemoteFileWriter {
     pub volume: String,
     pub path: String,
     pub is_append: bool,
-    client: NodeServiceClient<Timeout<Channel>>,
+    client: NodeServiceClient<Channel>,
 }
 
 impl RemoteFileWriter {
-    pub fn new(
-        root: PathBuf,
-        volume: String,
-        path: String,
-        is_append: bool,
-        client: NodeServiceClient<Timeout<Channel>>,
-    ) -> Self {
+    pub fn new(root: PathBuf, volume: String, path: String, is_append: bool, client: NodeServiceClient<Channel>) -> Self {
         Self {
             root,
             volume,
@@ -433,11 +426,11 @@ pub struct RemoteFileReader {
     pub root: PathBuf,
     pub volume: String,
     pub path: String,
-    client: NodeServiceClient<Timeout<Channel>>,
+    client: NodeServiceClient<Channel>,
 }
 
 impl RemoteFileReader {
-    pub fn new(root: PathBuf, volume: String, path: String, client: NodeServiceClient<Timeout<Channel>>) -> Self {
+    pub fn new(root: PathBuf, volume: String, path: String, client: NodeServiceClient<Channel>) -> Self {
         Self {
             root,
             volume,

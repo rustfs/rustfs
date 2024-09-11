@@ -11,6 +11,7 @@ version = "0.0.1"
 
 [workspace.dependencies]
 async-trait = "0.1.80"
+backon = "1.2.0"
 bytes = "1.6.0"
 clap = { version = "4.5.7", features = ["derive"] }
 ecstore = { path = "./ecstore" }

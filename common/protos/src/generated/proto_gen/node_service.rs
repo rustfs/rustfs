@@ -419,6 +419,28 @@ pub struct ReadXlResponse {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteVersionsRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub volume: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "4")]
+    pub opts: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteVersionsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, repeated, tag = "2")]
+    pub errors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadMultipleRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
@@ -1048,6 +1070,31 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "ReadXL"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn delete_versions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteVersionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteVersionsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/node_service.NodeService/DeleteVersions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "DeleteVersions"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn read_multiple(
             &mut self,
             request: impl tonic::IntoRequest<super::ReadMultipleRequest>,
@@ -1232,6 +1279,13 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ReadXlRequest>,
         ) -> std::result::Result<tonic::Response<super::ReadXlResponse>, tonic::Status>;
+        async fn delete_versions(
+            &self,
+            request: tonic::Request<super::DeleteVersionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteVersionsResponse>,
+            tonic::Status,
+        >;
         async fn read_multiple(
             &self,
             request: tonic::Request<super::ReadMultipleRequest>,
@@ -2249,6 +2303,51 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReadXLSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/DeleteVersions" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteVersionsSvc<T: NodeService>(pub Arc<T>);
+                    impl<
+                        T: NodeService,
+                    > tonic::server::UnaryService<super::DeleteVersionsRequest>
+                    for DeleteVersionsSvc<T> {
+                        type Response = super::DeleteVersionsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteVersionsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeService>::delete_versions(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteVersionsSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

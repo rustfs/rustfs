@@ -9,7 +9,7 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { workspace = true, features = ["io-util"] }
+backon.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 futures.workspace = true
@@ -38,6 +38,7 @@ base64-simd = "0.8.0"
 sha2 = "0.10.8"
 hex-simd = "0.8.0"
 path-clean = "1.0.1"
+tokio = { workspace = true, features = ["io-util"] }
 tokio-stream = "0.1.15"
 tonic.workspace = true
 tower.workspace = true

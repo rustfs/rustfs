@@ -258,6 +258,19 @@ message ReadXLResponse {
   optional string error_info = 3;
 }
 
+message DeleteVersionsRequest {
+  string disk = 1;
+  string volume = 2;
+  repeated string versions = 3;
+  string opts = 4;
+}
+
+message DeleteVersionsResponse {
+  bool success = 1;
+  repeated string errors = 2;
+  optional string error_info = 3;
+}
+
 message ReadMultipleRequest {
   string disk = 1;
   string read_multiple_req = 2;
@@ -308,6 +321,7 @@ service NodeService {
   rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {};
   rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {};
   rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {};
+  rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {};
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
 }
