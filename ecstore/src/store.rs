@@ -183,7 +183,7 @@ impl ECStore {
 
             DiskError::check_disk_fatal_errs(&errs)?;
 
-            let fm = store_init::do_init_format_file(
+            let fm = store_init::connect_load_init_formats(
                 first_is_local,
                 &disks,
                 pool_eps.set_count,
