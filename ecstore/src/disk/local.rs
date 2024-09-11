@@ -26,9 +26,9 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct FormatInfo {
     pub id: Option<Uuid>,
-    pub _data: Vec<u8>,
-    pub _file_info: Option<Metadata>,
-    pub _last_check: Option<OffsetDateTime>,
+    pub data: Vec<u8>,
+    pub file_info: Option<Metadata>,
+    pub last_check: Option<OffsetDateTime>,
 }
 
 impl FormatInfo {}
