@@ -133,7 +133,7 @@ fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3
 
     warn!("get_format_erasure_in_quorum fi: {:?}", &formats);
 
-    if *max_drives == 0 || *max_count < formats.len() / 2 {
+    if *max_drives == 0 || *max_count <= formats.len() / 2 {
         warn!(
             "*max_drives == 0 || *max_count < formats.len() / 2, {} || {}<{}",
             max_drives,

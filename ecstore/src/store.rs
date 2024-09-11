@@ -14,16 +14,18 @@ use crate::{
     },
     store_init, utils,
 };
+use backon::{ExponentialBuilder, Retryable};
 use futures::future::join_all;
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 use time::OffsetDateTime;
 use tokio::{fs, sync::RwLock};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use lazy_static::lazy_static;
@@ -168,6 +170,8 @@ impl ECStore {
 
         let mut local_disks = Vec::new();
 
+        info!("endpoint_pools: {:?}", endpoint_pools);
+
         for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
             // TODO: read from config parseStorageClass
             let partiy_count = store_init::default_partiy_count(pool_eps.drives_per_set);
@@ -183,16 +187,22 @@ impl ECStore {
 
             DiskError::check_disk_fatal_errs(&errs)?;
 
-            let fm = store_init::connect_load_init_formats(
-                first_is_local,
-                &disks,
-                pool_eps.set_count,
-                pool_eps.drives_per_set,
-                deployment_id,
-            )
+            let fm = (|| async {
+                store_init::connect_load_init_formats(
+                    first_is_local,
+                    &disks,
+                    pool_eps.set_count,
+                    pool_eps.drives_per_set,
+                    deployment_id,
+                )
+                .await
+            })
+            .retry(ExponentialBuilder::default().with_max_times(usize::MAX))
+            .sleep(tokio::time::sleep)
+            .notify(|err, dur: Duration| {
+                info!("retrying get formats {:?} after {:?}", err, dur);
+            })
             .await?;
-
-            // TODO: 失败 重试 等试 3次
 
             if deployment_id.is_none() {
                 deployment_id = Some(fm.id);

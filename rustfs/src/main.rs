@@ -167,6 +167,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     warn!(" init store");
     // init store
     ECStore::new(opt.address.clone(), endpoint_pools.clone()).await?;
+    warn!(" init store success!");
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

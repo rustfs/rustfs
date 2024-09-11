@@ -1,5 +1,5 @@
 use ecstore::{
-    disk::{DeleteOptions, DiskStore, ReadMultipleReq, ReadOptions, WalkDirOptions},
+    disk::{DeleteOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, WalkDirOptions},
     erasure::{ReadAt, Write},
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
@@ -12,14 +12,14 @@ use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
         node_service_server::{NodeService as Node, NodeServiceServer as NodeServer},
-        DeleteBucketRequest, DeleteBucketResponse, DeleteRequest, DeleteResponse, DeleteVolumeRequest, DeleteVolumeResponse,
-        GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse,
-        ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse,
-        MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest,
-        ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest,
-        ReadXlResponse, RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, StatVolumeRequest,
-        StatVolumeResponse, WalkDirRequest, WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest,
-        WriteMetadataResponse, WriteRequest, WriteResponse,
+        DeleteBucketRequest, DeleteBucketResponse, DeleteRequest, DeleteResponse, DeleteVersionsRequest, DeleteVersionsResponse,
+        DeleteVolumeRequest, DeleteVolumeResponse, GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest,
+        ListBucketResponse, ListDirRequest, ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest,
+        MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, PingRequest,
+        PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse,
+        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse,
+        RenameFileRequst, RenameFileResponse, StatVolumeRequest, StatVolumeResponse, WalkDirRequest, WalkDirResponse,
+        WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse,
     },
 };
 
@@ -201,6 +201,8 @@ impl Node for NodeService {
     }
 
     async fn read_all(&self, request: Request<ReadAllRequest>) -> Result<Response<ReadAllResponse>, Status> {
+        debug!("read all");
+
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.read_all(&request.volume, &request.path).await {
@@ -688,6 +690,63 @@ impl Node for NodeService {
             Ok(tonic::Response::new(ReadXlResponse {
                 success: false,
                 raw_file_info: String::new(),
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
+    async fn delete_versions(&self, request: Request<DeleteVersionsRequest>) -> Result<Response<DeleteVersionsResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let mut versions = Vec::with_capacity(request.versions.len());
+            for version in request.versions.iter() {
+                match serde_json::from_str::<FileInfoVersions>(&version) {
+                    Ok(version) => versions.push(version),
+                    Err(_) => {
+                        return Ok(tonic::Response::new(DeleteVersionsResponse {
+                            success: false,
+                            errors: Vec::new(),
+                            error_info: Some("can not decode FileInfoVersions".to_string()),
+                        }));
+                    }
+                };
+            }
+            let opts = match serde_json::from_str::<DeleteOptions>(&request.opts) {
+                Ok(opts) => opts,
+                Err(_) => {
+                    return Ok(tonic::Response::new(DeleteVersionsResponse {
+                        success: false,
+                        errors: Vec::new(),
+                        error_info: Some("can not decode DeleteOptions".to_string()),
+                    }));
+                }
+            };
+            match disk.delete_versions(&request.volume, versions, opts).await {
+                Ok(errors) => {
+                    let errors = errors
+                        .into_iter()
+                        .map(|error| match error {
+                            Some(e) => e.to_string(),
+                            None => "".to_string(),
+                        })
+                        .collect();
+
+                    Ok(tonic::Response::new(DeleteVersionsResponse {
+                        success: true,
+                        errors,
+                        error_info: None,
+                    }))
+                }
+                Err(err) => Ok(tonic::Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(DeleteVersionsResponse {
+                success: false,
+                errors: Vec::new(),
                 error_info: Some("can not find disk".to_string()),
             }))
         }

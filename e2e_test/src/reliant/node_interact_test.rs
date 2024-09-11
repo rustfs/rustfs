@@ -4,13 +4,14 @@ use ecstore::disk::VolumeInfo;
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
-        node_service_client::NodeServiceClient, ListVolumesRequest, MakeVolumeRequest, PingRequest, PingResponse,
+        node_service_client::NodeServiceClient, ListVolumesRequest, MakeVolumeRequest, PingRequest, PingResponse, ReadAllRequest,
     },
 };
 use std::error::Error;
 use tonic::Request;
 
 async fn get_client() -> Result<NodeServiceClient<tonic::transport::Channel>, Box<dyn Error>> {
+    // Ok(NodeServiceClient::connect("http://220.181.1.138:9000").await?)
     Ok(NodeServiceClient::connect("http://localhost:9000").await?)
 }
 
@@ -30,7 +31,7 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     assert!(decoded_payload.is_ok());
 
     // 创建客户端
-    let mut client = NodeServiceClient::connect("http://localhost:9000").await?;
+    let mut client = get_client().await?;
 
     // 构造 PingRequest
     let request = Request::new(PingRequest {
@@ -83,6 +84,23 @@ async fn list_volumes() -> Result<(), Box<dyn Error>> {
         .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
         .collect();
 
+    println!("{:?}", volume_infos);
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_all() -> Result<(), Box<dyn Error>> {
+    let mut client = get_client().await?;
+    let request = Request::new(ReadAllRequest {
+        disk: "data".to_string(),
+        volume: "ff".to_string(),
+        path: "format.json".to_string(),
+    });
+
+    let response = client.read_all(request).await?.into_inner();
+    let volume_infos = response.data;
+
+    println!("{}", response.success);
     println!("{:?}", volume_infos);
     Ok(())
 }
