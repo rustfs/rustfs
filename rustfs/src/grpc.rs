@@ -452,44 +452,95 @@ impl Node for NodeService {
         Ok(tonic::Response::new(Box::pin(out_stream)))
     }
 
-    async fn read_at(&self, request: Request<ReadAtRequest>) -> Result<Response<ReadAtResponse>, Status> {
-        let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk.read_file(&request.volume, &request.path).await {
-                Ok(mut file_reader) => {
-                    match file_reader
-                        .read_at(request.offset.try_into().unwrap(), request.length.try_into().unwrap())
+    type ReadAtStream = ResponseStream<ReadAtResponse>;
+    async fn read_at(&self, request: Request<Streaming<ReadAtRequest>>) -> Result<Response<Self::ReadAtStream>, Status> {
+        info!("read_at");
+
+        let mut in_stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(128);
+
+        tokio::spawn(async move {
+            let mut file_ref = None;
+            while let Some(result) = in_stream.next().await {
+                match result {
+                    Ok(v) => {
+                        match file_ref.as_ref() {
+                            Some(_) => (),
+                            None => {
+                                if let Some(disk) = find_local_disk(&v.disk).await {
+                                    match disk.read_file(&v.volume, &v.path).await {
+                                        Ok(file_reader) => file_ref = Some(file_reader),
+                                        Err(err) => {
+                                            tx.send(Ok(ReadAtResponse {
+                                                success: false,
+                                                data: Vec::new(),
+                                                error_info: Some(err.to_string()),
+                                                read_size: -1,
+                                            }))
+                                            .await
+                                            .expect("working rx");
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    tx.send(Ok(ReadAtResponse {
+                                        success: false,
+                                        data: Vec::new(),
+                                        error_info: Some("can not find disk".to_string()),
+                                        read_size: -1,
+                                    }))
+                                    .await
+                                    .expect("working rx");
+                                    break;
+                                }
+                            }
+                        };
+
+                        match file_ref
+                            .as_mut()
+                            .unwrap()
+                            .read_at(v.offset.try_into().unwrap(), v.length.try_into().unwrap())
+                            .await
+                        {
+                            Ok((data, read_size)) => tx.send(Ok(ReadAtResponse {
+                                success: true,
+                                data,
+                                read_size: read_size.try_into().unwrap(),
+                                error_info: None,
+                            })),
+                            Err(err) => tx.send(Ok(ReadAtResponse {
+                                success: false,
+                                data: Vec::new(),
+                                error_info: Some(err.to_string()),
+                                read_size: -1,
+                            })),
+                        }
                         .await
-                    {
-                        Ok((data, read_size)) => Ok(tonic::Response::new(ReadAtResponse {
-                            success: true,
-                            data,
-                            read_size: read_size.try_into().unwrap(),
-                            error_info: None,
-                        })),
-                        Err(err) => Ok(tonic::Response::new(ReadAtResponse {
-                            success: false,
-                            data: Vec::new(),
-                            read_size: -1,
-                            error_info: Some(err.to_string()),
-                        })),
+                        .unwrap();
+                    }
+                    Err(err) => {
+                        if let Some(io_err) = match_for_io_error(&err) {
+                            if io_err.kind() == ErrorKind::BrokenPipe {
+                                // here you can handle special case when client
+                                // disconnected in unexpected way
+                                eprintln!("\tclient disconnected: broken pipe");
+                                break;
+                            }
+                        }
+
+                        match tx.send(Err(err)).await {
+                            Ok(_) => (),
+                            Err(_err) => break, // response was dropped
+                        }
                     }
                 }
-                Err(err) => Ok(tonic::Response::new(ReadAtResponse {
-                    success: false,
-                    data: Vec::new(),
-                    read_size: -1,
-                    error_info: Some(err.to_string()),
-                })),
             }
-        } else {
-            Ok(tonic::Response::new(ReadAtResponse {
-                success: false,
-                data: Vec::new(),
-                read_size: -1,
-                error_info: Some("can not find disk".to_string()),
-            }))
-        }
+            println!("\tstream ended");
+        });
+
+        let out_stream = ReceiverStream::new(rx);
+
+        Ok(tonic::Response::new(Box::pin(out_stream)))
     }
 
     async fn list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {

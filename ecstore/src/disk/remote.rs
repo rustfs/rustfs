@@ -196,34 +196,31 @@ impl DiskAPI for RemoteDisk {
 
     async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
         info!("create_file");
-        Ok(FileWriter::Remote(RemoteFileWriter::new(
-            self.root.clone(),
-            volume.to_string(),
-            path.to_string(),
-            false,
-            self.get_client_v2().await?,
-        )?))
+        Ok(FileWriter::Remote(
+            RemoteFileWriter::new(
+                self.root.clone(),
+                volume.to_string(),
+                path.to_string(),
+                false,
+                self.get_client_v2().await?,
+            )
+            .await?,
+        ))
     }
 
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         info!("append_file");
-        Ok(FileWriter::Remote(RemoteFileWriter::new(
-            self.root.clone(),
-            volume.to_string(),
-            path.to_string(),
-            true,
-            self.get_client_v2().await?,
-        )?))
+        Ok(FileWriter::Remote(
+            RemoteFileWriter::new(self.root.clone(), volume.to_string(), path.to_string(), true, self.get_client_v2().await?)
+                .await?,
+        ))
     }
 
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         info!("read_file");
-        Ok(FileReader::Remote(RemoteFileReader::new(
-            self.root.clone(),
-            volume.to_string(),
-            path.to_string(),
-            self.get_client_v2().await?,
-        )))
+        Ok(FileReader::Remote(
+            RemoteFileReader::new(self.root.clone(), volume.to_string(), path.to_string(), self.get_client_v2().await?).await?,
+        ))
     }
 
     async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {

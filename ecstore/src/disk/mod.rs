@@ -20,7 +20,9 @@ use crate::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
-use protos::proto_gen::node_service::{node_service_client::NodeServiceClient, ReadAtRequest, WriteRequest};
+use protos::proto_gen::node_service::{
+    node_service_client::NodeServiceClient, ReadAtRequest, ReadAtResponse, WriteRequest, WriteResponse,
+};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
@@ -30,7 +32,7 @@ use tokio::{
     sync::mpsc::{self, Sender},
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{transport::Channel, Request};
+use tonic::{transport::Channel, Streaming};
 use tracing::info;
 use uuid::Uuid;
 
@@ -354,10 +356,11 @@ pub struct RemoteFileWriter {
     pub path: String,
     pub is_append: bool,
     tx: Sender<WriteRequest>,
+    resp_stream: Streaming<WriteResponse>,
 }
 
 impl RemoteFileWriter {
-    pub fn new(
+    pub async fn new(
         root: PathBuf,
         volume: String,
         path: String,
@@ -367,26 +370,9 @@ impl RemoteFileWriter {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 
-        tokio::spawn(async move {
-            let response = client.write_stream(in_stream).await.unwrap();
+        let response = client.write_stream(in_stream).await.unwrap();
 
-            let mut resp_stream = response.into_inner();
-
-            while let Some(resp) = resp_stream.next().await {
-                match resp {
-                    Ok(resp) => {
-                        if resp.success {
-                            info!("write stream success");
-                        } else {
-                            info!("write stream failed: {}", resp.error_info.unwrap_or("".to_string()));
-                        }
-                    }
-                    Err(_err) => {
-                        break;
-                    }
-                }
-            }
-        });
+        let resp_stream = response.into_inner();
 
         Ok(Self {
             root,
@@ -394,6 +380,7 @@ impl RemoteFileWriter {
             path,
             is_append,
             tx,
+            resp_stream,
         })
     }
 }
@@ -408,7 +395,35 @@ impl Write for RemoteFileWriter {
             is_append: self.is_append,
             data: buf.to_vec(),
         };
-        let _response = self.tx.send(request).await?;
+        self.tx.send(request).await?;
+
+        if let Some(resp) = self.resp_stream.next().await {
+            // match resp {
+            //     Ok(resp) => {
+            //         if resp.success {
+            //             info!("write stream success");
+            //         } else {
+            //             info!("write stream failed: {}", resp.error_info.unwrap_or("".to_string()));
+            //         }
+            //     }
+            //     Err(_err) => {
+
+            //     }
+            // }
+            let resp = resp?;
+            if resp.success {
+                info!("write stream success");
+            } else {
+                let error_info = resp.error_info.unwrap_or("".to_string());
+                info!("write stream failed: {}", error_info);
+                return Err(Error::from_string(error_info));
+            }
+        } else {
+            let error_info = "can not get response";
+            info!("write stream failed: {}", error_info);
+            return Err(Error::from_string(error_info));
+        }
+
         Ok(())
     }
 }
@@ -460,32 +475,55 @@ pub struct RemoteFileReader {
     pub root: PathBuf,
     pub volume: String,
     pub path: String,
-    client: NodeServiceClient<Channel>,
+    tx: Sender<ReadAtRequest>,
+    resp_stream: Streaming<ReadAtResponse>,
 }
 
 impl RemoteFileReader {
-    pub fn new(root: PathBuf, volume: String, path: String, client: NodeServiceClient<Channel>) -> Self {
-        Self {
+    pub async fn new(root: PathBuf, volume: String, path: String, mut client: NodeServiceClient<Channel>) -> Result<Self> {
+        let (tx, rx) = mpsc::channel(128);
+        let in_stream = ReceiverStream::new(rx);
+
+        let response = client.read_at(in_stream).await.unwrap();
+
+        let resp_stream = response.into_inner();
+
+        Ok(Self {
             root,
             volume,
             path,
-            client,
-        }
+            tx,
+            resp_stream,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl ReadAt for RemoteFileReader {
     async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
-        let request = Request::new(ReadAtRequest {
+        let request = ReadAtRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: self.volume.to_string(),
             path: self.path.to_string(),
             offset: offset.try_into().unwrap(),
             length: length.try_into().unwrap(),
-        });
-        let response = self.client.read_at(request).await?.into_inner();
+        };
+        self.tx.send(request).await?;
 
-        Ok((response.data, response.read_size.try_into().unwrap()))
+        if let Some(resp) = self.resp_stream.next().await {
+            let resp = resp?;
+            if resp.success {
+                info!("read at stream success");
+                Ok((resp.data, resp.read_size.try_into().unwrap()))
+            } else {
+                let error_info = resp.error_info.unwrap_or("".to_string());
+                info!("read at stream failed: {}", error_info);
+                Err(Error::from_string(error_info))
+            }
+        } else {
+            let error_info = "can not get response";
+            info!("read at stream failed: {}", error_info);
+            Err(Error::from_string(error_info))
+        }
     }
 }

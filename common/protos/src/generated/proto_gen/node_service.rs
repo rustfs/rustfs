@@ -720,18 +720,18 @@ pub mod node_service_client {
         ///  rpc Append(AppendRequest) returns (AppendResponse) {};
         pub async fn read_at(
             &mut self,
-            request: impl tonic::IntoRequest<super::ReadAtRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadAtResponse>, tonic::Status> {
+            request: impl tonic::IntoStreamingRequest<Message = super::ReadAtRequest>,
+        ) -> std::result::Result<tonic::Response<tonic::codec::Streaming<super::ReadAtResponse>>, tonic::Status> {
             self.inner
                 .ready()
                 .await
                 .map_err(|e| tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {}", e.into())))?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ReadAt");
-            let mut req = request.into_request();
+            let mut req = request.into_streaming_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "ReadAt"));
-            self.inner.unary(req, path, codec).await
+            self.inner.streaming(req, path, codec).await
         }
         pub async fn list_dir(
             &mut self,
@@ -986,11 +986,15 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<tonic::Streaming<super::WriteRequest>>,
         ) -> std::result::Result<tonic::Response<Self::WriteStreamStream>, tonic::Status>;
+        /// Server streaming response type for the ReadAt method.
+        type ReadAtStream: tonic::codegen::tokio_stream::Stream<Item = std::result::Result<super::ReadAtResponse, tonic::Status>>
+            + Send
+            + 'static;
         ///  rpc Append(AppendRequest) returns (AppendResponse) {};
         async fn read_at(
             &self,
-            request: tonic::Request<super::ReadAtRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadAtResponse>, tonic::Status>;
+            request: tonic::Request<tonic::Streaming<super::ReadAtRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::ReadAtStream>, tonic::Status>;
         async fn list_dir(
             &self,
             request: tonic::Request<super::ListDirRequest>,
@@ -1426,10 +1430,11 @@ pub mod node_service_server {
                 "/node_service.NodeService/ReadAt" => {
                     #[allow(non_camel_case_types)]
                     struct ReadAtSvc<T: NodeService>(pub Arc<T>);
-                    impl<T: NodeService> tonic::server::UnaryService<super::ReadAtRequest> for ReadAtSvc<T> {
+                    impl<T: NodeService> tonic::server::StreamingService<super::ReadAtRequest> for ReadAtSvc<T> {
                         type Response = super::ReadAtResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
-                        fn call(&mut self, request: tonic::Request<super::ReadAtRequest>) -> Self::Future {
+                        type ResponseStream = T::ReadAtStream;
+                        type Future = BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<tonic::Streaming<super::ReadAtRequest>>) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move { <T as NodeService>::read_at(&inner, request).await };
                             Box::pin(fut)
@@ -1446,7 +1451,7 @@ pub mod node_service_server {
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
                             .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
