@@ -3,7 +3,7 @@ use super::{
     DeleteOptions, DiskAPI, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp,
     ReadOptions, RenameDataResp, VolumeInfo, WalkDirOptions,
 };
-use crate::disk::STORAGE_FORMAT_FILE;
+use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::{
     error::{Error, Result},
     file_meta::FileMeta,
@@ -19,18 +19,29 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::ErrorKind;
-use tracing::{debug, error, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
 use uuid::Uuid;
+
+#[derive(Debug)]
+pub struct FormatInfo {
+    pub id: Option<Uuid>,
+    pub _data: Vec<u8>,
+    pub _file_info: Option<Metadata>,
+    pub _last_check: Option<OffsetDateTime>,
+}
+
+impl FormatInfo {}
 
 #[derive(Debug)]
 pub struct LocalDisk {
     pub root: PathBuf,
-    pub id: Uuid,
-    pub _format_data: Vec<u8>,
-    pub _format_meta: Option<Metadata>,
     pub _format_path: PathBuf,
-    // pub format_legacy: bool, // drop
-    pub _format_last_check: Option<OffsetDateTime>,
+    pub format_info: Mutex<FormatInfo>,
+    // pub id: Mutex<Option<Uuid>>,
+    // pub format_data: Mutex<Vec<u8>>,
+    // pub format_file_info: Mutex<Option<Metadata>>,
+    // pub format_last_check: Mutex<Option<OffsetDateTime>>,
 }
 
 impl LocalDisk {
@@ -48,7 +59,7 @@ impl LocalDisk {
 
         let (format_data, format_meta) = read_file_exists(&format_path).await?;
 
-        let mut id = Uuid::nil();
+        let mut id = None;
         // let mut format_legacy = false;
         let mut format_last_check = None;
 
@@ -61,19 +72,26 @@ impl LocalDisk {
                 return Err(Error::from(DiskError::InconsistentDisk));
             }
 
-            id = fm.erasure.this;
+            id = Some(fm.erasure.this);
             // format_legacy = fm.erasure.distribution_algo == DistributionAlgoVersion::V1;
             format_last_check = Some(OffsetDateTime::now_utc());
         }
 
+        let format_info = FormatInfo {
+            id,
+            _data: format_data,
+            _file_info: format_meta,
+            _last_check: format_last_check,
+        };
+
         let disk = Self {
             root,
-            id,
-            _format_meta: format_meta,
-            _format_data: format_data,
             _format_path: format_path,
-            // format_legacy,
-            _format_last_check: format_last_check,
+            format_info: Mutex::new(format_info),
+            // // format_legacy,
+            // format_file_info: Mutex::new(format_meta),
+            // format_data: Mutex::new(format_data),
+            // format_last_check: Mutex::new(format_last_check),
         };
 
         disk.make_meta_volumes().await?;
@@ -204,7 +222,7 @@ impl LocalDisk {
         } else {
             if delete_path.is_dir() {
                 if let Err(err) = fs::remove_dir(&delete_path).await {
-                    error!("remove_dir err {:?} when {:?}", &err, &delete_path);
+                    debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         // ErrorKind::DirectoryNotEmpty => (),
@@ -218,7 +236,7 @@ impl LocalDisk {
                 }
             } else {
                 if let Err(err) = fs::remove_file(&delete_path).await {
-                    error!("remove_file err {:?} when {:?}", &err, &delete_path);
+                    debug!("remove_file err {:?} when {:?}", &err, &delete_path);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         _ => {
@@ -413,9 +431,24 @@ impl DiskAPI for LocalDisk {
     fn is_local(&self) -> bool {
         true
     }
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+    fn path(&self) -> PathBuf {
+        self.root.clone()
+    }
 
-    fn id(&self) -> Uuid {
-        self.id
+    async fn get_disk_id(&self) -> Option<Uuid> {
+        // TODO: check format file
+        let format_info = self.format_info.lock().await;
+
+        format_info.id.clone()
+        // TODO: 判断源文件id,是否有效
+    }
+
+    async fn set_disk_id(&self, _id: Option<Uuid>) -> Result<()> {
+        // 本地不需要设置
+        Ok(())
     }
 
     #[must_use]
@@ -517,7 +550,8 @@ impl DiskAPI for LocalDisk {
 
         let file = File::create(&fpath).await?;
 
-        Ok(FileWriter::new(file))
+        Ok(FileWriter::Local(LocalFileWriter::new(file)))
+        // Ok(FileWriter::new(file))
 
         // let mut writer = BufWriter::new(file);
 
@@ -543,7 +577,8 @@ impl DiskAPI for LocalDisk {
             .open(&p)
             .await?;
 
-        Ok(FileWriter::new(file))
+        Ok(FileWriter::Local(LocalFileWriter::new(file)))
+        // Ok(FileWriter::new(file))
 
         // let mut writer = BufWriter::new(file);
 
@@ -560,7 +595,7 @@ impl DiskAPI for LocalDisk {
         debug!("read_file {:?}", &p);
         let file = File::options().read(true).open(&p).await?;
 
-        Ok(FileReader::new(file))
+        Ok(FileReader::Local(LocalFileReader::new(file)))
 
         // file.seek(SeekFrom::Start(offset as u64)).await?;
 
@@ -756,9 +791,7 @@ impl DiskAPI for LocalDisk {
                 .await?;
         }
 
-        Ok(RenameDataResp {
-            old_data_dir: old_data_dir,
-        })
+        Ok(RenameDataResp { old_data_dir })
     }
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {

@@ -1,7 +1,9 @@
 use crate::{
-    disk::error::DiskError,
-    disk::format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
-    disk::{new_disk, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET},
+    disk::{
+        error::DiskError,
+        format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
+        new_disk, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
+    },
     endpoints::Endpoints,
     error::{Error, Result},
 };
@@ -10,6 +12,7 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Debug,
 };
+
 use tracing::warn;
 use uuid::Uuid;
 
@@ -40,30 +43,34 @@ pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskSt
     (res, errors)
 }
 
-pub async fn do_init_format_file(
+pub async fn connect_load_init_formats(
     first_disk: bool,
     disks: &[Option<DiskStore>],
     set_count: usize,
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
 ) -> Result<FormatV3, Error> {
-    let (formats, errs) = read_format_file_all(disks, false).await;
+    warn!("connect_load_init_formats  id: {:?}, first_disk: {}", deployment_id, first_disk);
+
+    let (formats, errs) = load_format_erasure_all(disks, false).await;
 
     DiskError::check_disk_fatal_errs(&errs)?;
+
+    warn!("load_format_erasure_all errs {:?}", &errs);
 
     check_format_erasure_values(&formats, set_drive_count)?;
 
     if first_disk && DiskError::should_init_erasure_disks(&errs) {
         //  UnformattedDisk, not format file create
         // new format and save
-        let fms = init_format_files(disks, set_count, set_drive_count, deployment_id);
+        let fms = init_format_erasure(disks, set_count, set_drive_count, deployment_id);
 
         let _errs = save_format_file_all(disks, &fms).await;
 
         // TODO: check quorum
         // reduceWriteQuorumErrs(&errs)?;
 
-        let fm = get_format_file_in_quorum(&fms)?;
+        let fm = get_format_erasure_in_quorum(&fms)?;
 
         return Ok(fm);
     }
@@ -77,12 +84,12 @@ pub async fn do_init_format_file(
         return Err(Error::new(ErasureError::FirstDiskWait));
     }
 
-    let fm = get_format_file_in_quorum(&formats)?;
+    let fm = get_format_erasure_in_quorum(&formats)?;
 
     Ok(fm)
 }
 
-fn init_format_files(
+fn init_format_erasure(
     disks: &[Option<DiskStore>],
     set_count: usize,
     set_drive_count: usize,
@@ -106,7 +113,7 @@ fn init_format_files(
     fms
 }
 
-fn get_format_file_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {
+fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {
     let mut countmap = HashMap::new();
 
     for f in formats.iter() {
@@ -124,8 +131,15 @@ fn get_format_file_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {
 
     let (max_drives, max_count) = countmap.iter().max_by_key(|&(_, c)| c).unwrap_or((&0, &0));
 
-    if *max_drives == 0 || *max_count < formats.len() / 2 {
-        warn!("*max_drives == 0 || *max_count < formats.len() / 2");
+    warn!("get_format_erasure_in_quorum fi: {:?}", &formats);
+
+    if *max_drives == 0 || *max_count <= formats.len() / 2 {
+        warn!(
+            "*max_drives == 0 || *max_count < formats.len() / 2, {} || {}<{}",
+            max_drives,
+            max_count,
+            formats.len() / 2
+        );
         return Err(Error::new(ErasureError::ErasureReadQuorum));
     }
 
@@ -184,21 +198,26 @@ pub fn default_partiy_count(drive: usize) -> usize {
         _ => 4,
     }
 }
-// read_format_file_all 读取所有foramt.json
-async fn read_format_file_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
+// load_format_erasure_all 读取所有foramt.json
+async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
     let mut futures = Vec::with_capacity(disks.len());
 
-    for ep in disks.iter() {
-        futures.push(read_format_file(ep, heal));
+    for disk in disks.iter() {
+        futures.push(read_format_file(disk, heal));
     }
 
     let mut datas = Vec::with_capacity(disks.len());
     let mut errors = Vec::with_capacity(disks.len());
 
     let results = join_all(futures).await;
+    let mut i = 0;
     for result in results {
         match result {
             Ok(s) => {
+                if !heal {
+                    let _ = disks[i].as_ref().unwrap().set_disk_id(Some(s.erasure.this.clone())).await;
+                }
+
                 datas.push(Some(s));
                 errors.push(None);
             }
@@ -207,6 +226,8 @@ async fn read_format_file_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<O
                 errors.push(Some(e));
             }
         }
+
+        i += 1;
     }
 
     (datas, errors)
@@ -238,8 +259,8 @@ async fn read_format_file(disk: &Option<DiskStore>, _heal: bool) -> Result<Forma
 async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<FormatV3>]) -> Vec<Option<Error>> {
     let mut futures = Vec::with_capacity(disks.len());
 
-    for (i, ep) in disks.iter().enumerate() {
-        futures.push(save_format_file(ep, &formats[i]));
+    for (i, disk) in disks.iter().enumerate() {
+        futures.push(save_format_file(disk, &formats[i]));
     }
 
     let mut errors = Vec::with_capacity(disks.len());
@@ -277,9 +298,7 @@ async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -
     disk.rename_file(RUSTFS_META_BUCKET, tmpfile.as_str(), RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
         .await?;
 
-    // let mut disk = disk;
-
-    // disk.set_disk_id(format.erasure.this);
+    disk.set_disk_id(Some(format.erasure.this)).await?;
 
     Ok(())
 }
