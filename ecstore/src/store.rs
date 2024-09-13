@@ -7,9 +7,9 @@ use crate::{
     peer::{PeerS3Client, S3PeerSys},
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsInfo,
-        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
-        PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
+        ListObjectsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete,
+        PartInfo, PutObjReader, StorageAPI,
     },
     store_init, utils,
 };
@@ -630,8 +630,8 @@ impl StorageAPI for ECStore {
         unimplemented!()
     }
 
-    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
-        self.peer_sys.delete_bucket(bucket).await?;
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        self.peer_sys.delete_bucket(bucket, opts).await?;
 
         // 删除meta
         self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())

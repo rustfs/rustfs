@@ -31,6 +31,9 @@ pub enum DiskError {
 
     #[error("volume not found")]
     VolumeNotFound,
+
+    #[error("volume not empty")]
+    VolumeNotEmpty,
 }
 
 impl DiskError {

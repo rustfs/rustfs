@@ -972,7 +972,20 @@ impl DiskAPI for LocalDisk {
         let p = self.get_bucket_path(volume)?;
 
         // TODO: 不能用递归删除，如果目录下面有文件，返回errVolumeNotEmpty
-        fs::remove_dir_all(&p).await?;
+
+        if let Err(err) = fs::remove_dir_all(&p).await {
+            match err.kind() {
+                ErrorKind::NotFound => (),
+                // ErrorKind::DirectoryNotEmpty => (),
+                kind => {
+                    if kind.to_string() == "directory not empty" {
+                        return Err(Error::new(DiskError::VolumeNotEmpty));
+                    }
+
+                    return Err(Error::from(err));
+                }
+            }
+        }
 
         Ok(())
     }

@@ -2,6 +2,7 @@ use bytes::Bytes;
 use ecstore::disk::error::DiskError;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
+use ecstore::store_api::DeleteBucketOptions;
 use ecstore::store_api::HTTPRangeSpec;
 use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::MultipartUploadResult;
@@ -86,8 +87,12 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
-
-        try_!(self.store.delete_bucket(&input.bucket).await);
+        // TODO: DeleteBucketInput 没有force参数？
+        try_!(
+            self.store
+                .delete_bucket(&input.bucket, &DeleteBucketOptions { force: false })
+                .await
+        );
 
         Ok(S3Response::new(DeleteBucketOutput {}))
     }

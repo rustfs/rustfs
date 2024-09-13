@@ -8,7 +8,7 @@ use crate::{
     disk::{self, error::DiskError, DiskStore, VolumeInfo},
     endpoints::{EndpointServerPools, Node},
     error::{Error, Result},
-    store_api::{BucketInfo, BucketOptions, MakeBucketOptions},
+    store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
 };
 
 type Client = Arc<Box<dyn PeerS3Client>>;
@@ -17,7 +17,7 @@ type Client = Arc<Box<dyn PeerS3Client>>;
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
-    async fn delete_bucket(&self, bucket: &str) -> Result<()>;
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
     fn get_pools(&self) -> Vec<usize>;
 }
@@ -140,10 +140,10 @@ impl PeerS3Client for S3PeerSys {
 
         Ok(buckets)
     }
-    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
-            futures.push(cli.delete_bucket(bucket));
+            futures.push(cli.delete_bucket(bucket, &opts));
         }
 
         let mut errors = Vec::with_capacity(self.clients.len());
@@ -350,7 +350,7 @@ impl PeerS3Client for LocalPeerS3Client {
             .ok_or(Error::new(DiskError::VolumeNotFound))
     }
 
-    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.local_disks.len());
 
         for disk in self.local_disks.iter() {
@@ -361,14 +361,34 @@ impl PeerS3Client for LocalPeerS3Client {
 
         let mut errs = Vec::new();
 
+        let mut recreate = false;
+
         for res in results {
             match res {
                 Ok(_) => errs.push(None),
-                Err(e) => errs.push(Some(e)),
+                Err(e) => {
+                    if DiskError::VolumeNotEmpty.is(&e) {
+                        recreate = true;
+                    }
+                    errs.push(Some(e))
+                }
             }
         }
 
-        // TODO: errVolumeNotEmpty 不删除，把已经删除的重新创建
+        // errVolumeNotEmpty 不删除，把已经删除的重新创建
+
+        let mut idx = 0;
+        for err in errs {
+            if err.is_none() && recreate {
+                let _ = self.local_disks[idx].make_volume(bucket).await;
+            }
+
+            idx += 1;
+        }
+
+        if recreate {
+            return Err(Error::new(DiskError::VolumeNotEmpty));
+        }
 
         // TODO: reduceWriteQuorumErrs
 
@@ -404,7 +424,7 @@ impl PeerS3Client for RemotePeerS3Client {
         unimplemented!()
     }
 
-    async fn delete_bucket(&self, _bucket: &str) -> Result<()> {
+    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
 }
