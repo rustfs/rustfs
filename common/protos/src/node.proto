@@ -311,7 +311,7 @@ service NodeService {
   rpc Write(WriteRequest) returns (WriteResponse) {};
   rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {};
 //  rpc Append(AppendRequest) returns (AppendResponse) {};
-  rpc ReadAt(ReadAtRequest) returns (ReadAtResponse) {};
+  rpc ReadAt(stream ReadAtRequest) returns (stream ReadAtResponse) {};
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {};
   rpc WalkDir(WalkDirRequest) returns (WalkDirResponse) {};
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {};
