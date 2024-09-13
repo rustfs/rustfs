@@ -16,6 +16,7 @@ ecstore.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
+h2 = "0.4.6"
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
@@ -37,6 +38,7 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
 ] }
+tokio-stream.workspace = true
 tonic = { version = "0.12.1", features = ["gzip"] }
 tonic-reflection.workspace = true
 tower.workspace = true

@@ -202,7 +202,7 @@ impl DiskAPI for RemoteDisk {
             path.to_string(),
             false,
             self.get_client_v2().await?,
-        )))
+        )?))
     }
 
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
@@ -213,7 +213,7 @@ impl DiskAPI for RemoteDisk {
             path.to_string(),
             true,
             self.get_client_v2().await?,
-        )))
+        )?))
     }
 
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
@@ -253,11 +253,11 @@ impl DiskAPI for RemoteDisk {
         });
 
         let response = client.walk_dir(request).await?.into_inner();
-        
+
         if !response.success {
             return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
         }
-        
+
         let entries = response
             .meta_cache_entry
             .into_iter()
@@ -288,7 +288,7 @@ impl DiskAPI for RemoteDisk {
         });
 
         let response = client.rename_data(request).await?.into_inner();
-        
+
         if !response.success {
             return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
         }
@@ -363,7 +363,7 @@ impl DiskAPI for RemoteDisk {
         });
 
         let response = client.stat_volume(request).await?.into_inner();
-        
+
         if !response.success {
             return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
         }

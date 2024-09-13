@@ -1,3 +1,5 @@
+use std::{error::Error, io::ErrorKind, pin::Pin};
+
 use ecstore::{
     disk::{DeleteOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, WalkDirOptions},
     erasure::{ReadAt, Write},
@@ -5,7 +7,10 @@ use ecstore::{
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, FileInfo, MakeBucketOptions},
 };
-use tonic::{Request, Response, Status};
+use futures::{Stream, StreamExt};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
 
 use protos::{
@@ -22,6 +27,31 @@ use protos::{
         WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse,
     },
 };
+
+type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send>>;
+
+fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
+    let mut err: &(dyn Error + 'static) = err_status;
+
+    loop {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            return Some(io_err);
+        }
+
+        // h2::Error do not expose std::io::Error with `source()`
+        // https://github.com/hyperium/h2/pull/462
+        if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
+            if let Some(io_err) = h2_err.get_io() {
+                return Some(io_err);
+            }
+        }
+
+        err = match err.source() {
+            Some(err) => err,
+            None => return None,
+        };
+    }
+}
 
 #[derive(Debug)]
 struct NodeService {
@@ -332,6 +362,94 @@ impl Node for NodeService {
                 error_info: Some("can not find disk".to_string()),
             }))
         }
+    }
+
+    type WriteStreamStream = ResponseStream<WriteResponse>;
+    async fn write_stream(&self, request: Request<Streaming<WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
+        info!("write_stream");
+
+        let mut in_stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(128);
+
+        tokio::spawn(async move {
+            let mut file_ref = None;
+            while let Some(result) = in_stream.next().await {
+                match result {
+                    // Ok(v) => tx
+                    //     .send(Ok(EchoResponse { message: v.message }))
+                    //     .await
+                    //     .expect("working rx"),
+                    Ok(v) => {
+                        match file_ref.as_ref() {
+                            Some(_) => (),
+                            None => {
+                                if let Some(disk) = find_local_disk(&v.disk).await {
+                                    let file_writer = if v.is_append {
+                                        disk.append_file(&v.volume, &v.path).await
+                                    } else {
+                                        disk.create_file("", &v.volume, &v.path, 0).await
+                                    };
+
+                                    match file_writer {
+                                        Ok(file_writer) => file_ref = Some(file_writer),
+                                        Err(err) => {
+                                            tx.send(Ok(WriteResponse {
+                                                success: false,
+                                                error_info: Some(err.to_string()),
+                                            }))
+                                            .await
+                                            .expect("working rx");
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    tx.send(Ok(WriteResponse {
+                                        success: false,
+                                        error_info: Some("can not find disk".to_string()),
+                                    }))
+                                    .await
+                                    .expect("working rx");
+                                    break;
+                                }
+                            }
+                        };
+
+                        match file_ref.as_mut().unwrap().write(&v.data).await {
+                            Ok(_) => tx.send(Ok(WriteResponse {
+                                success: true,
+                                error_info: None,
+                            })),
+                            Err(err) => tx.send(Ok(WriteResponse {
+                                success: false,
+                                error_info: Some(err.to_string()),
+                            })),
+                        }
+                        .await
+                        .unwrap();
+                    }
+                    Err(err) => {
+                        if let Some(io_err) = match_for_io_error(&err) {
+                            if io_err.kind() == ErrorKind::BrokenPipe {
+                                // here you can handle special case when client
+                                // disconnected in unexpected way
+                                eprintln!("\tclient disconnected: broken pipe");
+                                break;
+                            }
+                        }
+
+                        match tx.send(Err(err)).await {
+                            Ok(_) => (),
+                            Err(_err) => break, // response was dropped
+                        }
+                    }
+                }
+            }
+            println!("\tstream ended");
+        });
+
+        let out_stream = ReceiverStream::new(rx);
+
+        Ok(tonic::Response::new(Box::pin(out_stream)))
     }
 
     async fn read_at(&self, request: Request<ReadAtRequest>) -> Result<Response<ReadAtResponse>, Status> {

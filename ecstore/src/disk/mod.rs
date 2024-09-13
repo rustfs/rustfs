@@ -19,6 +19,7 @@ use crate::{
     store_api::{FileInfo, RawFileInfo},
 };
 use bytes::Bytes;
+use futures::StreamExt;
 use protos::proto_gen::node_service::{node_service_client::NodeServiceClient, ReadAtRequest, WriteRequest};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc};
@@ -26,8 +27,11 @@ use time::OffsetDateTime;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::mpsc::{self, Sender},
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Channel, Request};
+use tracing::info;
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Box<dyn DiskAPI>>;
@@ -349,32 +353,62 @@ pub struct RemoteFileWriter {
     pub volume: String,
     pub path: String,
     pub is_append: bool,
-    client: NodeServiceClient<Channel>,
+    tx: Sender<WriteRequest>,
 }
 
 impl RemoteFileWriter {
-    pub fn new(root: PathBuf, volume: String, path: String, is_append: bool, client: NodeServiceClient<Channel>) -> Self {
-        Self {
+    pub fn new(
+        root: PathBuf,
+        volume: String,
+        path: String,
+        is_append: bool,
+        mut client: NodeServiceClient<Channel>,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel(128);
+        let in_stream = ReceiverStream::new(rx);
+
+        tokio::spawn(async move {
+            let response = client.write_stream(in_stream).await.unwrap();
+
+            let mut resp_stream = response.into_inner();
+
+            while let Some(resp) = resp_stream.next().await {
+                match resp {
+                    Ok(resp) => {
+                        if resp.success {
+                            info!("write stream success");
+                        } else {
+                            info!("write stream failed: {}", resp.error_info.unwrap_or("".to_string()));
+                        }
+                    }
+                    Err(_err) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
             root,
             volume,
             path,
             is_append,
-            client,
-        }
+            tx,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl Write for RemoteFileWriter {
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        let request = Request::new(WriteRequest {
+        let request = WriteRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: self.volume.to_string(),
             path: self.path.to_string(),
             is_append: self.is_append,
             data: buf.to_vec(),
-        });
-        let _response = self.client.write(request).await?.into_inner();
+        };
+        let _response = self.tx.send(request).await?;
         Ok(())
     }
 }

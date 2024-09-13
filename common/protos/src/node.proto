@@ -309,6 +309,7 @@ service NodeService {
   rpc Delete(DeleteRequest) returns (DeleteResponse) {};
   rpc RenameFile(RenameFileRequst) returns (RenameFileResponse) {};
   rpc Write(WriteRequest) returns (WriteResponse) {};
+  rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {};
 //  rpc Append(AppendRequest) returns (AppendResponse) {};
   rpc ReadAt(ReadAtRequest) returns (ReadAtResponse) {};
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {};
