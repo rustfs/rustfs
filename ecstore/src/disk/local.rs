@@ -19,7 +19,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::ErrorKind;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -140,6 +140,12 @@ impl LocalDisk {
 
     pub async fn move_to_trash(&self, delete_path: &PathBuf, _recursive: bool, _immediate_purge: bool) -> Result<()> {
         let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+        if let Some(parent) = trash_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).await?;
+            }
+        }
+        debug!("move_to_trash from:{:?} to {:?}", &delete_path, &trash_path);
         // TODO: 清空回收站
         if let Err(err) = fs::rename(&delete_path, &trash_path).await {
             match err.kind() {
@@ -152,7 +158,22 @@ impl LocalDisk {
         }
 
         // FIXME: 先清空回收站吧，有时间再添加判断逻辑
-        let _ = fs::remove_dir_all(&trash_path).await;
+
+        if let Err(err) = {
+            if trash_path.is_dir() {
+                fs::remove_dir_all(&trash_path).await
+            } else {
+                fs::remove_file(&trash_path).await
+            }
+        } {
+            match err.kind() {
+                ErrorKind::NotFound => (),
+                _ => {
+                    warn!("delete_file remove trash {:?} err {:?}", &trash_path, &err);
+                    return Err(Error::from(err));
+                }
+            }
+        }
 
         // TODO: immediate
         Ok(())
@@ -183,6 +204,7 @@ impl LocalDisk {
         } else {
             if delete_path.is_dir() {
                 if let Err(err) = fs::remove_dir(&delete_path).await {
+                    error!("remove_dir err {:?} when {:?}", &err, &delete_path);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         // ErrorKind::DirectoryNotEmpty => (),
@@ -196,6 +218,7 @@ impl LocalDisk {
                 }
             } else {
                 if let Err(err) = fs::remove_file(&delete_path).await {
+                    error!("remove_file err {:?} when {:?}", &err, &delete_path);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         _ => {
@@ -281,16 +304,17 @@ impl LocalDisk {
 
         for fi in fis {
             let data_dir = fm.delete_version(fi)?;
-
+            warn!("删除版本号 对应data_dir {:?}", &data_dir);
             if data_dir.is_some() {
                 let dir_path = self.get_object_path(volume, format!("{}/{}", path, data_dir.unwrap().to_string()).as_str())?;
-
                 self.move_to_trash(&dir_path, true, false).await?;
             }
         }
 
         // 没有版本了，删除xl.meta
         if fm.versions.is_empty() {
+            warn!("没有版本了，删除xl.meta");
+
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
             return Ok(());
         }

@@ -21,6 +21,7 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
@@ -172,8 +173,8 @@ impl S3 for FS {
             })
             .collect();
 
-        let (dobjs, _errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
-        // info!("delete_objects res {:?} {:?}", &dobjs, errs);
+        let (dobjs, errs) = try_!(self.store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
+        warn!("delete_objects res {:?} {:?}", &dobjs, errs);
 
         let deleted = dobjs
             .iter()
