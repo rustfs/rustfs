@@ -13,8 +13,9 @@ use crate::{
     error::{Error, Result},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsV2Info,
-        MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
+        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
+        PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -297,7 +298,7 @@ impl StorageAPI for Sets {
             .await
     }
 
-    async fn delete_bucket(&self, _bucket: &str) -> Result<()> {
+    async fn delete_bucket(&self, _bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
 }
