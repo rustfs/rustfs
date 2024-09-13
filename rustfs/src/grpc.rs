@@ -3,7 +3,7 @@ use ecstore::{
     erasure::{ReadAt, Write},
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
-    store_api::{BucketOptions, FileInfo, MakeBucketOptions},
+    store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions},
 };
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
@@ -188,7 +188,11 @@ impl Node for NodeService {
         debug!("make bucket");
 
         let request = request.into_inner();
-        match self.local_peer.delete_bucket(&request.bucket).await {
+        match self
+            .local_peer
+            .delete_bucket(&request.bucket, &DeleteBucketOptions { force: false })
+            .await
+        {
             Ok(_) => Ok(tonic::Response::new(DeleteBucketResponse {
                 success: true,
                 error_info: None,

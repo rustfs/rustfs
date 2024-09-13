@@ -488,6 +488,15 @@ impl StorageAPI for ECStore {
 
         Ok(buckets)
     }
+
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        self.peer_sys.delete_bucket(bucket, opts).await?;
+
+        // 删除meta
+        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
+            .await?;
+        Ok(())
+    }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         // TODO:  check valid bucket name
 
@@ -780,14 +789,5 @@ impl StorageAPI for ECStore {
                 .await;
         }
         unimplemented!()
-    }
-
-    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
-        self.peer_sys.delete_bucket(bucket, opts).await?;
-
-        // 删除meta
-        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
-            .await?;
-        Ok(())
     }
 }

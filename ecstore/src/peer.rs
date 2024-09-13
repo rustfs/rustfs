@@ -146,7 +146,7 @@ impl S3PeerSys {
 
         Ok(buckets)
     }
-    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+    pub async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
             futures.push(cli.delete_bucket(bucket, &opts));
@@ -391,7 +391,7 @@ impl PeerS3Client for LocalPeerS3Client {
         let mut idx = 0;
         for err in errs {
             if err.is_none() && recreate {
-                let _ = self.local_disks[idx].make_volume(bucket).await;
+                let _ = local_disks[idx].make_volume(bucket).await;
             }
 
             idx += 1;
