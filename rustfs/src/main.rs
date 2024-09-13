@@ -1,16 +1,25 @@
 mod config;
+mod grpc;
+mod service;
 mod storage;
 
 use clap::Parser;
-use ecstore::error::Result;
+use ecstore::{
+    endpoints::EndpointServerPools,
+    error::Result,
+    store::{init_local_disks, update_erasure_type, ECStore},
+};
+use grpc::make_server;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
+    service::TowerToHyperService,
 };
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
+use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -66,10 +75,19 @@ async fn run(opt: config::Opt) -> Result<()> {
     //         })
     // };
 
+    // 用于rpc
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())?;
+
+    update_erasure_type(setup_type).await;
+
+    // 初始化本地磁盘
+    init_local_disks(endpoint_pools.clone()).await?;
+
     // Setup S3 service
     // 本项目使用s3s库来实现s3服务
     let service = {
-        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), opt.volumes.clone()).await?);
+        // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), endpoint_pools).await?);
+        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new());
         //设置AK和SK
         //其中部份内容从config配置文件中读取
         let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
@@ -101,44 +119,59 @@ async fn run(opt: config::Opt) -> Result<()> {
         b.build()
     };
 
-    let hyper_service = service.into_shared();
+    let rpc_service = make_server();
 
-    let http_server = ConnBuilder::new(TokioExecutor::new());
-    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    tokio::spawn(async move {
+        let hyper_service = service.into_shared();
 
-    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+        let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, rpc_service));
 
-    info!("server is running at http://{local_addr}");
+        let http_server = ConnBuilder::new(TokioExecutor::new());
+        let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+        info!("server is running at http://{local_addr}");
 
-    loop {
-        let (socket, _) = tokio::select! {
-            res =  listener.accept() => {
-                match res {
-                    Ok(conn) => conn,
-                    Err(err) => {
-                        tracing::error!("error accepting connection: {err}");
-                        continue;
+        loop {
+            let (socket, _) = tokio::select! {
+                res =  listener.accept() => {
+                    match res {
+                        Ok(conn) => conn,
+                        Err(err) => {
+                            tracing::error!("error accepting connection: {err}");
+                            continue;
+                        }
                     }
                 }
-            }
-            _ = ctrl_c.as_mut() => {
-                break;
-            }
-        };
+                _ = ctrl_c.as_mut() => {
+                    break;
+                }
+            };
 
-        let conn = http_server.serve_connection(TokioIo::new(socket), hyper_service.clone());
-        let conn = graceful.watch(conn.into_owned());
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-    }
+            let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
+            let conn = graceful.watch(conn.into_owned());
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+        }
+
+        tokio::select! {
+            () = graceful.shutdown() => {
+                 tracing::debug!("Gracefully shutdown!");
+            },
+            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                 tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
+            }
+        }
+    });
+
+    warn!(" init store");
+    // init store
+    ECStore::new(opt.address.clone(), endpoint_pools.clone()).await?;
+    warn!(" init store success!");
 
     tokio::select! {
-        () = graceful.shutdown() => {
-             tracing::debug!("Gracefully shutdown!");
-        },
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-             tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
+        _ = tokio::signal::ctrl_c() => {
+
         }
     }
 

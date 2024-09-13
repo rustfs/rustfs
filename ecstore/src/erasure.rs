@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use futures::{Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use tokio::io::AsyncWrite;
+use std::fmt::Debug;
 use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;
 use tracing::debug;
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::chunk_stream::ChunkedStream;
 use crate::disk::error::DiskError;
-use crate::disk::FileReader;
+use crate::disk::{FileReader, FileWriter};
 
 pub struct Erasure {
     data_shards: usize,
@@ -43,17 +43,16 @@ impl Erasure {
         }
     }
 
-    pub async fn encode<S, W>(
+    pub async fn encode<S>(
         &self,
         body: S,
-        writers: &mut [W],
+        writers: &mut [FileWriter],
         // block_size: usize,
         total_size: usize,
         _write_quorum: usize,
     ) -> Result<usize>
     where
         S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
-        W: AsyncWrite + Unpin,
     {
         let mut stream = ChunkedStream::new(body, total_size, self.block_size, false);
         let mut total: usize = 0;
@@ -85,7 +84,7 @@ impl Erasure {
                     let mut errs = Vec::new();
 
                     for (i, w) in writers.iter_mut().enumerate() {
-                        match w.write_all(blocks[i].as_ref()).await {
+                        match w.write(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
                             Err(e) => errs.push(Some(e)),
                         }
@@ -318,6 +317,12 @@ impl Erasure {
     }
 }
 
+#[async_trait::async_trait]
+pub trait Write {
+    async fn write(&mut self, buf: &[u8]) -> Result<()>;
+}
+
+#[async_trait::async_trait]
 pub trait ReadAt {
     async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)>;
 }

@@ -194,6 +194,7 @@ pub struct ObjectPartInfo {
 //     }
 // }
 
+#[derive(Serialize, Deserialize)]
 pub struct RawFileInfo {
     pub buf: Vec<u8>,
 }
@@ -239,6 +240,7 @@ pub enum BitrotAlgorithm {
     BLAKE2b512,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MakeBucketOptions {
     pub force_create: bool,
 }
@@ -380,9 +382,10 @@ pub struct ObjectOptions {
 //     }
 // }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BucketOptions {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketInfo {
     pub name: String,
     pub created: Option<OffsetDateTime>,

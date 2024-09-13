@@ -1,12 +1,12 @@
 mod bucket_meta;
 mod chunk_stream;
 pub mod disk;
-mod disks_layout;
-mod endpoints;
-mod erasure;
+pub mod disks_layout;
+pub mod endpoints;
+pub mod erasure;
 pub mod error;
 mod file_meta;
-mod peer;
+pub mod peer;
 pub mod set_disk;
 mod sets;
 pub mod store;
