@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rustfs", "ecstore", "e2e_test", "common/protos"]
+members = ["rustfs", "ecstore", "e2e_test", "common/lock", "common/protos"]
 
 [workspace.package]
 edition = "2021"

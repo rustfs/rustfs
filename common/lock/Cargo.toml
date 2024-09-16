@@ -1,0 +1,8 @@
+[package]
+name = "lock"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ecstore.workspace = true
+tracing.workspace = true
