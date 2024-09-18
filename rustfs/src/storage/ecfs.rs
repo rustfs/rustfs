@@ -1,5 +1,8 @@
+use bytes::BufMut;
 use bytes::Bytes;
+use ecstore::bucket_meta::BucketMetadata;
 use ecstore::disk::error::DiskError;
+use ecstore::disk::RUSTFS_META_BUCKET;
 use ecstore::store::new_object_layer_fn;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
@@ -16,6 +19,7 @@ use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use s3s::dto::*;
 use s3s::s3_error;
+use s3s::Body;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
@@ -680,6 +684,130 @@ impl S3 for FS {
                 .await
         );
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
+        log::debug!("bucket: {bucket}, tagging: {tagging:?}");
+
+        // check bucket exists.
+        let _bucket = self
+            .head_bucket(S3Request::new(HeadBucketInput {
+                bucket: bucket.clone(),
+                expected_bucket_owner: None,
+            }))
+            .await?;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        let meta_obj = try_!(
+            store
+                .get_object_reader(
+                    RUSTFS_META_BUCKET,
+                    BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
+                    HTTPRangeSpec::nil(),
+                    Default::default(),
+                    &ObjectOptions::default(),
+                )
+                .await
+        );
+
+        let stream = meta_obj.stream;
+
+        let mut data = vec![];
+        pin_mut!(stream);
+
+        while let Some(x) = stream.next().await {
+            let x = try_!(x);
+            data.put_slice(&x[..]);
+        }
+
+        let mut meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
+        if tagging.tag_set.is_empty() {
+            meta.tagging = None;
+        } else {
+            meta.tagging = Some(tagging.tag_set.into_iter().map(|x| (x.key, x.value)).collect())
+        }
+
+        let data = try_!(meta.marshal_msg());
+        let len = data.len();
+        try_!(
+            store
+                .put_object(
+                    RUSTFS_META_BUCKET,
+                    BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
+                    PutObjReader::new(StreamingBlob::from(Body::from(data)), len),
+                    &ObjectOptions::default(),
+                )
+                .await
+        );
+
+        Ok(S3Response::new(Default::default()))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        let GetBucketTaggingInput { bucket, .. } = req.input;
+        // check bucket exists.
+        let _bucket = self
+            .head_bucket(S3Request::new(HeadBucketInput {
+                bucket: bucket.clone(),
+                expected_bucket_owner: None,
+            }))
+            .await?;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        let meta_obj = try_!(
+            store
+                .get_object_reader(
+                    RUSTFS_META_BUCKET,
+                    BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
+                    HTTPRangeSpec::nil(),
+                    Default::default(),
+                    &ObjectOptions::default(),
+                )
+                .await
+        );
+
+        let stream = meta_obj.stream;
+
+        let mut data = vec![];
+        pin_mut!(stream);
+
+        while let Some(x) = stream.next().await {
+            let x = try_!(x);
+            data.put_slice(&x[..]);
+        }
+
+        let meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
+        if meta.tagging.is_none() {
+            return Err({
+                let mut err = S3Error::with_message(S3ErrorCode::Custom("NoSuchTagSet".into()), "The TagSet does not exist");
+                err.set_status_code("404".try_into().unwrap());
+                err
+            });
+        }
+
+        Ok(S3Response::new(GetBucketTaggingOutput {
+            tag_set: meta
+                .tagging
+                .unwrap()
+                .into_iter()
+                .map(|(key, value)| Tag { key, value })
+                .collect(),
+        }))
     }
 }
 
