@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use futures::future::join_all;
 use http::HeaderMap;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -55,6 +56,7 @@ impl Sets {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
                 if disk.is_none() {
+                    warn!("sets new set_drive {}-{} is none", i, j);
                     set_drive.push(None);
                     continue;
                 }
@@ -66,6 +68,7 @@ impl Sets {
                     };
 
                     if local_disk.is_none() {
+                        warn!("sets new set_drive {}-{} local_disk is none", i, j);
                         set_drive.push(None);
                         continue;
                     }
@@ -78,9 +81,12 @@ impl Sets {
                 if let Some(_disk_id) = disk.as_ref().unwrap().get_disk_id().await {
                     set_drive.push(disk);
                 } else {
+                    warn!("sets new set_drive {}-{} get_disk_id is none", i, j);
                     set_drive.push(None);
                 }
             }
+
+            warn!("sets new set_drive {:?}", &set_drive);
 
             let set_disks = SetDisks {
                 disks: set_drive,
@@ -320,7 +326,7 @@ impl StorageAPI for Sets {
             .await
     }
 
-    async fn delete_bucket(&self, _bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
 }
