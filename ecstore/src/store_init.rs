@@ -65,8 +65,9 @@ pub async fn connect_load_init_formats(
         // new format and save
         let fms = init_format_erasure(disks, set_count, set_drive_count, deployment_id);
 
-        let _errs = save_format_file_all(disks, &fms).await;
+        let errs = save_format_file_all(disks, &fms).await;
 
+        warn!("save_format_file_all errs {:?}", &errs);
         // TODO: check quorum
         // reduceWriteQuorumErrs(&errs)?;
 
