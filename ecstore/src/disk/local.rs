@@ -439,6 +439,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn get_disk_id(&self) -> Option<Uuid> {
+        warn!("local get_disk_id");
         // TODO: check format file
         let format_info = self.format_info.lock().await;
 
@@ -446,8 +447,10 @@ impl DiskAPI for LocalDisk {
         // TODO: 判断源文件id,是否有效
     }
 
-    async fn set_disk_id(&self, _id: Option<Uuid>) -> Result<()> {
+    async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         // 本地不需要设置
+        let mut format_info = self.format_info.lock().await;
+        format_info.id = id;
         Ok(())
     }
 

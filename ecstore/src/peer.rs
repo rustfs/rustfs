@@ -360,7 +360,7 @@ impl PeerS3Client for LocalPeerS3Client {
             .ok_or(Error::new(DiskError::VolumeNotFound))
     }
 
-    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+    async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         let local_disks = all_local_disk().await;
         let mut futures = Vec::with_capacity(local_disks.len());
 
