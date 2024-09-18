@@ -34,6 +34,9 @@ pub enum DiskError {
 
     #[error("volume not empty")]
     VolumeNotEmpty,
+
+    #[error("corrupted backend")]
+    CorruptedBackend
 }
 
 impl DiskError {
