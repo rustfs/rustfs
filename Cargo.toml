@@ -55,3 +55,4 @@ tracing = "0.1.40"
 tracing-error = "0.2.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 transform-stream = "0.3.0"
+log = "0.4.22"
