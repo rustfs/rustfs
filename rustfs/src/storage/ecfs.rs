@@ -687,7 +687,7 @@ impl S3 for FS {
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
         log::debug!("bucket: {bucket}, tagging: {tagging:?}");
@@ -702,10 +702,9 @@ impl S3 for FS {
 
         let layer = new_object_layer_fn();
         let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
-        };
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
         let meta_obj = try_!(
             store
@@ -752,7 +751,7 @@ impl S3 for FS {
         Ok(S3Response::new(Default::default()))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
         let GetBucketTaggingInput { bucket, .. } = req.input;
         // check bucket exists.
@@ -765,10 +764,9 @@ impl S3 for FS {
 
         let layer = new_object_layer_fn();
         let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
-        };
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
         let meta_obj = try_!(
             store
@@ -811,8 +809,11 @@ impl S3 for FS {
         }))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
-    async fn delete_bucket_tagging(&self, req: S3Request<DeleteBucketTaggingInput>) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn delete_bucket_tagging(
+        &self,
+        req: S3Request<DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
         // check bucket exists.
         let _bucket = self
@@ -824,10 +825,9 @@ impl S3 for FS {
 
         let layer = new_object_layer_fn();
         let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
-        };
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
         let meta_obj = try_!(
             store
@@ -867,6 +867,79 @@ impl S3 for FS {
         );
 
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let PutObjectTaggingInput {
+            bucket,
+            key: object,
+            tagging,
+            ..
+        } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        let mut object_info = try_!(store.get_object_info(&bucket, &object, &ObjectOptions::default()).await);
+        object_info.tags = Some(tagging.tag_set.into_iter().map(|Tag { key, value }| (key, value)).collect());
+
+        try_!(
+            store
+                .put_object_info(&bucket, &object, object_info, &ObjectOptions::default())
+                .await
+        );
+
+        Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let GetObjectTaggingInput { bucket, key: object, .. } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        let object_info = try_!(store.get_object_info(&bucket, &object, &ObjectOptions::default()).await);
+
+        Ok(S3Response::new(GetObjectTaggingOutput {
+            tag_set: object_info
+                .tags
+                .map(|tags| tags.into_iter().map(|(key, value)| Tag { key, value }).collect())
+                .unwrap_or_else(|| vec![]),
+            version_id: None,
+        }))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let DeleteObjectTaggingInput { bucket, key: object, .. } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        let mut object_info = try_!(store.get_object_info(&bucket, &object, &ObjectOptions::default()).await);
+        object_info.tags = None;
+
+        try_!(
+            store
+                .put_object_info(&bucket, &object, object_info, &ObjectOptions::default())
+                .await
+        );
+
+        Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
     }
 }
 
