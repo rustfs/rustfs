@@ -105,8 +105,8 @@ impl DiskAPI for RemoteDisk {
         self.root.clone()
     }
 
-    async fn get_disk_id(&self) -> Option<Uuid> {
-        self.id.lock().await.clone()
+    async fn get_disk_id(&self) -> Result<Option<Uuid>> {
+        Ok(self.id.lock().await.clone())
     }
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         let mut lock = self.id.lock().await;

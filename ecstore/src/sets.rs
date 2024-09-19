@@ -78,7 +78,7 @@ impl Sets {
                     disk = local_disk;
                 }
 
-                if let Some(_disk_id) = disk.as_ref().unwrap().get_disk_id().await {
+                if let Some(_disk_id) = disk.as_ref().unwrap().get_disk_id().await? {
                     set_drive.push(disk);
                 } else {
                     warn!("sets new set_drive {}-{} get_disk_id is none", i, j);

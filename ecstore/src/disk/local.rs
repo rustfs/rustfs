@@ -32,11 +32,13 @@ pub struct FormatInfo {
 }
 
 impl FormatInfo {
-    pub fn last_check_valid(&self)->bool{
+    pub fn last_check_valid(&self) -> bool {
         let now = OffsetDateTime::now_utc();
-        self.file_info.is_some() && self.id.is_some() && self.last_check.is_some() &&  (now.unix_timestamp() - self.last_check.unwrap().unix_timestamp() <=1)
+        self.file_info.is_some()
+            && self.id.is_some()
+            && self.last_check.is_some()
+            && (now.unix_timestamp() - self.last_check.unwrap().unix_timestamp() <= 1)
     }
-
 }
 
 #[derive(Debug)]
@@ -44,6 +46,7 @@ pub struct LocalDisk {
     pub root: PathBuf,
     pub format_path: PathBuf,
     pub format_info: Mutex<FormatInfo>,
+    pub endpoint: Endpoint,
     // pub id: Mutex<Option<Uuid>>,
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
@@ -92,6 +95,7 @@ impl LocalDisk {
 
         let disk = Self {
             root,
+            endpoint: ep.clone(),
             format_path: format_path,
             format_info: Mutex::new(format_info),
             // // format_legacy,
@@ -105,16 +109,16 @@ impl LocalDisk {
         Ok(disk)
     }
 
-    async fn check_format_json(&self) ->Result<Metadata>{
-        let p = self.format_path;
-       let md = fs::metadata(&p).await.map_err(|e|match e.kind(){
-        ErrorKind::NotFound => DiskError::DiskNotFound,
-        ErrorKind::PermissionDenied => DiskError::FileAccessDenied,
-        _ => {
-            warn!("check_format_json err {:?}",e);
-            DiskError::CorruptedBackend},
-           })?;
-       Ok(md)
+    async fn check_format_json(&self) -> Result<Metadata> {
+        let md = fs::metadata(&self.format_path).await.map_err(|e| match e.kind() {
+            ErrorKind::NotFound => DiskError::DiskNotFound,
+            ErrorKind::PermissionDenied => DiskError::FileAccessDenied,
+            _ => {
+                warn!("check_format_json err {:?}", e);
+                DiskError::CorruptedBackend
+            }
+        })?;
+        Ok(md)
     }
     async fn make_meta_volumes(&self) -> Result<()> {
         let buckets = format!("{}/{}", super::RUSTFS_META_BUCKET, super::BUCKET_META_PREFIX);
@@ -455,58 +459,60 @@ impl DiskAPI for LocalDisk {
         self.root.clone()
     }
 
-    async fn get_disk_id(&self) -> Option<Uuid> {
+    async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         warn!("local get_disk_id");
         // TODO: check format file
         let mut format_info = self.format_info.lock().await;
 
-       let id =  format_info.id.clone();
+        let id = format_info.id.clone();
 
-       if format_info.last_check_valid(){
-        return id
-       }
-
-      let file_meta =  self.check_format_json().await?;
-
-      if let Some(file_info) = format_info.file_info{
-        if file_meta == file_info{
-
-            format_info.last_check = Some(OffsetDateTime::now_utc());
-
-            return id
+        if format_info.last_check_valid() {
+            return Ok(id);
         }
-      }
 
+        let file_meta = self.check_format_json().await?;
 
-     let b = fs::read(&format_info.file_path).await.map_err(|e|match e.kind(){
-        ErrorKind::NotFound => DiskError::DiskNotFound,
-        ErrorKind::PermissionDenied => DiskError::FileAccessDenied,
-        _ => {
-            warn!("check_format_json err {:?}",e);
-            DiskError::CorruptedBackend},
-           })?;
+        if let Some(file_info) = &format_info.file_info {
+            if utils::fs::same_file(&file_meta, file_info) {
+                format_info.last_check = Some(OffsetDateTime::now_utc());
 
+                return Ok(id);
+            }
+        }
 
-           let fm = FormatV3::try_from(b.as_slice()).map_err(|e|{
-            warn!("decode format.json  err {:?}",e);
+        let b = fs::read(&self.format_path).await.map_err(|e| match e.kind() {
+            ErrorKind::NotFound => DiskError::DiskNotFound,
+            ErrorKind::PermissionDenied => DiskError::FileAccessDenied,
+            _ => {
+                warn!("check_format_json err {:?}", e);
+                DiskError::CorruptedBackend
+            }
+        })?;
+
+        let fm = FormatV3::try_from(b.as_slice()).map_err(|e| {
+            warn!("decode format.json  err {:?}", e);
             DiskError::CorruptedBackend
-           })?;
-       
-       let (m,n) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
+        })?;
 
-       let disk_id = fm.erasure.this;
+        let (m, n) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
 
-       if m != self.endpoint.set_idx || n != self.endpoint.disk_idx {
-        return DiskError::InconsistentDisk;
-       }
+        let disk_id = fm.erasure.this;
 
-       format_info.id = Some(disk_id);
-       format_info.file_info= Some(file_meta);
-       format_info.data = b;
-       format_info.last_check = Some(OffsetDateTime::now_utc());
-;
+        match (self.endpoint.set_idx, self.endpoint.disk_idx) {
+            (Some(set_idx), Some(disk_idx)) => {
+                if m != set_idx || n != disk_idx {
+                    return Err(Error::new(DiskError::InconsistentDisk));
+                }
+            }
+            _ => return Err(Error::new(DiskError::InconsistentDisk)),
+        }
 
-Some(disk_id)
+        format_info.id = Some(disk_id);
+        format_info.file_info = Some(file_meta);
+        format_info.data = b;
+        format_info.last_check = Some(OffsetDateTime::now_utc());
+
+        Ok(Some(disk_id))
         // TODO: 判断源文件id,是否有效
     }
 
