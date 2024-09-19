@@ -28,9 +28,9 @@ use crate::{
 };
 
 use super::{
-    endpoint::Endpoint, DeleteOptions, DiskAPI, DiskOption, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter, RenameDataResp, VolumeInfo,
-    WalkDirOptions,
+    endpoint::Endpoint, DeleteOptions, DiskAPI, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter,
+    MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter, RenameDataResp,
+    VolumeInfo, WalkDirOptions,
 };
 
 #[derive(Debug)]
@@ -39,6 +39,7 @@ pub struct RemoteDisk {
     channel: Arc<RwLock<Option<Channel>>>,
     url: url::Url,
     pub root: PathBuf,
+    endpoint: Endpoint,
 }
 
 impl RemoteDisk {
@@ -50,6 +51,7 @@ impl RemoteDisk {
             url: ep.url.clone(),
             root,
             id: Mutex::new(None),
+            endpoint: ep.clone(),
         })
     }
 
@@ -98,11 +100,26 @@ impl DiskAPI for RemoteDisk {
     fn is_local(&self) -> bool {
         false
     }
+    async fn is_online(&self) -> bool {
+        // TODO: 连接状态
+        if let Ok(_) = self.get_client_v2().await {
+            return true;
+        }
+        false
+    }
     async fn close(&self) -> Result<()> {
         Ok(())
     }
     fn path(&self) -> PathBuf {
         self.root.clone()
+    }
+
+    fn get_location(&self) -> DiskLocation {
+        DiskLocation {
+            pool_idx: self.endpoint.pool_idx,
+            set_idx: self.endpoint.set_idx,
+            disk_idx: self.endpoint.pool_idx,
+        }
     }
 
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
@@ -253,11 +270,11 @@ impl DiskAPI for RemoteDisk {
         });
 
         let response = client.walk_dir(request).await?.into_inner();
-        
+
         if !response.success {
             return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
         }
-        
+
         let entries = response
             .meta_cache_entry
             .into_iter()
@@ -288,7 +305,7 @@ impl DiskAPI for RemoteDisk {
         });
 
         let response = client.rename_data(request).await?.into_inner();
-        
+
         if !response.success {
             return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
         }
@@ -363,7 +380,7 @@ impl DiskAPI for RemoteDisk {
         });
 
         let response = client.stat_volume(request).await?.into_inner();
-        
+
         if !response.success {
             return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
         }

@@ -45,10 +45,12 @@ pub async fn new_disk(ep: &endpoint::Endpoint, opt: &DiskOption) -> Result<DiskS
 #[async_trait::async_trait]
 pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn is_local(&self) -> bool;
+    async fn is_online(&self) -> bool;
     fn path(&self) -> PathBuf;
     async fn close(&self) -> Result<()>;
     async fn get_disk_id(&self) -> Result<Option<Uuid>>;
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()>;
+    fn get_location(&self) -> DiskLocation;
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
@@ -93,6 +95,18 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         opts: DeleteOptions,
     ) -> Result<Vec<Option<Error>>>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
+}
+
+pub struct DiskLocation {
+    pub pool_idx: Option<usize>,
+    pub set_idx: Option<usize>,
+    pub disk_idx: Option<usize>,
+}
+
+impl DiskLocation {
+    pub fn valid(&self) -> bool {
+        self.pool_idx.is_some() && self.set_idx.is_some() && self.disk_idx.is_some()
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

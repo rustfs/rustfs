@@ -1,7 +1,7 @@
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
-    DeleteOptions, DiskAPI, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp,
-    ReadOptions, RenameDataResp, VolumeInfo, WalkDirOptions,
+    DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, RenameDataResp, VolumeInfo, WalkDirOptions,
 };
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::{
@@ -452,11 +452,22 @@ impl DiskAPI for LocalDisk {
     fn is_local(&self) -> bool {
         true
     }
+    async fn is_online(&self) -> bool {
+        true
+    }
     async fn close(&self) -> Result<()> {
         Ok(())
     }
     fn path(&self) -> PathBuf {
         self.root.clone()
+    }
+
+    fn get_location(&self) -> DiskLocation {
+        DiskLocation {
+            pool_idx: self.endpoint.pool_idx,
+            set_idx: self.endpoint.set_idx,
+            disk_idx: self.endpoint.pool_idx,
+        }
     }
 
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
