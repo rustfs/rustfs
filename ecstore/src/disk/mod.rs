@@ -47,7 +47,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn is_local(&self) -> bool;
     fn path(&self) -> PathBuf;
     async fn close(&self) -> Result<()>;
-    async fn get_disk_id(&self) -> Option<Uuid>;
+    async fn get_disk_id(&self) -> Result<Option<Uuid>>;
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()>;
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
