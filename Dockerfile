@@ -1,0 +1,39 @@
+FROM m.daocloud.io/docker.io/library/ubuntu:22.04
+
+ENV LANG C.UTF-8
+
+RUN sed -i s@http://.*archive.ubuntu.com@http://repo.huaweicloud.com@g /etc/apt/sources.list
+
+RUN apt-get clean && apt-get update && apt-get install wget git curl unzip gcc pkg-config libssl-dev -y
+
+# install protoc
+RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip \
+    && unzip protoc-27.0-linux-x86_64.zip -d protoc3 \
+    && mv protoc3/bin/* /usr/local/bin/ && chmod +x /usr/local/bin/protoc && mv protoc3/include/* /usr/local/include/ && rm -rf protoc-27.0-linux-x86_64.zip protoc3
+
+# install flatc
+RUN wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip \
+    && unzip Linux.flatc.binary.g++-13.zip \
+    && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc && rm -rf Linux.flatc.binary.g++-13.zip
+
+# install rust
+ENV RUSTUP_DIST_SERVER="https://rsproxy.cn"
+ENV RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+RUN curl -o rustup-init.sh --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
+    && sh rustup-init.sh -y && rm -rf rustup-init.sh
+
+RUN echo "[source.crates-io]" > /root/.cargo/config.toml \
+&& echo "registry = \"https://github.com/rust-lang/crates.io-index\"" >> /root/.cargo/config.toml \
+&& echo "replace-with = \"rsproxy-sparse\"" >> /root/.cargo/config.toml \
+&& echo "[source.rsproxy]" >> /root/.cargo/config.toml \
+&& echo "registry = \"https://rsproxy.cn/crates.io-index\"" >> /root/.cargo/config.toml \
+&& echo "[source.rsproxy-sparse]" >> /root/.cargo/config.toml \
+&& echo "registry = \"sparse+https://rsproxy.cn/index/\"" >> /root/.cargo/config.toml \
+&& echo "[registries.rsproxy]" >> /root/.cargo/config.toml \
+&& echo "index = \"https://rsproxy.cn/crates.io-index\"" >> /root/.cargo/config.toml \
+&& echo "[net]" >> /root/.cargo/config.toml \
+&& echo "git-fetch-with-cli = true" >> /root/.cargo/config.toml
+
+WORKDIR /root/s3-rustfs
+
+CMD [ "bash", "-c", "while true; do sleep 1; done" ]
