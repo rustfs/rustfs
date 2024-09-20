@@ -102,6 +102,7 @@ impl Sets {
                 set_index: i,
                 pool_index: pool_idx,
                 set_endpoints,
+                format: fm.clone(),
             };
 
             disk_set.push(Arc::new(set_disks));
@@ -159,6 +160,7 @@ impl Sets {
         for set in self.disk_set.iter() {
             set.connect_disks().await;
         }
+        debug!("done connect_disks ...");
     }
 
     pub fn get_disks(&self, set_idx: usize) -> Arc<SetDisks> {

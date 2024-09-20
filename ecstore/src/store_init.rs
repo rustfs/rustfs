@@ -202,13 +202,18 @@ pub fn default_partiy_count(drive: usize) -> usize {
 // load_format_erasure_all 读取所有foramt.json
 async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
     let mut futures = Vec::with_capacity(disks.len());
-
-    for disk in disks.iter() {
-        futures.push(read_format_file(disk, heal));
-    }
-
     let mut datas = Vec::with_capacity(disks.len());
     let mut errors = Vec::with_capacity(disks.len());
+
+    for disk in disks.iter() {
+        if disk.is_none() {
+            datas.push(None);
+            errors.push(Some(Error::new(DiskError::DiskNotFound)));
+        }
+
+        let disk = disk.as_ref().unwrap();
+        futures.push(load_format_erasure(disk, heal));
+    }
 
     let results = join_all(futures).await;
     let mut i = 0;
@@ -234,12 +239,7 @@ async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Ve
     (datas, errors)
 }
 
-async fn read_format_file(disk: &Option<DiskStore>, _heal: bool) -> Result<FormatV3, Error> {
-    if disk.is_none() {
-        return Err(Error::new(DiskError::DiskNotFound));
-    }
-    let disk = disk.as_ref().unwrap();
-
+pub async fn load_format_erasure(disk: &DiskStore, _heal: bool) -> Result<FormatV3, Error> {
     let data = disk
         .read_all(RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
         .await
