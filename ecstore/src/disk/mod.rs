@@ -222,6 +222,7 @@ impl MetaCacheEntry {
     }
 }
 
+#[derive(Debug, Default)]
 pub struct DiskOption {
     pub cleanup: bool,
     pub health_check: bool,
