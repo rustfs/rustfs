@@ -717,6 +717,17 @@ impl StorageAPI for ECStore {
 
         unimplemented!()
     }
+
+    async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+        let object = utils::path::encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].put_object_info(bucket, object.as_str(), info, opts).await;
+        }
+
+        unimplemented!()
+    }
+
     async fn get_object_reader(
         &self,
         bucket: &str,
