@@ -40,7 +40,25 @@ jobs:
 
       - name: print protoc version
         run: protoc --version
-  
+
+      - name: cache flatc bin
+        id: cache-flatc-action
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-flatc-action-bin
+        with:
+          path: /usr/local/bin/flatc
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
+
+      - name: install flatc
+        if: steps.cache-flatc-action.outputs.cache-hit != 'true'
+        run: |
+          wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
+          unzip Linux.flatc.binary.g++-13.zip
+          mv flatc /usr/local/bin/ 
+          chmod +x /usr/local/bin/flatc 
+          rm -rf Linux.flatc.binary.g++-13.zip
+
       - uses: actions/checkout@v2
 
       - uses: actions-rs/toolchain@v1
