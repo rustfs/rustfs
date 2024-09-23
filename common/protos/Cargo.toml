@@ -1,0 +1,17 @@
+[package]
+name = "protos"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+#async-backtrace = { workspace = true, optional = true }
+flatbuffers = { workspace = true }
+prost = { workspace = true }
+protobuf = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport", "tls"] }
+tower = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+tonic-build = { workspace = true }

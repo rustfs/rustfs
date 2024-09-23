@@ -3,7 +3,7 @@ use super::{
     DeleteOptions, DiskAPI, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp,
     ReadOptions, RenameDataResp, VolumeInfo, WalkDirOptions,
 };
-use crate::disk::STORAGE_FORMAT_FILE;
+use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::{
     error::{Error, Result},
     file_meta::FileMeta,
@@ -19,18 +19,29 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::ErrorKind;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Debug)]
+pub struct FormatInfo {
+    pub id: Option<Uuid>,
+    pub _data: Vec<u8>,
+    pub _file_info: Option<Metadata>,
+    pub _last_check: Option<OffsetDateTime>,
+}
+
+impl FormatInfo {}
+
+#[derive(Debug)]
 pub struct LocalDisk {
     pub root: PathBuf,
-    pub id: Uuid,
-    pub _format_data: Vec<u8>,
-    pub _format_meta: Option<Metadata>,
     pub _format_path: PathBuf,
-    // pub format_legacy: bool, // drop
-    pub _format_last_check: Option<OffsetDateTime>,
+    pub format_info: Mutex<FormatInfo>,
+    // pub id: Mutex<Option<Uuid>>,
+    // pub format_data: Mutex<Vec<u8>>,
+    // pub format_file_info: Mutex<Option<Metadata>>,
+    // pub format_last_check: Mutex<Option<OffsetDateTime>>,
 }
 
 impl LocalDisk {
@@ -48,7 +59,7 @@ impl LocalDisk {
 
         let (format_data, format_meta) = read_file_exists(&format_path).await?;
 
-        let mut id = Uuid::nil();
+        let mut id = None;
         // let mut format_legacy = false;
         let mut format_last_check = None;
 
@@ -61,19 +72,26 @@ impl LocalDisk {
                 return Err(Error::from(DiskError::InconsistentDisk));
             }
 
-            id = fm.erasure.this;
+            id = Some(fm.erasure.this);
             // format_legacy = fm.erasure.distribution_algo == DistributionAlgoVersion::V1;
             format_last_check = Some(OffsetDateTime::now_utc());
         }
 
+        let format_info = FormatInfo {
+            id,
+            _data: format_data,
+            _file_info: format_meta,
+            _last_check: format_last_check,
+        };
+
         let disk = Self {
             root,
-            id,
-            _format_meta: format_meta,
-            _format_data: format_data,
             _format_path: format_path,
-            // format_legacy,
-            _format_last_check: format_last_check,
+            format_info: Mutex::new(format_info),
+            // // format_legacy,
+            // format_file_info: Mutex::new(format_meta),
+            // format_data: Mutex::new(format_data),
+            // format_last_check: Mutex::new(format_last_check),
         };
 
         disk.make_meta_volumes().await?;
@@ -140,6 +158,12 @@ impl LocalDisk {
 
     pub async fn move_to_trash(&self, delete_path: &PathBuf, _recursive: bool, _immediate_purge: bool) -> Result<()> {
         let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+        if let Some(parent) = trash_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).await?;
+            }
+        }
+        debug!("move_to_trash from:{:?} to {:?}", &delete_path, &trash_path);
         // TODO: 清空回收站
         if let Err(err) = fs::rename(&delete_path, &trash_path).await {
             match err.kind() {
@@ -152,7 +176,22 @@ impl LocalDisk {
         }
 
         // FIXME: 先清空回收站吧，有时间再添加判断逻辑
-        let _ = fs::remove_dir_all(&trash_path).await;
+
+        if let Err(err) = {
+            if trash_path.is_dir() {
+                fs::remove_dir_all(&trash_path).await
+            } else {
+                fs::remove_file(&trash_path).await
+            }
+        } {
+            match err.kind() {
+                ErrorKind::NotFound => (),
+                _ => {
+                    warn!("delete_file remove trash {:?} err {:?}", &trash_path, &err);
+                    return Err(Error::from(err));
+                }
+            }
+        }
 
         // TODO: immediate
         Ok(())
@@ -184,7 +223,7 @@ impl LocalDisk {
             if delete_path.is_dir() {
                 debug!("delete_file remove_dir {:?}", &delete_path);
                 if let Err(err) = fs::remove_dir(&delete_path).await {
-                    debug!("delete_file remove_dir err {:?} err: {:?}", &delete_path, err);
+                    debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         // ErrorKind::DirectoryNotEmpty => (),
@@ -199,6 +238,7 @@ impl LocalDisk {
                 debug!("delete_file remove_dir done {:?}", &delete_path);
             } else {
                 if let Err(err) = fs::remove_file(&delete_path).await {
+                    debug!("remove_file err {:?} when {:?}", &err, &delete_path);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         _ => {
@@ -284,16 +324,17 @@ impl LocalDisk {
 
         for fi in fis {
             let data_dir = fm.delete_version(fi)?;
-
+            warn!("删除版本号 对应data_dir {:?}", &data_dir);
             if data_dir.is_some() {
                 let dir_path = self.get_object_path(volume, format!("{}/{}", path, data_dir.unwrap().to_string()).as_str())?;
-
                 self.move_to_trash(&dir_path, true, false).await?;
             }
         }
 
         // 没有版本了，删除xl.meta
         if fm.versions.is_empty() {
+            warn!("没有版本了，删除xl.meta");
+
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
             return Ok(());
         }
@@ -392,9 +433,27 @@ impl DiskAPI for LocalDisk {
     fn is_local(&self) -> bool {
         true
     }
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+    fn path(&self) -> PathBuf {
+        self.root.clone()
+    }
 
-    fn id(&self) -> Uuid {
-        self.id
+    async fn get_disk_id(&self) -> Option<Uuid> {
+        warn!("local get_disk_id");
+        // TODO: check format file
+        let format_info = self.format_info.lock().await;
+
+        format_info.id.clone()
+        // TODO: 判断源文件id,是否有效
+    }
+
+    async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
+        // 本地不需要设置
+        let mut format_info = self.format_info.lock().await;
+        format_info.id = id;
+        Ok(())
     }
 
     #[must_use]
@@ -503,7 +562,8 @@ impl DiskAPI for LocalDisk {
 
         let file = File::create(&fpath).await?;
 
-        Ok(FileWriter::new(file))
+        Ok(FileWriter::Local(LocalFileWriter::new(file)))
+        // Ok(FileWriter::new(file))
 
         // let mut writer = BufWriter::new(file);
 
@@ -529,7 +589,8 @@ impl DiskAPI for LocalDisk {
             .open(&p)
             .await?;
 
-        Ok(FileWriter::new(file))
+        Ok(FileWriter::Local(LocalFileWriter::new(file)))
+        // Ok(FileWriter::new(file))
 
         // let mut writer = BufWriter::new(file);
 
@@ -546,7 +607,7 @@ impl DiskAPI for LocalDisk {
         debug!("read_file {:?}", &p);
         let file = File::options().read(true).open(&p).await?;
 
-        Ok(FileReader::new(file))
+        Ok(FileReader::Local(LocalFileReader::new(file)))
 
         // file.seek(SeekFrom::Start(offset as u64)).await?;
 
@@ -967,7 +1028,20 @@ impl DiskAPI for LocalDisk {
         let p = self.get_bucket_path(volume)?;
 
         // TODO: 不能用递归删除，如果目录下面有文件，返回errVolumeNotEmpty
-        fs::remove_dir_all(&p).await?;
+
+        if let Err(err) = fs::remove_dir_all(&p).await {
+            match err.kind() {
+                ErrorKind::NotFound => (),
+                // ErrorKind::DirectoryNotEmpty => (),
+                kind => {
+                    if kind.to_string() == "directory not empty" {
+                        return Err(Error::new(DiskError::VolumeNotEmpty));
+                    }
+
+                    return Err(Error::from(err));
+                }
+            }
+        }
 
         Ok(())
     }

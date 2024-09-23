@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use futures::future::join_all;
 use http::HeaderMap;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -12,9 +13,11 @@ use crate::{
     endpoints::PoolEndpoints,
     error::{Error, Result},
     set_disk::SetDisks,
+    store::{GLOBAL_IsDistErasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsV2Info,
-        MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
+        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
+        PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -35,7 +38,7 @@ pub struct Sets {
 }
 
 impl Sets {
-    pub fn new(
+    pub async fn new(
         disks: Vec<Option<DiskStore>>,
         endpoints: &PoolEndpoints,
         fm: &FormatV3,
@@ -51,13 +54,39 @@ impl Sets {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
-                if disks[idx].is_none() {
+                let mut disk = disks[idx].clone();
+                if disk.is_none() {
+                    warn!("sets new set_drive {}-{} is none", i, j);
                     set_drive.push(None);
-                } else {
-                    let disk = disks[idx].clone();
+                    continue;
+                }
+
+                if disk.as_ref().unwrap().is_local() && *GLOBAL_IsDistErasure.read().await {
+                    let local_disk = {
+                        let local_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.read().await;
+                        local_set_drives[pool_idx][i][j].clone()
+                    };
+
+                    if local_disk.is_none() {
+                        warn!("sets new set_drive {}-{} local_disk is none", i, j);
+                        set_drive.push(None);
+                        continue;
+                    }
+
+                    let _ = disk.as_ref().unwrap().close().await;
+
+                    disk = local_disk;
+                }
+
+                if let Some(_disk_id) = disk.as_ref().unwrap().get_disk_id().await {
                     set_drive.push(disk);
+                } else {
+                    warn!("sets new set_drive {}-{} get_disk_id is none", i, j);
+                    set_drive.push(None);
                 }
             }
+
+            warn!("sets new set_drive {:?}", &set_drive);
 
             let set_disks = SetDisks {
                 disks: set_drive,
@@ -246,6 +275,13 @@ impl StorageAPI for Sets {
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
     }
+
+    async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object)
+            .put_object_info(bucket, object, info, opts)
+            .await
+    }
+
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -297,7 +333,7 @@ impl StorageAPI for Sets {
             .await
     }
 
-    async fn delete_bucket(&self, _bucket: &str) -> Result<()> {
+    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
 }
