@@ -24,7 +24,10 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
-use tokio::{fs, sync::RwLock};
+use tokio::{
+    fs,
+    sync::{RwLock, Semaphore},
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -391,60 +394,69 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<(PoolObjInfo, Vec<Error>)> {
-        let mut futures = Vec::new();
-
-        for pool in self.pools.iter() {
-            futures.push(pool.get_object_info(bucket, object, opts));
-        }
-
-        let results = join_all(futures).await;
-
-        let mut ress = Vec::new();
-
-        let mut i = 0;
-
-        // join_all结果跟输入顺序一致
-        for res in results {
-            let index = i;
-
-            match res {
-                Ok(r) => {
-                    ress.push(PoolObjInfo {
-                        index,
-                        object_info: r,
-                        err: None,
-                    });
-                }
-                Err(e) => {
-                    ress.push(PoolObjInfo {
-                        index,
-                        err: Some(e),
-                        ..Default::default()
-                    });
-                }
-            }
-            i += 1;
-        }
-
-        ress.sort_by(|a, b| {
-            let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-            let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-
-            at.cmp(&bt)
-        });
-
-        for res in ress {
-            // check
-            if res.err.is_none() {
-                // TODO: let errs = self.poolsWithObject()
-                return Ok((res, Vec::new()));
-            }
-        }
-
-        let ret = PoolObjInfo::default();
-
-        Ok((ret, Vec::new()))
+        internal_get_pool_info_existing_with_opts(&self.pools, bucket, object, opts).await
     }
+}
+
+async fn internal_get_pool_info_existing_with_opts(
+    pools: &[Sets],
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+) -> Result<(PoolObjInfo, Vec<Error>)> {
+    let mut futures = Vec::new();
+
+    for pool in pools.iter() {
+        futures.push(pool.get_object_info(bucket, object, opts));
+    }
+
+    let results = join_all(futures).await;
+
+    let mut ress = Vec::new();
+
+    let mut i = 0;
+
+    // join_all结果跟输入顺序一致
+    for res in results {
+        let index = i;
+
+        match res {
+            Ok(r) => {
+                ress.push(PoolObjInfo {
+                    index,
+                    object_info: r,
+                    err: None,
+                });
+            }
+            Err(e) => {
+                ress.push(PoolObjInfo {
+                    index,
+                    err: Some(e),
+                    ..Default::default()
+                });
+            }
+        }
+        i += 1;
+    }
+
+    ress.sort_by(|a, b| {
+        let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+
+        at.cmp(&bt)
+    });
+
+    for res in ress {
+        // check
+        if res.err.is_none() {
+            // TODO: let errs = self.poolsWithObject()
+            return Ok((res, Vec::new()));
+        }
+    }
+
+    let ret = PoolObjInfo::default();
+
+    Ok((ret, Vec::new()))
 }
 
 #[derive(Debug, Default)]
@@ -559,15 +571,29 @@ impl StorageAPI for ECStore {
             del_errs.push(None)
         }
 
-        // TODO: limte 限制并发数量
-        let opt = ObjectOptions::default();
-        // 取所有poolObjInfo
-        let mut futures = Vec::new();
-        for obj in objects.iter() {
-            futures.push(self.get_pool_info_existing_with_opts(bucket, &obj.object_name, &opt));
-        }
+        let mut jhs = Vec::new();
+        let semaphore = Arc::new(Semaphore::new(num_cpus::get()));
+        let pools = Arc::new(self.pools.clone());
 
-        let results = join_all(futures).await;
+        for obj in objects.iter() {
+            let (semaphore, pools, bucket, object_name, opt) = (
+                semaphore.clone(),
+                pools.clone(),
+                bucket.to_string(),
+                obj.object_name.to_string(),
+                ObjectOptions::default(),
+            );
+
+            let jh = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                internal_get_pool_info_existing_with_opts(pools.as_ref(), &bucket, &object_name, &opt).await
+            });
+            jhs.push(jh);
+        }
+        let mut results = Vec::new();
+        for jh in jhs {
+            results.push(jh.await.unwrap());
+        }
 
         // 记录pool Index 对应的objects pool_idx -> objects idx
         let mut pool_index_objects = HashMap::new();
