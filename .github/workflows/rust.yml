@@ -71,9 +71,8 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: build
-          args: --verbose
 
       - uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --all --verbose
+          args: --all
