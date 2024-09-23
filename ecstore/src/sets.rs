@@ -93,7 +93,7 @@ impl Sets {
                 }
             }
 
-            warn!("sets new set_drive {:?}", &set_drive);
+            // warn!("sets new set_drive {:?}", &set_drive);
 
             let set_disks = SetDisks {
                 disks: RwLock::new(set_drive),
