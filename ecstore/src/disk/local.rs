@@ -1,7 +1,7 @@
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RenameDataResp, VolumeInfo, WalkDirOptions,
+    ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::{
@@ -451,12 +451,23 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
+    fn to_string(&self) -> String {
+        self.root.to_string_lossy().to_string()
+    }
     fn is_local(&self) -> bool {
         true
+    }
+    fn host_name(&self) -> String {
+        self.endpoint.host_port()
     }
     async fn is_online(&self) -> bool {
         true
     }
+
+    fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
     async fn close(&self) -> Result<()> {
         Ok(())
     }
@@ -959,7 +970,12 @@ impl DiskAPI for LocalDisk {
             created: modtime,
         })
     }
-
+    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+        unimplemented!()
+    }
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) {
+        unimplemented!()
+    }
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         let p = self.get_object_path(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;
 

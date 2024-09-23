@@ -30,7 +30,7 @@ use crate::{
 use super::{
     endpoint::Endpoint, DeleteOptions, DiskAPI, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter,
     MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter, RenameDataResp,
-    VolumeInfo, WalkDirOptions,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 
 #[derive(Debug)]
@@ -97,8 +97,16 @@ impl RemoteDisk {
 // TODO: all api need to handle errors
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
+    fn to_string(&self) -> String {
+        self.endpoint.to_string()
+    }
+
     fn is_local(&self) -> bool {
         false
+    }
+
+    fn host_name(&self) -> String {
+        self.endpoint.host_port()
     }
     async fn is_online(&self) -> bool {
         // TODO: 连接状态
@@ -106,6 +114,9 @@ impl DiskAPI for RemoteDisk {
             return true;
         }
         false
+    }
+    fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
     }
     async fn close(&self) -> Result<()> {
         Ok(())
@@ -388,6 +399,13 @@ impl DiskAPI for RemoteDisk {
         let volume_info = serde_json::from_str::<VolumeInfo>(&response.volume_info)?;
 
         Ok(volume_info)
+    }
+
+    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+        unimplemented!()
+    }
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) {
+        unimplemented!()
     }
 
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
