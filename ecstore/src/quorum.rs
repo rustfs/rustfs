@@ -15,10 +15,6 @@ enum QuorumError {
     Write,
 }
 
-pub fn is_file_not_found(e: &Error) -> bool {
-    DiskError::FileNotFound.is(e)
-}
-
 pub fn base_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
     vec![
         Box::new(DiskError::DiskNotFound),
@@ -29,14 +25,20 @@ pub fn base_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
 
 // object_op_ignored_errs
 pub fn object_op_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
-    vec![
-        Box::new(DiskError::DiskNotFound),
-        Box::new(DiskError::FaultyDisk),
-        Box::new(DiskError::FaultyRemoteDisk),
+    let mut base = base_ignored_errs();
+
+    
+    let ext:Vec<Box<dyn CheckErrorFn>> = vec![
+        // Box::new(DiskError::DiskNotFound),
+        // Box::new(DiskError::FaultyDisk),
+        // Box::new(DiskError::FaultyRemoteDisk),
         Box::new(DiskError::DiskAccessDenied),
         Box::new(DiskError::UnformattedDisk),
         Box::new(DiskError::DiskOngoingReq),
-    ]
+    ];
+
+    base.extend(ext);
+    base
 }
 
 // 用于检查错误是否被忽略的函数

@@ -1,6 +1,6 @@
 const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
-const SLASH_SEPARATOR: &str = "/";
+pub const SLASH_SEPARATOR: &str = "/";
 
 pub fn has_suffix(s: &str, suffix: &str) -> bool {
     if cfg!(target_os = "windows") {

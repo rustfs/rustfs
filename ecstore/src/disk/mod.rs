@@ -3,6 +3,7 @@ pub mod error;
 pub mod format;
 mod local;
 mod remote;
+pub mod os;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
@@ -56,7 +57,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()>;
 
     fn path(&self) -> PathBuf;
-    fn get_location(&self) -> DiskLocation;
+    fn get_disk_location(&self) -> DiskLocation;
 
     // Healing
     // DiskInfo
@@ -126,7 +127,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
-    // GetDiskLoc
+    
 }
 
 pub struct UpdateMetadataOpts {

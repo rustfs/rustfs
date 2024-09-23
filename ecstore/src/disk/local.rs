@@ -1,9 +1,11 @@
+use super::error::{ioerr_to_diskerr, os_is_not_exist};
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
-    DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
+    os, DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
+use crate::utils::path::SLASH_SEPARATOR;
 use crate::{
     error::{Error, Result},
     file_meta::FileMeta,
@@ -93,6 +95,8 @@ impl LocalDisk {
             last_check: format_last_check,
         };
 
+        // TODO: DIRECT suport
+        // TODD: DiskInfo
         let disk = Self {
             root,
             endpoint: ep.clone(),
@@ -107,6 +111,36 @@ impl LocalDisk {
         disk.make_meta_volumes().await?;
 
         Ok(disk)
+    }
+
+    fn check_path_length(path_name: &str) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn is_valid_volname(volname: &str) -> bool {
+        if volname.len() < 3 {
+            return false;
+        }
+
+        if cfg!(target_os = "windows") {
+            // 在 Windows 上，卷名不应该包含保留字符。
+            // 这个正则表达式匹配了不允许的字符。
+            if volname.contains('|')
+                || volname.contains('<')
+                || volname.contains('>')
+                || volname.contains('?')
+                || volname.contains('*')
+                || volname.contains(':')
+                || volname.contains('"')
+                || volname.contains('\\')
+            {
+                return false;
+            }
+        } else {
+            // 对于非 Windows 系统，可能需要其他的验证逻辑。
+        }
+
+        true
     }
 
     async fn check_format_json(&self) -> Result<Metadata> {
@@ -475,7 +509,7 @@ impl DiskAPI for LocalDisk {
         self.root.clone()
     }
 
-    fn get_location(&self) -> DiskLocation {
+    fn get_disk_location(&self) -> DiskLocation {
         DiskLocation {
             pool_idx: self.endpoint.pool_idx,
             set_idx: self.endpoint.set_idx,
@@ -900,54 +934,51 @@ impl DiskAPI for LocalDisk {
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
         for vol in volumes {
             if let Err(e) = self.make_volume(vol).await {
-                match &e.downcast_ref::<DiskError>() {
-                    Some(DiskError::VolumeExists) => Ok(()),
-                    Some(_) => Err(e),
-                    None => Err(e),
-                }?;
+                if !DiskError::VolumeExists.is(&e) {
+                    return Err(e);
+                }
             }
             // TODO: health check
         }
         Ok(())
     }
     async fn make_volume(&self, volume: &str) -> Result<()> {
+        if !Self::is_valid_volname(volume) {
+            return Err(Error::msg("Invalid arguments specified"));
+        }
+
         let p = self.get_bucket_path(volume)?;
-        match File::open(&p).await {
-            Ok(_) => (),
-            Err(e) => match e.kind() {
-                ErrorKind::NotFound => {
-                    fs::create_dir_all(&p).await?;
-                    return Ok(());
-                }
-                _ => return Err(Error::from(e)),
-            },
+
+        if let Err(err) = utils::fs::access(&p).await {
+            if os_is_not_exist(err) {
+                os::make_dir_all(&p).await?;
+            }
         }
 
         Err(Error::from(DiskError::VolumeExists))
     }
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
-        let mut entries = fs::read_dir(&self.root).await?;
-
         let mut volumes = Vec::new();
 
-        while let Some(entry) = entries.next_entry().await? {
-            if let Ok(metadata) = entry.metadata().await {
-                // if !metadata.is_dir() {
-                //     continue;
-                // }
-
-                let name = entry.file_name().to_string_lossy().to_string();
-
-                let created = match metadata.created() {
-                    Ok(md) => Some(OffsetDateTime::from(md)),
-                    Err(_) => {
-                        warn!("Not supported created on this platform");
-                        None
-                    }
-                };
-
-                volumes.push(VolumeInfo { name, created });
+        let entries = os::read_dir(&self.root, 0).await.map_err(|e| {
+            if DiskError::FileAccessDenied.is(&e) {
+                Error::new(DiskError::DiskAccessDenied)
+            } else if DiskError::FileNotFound.is(&e) {
+                Error::new(DiskError::DiskAccessDenied)
+            } else {
+                e
             }
+        })?;
+
+        for entry in entries {
+            if utils::path::has_suffix(&entry, SLASH_SEPARATOR) || !Self::is_valid_volname(&entry) {
+                continue;
+            }
+
+            volumes.push(VolumeInfo {
+                name: entry,
+                created: None,
+            });
         }
 
         Ok(volumes)

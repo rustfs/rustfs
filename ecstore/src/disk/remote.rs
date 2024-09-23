@@ -125,7 +125,7 @@ impl DiskAPI for RemoteDisk {
         self.root.clone()
     }
 
-    fn get_location(&self) -> DiskLocation {
+    fn get_disk_location(&self) -> DiskLocation {
         DiskLocation {
             pool_idx: self.endpoint.pool_idx,
             set_idx: self.endpoint.set_idx,
