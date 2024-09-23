@@ -22,7 +22,7 @@ use crate::{
     utils::hash,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Sets {
     pub id: Uuid,
     // pub sets: Vec<Objects>,
