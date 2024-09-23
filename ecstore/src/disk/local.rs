@@ -484,7 +484,6 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
-        warn!("local get_disk_id");
         // TODO: check format file
         let mut format_info = self.format_info.lock().await;
 
