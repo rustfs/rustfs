@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::error::{Error, Result};
 use http::HeaderMap;
 use rmp_serde::Serializer;
@@ -25,6 +27,8 @@ pub struct FileInfo {
     pub fresh: bool, // indicates this is a first time call to write FileInfo.
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 // impl Default for FileInfo {
@@ -150,6 +154,7 @@ impl FileInfo {
             size: self.size,
             parts: self.parts.clone(),
             is_latest: self.is_latest,
+            tags: self.tags.clone(),
         }
     }
     // to_part_offset 取offset 所在的part index, 返回part index, offset
@@ -429,6 +434,7 @@ pub struct ObjectInfo {
     pub delete_marker: bool,
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
+    pub tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Default)]
@@ -516,6 +522,9 @@ pub trait StorageAPI {
         start_after: &str,
     ) -> Result<ListObjectsV2Info>;
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+
+    async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()>;
+
     async fn get_object_reader(
         &self,
         bucket: &str,
