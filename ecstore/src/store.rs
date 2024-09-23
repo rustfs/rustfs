@@ -212,6 +212,7 @@ impl ECStore {
                         DeleteOptions {
                             recursive: true,
                             immediate: false,
+                            ..Default::default()
                         },
                     ));
                 }
