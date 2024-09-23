@@ -37,7 +37,10 @@ jobs:
           mv protoc3/bin/* /usr/local/bin/
           chmod +x /usr/local/bin/protoc
           rm -rf protoc-27.0-linux-x86_64.zip protoc3
-        
+
+      - name: print protoc version
+        run: protoc --version
+  
       - uses: actions/checkout@v2
 
       - uses: actions-rs/toolchain@v1
