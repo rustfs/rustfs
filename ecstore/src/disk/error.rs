@@ -1,3 +1,5 @@
+use std::io::{self, ErrorKind};
+
 use crate::{
     error::{Error, Result},
     quorum::CheckErrorFn,
@@ -98,6 +100,9 @@ pub enum DiskError {
 
     #[error("more data was sent than what was advertised")]
     MoreData,
+
+    #[error("other io err {0}")]
+    IoError(io::Error),
 }
 
 impl DiskError {
@@ -201,8 +206,61 @@ pub fn clone_err(err: &Error) -> Error {
             DiskError::CrossDeviceLink => Error::new(DiskError::CrossDeviceLink),
             DiskError::LessData => Error::new(DiskError::LessData),
             DiskError::MoreData => Error::new(DiskError::MoreData),
+            DiskError::IoError(ioerr) => Error::msg(ioerr.to_string()),
         }
     } else {
         Error::msg(err.to_string())
     }
+}
+
+
+pub fn ioerr_to_diskerr(e:io::Error)->DiskError{
+match e.kind(){
+    io::ErrorKind::NotFound => DiskError::FileNotFound,
+    io::ErrorKind::PermissionDenied => DiskError::FileAccessDenied,
+    // io::ErrorKind::ConnectionRefused => todo!(),
+    // io::ErrorKind::ConnectionReset => todo!(),
+    // io::ErrorKind::HostUnreachable => todo!(),
+    // io::ErrorKind::NetworkUnreachable => todo!(),
+    // io::ErrorKind::ConnectionAborted => todo!(),
+    // io::ErrorKind::NotConnected => todo!(),
+    // io::ErrorKind::AddrInUse => todo!(),
+    // io::ErrorKind::AddrNotAvailable => todo!(),
+    // io::ErrorKind::NetworkDown => todo!(),
+    // io::ErrorKind::BrokenPipe => todo!(),
+    // io::ErrorKind::AlreadyExists => todo!(),
+    // io::ErrorKind::WouldBlock => todo!(),
+    // io::ErrorKind::NotADirectory => DiskError::FileNotFound,
+    // io::ErrorKind::IsADirectory => DiskError::FileNotFound,
+    // io::ErrorKind::DirectoryNotEmpty => DiskError::VolumeNotEmpty,
+    // io::ErrorKind::ReadOnlyFilesystem => todo!(),
+    // io::ErrorKind::FilesystemLoop => todo!(),
+    // io::ErrorKind::StaleNetworkFileHandle => todo!(),
+    // io::ErrorKind::InvalidInput => todo!(),
+    // io::ErrorKind::InvalidData => todo!(),
+    // io::ErrorKind::TimedOut => todo!(),
+    // io::ErrorKind::WriteZero => todo!(),
+    // io::ErrorKind::StorageFull => DiskError::DiskFull,
+    // io::ErrorKind::NotSeekable => todo!(),
+    // io::ErrorKind::FilesystemQuotaExceeded => todo!(),
+    // io::ErrorKind::FileTooLarge => todo!(),
+    // io::ErrorKind::ResourceBusy => todo!(),
+    // io::ErrorKind::ExecutableFileBusy => todo!(),
+    // io::ErrorKind::Deadlock => todo!(),
+    // io::ErrorKind::CrossesDevices => todo!(),
+    // io::ErrorKind::TooManyLinks =>DiskError::TooManyOpenFiles,
+    // io::ErrorKind::InvalidFilename => todo!(),
+    // io::ErrorKind::ArgumentListTooLong => todo!(),
+    // io::ErrorKind::Interrupted => todo!(),
+    // io::ErrorKind::Unsupported => todo!(),
+    // io::ErrorKind::UnexpectedEof => todo!(),
+    // io::ErrorKind::OutOfMemory => todo!(),
+    // io::ErrorKind::Other => todo!(),
+    // TODO: 把不支持的king用字符串处理 
+    _ => DiskError::IoError(e),
+}
+}
+
+pub fn os_is_not_exist(e:io::Error) -> bool{
+    e.kind() ==  ErrorKind::NotFound
 }
