@@ -47,7 +47,7 @@ impl Erasure {
     pub async fn encode<S>(
         &self,
         body: S,
-        writers: &mut [FileWriter],
+        writers: &mut [Option<FileWriter>],
         // block_size: usize,
         total_size: usize,
         write_quorum: usize,
@@ -85,7 +85,10 @@ impl Erasure {
                     let mut errs = Vec::new();
 
                     for (i, w) in writers.iter_mut().enumerate() {
-                        match w.write(blocks[i].as_ref()).await {
+                        if w.is_none() {
+                            continue;
+                        }
+                        match w.as_mut().unwrap().write(blocks[i].as_ref()).await {
                             Ok(_) => errs.push(None),
                             Err(e) => errs.push(Some(e)),
                         }

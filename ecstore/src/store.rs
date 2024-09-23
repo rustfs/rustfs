@@ -1,8 +1,6 @@
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::{
-        error::DiskError, new_disk, DeleteOptions, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
-    },
+    disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     endpoints::{EndpointServerPools, SetupType},
     error::{Error, Result},
     peer::S3PeerSys,
@@ -26,7 +24,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::{fs, sync::RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use lazy_static::lazy_static;
@@ -151,7 +149,7 @@ pub struct ECStore {
     pub id: uuid::Uuid,
     // pub disks: Vec<DiskStore>,
     pub disk_map: HashMap<usize, Vec<Option<DiskStore>>>,
-    pub pools: Vec<Sets>,
+    pub pools: Vec<Arc<Sets>>,
     pub peer_sys: S3PeerSys,
     // pub local_disks: Vec<DiskStore>,
 }
@@ -226,7 +224,6 @@ impl ECStore {
             }
 
             let sets = Sets::new(disks.clone(), pool_eps, &fm, i, partiy_count).await?;
-
             pools.push(sets);
 
             disk_map.insert(i, disks);
@@ -288,62 +285,54 @@ impl ECStore {
 
         for sets in self.pools.iter() {
             for set in sets.disk_set.iter() {
-                for disk in set.disks.iter() {
-                    if disk.is_none() {
-                        continue;
-                    }
-
-                    let disk = disk.as_ref().unwrap();
-                    let opts = opts.clone();
-                    // let mut wr = &mut wr;
-                    futures.push(disk.walk_dir(opts));
-                    // tokio::spawn(async move { disk.walk_dir(opts, wr).await });
-                }
+                futures.push(set.walk_dir(&opts));
             }
         }
 
         let results = join_all(futures).await;
 
-        let mut errs = Vec::new();
+        // let mut errs = Vec::new();
         let mut ress = Vec::new();
         let mut uniq = HashSet::new();
 
-        for res in results {
-            match res {
-                Ok(entrys) => {
-                    for entry in entrys {
-                        if !uniq.contains(&entry.name) {
-                            uniq.insert(entry.name.clone());
-                            // TODO: 过滤
-                            if opts.limit > 0 && ress.len() as i32 >= opts.limit {
-                                return Ok(ress);
-                            }
+        for (disks_ress, _disks_errs) in results {
+            for (_i, disks_res) in disks_ress.iter().enumerate() {
+                if disks_res.is_none() {
+                    // TODO handle errs
+                    continue;
+                }
+                let entrys = disks_res.as_ref().unwrap();
 
-                            if entry.is_object() {
-                                let fi = entry.to_fileinfo(&opts.bucket)?;
-                                if fi.is_some() {
-                                    ress.push(fi.unwrap().into_object_info(&opts.bucket, &entry.name, false));
-                                }
-                                continue;
-                            }
+                for entry in entrys {
+                    if !uniq.contains(&entry.name) {
+                        uniq.insert(entry.name.clone());
+                        // TODO: 过滤
+                        if opts.limit > 0 && ress.len() as i32 >= opts.limit {
+                            return Ok(ress);
+                        }
 
-                            if entry.is_dir() {
-                                ress.push(ObjectInfo {
-                                    is_dir: true,
-                                    bucket: opts.bucket.clone(),
-                                    name: entry.name,
-                                    ..Default::default()
-                                });
+                        if entry.is_object() {
+                            let fi = entry.to_fileinfo(&opts.bucket)?;
+                            if fi.is_some() {
+                                ress.push(fi.unwrap().into_object_info(&opts.bucket, &entry.name, false));
                             }
+                            continue;
+                        }
+
+                        if entry.is_dir() {
+                            ress.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: opts.bucket.clone(),
+                                name: entry.name.clone(),
+                                ..Default::default()
+                            });
                         }
                     }
-                    errs.push(None);
                 }
-                Err(e) => errs.push(Some(e)),
             }
         }
 
-        warn!("list_merged errs {:?}", errs);
+        // warn!("list_merged errs {:?}", errs);
 
         Ok(ress)
     }
@@ -352,22 +341,23 @@ impl ECStore {
         let mut futures = Vec::new();
         for sets in self.pools.iter() {
             for set in sets.disk_set.iter() {
-                for disk in set.disks.iter() {
-                    if disk.is_none() {
-                        continue;
-                    }
-
-                    let disk = disk.as_ref().unwrap();
-                    futures.push(disk.delete(
-                        bucket,
-                        prefix,
-                        DeleteOptions {
-                            recursive: true,
-                            immediate: false,
-                            ..Default::default()
-                        },
-                    ));
-                }
+                futures.push(set.delete_all(bucket, prefix));
+                // let disks = set.disks.read().await;
+                // let dd = disks.clone();
+                // for disk in dd {
+                //     if disk.is_none() {
+                //         continue;
+                //     }
+                //     // let disk = disk.as_ref().unwrap().clone();
+                //     // futures.push(disk.delete(
+                //     //     bucket,
+                //     //     prefix,
+                //     //     DeleteOptions {
+                //     //         recursive: true,
+                //     //         immediate: false,
+                //     //     },
+                //     // ));
+                // }
             }
         }
         let results = join_all(futures).await;
