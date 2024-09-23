@@ -166,3 +166,43 @@ impl CheckErrorFn for DiskError {
         self.is(e)
     }
 }
+
+pub fn clone_err(err: &Error) -> Error {
+    if let Some(e) = err.downcast_ref::<DiskError>() {
+        match e {
+            DiskError::MaxVersionsExceeded => Error::new(DiskError::MaxVersionsExceeded),
+            DiskError::Unexpected => Error::new(DiskError::Unexpected),
+            DiskError::CorruptedFormat => Error::new(DiskError::CorruptedFormat),
+            DiskError::CorruptedBackend => Error::new(DiskError::CorruptedBackend),
+            DiskError::UnformattedDisk => Error::new(DiskError::UnformattedDisk),
+            DiskError::InconsistentDisk => Error::new(DiskError::InconsistentDisk),
+            DiskError::UnsupportedDisk => Error::new(DiskError::UnsupportedDisk),
+            DiskError::DiskFull => Error::new(DiskError::DiskFull),
+            DiskError::DiskNotDir => Error::new(DiskError::DiskNotDir),
+            DiskError::DiskNotFound => Error::new(DiskError::DiskNotFound),
+            DiskError::DiskOngoingReq => Error::new(DiskError::DiskOngoingReq),
+            DiskError::DriveIsRoot => Error::new(DiskError::DriveIsRoot),
+            DiskError::FaultyRemoteDisk => Error::new(DiskError::FaultyRemoteDisk),
+            DiskError::FaultyDisk => Error::new(DiskError::FaultyDisk),
+            DiskError::DiskAccessDenied => Error::new(DiskError::DiskAccessDenied),
+            DiskError::FileNotFound => Error::new(DiskError::FileNotFound),
+            DiskError::FileVersionNotFound => Error::new(DiskError::FileVersionNotFound),
+            DiskError::TooManyOpenFiles => Error::new(DiskError::TooManyOpenFiles),
+            DiskError::FileNameTooLong => Error::new(DiskError::FileNameTooLong),
+            DiskError::VolumeExists => Error::new(DiskError::VolumeExists),
+            DiskError::IsNotRegular => Error::new(DiskError::IsNotRegular),
+            DiskError::PathNotFound => Error::new(DiskError::PathNotFound),
+            DiskError::VolumeNotFound => Error::new(DiskError::VolumeNotFound),
+            DiskError::VolumeNotEmpty => Error::new(DiskError::VolumeNotEmpty),
+            DiskError::VolumeAccessDenied => Error::new(DiskError::VolumeAccessDenied),
+            DiskError::FileAccessDenied => Error::new(DiskError::FileAccessDenied),
+            DiskError::FileCorrupt => Error::new(DiskError::FileCorrupt),
+            DiskError::BitrotHashAlgoInvalid => Error::new(DiskError::BitrotHashAlgoInvalid),
+            DiskError::CrossDeviceLink => Error::new(DiskError::CrossDeviceLink),
+            DiskError::LessData => Error::new(DiskError::LessData),
+            DiskError::MoreData => Error::new(DiskError::MoreData),
+        }
+    } else {
+        Error::msg(err.to_string())
+    }
+}
