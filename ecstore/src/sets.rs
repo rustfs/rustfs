@@ -205,10 +205,10 @@ impl StorageAPI for Sets {
         let mut set_obj_map = HashMap::new();
 
         // hash key
-        let mut i = 0;
-        for obj in objects.iter() {
+        for (i, obj) in objects.iter().enumerate() {
             let idx = self.get_hashed_set_index(obj.object_name.as_str());
 
+            #[allow(clippy::map_entry)]
             if !set_obj_map.contains_key(&idx) {
                 set_obj_map.insert(
                     idx,
@@ -218,17 +218,13 @@ impl StorageAPI for Sets {
                         obj: obj.clone(),
                     }],
                 );
-            } else {
-                if let Some(val) = set_obj_map.get_mut(&idx) {
-                    val.push(DelObj {
-                        // set_idx: idx,
-                        orig_idx: i,
-                        obj: obj.clone(),
-                    });
-                }
+            } else if let Some(val) = set_obj_map.get_mut(&idx) {
+                val.push(DelObj {
+                    // set_idx: idx,
+                    orig_idx: i,
+                    obj: obj.clone(),
+                });
             }
-
-            i += 1;
         }
 
         // TODO: 并发
@@ -237,15 +233,12 @@ impl StorageAPI for Sets {
             let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
             let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await?;
 
-            let mut i = 0;
-            for err in errs {
+            for (i, err) in errs.into_iter().enumerate() {
                 let obj = v.get(i).unwrap();
 
                 del_errs[obj.orig_idx] = err;
 
                 del_objects[obj.orig_idx] = dobjects.get(i).unwrap().clone();
-
-                i += 1;
             }
         }
 
