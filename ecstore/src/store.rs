@@ -1,3 +1,4 @@
+#![allow(clippy::map_entry)]
 use crate::{
     bucket_meta::BucketMetadata,
     disk::{
@@ -54,10 +55,11 @@ pub async fn update_erasure_type(setup_type: SetupType) {
     *is_erasure_sd = setup_type == SetupType::ErasureSD;
 }
 
+type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
+
 lazy_static! {
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
-    pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<Vec<Vec<Vec<Option<DiskStore>>>>>> =
-        Arc::new(RwLock::new(Vec::new()));
+    pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
 }
 
 pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
@@ -79,7 +81,7 @@ pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
 
 pub async fn all_local_disk_path() -> Vec<String> {
     let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
-    disk_map.keys().map(|v| v.clone()).collect()
+    disk_map.keys().cloned().collect()
 }
 
 pub async fn all_local_disk() -> Vec<DiskStore> {
@@ -159,6 +161,7 @@ pub struct ECStore {
 }
 
 impl ECStore {
+    #[allow(clippy::new_ret_no_self)]
     pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<()> {
         // let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 
@@ -321,8 +324,8 @@ impl ECStore {
 
                             if entry.is_object() {
                                 let fi = entry.to_fileinfo(&opts.bucket)?;
-                                if fi.is_some() {
-                                    ress.push(fi.unwrap().into_object_info(&opts.bucket, &entry.name, false));
+                                if let Some(f) = fi {
+                                    ress.push(f.into_object_info(&opts.bucket, &entry.name, false));
                                 }
                                 continue;
                             }
@@ -414,10 +417,8 @@ async fn internal_get_pool_info_existing_with_opts(
 
     let mut ress = Vec::new();
 
-    let mut i = 0;
-
     // join_all结果跟输入顺序一致
-    for res in results {
+    for (i, res) in results.into_iter().enumerate() {
         let index = i;
 
         match res {
@@ -436,7 +437,6 @@ async fn internal_get_pool_info_existing_with_opts(
                 });
             }
         }
-        i += 1;
     }
 
     ress.sort_by(|a, b| {
@@ -598,8 +598,7 @@ impl StorageAPI for ECStore {
         // 记录pool Index 对应的objects pool_idx -> objects idx
         let mut pool_index_objects = HashMap::new();
 
-        let mut i = 0;
-        for res in results {
+        for (i, res) in results.into_iter().enumerate() {
             match res {
                 Ok((pinfo, _)) => {
                     if pinfo.object_info.delete_marker && opts.version_id.is_empty() {
@@ -627,8 +626,6 @@ impl StorageAPI for ECStore {
                     del_errs[i] = Some(e)
                 }
             }
-
-            i += 1;
         }
 
         if !pool_index_objects.is_empty() {
@@ -641,16 +638,7 @@ impl StorageAPI for ECStore {
 
                 let obj_idxs = vals.unwrap();
                 //  取对应obj,理论上不会none
-                let objs: Vec<ObjectToDelete> = obj_idxs
-                    .iter()
-                    .filter_map(|&idx| {
-                        if let Some(obj) = objects.get(idx) {
-                            Some(obj.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let objs: Vec<ObjectToDelete> = obj_idxs.iter().filter_map(|&idx| objects.get(idx).cloned()).collect();
 
                 if objs.is_empty() {
                     continue;
@@ -659,8 +647,7 @@ impl StorageAPI for ECStore {
                 let (pdel_objs, perrs) = sets.delete_objects(bucket, objs, opts.clone()).await?;
 
                 // perrs的顺序理论上跟obj_idxs顺序一致
-                let mut i = 0;
-                for err in perrs {
+                for (i, err) in perrs.into_iter().enumerate() {
                     let obj_idx = obj_idxs[i];
 
                     if err.is_some() {
@@ -671,8 +658,6 @@ impl StorageAPI for ECStore {
                     dobj.object_name = utils::path::decode_dir_object(&dobj.object_name);
 
                     del_objects[obj_idx] = dobj;
-
-                    i += 1;
                 }
             }
         }
@@ -681,7 +666,7 @@ impl StorageAPI for ECStore {
     }
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix {
-            self.delete_prefix(bucket, &object).await?;
+            self.delete_prefix(bucket, object).await?;
             return Ok(ObjectInfo::default());
         }
 

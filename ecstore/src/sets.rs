@@ -1,3 +1,4 @@
+#![allow(clippy::map_entry)]
 use std::{collections::HashMap, sync::Arc};
 
 use futures::future::join_all;
@@ -209,7 +210,6 @@ impl StorageAPI for Sets {
         for (i, obj) in objects.iter().enumerate() {
             let idx = self.get_hashed_set_index(obj.object_name.as_str());
 
-            #[allow(clippy::map_entry)]
             if !set_obj_map.contains_key(&idx) {
                 set_obj_map.insert(
                     idx,
