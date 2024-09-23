@@ -22,17 +22,7 @@ ENV RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
 RUN curl -o rustup-init.sh --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
     && sh rustup-init.sh -y && rm -rf rustup-init.sh
 
-RUN echo "[source.crates-io]" > /root/.cargo/config.toml \
-&& echo "registry = \"https://github.com/rust-lang/crates.io-index\"" >> /root/.cargo/config.toml \
-&& echo "replace-with = \"rsproxy-sparse\"" >> /root/.cargo/config.toml \
-&& echo "[source.rsproxy]" >> /root/.cargo/config.toml \
-&& echo "registry = \"https://rsproxy.cn/crates.io-index\"" >> /root/.cargo/config.toml \
-&& echo "[source.rsproxy-sparse]" >> /root/.cargo/config.toml \
-&& echo "registry = \"sparse+https://rsproxy.cn/index/\"" >> /root/.cargo/config.toml \
-&& echo "[registries.rsproxy]" >> /root/.cargo/config.toml \
-&& echo "index = \"https://rsproxy.cn/crates.io-index\"" >> /root/.cargo/config.toml \
-&& echo "[net]" >> /root/.cargo/config.toml \
-&& echo "git-fetch-with-cli = true" >> /root/.cargo/config.toml
+COPY .docker/cargo.config.toml /root/.cargo/config.toml
 
 WORKDIR /root/s3-rustfs
 
