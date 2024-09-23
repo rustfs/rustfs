@@ -79,6 +79,14 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
+    async fn delete_version(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> Result<RawFileInfo>;
     async fn delete_versions(
         &self,
         volume: &str,
@@ -206,14 +214,18 @@ pub struct DiskOption {
     pub health_check: bool,
 }
 
+#[derive(Debug, Default)]
 pub struct RenameDataResp {
     pub old_data_dir: Option<Uuid>,
+    pub sign: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DeleteOptions {
     pub recursive: bool,
     pub immediate: bool,
+    pub undo_write: bool,
+    pub old_data_dir: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]

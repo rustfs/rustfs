@@ -742,6 +742,7 @@ impl DiskAPI for LocalDisk {
 
         Ok(RenameDataResp {
             old_data_dir: old_data_dir,
+            sign: None, // TODO:
         })
     }
 
@@ -871,6 +872,16 @@ impl DiskAPI for LocalDisk {
         let (buf, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
 
         Ok(RawFileInfo { buf })
+    }
+    async fn delete_version(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> Result<RawFileInfo> {
+        unimplemented!()
     }
     async fn delete_versions(
         &self,

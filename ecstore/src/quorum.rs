@@ -27,8 +27,16 @@ pub fn base_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
     ]
 }
 
-pub fn object_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
-    vec![Box::new(DiskError::FileNotFound)]
+// object_op_ignored_errs
+pub fn object_op_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
+    vec![
+        Box::new(DiskError::DiskNotFound),
+        Box::new(DiskError::FaultyDisk),
+        Box::new(DiskError::FaultyRemoteDisk),
+        Box::new(DiskError::DiskAccessDenied),
+        Box::new(DiskError::UnformattedDisk),
+        Box::new(DiskError::DiskOngoingReq),
+    ]
 }
 
 // 用于检查错误是否被忽略的函数
@@ -91,6 +99,7 @@ fn reduce_quorum_errs(errs: &Vec<Option<Error>>, ignored_errs: &Vec<Box<dyn Chec
 }
 
 // 根据读quorum验证错误数量
+// 返回最大错误数量的下标，或QuorumError
 pub fn reduce_read_quorum_errs(
     errs: &mut Vec<Option<Error>>,
     ignored_errs: &Vec<Box<dyn CheckErrorFn>>,
@@ -105,6 +114,7 @@ pub fn reduce_read_quorum_errs(
 }
 
 // 根据写quorum验证错误数量
+// 返回最大错误数量的下标，或QuorumError
 pub fn reduce_write_quorum_errs(
     errs: &Vec<Option<Error>>,
     ignored_errs: &Vec<Box<dyn CheckErrorFn>>,

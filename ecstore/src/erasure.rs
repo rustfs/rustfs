@@ -1,5 +1,5 @@
 use crate::error::{Error, Result, StdError};
-use crate::quorum::{object_ignored_errs, reduce_write_quorum_errs};
+use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
 use bytes::Bytes;
 use futures::future::join_all;
 use futures::{Stream, StreamExt};
@@ -94,7 +94,7 @@ impl Erasure {
 
                     warn!("Erasure encode errs {:?}", errs);
 
-                    let err_idx = reduce_write_quorum_errs(&errs, object_ignored_errs().as_ref(), write_quorum)?;
+                    let err_idx = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum)?;
                     if errs[err_idx].is_some() {
                         let err = errs[err_idx].take().unwrap();
                         return Err(err);
