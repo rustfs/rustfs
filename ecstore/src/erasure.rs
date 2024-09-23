@@ -94,7 +94,7 @@ impl Erasure {
 
                     warn!("Erasure encode errs {:?}", errs);
 
-                    let err_idx = reduce_write_quorum_errs(&errs, object_ignored_errs().as_slice(), write_quorum)?;
+                    let err_idx = reduce_write_quorum_errs(&errs, object_ignored_errs().as_ref(), write_quorum)?;
                     if errs[err_idx].is_some() {
                         let err = errs[err_idx].take().unwrap();
                         return Err(err);

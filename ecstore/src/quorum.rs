@@ -1,7 +1,11 @@
 use crate::{disk::error::DiskError, error::Error};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Debug};
 
-pub type CheckErrorFn = fn(e: &Error) -> bool;
+// pub type CheckErrorFn = fn(e: &Error) -> bool;
+
+pub trait CheckErrorFn: Debug + Send + Sync + 'static {
+    fn is(&self, e: &Error) -> bool;
+}
 
 #[derive(Debug, thiserror::Error)]
 enum QuorumError {
@@ -15,17 +19,25 @@ pub fn is_file_not_found(e: &Error) -> bool {
     DiskError::FileNotFound.is(e)
 }
 
-pub fn object_ignored_errs() -> Vec<CheckErrorFn> {
-    vec![is_file_not_found]
+pub fn base_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
+    vec![
+        Box::new(DiskError::DiskNotFound),
+        Box::new(DiskError::FaultyDisk),
+        Box::new(DiskError::FaultyRemoteDisk),
+    ]
+}
+
+pub fn object_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
+    vec![Box::new(DiskError::FileNotFound)]
 }
 
 // 用于检查错误是否被忽略的函数
-fn is_err_ignored(err: &Error, ignored_errs: &[CheckErrorFn]) -> bool {
-    ignored_errs.iter().any(|&ignored_err| ignored_err(err))
+fn is_err_ignored(err: &Error, ignored_errs: &Vec<Box<dyn CheckErrorFn>>) -> bool {
+    ignored_errs.iter().any(|ignored_err| ignored_err.is(err))
 }
 
 // 减少错误数量并返回出现次数最多的错误
-fn reduce_errs(errs: &Vec<Option<Error>>, ignored_errs: &[CheckErrorFn]) -> (usize, Option<usize>) {
+fn reduce_errs(errs: &Vec<Option<Error>>, ignored_errs: &Vec<Box<dyn CheckErrorFn>>) -> (usize, Option<usize>) {
     let mut error_counts: HashMap<String, usize> = HashMap::new();
     let mut error_map: HashMap<String, usize> = HashMap::new(); // 存err位置
     let nil = "nil".to_string();
@@ -69,7 +81,7 @@ fn reduce_errs(errs: &Vec<Option<Error>>, ignored_errs: &[CheckErrorFn]) -> (usi
 }
 
 // 根据quorum验证错误数量
-fn reduce_quorum_errs(errs: &Vec<Option<Error>>, ignored_errs: &[CheckErrorFn], quorum: usize) -> Option<usize> {
+fn reduce_quorum_errs(errs: &Vec<Option<Error>>, ignored_errs: &Vec<Box<dyn CheckErrorFn>>, quorum: usize) -> Option<usize> {
     let (max_count, max_err) = reduce_errs(errs, ignored_errs);
     if max_count >= quorum {
         max_err
@@ -81,7 +93,7 @@ fn reduce_quorum_errs(errs: &Vec<Option<Error>>, ignored_errs: &[CheckErrorFn], 
 // 根据读quorum验证错误数量
 pub fn reduce_read_quorum_errs(
     errs: &mut Vec<Option<Error>>,
-    ignored_errs: &[CheckErrorFn],
+    ignored_errs: &Vec<Box<dyn CheckErrorFn>>,
     read_quorum: usize,
 ) -> Result<usize, Error> {
     let idx = reduce_quorum_errs(errs, ignored_errs, read_quorum);
@@ -95,7 +107,7 @@ pub fn reduce_read_quorum_errs(
 // 根据写quorum验证错误数量
 pub fn reduce_write_quorum_errs(
     errs: &Vec<Option<Error>>,
-    ignored_errs: &[CheckErrorFn],
+    ignored_errs: &Vec<Box<dyn CheckErrorFn>>,
     write_quorum: usize,
 ) -> Result<usize, Error> {
     let idx = reduce_quorum_errs(errs, ignored_errs, write_quorum);

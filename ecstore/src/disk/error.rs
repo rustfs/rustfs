@@ -1,36 +1,103 @@
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    quorum::CheckErrorFn,
+};
 
+// DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
+    #[error("maximum versions exceeded, please delete few versions to proceed")]
+    MaxVersionsExceeded,
+
+    #[error("unexpected error")]
+    Unexpected,
+
+    #[error("corrupted format")]
+    CorruptedFormat,
+
+    #[error("corrupted backend")]
+    CorruptedBackend,
+
+    #[error("unformatted disk error")]
+    UnformattedDisk,
+
+    #[error("inconsistent drive found")]
+    InconsistentDisk,
+
+    #[error("drive does not support O_DIRECT")]
+    UnsupportedDisk,
+
+    #[error("drive path full")]
+    DiskFull,
+
+    #[error("disk not a dir")]
+    DiskNotDir,
+
+    #[error("disk not found")]
+    DiskNotFound,
+
+    #[error("drive still did not complete the request")]
+    DiskOngoingReq,
+
+    #[error("drive is part of root drive, will not be used")]
+    DriveIsRoot,
+
+    #[error("remote drive is faulty")]
+    FaultyRemoteDisk,
+
+    #[error("drive is faulty")]
+    FaultyDisk,
+
+    #[error("drive access denied")]
+    DiskAccessDenied,
+
     #[error("file not found")]
     FileNotFound,
 
     #[error("file version not found")]
     FileVersionNotFound,
 
-    #[error("disk not found")]
-    DiskNotFound,
+    #[error("too many open files, please increase 'ulimit -n'")]
+    TooManyOpenFiles,
 
-    #[error("disk access denied")]
-    FileAccessDenied,
-
-    #[error("InconsistentDisk")]
-    InconsistentDisk,
+    #[error("file name too long")]
+    FileNameTooLong,
 
     #[error("volume already exists")]
     VolumeExists,
 
-    #[error("unformatted disk error")]
-    UnformattedDisk,
+    #[error("not of regular file type")]
+    IsNotRegular,
 
-    #[error("unsupport disk")]
-    UnsupportedDisk,
-
-    #[error("disk not a dir")]
-    DiskNotDir,
+    #[error("path not found")]
+    PathNotFound,
 
     #[error("volume not found")]
     VolumeNotFound,
+
+    #[error("volume is not empty")]
+    VolumeNotEmpty,
+
+    #[error("volume access denied")]
+    VolumeAccessDenied,
+
+    #[error("disk access denied")]
+    FileAccessDenied,
+
+    #[error("file is corrupted")]
+    FileCorrupt,
+
+    #[error("bit-rot hash algorithm is invalid")]
+    BitrotHashAlgoInvalid,
+
+    #[error("Rename across devices not allowed, please fix your backend configuration")]
+    CrossDeviceLink,
+
+    #[error("less data available than what was requested")]
+    LessData,
+
+    #[error("more data was sent than what was advertised")]
+    MoreData,
 }
 
 impl DiskError {
@@ -91,5 +158,11 @@ impl DiskError {
 impl PartialEq for DiskError {
     fn eq(&self, other: &Self) -> bool {
         core::mem::discriminant(self) == core::mem::discriminant(other)
+    }
+}
+
+impl CheckErrorFn for DiskError {
+    fn is(&self, e: &Error) -> bool {
+        self.is(e)
     }
 }
