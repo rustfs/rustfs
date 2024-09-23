@@ -1,26 +1,150 @@
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::{error::DiskError, DeleteOptions, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-    disks_layout::DisksLayout,
-    endpoints::EndpointServerPools,
+    disk::{
+        error::DiskError, new_disk, DeleteOptions, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
+    },
+    endpoints::{EndpointServerPools, SetupType},
     error::{Error, Result},
-    peer::{PeerS3Client, S3PeerSys},
+    peer::S3PeerSys,
     sets::Sets,
     storage_class::default_partiy_count,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsInfo,
-        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
-        PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
+        ListObjectsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete,
+        PartInfo, PutObjReader, StorageAPI,
     },
     store_init, utils,
 };
+use backon::{ExponentialBuilder, Retryable};
 use futures::future::join_all;
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use time::OffsetDateTime;
-use tracing::{debug, warn};
+use tokio::{fs, sync::RwLock};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
+}
+
+pub async fn update_erasure_type(setup_type: SetupType) {
+    let mut is_erasure = GLOBAL_IsErasure.write().await;
+    *is_erasure = setup_type == SetupType::Erasure;
+
+    let mut is_dist_erasure = GLOBAL_IsDistErasure.write().await;
+    *is_dist_erasure = setup_type == SetupType::DistErasure;
+
+    if *is_dist_erasure {
+        *is_erasure = true
+    }
+
+    let mut is_erasure_sd = GLOBAL_IsErasureSD.write().await;
+    *is_erasure_sd = setup_type == SetupType::ErasureSD;
+}
+
+lazy_static! {
+    pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
+    pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<Vec<Vec<Vec<Option<DiskStore>>>>>> =
+        Arc::new(RwLock::new(Vec::new()));
+}
+
+pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
+    let disk_path = match fs::canonicalize(disk_path).await {
+        Ok(disk_path) => disk_path,
+        Err(_) => return None,
+    };
+
+    let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
+
+    let path = disk_path.to_string_lossy().to_string();
+    if disk_map.contains_key(&path) {
+        let a = disk_map[&path].as_ref().cloned();
+
+        return a;
+    }
+    None
+}
+
+pub async fn all_local_disk_path() -> Vec<String> {
+    let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
+    disk_map.keys().map(|v| v.clone()).collect()
+}
+
+pub async fn all_local_disk() -> Vec<DiskStore> {
+    let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
+    disk_map
+        .values()
+        .filter(|v| v.is_some())
+        .map(|v| v.as_ref().unwrap().clone())
+        .collect()
+}
+
+// init_local_disks 初始化本地磁盘，server启动前必须初始化成功
+pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
+    let opt = &DiskOption {
+        cleanup: true,
+        health_check: true,
+    };
+
+    let mut global_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.write().await;
+    for pool_eps in endpoint_pools.as_ref().iter() {
+        let mut set_count_drives = Vec::with_capacity(pool_eps.set_count);
+        for _ in 0..pool_eps.set_count {
+            set_count_drives.push(vec![None; pool_eps.drives_per_set]);
+        }
+
+        global_set_drives.push(set_count_drives);
+    }
+
+    let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
+
+    for pool_eps in endpoint_pools.as_ref().iter() {
+        let mut set_drives = HashMap::new();
+        for ep in pool_eps.endpoints.as_ref().iter() {
+            if !ep.is_local {
+                continue;
+            }
+
+            let disk = new_disk(ep, opt).await?;
+
+            let path = disk.path().to_string_lossy().to_string();
+
+            global_local_disk_map.insert(path, Some(disk.clone()));
+
+            set_drives.insert(ep.disk_idx, Some(disk.clone()));
+
+            if ep.pool_idx.is_some() && ep.set_idx.is_some() && ep.disk_idx.is_some() {
+                global_set_drives[ep.pool_idx.unwrap()][ep.set_idx.unwrap()][ep.disk_idx.unwrap()] = Some(disk.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+lazy_static! {
+    pub static ref GLOBAL_OBJECT_API: Arc<RwLock<Option<ECStore>>> = Arc::new(RwLock::new(None));
+    pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
+}
+
+pub fn new_object_layer_fn() -> Arc<RwLock<Option<ECStore>>> {
+    GLOBAL_OBJECT_API.clone()
+}
+
+async fn set_object_layer(o: ECStore) {
+    let mut global_object_api = GLOBAL_OBJECT_API.write().await;
+    *global_object_api = Some(o);
+}
 
 #[derive(Debug)]
 pub struct ECStore {
@@ -29,16 +153,16 @@ pub struct ECStore {
     pub disk_map: HashMap<usize, Vec<Option<DiskStore>>>,
     pub pools: Vec<Sets>,
     pub peer_sys: S3PeerSys,
-    pub local_disks: Vec<DiskStore>,
+    // pub local_disks: Vec<DiskStore>,
 }
 
 impl ECStore {
-    pub async fn new(address: String, endpoints: Vec<String>) -> Result<Self> {
-        let layouts = DisksLayout::try_from(endpoints.as_slice())?;
+    pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<()> {
+        // let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 
         let mut deployment_id = None;
 
-        let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
+        // let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
 
         let mut pools = Vec::with_capacity(endpoint_pools.as_ref().len());
         let mut disk_map = HashMap::with_capacity(endpoint_pools.as_ref().len());
@@ -46,6 +170,8 @@ impl ECStore {
         let first_is_local = endpoint_pools.first_local();
 
         let mut local_disks = Vec::new();
+
+        info!("endpoint_pools: {:?}", endpoint_pools);
 
         for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
             // TODO: read from config parseStorageClass
@@ -64,13 +190,21 @@ impl ECStore {
 
             DiskError::check_disk_fatal_errs(&errs)?;
 
-            let fm = store_init::do_init_format_file(
-                first_is_local,
-                &disks,
-                pool_eps.set_count,
-                pool_eps.drives_per_set,
-                deployment_id,
-            )
+            let fm = (|| async {
+                store_init::connect_load_init_formats(
+                    first_is_local,
+                    &disks,
+                    pool_eps.set_count,
+                    pool_eps.drives_per_set,
+                    deployment_id,
+                )
+                .await
+            })
+            .retry(ExponentialBuilder::default().with_max_times(usize::MAX))
+            .sleep(tokio::time::sleep)
+            .notify(|err, dur: Duration| {
+                info!("retrying get formats {:?} after {:?}", err, dur);
+            })
             .await?;
 
             if deployment_id.is_none() {
@@ -91,23 +225,41 @@ impl ECStore {
                 }
             }
 
-            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, partiy_count)?;
+            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, partiy_count).await?;
 
             pools.push(sets);
 
             disk_map.insert(i, disks);
         }
 
-        let peer_sys = S3PeerSys::new(&endpoint_pools, local_disks.clone());
+        // 替换本地磁盘
+        if !*GLOBAL_IsDistErasure.read().await {
+            let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
+            for disk in local_disks {
+                let path = disk.path().to_string_lossy().to_string();
+                global_local_disk_map.insert(path, Some(disk.clone()));
+            }
+        }
 
-        Ok(ECStore {
+        let peer_sys = S3PeerSys::new(&endpoint_pools);
+
+        let ec = ECStore {
             id: deployment_id.unwrap(),
             disk_map,
             pools,
-            local_disks,
             peer_sys,
-        })
+        };
+
+        set_object_layer(ec).await;
+
+        Ok(())
     }
+
+    pub fn init_local_disks() {}
+
+    // pub fn local_disks(&self) -> Vec<DiskStore> {
+    //     self.local_disks.clone()
+    // }
 
     fn single_pool(&self) -> bool {
         self.pools.len() == 1
@@ -340,6 +492,15 @@ impl StorageAPI for ECStore {
 
         Ok(buckets)
     }
+
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        self.peer_sys.delete_bucket(bucket, opts).await?;
+
+        // 删除meta
+        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
+            .await?;
+        Ok(())
+    }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         // TODO:  check valid bucket name
 
@@ -560,6 +721,17 @@ impl StorageAPI for ECStore {
 
         unimplemented!()
     }
+
+    async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+        let object = utils::path::encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].put_object_info(bucket, object.as_str(), info, opts).await;
+        }
+
+        unimplemented!()
+    }
+
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -632,14 +804,5 @@ impl StorageAPI for ECStore {
                 .await;
         }
         unimplemented!()
-    }
-
-    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
-        self.peer_sys.delete_bucket(bucket).await?;
-
-        // 删除meta
-        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
-            .await?;
-        Ok(())
     }
 }

@@ -9,7 +9,27 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+log.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+ecstore.workspace = true
+flatbuffers.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+mime.workspace = true
+netif.workspace = true
+pin-project-lite.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+protos.workspace = true
+protobuf.workspace = true
+s3s.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = [
@@ -18,12 +38,22 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
 ] }
+tonic = { version = "0.12.1", features = ["gzip"] }
+tonic-reflection.workspace = true
+tower.workspace = true
 tracing-error.workspace = true
+tracing-subscriber.workspace = true
+transform-stream.workspace = true
+uuid = "1.10.0"
+
+[build-dependencies]
+prost-build.workspace = true
+tonic-build.workspace = true
 http.workspace = true
 bytes.workspace = true
 futures.workspace = true
 futures-util.workspace = true
-uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
+# uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
 s3s = "0.10.0"
 clap = { version = "4.5.7", features = ["derive"] }
