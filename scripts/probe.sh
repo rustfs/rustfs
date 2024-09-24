@@ -8,7 +8,7 @@ PORT=9000
 
 while true; do
     nc -zv ${IP} ${PORT}
-    if [ "$?" == "0" ]; then
+    if [ "$?" -eq "0" ]; then
         exit 0
     fi
     sleep 2
