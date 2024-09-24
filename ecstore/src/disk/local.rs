@@ -901,7 +901,7 @@ impl DiskAPI for LocalDisk {
             self.rename_all(&src_data_path, &dst_data_path, &skip_parent).await?;
         }
 
-        warn!("old_data_dir {:?}", old_data_dir);
+        // warn!("old_data_dir {:?}", old_data_dir);
         // 有旧目录，把old xl.meta存到旧目录里
         if old_data_dir.is_some() {
             self.write_all(

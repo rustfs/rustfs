@@ -447,6 +447,7 @@ dependencies = [
  "http",
  "lazy_static",
  "netif",
+ "num_cpus",
  "openssl",
  "path-absolutize",
  "path-clean",

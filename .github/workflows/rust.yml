@@ -1,8 +1,8 @@
 name: Rust
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
@@ -11,12 +11,68 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - beta
+          - nightly
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - name: cache protoc bin
+        id: cache-protoc-action
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-protoc-action-bin
+        with:
+          path: /usr/local/bin/protoc
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
+
+      - name: install protoc
+        if: steps.cache-protoc-action.outputs.cache-hit != 'true'
+        run: |
+          wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip
+          unzip protoc-27.0-linux-x86_64.zip -d protoc3
+          mv protoc3/bin/* /usr/local/bin/
+          chmod +x /usr/local/bin/protoc
+          rm -rf protoc-27.0-linux-x86_64.zip protoc3
+
+      - name: print protoc version
+        run: protoc --version
+
+      - name: cache flatc bin
+        id: cache-flatc-action
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-flatc-action-bin
+        with:
+          path: /usr/local/bin/flatc
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
+
+      - name: install flatc
+        if: steps.cache-flatc-action.outputs.cache-hit != 'true'
+        run: |
+          wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
+          unzip Linux.flatc.binary.g++-13.zip
+          mv flatc /usr/local/bin/ 
+          chmod +x /usr/local/bin/flatc 
+          rm -rf Linux.flatc.binary.g++-13.zip
+
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          override: true
+          components: rustfmt, clippy
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all
