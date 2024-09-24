@@ -8,7 +8,7 @@ use crate::{
     utils,
 };
 
-use super::error::{ioerr_to_diskerr, DiskError};
+use super::error::{ioerr_to_err, DiskError};
 
 fn check_path_length(path_name: &str) -> Result<()> {
     // Apple OS X path length is limited to 1016
@@ -51,7 +51,7 @@ fn check_path_length(path_name: &str) -> Result<()> {
 pub async fn make_dir_all(path: impl AsRef<Path>) -> Result<()> {
     check_path_length(path.as_ref().to_string_lossy().to_string().as_str())?;
 
-    utils::fs::make_dir_all(path.as_ref()).map_err(ioerr_to_diskerr).await?;
+    utils::fs::make_dir_all(path.as_ref()).map_err(ioerr_to_err).await?;
 
     Ok(())
 }

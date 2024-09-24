@@ -1,10 +1,10 @@
-use std::{fs::Metadata,  path::Path};
+use std::{fs::Metadata, path::Path};
 
 use tokio::{fs, io};
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "windows"))]
 pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
-   use os::unix::fs::MetadataExt;
+    use std::os::unix::fs::MetadataExt;
 
     if f1.dev() != f2.dev() {
         return false;
@@ -31,12 +31,11 @@ pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
 #[cfg(target_os = "windows")]
 pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
     if f1.permissions() != f2.permissions() {
-        return  false;
+        return false;
     }
 
-    
     if f1.file_type() != f2.file_type() {
-        return  false;
+        return false;
     }
 
     if f1.len() != f2.len() {
@@ -45,11 +44,11 @@ pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
     true
 }
 
-pub async fn access(path: impl AsRef<Path>) -> io::Result<()>{
+pub async fn access(path: impl AsRef<Path>) -> io::Result<()> {
     fs::metadata(path).await?;
     Ok(())
 }
 
-pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()>{
+pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir_all(path.as_ref()).await
 }

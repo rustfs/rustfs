@@ -401,10 +401,12 @@ impl DiskAPI for RemoteDisk {
         Ok(volume_info)
     }
 
-    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+    async fn delete_paths(&self, _volume: &str, _paths: &[&str]) -> Result<()> {
+        // TODO:
         unimplemented!()
     }
-    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) {
+    async fn update_metadata(&self, _volume: &str, _path: &str, _fi: FileInfo, _opts: UpdateMetadataOpts) {
+        // TODO:
         unimplemented!()
     }
 

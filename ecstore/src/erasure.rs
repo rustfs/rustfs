@@ -94,11 +94,14 @@ impl Erasure {
                         }
                     }
 
-                    warn!("Erasure encode errs {:?}", errs);
+                    warn!("Erasure encode errs {:?}", &errs);
 
-                    let err_idx = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum)?;
-                    if errs[err_idx].is_some() {
-                        let err = errs[err_idx].take().unwrap();
+                    let none_count = errs.iter().filter(|&x| x.is_none()).count();
+                    if none_count >= write_quorum {
+                        continue;
+                    }
+
+                    if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
                         return Err(err);
                     }
                 }
