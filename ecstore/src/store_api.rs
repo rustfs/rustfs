@@ -27,7 +27,7 @@ pub struct FileInfo {
     pub fresh: bool, // indicates this is a first time call to write FileInfo.
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    // #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tags: Option<HashMap<String, String>>,
     pub metadata: Option<HashMap<String, String>>,
     pub num_versions: usize,

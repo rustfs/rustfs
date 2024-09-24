@@ -629,6 +629,7 @@ impl S3 for FS {
             ..
         } = req.input;
 
+        // error!("complete_multipart_upload {:?}", multipart_upload);
         // mc cp step 5
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
