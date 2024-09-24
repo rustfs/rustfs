@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+#![allow(clippy::map_entry)]
+use std::{collections::HashMap, sync::Arc};
 
 use futures::future::join_all;
 use http::HeaderMap;
+use tokio::sync::Semaphore;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -22,7 +24,7 @@ use crate::{
     utils::hash,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Sets {
     pub id: Uuid,
     // pub sets: Vec<Objects>,
@@ -205,8 +207,7 @@ impl StorageAPI for Sets {
         let mut set_obj_map = HashMap::new();
 
         // hash key
-        let mut i = 0;
-        for obj in objects.iter() {
+        for (i, obj) in objects.iter().enumerate() {
             let idx = self.get_hashed_set_index(obj.object_name.as_str());
 
             if !set_obj_map.contains_key(&idx) {
@@ -218,35 +219,40 @@ impl StorageAPI for Sets {
                         obj: obj.clone(),
                     }],
                 );
-            } else {
-                if let Some(val) = set_obj_map.get_mut(&idx) {
-                    val.push(DelObj {
-                        // set_idx: idx,
-                        orig_idx: i,
-                        obj: obj.clone(),
-                    });
-                }
+            } else if let Some(val) = set_obj_map.get_mut(&idx) {
+                val.push(DelObj {
+                    // set_idx: idx,
+                    orig_idx: i,
+                    obj: obj.clone(),
+                });
             }
-
-            i += 1;
         }
 
-        // TODO: 并发
+        let semaphore = Arc::new(Semaphore::new(num_cpus::get()));
+        let mut jhs = Vec::with_capacity(semaphore.available_permits());
+
         for (k, v) in set_obj_map {
             let disks = self.get_disks(k);
-            let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-            let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await?;
+            let semaphore = semaphore.clone();
+            let opts = opts.clone();
+            let bucket = bucket.to_string();
 
-            let mut i = 0;
-            for err in errs {
-                let obj = v.get(i).unwrap();
+            let jh = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
+                disks.delete_objects(&bucket, objs, opts).await
+            });
+            jhs.push(jh);
+        }
 
-                del_errs[obj.orig_idx] = err;
+        let mut results = Vec::with_capacity(jhs.len());
+        for jh in jhs {
+            results.push(jh.await?.unwrap());
+        }
 
-                del_objects[obj.orig_idx] = dobjects.get(i).unwrap().clone();
-
-                i += 1;
-            }
+        for (dobjects, errs) in results {
+            del_objects.extend(dobjects);
+            del_errs.extend(errs);
         }
 
         Ok((del_objects, del_errs))
