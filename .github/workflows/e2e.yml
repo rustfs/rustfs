@@ -16,7 +16,6 @@ jobs:
       matrix:
         rust:
           - stable
-          - beta
           - nightly
 
     steps:
@@ -59,6 +58,12 @@ jobs:
           chmod +x /usr/local/bin/flatc 
           rm -rf Linux.flatc.binary.g++-13.zip
 
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          # components: rustfmt, clippy
+
       - name: checkout
         uses: actions/checkout@v2
 
@@ -67,14 +72,9 @@ jobs:
         run: |
           make e2e-server > /dev/null &
           make probe-e2e
-        env:
-          PORT: 9000
 
       - name: e2e test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: -p e2e_test --lib
+        run: cargo test -p e2e_test --lib
 
       - name: cache cargo
         uses: actions/cache@v3
