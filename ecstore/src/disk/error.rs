@@ -100,9 +100,6 @@ pub enum DiskError {
 
     #[error("more data was sent than what was advertised")]
     MoreData,
-
-    #[error("other io err {0}")]
-    IoError(io::Error),
 }
 
 impl DiskError {
@@ -172,95 +169,89 @@ impl CheckErrorFn for DiskError {
     }
 }
 
-pub fn clone_err(err: &Error) -> Error {
-    if let Some(e) = err.downcast_ref::<DiskError>() {
-        match e {
-            DiskError::MaxVersionsExceeded => Error::new(DiskError::MaxVersionsExceeded),
-            DiskError::Unexpected => Error::new(DiskError::Unexpected),
-            DiskError::CorruptedFormat => Error::new(DiskError::CorruptedFormat),
-            DiskError::CorruptedBackend => Error::new(DiskError::CorruptedBackend),
-            DiskError::UnformattedDisk => Error::new(DiskError::UnformattedDisk),
-            DiskError::InconsistentDisk => Error::new(DiskError::InconsistentDisk),
-            DiskError::UnsupportedDisk => Error::new(DiskError::UnsupportedDisk),
-            DiskError::DiskFull => Error::new(DiskError::DiskFull),
-            DiskError::DiskNotDir => Error::new(DiskError::DiskNotDir),
-            DiskError::DiskNotFound => Error::new(DiskError::DiskNotFound),
-            DiskError::DiskOngoingReq => Error::new(DiskError::DiskOngoingReq),
-            DiskError::DriveIsRoot => Error::new(DiskError::DriveIsRoot),
-            DiskError::FaultyRemoteDisk => Error::new(DiskError::FaultyRemoteDisk),
-            DiskError::FaultyDisk => Error::new(DiskError::FaultyDisk),
-            DiskError::DiskAccessDenied => Error::new(DiskError::DiskAccessDenied),
-            DiskError::FileNotFound => Error::new(DiskError::FileNotFound),
-            DiskError::FileVersionNotFound => Error::new(DiskError::FileVersionNotFound),
-            DiskError::TooManyOpenFiles => Error::new(DiskError::TooManyOpenFiles),
-            DiskError::FileNameTooLong => Error::new(DiskError::FileNameTooLong),
-            DiskError::VolumeExists => Error::new(DiskError::VolumeExists),
-            DiskError::IsNotRegular => Error::new(DiskError::IsNotRegular),
-            DiskError::PathNotFound => Error::new(DiskError::PathNotFound),
-            DiskError::VolumeNotFound => Error::new(DiskError::VolumeNotFound),
-            DiskError::VolumeNotEmpty => Error::new(DiskError::VolumeNotEmpty),
-            DiskError::VolumeAccessDenied => Error::new(DiskError::VolumeAccessDenied),
-            DiskError::FileAccessDenied => Error::new(DiskError::FileAccessDenied),
-            DiskError::FileCorrupt => Error::new(DiskError::FileCorrupt),
-            DiskError::BitrotHashAlgoInvalid => Error::new(DiskError::BitrotHashAlgoInvalid),
-            DiskError::CrossDeviceLink => Error::new(DiskError::CrossDeviceLink),
-            DiskError::LessData => Error::new(DiskError::LessData),
-            DiskError::MoreData => Error::new(DiskError::MoreData),
-            DiskError::IoError(ioerr) => Error::msg(ioerr.to_string()),
-        }
-    } else {
-        Error::msg(err.to_string())
+pub fn clone_disk_err(e: &DiskError) -> Error {
+    match e {
+        DiskError::MaxVersionsExceeded => Error::new(DiskError::MaxVersionsExceeded),
+        DiskError::Unexpected => Error::new(DiskError::Unexpected),
+        DiskError::CorruptedFormat => Error::new(DiskError::CorruptedFormat),
+        DiskError::CorruptedBackend => Error::new(DiskError::CorruptedBackend),
+        DiskError::UnformattedDisk => Error::new(DiskError::UnformattedDisk),
+        DiskError::InconsistentDisk => Error::new(DiskError::InconsistentDisk),
+        DiskError::UnsupportedDisk => Error::new(DiskError::UnsupportedDisk),
+        DiskError::DiskFull => Error::new(DiskError::DiskFull),
+        DiskError::DiskNotDir => Error::new(DiskError::DiskNotDir),
+        DiskError::DiskNotFound => Error::new(DiskError::DiskNotFound),
+        DiskError::DiskOngoingReq => Error::new(DiskError::DiskOngoingReq),
+        DiskError::DriveIsRoot => Error::new(DiskError::DriveIsRoot),
+        DiskError::FaultyRemoteDisk => Error::new(DiskError::FaultyRemoteDisk),
+        DiskError::FaultyDisk => Error::new(DiskError::FaultyDisk),
+        DiskError::DiskAccessDenied => Error::new(DiskError::DiskAccessDenied),
+        DiskError::FileNotFound => Error::new(DiskError::FileNotFound),
+        DiskError::FileVersionNotFound => Error::new(DiskError::FileVersionNotFound),
+        DiskError::TooManyOpenFiles => Error::new(DiskError::TooManyOpenFiles),
+        DiskError::FileNameTooLong => Error::new(DiskError::FileNameTooLong),
+        DiskError::VolumeExists => Error::new(DiskError::VolumeExists),
+        DiskError::IsNotRegular => Error::new(DiskError::IsNotRegular),
+        DiskError::PathNotFound => Error::new(DiskError::PathNotFound),
+        DiskError::VolumeNotFound => Error::new(DiskError::VolumeNotFound),
+        DiskError::VolumeNotEmpty => Error::new(DiskError::VolumeNotEmpty),
+        DiskError::VolumeAccessDenied => Error::new(DiskError::VolumeAccessDenied),
+        DiskError::FileAccessDenied => Error::new(DiskError::FileAccessDenied),
+        DiskError::FileCorrupt => Error::new(DiskError::FileCorrupt),
+        DiskError::BitrotHashAlgoInvalid => Error::new(DiskError::BitrotHashAlgoInvalid),
+        DiskError::CrossDeviceLink => Error::new(DiskError::CrossDeviceLink),
+        DiskError::LessData => Error::new(DiskError::LessData),
+        DiskError::MoreData => Error::new(DiskError::MoreData),
     }
 }
 
-
-pub fn ioerr_to_diskerr(e:io::Error)->DiskError{
-match e.kind(){
-    io::ErrorKind::NotFound => DiskError::FileNotFound,
-    io::ErrorKind::PermissionDenied => DiskError::FileAccessDenied,
-    // io::ErrorKind::ConnectionRefused => todo!(),
-    // io::ErrorKind::ConnectionReset => todo!(),
-    // io::ErrorKind::HostUnreachable => todo!(),
-    // io::ErrorKind::NetworkUnreachable => todo!(),
-    // io::ErrorKind::ConnectionAborted => todo!(),
-    // io::ErrorKind::NotConnected => todo!(),
-    // io::ErrorKind::AddrInUse => todo!(),
-    // io::ErrorKind::AddrNotAvailable => todo!(),
-    // io::ErrorKind::NetworkDown => todo!(),
-    // io::ErrorKind::BrokenPipe => todo!(),
-    // io::ErrorKind::AlreadyExists => todo!(),
-    // io::ErrorKind::WouldBlock => todo!(),
-    // io::ErrorKind::NotADirectory => DiskError::FileNotFound,
-    // io::ErrorKind::IsADirectory => DiskError::FileNotFound,
-    // io::ErrorKind::DirectoryNotEmpty => DiskError::VolumeNotEmpty,
-    // io::ErrorKind::ReadOnlyFilesystem => todo!(),
-    // io::ErrorKind::FilesystemLoop => todo!(),
-    // io::ErrorKind::StaleNetworkFileHandle => todo!(),
-    // io::ErrorKind::InvalidInput => todo!(),
-    // io::ErrorKind::InvalidData => todo!(),
-    // io::ErrorKind::TimedOut => todo!(),
-    // io::ErrorKind::WriteZero => todo!(),
-    // io::ErrorKind::StorageFull => DiskError::DiskFull,
-    // io::ErrorKind::NotSeekable => todo!(),
-    // io::ErrorKind::FilesystemQuotaExceeded => todo!(),
-    // io::ErrorKind::FileTooLarge => todo!(),
-    // io::ErrorKind::ResourceBusy => todo!(),
-    // io::ErrorKind::ExecutableFileBusy => todo!(),
-    // io::ErrorKind::Deadlock => todo!(),
-    // io::ErrorKind::CrossesDevices => todo!(),
-    // io::ErrorKind::TooManyLinks =>DiskError::TooManyOpenFiles,
-    // io::ErrorKind::InvalidFilename => todo!(),
-    // io::ErrorKind::ArgumentListTooLong => todo!(),
-    // io::ErrorKind::Interrupted => todo!(),
-    // io::ErrorKind::Unsupported => todo!(),
-    // io::ErrorKind::UnexpectedEof => todo!(),
-    // io::ErrorKind::OutOfMemory => todo!(),
-    // io::ErrorKind::Other => todo!(),
-    // TODO: 把不支持的king用字符串处理 
-    _ => DiskError::IoError(e),
+pub fn ioerr_to_err(e: io::Error) -> Error {
+    match e.kind() {
+        io::ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
+        io::ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
+        // io::ErrorKind::ConnectionRefused => todo!(),
+        // io::ErrorKind::ConnectionReset => todo!(),
+        // io::ErrorKind::HostUnreachable => todo!(),
+        // io::ErrorKind::NetworkUnreachable => todo!(),
+        // io::ErrorKind::ConnectionAborted => todo!(),
+        // io::ErrorKind::NotConnected => todo!(),
+        // io::ErrorKind::AddrInUse => todo!(),
+        // io::ErrorKind::AddrNotAvailable => todo!(),
+        // io::ErrorKind::NetworkDown => todo!(),
+        // io::ErrorKind::BrokenPipe => todo!(),
+        // io::ErrorKind::AlreadyExists => todo!(),
+        // io::ErrorKind::WouldBlock => todo!(),
+        // io::ErrorKind::NotADirectory => DiskError::FileNotFound,
+        // io::ErrorKind::IsADirectory => DiskError::FileNotFound,
+        // io::ErrorKind::DirectoryNotEmpty => DiskError::VolumeNotEmpty,
+        // io::ErrorKind::ReadOnlyFilesystem => todo!(),
+        // io::ErrorKind::FilesystemLoop => todo!(),
+        // io::ErrorKind::StaleNetworkFileHandle => todo!(),
+        // io::ErrorKind::InvalidInput => todo!(),
+        // io::ErrorKind::InvalidData => todo!(),
+        // io::ErrorKind::TimedOut => todo!(),
+        // io::ErrorKind::WriteZero => todo!(),
+        // io::ErrorKind::StorageFull => DiskError::DiskFull,
+        // io::ErrorKind::NotSeekable => todo!(),
+        // io::ErrorKind::FilesystemQuotaExceeded => todo!(),
+        // io::ErrorKind::FileTooLarge => todo!(),
+        // io::ErrorKind::ResourceBusy => todo!(),
+        // io::ErrorKind::ExecutableFileBusy => todo!(),
+        // io::ErrorKind::Deadlock => todo!(),
+        // io::ErrorKind::CrossesDevices => todo!(),
+        // io::ErrorKind::TooManyLinks =>DiskError::TooManyOpenFiles,
+        // io::ErrorKind::InvalidFilename => todo!(),
+        // io::ErrorKind::ArgumentListTooLong => todo!(),
+        // io::ErrorKind::Interrupted => todo!(),
+        // io::ErrorKind::Unsupported => todo!(),
+        // io::ErrorKind::UnexpectedEof => todo!(),
+        // io::ErrorKind::OutOfMemory => todo!(),
+        // io::ErrorKind::Other => todo!(),
+        // TODO: 把不支持的king用字符串处理
+        _ => Error::new(e),
+    }
 }
-}
 
-pub fn os_is_not_exist(e:io::Error) -> bool{
-    e.kind() ==  ErrorKind::NotFound
+pub fn os_is_not_exist(e: io::Error) -> bool {
+    e.kind() == ErrorKind::NotFound
 }

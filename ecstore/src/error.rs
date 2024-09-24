@@ -1,4 +1,8 @@
+use std::io;
+
 use tracing_error::{SpanTrace, SpanTraceStatus};
+
+use crate::disk::error::{clone_disk_err, DiskError};
 
 pub type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -78,5 +82,18 @@ impl std::fmt::Display for Error {
         }
 
         Ok(())
+    }
+}
+
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        if let Some(e) = self.downcast_ref::<DiskError>() {
+            clone_disk_err(e)
+        } else if let Some(e) = self.downcast_ref::<io::Error>() {
+            Error::new(io::Error::new(e.kind(), e.to_string()))
+        } else {
+            // TODO: 优化其他类型
+            Error::msg(self.to_string())
+        }
     }
 }

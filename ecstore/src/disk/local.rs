@@ -1,4 +1,4 @@
-use super::error::{ioerr_to_diskerr, os_is_not_exist};
+use super::error::os_is_not_exist;
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
@@ -971,7 +971,7 @@ impl DiskAPI for LocalDisk {
         })?;
 
         for entry in entries {
-            if utils::path::has_suffix(&entry, SLASH_SEPARATOR) || !Self::is_valid_volname(&entry) {
+            if !utils::path::has_suffix(&entry, SLASH_SEPARATOR) || !Self::is_valid_volname(&entry) {
                 continue;
             }
 
