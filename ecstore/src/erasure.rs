@@ -94,7 +94,7 @@ impl Erasure {
                         }
                     }
 
-                    warn!("Erasure encode errs {:?}", &errs);
+                    debug!("Erasure encode errs {:?}", &errs);
 
                     let none_count = errs.iter().filter(|&x| x.is_none()).count();
                     if none_count >= write_quorum {
