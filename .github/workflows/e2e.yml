@@ -73,7 +73,8 @@ jobs:
       - name: run fs
         working-directory: .
         run: |
-          make e2e-server &
+          make e2e-server > /dev/null &
+          make probe-e2e
         env:
           PORT: 9000
 
