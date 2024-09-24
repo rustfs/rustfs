@@ -113,9 +113,9 @@ impl LocalDisk {
         Ok(disk)
     }
 
-    fn check_path_length(path_name: &str) -> Result<()> {
-        unimplemented!()
-    }
+    // fn check_path_length(_path_name: &str) -> Result<()> {
+    //     unimplemented!()
+    // }
 
     fn is_valid_volname(volname: &str) -> bool {
         if volname.len() < 3 {
@@ -1000,10 +1000,10 @@ impl DiskAPI for LocalDisk {
             created: modtime,
         })
     }
-    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+    async fn delete_paths(&self, _volume: &str, _paths: &[&str]) -> Result<()> {
         unimplemented!()
     }
-    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) {
+    async fn update_metadata(&self, _volume: &str, _path: &str, _fi: FileInfo, _opts: UpdateMetadataOpts) {
         unimplemented!()
     }
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
@@ -1062,11 +1062,11 @@ impl DiskAPI for LocalDisk {
     }
     async fn delete_version(
         &self,
-        volume: &str,
-        path: &str,
-        fi: FileInfo,
-        force_del_marker: bool,
-        opts: DeleteOptions,
+        _volume: &str,
+        _path: &str,
+        _fi: FileInfo,
+        _force_del_marker: bool,
+        _opts: DeleteOptions,
     ) -> Result<RawFileInfo> {
         unimplemented!()
     }

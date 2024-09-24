@@ -482,11 +482,11 @@ impl DiskAPI for RemoteDisk {
     }
     async fn delete_version(
         &self,
-        volume: &str,
-        path: &str,
-        fi: FileInfo,
-        force_del_marker: bool,
-        opts: DeleteOptions,
+        _volume: &str,
+        _path: &str,
+        _fi: FileInfo,
+        _force_del_marker: bool,
+        _opts: DeleteOptions,
     ) -> Result<RawFileInfo> {
         unimplemented!()
     }
