@@ -1,7 +1,6 @@
-name: Rust
+name: e2e
 
 on:
-  workflow_dispatch:
   push:
   pull_request:
     branches: [ "main" ]
@@ -11,6 +10,7 @@ env:
 
 jobs:
   build:
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -59,22 +59,18 @@ jobs:
           chmod +x /usr/local/bin/flatc 
           rm -rf Linux.flatc.binary.g++-13.zip
 
-      - uses: actions/checkout@v2
+      - name: checkout
+        uses: actions/checkout@v2
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-          components: rustfmt, clippy
+      - name: run fs
+        working-directory: packages/api
+        run: |
+          cargo run &
+        env:
+          PORT: 9000
 
-      - name: cargo build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-
-      - name: cargo test
+      - name: e2e test
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --all --exclude e2e_test
+          args: -p e2e_test --lib
