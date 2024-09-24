@@ -21,3 +21,7 @@ start:
 .PHONY: stop
 stop:
 	$(DOCKER_CLI) stop $(CONTAINER_NAME)	
+
+.PHONY: e2e
+e2e-server:
+	sh $(shell pwd)/scripts/run.sh 
