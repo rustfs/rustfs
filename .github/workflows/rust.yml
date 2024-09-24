@@ -16,7 +16,6 @@ jobs:
       matrix:
         rust:
           - stable
-          - beta
           - nightly
 
     steps:
@@ -59,25 +58,19 @@ jobs:
           chmod +x /usr/local/bin/flatc 
           rm -rf Linux.flatc.binary.g++-13.zip
 
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          # components: rustfmt, clippy
+
       - uses: actions/checkout@v2
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-          components: rustfmt, clippy
-
       - name: cargo build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
+        run: cargo build
 
       - name: cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --all --exclude e2e_test
+        run: cargo test --all --exclude e2e_test
 
       - name: cache cargo
         uses: actions/cache@v3
