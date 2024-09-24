@@ -2,7 +2,7 @@ use std::{fs::Metadata, path::Path};
 
 use tokio::{fs, io};
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(windows))]
 pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -28,7 +28,7 @@ pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
     true
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
     if f1.permissions() != f2.permissions() {
         return false;

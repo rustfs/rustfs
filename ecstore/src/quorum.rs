@@ -1,7 +1,4 @@
-use crate::{
-    disk::error::DiskError,
-    error::{Error, Result},
-};
+use crate::{disk::error::DiskError, error::Error};
 use std::{collections::HashMap, fmt::Debug};
 
 // pub type CheckErrorFn = fn(e: &Error) -> bool;
@@ -11,7 +8,7 @@ pub trait CheckErrorFn: Debug + Send + Sync + 'static {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum QuorumError {
+pub enum QuorumError {
     #[error("Read quorum not met")]
     Read,
     #[error("disk not found")]
@@ -112,7 +109,7 @@ fn reduce_quorum_errs(
 // 根据读quorum验证错误数量
 // 返回最大错误数量的下标，或QuorumError
 pub fn reduce_read_quorum_errs(
-    errs: &mut Vec<Option<Error>>,
+    errs: &Vec<Option<Error>>,
     ignored_errs: &Vec<Box<dyn CheckErrorFn>>,
     read_quorum: usize,
 ) -> Option<Error> {

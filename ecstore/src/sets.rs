@@ -98,7 +98,7 @@ impl Sets {
             let set_disks = SetDisks {
                 disks: RwLock::new(set_drive),
                 set_drive_count,
-                parity_count: partiy_count,
+                default_parity_count: partiy_count,
                 set_index: i,
                 pool_index: pool_idx,
                 set_endpoints,
@@ -343,7 +343,7 @@ impl StorageAPI for Sets {
             .get_object_reader(bucket, object, range, h, opts)
             .await
     }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).put_object(bucket, object, data, opts).await
     }
 

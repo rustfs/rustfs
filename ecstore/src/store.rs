@@ -314,7 +314,7 @@ impl ECStore {
                         if entry.is_object() {
                             let fi = entry.to_fileinfo(&opts.bucket)?;
                             if fi.is_some() {
-                                ress.push(fi.unwrap().into_object_info(&opts.bucket, &entry.name, false));
+                                ress.push(fi.unwrap().to_object_info(&opts.bucket, &entry.name, false));
                             }
                             continue;
                         }
@@ -738,7 +738,7 @@ impl StorageAPI for ECStore {
 
         unimplemented!()
     }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // checkPutObjectArgs
 
         let object = utils::path::encode_dir_object(object);
