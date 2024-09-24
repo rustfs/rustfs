@@ -59,6 +59,14 @@ jobs:
           chmod +x /usr/local/bin/flatc 
           rm -rf Linux.flatc.binary.g++-13.zip
 
+      - name: cache cargo
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-cargo
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
+
       - name: checkout
         uses: actions/checkout@v2
 
