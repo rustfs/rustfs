@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -135,14 +135,17 @@ impl Sets {
     pub async fn monitor_and_connect_endpoints(&self) {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
+        info!("start monitor_and_connect_endpoints");
+
         self.connect_disks().await;
 
+        // TODO: config interval
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15 * 3));
         let cloned_token = self.ctx.clone();
         loop {
             tokio::select! {
                _= interval.tick()=>{
-                debug!("tick...");
+                // debug!("tick...");
                 self.connect_disks().await;
 
                 interval.reset();
@@ -159,11 +162,11 @@ impl Sets {
     }
 
     async fn connect_disks(&self) {
-        debug!("start connect_disks ...");
+        // debug!("start connect_disks ...");
         for set in self.disk_set.iter() {
             set.connect_disks().await;
         }
-        debug!("done connect_disks ...");
+        // debug!("done connect_disks ...");
     }
 
     pub fn get_disks(&self, set_idx: usize) -> Arc<SetDisks> {

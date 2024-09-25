@@ -204,10 +204,10 @@ impl LocalDisk {
             fs::create_dir_all(dst_data_path.parent().unwrap_or(Path::new("/"))).await?;
         }
 
-        debug!(
-            "rename_all from \n {:?} \n to \n {:?} \n skip:{:?}",
-            &src_data_path, &dst_data_path, &skip
-        );
+        // debug!(
+        //     "rename_all from \n {:?} \n to \n {:?} \n skip:{:?}",
+        //     &src_data_path, &dst_data_path, &skip
+        // );
 
         fs::rename(&src_data_path, &dst_data_path).await?;
 
@@ -221,7 +221,7 @@ impl LocalDisk {
                 fs::create_dir_all(parent).await?;
             }
         }
-        debug!("move_to_trash from:{:?} to {:?}", &delete_path, &trash_path);
+        // debug!("move_to_trash from:{:?} to {:?}", &delete_path, &trash_path);
         // TODO: 清空回收站
         if let Err(err) = fs::rename(&delete_path, &trash_path).await {
             match err.kind() {
@@ -263,15 +263,15 @@ impl LocalDisk {
         recursive: bool,
         immediate_purge: bool,
     ) -> Result<()> {
-        debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
+        // debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
 
         if is_root_path(base_path) || is_root_path(delete_path) {
-            debug!("delete_file skip {:?}", &delete_path);
+            // debug!("delete_file skip {:?}", &delete_path);
             return Ok(());
         }
 
         if !delete_path.starts_with(base_path) || base_path == delete_path {
-            debug!("delete_file skip {:?}", &delete_path);
+            // debug!("delete_file skip {:?}", &delete_path);
             return Ok(());
         }
 
@@ -279,9 +279,9 @@ impl LocalDisk {
             self.move_to_trash(delete_path, recursive, immediate_purge).await?;
         } else {
             if delete_path.is_dir() {
-                debug!("delete_file remove_dir {:?}", &delete_path);
+                // debug!("delete_file remove_dir {:?}", &delete_path);
                 if let Err(err) = fs::remove_dir(&delete_path).await {
-                    debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
+                    // debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         // ErrorKind::DirectoryNotEmpty => (),
@@ -293,10 +293,10 @@ impl LocalDisk {
                         }
                     }
                 }
-                debug!("delete_file remove_dir done {:?}", &delete_path);
+                // debug!("delete_file remove_dir done {:?}", &delete_path);
             } else {
                 if let Err(err) = fs::remove_file(&delete_path).await {
-                    debug!("remove_file err {:?} when {:?}", &err, &delete_path);
+                    // debug!("remove_file err {:?} when {:?}", &err, &delete_path);
                     match err.kind() {
                         ErrorKind::NotFound => (),
                         _ => {
@@ -312,7 +312,7 @@ impl LocalDisk {
             Box::pin(self.delete_file(base_path, &PathBuf::from(dir_path), false, false)).await?;
         }
 
-        debug!("delete_file done {:?}", &delete_path);
+        // debug!("delete_file done {:?}", &delete_path);
         Ok(())
     }
 
@@ -811,7 +811,7 @@ impl DiskAPI for LocalDisk {
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         let p = self.get_object_path(volume, path)?;
 
-        debug!("read_file {:?}", &p);
+        // debug!("read_file {:?}", &p);
         let file = File::options().read(true).open(&p).await?;
 
         Ok(FileReader::Local(LocalFileReader::new(file)))

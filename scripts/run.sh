@@ -7,7 +7,7 @@ mkdir -p ./target/volume/test{0..4}
 
 
 if [ -z "$RUST_LOG" ]; then
-    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug"
+    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug"
 fi
 
 DATA_DIR_ARG="./target/volume/test{0...4}"
