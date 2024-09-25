@@ -4,7 +4,7 @@ use super::{
     os, DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
-use crate::disk::error::{is_sys_err_not_dir, map_err_not_exists};
+use crate::disk::error::{is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err};
 use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::utils::fs::lstat;
@@ -25,7 +25,6 @@ use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::ErrorKind;
 use tokio::sync::Mutex;
-use tower::layer::util;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -679,7 +678,31 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        unimplemented!()
+        if let Err(err) = os::rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await {
+            if let Some(e) = err.to_io_err() {
+                if is_sys_err_not_empty(&e) || is_sys_err_not_dir(&e) {
+                    return Err(Error::new(DiskError::FileAccessDenied));
+                }
+
+                return Err(os_err_to_file_err(e));
+            }
+
+            return Err(err);
+        }
+
+        if let Err(err) = self.write_all(&dst_volume, format!("{}.meta", dst_path).as_str(), meta).await {
+            if let Some(e) = err.to_io_err() {
+                return Err(os_err_to_file_err(e));
+            }
+
+            return Err(err);
+        }
+
+        if let Some(parent) = src_file_path.parent() {
+            self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await?;
+        }
+
+        Ok(())
     }
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         let src_volume_path = self.get_bucket_path(src_volume)?;
@@ -1009,8 +1032,8 @@ impl DiskAPI for LocalDisk {
 
         let p = self.get_bucket_path(volume)?;
 
-        if let Err(err) = utils::fs::access(&p).await {
-            if os_is_not_exist(err) {
+        if let Err(e) = utils::fs::access(&p).await {
+            if os_is_not_exist(&e) {
                 os::make_dir_all(&p).await?;
             }
         }
