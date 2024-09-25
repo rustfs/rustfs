@@ -1,6 +1,9 @@
 use std::{fs::Metadata, path::Path};
 
-use tokio::{fs, io};
+use tokio::{
+    fs::{self, File},
+    io,
+};
 
 #[cfg(not(windows))]
 pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
@@ -42,6 +45,51 @@ pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
         return false;
     }
     true
+}
+
+type FileMode = usize;
+
+const O_RDONLY: FileMode = 0x00000;
+const O_WRONLY: FileMode = 0x00001;
+const O_RDWR: FileMode = 0x00002;
+const O_CREAT: FileMode = 0x00040;
+const O_EXCL: FileMode = 0x00080;
+const O_NOCTTY: FileMode = 0x00100;
+const O_TRUNC: FileMode = 0x00200;
+const O_NONBLOCK: FileMode = 0x00800;
+const O_APPEND: FileMode = 0x00400;
+const O_SYNC: FileMode = 0x01000;
+const O_ASYNC: FileMode = 0x02000;
+const O_CLOEXEC: FileMode = 0x80000;
+
+pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<File> {
+    let mut opts = fs::OpenOptions::new();
+
+    match mode & (O_RDONLY | O_WRONLY | O_RDWR) {
+        O_RDONLY => {
+            opts.read(true);
+        }
+        O_WRONLY => {
+            opts.write(true);
+        }
+        O_RDWR => {
+            opts.read(true);
+            opts.write(true);
+        }
+        _ => (),
+    };
+
+    if mode & O_CREAT != 0 {
+        opts.write(true);
+    }
+
+    if mode & O_APPEND != 0 {
+        opts.write(true);
+    }
+
+    // FIXME: TODO
+
+    opts.open(path.as_ref()).await
 }
 
 pub async fn access(path: impl AsRef<Path>) -> io::Result<()> {

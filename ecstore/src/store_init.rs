@@ -232,7 +232,7 @@ pub async fn load_format_erasure(disk: &DiskStore, _heal: bool) -> Result<Format
             None => e,
         })?;
 
-    let fm = FormatV3::try_from(data.as_ref())?;
+    let fm = FormatV3::try_from(data.as_slice())?;
 
     // TODO: heal
 

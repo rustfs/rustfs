@@ -17,6 +17,7 @@ use crate::{
 };
 use bytes::Bytes;
 use path_absolutize::Absolutize;
+use std::io::Read;
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
@@ -405,6 +406,65 @@ impl LocalDisk {
 
         Ok(())
     }
+
+    async fn write_all_meta(&self, volume: &str, path: &str, buf: &[u8], sync: bool) -> Result<()> {
+        let volume_dir = self.get_bucket_path(&volume)?;
+        let file_path = volume_dir.join(Path::new(&path));
+        check_path_length(&file_path.to_string_lossy().to_string())?;
+
+        let tmp_volume_dir = self.get_bucket_path(super::RUSTFS_META_TMP_BUCKET)?;
+        let tmp_file_path = tmp_volume_dir.join(Path::new(Uuid::new_v4().to_string().as_str()));
+
+        self.write_all_internal(&tmp_file_path, buf, sync, tmp_volume_dir).await?;
+
+        os::rename_all(tmp_file_path, file_path, volume_dir).await
+    }
+
+    // write_all_private
+    pub async fn write_all_private(
+        &self,
+        volume: &str,
+        path: &str,
+        buf: &[u8],
+        sync: bool,
+        skip_parent: impl AsRef<Path>,
+    ) -> Result<()> {
+        let volume_dir = self.get_bucket_path(&volume)?;
+        let file_path = volume_dir.join(Path::new(&path));
+        check_path_length(&file_path.to_string_lossy().to_string())?;
+
+        self.write_all_internal(file_path, buf, sync, skip_parent).await
+    }
+
+    pub async fn write_all_internal(
+        &self,
+        p: impl AsRef<Path>,
+        data: impl AsRef<[u8]>,
+        sync: bool,
+        base_dir: impl AsRef<Path>,
+    ) -> Result<()> {
+        if sync {
+        } else {
+        }
+        // create top dir if not exists
+        fs::create_dir_all(&p.as_ref().parent().unwrap_or_else(|| Path::new("."))).await?;
+
+        fs::write(&p, data).await?;
+        Ok(())
+    }
+
+    async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
+        let mut skip_parent = skip_parent.as_ref();
+        if skip_parent.as_os_str().is_empty() {
+            skip_parent = self.root.as_path();
+        }
+
+        if let Some(parent) = path.as_ref().parent() {
+            os::make_dir_all(parent, skip_parent).await?;
+        }
+
+        unimplemented!()
+    }
 }
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
@@ -431,14 +491,6 @@ pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Vec<u8>, Option
     // }
 
     Ok((data, meta))
-}
-
-pub async fn write_all_internal(p: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Result<()> {
-    // create top dir if not exists
-    fs::create_dir_all(&p.as_ref().parent().unwrap_or_else(|| Path::new("."))).await?;
-
-    fs::write(&p, data).await?;
-    Ok(())
 }
 
 pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Vec<u8>, Metadata)> {
@@ -584,18 +636,25 @@ impl DiskAPI for LocalDisk {
     }
 
     #[must_use]
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
         // TOFIX:
         let p = self.get_object_path(volume, path)?;
         let (data, _) = read_file_all(&p).await?;
 
-        Ok(Bytes::from(data))
+        Ok(data)
     }
 
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
-        let p = self.get_object_path(volume, path)?;
+        if volume == super::RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
+            let mut format_info = self.format_info.lock().await;
+            format_info.data = data.clone();
+        }
 
-        write_all_internal(p, data).await?;
+        let volume_dir = self.get_bucket_path(&volume)?;
+        let file_path = volume_dir.join(Path::new(&path));
+        check_path_length(&file_path.to_string_lossy().to_string())?;
+
+        self.write_all_internal(file_path, data, true, volume_dir).await?;
 
         Ok(())
     }
@@ -978,7 +1037,8 @@ impl DiskAPI for LocalDisk {
         let fm_data = meta.marshal_msg()?;
 
         // 写入xl.meta
-        write_all_internal(&src_file_path, fm_data).await?;
+        self.write_all(src_volume, format!("{}/{}", &src_path, super::STORAGE_FORMAT_FILE).as_str(), fm_data)
+            .await?;
 
         let no_inline = src_data_path.has_root() && fi.data.is_none() && fi.size > 0;
         if no_inline {
@@ -1035,7 +1095,7 @@ impl DiskAPI for LocalDisk {
 
         if let Err(e) = utils::fs::access(&p).await {
             if os_is_not_exist(&e) {
-                os::make_dir_all(&p).await?;
+                os::make_dir_all(&p, self.root.as_path()).await?;
             }
         }
 
@@ -1102,14 +1162,15 @@ impl DiskAPI for LocalDisk {
 
         Ok(())
     }
-    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, _opts: UpdateMetadataOpts) -> Result<()> {
-        if let Some(metadata) = fi.metadata {
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) -> Result<()> {
+        if let Some(metadata) = &fi.metadata {
             let volume_dir = self.get_bucket_path(&volume)?;
             let file_path = volume_dir.join(Path::new(&path));
 
             check_path_length(&file_path.to_string_lossy().to_string())?;
 
-            self.read_all(&volume, format!("{}/{}", &path, super::STORAGE_FORMAT_FILE).as_str())
+            let buf = self
+                .read_all(&volume, format!("{}/{}", &path, super::STORAGE_FORMAT_FILE).as_str())
                 .await
                 .map_err(|e| {
                     if DiskError::FileNotFound.is(&e) && fi.version_id.is_some() {
@@ -1118,6 +1179,25 @@ impl DiskAPI for LocalDisk {
                         e
                     }
                 })?;
+
+            if !FileMeta::is_xl_format(buf.as_slice()) {
+                return Err(Error::new(DiskError::FileVersionNotFound));
+            }
+
+            let xl_meta = FileMeta::load(buf.as_slice())?;
+
+            xl_meta.update_object_version(fi)?;
+
+            let wbuf = xl_meta.marshal_msg()?;
+
+            return self
+                .write_all_meta(
+                    &volume,
+                    format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str(),
+                    &wbuf,
+                    !opts.no_persistence,
+                )
+                .await;
 
             // FIXME:
         }
@@ -1144,7 +1224,8 @@ impl DiskAPI for LocalDisk {
 
         let fm_data = meta.marshal_msg()?;
 
-        write_all_internal(p, fm_data).await?;
+        self.write_all(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str(), fm_data)
+            .await?;
 
         return Ok(());
     }
