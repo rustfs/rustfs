@@ -1,9 +1,8 @@
 #![allow(clippy::map_entry)]
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use futures::future::join_all;
 use http::HeaderMap;
-use tokio::sync::Semaphore;
 use tracing::warn;
 use uuid::Uuid;
 
