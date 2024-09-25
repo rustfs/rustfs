@@ -414,7 +414,7 @@ impl DiskAPI for RemoteDisk {
         // TODO:
         unimplemented!()
     }
-    async fn update_metadata(&self, _volume: &str, _path: &str, _fi: FileInfo, _opts: UpdateMetadataOpts) {
+    async fn update_metadata(&self, _volume: &str, _path: &str, _fi: FileInfo, _opts: UpdateMetadataOpts) -> Result<()> {
         // TODO:
         unimplemented!()
     }

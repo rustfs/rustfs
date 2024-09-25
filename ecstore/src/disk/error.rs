@@ -391,3 +391,15 @@ pub fn map_err_not_exists(e: io::Error) -> Error {
 
     Error::new(e)
 }
+
+pub fn convert_access_error(e: io::Error, per_err: DiskError) -> Error {
+    if os_is_not_exist(&e) {
+        return Error::new(DiskError::VolumeNotEmpty);
+    } else if is_sys_err_io(&e) {
+        return Error::new(DiskError::FaultyDisk);
+    } else if os_is_permission(&e) {
+        return Error::new(per_err);
+    }
+
+    Error::new(e)
+}

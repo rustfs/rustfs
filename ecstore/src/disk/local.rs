@@ -4,7 +4,7 @@ use super::{
     os, DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
-use crate::disk::error::{is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err};
+use crate::disk::error::{convert_access_error, is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err};
 use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::utils::fs::lstat;
@@ -585,6 +585,7 @@ impl DiskAPI for LocalDisk {
 
     #[must_use]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
+        // TOFIX:
         let p = self.get_object_path(volume, path)?;
         let (data, _) = read_file_all(&p).await?;
 
@@ -1083,11 +1084,45 @@ impl DiskAPI for LocalDisk {
             created: modtime,
         })
     }
-    async fn delete_paths(&self, _volume: &str, _paths: &[&str]) -> Result<()> {
-        unimplemented!()
+    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+        let volume_dir = self.get_bucket_path(volume)?;
+        if !skip_access_checks(volume) {
+            utils::fs::access(&volume_dir)
+                .await
+                .map_err(|e| convert_access_error(e, DiskError::VolumeAccessDenied))?
+        }
+
+        for path in paths.iter() {
+            let file_path = volume_dir.join(Path::new(path));
+
+            check_path_length(&file_path.to_string_lossy().to_string())?;
+
+            self.move_to_trash(&file_path, false, false).await?;
+        }
+
+        Ok(())
     }
-    async fn update_metadata(&self, _volume: &str, _path: &str, _fi: FileInfo, _opts: UpdateMetadataOpts) {
-        unimplemented!()
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, _opts: UpdateMetadataOpts) -> Result<()> {
+        if let Some(metadata) = fi.metadata {
+            let volume_dir = self.get_bucket_path(&volume)?;
+            let file_path = volume_dir.join(Path::new(&path));
+
+            check_path_length(&file_path.to_string_lossy().to_string())?;
+
+            self.read_all(&volume, format!("{}/{}", &path, super::STORAGE_FORMAT_FILE).as_str())
+                .await
+                .map_err(|e| {
+                    if DiskError::FileNotFound.is(&e) && fi.version_id.is_some() {
+                        Error::new(DiskError::FileVersionNotFound)
+                    } else {
+                        e
+                    }
+                })?;
+
+            // FIXME:
+        }
+
+        Err(Error::msg("Invalid Argument"))
     }
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         let p = self.get_object_path(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;

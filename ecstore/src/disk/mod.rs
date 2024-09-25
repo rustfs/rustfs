@@ -90,7 +90,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<Vec<Option<Error>>>;
     async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()>;
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
-    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts);
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) -> Result<()>;
     async fn read_version(
         &self,
         org_volume: &str,
