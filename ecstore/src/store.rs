@@ -173,7 +173,7 @@ impl ECStore {
 
         let mut local_disks = Vec::new();
 
-        info!("endpoint_pools: {:?}", endpoint_pools);
+        debug!("endpoint_pools: {:?}", endpoint_pools);
 
         for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
             // TODO: read from config parseStorageClass

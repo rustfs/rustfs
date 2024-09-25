@@ -26,7 +26,7 @@ pub struct Erasure {
 
 impl Erasure {
     pub fn new(data_shards: usize, parity_shards: usize, block_size: usize) -> Self {
-        warn!(
+        debug!(
             "Erasure new data_shards {},parity_shards {} block_size {} ",
             data_shards, parity_shards, block_size
         );
@@ -57,7 +57,7 @@ impl Erasure {
     {
         let mut stream = ChunkedStream::new(body, total_size, self.block_size, false);
         let mut total: usize = 0;
-        let mut idx = 0;
+        // let mut idx = 0;
         while let Some(result) = stream.next().await {
             match result {
                 Ok(data) => {
@@ -68,19 +68,19 @@ impl Erasure {
                         break;
                     }
 
-                    idx += 1;
-                    debug!("encode {} get data {}", idx, data.len());
+                    // idx += 1;
+                    // debug!("encode {} get data {}", idx, data.len());
 
                     let blocks = self.encode_data(data.as_ref())?;
 
-                    debug!(
-                        "encode shard {} size: {}/{} from block_size {}, total_size {} ",
-                        idx,
-                        blocks[0].len(),
-                        blocks.len(),
-                        data.len(),
-                        total_size
-                    );
+                    // debug!(
+                    //     "encode shard {} size: {}/{} from block_size {}, total_size {} ",
+                    //     idx,
+                    //     blocks[0].len(),
+                    //     blocks.len(),
+                    //     data.len(),
+                    //     total_size
+                    // );
 
                     let mut errs = Vec::new();
 
@@ -94,14 +94,13 @@ impl Erasure {
                         }
                     }
 
-                    debug!("Erasure encode errs {:?}", &errs);
-
                     let none_count = errs.iter().filter(|&x| x.is_none()).count();
                     if none_count >= write_quorum {
                         continue;
                     }
 
                     if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
+                        warn!("Erasure encode errs {:?}", &errs);
                         return Err(err);
                     }
                 }
@@ -161,7 +160,7 @@ impl Erasure {
                 break;
             }
 
-            debug!("decode {} block_offset {},block_length {} ", block_idx, block_offset, block_length);
+            // debug!("decode {} block_offset {},block_length {} ", block_idx, block_offset, block_length);
 
             let mut bufs = reader.read().await?;
 
@@ -175,7 +174,7 @@ impl Erasure {
 
             bytes_writed += writed_n;
 
-            debug!("decode {} writed_n {}, total_writed: {} ", block_idx, writed_n, bytes_writed);
+            // debug!("decode {} writed_n {}, total_writed: {} ", block_idx, writed_n, bytes_writed);
         }
 
         if bytes_writed != length {
