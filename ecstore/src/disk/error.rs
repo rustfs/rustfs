@@ -252,6 +252,142 @@ pub fn ioerr_to_err(e: io::Error) -> Error {
     }
 }
 
-pub fn os_is_not_exist(e: io::Error) -> bool {
+pub fn is_sys_err_no_space(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 28;
+    }
+    false
+}
+
+pub fn is_sys_err_invalid_arg(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 22;
+    }
+    false
+}
+
+pub fn is_sys_err_io(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 5;
+    }
+    false
+}
+
+pub fn is_sys_err_is_dir(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 21;
+    }
+    false
+}
+
+pub fn is_sys_err_not_dir(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 20;
+    }
+    false
+}
+
+pub fn is_sys_err_too_long(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 63;
+    }
+    false
+}
+
+pub fn is_sys_err_too_many_symlinks(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 62;
+    }
+    false
+}
+
+pub fn is_sys_err_not_empty(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        if no == 66 {
+            return true;
+        }
+
+        if cfg!(target_os = "solaris") && no == 17 {
+            return true;
+        }
+
+        if cfg!(target_os = "windows") && no == 145 {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn is_sys_err_path_not_found(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        if cfg!(target_os = "windows") {
+            if no == 3 {
+                return true;
+            }
+        } else {
+            if no == 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn is_sys_err_handle_invalid(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        if cfg!(target_os = "windows") {
+            if no == 6 {
+                return true;
+            }
+        } else {
+            return false;
+        }
+    }
+    false
+}
+
+pub fn is_sys_err_cross_device(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 18;
+    }
+    false
+}
+
+pub fn is_sys_err_too_many_files(e: &io::Error) -> bool {
+    if let Some(no) = e.raw_os_error() {
+        return no == 23 || no == 24;
+    }
+    false
+}
+
+pub fn os_is_not_exist(e: &io::Error) -> bool {
     e.kind() == ErrorKind::NotFound
+}
+
+pub fn os_is_permission(e: &io::Error) -> bool {
+    if e.kind() == ErrorKind::PermissionDenied {
+        return true;
+    }
+    if let Some(no) = e.raw_os_error() {
+        if no == 30 {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn os_is_exist(e: &io::Error) -> bool {
+    e.kind() == ErrorKind::AlreadyExists
+}
+
+// map_err_not_exists
+pub fn map_err_not_exists(e: io::Error) -> Error {
+    if os_is_not_exist(&e) {
+        return Error::new(DiskError::VolumeNotEmpty);
+    } else if is_sys_err_io(&e) {
+        return Error::new(DiskError::FaultyDisk);
+    }
+
+    Error::new(e)
 }

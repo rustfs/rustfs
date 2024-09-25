@@ -201,7 +201,16 @@ impl DiskAPI for RemoteDisk {
 
         Ok(())
     }
-
+    async fn rename_part(
+        &self,
+        _src_volume: &str,
+        _src_path: &str,
+        _dst_volume: &str,
+        _dst_path: &str,
+        _meta: Vec<u8>,
+    ) -> Result<()> {
+        unimplemented!()
+    }
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         info!("rename_file");
         let mut client = self.get_client_v2().await?;

@@ -2,8 +2,8 @@ pub mod endpoint;
 pub mod error;
 pub mod format;
 mod local;
-mod remote;
 pub mod os;
+mod remote;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
@@ -117,7 +117,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
-    // RenamePart
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()>;
     // CheckParts
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     // VerifyFile
@@ -127,7 +127,6 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
-    
 }
 
 pub struct UpdateMetadataOpts {

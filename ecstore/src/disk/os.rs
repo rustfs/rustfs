@@ -1,16 +1,20 @@
-use std::path::Path;
+use std::{
+    io,
+    path::{Component, Path},
+};
 
 use futures::TryFutureExt;
 use tokio::fs;
 
 use crate::{
+    disk::error::{is_sys_err_not_dir, is_sys_err_path_not_found, os_is_not_exist},
     error::{Error, Result},
     utils,
 };
 
-use super::error::{ioerr_to_err, DiskError};
+use super::error::{ioerr_to_err, os_is_exist, DiskError};
 
-fn check_path_length(path_name: &str) -> Result<()> {
+pub fn check_path_length(path_name: &str) -> Result<()> {
     // Apple OS X path length is limited to 1016
     if cfg!(target_os = "macos") && path_name.len() > 1016 {
         return Err(Error::new(DiskError::FileNameTooLong));
@@ -90,4 +94,111 @@ pub async fn read_dir(path: impl AsRef<Path>, count: usize) -> Result<Vec<String
     }
 
     Ok(volumes)
+}
+
+pub async fn rename_all(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+) -> Result<()> {
+    reliable_rename(src_file_path, dst_file_path, base_dir).await.map_err(|e| {
+        if is_sys_err_not_dir(&e) || !os_is_not_exist(&e) {
+            Error::new(DiskError::FileAccessDenied)
+        } else if is_sys_err_path_not_found(&e) {
+            Error::new(DiskError::FileAccessDenied)
+        } else if os_is_not_exist(&e) {
+            Error::new(DiskError::FileNotFound)
+        } else if os_is_exist(&e) {
+            Error::new(DiskError::IsNotRegular)
+        } else {
+            Error::new(e)
+        }
+    })?;
+
+    Ok(())
+}
+
+pub async fn reliable_rename(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+) -> io::Result<()> {
+    if let Some(parent) = dst_file_path.as_ref().parent() {
+        reliable_mkdir_all(parent, base_dir.as_ref()).await?;
+    }
+
+    let mut i = 0;
+    loop {
+        if let Err(e) = utils::fs::rename(src_file_path.as_ref(), dst_file_path.as_ref()).await {
+            if os_is_not_exist(&e) && i == 0 {
+                i += 1;
+                continue;
+            }
+
+            return Err(e);
+        }
+
+        break;
+    }
+
+    Ok(())
+}
+
+pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
+    let mut i = 0;
+
+    let mut base_dir = base_dir.as_ref().clone();
+    loop {
+        if let Err(e) = os_mkdir_all(path.as_ref(), base_dir).await {
+            if os_is_not_exist(&e) && i == 0 {
+                i += 1;
+
+                if let Some(base_parent) = base_dir.parent() {
+                    if let Some(c) = base_parent.components().next() {
+                        if c != Component::RootDir {
+                            base_dir = base_parent
+                        }
+                    }
+                }
+                continue;
+            }
+
+            return Err(e);
+        }
+
+        break;
+    }
+
+    Ok(())
+}
+
+pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
+    if !base_dir.as_ref().to_string_lossy().is_empty() {
+        if base_dir.as_ref().starts_with(dir_path.as_ref()) {
+            return Ok(());
+        }
+    }
+
+    if let Some(parent) = dir_path.as_ref().parent() {
+        Box::pin(os_mkdir_all(parent, base_dir)).await?;
+    }
+
+    if let Err(e) = utils::fs::mkdir(dir_path.as_ref()).await {
+        if os_is_exist(&e) {
+            return Ok(());
+        }
+
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_make_dir() {}
 }
