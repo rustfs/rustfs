@@ -52,10 +52,18 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn make_dir_all(path: impl AsRef<Path>) -> Result<()> {
+pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> Result<()> {
     check_path_length(path.as_ref().to_string_lossy().to_string().as_str())?;
 
-    utils::fs::make_dir_all(path.as_ref()).map_err(os_err_to_file_err).await?;
+    if let Err(e) = reliable_mkdir_all(path.as_ref(), base_dir.as_ref()).await {
+        if is_sys_err_not_dir(&e) {
+            return Err(Error::new(DiskError::FileAccessDenied));
+        } else if is_sys_err_path_not_found(&e) {
+            return Err(Error::new(DiskError::FileAccessDenied));
+        }
+
+        return Err(os_err_to_file_err(e));
+    }
 
     Ok(())
 }
@@ -181,7 +189,7 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
 
     if let Some(parent) = dir_path.as_ref().parent() {
         // 不支持递归，直接create_dir_all了
-        if let Err(e) = fs::create_dir_all(&parent).await {
+        if let Err(e) = utils::fs::make_dir_all(&parent).await {
             if os_is_exist(&e) {
                 return Ok(());
             }

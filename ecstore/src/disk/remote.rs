@@ -143,7 +143,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
         info!("read_all");
         let mut client = self.get_client_v2().await?;
         let request = Request::new(ReadAllRequest {
@@ -160,7 +160,7 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FileNotFound.into());
         }
 
-        Ok(Bytes::from(response.data))
+        Ok(response.data)
     }
 
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
