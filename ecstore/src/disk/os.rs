@@ -12,7 +12,7 @@ use crate::{
     utils,
 };
 
-use super::error::{ioerr_to_err, os_is_exist, DiskError};
+use super::error::{os_err_to_file_err, os_is_exist, DiskError};
 
 pub fn check_path_length(path_name: &str) -> Result<()> {
     // Apple OS X path length is limited to 1016
@@ -55,7 +55,7 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
 pub async fn make_dir_all(path: impl AsRef<Path>) -> Result<()> {
     check_path_length(path.as_ref().to_string_lossy().to_string().as_str())?;
 
-    utils::fs::make_dir_all(path.as_ref()).map_err(ioerr_to_err).await?;
+    utils::fs::make_dir_all(path.as_ref()).map_err(os_err_to_file_err).await?;
 
     Ok(())
 }
@@ -147,7 +147,7 @@ pub async fn reliable_rename(
 pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
     let mut i = 0;
 
-    let mut base_dir = base_dir.as_ref().clone();
+    let mut base_dir = base_dir.as_ref();
     loop {
         if let Err(e) = os_mkdir_all(path.as_ref(), base_dir).await {
             if os_is_not_exist(&e) && i == 0 {
@@ -180,7 +180,15 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
     }
 
     if let Some(parent) = dir_path.as_ref().parent() {
-        Box::pin(os_mkdir_all(parent, base_dir)).await?;
+        // 不支持递归，直接create_dir_all了
+        if let Err(e) = fs::create_dir_all(&parent).await {
+            if os_is_exist(&e) {
+                return Ok(());
+            }
+
+            return Err(e);
+        }
+        // Box::pin(os_mkdir_all(&parent, &base_dir)).await?;
     }
 
     if let Err(e) = utils::fs::mkdir(dir_path.as_ref()).await {

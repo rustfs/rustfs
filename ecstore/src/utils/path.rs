@@ -1,5 +1,3 @@
-use std::path::Path;
-
 const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
 pub const SLASH_SEPARATOR: &str = "/";
@@ -38,8 +36,4 @@ pub fn retain_slash(s: &str) -> String {
     } else {
         format!("{}{}", s, SLASH_SEPARATOR)
     }
-}
-
-pub fn join(p1: &str, p2: &str) -> String {
-    Path::new(p1).join(Path::new(p2)).to_string_lossy().to_string()
 }

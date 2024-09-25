@@ -205,7 +205,7 @@ pub fn clone_disk_err(e: &DiskError) -> Error {
     }
 }
 
-pub fn ioerr_to_err(e: io::Error) -> Error {
+pub fn os_err_to_file_err(e: io::Error) -> Error {
     match e.kind() {
         io::ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
         io::ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
