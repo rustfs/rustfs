@@ -49,6 +49,27 @@ pub async fn access(path: impl AsRef<Path>) -> io::Result<()> {
     Ok(())
 }
 
+pub async fn lstat(path: impl AsRef<Path>) -> io::Result<Metadata> {
+    fs::metadata(path).await
+}
+
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir_all(path.as_ref()).await
+}
+
+pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
+    let meta = fs::metadata(path.as_ref()).await?;
+    if meta.is_dir() {
+        fs::remove_dir(path.as_ref()).await
+    } else {
+        fs::remove_file(path.as_ref()).await
+    }
+}
+
+pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
+    fs::create_dir(path.as_ref()).await
+}
+
+pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    fs::rename(from, to).await
 }

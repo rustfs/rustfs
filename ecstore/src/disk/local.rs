@@ -1,11 +1,14 @@
-use super::error::os_is_not_exist;
+use super::error::{is_sys_err_io, is_sys_err_not_empty, os_is_not_exist};
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
+use crate::disk::error::{is_sys_err_not_dir, map_err_not_exists};
+use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
-use crate::utils::path::SLASH_SEPARATOR;
+use crate::utils::fs::lstat;
+use crate::utils::path::{has_suffix, SLASH_SEPARATOR};
 use crate::{
     error::{Error, Result},
     file_meta::FileMeta,
@@ -22,6 +25,7 @@ use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::ErrorKind;
 use tokio::sync::Mutex;
+use tower::layer::util;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -620,15 +624,71 @@ impl DiskAPI for LocalDisk {
 
         Ok(())
     }
-
-    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
-        let src_volume_path = self.get_bucket_path(src_volume)?;
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
+        let src_volume_dir = self.get_bucket_path(src_volume)?;
+        let dst_volume_dir = self.get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
-            check_volume_exists(&src_volume_path).await?;
+            utils::fs::access(&src_volume_dir).await.map_err(map_err_not_exists)?
         }
         if !skip_access_checks(dst_volume) {
-            let vol_path = self.get_bucket_path(dst_volume)?;
-            check_volume_exists(&vol_path).await?;
+            utils::fs::access(&dst_volume_dir).await.map_err(map_err_not_exists)?
+        }
+
+        let src_is_dir = has_suffix(&src_path, SLASH_SEPARATOR);
+        let dst_is_dir = has_suffix(&dst_path, SLASH_SEPARATOR);
+
+        if !(src_is_dir && dst_is_dir || !src_is_dir && !dst_is_dir) {
+            return Err(Error::from(DiskError::FileAccessDenied));
+        }
+
+        let src_file_path = src_volume_dir.join(Path::new(src_path));
+        let dst_file_path = dst_volume_dir.join(Path::new(dst_path));
+
+        check_path_length(&src_file_path.to_string_lossy().to_string())?;
+        check_path_length(&dst_file_path.to_string_lossy().to_string())?;
+
+        if src_is_dir {
+            let meta_op = match lstat(&src_file_path).await {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    if is_sys_err_io(&e) {
+                        return Err(Error::new(DiskError::FaultyDisk));
+                    }
+
+                    if !os_is_not_exist(&e) {
+                        return Err(Error::new(e));
+                    }
+                    None
+                }
+            };
+
+            if let Some(meta) = meta_op {
+                if !meta.is_dir() {
+                    return Err(Error::new(DiskError::FileAccessDenied));
+                }
+            }
+
+            if let Err(e) = utils::fs::remove(&dst_file_path).await {
+                if is_sys_err_not_empty(&e) || is_sys_err_not_dir(&e) {
+                    return Err(Error::new(DiskError::FileAccessDenied));
+                } else if is_sys_err_io(&e) {
+                    return Err(Error::new(DiskError::FaultyDisk));
+                }
+
+                return Err(Error::new(e));
+            }
+        }
+
+        unimplemented!()
+    }
+    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        let src_volume_path = self.get_bucket_path(src_volume)?;
+        let dst_volume_path = self.get_bucket_path(dst_volume)?;
+        if !skip_access_checks(src_volume) {
+            utils::fs::access(&src_volume_path).await.map_err(map_err_not_exists)?;
+        }
+        if !skip_access_checks(dst_volume) {
+            utils::fs::access(&dst_volume_path).await.map_err(map_err_not_exists)?;
         }
 
         let srcp = self.get_object_path(src_volume, src_path)?;
