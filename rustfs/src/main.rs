@@ -19,7 +19,7 @@ use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
