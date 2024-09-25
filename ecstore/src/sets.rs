@@ -20,10 +20,10 @@ use crate::{
 use futures::future::join_all;
 use http::HeaderMap;
 use tokio::sync::RwLock;
-use tokio::sync::Semaphore;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
