@@ -332,10 +332,11 @@ impl LocalDisk {
         }
     }
 
+    // FIXME: read_metadata only suport
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(&file_path.as_ref().to_string_lossy().to_string())?;
 
-        let f = utils::fs::open_file(file_path, O_RDONLY).await?;
+        let mut f = utils::fs::open_file(file_path, O_RDONLY).await?;
 
         let meta = f.metadata().await?;
 
@@ -343,8 +344,24 @@ impl LocalDisk {
             return Err(Error::new(DiskError::FileNotFound));
         }
 
-        //    FIXME:
-        unimplemented!()
+        let meta = f.metadata().await.map_err(os_err_to_file_err)?;
+
+        if meta.is_dir() {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        let size = meta.len() as usize;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size)?;
+
+        f.read_to_end(&mut bytes).await.map_err(os_err_to_file_err)?;
+
+        let modtime = match meta.modified() {
+            Ok(md) => Some(OffsetDateTime::from(md)),
+            Err(_) => None,
+        };
+
+        Ok((bytes, modtime))
     }
 
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
