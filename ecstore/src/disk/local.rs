@@ -18,16 +18,14 @@ use crate::{
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
-use bytes::Bytes;
 use path_absolutize::Absolutize;
-use std::io::Read;
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
 };
-use time::{util, OffsetDateTime};
+use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -1343,12 +1341,12 @@ impl DiskAPI for LocalDisk {
     async fn delete_version(
         &self,
         volume: &str,
-        path: &str,
-        fi: FileInfo,
-        force_del_marker: bool,
-        opts: DeleteOptions,
+        _path: &str,
+        _fi: FileInfo,
+        _force_del_marker: bool,
+        _opts: DeleteOptions,
     ) -> Result<RawFileInfo> {
-        let volume_dir = self.get_bucket_path(&volume)?;
+        let _volume_dir = self.get_bucket_path(&volume)?;
 
         // self.read_all_data(bucket, volume_dir, path);
 
