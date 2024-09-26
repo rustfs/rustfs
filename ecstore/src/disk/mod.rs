@@ -2,6 +2,7 @@ pub mod endpoint;
 pub mod error;
 pub mod format;
 mod local;
+pub mod os;
 mod remote;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
@@ -18,7 +19,8 @@ use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
 };
-use bytes::Bytes;
+
+use endpoint::Endpoint;
 use protos::proto_gen::node_service::{node_service_client::NodeServiceClient, ReadAtRequest, WriteRequest};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc};
@@ -44,39 +46,51 @@ pub async fn new_disk(ep: &endpoint::Endpoint, opt: &DiskOption) -> Result<DiskS
 
 #[async_trait::async_trait]
 pub trait DiskAPI: Debug + Send + Sync + 'static {
+    fn to_string(&self) -> String;
+    async fn is_online(&self) -> bool;
     fn is_local(&self) -> bool;
-    fn path(&self) -> PathBuf;
+    // LastConn
+    fn host_name(&self) -> String;
+    fn endpoint(&self) -> Endpoint;
     async fn close(&self) -> Result<()>;
-    async fn get_disk_id(&self) -> Option<Uuid>;
+    async fn get_disk_id(&self) -> Result<Option<Uuid>>;
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()>;
 
-    async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
-    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
-    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
-    async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
-    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
-    // 读目录下的所有文件、目录
-    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
+    fn path(&self) -> PathBuf;
+    fn get_disk_location(&self) -> DiskLocation;
+
+    // Healing
+    // DiskInfo
+    // NSScanner
+
+    // Volume operations.
+    async fn make_volume(&self, volume: &str) -> Result<()>;
+    async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
+    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
+    async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
+    async fn delete_volume(&self, volume: &str) -> Result<()>;
+
     // 并发边读边写 TODO: wr io.Writer
     async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>>;
-    async fn rename_data(
+
+    // Metadata operations
+    async fn delete_version(
         &self,
-        src_volume: &str,
-        src_path: &str,
-        file_info: FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-    ) -> Result<RenameDataResp>;
-
-    async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
-    async fn delete_volume(&self, volume: &str) -> Result<()>;
-    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
-    async fn make_volume(&self, volume: &str) -> Result<()>;
-    async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
-
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> Result<RawFileInfo>;
+    async fn delete_versions(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Result<Vec<Option<Error>>>;
+    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()>;
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) -> Result<()>;
     async fn read_version(
         &self,
         org_volume: &str,
@@ -86,13 +100,50 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
-    async fn delete_versions(
+    async fn rename_data(
         &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>>;
+        src_volume: &str,
+        src_path: &str,
+        file_info: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp>;
+
+    // File operations.
+    // 读目录下的所有文件、目录
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
+    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
+    async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
+    // ReadFileStream
+    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()>;
+    // CheckParts
+    async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
+    // VerifyFile
+    // StatInfoFile
+    // ReadParts
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
+    // CleanAbandonedData
+    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateMetadataOpts {
+    pub no_persistence: bool,
+}
+
+pub struct DiskLocation {
+    pub pool_idx: Option<usize>,
+    pub set_idx: Option<usize>,
+    pub disk_idx: Option<usize>,
+}
+
+impl DiskLocation {
+    pub fn valid(&self) -> bool {
+        self.pool_idx.is_some() && self.set_idx.is_some() && self.disk_idx.is_some()
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -208,20 +259,24 @@ impl MetaCacheEntry {
     }
 }
 
+#[derive(Debug, Default)]
 pub struct DiskOption {
     pub cleanup: bool,
     pub health_check: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RenameDataResp {
     pub old_data_dir: Option<Uuid>,
+    pub sign: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteOptions {
     pub recursive: bool,
     pub immediate: bool,
+    pub undo_write: bool,
+    pub old_data_dir: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
