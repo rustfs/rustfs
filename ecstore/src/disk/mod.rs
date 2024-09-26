@@ -129,6 +129,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateMetadataOpts {
     pub no_persistence: bool,
 }
