@@ -19,7 +19,7 @@ use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
 };
-use bytes::Bytes;
+
 use endpoint::Endpoint;
 use protos::proto_gen::node_service::{node_service_client::NodeServiceClient, ReadAtRequest, WriteRequest};
 use serde::{Deserialize, Serialize};

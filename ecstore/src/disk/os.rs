@@ -3,7 +3,6 @@ use std::{
     path::{Component, Path},
 };
 
-use futures::TryFutureExt;
 use tokio::fs;
 
 use crate::{

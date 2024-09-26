@@ -1,6 +1,5 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use bytes::Bytes;
 use futures::lock::Mutex;
 use protos::{
     node_service_time_out_client,
