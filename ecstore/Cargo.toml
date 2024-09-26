@@ -9,22 +9,24 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-trait.workspace = true
 backon.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 futures.workspace = true
-async-trait.workspace = true
+common.workspace = true
 tracing.workspace = true
 serde.workspace = true
 time.workspace = true
 serde_json.workspace = true
 tracing-error.workspace = true
 http.workspace = true
-url = "2.5.2"
+url.workspace = true
 uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 reed-solomon-erasure = "6.0.0"
 transform-stream = "0.3.0"
-lazy_static = "1.5.0"
+lazy_static.workspace = true
+lock.workspace = true
 regex = "1.10.5"
 netif = "0.1.6"
 path-absolutize = "3.1.1"

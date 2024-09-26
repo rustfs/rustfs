@@ -1,4 +1,4 @@
-use crate::error::{Error, Result};
+use common::error::{Error, Result};
 use lazy_static::lazy_static;
 use std::{
     collections::HashSet,

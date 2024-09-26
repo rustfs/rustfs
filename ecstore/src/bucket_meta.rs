@@ -2,7 +2,7 @@ use rmp_serde::Serializer;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::error::Result;
+use common::error::Result;
 
 use crate::disk::BUCKET_META_PREFIX;
 

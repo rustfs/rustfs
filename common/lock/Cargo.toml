@@ -4,5 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ecstore.workspace = true
+async-trait.workspace = true
+backon.workspace = true
+common.workspace = true
+lazy_static.workspace = true
+protos.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
+tracing-error.workspace = true
+url.workspace = true
+uuid.workspace = true

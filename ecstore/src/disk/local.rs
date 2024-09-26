@@ -5,12 +5,12 @@ use super::{
 };
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::{
-    error::{Error, Result},
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
 use bytes::Bytes;
+use common::error::{Error, Result};
 use path_absolutize::Absolutize;
 use std::{
     fs::Metadata,

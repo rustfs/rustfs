@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::Bytes;
+use common::error::{Error, Result};
 use futures::lock::Mutex;
 use protos::{
     node_service_time_out_client,
@@ -12,7 +13,7 @@ use protos::{
     },
     DEFAULT_GRPC_SERVER_MESSAGE_LEN,
 };
-use tokio::{fs, sync::RwLock};
+use tokio::sync::RwLock;
 use tonic::{
     transport::{Channel, Endpoint as tonic_Endpoint},
     Request,
@@ -23,7 +24,6 @@ use uuid::Uuid;
 
 use crate::{
     disk::error::DiskError,
-    error::{Error, Result},
     store_api::{FileInfo, RawFileInfo},
 };
 
@@ -35,15 +35,16 @@ use super::{
 
 #[derive(Debug)]
 pub struct RemoteDisk {
-    id: Mutex<Option<Uuid>>,
-    channel: Arc<RwLock<Option<Channel>>>,
-    url: url::Url,
+    pub id: Mutex<Option<Uuid>>,
+    pub channel: Arc<RwLock<Option<Channel>>>,
+    pub url: url::Url,
     pub root: PathBuf,
 }
 
 impl RemoteDisk {
     pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
-        let root = fs::canonicalize(ep.url.path()).await?;
+        // let root = fs::canonicalize(ep.url.path()).await?;
+        let root = PathBuf::from(ep.url.path());
 
         Ok(Self {
             channel: Arc::new(RwLock::new(None)),
