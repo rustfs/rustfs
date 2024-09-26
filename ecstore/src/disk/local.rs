@@ -1312,12 +1312,19 @@ impl DiskAPI for LocalDisk {
             return Err(Error::msg("Invalid arguments specified"));
         }
 
-        let p = self.get_bucket_path(volume)?;
+        let volume_dir = self.get_bucket_path(volume)?;
 
-        if let Err(e) = utils::fs::access(&p).await {
+        if let Err(e) = utils::fs::access(&volume_dir).await {
             if os_is_not_exist(&e) {
-                os::make_dir_all(&p, self.root.as_path()).await?;
+                os::make_dir_all(&volume_dir, self.root.as_path()).await?;
             }
+            if os_is_permission(&e) {
+                return Err(Error::new(DiskError::DiskAccessDenied));
+            } else if is_sys_err_io(&e) {
+                return Err(Error::new(DiskError::FaultyDisk));
+            }
+
+            return Err(Error::new(e));
         }
 
         Err(Error::from(DiskError::VolumeExists))
@@ -1349,15 +1356,25 @@ impl DiskAPI for LocalDisk {
         Ok(volumes)
     }
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
-        let p = self.get_bucket_path(volume)?;
-
-        let m = read_file_metadata(&p).await?;
-        let modtime = match m.modified() {
-            Ok(md) => Some(OffsetDateTime::from(md)),
-            Err(_) => {
-                warn!("Not supported modified on this platform");
-                None
+        let volume_dir = self.get_bucket_path(volume)?;
+        let meta = match utils::fs::lstat(&volume_dir).await {
+            Ok(res) => res,
+            Err(e) => {
+                if os_is_not_exist(&e) {
+                    return Err(Error::new(DiskError::VolumeNotFound));
+                } else if os_is_permission(&e) {
+                    return Err(Error::new(DiskError::DiskAccessDenied));
+                } else if is_sys_err_io(&e) {
+                    return Err(Error::new(DiskError::FaultyDisk));
+                } else {
+                    return Err(Error::new(e));
+                }
             }
+        };
+
+        let modtime = match meta.modified() {
+            Ok(md) => Some(OffsetDateTime::from(md)),
+            Err(_) => None,
         };
 
         Ok(VolumeInfo {
