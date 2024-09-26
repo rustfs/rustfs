@@ -363,6 +363,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b6a852b24ab71dffc585bcb46eaf7959d175cb865a7152e35b348d1b2960422"
 
 [[package]]
+name = "common"
+version = "0.0.1"
+dependencies = [
+ "lazy_static",
+ "tokio",
+ "tracing-error",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -441,11 +450,13 @@ dependencies = [
  "base64-simd",
  "byteorder",
  "bytes",
+ "common",
  "crc32fast",
  "futures",
  "hex-simd",
  "http",
  "lazy_static",
+ "lock",
  "netif",
  "openssl",
  "path-absolutize",
@@ -949,8 +960,20 @@ checksum = "78b3ae25bc7c8c38cec158d1f2757ee79e9b3740fbc7ccf0e59e4b08d793fa89"
 name = "lock"
 version = "0.0.1"
 dependencies = [
- "ecstore",
+ "async-trait",
+ "backon",
+ "common",
+ "lazy_static",
+ "protos",
+ "rand",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
  "tracing",
+ "tracing-error",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1582,6 +1605,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "common",
  "ecstore",
  "flatbuffers",
  "futures",
@@ -1591,6 +1615,7 @@ dependencies = [
  "http-body",
  "hyper",
  "hyper-util",
+ "lock",
  "mime",
  "netif",
  "pin-project-lite",
@@ -2299,6 +2324,18 @@ dependencies = [
  "getrandom",
  "rand",
  "serde",
+ "uuid-macro-internal",
+]
+
+[[package]]
+name = "uuid-macro-internal"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee1cd046f83ea2c4e920d6ee9f7c3537ef928d75dce5d84a87c2c5d6b3999a3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

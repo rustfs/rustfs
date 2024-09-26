@@ -4,9 +4,9 @@ mod service;
 mod storage;
 
 use clap::Parser;
+use common::error::Result;
 use ecstore::{
     endpoints::EndpointServerPools,
-    error::Result,
     store::{init_local_disks, update_erasure_type, ECStore},
 };
 use grpc::make_server;

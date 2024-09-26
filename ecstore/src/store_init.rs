@@ -5,8 +5,8 @@ use crate::{
         new_disk, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
     },
     endpoints::Endpoints,
-    error::{Error, Result},
 };
+use common::error::{Error, Result};
 use futures::future::join_all;
 use std::{
     collections::{hash_map::Entry, HashMap},

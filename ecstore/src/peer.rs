@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use common::error::{Error, Result};
 use futures::future::join_all;
 use protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use protos::proto_gen::node_service::{DeleteBucketRequest, GetBucketInfoRequest, ListBucketRequest, MakeBucketRequest};
@@ -15,7 +16,6 @@ use crate::store::all_local_disk;
 use crate::{
     disk::{self, error::DiskError, VolumeInfo},
     endpoints::{EndpointServerPools, Node},
-    error::{Error, Result},
     store_api::{BucketInfo, BucketOptions, MakeBucketOptions},
 };
 

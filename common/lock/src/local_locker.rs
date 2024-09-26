@@ -1,7 +1,11 @@
-use ecstore::error::{Error, Result};
-use std::{collections::HashMap, time::{Duration, Instant}};
+use async_trait::async_trait;
+use common::error::{Error, Result};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
-use crate::lock_args::LockArgs;
+use crate::{lock_args::LockArgs, Locker};
 
 const MAX_DELETE_LIST: usize = 1000;
 
@@ -54,7 +58,7 @@ pub struct LocalLocker {
 }
 
 impl LocalLocker {
-    fn new() -> Self {
+    pub fn new() -> Self {
         LocalLocker::default()
     }
 }
@@ -64,7 +68,55 @@ impl LocalLocker {
         resource.iter().fold(true, |acc, x| !self.lock_map.contains_key(x) && acc)
     }
 
-    pub fn lock(&mut self, args: LockArgs) -> Result<bool> {
+    pub fn stats(&self) -> LockStats {
+        let mut st = LockStats {
+            total: self.lock_map.len(),
+            ..Default::default()
+        };
+
+        self.lock_map.iter().for_each(|(_, value)| {
+            if value.len() > 0 {
+                if value[0].writer {
+                    st.writes += 1;
+                } else {
+                    st.reads += 1;
+                }
+            }
+        });
+
+        return st;
+    }
+
+    fn dump_lock_map(&mut self) -> HashMap<String, Vec<LockRequesterInfo>> {
+        let mut lock_copy = HashMap::new();
+        self.lock_map.iter().for_each(|(key, value)| {
+            lock_copy.insert(key.to_string(), value.to_vec());
+        });
+
+        return lock_copy;
+    }
+
+    fn expire_old_locks(&mut self, interval: Duration) {
+        self.lock_map.iter_mut().for_each(|(_, lris)| {
+            lris.retain(|lri| {
+                if Instant::now().duration_since(lri.time_last_refresh) > interval {
+                    let mut key = lri.uid.to_string();
+                    format_uuid(&mut key, &lri.idx);
+                    self.lock_uid.remove(&key);
+                    return false;
+                }
+
+                true
+            });
+        });
+
+        return;
+    }
+}
+
+#[async_trait]
+impl Locker for LocalLocker {
+    async fn lock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() > MAX_DELETE_LIST {
             return Err(Error::from_string(format!(
                 "internal error: LocalLocker.lock called with more than {} resources",
@@ -100,7 +152,7 @@ impl LocalLocker {
         Ok(true)
     }
 
-    pub fn unlock(&mut self, args: LockArgs) -> Result<bool> {
+    async fn unlock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() > MAX_DELETE_LIST {
             return Err(Error::from_string(format!(
                 "internal error: LocalLocker.unlock called with more than {} resources",
@@ -128,24 +180,24 @@ impl LocalLocker {
                                 reply |= true;
                                 return false;
                             }
-                
+
                             true
                         });
                     }
                     if lris.len() == 0 {
                         self.lock_map.remove(resource);
                     }
-                },
+                }
                 None => {
                     continue;
                 }
             };
-        };
+        }
 
         Ok(reply)
     }
 
-    pub fn rlock(&mut self, args: LockArgs) -> Result<bool> {
+    async fn rlock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() != 1 {
             return Err(Error::from_string("internal error: localLocker.RLock called with more than one resource"));
         }
@@ -166,17 +218,20 @@ impl LocalLocker {
                 } else {
                     return Ok(false);
                 }
-            },
+            }
             None => {
-                self.lock_map.insert(resource.to_string(), vec![LockRequesterInfo {
-                    name: resource.to_string(),
-                    writer: false,
-                    source: args.source.to_string(),
-                    owner: args.owner.to_string(),
-                    uid: args.uid.to_string(),
-                    quorum: args.quorum,
-                    ..Default::default()
-                }]);
+                self.lock_map.insert(
+                    resource.to_string(),
+                    vec![LockRequesterInfo {
+                        name: resource.to_string(),
+                        writer: false,
+                        source: args.source.to_string(),
+                        owner: args.owner.to_string(),
+                        uid: args.uid.to_string(),
+                        quorum: args.quorum,
+                        ..Default::default()
+                    }],
+                );
             }
         }
         let mut uuid = args.uid.to_string();
@@ -186,7 +241,7 @@ impl LocalLocker {
         Ok(true)
     }
 
-    pub fn runlock(&mut self, args: LockArgs) -> Result<bool> {
+    async fn runlock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() != 1 {
             return Err(Error::from_string("internal error: localLocker.RLock called with more than one resource"));
         }
@@ -206,14 +261,14 @@ impl LocalLocker {
                             reply |= true;
                             return false;
                         }
-            
+
                         true
                     });
                 }
                 if lris.len() == 0 {
                     self.lock_map.remove(resource);
                 }
-            },
+            }
             None => {
                 return Ok(reply || true);
             }
@@ -222,64 +277,32 @@ impl LocalLocker {
         Ok(reply)
     }
 
-    pub fn stats(&self) -> LockStats {
-        let mut st = LockStats {
-            total: self.lock_map.len(),
-            ..Default::default()
-        };
+    async fn close(&self) {}
 
-        self.lock_map.iter().for_each(|(_, value)| {
-            if value.len() > 0 {
-                if value[0].writer {
-                    st.writes += 1;
-                } else {
-                    st.reads += 1;
-                }
-            }
-        });
-
-        return st;
-    }
-
-    pub fn dump_lock_map(&mut self) -> HashMap<String, Vec<LockRequesterInfo>> {
-        let mut lock_copy = HashMap::new();
-        self.lock_map.iter().for_each(|(key, value)| {
-            lock_copy.insert(key.to_string(), value.to_vec());
-        });
-
-        return lock_copy;
-    }
-
-    pub fn close(&self) {
-
-    }
-
-    pub fn is_online(&self) ->bool {
+    async fn is_online(&self) -> bool {
         true
     }
 
-    pub fn is_local(&self) -> bool {
+    async fn is_local(&self) -> bool {
         true
     }
 
     // TODO: need add timeout mechanism
-    pub fn force_unlock(&mut self, args: LockArgs) -> Result<bool> {
+    async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
         let mut reply = false;
         if args.uid.is_empty() {
-            args.resources.iter().for_each(|resource| {
-                match self.lock_map.get(resource) {
-                    Some(lris) => {
-                        lris.iter().for_each(|lri| {
-                            let mut key = lri.uid.to_string();
-                            format_uuid(&mut key, &lri.idx);
-                            self.lock_uid.remove(&key);
-                        });
-                        if lris.len() == 0 {
-                            self.lock_map.remove(resource);
-                        }
-                    },
-                    None => (),
+            args.resources.iter().for_each(|resource| match self.lock_map.get(resource) {
+                Some(lris) => {
+                    lris.iter().for_each(|lri| {
+                        let mut key = lri.uid.to_string();
+                        format_uuid(&mut key, &lri.idx);
+                        self.lock_uid.remove(&key);
+                    });
+                    if lris.len() == 0 {
+                        self.lock_map.remove(resource);
+                    }
                 }
+                None => (),
             });
 
             return Ok(true);
@@ -291,32 +314,30 @@ impl LocalLocker {
             let mut map_id = args.uid.to_string();
             format_uuid(&mut map_id, &idx);
             match self.lock_uid.get(&map_id) {
-                Some(resource) => {
-                    match self.lock_map.get_mut(resource) {
-                        Some(lris) => {
-                            reply = true;
-                            {
-                                lris.retain(|lri| {
-                                    if lri.uid == args.uid && (args.owner.is_empty() || lri.owner == args.owner) {
-                                        let mut key = args.uid.to_string();
-                                        format_uuid(&mut key, &lri.idx);
-                                        need_remove_map_id.push(key);
-                                        return false;
-                                    }
-                        
-                                    true
-                                });
-                            }
-                            idx += 1;
-                            if lris.len() == 0 {
-                                need_remove_resource.push(resource.to_string());
-                            }
-                        },
-                        None => {
-                            need_remove_map_id.push(map_id);
-                            idx += 1;
-                            continue;
+                Some(resource) => match self.lock_map.get_mut(resource) {
+                    Some(lris) => {
+                        reply = true;
+                        {
+                            lris.retain(|lri| {
+                                if lri.uid == args.uid && (args.owner.is_empty() || lri.owner == args.owner) {
+                                    let mut key = args.uid.to_string();
+                                    format_uuid(&mut key, &lri.idx);
+                                    need_remove_map_id.push(key);
+                                    return false;
+                                }
+
+                                true
+                            });
                         }
+                        idx += 1;
+                        if lris.len() == 0 {
+                            need_remove_resource.push(resource.to_string());
+                        }
+                    }
+                    None => {
+                        need_remove_map_id.push(map_id);
+                        idx += 1;
+                        continue;
                     }
                 },
                 None => {
@@ -335,7 +356,7 @@ impl LocalLocker {
         Ok(reply)
     }
 
-    pub fn refresh(&mut self, args: LockArgs) -> Result<bool> {
+    async fn refresh(&mut self, args: &LockArgs) -> Result<bool> {
         let mut idx = 0;
         let mut key = args.uid.to_string();
         format_uuid(&mut key, &idx);
@@ -344,9 +365,7 @@ impl LocalLocker {
                 let mut resource = resource;
                 loop {
                     match self.lock_map.get_mut(resource) {
-                        Some(lris) => {
-                            
-                        },
+                        Some(_lris) => {}
                         None => {
                             let mut key = args.uid.to_string();
                             format_uuid(&mut key, &0);
@@ -363,28 +382,11 @@ impl LocalLocker {
                         None => return Ok(true),
                     };
                 }
-            },
+            }
             None => {
                 return Ok(false);
             }
         }
-    }
-
-    fn expire_old_locks(&mut self, interval: Duration) {
-        self.lock_map.iter_mut().for_each(|(_, lris)| {
-            lris.retain(|lri| {
-                if Instant::now().duration_since(lri.time_last_refresh) > interval {
-                    let mut key = lri.uid.to_string();
-                    format_uuid(&mut key, &lri.idx);
-                    self.lock_uid.remove(&key);
-                    return false;
-                }
-    
-                true
-            });
-        });
-
-        return;
     }
 }
 
@@ -394,12 +396,13 @@ fn format_uuid(s: &mut String, idx: &usize) {
 
 #[cfg(test)]
 mod test {
-    use crate::lock_args::LockArgs;
-    use ecstore::error::Result;
     use super::LocalLocker;
+    use crate::{lock_args::LockArgs, Locker};
+    use common::error::Result;
+    use tokio;
 
-    #[test]
-    fn test_lock_unlock() -> Result<()> {
+    #[tokio::test]
+    async fn test_lock_unlock() -> Result<()> {
         let mut local_locker = LocalLocker::new();
         let args = LockArgs {
             uid: "1111".to_string(),
@@ -408,11 +411,11 @@ mod test {
             source: "".to_string(),
             quorum: 3,
         };
-        local_locker.lock(args.clone())?;
+        local_locker.lock(&args).await?;
 
         println!("lock local_locker: {:?} \n", local_locker);
 
-        local_locker.unlock(args)?;
+        local_locker.unlock(&args).await?;
         println!("unlock local_locker: {:?}", local_locker);
 
         Ok(())

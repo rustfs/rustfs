@@ -4,7 +4,6 @@ pub mod disk;
 pub mod disks_layout;
 pub mod endpoints;
 pub mod erasure;
-pub mod error;
 mod file_meta;
 pub mod peer;
 pub mod set_disk;

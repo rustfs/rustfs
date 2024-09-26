@@ -1,9 +1,9 @@
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
     disks_layout::DisksLayout,
-    error::{Error, Result},
     utils::net,
 };
+use common::error::{Error, Result};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::IpAddr,

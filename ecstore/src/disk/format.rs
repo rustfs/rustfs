@@ -1,5 +1,5 @@
 use super::error::DiskError;
-use crate::error::{Error, Result};
+use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use uuid::Uuid;

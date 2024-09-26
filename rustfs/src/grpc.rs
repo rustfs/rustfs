@@ -8,6 +8,7 @@ use ecstore::{
     store_api::{BucketOptions, FileInfo, MakeBucketOptions},
 };
 use futures::{Stream, StreamExt};
+use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -18,13 +19,14 @@ use protos::{
     proto_gen::node_service::{
         node_service_server::{NodeService as Node, NodeServiceServer as NodeServer},
         DeleteBucketRequest, DeleteBucketResponse, DeleteRequest, DeleteResponse, DeleteVersionsRequest, DeleteVersionsResponse,
-        DeleteVolumeRequest, DeleteVolumeResponse, GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest,
-        ListBucketResponse, ListDirRequest, ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest,
-        MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, PingRequest,
-        PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse,
-        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse,
-        RenameFileRequst, RenameFileResponse, StatVolumeRequest, StatVolumeResponse, WalkDirRequest, WalkDirResponse,
-        WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse,
+        DeleteVolumeRequest, DeleteVolumeResponse, GenerallyLockRequest, GenerallyLockResponse, GetBucketInfoRequest,
+        GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse, ListVolumesRequest,
+        ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest,
+        MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse,
+        ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse,
+        RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, StatVolumeRequest, StatVolumeResponse,
+        WalkDirRequest, WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse,
+        WriteRequest, WriteResponse,
     },
 };
 
@@ -55,11 +57,10 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
 
 #[derive(Debug)]
 struct NodeService {
-    pub local_peer: LocalPeerS3Client,
+    local_peer: LocalPeerS3Client,
 }
 
 pub fn make_server() -> NodeServer<impl Node> {
-    // let local_disks = all_local_disk().await;
     let local_peer = LocalPeerS3Client::new(None, None);
     NodeServer::new(NodeService { local_peer })
 }
@@ -67,20 +68,10 @@ pub fn make_server() -> NodeServer<impl Node> {
 impl NodeService {
     async fn find_disk(&self, disk_path: &String) -> Option<DiskStore> {
         find_local_disk(disk_path).await
-        // let disk_path = match fs::canonicalize(disk_path).await {
-        //     Ok(disk_path) => disk_path,
-        //     Err(_) => return None,
-        // };
-        // self.local_peer.local_disks.iter().find(|&x| x.path() == disk_path).cloned()
     }
 
     async fn all_disk(&self) -> Vec<String> {
         all_local_disk_path().await
-        // self.local_peer
-        //     .local_disks
-        //     .iter()
-        //     .map(|disk| disk.path().to_string_lossy().to_string())
-        //     .collect()
     }
 }
 
@@ -980,6 +971,126 @@ impl Node for NodeService {
                 success: false,
                 error_info: Some("can not find disk".to_string()),
             }))
+        }
+    }
+
+    async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.lock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not lock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.unlock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not unlock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn r_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.rlock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not rlock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.runlock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not runlock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.force_unlock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not force_unlock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn refresh(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.refresh(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not refresh, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
         }
     }
 }

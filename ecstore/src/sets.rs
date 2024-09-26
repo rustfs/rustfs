@@ -1,7 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
+use common::error::{Error, Result};
+use common::globals::GLOBAL_Local_Node_Name;
 use futures::future::join_all;
 use http::HeaderMap;
+use lock::{namespace_lock::NsLockMap, new_lock_api, LockApi};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
@@ -10,7 +14,6 @@ use crate::{
         DiskStore,
     },
     endpoints::PoolEndpoints,
-    error::{Error, Result},
     set_disk::SetDisks,
     store::{GLOBAL_IsDistErasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     store_api::{
@@ -26,6 +29,7 @@ pub struct Sets {
     // pub sets: Vec<Objects>,
     // pub disk_set: Vec<Vec<Option<DiskStore>>>, // [set_count_idx][set_drive_count_idx] = disk_idx
     pub disk_set: Vec<SetDisks>, // [set_count_idx][set_drive_count_idx] = disk_idx
+    pub lockers: Vec<Vec<LockApi>>,
     pub pool_idx: usize,
     pub endpoints: PoolEndpoints,
     pub format: FormatV3,
@@ -45,6 +49,20 @@ impl Sets {
     ) -> Result<Self> {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
+
+        let mut unique: Vec<Vec<String>> = vec![vec![]; set_count];
+        let mut lockers: Vec<Vec<LockApi>> = vec![vec![]; set_count];
+        endpoints.endpoints.as_ref().iter().enumerate().for_each(|(idx, endpoint)| {
+            let set_idx = idx / set_drive_count;
+            if !unique[set_idx].contains(&endpoint.url.host_str().unwrap().to_string()) {
+                if endpoint.is_local {
+                    unique[set_idx].push(endpoint.url.host_str().unwrap().to_string());
+                    lockers[set_idx].push(new_lock_api(true, None));
+                } else {
+                    lockers[set_idx].push(new_lock_api(false, Some(endpoint.url.clone())));
+                }
+            }
+        });
 
         let mut disk_set = Vec::with_capacity(set_count);
 
@@ -83,6 +101,9 @@ impl Sets {
 
             let set_disks = SetDisks {
                 disks: set_drive,
+                lockers: lockers[i].clone(),
+                locker_owner: GLOBAL_Local_Node_Name.read().await.to_string(),
+                ns_mutex: Arc::new(RwLock::new(NsLockMap::default())),
                 set_drive_count,
                 parity_count: partiy_count,
                 set_index: i,
@@ -96,6 +117,7 @@ impl Sets {
             id: fm.id,
             // sets: todo!(),
             disk_set,
+            lockers,
             pool_idx,
             endpoints: endpoints.clone(),
             format: fm.clone(),

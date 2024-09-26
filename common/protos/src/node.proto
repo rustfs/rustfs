@@ -292,6 +292,16 @@ message DeleteVolumeResponse {
   optional string error_info = 2;
 }
 
+// lock api have same argument type
+message GenerallyLockRequest {
+    string args = 1;
+}
+
+message GenerallyLockResponse {
+    bool success = 1;
+    optional string error_info = 2;
+}
+
 /* -------------------------------------------------------------------- */
 
 service NodeService {
@@ -325,4 +335,13 @@ service NodeService {
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {};
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
+
+/* -------------------------------lock service-------------------------- */
+
+  rpc Lock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
+  rpc UnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
+  rpc RLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
+  rpc RUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
+  rpc ForceUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
+  rpc Refresh(GenerallyLockRequest) returns (GenerallyLockResponse) {};
 }
