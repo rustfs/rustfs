@@ -262,6 +262,7 @@ impl PeerS3Client for LocalPeerS3Client {
             }
         }
 
+        warn!("list_bucket ress {:?}", &ress);
         warn!("list_bucket errs {:?}", &errs);
 
         let mut uniq_map: HashMap<&String, &VolumeInfo> = HashMap::new();

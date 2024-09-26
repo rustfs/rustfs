@@ -27,8 +27,10 @@ pub struct FileInfo {
     pub fresh: bool, // indicates this is a first time call to write FileInfo.
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    // #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tags: Option<HashMap<String, String>>,
+    pub metadata: Option<HashMap<String, String>>,
+    pub num_versions: usize,
 }
 
 // impl Default for FileInfo {
@@ -96,6 +98,14 @@ impl FileInfo {
         false
     }
 
+    pub fn get_etag(&self) -> Option<String> {
+        if let Some(meta) = &self.metadata {
+            meta.get("etag").cloned()
+        } else {
+            None
+        }
+    }
+
     pub fn write_quorum(&self, quorum: usize) -> usize {
         if self.deleted {
             return quorum;
@@ -141,7 +151,7 @@ impl FileInfo {
         self.parts.sort_by(|a, b| a.number.cmp(&b.number));
     }
 
-    pub fn into_object_info(&self, bucket: &str, object: &str, _versioned: bool) -> ObjectInfo {
+    pub fn to_object_info(&self, bucket: &str, object: &str, _versioned: bool) -> ObjectInfo {
         ObjectInfo {
             bucket: bucket.to_string(),
             name: object.to_string(),
@@ -533,7 +543,7 @@ pub trait StorageAPI {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader>;
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()>;
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn put_object_part(
         &self,
         bucket: &str,

@@ -182,6 +182,55 @@ impl FormatV3 {
 
         Err(Error::msg(format!("disk id not found {}", disk_id)))
     }
+
+    pub fn check_other(&self, other: &FormatV3) -> Result<()> {
+        let mut tmp = other.clone();
+        let this = tmp.erasure.this;
+        tmp.erasure.this = Uuid::nil();
+
+        if self.erasure.sets.len() != other.erasure.sets.len() {
+            return Err(Error::from_string(format!(
+                "Expected number of sets {}, got {}",
+                self.erasure.sets.len(),
+                other.erasure.sets.len()
+            )));
+        }
+
+        for i in 0..self.erasure.sets.len() {
+            if self.erasure.sets[i].len() != other.erasure.sets[i].len() {
+                return Err(Error::from_string(format!(
+                    "Each set should be of same size, expected {}, got {}",
+                    self.erasure.sets[i].len(),
+                    other.erasure.sets[i].len()
+                )));
+            }
+
+            for j in 0..self.erasure.sets[i].len() {
+                if self.erasure.sets[i][j] != self.erasure.sets[i][j] {
+                    return Err(Error::from_string(format!(
+                        "UUID on positions {}:{} do not match with, expected {:?} got {:?}: (%w)",
+                        i,
+                        j,
+                        self.erasure.sets[i][j].to_string(),
+                        other.erasure.sets[i][j].to_string(),
+                    )));
+                }
+            }
+        }
+
+        for i in 0..tmp.erasure.sets.len() {
+            for j in 0..tmp.erasure.sets[i].len() {
+                if this == tmp.erasure.sets[i][j] {
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(Error::msg(format!(
+            "DriveID {:?} not found in any drive sets {:?}",
+            this, other.erasure.sets
+        )))
+    }
 }
 
 #[cfg(test)]

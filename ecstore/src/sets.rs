@@ -1,10 +1,5 @@
 #![allow(clippy::map_entry)]
-use std::collections::HashMap;
-
-use futures::future::join_all;
-use http::HeaderMap;
-use tracing::warn;
-use uuid::Uuid;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     disk::{
@@ -22,13 +17,21 @@ use crate::{
     },
     utils::hash,
 };
+use futures::future::join_all;
+use http::HeaderMap;
+use tokio::sync::RwLock;
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
+use tracing::warn;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
     pub id: Uuid,
     // pub sets: Vec<Objects>,
     // pub disk_set: Vec<Vec<Option<DiskStore>>>, // [set_count_idx][set_drive_count_idx] = disk_idx
-    pub disk_set: Vec<SetDisks>, // [set_count_idx][set_drive_count_idx] = disk_idx
+    pub disk_set: Vec<Arc<SetDisks>>, // [set_count_idx][set_drive_count_idx] = disk_idx
     pub pool_idx: usize,
     pub endpoints: PoolEndpoints,
     pub format: FormatV3,
@@ -36,6 +39,7 @@ pub struct Sets {
     pub set_count: usize,
     pub set_drive_count: usize,
     pub distribution_algo: DistributionAlgoVersion,
+    ctx: CancellationToken,
 }
 
 impl Sets {
@@ -45,7 +49,7 @@ impl Sets {
         fm: &FormatV3,
         pool_idx: usize,
         partiy_count: usize,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Self>> {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
@@ -53,9 +57,14 @@ impl Sets {
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
+            let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
+
+                let endpoint = endpoints.endpoints.as_ref().get(idx).cloned();
+                set_endpoints.push(endpoint);
+
                 if disk.is_none() {
                     warn!("sets new set_drive {}-{} is none", i, j);
                     set_drive.push(None);
@@ -79,7 +88,7 @@ impl Sets {
                     disk = local_disk;
                 }
 
-                if let Some(_disk_id) = disk.as_ref().unwrap().get_disk_id().await {
+                if let Some(_disk_id) = disk.as_ref().unwrap().get_disk_id().await? {
                     set_drive.push(disk);
                 } else {
                     warn!("sets new set_drive {}-{} get_disk_id is none", i, j);
@@ -87,20 +96,22 @@ impl Sets {
                 }
             }
 
-            warn!("sets new set_drive {:?}", &set_drive);
+            // warn!("sets new set_drive {:?}", &set_drive);
 
             let set_disks = SetDisks {
-                disks: set_drive,
+                disks: RwLock::new(set_drive),
                 set_drive_count,
-                parity_count: partiy_count,
+                default_parity_count: partiy_count,
                 set_index: i,
                 pool_index: pool_idx,
+                set_endpoints,
+                format: fm.clone(),
             };
 
-            disk_set.push(set_disks);
+            disk_set.push(Arc::new(set_disks));
         }
 
-        let sets = Self {
+        let sets = Arc::new(Self {
             id: fm.id,
             // sets: todo!(),
             disk_set,
@@ -111,15 +122,58 @@ impl Sets {
             set_count,
             set_drive_count,
             distribution_algo: fm.erasure.distribution_algo.clone(),
-        };
+            ctx: CancellationToken::new(),
+        });
+
+        let asets = sets.clone();
+
+        tokio::spawn(async move { asets.monitor_and_connect_endpoints().await });
 
         Ok(sets)
     }
-    pub fn get_disks(&self, set_idx: usize) -> SetDisks {
+
+    pub async fn monitor_and_connect_endpoints(&self) {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        info!("start monitor_and_connect_endpoints");
+
+        self.connect_disks().await;
+
+        // TODO: config interval
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15 * 3));
+        let cloned_token = self.ctx.clone();
+        loop {
+            tokio::select! {
+               _= interval.tick()=>{
+                // debug!("tick...");
+                self.connect_disks().await;
+
+                interval.reset();
+               },
+
+               _ = cloned_token.cancelled() => {
+                warn!("ctx cancelled");
+                break;
+               }
+            }
+        }
+
+        warn!("monitor_and_connect_endpoints exit");
+    }
+
+    async fn connect_disks(&self) {
+        // debug!("start connect_disks ...");
+        for set in self.disk_set.iter() {
+            set.connect_disks().await;
+        }
+        // debug!("done connect_disks ...");
+    }
+
+    pub fn get_disks(&self, set_idx: usize) -> Arc<SetDisks> {
         self.disk_set[set_idx].clone()
     }
 
-    pub fn get_disks_by_key(&self, key: &str) -> SetDisks {
+    pub fn get_disks_by_key(&self, key: &str) -> Arc<SetDisks> {
         self.get_disks(self.get_hashed_set_index(key))
     }
 
@@ -314,7 +368,7 @@ impl StorageAPI for Sets {
             .get_object_reader(bucket, object, range, h, opts)
             .await
     }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).put_object(bucket, object, data, opts).await
     }
 
