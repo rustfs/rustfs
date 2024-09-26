@@ -49,18 +49,25 @@ pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
 
 type FileMode = usize;
 
-const O_RDONLY: FileMode = 0x00000;
-const O_WRONLY: FileMode = 0x00001;
-const O_RDWR: FileMode = 0x00002;
-const O_CREAT: FileMode = 0x00040;
-const O_EXCL: FileMode = 0x00080;
-const O_NOCTTY: FileMode = 0x00100;
-const O_TRUNC: FileMode = 0x00200;
-const O_NONBLOCK: FileMode = 0x00800;
-const O_APPEND: FileMode = 0x00400;
-const O_SYNC: FileMode = 0x01000;
-const O_ASYNC: FileMode = 0x02000;
-const O_CLOEXEC: FileMode = 0x80000;
+pub const O_RDONLY: FileMode = 0x00000;
+pub const O_WRONLY: FileMode = 0x00001;
+pub const O_RDWR: FileMode = 0x00002;
+pub const O_CREATE: FileMode = 0x00040;
+// pub const O_EXCL: FileMode = 0x00080;
+// pub const O_NOCTTY: FileMode = 0x00100;
+pub const O_TRUNC: FileMode = 0x00200;
+// pub const O_NONBLOCK: FileMode = 0x00800;
+pub const O_APPEND: FileMode = 0x00400;
+// pub const O_SYNC: FileMode = 0x01000;
+// pub const O_ASYNC: FileMode = 0x02000;
+// pub const O_CLOEXEC: FileMode = 0x80000;
+
+//      read: bool,
+//     write: bool,
+//     append: bool,
+//     truncate: bool,
+//     create: bool,
+//     create_new: bool,
 
 pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<File> {
     let mut opts = fs::OpenOptions::new();
@@ -79,15 +86,17 @@ pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<Fil
         _ => (),
     };
 
-    if mode & O_CREAT != 0 {
-        opts.write(true);
+    if mode & O_CREATE != 0 {
+        opts.create(true);
     }
 
     if mode & O_APPEND != 0 {
-        opts.write(true);
+        opts.append(true);
     }
 
-    // FIXME: TODO
+    if mode & O_TRUNC != 0 {
+        opts.truncate(true);
+    }
 
     opts.open(path.as_ref()).await
 }

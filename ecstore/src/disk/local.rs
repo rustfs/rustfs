@@ -1,13 +1,16 @@
-use super::error::{is_sys_err_io, is_sys_err_not_empty, os_is_not_exist};
+use super::error::{is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files, os_is_not_exist, os_is_permission};
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
-use crate::disk::error::{convert_access_error, is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err};
+use crate::disk::error::{
+    convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
+    map_err_not_exists, os_err_to_file_err,
+};
 use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
-use crate::utils::fs::lstat;
+use crate::utils::fs::{lstat, O_RDONLY};
 use crate::utils::path::{has_suffix, SLASH_SEPARATOR};
 use crate::{
     error::{Error, Result},
@@ -22,9 +25,9 @@ use std::{
     fs::Metadata,
     path::{Path, PathBuf},
 };
-use time::OffsetDateTime;
+use time::{util, OffsetDateTime};
 use tokio::fs::{self, File};
-use tokio::io::ErrorKind;
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -116,10 +119,6 @@ impl LocalDisk {
 
         Ok(disk)
     }
-
-    // fn check_path_length(_path_name: &str) -> Result<()> {
-    //     unimplemented!()
-    // }
 
     fn is_valid_volname(volname: &str) -> bool {
         if volname.len() < 3 {
@@ -324,54 +323,108 @@ impl LocalDisk {
         volume_dir: impl AsRef<Path>,
         path: impl AsRef<Path>,
         read_data: bool,
-    ) -> Result<(Vec<u8>, OffsetDateTime)> {
+    ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         let meta_path = path.as_ref().join(Path::new(super::STORAGE_FORMAT_FILE));
         if read_data {
-            self.read_all_data(bucket, volume_dir, meta_path).await
+            self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
         } else {
-            self.read_metadata_with_dmtime(meta_path).await
+            self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
+            // FIXME: read_metadata only suport
+            // self.read_metadata_with_dmtime(meta_path).await
         }
     }
 
-    async fn read_metadata_with_dmtime(&self, path: impl AsRef<Path>) -> Result<(Vec<u8>, OffsetDateTime)> {
-        let (data, meta) = read_file_all(path).await?;
+    async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
+        check_path_length(&file_path.as_ref().to_string_lossy().to_string())?;
 
-        let modtime = match meta.modified() {
-            Ok(md) => OffsetDateTime::from(md),
-            Err(_) => return Err(Error::msg("Not supported modified on this platform")),
-        };
+        let f = utils::fs::open_file(file_path, O_RDONLY).await?;
 
-        Ok((data, modtime))
+        let meta = f.metadata().await?;
+
+        if meta.is_dir() {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        //    FIXME:
+        unimplemented!()
     }
 
-    async fn read_all_data(
-        &self,
-        _bucket: &str,
-        _volume_dir: impl AsRef<Path>,
-        path: impl AsRef<Path>,
-    ) -> Result<(Vec<u8>, OffsetDateTime)> {
-        let (data, meta) = read_file_all(path).await?;
+    async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
+        // TODO: timeout suport
+        let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
+        Ok(data)
+    }
 
-        let modtime = match meta.modified() {
-            Ok(md) => OffsetDateTime::from(md),
-            Err(_) => return Err(Error::msg("Not supported modified on this platform")),
+    async fn read_all_data_with_dmtime(
+        &self,
+        volume: &str,
+        volume_dir: impl AsRef<Path>,
+        file_path: impl AsRef<Path>,
+    ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
+        let mut f = match utils::fs::open_file(file_path.as_ref(), utils::fs::O_RDONLY).await {
+            Ok(f) => f,
+            Err(e) => {
+                if os_is_not_exist(&e) {
+                    if !skip_access_checks(volume) {
+                        if let Err(er) = utils::fs::access(volume_dir.as_ref()).await {
+                            if os_is_not_exist(&er) {
+                                return Err(Error::new(DiskError::VolumeNotFound));
+                            }
+                        }
+                    }
+
+                    return Err(Error::new(DiskError::FileNotFound));
+                } else if os_is_permission(&e) {
+                    return Err(Error::new(DiskError::FileAccessDenied));
+                } else if is_sys_err_not_dir(&e) || is_sys_err_is_dir(&e) {
+                    return Err(Error::new(DiskError::FileNotFound));
+                } else if is_sys_err_handle_invalid(&e) {
+                    return Err(Error::new(DiskError::FileNotFound));
+                } else if is_sys_err_io(&e) {
+                    return Err(Error::new(DiskError::FaultyDisk));
+                } else if is_sys_err_too_many_files(&e) {
+                    return Err(Error::new(DiskError::TooManyOpenFiles));
+                } else if is_sys_err_invalid_arg(&e) {
+                    if let Ok(meta) = utils::fs::lstat(file_path.as_ref()).await {
+                        if meta.is_dir() {
+                            return Err(Error::new(DiskError::FileNotFound));
+                        }
+                    }
+                    return Err(Error::new(DiskError::UnsupportedDisk));
+                }
+
+                return Err(Error::new(e));
+            }
         };
 
-        Ok((data, modtime))
+        let meta = f.metadata().await.map_err(os_err_to_file_err)?;
+
+        if meta.is_dir() {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        let size = meta.len() as usize;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size)?;
+
+        f.read_to_end(&mut bytes).await.map_err(os_err_to_file_err)?;
+
+        let modtime = match meta.modified() {
+            Ok(md) => Some(OffsetDateTime::from(md)),
+            Err(_) => None,
+        };
+
+        Ok((bytes, modtime))
     }
 
     async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &Vec<FileInfo>) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
         let xlpath = self.get_object_path(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;
 
-        let (data, _) = match self.read_all_data(volume, volume_dir.as_path(), &xlpath).await {
-            Ok(res) => res,
-            Err(_err) => {
-                //  TODO: check if not found return err
-
-                (Vec::new(), OffsetDateTime::UNIX_EPOCH)
-            }
-        };
+        let data = self
+            .read_all_data(volume, volume_dir.as_path(), &xlpath)
+            .await
+            .unwrap_or_default();
 
         if data.is_empty() {
             return Err(Error::new(DiskError::FileNotFound));
@@ -401,8 +454,16 @@ impl LocalDisk {
         // 更新xl.meta
         let buf = fm.marshal_msg()?;
 
-        self.write_all(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str(), buf)
-            .await?;
+        let volume_dir = self.get_bucket_path(&volume)?;
+
+        self.write_all_private(
+            volume,
+            format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str(),
+            &buf,
+            true,
+            volume_dir,
+        )
+        .await?;
 
         Ok(())
     }
@@ -420,7 +481,21 @@ impl LocalDisk {
         os::rename_all(tmp_file_path, file_path, volume_dir).await
     }
 
-    // write_all_private
+    // write_all_public for trail
+    async fn write_all_public(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
+        if volume == super::RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
+            let mut format_info = self.format_info.lock().await;
+            format_info.data = data.clone();
+        }
+
+        let volume_dir = self.get_bucket_path(&volume)?;
+
+        self.write_all_private(&volume, &path, &data, true, volume_dir).await?;
+
+        Ok(())
+    }
+
+    // write_all_private with check_path_length
     pub async fn write_all_private(
         &self,
         volume: &str,
@@ -435,21 +510,27 @@ impl LocalDisk {
 
         self.write_all_internal(file_path, buf, sync, skip_parent).await
     }
-
+    // write_all_internal do write file
     pub async fn write_all_internal(
         &self,
-        p: impl AsRef<Path>,
+        file_path: impl AsRef<Path>,
         data: impl AsRef<[u8]>,
         sync: bool,
-        base_dir: impl AsRef<Path>,
+        skip_parent: impl AsRef<Path>,
     ) -> Result<()> {
-        if sync {
-        } else {
-        }
-        // create top dir if not exists
-        fs::create_dir_all(&p.as_ref().parent().unwrap_or_else(|| Path::new("."))).await?;
+        let flags = utils::fs::O_CREATE | utils::fs::O_WRONLY | utils::fs::O_TRUNC;
 
-        fs::write(&p, data).await?;
+        let mut f = {
+            if sync {
+                // TODO: suport sync
+                self.open_file(file_path.as_ref(), flags, skip_parent.as_ref()).await?
+            } else {
+                self.open_file(file_path.as_ref(), flags, skip_parent.as_ref()).await?
+            }
+        };
+
+        f.write_all(data.as_ref()).await?;
+
         Ok(())
     }
 
@@ -463,7 +544,23 @@ impl LocalDisk {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
-        unimplemented!()
+        let f = utils::fs::open_file(path.as_ref(), mode).await.map_err(|e| {
+            if is_sys_err_io(&e) {
+                Error::new(DiskError::IsNotRegular)
+            } else if os_is_permission(&e) {
+                Error::new(DiskError::FileAccessDenied)
+            } else if is_sys_err_not_dir(&e) {
+                Error::new(DiskError::FileAccessDenied)
+            } else if is_sys_err_io(&e) {
+                Error::new(DiskError::FaultyDisk)
+            } else if is_sys_err_too_many_files(&e) {
+                Error::new(DiskError::TooManyOpenFiles)
+            } else {
+                Error::new(e)
+            }
+        })?;
+
+        Ok(f)
     }
 }
 
@@ -645,18 +742,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
-        if volume == super::RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
-            let mut format_info = self.format_info.lock().await;
-            format_info.data = data.clone();
-        }
-
-        let volume_dir = self.get_bucket_path(&volume)?;
-        let file_path = volume_dir.join(Path::new(&path));
-        check_path_length(&file_path.to_string_lossy().to_string())?;
-
-        self.write_all_internal(file_path, data, true, volume_dir).await?;
-
-        Ok(())
+        self.write_all_public(volume, path, data).await
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
@@ -947,10 +1033,7 @@ impl DiskAPI for LocalDisk {
 
             let (fdata, _) = match self.read_metadata_with_dmtime(&fpath).await {
                 Ok(res) => res,
-                Err(_) => {
-                    // TODO: check err
-                    (Vec::new(), OffsetDateTime::UNIX_EPOCH)
-                }
+                Err(_) => (Vec::new(), None),
             };
 
             meta.metadata = fdata;
@@ -1259,12 +1342,16 @@ impl DiskAPI for LocalDisk {
     }
     async fn delete_version(
         &self,
-        _volume: &str,
-        _path: &str,
-        _fi: FileInfo,
-        _force_del_marker: bool,
-        _opts: DeleteOptions,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
     ) -> Result<RawFileInfo> {
+        let volume_dir = self.get_bucket_path(&volume)?;
+
+        // self.read_all_data(bucket, volume_dir, path);
+
         unimplemented!()
     }
     async fn delete_versions(
