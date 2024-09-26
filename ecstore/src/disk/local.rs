@@ -1163,7 +1163,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) -> Result<()> {
-        if let Some(metadata) = &fi.metadata {
+        if let Some(_) = &fi.metadata {
             let volume_dir = self.get_bucket_path(&volume)?;
             let file_path = volume_dir.join(Path::new(&path));
 
@@ -1184,7 +1184,7 @@ impl DiskAPI for LocalDisk {
                 return Err(Error::new(DiskError::FileVersionNotFound));
             }
 
-            let xl_meta = FileMeta::load(buf.as_slice())?;
+            let mut xl_meta = FileMeta::load(buf.as_slice())?;
 
             xl_meta.update_object_version(fi)?;
 
@@ -1198,8 +1198,6 @@ impl DiskAPI for LocalDisk {
                     !opts.no_persistence,
                 )
                 .await;
-
-            // FIXME:
         }
 
         Err(Error::msg("Invalid Argument"))
