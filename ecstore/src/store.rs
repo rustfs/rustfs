@@ -814,9 +814,11 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
     if peer_set.is_empty() {
         if !host.is_empty() {
             *GLOBAL_Local_Node_Name.write().await = format!("{}:{}", host, port);
+            return;
         }
 
         *GLOBAL_Local_Node_Name.write().await = format!("127.0.0.1:{}", port);
+        return;
     }
 
     *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();

@@ -7,11 +7,11 @@ use tracing::info;
 use crate::{lock_args::LockArgs, Locker};
 
 #[derive(Debug, Clone)]
-pub struct RemoteClinet {
+pub struct RemoteClient {
     url: url::Url,
 }
 
-impl RemoteClinet {
+impl RemoteClient {
     pub fn new(url: url::Url) -> Self {
         Self { url }
     }
@@ -24,7 +24,7 @@ impl RemoteClinet {
 }
 
 #[async_trait]
-impl Locker for RemoteClinet {
+impl Locker for RemoteClient {
     async fn lock(&mut self, args: &LockArgs) -> Result<bool> {
         info!("remote lock");
         let args = serde_json::to_string(args)?;

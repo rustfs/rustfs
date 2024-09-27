@@ -107,7 +107,7 @@ impl DRWMutex {
 
         tolerance = locker_len - quorum;
         let mut attempt = 0;
-        let mut locks = Vec::with_capacity(self.lockers.len());
+        let mut locks = vec!["".to_string(); self.lockers.len()];
 
         loop {
             if self.inner_lock(&mut locks, id, source, is_read_lock, tolerance, quorum).await {
@@ -202,12 +202,12 @@ impl DRWMutex {
 
     pub async fn un_lock(&mut self) {
         if self.write_locks.is_empty() || !self.write_locks.iter().any(|w_lock| is_locked(w_lock)) {
-            panic!("Trying to un_lock() while no lock() is active")
+            panic!("Trying to un_lock() while no lock() is active, write_locks: {:?}", self.write_locks)
         }
 
         let tolerance = self.lockers.len() / 2;
         let is_read_lock = false;
-        let mut locks = self.write_locks.clone();
+        let mut locks = std::mem::take(&mut self.write_locks);
         let start = Instant::now();
         loop {
             if self.release_all(tolerance, &mut locks, is_read_lock).await {
@@ -222,13 +222,13 @@ impl DRWMutex {
     }
 
     pub async fn un_r_lock(&mut self) {
-        if self.write_locks.is_empty() || !self.write_locks.iter().any(|w_lock| is_locked(w_lock)) {
-            panic!("Trying to un_r_lock() while no r_lock() is active")
+        if self.read_locks.is_empty() || !self.read_locks.iter().any(|r_lock| is_locked(r_lock)) {
+            panic!("Trying to un_r_lock() while no r_lock() is active, read_locks: {:?}", self.read_locks)
         }
 
         let tolerance = self.lockers.len() / 2;
         let is_read_lock = true;
-        let mut locks = self.write_locks.clone();
+        let mut locks = std::mem::take(&mut self.read_locks);
         let start = Instant::now();
         loop {
             if self.release_all(tolerance, &mut locks, is_read_lock).await {
@@ -249,7 +249,7 @@ impl DRWMutex {
             }
         }
 
-        check_failed_unlocks(&locks, tolerance)
+        !check_failed_unlocks(&locks, tolerance)
     }
 }
 

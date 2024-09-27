@@ -289,7 +289,7 @@ impl Locker for LocalLocker {
 
     // TODO: need add timeout mechanism
     async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
-        let mut reply = false;
+        let mut reply: bool;
         if args.uid.is_empty() {
             args.resources.iter().for_each(|resource| match self.lock_map.get(resource) {
                 Some(lris) => {
