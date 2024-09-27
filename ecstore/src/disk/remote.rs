@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::path::PathBuf;
 
 use bytes::Bytes;
 use common::error::{Error, Result};
@@ -6,19 +6,12 @@ use futures::lock::Mutex;
 use protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
-        node_service_client::NodeServiceClient, DeleteRequest, DeleteVersionsRequest, DeleteVolumeRequest, ListDirRequest,
-        ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest, ReadMultipleRequest, ReadVersionRequest,
-        ReadXlRequest, RenameDataRequest, RenameFileRequst, StatVolumeRequest, WalkDirRequest, WriteAllRequest,
-        WriteMetadataRequest,
+        DeleteRequest, DeleteVersionsRequest, DeleteVolumeRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest,
+        MakeVolumesRequest, ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
+        RenameFileRequst, StatVolumeRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
-    DEFAULT_GRPC_SERVER_MESSAGE_LEN,
 };
-use tokio::sync::RwLock;
-use tonic::{
-    transport::{Channel, Endpoint as tonic_Endpoint},
-    Request,
-};
-use tower::timeout::Timeout;
+use tonic::Request;
 use tracing::info;
 use uuid::Uuid;
 
@@ -36,7 +29,7 @@ use super::{
 #[derive(Debug)]
 pub struct RemoteDisk {
     pub id: Mutex<Option<Uuid>>,
-    pub channel: Arc<RwLock<Option<Channel>>>,
+    pub addr: String,
     pub url: url::Url,
     pub root: PathBuf,
 }
@@ -45,51 +38,13 @@ impl RemoteDisk {
     pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
         // let root = fs::canonicalize(ep.url.path()).await?;
         let root = PathBuf::from(ep.url.path());
-
+        let addr = format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), ep.url.port().unwrap());
         Ok(Self {
-            channel: Arc::new(RwLock::new(None)),
+            id: Mutex::new(None),
+            addr,
             url: ep.url.clone(),
             root,
-            id: Mutex::new(None),
         })
-    }
-
-    #[allow(dead_code)]
-    async fn get_client(&self) -> Result<NodeServiceClient<Timeout<Channel>>> {
-        let channel_clone = self.channel.clone();
-        let channel = {
-            let read_lock = channel_clone.read().await;
-
-            if let Some(ref channel) = *read_lock {
-                channel.clone()
-            } else {
-                let addr = format!("{}://{}:{}", self.url.scheme(), self.url.host_str().unwrap(), self.url.port().unwrap());
-                info!("disk url: {}", addr);
-                let connector = tonic_Endpoint::from_shared(addr.clone())?;
-
-                let new_channel = connector.connect().await.map_err(|_err| DiskError::DiskNotFound)?;
-
-                info!("get channel success");
-
-                *self.channel.write().await = Some(new_channel.clone());
-
-                new_channel
-            }
-        };
-
-        Ok(node_service_time_out_client(
-            channel,
-            Duration::new(30, 0), // TODO: use config setting
-            DEFAULT_GRPC_SERVER_MESSAGE_LEN,
-            // grpc_enable_gzip,
-            false, // TODO: use config setting
-        ))
-    }
-
-    async fn get_client_v2(&self) -> Result<NodeServiceClient<tonic::transport::Channel>> {
-        // Ok(NodeServiceClient::connect("http://220.181.1.138:9000").await?)
-        let addr = format!("{}://{}:{}", self.url.scheme(), self.url.host_str().unwrap(), self.url.port().unwrap());
-        Ok(NodeServiceClient::connect(addr).await?)
     }
 }
 
@@ -118,7 +73,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         info!("read_all");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(ReadAllRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -138,7 +95,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
         info!("write_all");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(WriteAllRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -158,7 +117,9 @@ impl DiskAPI for RemoteDisk {
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
         info!("delete");
         let options = serde_json::to_string(&opt)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(DeleteRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -177,7 +138,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         info!("rename_file");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(RenameFileRequst {
             disk: self.root.to_string_lossy().to_string(),
             src_volume: src_volume.to_string(),
@@ -203,7 +166,9 @@ impl DiskAPI for RemoteDisk {
                 volume.to_string(),
                 path.to_string(),
                 false,
-                self.get_client_v2().await?,
+                node_service_time_out_client(&self.addr)
+                    .await
+                    .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?,
             )
             .await?,
         ))
@@ -212,21 +177,39 @@ impl DiskAPI for RemoteDisk {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         info!("append_file");
         Ok(FileWriter::Remote(
-            RemoteFileWriter::new(self.root.clone(), volume.to_string(), path.to_string(), true, self.get_client_v2().await?)
-                .await?,
+            RemoteFileWriter::new(
+                self.root.clone(),
+                volume.to_string(),
+                path.to_string(),
+                true,
+                node_service_time_out_client(&self.addr)
+                    .await
+                    .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?,
+            )
+            .await?,
         ))
     }
 
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         info!("read_file");
         Ok(FileReader::Remote(
-            RemoteFileReader::new(self.root.clone(), volume.to_string(), path.to_string(), self.get_client_v2().await?).await?,
+            RemoteFileReader::new(
+                self.root.clone(),
+                volume.to_string(),
+                path.to_string(),
+                node_service_time_out_client(&self.addr)
+                    .await
+                    .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?,
+            )
+            .await?,
         ))
     }
 
     async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
         info!("list_dir");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(ListDirRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -244,7 +227,9 @@ impl DiskAPI for RemoteDisk {
     async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
         info!("walk_dir");
         let walk_dir_options = serde_json::to_string(&opts)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(WalkDirRequest {
             disk: self.root.to_string_lossy().to_string(),
             walk_dir_options,
@@ -275,7 +260,9 @@ impl DiskAPI for RemoteDisk {
     ) -> Result<RenameDataResp> {
         info!("rename_data");
         let file_info = serde_json::to_string(&fi)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(RenameDataRequest {
             disk: self.root.to_string_lossy().to_string(),
             src_volume: src_volume.to_string(),
@@ -298,7 +285,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
         info!("make_volumes");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(MakeVolumesRequest {
             disk: self.root.to_string_lossy().to_string(),
             volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
@@ -315,7 +304,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn make_volume(&self, volume: &str) -> Result<()> {
         info!("make_volume");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(MakeVolumeRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -332,7 +323,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
         info!("list_volumes");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(ListVolumesRequest {
             disk: self.root.to_string_lossy().to_string(),
         });
@@ -354,7 +347,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         info!("stat_volume");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(StatVolumeRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -374,7 +369,9 @@ impl DiskAPI for RemoteDisk {
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         info!("write_metadata");
         let file_info = serde_json::to_string(&fi)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(WriteMetadataRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -401,7 +398,9 @@ impl DiskAPI for RemoteDisk {
     ) -> Result<FileInfo> {
         info!("read_version");
         let opts = serde_json::to_string(opts)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(ReadVersionRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -423,7 +422,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         info!("read_xl");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(ReadXlRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -454,7 +455,9 @@ impl DiskAPI for RemoteDisk {
         for file_info_versions in versions.iter() {
             versions_str.push(serde_json::to_string(file_info_versions)?);
         }
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(DeleteVersionsRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),
@@ -487,7 +490,9 @@ impl DiskAPI for RemoteDisk {
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
         info!("read_multiple");
         let read_multiple_req = serde_json::to_string(&req)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(ReadMultipleRequest {
             disk: self.root.to_string_lossy().to_string(),
             read_multiple_req,
@@ -510,7 +515,9 @@ impl DiskAPI for RemoteDisk {
 
     async fn delete_volume(&self, volume: &str) -> Result<()> {
         info!("delete_volume");
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(DeleteVolumeRequest {
             disk: self.root.to_string_lossy().to_string(),
             volume: volume.to_string(),

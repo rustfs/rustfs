@@ -1,7 +1,8 @@
 #![cfg(test)]
 
-use std::{error::Error, sync::Arc, time::Duration, vec};
+use std::{collections::HashMap, error::Error, sync::Arc, time::Duration, vec};
 
+use lazy_static::lazy_static;
 use lock::{
     drwmutex::Options,
     lock_args::LockArgs,
@@ -10,11 +11,44 @@ use lock::{
 };
 use protos::proto_gen::node_service::{node_service_client::NodeServiceClient, GenerallyLockRequest};
 use tokio::sync::RwLock;
-use tonic::Request;
+use tonic::{
+    metadata::MetadataValue,
+    service::interceptor::InterceptedService,
+    transport::{Channel, Endpoint},
+    Request, Status,
+};
 
-async fn get_client() -> Result<NodeServiceClient<tonic::transport::Channel>, Box<dyn Error>> {
-    // Ok(NodeServiceClient::connect("http://220.181.1.138:9000").await?)
-    Ok(NodeServiceClient::connect("http://localhost:9000").await?)
+lazy_static! {
+    pub static ref GLOBAL_Conn_Map: RwLock<HashMap<String, Channel>> = RwLock::new(HashMap::new());
+}
+
+async fn get_client() -> Result<
+    NodeServiceClient<
+        InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+    >,
+    Box<dyn Error>,
+> {
+    let token: MetadataValue<_> = "rustfs rpc".parse()?;
+    let channel = match GLOBAL_Conn_Map.read().await.get("local") {
+        Some(channel) => channel.clone(),
+        None => {
+            println!("get channel start");
+            let connector = Endpoint::from_static("http://localhost:9000").connect_timeout(Duration::from_secs(60));
+            let channel = connector.connect().await?;
+            // let channel = Channel::from_static("http://localhost:9000").connect().await?;
+            channel
+        }
+    };
+    GLOBAL_Conn_Map.write().await.insert("local".to_owned(), channel.clone());
+
+    // let timeout_channel = Timeout::new(channel, Duration::from_secs(60));
+    Ok(NodeServiceClient::with_interceptor(
+        channel,
+        Box::new(move |mut req: Request<()>| {
+            req.metadata_mut().insert("authorization", token.clone());
+            Ok(req)
+        }),
+    ))
 }
 
 #[tokio::test]
@@ -29,12 +63,22 @@ async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
     let args = serde_json::to_string(&args)?;
 
     let mut client = get_client().await?;
-    let request = Request::new(GenerallyLockRequest { args });
+    println!("got client");
+    let request = Request::new(GenerallyLockRequest { args: args.clone() });
 
+    println!("start request");
     let response = client.lock(request).await?.into_inner();
+    println!("request ended");
     if let Some(error_info) = response.error_info {
         assert!(false, "can not get lock: {}", error_info);
     }
+
+    let request = Request::new(GenerallyLockRequest { args });
+    let response = client.un_lock(request).await?.into_inner();
+    if let Some(error_info) = response.error_info {
+        assert!(false, "can not get un_lock: {}", error_info);
+    }
+
     Ok(())
 }
 

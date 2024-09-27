@@ -15,10 +15,12 @@ use hyper_util::{
     server::conn::auto::Builder as ConnBuilder,
     service::TowerToHyperService,
 };
+use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
+use tonic::{metadata::MetadataValue, Request, Status};
 use tracing::{debug, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,6 +39,15 @@ fn setup_tracing() {
         .with(ErrorLayer::default());
 
     subscriber.try_init().expect("failed to set global default subscriber");
+}
+
+fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
+    let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
+
+    match req.metadata().get("authorization") {
+        Some(t) if token == t => Ok(req),
+        _ => Err(Status::unauthenticated("No valid auth token")),
+    }
 }
 
 fn main() -> Result<()> {
@@ -119,7 +130,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         b.build()
     };
 
-    let rpc_service = make_server();
+    let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
     tokio::spawn(async move {
         let hyper_service = service.into_shared();

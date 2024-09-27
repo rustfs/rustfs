@@ -17,16 +17,15 @@ use tracing::{debug, error, info};
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
-        node_service_server::{NodeService as Node, NodeServiceServer as NodeServer},
-        DeleteBucketRequest, DeleteBucketResponse, DeleteRequest, DeleteResponse, DeleteVersionsRequest, DeleteVersionsResponse,
-        DeleteVolumeRequest, DeleteVolumeResponse, GenerallyLockRequest, GenerallyLockResponse, GetBucketInfoRequest,
-        GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse, ListVolumesRequest,
-        ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest,
-        MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse,
-        ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse,
-        RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, StatVolumeRequest, StatVolumeResponse,
-        WalkDirRequest, WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse,
-        WriteRequest, WriteResponse,
+        node_service_server::NodeService as Node, DeleteBucketRequest, DeleteBucketResponse, DeleteRequest, DeleteResponse,
+        DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse, GenerallyLockRequest,
+        GenerallyLockResponse, GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse,
+        ListDirRequest, ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse,
+        MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse,
+        ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse,
+        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse,
+        RenameFileRequst, RenameFileResponse, StatVolumeRequest, StatVolumeResponse, WalkDirRequest, WalkDirResponse,
+        WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse,
     },
 };
 
@@ -56,13 +55,13 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
 }
 
 #[derive(Debug)]
-struct NodeService {
+pub struct NodeService {
     local_peer: LocalPeerS3Client,
 }
 
-pub fn make_server() -> NodeServer<impl Node> {
+pub fn make_server() -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeServer::new(NodeService { local_peer })
+    NodeService { local_peer }
 }
 
 impl NodeService {
