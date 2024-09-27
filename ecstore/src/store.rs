@@ -1,6 +1,6 @@
 #![allow(clippy::map_entry)]
 use crate::{
-    bucket_meta::BucketMetadata,
+    bucket::BucketMetadata,
     disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     endpoints::{EndpointServerPools, SetupType},
     error::{Error, Result},

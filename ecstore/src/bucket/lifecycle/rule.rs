@@ -6,14 +6,16 @@ use super::{
     prefix::Prefix,
     transition::Transition,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub enum Status {
+    #[default]
     Enabled,
     Disabled,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Rule {
     pub id: String,
     pub status: Status,

@@ -1,8 +1,9 @@
 use super::and::And;
 use super::tag::Tag;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Filter {
     prefix: String,
     and: And,

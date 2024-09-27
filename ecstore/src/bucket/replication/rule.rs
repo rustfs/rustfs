@@ -1,27 +1,29 @@
 use super::filter::Filter;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub enum Status {
+    #[default]
     Enabled,
     Disabled,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct DeleteMarkerReplication {
     pub status: Status,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct DeleteReplication {
     pub status: Status,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ExistingObjectReplication {
     pub status: Status,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Destination {
     pub bucket: String,
     pub storage_class: String,
@@ -29,18 +31,18 @@ pub struct Destination {
 }
 
 // 定义ReplicaModifications结构体
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ReplicaModifications {
     status: Status,
 }
 
 // 定义SourceSelectionCriteria结构体
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct SourceSelectionCriteria {
     replica_modifications: ReplicaModifications,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Rule {
     pub id: String,
     pub status: Status,

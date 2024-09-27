@@ -1,5 +1,8 @@
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Hash)]
 pub enum RetMode {
+    #[default]
     Govenance,
     Compliance,
 }
@@ -17,19 +20,19 @@ impl std::str::FromStr for RetMode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct DefaultRetention {
     pub mode: RetMode,
     pub days: Option<usize>,
     pub years: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Rule {
     pub default_retention: DefaultRetention,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Config {
     pub object_lock_enabled: String,
     pub rule: Option<Rule>,

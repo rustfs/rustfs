@@ -9,3 +9,5 @@ mod replication;
 mod tags;
 mod target;
 mod versioning;
+
+pub use metadata::BucketMetadata;

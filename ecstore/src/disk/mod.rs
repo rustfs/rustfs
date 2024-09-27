@@ -364,6 +364,7 @@ pub struct ReadOptions {
 //     }
 // }
 
+#[derive(Debug)]
 pub enum FileWriter {
     Local(LocalFileWriter),
     Remote(RemoteFileWriter),
@@ -378,7 +379,7 @@ impl Write for FileWriter {
         }
     }
 }
-
+#[derive(Debug)]
 pub struct LocalFileWriter {
     pub inner: File,
 }
@@ -399,6 +400,7 @@ impl Write for LocalFileWriter {
     }
 }
 
+#[derive(Debug)]
 pub struct RemoteFileWriter {
     pub root: PathBuf,
     pub volume: String,

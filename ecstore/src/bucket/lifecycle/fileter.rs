@@ -1,6 +1,9 @@
-use super::{and::And, prefix::Prefix, tag::Tag};
+use std::collections::HashMap;
 
-#[derive(Debug)]
+use super::{and::And, prefix::Prefix, tag::Tag};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Filter {
     pub set: bool,
 
@@ -16,5 +19,5 @@ pub struct Filter {
     pub tag_set: bool,
 
     // 使用HashMap存储缓存的标签
-    pub cached_tags: std::collections::HashMap<String, String>,
+    pub cached_tags: HashMap<String, String>,
 }

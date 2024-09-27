@@ -16,4 +16,4 @@ pub mod store_api;
 mod store_init;
 mod utils;
 
-mod bucket;
+pub mod bucket;

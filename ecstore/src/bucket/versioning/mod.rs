@@ -1,5 +1,8 @@
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 pub enum State {
+    #[default]
     Enabled,
     Suspended,
     // 如果未来可能会使用到Disabled状态，可以在这里添加
@@ -22,12 +25,12 @@ impl std::fmt::Display for State {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ExcludedPrefix {
     pub prefix: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Versioning {
     pub status: State,
     pub excluded_prefixes: Vec<ExcludedPrefix>,

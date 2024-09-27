@@ -1,9 +1,9 @@
+use super::name::Name;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{Debug, Display},
+    fmt::Debug,
 };
-
-use super::name::Name;
 
 #[derive(Debug, Clone)]
 pub struct Key {
@@ -15,7 +15,7 @@ pub struct Key {
 pub type ValueSet = HashSet<String>;
 
 // 定义Function trait
-pub trait Function {
+pub trait FunctionApi {
     // evaluate方法
     fn evaluate(&self, values: &HashMap<Key, ValueSet>) -> bool;
 
@@ -32,34 +32,24 @@ pub trait Function {
     fn to_map(&self) -> HashMap<Key, ValueSet>;
 
     // clone方法
-    fn clone(&self) -> Box<dyn Function>;
+    fn clone(&self) -> Box<Function>;
 }
 
-impl Display for dyn Function {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.to_string())
-    }
-}
+// impl Debug for dyn Function {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         write!(f, "{:?}", self.to_string())
+//     }
+// }
 
-impl Debug for dyn Function {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.to_string())
-    }
+#[derive(Debug, Deserialize, Serialize, Default)]
+enum Function {
+    #[default]
+    Test,
 }
 
 // 定义Functions类型
-pub struct Functions(Vec<Box<dyn Function>>);
-
-impl Display for Functions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[")?;
-        for v in self.0.iter() {
-            write!(f, "{:?}", v.to_string())?;
-        }
-
-        write!(f, "]")
-    }
-}
+#[derive(Deserialize, Serialize, Default)]
+pub struct Functions(Vec<Function>);
 
 impl Debug for Functions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

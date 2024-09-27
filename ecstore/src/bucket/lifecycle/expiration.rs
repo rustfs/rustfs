@@ -1,23 +1,23 @@
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-
 // ExpirationDays is a type alias to unmarshal Days in Expiration
 pub type ExpirationDays = usize;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExpirationDate(OffsetDateTime);
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct ExpirationDate(Option<OffsetDateTime>);
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ExpireDeleteMarker {
     pub marker: Boolean,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Boolean {
     pub val: bool,
     pub set: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Expiration {
     pub days: Option<ExpirationDays>,
     pub date: Option<ExpirationDate>,

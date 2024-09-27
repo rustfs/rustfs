@@ -1,8 +1,8 @@
+use super::rule::Rule;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::rule::Rule;
-
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Lifecycle {
     pub rules: Vec<Rule>,
     pub expiry_updated_at: Option<OffsetDateTime>,

@@ -1,11 +1,12 @@
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 pub type TransitionDays = usize;
 
-#[derive(Debug)]
-pub struct TransitionDate(OffsetDateTime);
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct TransitionDate(Option<OffsetDateTime>);
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Transition {
     pub days: Option<TransitionDays>,
     pub date: Option<TransitionDate>,

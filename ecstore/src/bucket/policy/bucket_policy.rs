@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::{
@@ -8,7 +9,7 @@ use super::{
     resource::ResourceSet,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct BucketPolicyArgs {
     account_name: String,
     groups: Vec<String>,
@@ -19,7 +20,7 @@ pub struct BucketPolicyArgs {
     object_name: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct BPStatement {
     sid: String,
     effect: Effect,
@@ -31,7 +32,7 @@ pub struct BPStatement {
     conditions: Option<Functions>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct BucketPolicy {
     pub id: String,
     pub version: String,
