@@ -1,5 +1,10 @@
 mod and;
+mod delmarker;
 mod expiration;
 mod fileter;
+pub(crate) mod lifecycle;
+mod noncurrentversion;
 mod prefix;
+mod rule;
 mod tag;
+mod transition;

@@ -1,4 +1,5 @@
+#[derive(Debug)]
 pub struct Prefix {
-    pub  val: String,
-    pub  set: bool,
+    pub val: String,
+    pub set: bool,
 }
