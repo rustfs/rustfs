@@ -1,12 +1,13 @@
-use std::{collections::HashSet, default};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ActionSet(HashSet<Action>);
 
 impl ActionSet {}
 
 // 定义Action枚举类型
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default, Hash)]
 pub enum Action {
     AbortMultipartUpload,
     CreateBucket,

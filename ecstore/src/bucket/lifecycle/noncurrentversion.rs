@@ -1,13 +1,14 @@
 use super::{expiration::ExpirationDays, transition::TransitionDays};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct NoncurrentVersionExpiration {
     pub noncurrent_days: ExpirationDays,
     pub newer_noncurrent_versions: usize,
     set: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct NoncurrentVersionTransition {
     pub noncurrent_days: TransitionDays,
     pub storage_class: String,

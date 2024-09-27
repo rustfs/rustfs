@@ -1,11 +1,23 @@
+use std::collections::HashMap;
+
+use rmp_serde::Serializer;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::{
     encryption::BucketSSEConfig, event, lifecycle::lifecycle::Lifecycle, objectlock, policy::bucket_policy::BucketPolicy,
-    quota::BucketQuota, replication, tags::Tags, versioning::Versioning,
+    quota::BucketQuota, replication, tags::Tags, target::BucketTargets, versioning::Versioning,
 };
 
-#[derive(Debug, Default)]
+use crate::error::Result;
+
+use crate::disk::BUCKET_META_PREFIX;
+
+pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
+pub const BUCKET_METADATA_FORMAT: u16 = 1;
+pub const BUCKET_METADATA_VERSION: u16 = 1;
+
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct BucketMetadata {
     format: u16,
     version: u16,
@@ -37,21 +49,45 @@ pub struct BucketMetadata {
     pub bucket_targets_config_meta_updated_at: Option<OffsetDateTime>,
 
     // 新增UpdatedAt字段
-    new_field_updated_at: Option<OffsetDateTime>,
+    pub new_field_updated_at: Option<OffsetDateTime>,
 
     // 私有字段，需要原子更新
-    policy_config: Option<BucketPolicy>, // 假设Policy是一个已经定义好的结构体
-    notification_config: Option<event::config::Config>,
-    lifecycle_config: Option<Lifecycle>,
-    object_lock_config: Option<objectlock::Config>,
-    versioning_config: Option<Versioning>,
-    sse_config: Option<BucketSSEConfig>,
-    tagging_config: Option<Tags>,
-    quota_config: Option<BucketQuota>,
-    replication_config: Option<replication::Config>,
-    bucket_target_config: Option<BucketTargets>,
-    bucket_target_config_meta: Option<std::collections::HashMap<String, String>>,
+    pub policy_config: Option<BucketPolicy>, // 假设Policy是一个已经定义好的结构体
+    pub notification_config: Option<event::Config>,
+    pub lifecycle_config: Option<Lifecycle>,
+    pub object_lock_config: Option<objectlock::Config>,
+    pub versioning_config: Option<Versioning>,
+    pub sse_config: Option<BucketSSEConfig>,
+    pub tagging_config: Option<Tags>,
+    pub quota_config: Option<BucketQuota>,
+    pub replication_config: Option<replication::Config>,
+    pub bucket_target_config: Option<BucketTargets>,
+    pub bucket_target_config_meta: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Default)]
-struct BucketTargets;
+impl BucketMetadata {
+    pub fn new(name: &str) -> Self {
+        BucketMetadata {
+            format: BUCKET_METADATA_FORMAT,
+            version: BUCKET_METADATA_VERSION,
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn save_file_path(&self) -> String {
+        format!("{}/{}/{}", BUCKET_META_PREFIX, self.name.as_str(), BUCKET_METADATA_FILE)
+    }
+
+    fn msg_size(&self) -> usize {
+        unimplemented!()
+    }
+
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        unimplemented!()
+    }
+
+    pub fn unmarshal(_buf: &[u8]) -> Result<Self> {
+        unimplemented!()
+    }
+}
