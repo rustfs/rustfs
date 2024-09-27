@@ -21,7 +21,7 @@ use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -178,12 +178,11 @@ async fn run(opt: config::Opt) -> Result<()> {
         }
     });
 
-    warn!(" init store");
     // init store
     ECStore::new(opt.address.clone(), endpoint_pools.clone())
         .await
         .map_err(|err| Error::from_string(err.to_string()))?;
-    warn!(" init store success!");
+    info!(" init store success!");
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

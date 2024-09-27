@@ -1,17 +1,17 @@
+#![allow(clippy::map_entry)]
+use crate::disk::endpoint::EndpointType;
 use crate::{
     bucket_meta::BucketMetadata,
-    disk::{
-        endpoint::EndpointType, error::DiskError, new_disk, DeleteOptions, DiskOption, DiskStore, WalkDirOptions,
-        BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
-    },
+    disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     endpoints::{EndpointServerPools, SetupType},
     error::{Error, Result},
     peer::S3PeerSys,
     sets::Sets,
+    storage_class::default_partiy_count,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeletedObject, GetObjectReader, HTTPRangeSpec, ListObjectsInfo,
-        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
-        PutObjReader, StorageAPI,
+        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
+        ListObjectsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete,
+        PartInfo, PutObjReader, StorageAPI,
     },
     store_init, utils,
 };
@@ -26,8 +26,9 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
+use tokio::sync::Semaphore;
 use tokio::{fs, sync::RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use lazy_static::lazy_static;
@@ -53,10 +54,11 @@ pub async fn update_erasure_type(setup_type: SetupType) {
     *is_erasure_sd = setup_type == SetupType::ErasureSD;
 }
 
+type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
+
 lazy_static! {
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
-    pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<Vec<Vec<Vec<Option<DiskStore>>>>>> =
-        Arc::new(RwLock::new(Vec::new()));
+    pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
 }
 
 pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
@@ -78,7 +80,7 @@ pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
 
 pub async fn all_local_disk_path() -> Vec<String> {
     let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
-    disk_map.keys().map(|v| v.clone()).collect()
+    disk_map.keys().cloned().collect()
 }
 
 pub async fn all_local_disk() -> Vec<DiskStore> {
@@ -152,12 +154,13 @@ pub struct ECStore {
     pub id: uuid::Uuid,
     // pub disks: Vec<DiskStore>,
     pub disk_map: HashMap<usize, Vec<Option<DiskStore>>>,
-    pub pools: Vec<Sets>,
+    pub pools: Vec<Arc<Sets>>,
     pub peer_sys: S3PeerSys,
     // pub local_disks: Vec<DiskStore>,
 }
 
 impl ECStore {
+    #[allow(clippy::new_ret_no_self)]
     pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<()> {
         // let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 
@@ -179,11 +182,13 @@ impl ECStore {
         )
         .await;
 
-        info!("endpoint_pools: {:?}", endpoint_pools);
+        debug!("endpoint_pools: {:?}", endpoint_pools);
 
         for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
             // TODO: read from config parseStorageClass
-            let partiy_count = store_init::default_partiy_count(pool_eps.drives_per_set);
+            let partiy_count = default_partiy_count(pool_eps.drives_per_set);
+
+            // validate_parity(partiy_count, pool_eps.drives_per_set)?;
 
             let (disks, errs) = crate::store_init::init_disks(
                 &pool_eps.endpoints,
@@ -232,7 +237,6 @@ impl ECStore {
             }
 
             let sets = Sets::new(disks.clone(), pool_eps, &fm, i, partiy_count).await?;
-
             pools.push(sets);
 
             disk_map.insert(i, disks);
@@ -294,62 +298,54 @@ impl ECStore {
 
         for sets in self.pools.iter() {
             for set in sets.disk_set.iter() {
-                for disk in set.disks.iter() {
-                    if disk.is_none() {
-                        continue;
-                    }
-
-                    let disk = disk.as_ref().unwrap();
-                    let opts = opts.clone();
-                    // let mut wr = &mut wr;
-                    futures.push(disk.walk_dir(opts));
-                    // tokio::spawn(async move { disk.walk_dir(opts, wr).await });
-                }
+                futures.push(set.walk_dir(&opts));
             }
         }
 
         let results = join_all(futures).await;
 
-        let mut errs = Vec::new();
+        // let mut errs = Vec::new();
         let mut ress = Vec::new();
         let mut uniq = HashSet::new();
 
-        for res in results {
-            match res {
-                Ok(entrys) => {
-                    for entry in entrys {
-                        if !uniq.contains(&entry.name) {
-                            uniq.insert(entry.name.clone());
-                            // TODO: 过滤
-                            if opts.limit > 0 && ress.len() as i32 >= opts.limit {
-                                return Ok(ress);
-                            }
+        for (disks_ress, _disks_errs) in results {
+            for (_i, disks_res) in disks_ress.iter().enumerate() {
+                if disks_res.is_none() {
+                    // TODO handle errs
+                    continue;
+                }
+                let entrys = disks_res.as_ref().unwrap();
 
-                            if entry.is_object() {
-                                let fi = entry.to_fileinfo(&opts.bucket)?;
-                                if fi.is_some() {
-                                    ress.push(fi.unwrap().into_object_info(&opts.bucket, &entry.name, false));
-                                }
-                                continue;
-                            }
+                for entry in entrys {
+                    if !uniq.contains(&entry.name) {
+                        uniq.insert(entry.name.clone());
+                        // TODO: 过滤
+                        if opts.limit > 0 && ress.len() as i32 >= opts.limit {
+                            return Ok(ress);
+                        }
 
-                            if entry.is_dir() {
-                                ress.push(ObjectInfo {
-                                    is_dir: true,
-                                    bucket: opts.bucket.clone(),
-                                    name: entry.name,
-                                    ..Default::default()
-                                });
+                        if entry.is_object() {
+                            let fi = entry.to_fileinfo(&opts.bucket)?;
+                            if let Some(f) = fi {
+                                ress.push(f.to_object_info(&opts.bucket, &entry.name, false));
                             }
+                            continue;
+                        }
+
+                        if entry.is_dir() {
+                            ress.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: opts.bucket.clone(),
+                                name: entry.name.clone(),
+                                ..Default::default()
+                            });
                         }
                     }
-                    errs.push(None);
                 }
-                Err(e) => errs.push(Some(e)),
             }
         }
 
-        warn!("list_merged errs {:?}", errs);
+        // warn!("list_merged errs {:?}", errs);
 
         Ok(ress)
     }
@@ -358,21 +354,23 @@ impl ECStore {
         let mut futures = Vec::new();
         for sets in self.pools.iter() {
             for set in sets.disk_set.iter() {
-                for disk in set.disks.iter() {
-                    if disk.is_none() {
-                        continue;
-                    }
-
-                    let disk = disk.as_ref().unwrap();
-                    futures.push(disk.delete(
-                        bucket,
-                        prefix,
-                        DeleteOptions {
-                            recursive: true,
-                            immediate: false,
-                        },
-                    ));
-                }
+                futures.push(set.delete_all(bucket, prefix));
+                // let disks = set.disks.read().await;
+                // let dd = disks.clone();
+                // for disk in dd {
+                //     if disk.is_none() {
+                //         continue;
+                //     }
+                //     // let disk = disk.as_ref().unwrap().clone();
+                //     // futures.push(disk.delete(
+                //     //     bucket,
+                //     //     prefix,
+                //     //     DeleteOptions {
+                //     //         recursive: true,
+                //     //         immediate: false,
+                //     //     },
+                //     // ));
+                // }
             }
         }
         let results = join_all(futures).await;
@@ -400,60 +398,66 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<(PoolObjInfo, Vec<Error>)> {
-        let mut futures = Vec::new();
-
-        for pool in self.pools.iter() {
-            futures.push(pool.get_object_info(bucket, object, opts));
-        }
-
-        let results = join_all(futures).await;
-
-        let mut ress = Vec::new();
-
-        let mut i = 0;
-
-        // join_all结果跟输入顺序一致
-        for res in results {
-            let index = i;
-
-            match res {
-                Ok(r) => {
-                    ress.push(PoolObjInfo {
-                        index,
-                        object_info: r,
-                        err: None,
-                    });
-                }
-                Err(e) => {
-                    ress.push(PoolObjInfo {
-                        index,
-                        err: Some(e),
-                        ..Default::default()
-                    });
-                }
-            }
-            i += 1;
-        }
-
-        ress.sort_by(|a, b| {
-            let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-            let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-
-            at.cmp(&bt)
-        });
-
-        for res in ress {
-            // check
-            if res.err.is_none() {
-                // TODO: let errs = self.poolsWithObject()
-                return Ok((res, Vec::new()));
-            }
-        }
-
-        let ret = PoolObjInfo::default();
-
-        Ok((ret, Vec::new()))
+        internal_get_pool_info_existing_with_opts(&self.pools, bucket, object, opts).await
     }
+}
+
+async fn internal_get_pool_info_existing_with_opts(
+    pools: &[Arc<Sets>],
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+) -> Result<(PoolObjInfo, Vec<Error>)> {
+    let mut futures = Vec::new();
+
+    for pool in pools.iter() {
+        futures.push(pool.get_object_info(bucket, object, opts));
+    }
+
+    let results = join_all(futures).await;
+
+    let mut ress = Vec::new();
+
+    // join_all结果跟输入顺序一致
+    for (i, res) in results.into_iter().enumerate() {
+        let index = i;
+
+        match res {
+            Ok(r) => {
+                ress.push(PoolObjInfo {
+                    index,
+                    object_info: r,
+                    err: None,
+                });
+            }
+            Err(e) => {
+                ress.push(PoolObjInfo {
+                    index,
+                    err: Some(e),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    ress.sort_by(|a, b| {
+        let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+
+        at.cmp(&bt)
+    });
+
+    for res in ress {
+        // check
+        if res.err.is_none() {
+            // TODO: let errs = self.poolsWithObject()
+            return Ok((res, Vec::new()));
+        }
+    }
+
+    let ret = PoolObjInfo::default();
+
+    Ok((ret, Vec::new()))
 }
 
 #[derive(Debug, Default)]
@@ -496,6 +500,15 @@ impl StorageAPI for ECStore {
         let buckets = self.peer_sys.list_bucket(opts).await?;
 
         Ok(buckets)
+    }
+
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        self.peer_sys.delete_bucket(bucket, opts).await?;
+
+        // 删除meta
+        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
+            .await?;
+        Ok(())
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         // TODO:  check valid bucket name
@@ -559,21 +572,34 @@ impl StorageAPI for ECStore {
             del_errs.push(None)
         }
 
-        // TODO: limte 限制并发数量
-        let opt = ObjectOptions::default();
-        // 取所有poolObjInfo
-        let mut futures = Vec::new();
-        for obj in objects.iter() {
-            futures.push(self.get_pool_info_existing_with_opts(bucket, &obj.object_name, &opt));
-        }
+        let mut jhs = Vec::new();
+        let semaphore = Arc::new(Semaphore::new(num_cpus::get()));
+        let pools = Arc::new(self.pools.clone());
 
-        let results = join_all(futures).await;
+        for obj in objects.iter() {
+            let (semaphore, pools, bucket, object_name, opt) = (
+                semaphore.clone(),
+                pools.clone(),
+                bucket.to_string(),
+                obj.object_name.to_string(),
+                ObjectOptions::default(),
+            );
+
+            let jh = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                internal_get_pool_info_existing_with_opts(pools.as_ref(), &bucket, &object_name, &opt).await
+            });
+            jhs.push(jh);
+        }
+        let mut results = Vec::new();
+        for jh in jhs {
+            results.push(jh.await.unwrap());
+        }
 
         // 记录pool Index 对应的objects pool_idx -> objects idx
         let mut pool_index_objects = HashMap::new();
 
-        let mut i = 0;
-        for res in results {
+        for (i, res) in results.into_iter().enumerate() {
             match res {
                 Ok((pinfo, _)) => {
                     if pinfo.object_info.delete_marker && opts.version_id.is_empty() {
@@ -601,8 +627,6 @@ impl StorageAPI for ECStore {
                     del_errs[i] = Some(e)
                 }
             }
-
-            i += 1;
         }
 
         if !pool_index_objects.is_empty() {
@@ -615,16 +639,7 @@ impl StorageAPI for ECStore {
 
                 let obj_idxs = vals.unwrap();
                 //  取对应obj,理论上不会none
-                let objs: Vec<ObjectToDelete> = obj_idxs
-                    .iter()
-                    .filter_map(|&idx| {
-                        if let Some(obj) = objects.get(idx) {
-                            Some(obj.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let objs: Vec<ObjectToDelete> = obj_idxs.iter().filter_map(|&idx| objects.get(idx).cloned()).collect();
 
                 if objs.is_empty() {
                     continue;
@@ -633,8 +648,7 @@ impl StorageAPI for ECStore {
                 let (pdel_objs, perrs) = sets.delete_objects(bucket, objs, opts.clone()).await?;
 
                 // perrs的顺序理论上跟obj_idxs顺序一致
-                let mut i = 0;
-                for err in perrs {
+                for (i, err) in perrs.into_iter().enumerate() {
                     let obj_idx = obj_idxs[i];
 
                     if err.is_some() {
@@ -645,8 +659,6 @@ impl StorageAPI for ECStore {
                     dobj.object_name = utils::path::decode_dir_object(&dobj.object_name);
 
                     del_objects[obj_idx] = dobj;
-
-                    i += 1;
                 }
             }
         }
@@ -655,7 +667,7 @@ impl StorageAPI for ECStore {
     }
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix {
-            self.delete_prefix(bucket, &object).await?;
+            self.delete_prefix(bucket, object).await?;
             return Ok(ObjectInfo::default());
         }
 
@@ -717,6 +729,17 @@ impl StorageAPI for ECStore {
 
         unimplemented!()
     }
+
+    async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+        let object = utils::path::encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].put_object_info(bucket, object.as_str(), info, opts).await;
+        }
+
+        unimplemented!()
+    }
+
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -733,7 +756,7 @@ impl StorageAPI for ECStore {
 
         unimplemented!()
     }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<()> {
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // checkPutObjectArgs
 
         let object = utils::path::encode_dir_object(object);
@@ -789,15 +812,6 @@ impl StorageAPI for ECStore {
                 .await;
         }
         unimplemented!()
-    }
-
-    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
-        self.peer_sys.delete_bucket(bucket).await?;
-
-        // 删除meta
-        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
-            .await?;
-        Ok(())
     }
 }
 

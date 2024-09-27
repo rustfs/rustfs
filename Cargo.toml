@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["rustfs", "ecstore", "e2e_test", "common/common", "common/lock", "common/protos"]
+members = [
+    "rustfs",
+    "ecstore",
+    "e2e_test",
+    "common/common",
+    "common/lock",
+    "common/protos",
+]
 
 [workspace.package]
 edition = "2021"
@@ -61,4 +68,9 @@ tracing-error = "0.2.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 transform-stream = "0.3.0"
 url = "2.5.2"
-uuid = { version = "1.10.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { version = "1.10.0", features = [
+    "v4",
+    "fast-rng",
+    "macro-diagnostics",
+] }
+log = "0.4.22"

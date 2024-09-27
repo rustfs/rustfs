@@ -1,0 +1,85 @@
+name: e2e
+
+on:
+  push:
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - nightly
+
+    steps:
+      - name: cache protoc bin
+        id: cache-protoc-action
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-protoc-action-bin
+        with:
+          path: /usr/local/bin/protoc
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
+
+      - name: install protoc
+        if: steps.cache-protoc-action.outputs.cache-hit != 'true'
+        run: |
+          wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip
+          unzip protoc-27.0-linux-x86_64.zip -d protoc3
+          mv protoc3/bin/* /usr/local/bin/
+          chmod +x /usr/local/bin/protoc
+          rm -rf protoc-27.0-linux-x86_64.zip protoc3
+
+      - name: print protoc version
+        run: protoc --version
+
+      - name: cache flatc bin
+        id: cache-flatc-action
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-flatc-action-bin
+        with:
+          path: /usr/local/bin/flatc
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
+
+      - name: install flatc
+        if: steps.cache-flatc-action.outputs.cache-hit != 'true'
+        run: |
+          wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
+          unzip Linux.flatc.binary.g++-13.zip
+          mv flatc /usr/local/bin/ 
+          chmod +x /usr/local/bin/flatc 
+          rm -rf Linux.flatc.binary.g++-13.zip
+
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          # components: rustfmt, clippy
+
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: run fs
+        working-directory: .
+        run: |
+          make e2e-server > /dev/null &
+          make probe-e2e
+
+      - name: e2e test
+        run: cargo test -p e2e_test --lib
+
+      - name: cache cargo
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-cargo
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1

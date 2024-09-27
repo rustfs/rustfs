@@ -88,6 +88,20 @@ message DeleteResponse {
   optional string error_info = 2;
 }
 
+message RenamePartRequst {
+  string disk = 1;
+  string src_volume = 2;
+  string src_path = 3;
+  string dst_volume = 4;
+  string dst_path = 5;
+  bytes meta = 6;
+}
+
+message RenamePartResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
 message RenameFileRequst {
   string disk = 1;
   string src_volume = 2;
@@ -219,6 +233,30 @@ message StatVolumeResponse {
   optional string error_info = 3;
 }
 
+message DeletePathsRequest {
+  string disk = 1;
+  string volume = 2;
+  repeated string paths = 3;
+}
+
+message DeletePathsResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message UpdateMetadataRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  string file_info = 4;
+  string opts = 5;
+}
+
+message UpdateMetadataResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
 message WriteMetadataRequest {
   string disk = 1;  // indicate which one in the disks
   string volume = 2;
@@ -253,6 +291,21 @@ message ReadXLRequest {
 }
 
 message ReadXLResponse {
+  bool success = 1;
+  string raw_file_info = 2;
+  optional string error_info = 3;
+}
+
+message DeleteVersionRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  string file_info = 4;
+  bool force_del_marker = 5;
+  string opts = 6;
+}
+
+message DeleteVersionResponse {
   bool success = 1;
   string raw_file_info = 2;
   optional string error_info = 3;
@@ -317,6 +370,7 @@ service NodeService {
   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {};
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {};
   rpc Delete(DeleteRequest) returns (DeleteResponse) {};
+  rpc RenamePart(RenamePartRequst) returns (RenamePartResponse) {};
   rpc RenameFile(RenameFileRequst) returns (RenameFileResponse) {};
   rpc Write(WriteRequest) returns (WriteResponse) {};
   rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {};
@@ -329,9 +383,12 @@ service NodeService {
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {};
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {};
   rpc StatVolume(StatVolumeRequest) returns (StatVolumeResponse) {};
+  rpc DeletePaths(DeletePathsRequest) returns (DeletePathsResponse) {};
+  rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse) {};
   rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {};
   rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {};
   rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {};
+  rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse) {};
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {};
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};

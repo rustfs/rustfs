@@ -1,33 +1,35 @@
 use std::{error::Error, io::ErrorKind, pin::Pin};
 
 use ecstore::{
-    disk::{DeleteOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, WalkDirOptions},
+    disk::{DeleteOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts, WalkDirOptions},
     erasure::{ReadAt, Write},
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
-    store_api::{BucketOptions, FileInfo, MakeBucketOptions},
+    store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions},
 };
 use futures::{Stream, StreamExt};
 use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, error, info};
 
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
-        node_service_server::NodeService as Node, DeleteBucketRequest, DeleteBucketResponse, DeleteRequest, DeleteResponse,
-        DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse, GenerallyLockRequest,
-        GenerallyLockResponse, GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse,
-        ListDirRequest, ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse,
-        MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse,
-        ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse,
-        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse,
-        RenameFileRequst, RenameFileResponse, StatVolumeRequest, StatVolumeResponse, WalkDirRequest, WalkDirResponse,
-        WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse,
+        node_service_server::NodeService as Node, DeleteBucketRequest, DeleteBucketResponse, DeletePathsRequest,
+        DeletePathsResponse, DeleteRequest, DeleteResponse, DeleteVersionRequest, DeleteVersionResponse, DeleteVersionsRequest,
+        DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse, GenerallyLockRequest, GenerallyLockResponse,
+        GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse,
+        ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse,
+        MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest,
+        ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest,
+        ReadXlResponse, RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, RenamePartRequst,
+        RenamePartResponse, StatVolumeRequest, StatVolumeResponse, UpdateMetadataRequest, UpdateMetadataResponse, WalkDirRequest,
+        WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest,
+        WriteResponse,
     },
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status, Streaming};
+use tracing::{debug, error, info};
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send>>;
 
@@ -208,7 +210,11 @@ impl Node for NodeService {
         debug!("make bucket");
 
         let request = request.into_inner();
-        match self.local_peer.delete_bucket(&request.bucket).await {
+        match self
+            .local_peer
+            .delete_bucket(&request.bucket, &DeleteBucketOptions { force: false })
+            .await
+        {
             Ok(_) => Ok(tonic::Response::new(DeleteBucketResponse {
                 success: true,
                 error_info: None,
@@ -291,6 +297,36 @@ impl Node for NodeService {
             }
         } else {
             Ok(tonic::Response::new(DeleteResponse {
+                success: false,
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
+    async fn rename_part(&self, request: Request<RenamePartRequst>) -> Result<Response<RenamePartResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            match disk
+                .rename_part(
+                    &request.src_volume,
+                    &request.src_path,
+                    &request.dst_volume,
+                    &request.dst_path,
+                    request.meta,
+                )
+                .await
+            {
+                Ok(_) => Ok(tonic::Response::new(RenamePartResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(RenamePartResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(RenamePartResponse {
                 success: false,
                 error_info: Some("can not find disk".to_string()),
             }))
@@ -749,6 +785,68 @@ impl Node for NodeService {
         }
     }
 
+    async fn delete_paths(&self, request: Request<DeletePathsRequest>) -> Result<Response<DeletePathsResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let paths = request.paths.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+            match disk.delete_paths(&request.volume, &paths).await {
+                Ok(_) => Ok(tonic::Response::new(DeletePathsResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(DeletePathsResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(DeletePathsResponse {
+                success: false,
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
+    async fn update_metadata(&self, request: Request<UpdateMetadataRequest>) -> Result<Response<UpdateMetadataResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+                Ok(file_info) => file_info,
+                Err(_) => {
+                    return Ok(tonic::Response::new(UpdateMetadataResponse {
+                        success: false,
+                        error_info: Some("can not decode FileInfoVersions".to_string()),
+                    }));
+                }
+            };
+            let opts = match serde_json::from_str::<UpdateMetadataOpts>(&request.opts) {
+                Ok(opts) => opts,
+                Err(_) => {
+                    return Ok(tonic::Response::new(UpdateMetadataResponse {
+                        success: false,
+                        error_info: Some("can not decode UpdateMetadataOpts".to_string()),
+                    }));
+                }
+            };
+
+            match disk.update_metadata(&request.volume, &request.path, file_info, opts).await {
+                Ok(_) => Ok(tonic::Response::new(UpdateMetadataResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(UpdateMetadataResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(UpdateMetadataResponse {
+                success: false,
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
     async fn write_metadata(&self, request: Request<WriteMetadataRequest>) -> Result<Response<WriteMetadataResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
@@ -849,6 +947,60 @@ impl Node for NodeService {
             Ok(tonic::Response::new(ReadXlResponse {
                 success: false,
                 raw_file_info: String::new(),
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
+    async fn delete_version(&self, request: Request<DeleteVersionRequest>) -> Result<Response<DeleteVersionResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+                Ok(file_info) => file_info,
+                Err(_) => {
+                    return Ok(tonic::Response::new(DeleteVersionResponse {
+                        success: false,
+                        raw_file_info: "".to_string(),
+                        error_info: Some("can not decode FileInfoVersions".to_string()),
+                    }));
+                }
+            };
+            let opts = match serde_json::from_str::<DeleteOptions>(&request.opts) {
+                Ok(opts) => opts,
+                Err(_) => {
+                    return Ok(tonic::Response::new(DeleteVersionResponse {
+                        success: false,
+                        raw_file_info: "".to_string(),
+                        error_info: Some("can not decode DeleteOptions".to_string()),
+                    }));
+                }
+            };
+            match disk
+                .delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
+                .await
+            {
+                Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
+                    Ok(raw_file_info) => Ok(tonic::Response::new(DeleteVersionResponse {
+                        success: true,
+                        raw_file_info,
+                        error_info: None,
+                    })),
+                    Err(err) => Ok(tonic::Response::new(DeleteVersionResponse {
+                        success: false,
+                        raw_file_info: "".to_string(),
+                        error_info: Some(err.to_string()),
+                    })),
+                },
+                Err(err) => Ok(tonic::Response::new(DeleteVersionResponse {
+                    success: false,
+                    raw_file_info: "".to_string(),
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(DeleteVersionResponse {
+                success: false,
+                raw_file_info: "".to_string(),
                 error_info: Some("can not find disk".to_string()),
             }))
         }
