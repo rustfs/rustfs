@@ -1,4 +1,4 @@
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {

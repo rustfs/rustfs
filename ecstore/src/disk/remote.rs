@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use bytes::Bytes;
-use common::error::{Error, Result};
 use futures::lock::Mutex;
 use protos::{
     node_service_time_out_client,
@@ -17,6 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     disk::error::DiskError,
+    error::{Error, Result},
     store_api::{FileInfo, RawFileInfo},
 };
 

@@ -4,7 +4,7 @@ mod service;
 mod storage;
 
 use clap::Parser;
-use common::error::Result;
+use common::error::{Error, Result};
 use ecstore::{
     endpoints::EndpointServerPools,
     store::{init_local_disks, update_erasure_type, ECStore},
@@ -87,12 +87,15 @@ async fn run(opt: config::Opt) -> Result<()> {
     // };
 
     // 用于rpc
-    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())?;
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())
+        .map_err(|err| Error::from_string(err.to_string()))?;
 
     update_erasure_type(setup_type).await;
 
     // 初始化本地磁盘
-    init_local_disks(endpoint_pools.clone()).await?;
+    init_local_disks(endpoint_pools.clone())
+        .await
+        .map_err(|err| Error::from_string(err.to_string()))?;
 
     // Setup S3 service
     // 本项目使用s3s库来实现s3服务
@@ -177,7 +180,9 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     warn!(" init store");
     // init store
-    ECStore::new(opt.address.clone(), endpoint_pools.clone()).await?;
+    ECStore::new(opt.address.clone(), endpoint_pools.clone())
+        .await
+        .map_err(|err| Error::from_string(err.to_string()))?;
     warn!(" init store success!");
 
     tokio::select! {

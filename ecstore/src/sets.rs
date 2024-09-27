@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
 
-use common::error::{Error, Result};
 use common::globals::GLOBAL_Local_Node_Name;
 use futures::future::join_all;
 use http::HeaderMap;
@@ -14,6 +13,7 @@ use crate::{
         DiskStore,
     },
     endpoints::PoolEndpoints,
+    error::{Error, Result},
     set_disk::SetDisks,
     store::{GLOBAL_IsDistErasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     store_api::{

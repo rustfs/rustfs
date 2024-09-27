@@ -5,6 +5,7 @@ use crate::{
         BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
     },
     endpoints::{EndpointServerPools, SetupType},
+    error::{Error, Result},
     peer::S3PeerSys,
     sets::Sets,
     store_api::{
@@ -15,7 +16,6 @@ use crate::{
     store_init, utils,
 };
 use backon::{ExponentialBuilder, Retryable};
-use common::error::{Error, Result};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
 use http::HeaderMap;
