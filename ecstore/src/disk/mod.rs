@@ -32,7 +32,7 @@ use tokio::{
     sync::mpsc::{self, Sender},
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{transport::Channel, Streaming};
+use tonic::{service::interceptor::InterceptedService, transport::Channel, Request, Status, Streaming};
 use tracing::info;
 use uuid::Uuid;
 
@@ -365,7 +365,9 @@ impl RemoteFileWriter {
         volume: String,
         path: String,
         is_append: bool,
-        mut client: NodeServiceClient<Channel>,
+        mut client: NodeServiceClient<
+            InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+        >,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
@@ -480,7 +482,14 @@ pub struct RemoteFileReader {
 }
 
 impl RemoteFileReader {
-    pub async fn new(root: PathBuf, volume: String, path: String, mut client: NodeServiceClient<Channel>) -> Result<Self> {
+    pub async fn new(
+        root: PathBuf,
+        volume: String,
+        path: String,
+        mut client: NodeServiceClient<
+            InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+        >,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 

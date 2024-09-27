@@ -11,9 +11,11 @@ rust-version.workspace = true
 [dependencies]
 ecstore.workspace = true
 flatbuffers.workspace = true
+lazy_static.workspace = true
 lock.workspace = true
 protos.workspace = true
 serde_json.workspace = true
 tonic = { version = "0.12.1", features = ["gzip"] }
 tokio = { workspace = true }
+tower.workspace = true
 url.workspace = true

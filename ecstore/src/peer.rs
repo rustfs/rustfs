@@ -1,16 +1,12 @@
 use async_trait::async_trait;
 use common::error::{Error, Result};
 use futures::future::join_all;
-use protos::proto_gen::node_service::node_service_client::NodeServiceClient;
+use protos::node_service_time_out_client;
 use protos::proto_gen::node_service::{DeleteBucketRequest, GetBucketInfoRequest, ListBucketRequest, MakeBucketRequest};
-use protos::{node_service_time_out_client, DEFAULT_GRPC_SERVER_MESSAGE_LEN};
 use regex::Regex;
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
-use tonic::transport::{Channel, Endpoint};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tonic::Request;
-use tower::timeout::Timeout;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::store::all_local_disk;
 use crate::{
@@ -391,55 +387,13 @@ impl PeerS3Client for LocalPeerS3Client {
 pub struct RemotePeerS3Client {
     pub node: Option<Node>,
     pub pools: Option<Vec<usize>>,
-    connector: Endpoint,
-    channel: Arc<RwLock<Option<Channel>>>,
+    addr: String,
 }
 
 impl RemotePeerS3Client {
     fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
-        let connector =
-            Endpoint::from_shared(format!("{}", node.as_ref().map(|v| { v.url.to_string() }).unwrap_or_default())).unwrap();
-        Self {
-            node,
-            pools,
-            connector,
-            channel: Arc::new(RwLock::new(None)),
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn get_client(&self) -> Result<NodeServiceClient<Timeout<Channel>>> {
-        let channel_clone = self.channel.clone();
-        let channel = {
-            let read_lock = channel_clone.read().await;
-
-            if let Some(ref channel) = *read_lock {
-                channel.clone()
-            } else {
-                let new_channel = self.connector.connect().await?;
-
-                info!("get channel success");
-
-                *self.channel.write().await = Some(new_channel.clone());
-
-                new_channel
-            }
-        };
-
-        Ok(node_service_time_out_client(
-            channel,
-            Duration::new(30, 0), // TODO: use config setting
-            DEFAULT_GRPC_SERVER_MESSAGE_LEN,
-            // grpc_enable_gzip,
-            false, // TODO: use config setting
-        ))
-    }
-
-    async fn get_client_v2(&self) -> Result<NodeServiceClient<tonic::transport::Channel>> {
-        // Ok(NodeServiceClient::connect("http://220.181.1.138:9000").await?)
-        // let addr = format!("{}://{}:{}", self.url.scheme(), self.url.host_str().unwrap(), self.url.port().unwrap());
-        let addr = format!("{}", self.node.as_ref().map(|v| { v.url.to_string() }).unwrap_or_default());
-        Ok(NodeServiceClient::connect(addr).await?)
+        let addr = format!("{}", node.as_ref().map(|v| { v.url.to_string() }).unwrap_or_default());
+        Self { node, pools, addr }
     }
 }
 
@@ -450,7 +404,9 @@ impl PeerS3Client for RemotePeerS3Client {
     }
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         let options = serde_json::to_string(opts)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(ListBucketRequest { options });
         let response = client.list_bucket(request).await?.into_inner();
         let bucket_infos = response
@@ -463,7 +419,9 @@ impl PeerS3Client for RemotePeerS3Client {
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         let options = serde_json::to_string(opts)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(MakeBucketRequest {
             name: bucket.to_string(),
             options,
@@ -479,7 +437,9 @@ impl PeerS3Client for RemotePeerS3Client {
     }
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         let options = serde_json::to_string(opts)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(GetBucketInfoRequest {
             bucket: bucket.to_string(),
             options,
@@ -491,7 +451,9 @@ impl PeerS3Client for RemotePeerS3Client {
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<()> {
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(DeleteBucketRequest {
             bucket: bucket.to_string(),
         });

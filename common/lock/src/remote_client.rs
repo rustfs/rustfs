@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use common::error::{Error, Result};
-use protos::proto_gen::node_service::{node_service_client::NodeServiceClient, GenerallyLockRequest};
+use protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
 use tonic::Request;
 use tracing::info;
 
@@ -8,18 +8,13 @@ use crate::{lock_args::LockArgs, Locker};
 
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
-    url: url::Url,
+    addr: String,
 }
 
 impl RemoteClient {
     pub fn new(url: url::Url) -> Self {
-        Self { url }
-    }
-
-    async fn get_client_v2(&self) -> Result<NodeServiceClient<tonic::transport::Channel>> {
-        // Ok(NodeServiceClient::connect("http://220.181.1.138:9000").await?)
-        let addr = format!("{}://{}:{}", self.url.scheme(), self.url.host_str().unwrap(), self.url.port().unwrap());
-        Ok(NodeServiceClient::connect(addr).await?)
+        let addr = format!("{}://{}:{}", url.scheme(), url.host_str().unwrap(), url.port().unwrap());
+        Self { addr }
     }
 }
 
@@ -28,7 +23,9 @@ impl Locker for RemoteClient {
     async fn lock(&mut self, args: &LockArgs) -> Result<bool> {
         info!("remote lock");
         let args = serde_json::to_string(args)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(GenerallyLockRequest { args });
 
         let response = client.lock(request).await?.into_inner();
@@ -43,7 +40,9 @@ impl Locker for RemoteClient {
     async fn unlock(&mut self, args: &LockArgs) -> Result<bool> {
         info!("remote unlock");
         let args = serde_json::to_string(args)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(GenerallyLockRequest { args });
 
         let response = client.un_lock(request).await?.into_inner();
@@ -58,7 +57,9 @@ impl Locker for RemoteClient {
     async fn rlock(&mut self, args: &LockArgs) -> Result<bool> {
         info!("remote rlock");
         let args = serde_json::to_string(args)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(GenerallyLockRequest { args });
 
         let response = client.r_lock(request).await?.into_inner();
@@ -73,7 +74,9 @@ impl Locker for RemoteClient {
     async fn runlock(&mut self, args: &LockArgs) -> Result<bool> {
         info!("remote runlock");
         let args = serde_json::to_string(args)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(GenerallyLockRequest { args });
 
         let response = client.r_un_lock(request).await?.into_inner();
@@ -88,7 +91,9 @@ impl Locker for RemoteClient {
     async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
         info!("remote force_unlock");
         let args = serde_json::to_string(args)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(GenerallyLockRequest { args });
 
         let response = client.force_un_lock(request).await?.into_inner();
@@ -103,7 +108,9 @@ impl Locker for RemoteClient {
     async fn refresh(&mut self, args: &LockArgs) -> Result<bool> {
         info!("remote refresh");
         let args = serde_json::to_string(args)?;
-        let mut client = self.get_client_v2().await?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
         let request = Request::new(GenerallyLockRequest { args });
 
         let response = client.refresh(request).await?.into_inner();

@@ -368,6 +368,7 @@ version = "0.0.1"
 dependencies = [
  "lazy_static",
  "tokio",
+ "tonic",
  "tracing-error",
 ]
 
@@ -435,11 +436,13 @@ version = "0.0.1"
 dependencies = [
  "ecstore",
  "flatbuffers",
+ "lazy_static",
  "lock",
  "protos",
  "serde_json",
  "tokio",
  "tonic",
+ "tower",
  "url",
 ]
 
@@ -1423,6 +1426,7 @@ dependencies = [
 name = "protos"
 version = "0.0.1"
 dependencies = [
+ "common",
  "flatbuffers",
  "prost",
  "prost-build",
