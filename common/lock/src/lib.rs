@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -5,7 +7,7 @@ use common::error::Result;
 use lazy_static::lazy_static;
 use local_locker::LocalLocker;
 use lock_args::LockArgs;
-use remote_client::RemoteClinet;
+use remote_client::RemoteClient;
 use tokio::sync::RwLock;
 
 pub mod drwmutex;
@@ -37,7 +39,7 @@ pub trait Locker {
 #[derive(Debug, Clone)]
 pub enum LockApi {
     Local,
-    Remote(RemoteClinet),
+    Remote(RemoteClient),
 }
 
 #[async_trait]
@@ -111,5 +113,5 @@ pub fn new_lock_api(is_local: bool, url: Option<url::Url>) -> LockApi {
         return LockApi::Local;
     }
 
-    LockApi::Remote(RemoteClinet::new(url.unwrap()))
+    LockApi::Remote(RemoteClient::new(url.unwrap()))
 }

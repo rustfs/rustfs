@@ -435,10 +435,12 @@ version = "0.0.1"
 dependencies = [
  "ecstore",
  "flatbuffers",
+ "lock",
  "protos",
  "serde_json",
  "tokio",
  "tonic",
+ "url",
 ]
 
 [[package]]

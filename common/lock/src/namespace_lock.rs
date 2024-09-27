@@ -34,6 +34,13 @@ pub struct NsLockMap {
 }
 
 impl NsLockMap {
+    pub fn new(is_dist_erasure: bool) -> Self {
+        Self {
+            is_dist_erasure,
+            ..Default::default()
+        }
+    }
+
     async fn lock(
         &mut self,
         volume: &String,

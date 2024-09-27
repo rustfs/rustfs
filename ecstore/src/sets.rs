@@ -54,11 +54,15 @@ impl Sets {
         let mut lockers: Vec<Vec<LockApi>> = vec![vec![]; set_count];
         endpoints.endpoints.as_ref().iter().enumerate().for_each(|(idx, endpoint)| {
             let set_idx = idx / set_drive_count;
-            if !unique[set_idx].contains(&endpoint.url.host_str().unwrap().to_string()) {
-                if endpoint.is_local {
-                    unique[set_idx].push(endpoint.url.host_str().unwrap().to_string());
-                    lockers[set_idx].push(new_lock_api(true, None));
-                } else {
+            if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
+                unique[set_idx].push("local".to_string());
+                lockers[set_idx].push(new_lock_api(true, None));
+            }
+
+            if !endpoint.is_local {
+                let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap().to_string());
+                if !unique[set_idx].contains(&host_port) {
+                    unique[set_idx].push(host_port);
                     lockers[set_idx].push(new_lock_api(false, Some(endpoint.url.clone())));
                 }
             }
@@ -103,7 +107,7 @@ impl Sets {
                 disks: set_drive,
                 lockers: lockers[i].clone(),
                 locker_owner: GLOBAL_Local_Node_Name.read().await.to_string(),
-                ns_mutex: Arc::new(RwLock::new(NsLockMap::default())),
+                ns_mutex: Arc::new(RwLock::new(NsLockMap::new(*GLOBAL_IsDistErasure.read().await))),
                 set_drive_count,
                 parity_count: partiy_count,
                 set_index: i,
