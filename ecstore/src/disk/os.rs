@@ -68,18 +68,12 @@ pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) ->
 }
 
 // read_dir  count read limit. when count == 0 unlimit.
-pub async fn read_dir(path: impl AsRef<Path>, count: usize) -> Result<Vec<String>> {
+pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> Result<Vec<String>> {
     let mut entries = fs::read_dir(path.as_ref()).await?;
 
     let mut volumes = Vec::new();
 
-    let mut count: i32 = {
-        if count == 0 {
-            -1
-        } else {
-            count as i32
-        }
-    };
+    let mut count = count;
 
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -207,13 +201,4 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod test {
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_make_dir() {}
 }
