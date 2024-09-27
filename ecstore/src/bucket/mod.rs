@@ -7,4 +7,5 @@ mod policy;
 mod quota;
 mod replication;
 mod tags;
+mod target;
 mod versioning;
