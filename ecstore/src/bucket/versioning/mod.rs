@@ -1,0 +1,35 @@
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum State {
+    Enabled,
+    Suspended,
+    // 如果未来可能会使用到Disabled状态，可以在这里添加
+    // Disabled,
+}
+
+// 实现Display trait用于打印
+impl std::fmt::Display for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match *self {
+                State::Enabled => "Enabled",
+                State::Suspended => "Suspended",
+                // 如果未来可能会使用到Disabled状态，可以在这里添加
+                // State::Disabled => "Disabled",
+            }
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct ExcludedPrefix {
+    pub prefix: String,
+}
+
+#[derive(Debug)]
+pub struct Versioning {
+    pub status: State,
+    pub excluded_prefixes: Vec<ExcludedPrefix>,
+    pub exclude_folders: bool,
+}

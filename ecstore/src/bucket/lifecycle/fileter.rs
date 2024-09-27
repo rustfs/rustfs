@@ -1,5 +1,6 @@
 use super::{and::And, prefix::Prefix, tag::Tag};
 
+#[derive(Debug)]
 pub struct Filter {
     pub set: bool,
 

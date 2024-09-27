@@ -1,4 +1,10 @@
+mod encryption;
 mod event;
 mod lifecycle;
 mod metadata;
+mod objectlock;
 mod policy;
+mod quota;
+mod replication;
+mod tags;
+mod versioning;

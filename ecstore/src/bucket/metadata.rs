@@ -1,6 +1,9 @@
 use time::OffsetDateTime;
 
-use super::{event, policy::bucket_policy::BucketPolicy};
+use super::{
+    encryption::BucketSSEConfig, event, lifecycle::lifecycle::Lifecycle, objectlock, policy::bucket_policy::BucketPolicy,
+    quota::BucketQuota, replication, tags::Tags, versioning::Versioning,
+};
 
 #[derive(Debug, Default)]
 pub struct BucketMetadata {
@@ -40,29 +43,15 @@ pub struct BucketMetadata {
     policy_config: Option<BucketPolicy>, // 假设Policy是一个已经定义好的结构体
     notification_config: Option<event::config::Config>,
     lifecycle_config: Option<Lifecycle>,
-    object_lock_config: Option<ObjectLock>,
+    object_lock_config: Option<objectlock::Config>,
     versioning_config: Option<Versioning>,
     sse_config: Option<BucketSSEConfig>,
     tagging_config: Option<Tags>,
     quota_config: Option<BucketQuota>,
-    replication_config: Option<ReplicationConfig>,
+    replication_config: Option<replication::Config>,
     bucket_target_config: Option<BucketTargets>,
     bucket_target_config_meta: Option<std::collections::HashMap<String, String>>,
 }
 
-#[derive(Debug, Default)]
-struct Lifecycle;
-#[derive(Debug, Default)]
-struct ObjectLock;
-#[derive(Debug, Default)]
-struct Versioning;
-#[derive(Debug, Default)]
-struct BucketSSEConfig;
-#[derive(Debug, Default)]
-struct Tags;
-#[derive(Debug, Default)]
-struct BucketQuota;
-#[derive(Debug, Default)]
-struct ReplicationConfig;
 #[derive(Debug, Default)]
 struct BucketTargets;
