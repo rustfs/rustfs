@@ -208,12 +208,3 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
 
     Ok(())
 }
-
-#[cfg(test)]
-mod test {
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_make_dir() {}
-}

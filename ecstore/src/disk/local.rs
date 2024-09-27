@@ -26,7 +26,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -52,7 +52,7 @@ impl FormatInfo {
 pub struct LocalDisk {
     pub root: PathBuf,
     pub format_path: PathBuf,
-    pub format_info: Mutex<FormatInfo>,
+    pub format_info: RwLock<FormatInfo>,
     pub endpoint: Endpoint,
     // pub id: Mutex<Option<Uuid>>,
     // pub format_data: Mutex<Vec<u8>>,
@@ -106,7 +106,7 @@ impl LocalDisk {
             root,
             endpoint: ep.clone(),
             format_path: format_path,
-            format_info: Mutex::new(format_info),
+            format_info: RwLock::new(format_info),
             // // format_legacy,
             // format_file_info: Mutex::new(format_meta),
             // format_data: Mutex::new(format_data),
@@ -499,7 +499,7 @@ impl LocalDisk {
     // write_all_public for trail
     async fn write_all_public(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
         if volume == super::RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
-            let mut format_info = self.format_info.lock().await;
+            let mut format_info = self.format_info.write().await;
             format_info.data = data.clone();
         }
 
@@ -685,8 +685,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
-        // TODO: check format file
-        let mut format_info = self.format_info.lock().await;
+        let mut format_info = self.format_info.write().await;
 
         let id = format_info.id.clone();
 
@@ -737,18 +736,24 @@ impl DiskAPI for LocalDisk {
         format_info.last_check = Some(OffsetDateTime::now_utc());
 
         Ok(Some(disk_id))
-        // TODO: 判断源文件id,是否有效
     }
 
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         // 本地不需要设置
-        let mut format_info = self.format_info.lock().await;
+        // TODO: add check_id_store
+        let mut format_info = self.format_info.write().await;
         format_info.id = id;
         Ok(())
     }
 
     #[must_use]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
+        if volume == super::RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
+            let format_info = self.format_info.read().await;
+            if format_info.data.len() > 0 {
+                return Ok(format_info.data.clone());
+            }
+        }
         // TOFIX:
         let p = self.get_object_path(volume, path)?;
         let (data, _) = read_file_all(&p).await?;
