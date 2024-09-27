@@ -130,3 +130,7 @@ pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
 pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     fs::rename(from, to).await
 }
+
+pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    fs::read(path.as_ref()).await
+}
