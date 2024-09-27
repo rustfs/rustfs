@@ -15,3 +15,5 @@ pub mod store;
 pub mod store_api;
 mod store_init;
 mod utils;
+
+mod bucket;
