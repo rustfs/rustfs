@@ -4,13 +4,13 @@ use super::{
     ReadOptions, RenameDataResp, VolumeInfo, WalkDirOptions,
 };
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
+use crate::error::{Error, Result};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
 use bytes::Bytes;
-use common::error::{Error, Result};
 use path_absolutize::Absolutize;
 use std::{
     fs::Metadata,

@@ -1,5 +1,5 @@
+use crate::error::{Error, Result};
 use crate::utils::ellipses::*;
-use common::error::{Error, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 

@@ -14,11 +14,11 @@ const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 use crate::{
     erasure::{ReadAt, Write},
+    error::{Error, Result},
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
 };
 use bytes::Bytes;
-use common::error::{Error, Result};
 use futures::StreamExt;
 use protos::proto_gen::node_service::{
     node_service_client::NodeServiceClient, ReadAtRequest, ReadAtResponse, WriteRequest, WriteResponse,
