@@ -98,7 +98,11 @@ impl Clone for Error {
         if let Some(e) = self.downcast_ref::<DiskError>() {
             clone_disk_err(e)
         } else if let Some(e) = self.downcast_ref::<io::Error>() {
-            Error::new(io::Error::new(e.kind(), e.to_string()))
+            if let Some(code) = e.raw_os_error() {
+                Error::new(io::Error::from_raw_os_error(code))
+            } else {
+                Error::new(io::Error::new(e.kind(), e.to_string()))
+            }
         } else {
             // TODO: 优化其他类型
             Error::msg(self.to_string())
