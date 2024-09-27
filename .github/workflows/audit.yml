@@ -1,0 +1,27 @@
+name: Audit
+
+on:
+  push:
+    branches:
+      - main
+    paths: 
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+  pull_request:
+    branches:
+      - main
+    paths: 
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+  schedule:
+    - cron: '0 0 * * 0' # at midnight of each sunday
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit -D warnings

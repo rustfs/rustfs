@@ -5,11 +5,15 @@
 - [ ] EC可用读写数量判断 Read/WriteQuorum
 - [ ] 优化并发执行，边读边取，可中断
 - [ ] 小文件存储到metafile, inlinedata
+- [ ] 完善bucketmeta
+- [ ] 对象锁
 - [ ] 代码优化 使用范型？
 - [ ] 抽象出metafile存储
+- [ ] 边读写边hash
+- [x] 远程rpc
 - [x] 错误类型判断,程序中判断错误类型，如何统一错误
-- [x] 上传同名文件时，删除旧版本文件
 - [x] 优化xlmeta, 自定义msg数据结构
+- [x] appendFile, createFile, readFile, walk_dir sync io
 
 ## 基础功能
 
