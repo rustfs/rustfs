@@ -1322,6 +1322,7 @@ impl DiskAPI for LocalDisk {
         if let Err(e) = utils::fs::access(&volume_dir).await {
             if os_is_not_exist(&e) {
                 os::make_dir_all(&volume_dir, self.root.as_path()).await?;
+                return Ok(());
             }
             if os_is_permission(&e) {
                 return Err(Error::new(DiskError::DiskAccessDenied));
