@@ -1,0 +1,10 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lazy_static.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing-error.workspace = true

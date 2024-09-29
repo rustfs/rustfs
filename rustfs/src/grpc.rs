@@ -1,3 +1,5 @@
+use std::{error::Error, io::ErrorKind, pin::Pin};
+
 use ecstore::{
     disk::{DeleteOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts, WalkDirOptions},
     erasure::{ReadAt, Write},
@@ -5,54 +7,72 @@ use ecstore::{
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions},
 };
-use tonic::{Request, Response, Status};
-use tracing::{debug, error, info};
+use futures::{Stream, StreamExt};
+use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
-        node_service_server::{NodeService as Node, NodeServiceServer as NodeServer},
-        DeleteBucketRequest, DeleteBucketResponse, DeletePathsRequest, DeletePathsResponse, DeleteRequest, DeleteResponse,
-        DeleteVersionRequest, DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest,
-        DeleteVolumeResponse, GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest,
-        ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest,
-        MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse,
-        ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse,
-        ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse,
-        RenamePartRequst, RenamePartResponse, StatVolumeRequest, StatVolumeResponse, UpdateMetadataRequest,
-        UpdateMetadataResponse, WalkDirRequest, WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest,
-        WriteMetadataResponse, WriteRequest, WriteResponse,
+        node_service_server::NodeService as Node, DeleteBucketRequest, DeleteBucketResponse, DeletePathsRequest,
+        DeletePathsResponse, DeleteRequest, DeleteResponse, DeleteVersionRequest, DeleteVersionResponse, DeleteVersionsRequest,
+        DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse, GenerallyLockRequest, GenerallyLockResponse,
+        GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse,
+        ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse,
+        MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest,
+        ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest,
+        ReadXlResponse, RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, RenamePartRequst,
+        RenamePartResponse, StatVolumeRequest, StatVolumeResponse, UpdateMetadataRequest, UpdateMetadataResponse, WalkDirRequest,
+        WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest,
+        WriteResponse,
     },
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status, Streaming};
+use tracing::{debug, error, info};
 
-#[derive(Debug)]
-struct NodeService {
-    pub local_peer: LocalPeerS3Client,
+type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send>>;
+
+fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
+    let mut err: &(dyn Error + 'static) = err_status;
+
+    loop {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            return Some(io_err);
+        }
+
+        // h2::Error do not expose std::io::Error with `source()`
+        // https://github.com/hyperium/h2/pull/462
+        if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
+            if let Some(io_err) = h2_err.get_io() {
+                return Some(io_err);
+            }
+        }
+
+        err = match err.source() {
+            Some(err) => err,
+            None => return None,
+        };
+    }
 }
 
-pub fn make_server() -> NodeServer<impl Node> {
-    // let local_disks = all_local_disk().await;
+#[derive(Debug)]
+pub struct NodeService {
+    local_peer: LocalPeerS3Client,
+}
+
+pub fn make_server() -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeServer::new(NodeService { local_peer })
+    NodeService { local_peer }
 }
 
 impl NodeService {
     async fn find_disk(&self, disk_path: &String) -> Option<DiskStore> {
         find_local_disk(disk_path).await
-        // let disk_path = match fs::canonicalize(disk_path).await {
-        //     Ok(disk_path) => disk_path,
-        //     Err(_) => return None,
-        // };
-        // self.local_peer.local_disks.iter().find(|&x| x.path() == disk_path).cloned()
     }
 
     async fn all_disk(&self) -> Vec<String> {
         all_local_disk_path().await
-        // self.local_peer
-        //     .local_disks
-        //     .iter()
-        //     .map(|disk| disk.path().to_string_lossy().to_string())
-        //     .collect()
     }
 }
 
@@ -370,44 +390,183 @@ impl Node for NodeService {
         }
     }
 
-    async fn read_at(&self, request: Request<ReadAtRequest>) -> Result<Response<ReadAtResponse>, Status> {
-        let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk.read_file(&request.volume, &request.path).await {
-                Ok(mut file_reader) => {
-                    match file_reader
-                        .read_at(request.offset.try_into().unwrap(), request.length.try_into().unwrap())
+    type WriteStreamStream = ResponseStream<WriteResponse>;
+    async fn write_stream(&self, request: Request<Streaming<WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
+        info!("write_stream");
+
+        let mut in_stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(128);
+
+        tokio::spawn(async move {
+            let mut file_ref = None;
+            while let Some(result) = in_stream.next().await {
+                match result {
+                    // Ok(v) => tx
+                    //     .send(Ok(EchoResponse { message: v.message }))
+                    //     .await
+                    //     .expect("working rx"),
+                    Ok(v) => {
+                        match file_ref.as_ref() {
+                            Some(_) => (),
+                            None => {
+                                if let Some(disk) = find_local_disk(&v.disk).await {
+                                    let file_writer = if v.is_append {
+                                        disk.append_file(&v.volume, &v.path).await
+                                    } else {
+                                        disk.create_file("", &v.volume, &v.path, 0).await
+                                    };
+
+                                    match file_writer {
+                                        Ok(file_writer) => file_ref = Some(file_writer),
+                                        Err(err) => {
+                                            tx.send(Ok(WriteResponse {
+                                                success: false,
+                                                error_info: Some(err.to_string()),
+                                            }))
+                                            .await
+                                            .expect("working rx");
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    tx.send(Ok(WriteResponse {
+                                        success: false,
+                                        error_info: Some("can not find disk".to_string()),
+                                    }))
+                                    .await
+                                    .expect("working rx");
+                                    break;
+                                }
+                            }
+                        };
+
+                        match file_ref.as_mut().unwrap().write(&v.data).await {
+                            Ok(_) => tx.send(Ok(WriteResponse {
+                                success: true,
+                                error_info: None,
+                            })),
+                            Err(err) => tx.send(Ok(WriteResponse {
+                                success: false,
+                                error_info: Some(err.to_string()),
+                            })),
+                        }
                         .await
-                    {
-                        Ok((data, read_size)) => Ok(tonic::Response::new(ReadAtResponse {
-                            success: true,
-                            data,
-                            read_size: read_size.try_into().unwrap(),
-                            error_info: None,
-                        })),
-                        Err(err) => Ok(tonic::Response::new(ReadAtResponse {
-                            success: false,
-                            data: Vec::new(),
-                            read_size: -1,
-                            error_info: Some(err.to_string()),
-                        })),
+                        .unwrap();
+                    }
+                    Err(err) => {
+                        if let Some(io_err) = match_for_io_error(&err) {
+                            if io_err.kind() == ErrorKind::BrokenPipe {
+                                // here you can handle special case when client
+                                // disconnected in unexpected way
+                                eprintln!("\tclient disconnected: broken pipe");
+                                break;
+                            }
+                        }
+
+                        match tx.send(Err(err)).await {
+                            Ok(_) => (),
+                            Err(_err) => break, // response was dropped
+                        }
                     }
                 }
-                Err(err) => Ok(tonic::Response::new(ReadAtResponse {
-                    success: false,
-                    data: Vec::new(),
-                    read_size: -1,
-                    error_info: Some(err.to_string()),
-                })),
             }
-        } else {
-            Ok(tonic::Response::new(ReadAtResponse {
-                success: false,
-                data: Vec::new(),
-                read_size: -1,
-                error_info: Some("can not find disk".to_string()),
-            }))
-        }
+            println!("\tstream ended");
+        });
+
+        let out_stream = ReceiverStream::new(rx);
+
+        Ok(tonic::Response::new(Box::pin(out_stream)))
+    }
+
+    type ReadAtStream = ResponseStream<ReadAtResponse>;
+    async fn read_at(&self, request: Request<Streaming<ReadAtRequest>>) -> Result<Response<Self::ReadAtStream>, Status> {
+        info!("read_at");
+
+        let mut in_stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(128);
+
+        tokio::spawn(async move {
+            let mut file_ref = None;
+            while let Some(result) = in_stream.next().await {
+                match result {
+                    Ok(v) => {
+                        match file_ref.as_ref() {
+                            Some(_) => (),
+                            None => {
+                                if let Some(disk) = find_local_disk(&v.disk).await {
+                                    match disk.read_file(&v.volume, &v.path).await {
+                                        Ok(file_reader) => file_ref = Some(file_reader),
+                                        Err(err) => {
+                                            tx.send(Ok(ReadAtResponse {
+                                                success: false,
+                                                data: Vec::new(),
+                                                error_info: Some(err.to_string()),
+                                                read_size: -1,
+                                            }))
+                                            .await
+                                            .expect("working rx");
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    tx.send(Ok(ReadAtResponse {
+                                        success: false,
+                                        data: Vec::new(),
+                                        error_info: Some("can not find disk".to_string()),
+                                        read_size: -1,
+                                    }))
+                                    .await
+                                    .expect("working rx");
+                                    break;
+                                }
+                            }
+                        };
+
+                        match file_ref
+                            .as_mut()
+                            .unwrap()
+                            .read_at(v.offset.try_into().unwrap(), v.length.try_into().unwrap())
+                            .await
+                        {
+                            Ok((data, read_size)) => tx.send(Ok(ReadAtResponse {
+                                success: true,
+                                data,
+                                read_size: read_size.try_into().unwrap(),
+                                error_info: None,
+                            })),
+                            Err(err) => tx.send(Ok(ReadAtResponse {
+                                success: false,
+                                data: Vec::new(),
+                                error_info: Some(err.to_string()),
+                                read_size: -1,
+                            })),
+                        }
+                        .await
+                        .unwrap();
+                    }
+                    Err(err) => {
+                        if let Some(io_err) = match_for_io_error(&err) {
+                            if io_err.kind() == ErrorKind::BrokenPipe {
+                                // here you can handle special case when client
+                                // disconnected in unexpected way
+                                eprintln!("\tclient disconnected: broken pipe");
+                                break;
+                            }
+                        }
+
+                        match tx.send(Err(err)).await {
+                            Ok(_) => (),
+                            Err(_err) => break, // response was dropped
+                        }
+                    }
+                }
+            }
+            println!("\tstream ended");
+        });
+
+        let out_stream = ReceiverStream::new(rx);
+
+        Ok(tonic::Response::new(Box::pin(out_stream)))
     }
 
     async fn list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
@@ -963,6 +1122,126 @@ impl Node for NodeService {
                 success: false,
                 error_info: Some("can not find disk".to_string()),
             }))
+        }
+    }
+
+    async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.lock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not lock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.unlock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not unlock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn r_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.rlock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not rlock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn r_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.runlock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not runlock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.force_unlock(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not force_unlock, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
+        }
+    }
+
+    async fn refresh(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        match &serde_json::from_str::<LockArgs>(&request.args) {
+            Ok(args) => match GLOBAL_LOCAL_SERVER.write().await.refresh(args).await {
+                Ok(result) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: result,
+                    error_info: None,
+                })),
+                Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not refresh, args: {}, err: {}", args, err.to_string())),
+                })),
+            },
+            Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+            })),
         }
     }
 }

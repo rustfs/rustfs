@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 #async-backtrace = { workspace = true, optional = true }
+common.workspace = true
 flatbuffers = { workspace = true }
 prost = { workspace = true }
 protobuf = { workspace = true }

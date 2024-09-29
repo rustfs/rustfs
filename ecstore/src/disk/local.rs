@@ -10,10 +10,10 @@ use crate::disk::error::{
 };
 use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
+use crate::error::{Error, Result};
 use crate::utils::fs::{lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::path::{has_suffix, SLASH_SEPARATOR};
 use crate::{
-    error::{Error, Result},
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
     utils,
@@ -1322,6 +1322,7 @@ impl DiskAPI for LocalDisk {
         if let Err(e) = utils::fs::access(&volume_dir).await {
             if os_is_not_exist(&e) {
                 os::make_dir_all(&volume_dir, self.root.as_path()).await?;
+                return Ok(());
             }
             if os_is_permission(&e) {
                 return Err(Error::new(DiskError::DiskAccessDenied));

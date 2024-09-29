@@ -4,9 +4,9 @@ mod service;
 mod storage;
 
 use clap::Parser;
+use common::error::{Error, Result};
 use ecstore::{
     endpoints::EndpointServerPools,
-    error::Result,
     store::{init_local_disks, update_erasure_type, ECStore},
 };
 use grpc::make_server;
@@ -15,10 +15,12 @@ use hyper_util::{
     server::conn::auto::Builder as ConnBuilder,
     service::TowerToHyperService,
 };
+use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
+use tonic::{metadata::MetadataValue, Request, Status};
 use tracing::{debug, info};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,6 +39,15 @@ fn setup_tracing() {
         .with(ErrorLayer::default());
 
     subscriber.try_init().expect("failed to set global default subscriber");
+}
+
+fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
+    let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
+
+    match req.metadata().get("authorization") {
+        Some(t) if token == t => Ok(req),
+        _ => Err(Status::unauthenticated("No valid auth token")),
+    }
 }
 
 fn main() -> Result<()> {
@@ -76,12 +87,15 @@ async fn run(opt: config::Opt) -> Result<()> {
     // };
 
     // 用于rpc
-    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())?;
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())
+        .map_err(|err| Error::from_string(err.to_string()))?;
 
     update_erasure_type(setup_type).await;
 
     // 初始化本地磁盘
-    init_local_disks(endpoint_pools.clone()).await?;
+    init_local_disks(endpoint_pools.clone())
+        .await
+        .map_err(|err| Error::from_string(err.to_string()))?;
 
     // Setup S3 service
     // 本项目使用s3s库来实现s3服务
@@ -119,7 +133,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         b.build()
     };
 
-    let rpc_service = make_server();
+    let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
@@ -165,7 +179,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     });
 
     // init store
-    ECStore::new(opt.address.clone(), endpoint_pools.clone()).await?;
+    ECStore::new(opt.address.clone(), endpoint_pools.clone())
+        .await
+        .map_err(|err| Error::from_string(err.to_string()))?;
     info!(" init store success!");
 
     tokio::select! {
