@@ -385,6 +385,7 @@ pub struct ObjectOptions {
 
     pub delete_prefix: bool,
     pub version_id: String,
+    pub no_lock: bool,
 }
 
 // impl Default for ObjectOptions {

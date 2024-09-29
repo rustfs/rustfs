@@ -1,4 +1,5 @@
 #![allow(clippy::map_entry)]
+use crate::disk::endpoint::EndpointType;
 use crate::{
     bucket_meta::BucketMetadata,
     disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
@@ -15,6 +16,7 @@ use crate::{
     store_init, utils,
 };
 use backon::{ExponentialBuilder, Retryable};
+use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
 use http::HeaderMap;
 use s3s::{dto::StreamingBlob, Body};
@@ -172,6 +174,13 @@ impl ECStore {
         let first_is_local = endpoint_pools.first_local();
 
         let mut local_disks = Vec::new();
+
+        init_local_peer(
+            &endpoint_pools,
+            &GLOBAL_Rustfs_Host.read().await.to_string(),
+            &GLOBAL_Rustfs_Port.read().await.to_string(),
+        )
+        .await;
 
         debug!("endpoint_pools: {:?}", endpoint_pools);
 
@@ -804,4 +813,27 @@ impl StorageAPI for ECStore {
         }
         unimplemented!()
     }
+}
+
+async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, port: &String) {
+    let mut peer_set = Vec::new();
+    endpoint_pools.as_ref().iter().for_each(|endpoints| {
+        endpoints.endpoints.as_ref().iter().for_each(|endpoint| {
+            if endpoint.get_type() == EndpointType::Url && endpoint.is_local && endpoint.url.has_host() {
+                peer_set.push(endpoint.url.host_str().unwrap().to_string());
+            }
+        });
+    });
+
+    if peer_set.is_empty() {
+        if !host.is_empty() {
+            *GLOBAL_Local_Node_Name.write().await = format!("{}:{}", host, port);
+            return;
+        }
+
+        *GLOBAL_Local_Node_Name.write().await = format!("127.0.0.1:{}", port);
+        return;
+    }
+
+    *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
 }

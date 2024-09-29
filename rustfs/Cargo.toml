@@ -13,14 +13,17 @@ log.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
+common.workspace = true
 ecstore.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
+h2 = "0.4.6"
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
+lock.workspace = true
 mime.workspace = true
 netif.workspace = true
 pin-project-lite.workspace = true
@@ -38,6 +41,7 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
 ] }
+tokio-stream.workspace = true
 tonic = { version = "0.12.1", features = ["gzip"] }
 tonic-reflection.workspace = true
 tower.workspace = true

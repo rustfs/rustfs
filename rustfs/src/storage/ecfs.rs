@@ -30,7 +30,7 @@ use std::str::FromStr;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
-use ecstore::error::Result;
+use common::error::Result;
 use tracing::debug;
 
 macro_rules! try_ {
