@@ -1,5 +1,6 @@
 pub mod bucket_meta;
 mod chunk_stream;
+mod config;
 pub mod disk;
 pub mod disks_layout;
 pub mod endpoints;

@@ -1,7 +1,8 @@
 #![allow(clippy::map_entry)]
 use crate::disk::endpoint::EndpointType;
+use crate::store_api::ObjectIO;
 use crate::{
-    bucket::BucketMetadata,
+    bucket::metadata::BucketMetadata,
     disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     endpoints::{EndpointServerPools, SetupType},
     error::{Error, Result},
@@ -495,6 +496,38 @@ pub struct ListPathOptions {
 }
 
 #[async_trait::async_trait]
+impl ObjectIO for ECStore {
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: HTTPRangeSpec,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectReader> {
+        let object = utils::path::encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, opts).await;
+        }
+
+        unimplemented!()
+    }
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        // checkPutObjectArgs
+
+        let object = utils::path::encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
+        }
+
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
 impl StorageAPI for ECStore {
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         let buckets = self.peer_sys.list_bucket(opts).await?;
@@ -735,34 +768,6 @@ impl StorageAPI for ECStore {
 
         if self.single_pool() {
             return self.pools[0].put_object_info(bucket, object.as_str(), info, opts).await;
-        }
-
-        unimplemented!()
-    }
-
-    async fn get_object_reader(
-        &self,
-        bucket: &str,
-        object: &str,
-        range: HTTPRangeSpec,
-        h: HeaderMap,
-        opts: &ObjectOptions,
-    ) -> Result<GetObjectReader> {
-        let object = utils::path::encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, opts).await;
-        }
-
-        unimplemented!()
-    }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        // checkPutObjectArgs
-
-        let object = utils::path::encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
         unimplemented!()

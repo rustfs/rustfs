@@ -1,5 +1,6 @@
 use bytes::BufMut;
 use bytes::Bytes;
+use ecstore::bucket::get_bucket_metadata_sys;
 use ecstore::bucket_meta::BucketMetadata;
 use ecstore::disk::error::DiskError;
 use ecstore::disk::RUSTFS_META_BUCKET;
@@ -10,6 +11,7 @@ use ecstore::store_api::DeleteBucketOptions;
 use ecstore::store_api::HTTPRangeSpec;
 use ecstore::store_api::MakeBucketOptions;
 use ecstore::store_api::MultipartUploadResult;
+use ecstore::store_api::ObjectIO;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
@@ -769,45 +771,62 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        let meta_obj = try_!(
-            store
-                .get_object_reader(
-                    RUSTFS_META_BUCKET,
-                    BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-                    HTTPRangeSpec::nil(),
-                    Default::default(),
-                    &ObjectOptions::default(),
-                )
-                .await
-        );
+        // let a = get_bucket_metadata_sys();
 
-        let stream = meta_obj.stream;
+        Ok(S3Response::new(GetBucketTaggingOutput { ..Default::default() }))
 
-        let mut data = vec![];
-        pin_mut!(stream);
+        // let meta_obj = try_!(
+        //     store
+        //         .get_object_reader(
+        //             RUSTFS_META_BUCKET,
+        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
+        //             HTTPRangeSpec::nil(),
+        //             Default::default(),
+        //             &ObjectOptions::default(),
+        //         )
+        //         .await
+        // );
 
-        while let Some(x) = stream.next().await {
-            let x = try_!(x);
-            data.put_slice(&x[..]);
-        }
+        // let stream = meta_obj.stream;
 
-        let meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
-        if meta.tagging.is_none() {
-            return Err({
-                let mut err = S3Error::with_message(S3ErrorCode::Custom("NoSuchTagSet".into()), "The TagSet does not exist");
-                err.set_status_code("404".try_into().unwrap());
-                err
-            });
-        }
+        // let mut data = vec![];
+        // pin_mut!(stream);
 
-        Ok(S3Response::new(GetBucketTaggingOutput {
-            tag_set: meta
-                .tagging
-                .unwrap()
-                .into_iter()
-                .map(|(key, value)| Tag { key, value })
-                .collect(),
-        }))
+        // while let Some(x) = stream.next().await {
+        //     let x = try_!(x);
+        //     data.put_slice(&x[..]);
+        // }
+
+        // if data.is_empty() {
+        //     return Err({
+        //         let mut err = S3Error::with_message(S3ErrorCode::Custom("NoSuchTagSet".into()), "The TagSet does not exist");
+        //         err.set_status_code("404".try_into().unwrap());
+        //         err
+        //     });
+        // }
+
+        // warn!("bm: 1111");
+
+        // let meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
+
+        // warn!("bm  33333");
+        // if meta.tagging.is_none() {
+        //     return Err({
+        //         let mut err = S3Error::with_message(S3ErrorCode::Custom("NoSuchTagSet".into()), "The TagSet does not exist");
+        //         err.set_status_code("404".try_into().unwrap());
+        //         err
+        //     });
+        // }
+
+        // warn!("bm:4444");
+        // Ok(S3Response::new(GetBucketTaggingOutput {
+        //     tag_set: meta
+        //         .tagging
+        //         .unwrap()
+        //         .into_iter()
+        //         .map(|(key, value)| Tag { key, value })
+        //         .collect(),
+        // }))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]

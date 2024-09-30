@@ -14,12 +14,10 @@ pub const BUCKET_METADATA_VERSION: u16 = 1;
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, Default)]
 pub struct BucketMetadata {
-    format: u16,
-    version: u16,
+    pub format: u16,
+    pub version: u16,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tagging: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created: Option<OffsetDateTime>,
 }
 
@@ -60,7 +58,8 @@ impl BucketMetadata {
         Ok(buf)
     }
 
-    pub fn unmarshal_from(buffer: &[u8]) -> Result<Self> {
-        Ok(rmp_serde::from_slice(buffer)?)
+    pub fn unmarshal_from(buf: &[u8]) -> Result<Self> {
+        let t: BucketMetadata = rmp_serde::from_slice(buf)?;
+        Ok(t)
     }
 }
