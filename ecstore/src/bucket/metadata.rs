@@ -1,32 +1,34 @@
-use byteorder::{BigEndian, ByteOrder};
+use super::{
+    encryption::BucketSSEConfig, event, lifecycle::lifecycle::Lifecycle, objectlock, policy::bucket_policy::BucketPolicy,
+    quota::BucketQuota, replication, tags::Tags, target::BucketTargets, versioning::Versioning,
+};
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmp_serde::Serializer as rmpSerializer;
 use serde::Serializer;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
-use time::macros::datetime;
 use time::OffsetDateTime;
+use tracing::error;
 
-use super::{
-    encryption::BucketSSEConfig, event, lifecycle::lifecycle::Lifecycle, objectlock, policy::bucket_policy::BucketPolicy,
-    quota::BucketQuota, replication, tags::Tags, target::BucketTargets, versioning::Versioning,
-};
-
-use crate::error::Result;
+use crate::bucket::tags;
+use crate::config::common::{read_config, save_config};
+use crate::config::error::ConfigError;
+use crate::error::{Error, Result};
 
 use crate::disk::BUCKET_META_PREFIX;
-use crate::utils::crypto::hex;
+use crate::store::ECStore;
+use crate::store_api::StorageAPI;
 
 pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
 pub const BUCKET_METADATA_FORMAT: u16 = 1;
 pub const BUCKET_METADATA_VERSION: u16 = 1;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct BucketMetadata {
     pub name: String,
-    #[serde(serialize_with = "write_times")]
     pub created: OffsetDateTime,
     pub lock_enabled: bool, // 虽然标记为不使用，但可能需要保留
     pub policy_config_json: Vec<u8>,
@@ -41,27 +43,16 @@ pub struct BucketMetadata {
     pub bucket_targets_config_json: Vec<u8>,
     pub bucket_targets_config_meta_json: Vec<u8>,
 
-    #[serde(serialize_with = "write_times")]
     pub policy_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub object_lock_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub encryption_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub tagging_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub quota_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub replication_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub versioning_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub lifecycle_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub notification_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub bucket_targets_config_updated_at: OffsetDateTime,
-    #[serde(serialize_with = "write_times")]
     pub bucket_targets_config_meta_updated_at: OffsetDateTime,
 
     #[serde(skip)]
@@ -147,9 +138,9 @@ impl BucketMetadata {
         format!("{}/{}/{}", BUCKET_META_PREFIX, self.name.as_str(), BUCKET_METADATA_FILE)
     }
 
-    fn msg_size(&self) -> usize {
-        unimplemented!()
-    }
+    // fn msg_size(&self) -> usize {
+    //     unimplemented!()
+    // }
 
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
@@ -159,12 +150,99 @@ impl BucketMetadata {
         Ok(buf)
     }
 
-    pub fn unmarshal(_buf: &[u8]) -> Result<Self> {
-        unimplemented!()
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: BucketMetadata = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
+
+    pub fn check_header(buf: &[u8]) -> Result<()> {
+        if buf.len() <= 4 {
+            return Err(Error::msg("read_bucket_metadata: data invalid"));
+        }
+
+        // TODO: check version
+        Ok(())
+    }
+
+    fn default_timestamps(&mut self) {
+        if self.tagging_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.tagging_config_updated_at = self.created
+        }
+    }
+
+    async fn save(&mut self, api: &ECStore) -> Result<()> {
+        self.parse_all_configs(api)?;
+
+        let mut buf: Vec<u8> = vec![0; 4];
+
+        LittleEndian::write_u16(&mut buf[0..2], BUCKET_METADATA_FORMAT);
+
+        LittleEndian::write_u16(&mut buf[2..4], BUCKET_METADATA_VERSION);
+
+        let data = self.marshal_msg()?;
+
+        buf.extend_from_slice(&data);
+
+        save_config(api, self.save_file_path().as_str(), &buf).await?;
+
+        Ok(())
+    }
+
+    fn parse_all_configs(&mut self, _api: &ECStore) -> Result<()> {
+        if !self.tagging_config_xml.is_empty() {
+            self.tagging_config = Some(tags::Tags::unmarshal(&self.tagging_config_xml)?);
+        }
+
+        Ok(())
     }
 }
 
-fn deserialize_from_str<'de, S, D>(deserializer: D) -> core::result::Result<S, D::Error>
+pub async fn load_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketMetadata> {
+    load_bucket_metadata_parse(api, bucket, true).await
+}
+
+async fn load_bucket_metadata_parse(api: &ECStore, bucket: &str, parse: bool) -> Result<BucketMetadata> {
+    let mut bm = match read_bucket_metadata(api, bucket).await {
+        Ok(res) => res,
+        Err(err) => {
+            if let Some(e) = err.downcast_ref::<ConfigError>() {
+                if !ConfigError::is_not_found(&e) {
+                    return Err(err);
+                }
+            }
+
+            BucketMetadata::new(bucket)
+        }
+    };
+
+    bm.default_timestamps();
+
+    if parse {
+        bm.parse_all_configs(api)?;
+    }
+
+    // TODO: parse_all_configs
+
+    Ok(bm)
+}
+
+async fn read_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketMetadata> {
+    if bucket.is_empty() {
+        error!("bucket name empty");
+        return Err(Error::msg("invalid argument"));
+    }
+
+    let bm = BucketMetadata::new(&bucket);
+    let file_path = bm.save_file_path();
+
+    let data = read_config(api, &file_path).await?;
+
+    BucketMetadata::check_header(&data)?;
+
+    BucketMetadata::unmarshal(&data[4..])
+}
+
+fn _deserialize_from_str<'de, S, D>(deserializer: D) -> core::result::Result<S, D::Error>
 where
     S: FromStr,
     S::Err: Display,
@@ -175,7 +253,7 @@ where
     unimplemented!()
 }
 
-fn write_times<S>(t: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error>
+fn _write_time<S>(t: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -183,47 +261,16 @@ where
 
     let sec = t.unix_timestamp() - 62135596800;
     let nsec = t.nanosecond();
-    buf[0] = 0xc7;
-    buf[1] = 0x0c;
-    buf[2] = 0x05;
+    buf[0] = 0xc7; // mext8
+    buf[1] = 0x0c; // 长度
+    buf[2] = 0x05; // 时间扩展类型
     BigEndian::write_u64(&mut buf[3..], sec as u64);
     BigEndian::write_u32(&mut buf[11..], nsec as u32);
     s.serialize_bytes(&buf)
 }
 
-fn write_time(t: OffsetDateTime) -> Result<(), String> {
-    // let t = t.saturating_sub(0); // 转换为自 UNIX_EPOCH 以来的时间
-    println!("t:{:?}", t);
-    println!("offset:{:?}", datetime!(0-01-01 0:00 UTC));
-
-    let mut buf = vec![0x0; 15];
-
-    let sec = t.unix_timestamp() - 62135596800;
-    let nsec = t.nanosecond();
-
-    println!("sec:{:?}", sec);
-    println!("nsec:{:?}", nsec);
-
-    buf[0] = 0xc7;
-    buf[1] = 0x0c;
-    buf[2] = 0x05;
-    // 扩展格式的时间类型
-    // buf.push(0xc7); // mext8
-    // buf.push(12); // 长度
-    // buf.push(0x05); // 时间扩展类型
-
-    // 将 Unix 时间戳和纳秒部分写入缓冲区
-    BigEndian::write_u64(&mut buf[3..], sec as u64);
-    BigEndian::write_u32(&mut buf[11..], nsec as u32);
-
-    println!("hex:{:?}", hex(buf));
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod test {
-    use crate::utils::crypto::hex;
 
     use super::*;
 
@@ -235,6 +282,8 @@ mod test {
 
         let buf = bm.marshal_msg().unwrap();
 
-        println!("{:?}", hex(buf))
+        let new = BucketMetadata::unmarshal(&buf).unwrap();
+
+        assert_eq!(bm.name, new.name);
     }
 }

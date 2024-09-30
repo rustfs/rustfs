@@ -1,7 +1,8 @@
 mod encryption;
 mod event;
 mod lifecycle;
-mod metadata;
+pub mod metadata;
+mod metadata_sys;
 mod objectlock;
 mod policy;
 mod quota;
@@ -10,4 +11,4 @@ mod tags;
 mod target;
 mod versioning;
 
-pub use metadata::BucketMetadata;
+pub use metadata_sys::get_bucket_metadata_sys;

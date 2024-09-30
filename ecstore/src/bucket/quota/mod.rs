@@ -7,7 +7,7 @@ pub enum QuotaType {
 }
 
 // 定义BucketQuota结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketQuota {
     quota: Option<u64>, // 使用Option来表示可能不存在的字段
 

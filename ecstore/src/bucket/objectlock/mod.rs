@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Hash, Clone)]
 pub enum RetMode {
     #[default]
     Govenance,
@@ -20,19 +20,19 @@ impl std::str::FromStr for RetMode {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct DefaultRetention {
     pub mode: RetMode,
     pub days: Option<usize>,
     pub years: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Rule {
     pub default_retention: DefaultRetention,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Config {
     pub object_lock_enabled: String,
     pub rule: Option<Rule>,

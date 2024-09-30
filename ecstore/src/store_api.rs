@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
+use futures::StreamExt;
 use http::HeaderMap;
 use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
@@ -281,12 +282,26 @@ pub struct GetObjectReader {
     pub object_info: ObjectInfo,
 }
 
-// impl GetObjectReader {
-//     pub fn new(stream: StreamingBlob, object_info: ObjectInfo) -> Self {
-//         GetObjectReader { stream, object_info }
-//     }
-// }
+impl GetObjectReader {
+    // pub fn new(stream: StreamingBlob, object_info: ObjectInfo) -> Self {
+    //     GetObjectReader { stream, object_info }
+    // }
+    pub async fn read_all(&mut self) -> Result<Vec<u8>> {
+        let mut data = Vec::new();
 
+        while let Some(x) = self.stream.next().await {
+            let buf = match x {
+                Ok(res) => res,
+                Err(e) => return Err(Error::msg(e.to_string())),
+            };
+            data.extend_from_slice(buf.as_ref());
+        }
+
+        Ok(data)
+    }
+}
+
+#[derive(Debug)]
 pub struct HTTPRangeSpec {
     pub is_suffix_length: bool,
     pub start: i64,
@@ -510,7 +525,20 @@ pub struct DeletedObject {
 }
 
 #[async_trait::async_trait]
-pub trait StorageAPI {
+pub trait ObjectIO: Send + Sync + 'static {
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: HTTPRangeSpec,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectReader>;
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
+}
+
+#[async_trait::async_trait]
+pub trait StorageAPI: ObjectIO {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
@@ -536,15 +564,15 @@ pub trait StorageAPI {
 
     async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()>;
 
-    async fn get_object_reader(
-        &self,
-        bucket: &str,
-        object: &str,
-        range: HTTPRangeSpec,
-        h: HeaderMap,
-        opts: &ObjectOptions,
-    ) -> Result<GetObjectReader>;
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
+    // async fn get_object_reader(
+    //     &self,
+    //     bucket: &str,
+    //     object: &str,
+    //     range: HTTPRangeSpec,
+    //     h: HeaderMap,
+    //     opts: &ObjectOptions,
+    // ) -> Result<GetObjectReader>;
+    // async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn put_object_part(
         &self,
         bucket: &str,

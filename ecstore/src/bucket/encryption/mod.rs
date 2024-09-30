@@ -21,20 +21,20 @@ impl std::str::FromStr for Algorithm {
 }
 
 // 定义EncryptionAction结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct EncryptionAction {
     algorithm: Option<Algorithm>,
     master_key_id: Option<String>,
 }
 
 // 定义Rule结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct Rule {
     default_encryption_action: EncryptionAction,
 }
 
 // 定义BucketSSEConfig结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct BucketSSEConfig {
     xml_ns: String,
     xml_name: String,
