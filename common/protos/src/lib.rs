@@ -1,28 +1,44 @@
 mod generated;
-use std::time::Duration;
+use std::{error::Error, time::Duration};
 
+use common::globals::GLOBAL_Conn_Map;
 pub use generated::*;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use tonic::{codec::CompressionEncoding, transport::Channel};
-use tower::timeout::Timeout;
+use tonic::{
+    metadata::MetadataValue,
+    service::interceptor::InterceptedService,
+    transport::{Channel, Endpoint},
+    Request, Status,
+};
 
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 
-pub fn node_service_time_out_client(
-    channel: Channel,
-    time_out: Duration,
-    max_message_size: usize,
-    grpc_enable_gzip: bool,
-) -> NodeServiceClient<Timeout<Channel>> {
-    let timeout_channel = Timeout::new(channel, time_out);
-    let client = NodeServiceClient::<Timeout<Channel>>::new(timeout_channel);
-    let client = NodeServiceClient::max_decoding_message_size(client, max_message_size);
-    if grpc_enable_gzip {
-        NodeServiceClient::max_encoding_message_size(client, max_message_size)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .send_compressed(CompressionEncoding::Gzip)
-    } else {
-        NodeServiceClient::max_encoding_message_size(client, max_message_size)
-    }
+pub async fn node_service_time_out_client(
+    addr: &String,
+) -> Result<
+    NodeServiceClient<
+        InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+    >,
+    Box<dyn Error>,
+> {
+    let token: MetadataValue<_> = "rustfs rpc".parse()?;
+    let channel = match GLOBAL_Conn_Map.read().await.get(addr) {
+        Some(channel) => channel.clone(),
+        None => {
+            let connector = Endpoint::from_shared(addr.to_string())?.connect_timeout(Duration::from_secs(60));
+            let channel = connector.connect().await?;
+            channel
+        }
+    };
+    GLOBAL_Conn_Map.write().await.insert(addr.to_string(), channel.clone());
+
+    // let timeout_channel = Timeout::new(channel, Duration::from_secs(60));
+    Ok(NodeServiceClient::with_interceptor(
+        channel,
+        Box::new(move |mut req: Request<()>| {
+            req.metadata_mut().insert("authorization", token.clone());
+            Ok(req)
+        }),
+    ))
 }

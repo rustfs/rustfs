@@ -1,6 +1,13 @@
 #![allow(clippy::map_entry)]
 use std::{collections::HashMap, sync::Arc};
 
+use common::globals::GLOBAL_Local_Node_Name;
+use futures::future::join_all;
+use http::HeaderMap;
+use lock::{namespace_lock::NsLockMap, new_lock_api, LockApi};
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
 use crate::{
     disk::{
         format::{DistributionAlgoVersion, FormatV3},
@@ -17,20 +24,18 @@ use crate::{
     },
     utils::hash,
 };
-use futures::future::join_all;
-use http::HeaderMap;
-use tokio::sync::RwLock;
+
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::warn;
-use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
     pub id: Uuid,
     // pub sets: Vec<Objects>,
     // pub disk_set: Vec<Vec<Option<DiskStore>>>, // [set_count_idx][set_drive_count_idx] = disk_idx
+    pub lockers: Vec<Vec<LockApi>>,
     pub disk_set: Vec<Arc<SetDisks>>, // [set_count_idx][set_drive_count_idx] = disk_idx
     pub pool_idx: usize,
     pub endpoints: PoolEndpoints,
@@ -52,6 +57,24 @@ impl Sets {
     ) -> Result<Arc<Self>> {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
+
+        let mut unique: Vec<Vec<String>> = vec![vec![]; set_count];
+        let mut lockers: Vec<Vec<LockApi>> = vec![vec![]; set_count];
+        endpoints.endpoints.as_ref().iter().enumerate().for_each(|(idx, endpoint)| {
+            let set_idx = idx / set_drive_count;
+            if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
+                unique[set_idx].push("local".to_string());
+                lockers[set_idx].push(new_lock_api(true, None));
+            }
+
+            if !endpoint.is_local {
+                let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap().to_string());
+                if !unique[set_idx].contains(&host_port) {
+                    unique[set_idx].push(host_port);
+                    lockers[set_idx].push(new_lock_api(false, Some(endpoint.url.clone())));
+                }
+            }
+        });
 
         let mut disk_set = Vec::with_capacity(set_count);
 
@@ -99,6 +122,9 @@ impl Sets {
             // warn!("sets new set_drive {:?}", &set_drive);
 
             let set_disks = SetDisks {
+                lockers: lockers[i].clone(),
+                locker_owner: GLOBAL_Local_Node_Name.read().await.to_string(),
+                ns_mutex: Arc::new(RwLock::new(NsLockMap::new(*GLOBAL_IsDistErasure.read().await))),
                 disks: RwLock::new(set_drive),
                 set_drive_count,
                 default_parity_count: partiy_count,
@@ -115,6 +141,7 @@ impl Sets {
             id: fm.id,
             // sets: todo!(),
             disk_set,
+            lockers,
             pool_idx,
             endpoints: endpoints.clone(),
             format: fm.clone(),
