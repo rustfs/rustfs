@@ -363,6 +363,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b6a852b24ab71dffc585bcb46eaf7959d175cb865a7152e35b348d1b2960422"
 
 [[package]]
+name = "common"
+version = "0.0.1"
+dependencies = [
+ "lazy_static",
+ "tokio",
+ "tonic",
+ "tracing-error",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -426,10 +436,14 @@ version = "0.0.1"
 dependencies = [
  "ecstore",
  "flatbuffers",
+ "lazy_static",
+ "lock",
  "protos",
  "serde_json",
  "tokio",
  "tonic",
+ "tower",
+ "url",
 ]
 
 [[package]]
@@ -441,11 +455,13 @@ dependencies = [
  "base64-simd",
  "byteorder",
  "bytes",
+ "common",
  "crc32fast",
  "futures",
  "hex-simd",
  "http",
  "lazy_static",
+ "lock",
  "netif",
  "num_cpus",
  "openssl",
@@ -690,9 +706,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa82e28a107a8cc405f0839610bdc9b15f1e25ec7d696aa5cf173edbcb1486ab"
+checksum = "524e8ac6999421f49a846c2d4411f337e53497d8ec55d67753beffa43c5d9205"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -945,6 +961,26 @@ name = "linux-raw-sys"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78b3ae25bc7c8c38cec158d1f2757ee79e9b3740fbc7ccf0e59e4b08d793fa89"
+
+[[package]]
+name = "lock"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "backon",
+ "common",
+ "lazy_static",
+ "protos",
+ "rand",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-error",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "lock_api"
@@ -1391,6 +1427,7 @@ dependencies = [
 name = "protos"
 version = "0.0.1"
 dependencies = [
+ "common",
  "flatbuffers",
  "prost",
  "prost-build",
@@ -1575,14 +1612,17 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "common",
  "ecstore",
  "flatbuffers",
  "futures",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "hyper",
  "hyper-util",
+ "lock",
  "log",
  "mime",
  "netif",
@@ -1596,6 +1636,7 @@ dependencies = [
  "serde_json",
  "time",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tonic-reflection",
@@ -2025,9 +2066,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-stream"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "267ac89e0bec6e691e5813911606935d77c476ff49024f98abcea3e7b15e37af"
+checksum = "4f4e6ce100d0eb49a2734f8c0812bcd324cf357d21810932c5df6b96ef2b86f1"
 dependencies = [
  "futures-core",
  "pin-project-lite",
@@ -2291,6 +2332,18 @@ dependencies = [
  "getrandom",
  "rand",
  "serde",
+ "uuid-macro-internal",
+]
+
+[[package]]
+name = "uuid-macro-internal"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee1cd046f83ea2c4e920d6ee9f7c3537ef928d75dce5d84a87c2c5d6b3999a3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

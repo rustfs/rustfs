@@ -563,6 +563,21 @@ pub struct DeleteVolumeResponse {
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
+/// lock api have same argument type
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenerallyLockRequest {
+    #[prost(string, tag = "1")]
+    pub args: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenerallyLockResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
 /// Generated client implementations.
 pub mod node_service_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
@@ -915,11 +930,39 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "Write"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn write_stream(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::WriteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::WriteResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/node_service.NodeService/WriteStream",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "WriteStream"));
+            self.inner.streaming(req, path, codec).await
+        }
         ///  rpc Append(AppendRequest) returns (AppendResponse) {};
         pub async fn read_at(
             &mut self,
-            request: impl tonic::IntoRequest<super::ReadAtRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadAtResponse>, tonic::Status> {
+            request: impl tonic::IntoStreamingRequest<Message = super::ReadAtRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ReadAtResponse>>,
+            tonic::Status,
+        > {
             self.inner
                 .ready()
                 .await
@@ -933,10 +976,10 @@ pub mod node_service_client {
             let path = http::uri::PathAndQuery::from_static(
                 "/node_service.NodeService/ReadAt",
             );
-            let mut req = request.into_request();
+            let mut req = request.into_streaming_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "ReadAt"));
-            self.inner.unary(req, path, codec).await
+            self.inner.streaming(req, path, codec).await
         }
         pub async fn list_dir(
             &mut self,
@@ -1335,6 +1378,156 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "DeleteVolume"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn lock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/node_service.NodeService/Lock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "Lock"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn un_lock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/node_service.NodeService/UnLock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "UnLock"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn r_lock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/node_service.NodeService/RLock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "RLock"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn r_un_lock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/node_service.NodeService/RUnLock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "RUnLock"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn force_un_lock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/node_service.NodeService/ForceUnLock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ForceUnLock"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn refresh(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/node_service.NodeService/Refresh",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "Refresh"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1410,11 +1603,30 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::WriteRequest>,
         ) -> std::result::Result<tonic::Response<super::WriteResponse>, tonic::Status>;
+        /// Server streaming response type for the WriteStream method.
+        type WriteStreamStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::WriteResponse, tonic::Status>,
+            >
+            + Send
+            + 'static;
+        async fn write_stream(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::WriteRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::WriteStreamStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ReadAt method.
+        type ReadAtStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ReadAtResponse, tonic::Status>,
+            >
+            + Send
+            + 'static;
         ///  rpc Append(AppendRequest) returns (AppendResponse) {};
         async fn read_at(
             &self,
-            request: tonic::Request<super::ReadAtRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReadAtResponse>, tonic::Status>;
+            request: tonic::Request<tonic::Streaming<super::ReadAtRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::ReadAtStream>, tonic::Status>;
         async fn list_dir(
             &self,
             request: tonic::Request<super::ListDirRequest>,
@@ -1516,6 +1728,48 @@ pub mod node_service_server {
             request: tonic::Request<super::DeleteVolumeRequest>,
         ) -> std::result::Result<
             tonic::Response<super::DeleteVolumeResponse>,
+            tonic::Status,
+        >;
+        async fn lock(
+            &self,
+            request: tonic::Request<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        >;
+        async fn un_lock(
+            &self,
+            request: tonic::Request<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        >;
+        async fn r_lock(
+            &self,
+            request: tonic::Request<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        >;
+        async fn r_un_lock(
+            &self,
+            request: tonic::Request<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        >;
+        async fn force_un_lock(
+            &self,
+            request: tonic::Request<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
+            tonic::Status,
+        >;
+        async fn refresh(
+            &self,
+            request: tonic::Request<super::GenerallyLockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GenerallyLockResponse>,
             tonic::Status,
         >;
     }
@@ -2086,21 +2340,72 @@ pub mod node_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/node_service.NodeService/WriteStream" => {
+                    #[allow(non_camel_case_types)]
+                    struct WriteStreamSvc<T: NodeService>(pub Arc<T>);
+                    impl<
+                        T: NodeService,
+                    > tonic::server::StreamingService<super::WriteRequest>
+                    for WriteStreamSvc<T> {
+                        type Response = super::WriteResponse;
+                        type ResponseStream = T::WriteStreamStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::WriteRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeService>::write_stream(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WriteStreamSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/node_service.NodeService/ReadAt" => {
                     #[allow(non_camel_case_types)]
                     struct ReadAtSvc<T: NodeService>(pub Arc<T>);
                     impl<
                         T: NodeService,
-                    > tonic::server::UnaryService<super::ReadAtRequest>
+                    > tonic::server::StreamingService<super::ReadAtRequest>
                     for ReadAtSvc<T> {
                         type Response = super::ReadAtResponse;
+                        type ResponseStream = T::ReadAtStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
                             &mut self,
-                            request: tonic::Request<super::ReadAtRequest>,
+                            request: tonic::Request<
+                                tonic::Streaming<super::ReadAtRequest>,
+                            >,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
@@ -2126,7 +2431,7 @@ pub mod node_service_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -2836,6 +3141,276 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteVolumeSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/Lock" => {
+                    #[allow(non_camel_case_types)]
+                    struct LockSvc<T: NodeService>(pub Arc<T>);
+                    impl<
+                        T: NodeService,
+                    > tonic::server::UnaryService<super::GenerallyLockRequest>
+                    for LockSvc<T> {
+                        type Response = super::GenerallyLockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GenerallyLockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeService>::lock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LockSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/UnLock" => {
+                    #[allow(non_camel_case_types)]
+                    struct UnLockSvc<T: NodeService>(pub Arc<T>);
+                    impl<
+                        T: NodeService,
+                    > tonic::server::UnaryService<super::GenerallyLockRequest>
+                    for UnLockSvc<T> {
+                        type Response = super::GenerallyLockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GenerallyLockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeService>::un_lock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UnLockSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/RLock" => {
+                    #[allow(non_camel_case_types)]
+                    struct RLockSvc<T: NodeService>(pub Arc<T>);
+                    impl<
+                        T: NodeService,
+                    > tonic::server::UnaryService<super::GenerallyLockRequest>
+                    for RLockSvc<T> {
+                        type Response = super::GenerallyLockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GenerallyLockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeService>::r_lock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RLockSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/RUnLock" => {
+                    #[allow(non_camel_case_types)]
+                    struct RUnLockSvc<T: NodeService>(pub Arc<T>);
+                    impl<
+                        T: NodeService,
+                    > tonic::server::UnaryService<super::GenerallyLockRequest>
+                    for RUnLockSvc<T> {
+                        type Response = super::GenerallyLockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GenerallyLockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeService>::r_un_lock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RUnLockSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ForceUnLock" => {
+                    #[allow(non_camel_case_types)]
+                    struct ForceUnLockSvc<T: NodeService>(pub Arc<T>);
+                    impl<
+                        T: NodeService,
+                    > tonic::server::UnaryService<super::GenerallyLockRequest>
+                    for ForceUnLockSvc<T> {
+                        type Response = super::GenerallyLockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GenerallyLockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeService>::force_un_lock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ForceUnLockSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/Refresh" => {
+                    #[allow(non_camel_case_types)]
+                    struct RefreshSvc<T: NodeService>(pub Arc<T>);
+                    impl<
+                        T: NodeService,
+                    > tonic::server::UnaryService<super::GenerallyLockRequest>
+                    for RefreshSvc<T> {
+                        type Response = super::GenerallyLockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GenerallyLockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NodeService>::refresh(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RefreshSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
