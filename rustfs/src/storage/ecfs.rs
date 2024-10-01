@@ -4,7 +4,7 @@ use ecstore::bucket::get_bucket_metadata_sys;
 use ecstore::bucket_meta::BucketMetadata;
 use ecstore::disk::error::DiskError;
 use ecstore::disk::RUSTFS_META_BUCKET;
-use ecstore::store::new_object_layer_fn;
+use ecstore::new_object_layer_fn;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
 use ecstore::store_api::DeleteBucketOptions;

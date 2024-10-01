@@ -7,7 +7,8 @@ use clap::Parser;
 use common::error::{Error, Result};
 use ecstore::{
     endpoints::EndpointServerPools,
-    store::{init_local_disks, update_erasure_type, ECStore},
+    store::{init_local_disks, ECStore},
+    update_erasure_type,
 };
 use grpc::make_server;
 use hyper_util::{
@@ -91,7 +92,6 @@ async fn run(opt: config::Opt) -> Result<()> {
         .map_err(|err| Error::from_string(err.to_string()))?;
 
     update_erasure_type(setup_type).await;
-
     // 初始化本地磁盘
     init_local_disks(endpoint_pools.clone())
         .await

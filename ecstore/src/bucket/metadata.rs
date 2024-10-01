@@ -13,17 +13,29 @@ use time::OffsetDateTime;
 use tracing::error;
 
 use crate::bucket::tags;
+use crate::config;
 use crate::config::common::{read_config, save_config};
-use crate::config::error::ConfigError;
 use crate::error::{Error, Result};
 
 use crate::disk::BUCKET_META_PREFIX;
 use crate::store::ECStore;
-use crate::store_api::StorageAPI;
+
+type TypeConfigFile = &'static str;
 
 pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
 pub const BUCKET_METADATA_FORMAT: u16 = 1;
 pub const BUCKET_METADATA_VERSION: u16 = 1;
+
+pub const BUCKET_POLICY_CONFIG: &str = "policy.json";
+pub const BUCKET_NOTIFICATION_CONFIG: &str = "notification.xml";
+pub const BUCKET_LIFECYCLE_CONFIG: &str = "lifecycle.xml";
+pub const BUCKET_SSECONFIG: &str = "bucket-encryption.xml";
+pub const BUCKET_TAGGING_CONFIG: &str = "tagging.xml";
+pub const BUCKET_QUOTA_CONFIG_FILE: &str = "quota.json";
+pub const OBJECT_LOCK_CONFIG: &str = "object-lock.xml";
+pub const BUCKET_VERSIONING_CONFIG: &str = "versioning.xml";
+pub const BUCKET_REPLICATION_CONFIG: &str = "replication.xml";
+pub const BUCKET_TARGETS_FILE: &str = "bucket-targets.json";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
@@ -170,7 +182,57 @@ impl BucketMetadata {
         }
     }
 
-    async fn save(&mut self, api: &ECStore) -> Result<()> {
+    pub fn update_config(&mut self, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
+        let updated = OffsetDateTime::now_utc();
+
+        match config_file {
+            BUCKET_POLICY_CONFIG => {
+                self.policy_config_json = data;
+                self.policy_config_updated_at = updated;
+            }
+            BUCKET_NOTIFICATION_CONFIG => {
+                self.notification_config_xml = data;
+                self.notification_config_updated_at = updated;
+            }
+            BUCKET_LIFECYCLE_CONFIG => {
+                self.lifecycle_config_xml = data;
+                self.lifecycle_config_updated_at = updated;
+            }
+            BUCKET_SSECONFIG => {
+                self.encryption_config_xml = data;
+                self.encryption_config_updated_at = updated;
+            }
+            BUCKET_TAGGING_CONFIG => {
+                self.tagging_config_xml = data;
+                self.tagging_config_updated_at = updated;
+            }
+            BUCKET_QUOTA_CONFIG_FILE => {
+                self.quota_config_json = data;
+                self.quota_config_updated_at = updated;
+            }
+            OBJECT_LOCK_CONFIG => {
+                self.object_lock_config_xml = data;
+                self.object_lock_config_updated_at = updated;
+            }
+            BUCKET_VERSIONING_CONFIG => {
+                self.versioning_config_xml = data;
+                self.versioning_config_updated_at = updated;
+            }
+            BUCKET_REPLICATION_CONFIG => {
+                self.replication_config_xml = data;
+                self.replication_config_updated_at = updated;
+            }
+            BUCKET_TARGETS_FILE => {
+                self.tagging_config_xml = data;
+                self.tagging_config_updated_at = updated;
+            }
+            _ => return Err(Error::msg(format!("config file not found : {}", config_file))),
+        }
+
+        Ok(updated)
+    }
+
+    pub async fn save(&mut self, api: &ECStore) -> Result<()> {
         self.parse_all_configs(api)?;
 
         let mut buf: Vec<u8> = vec![0; 4];
@@ -201,14 +263,12 @@ pub async fn load_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketM
     load_bucket_metadata_parse(api, bucket, true).await
 }
 
-async fn load_bucket_metadata_parse(api: &ECStore, bucket: &str, parse: bool) -> Result<BucketMetadata> {
+pub async fn load_bucket_metadata_parse(api: &ECStore, bucket: &str, parse: bool) -> Result<BucketMetadata> {
     let mut bm = match read_bucket_metadata(api, bucket).await {
         Ok(res) => res,
         Err(err) => {
-            if let Some(e) = err.downcast_ref::<ConfigError>() {
-                if !ConfigError::is_not_found(&e) {
-                    return Err(err);
-                }
+            if !config::error::is_not_found(&err) {
+                return Err(err);
             }
 
             BucketMetadata::new(bucket)
