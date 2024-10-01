@@ -1,3 +1,5 @@
+use crate::error::Error;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("config not found")]
@@ -11,5 +13,13 @@ impl ConfigError {
     #[must_use]
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound)
+    }
+}
+
+pub fn is_not_found(err: &Error) -> bool {
+    if let Some(e) = err.downcast_ref::<ConfigError>() {
+        ConfigError::is_not_found(&e)
+    } else {
+        false
     }
 }

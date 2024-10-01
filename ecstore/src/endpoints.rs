@@ -10,7 +10,7 @@ use std::{
 };
 
 /// enum for setup type.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub enum SetupType {
     /// starts with unknown setup type.
     Unknown,
@@ -111,6 +111,7 @@ impl Endpoints {
     }
 }
 
+#[derive(Debug)]
 /// a temporary type to holds the list of endpoints
 struct PoolEndpointList {
     inner: Vec<Endpoints>,
@@ -437,6 +438,10 @@ impl EndpointServerPools {
         }
 
         Ok((ret, pool_eps.setup_type))
+    }
+
+    pub fn es_count(&self) -> usize {
+        self.0.iter().map(|v| v.set_count).count()
     }
 
     /// add pool endpoints

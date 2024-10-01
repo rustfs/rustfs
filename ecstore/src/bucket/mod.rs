@@ -1,4 +1,5 @@
 mod encryption;
+mod error;
 mod event;
 mod lifecycle;
 pub mod metadata;
@@ -10,5 +11,6 @@ mod replication;
 mod tags;
 mod target;
 mod versioning;
+pub mod utils;
 
 pub use metadata_sys::get_bucket_metadata_sys;

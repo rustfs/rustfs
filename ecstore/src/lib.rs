@@ -7,6 +7,7 @@ pub mod endpoints;
 pub mod erasure;
 pub mod error;
 mod file_meta;
+mod global;
 pub mod peer;
 mod quorum;
 pub mod set_disk;
@@ -18,3 +19,6 @@ mod store_init;
 mod utils;
 
 pub mod bucket;
+
+pub use global::new_object_layer_fn;
+pub use global::update_erasure_type;

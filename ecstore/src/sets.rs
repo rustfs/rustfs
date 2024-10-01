@@ -15,8 +15,8 @@ use crate::{
     },
     endpoints::PoolEndpoints,
     error::{Error, Result},
+    global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     set_disk::SetDisks,
-    store::{GLOBAL_IsDistErasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
         ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete,
@@ -94,7 +94,7 @@ impl Sets {
                     continue;
                 }
 
-                if disk.as_ref().unwrap().is_local() && *GLOBAL_IsDistErasure.read().await {
+                if disk.as_ref().unwrap().is_local() && is_dist_erasure().await {
                     let local_disk = {
                         let local_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.read().await;
                         local_set_drives[pool_idx][i][j].clone()
@@ -124,7 +124,7 @@ impl Sets {
             let set_disks = SetDisks {
                 lockers: lockers[i].clone(),
                 locker_owner: GLOBAL_Local_Node_Name.read().await.to_string(),
-                ns_mutex: Arc::new(RwLock::new(NsLockMap::new(*GLOBAL_IsDistErasure.read().await))),
+                ns_mutex: Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
                 disks: RwLock::new(set_drive),
                 set_drive_count,
                 default_parity_count: partiy_count,
