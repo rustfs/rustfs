@@ -1,5 +1,8 @@
 use bytes::BufMut;
 use bytes::Bytes;
+use ecstore::bucket::get_bucket_metadata_sys;
+use ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
+use ecstore::bucket::tags::Tags;
 use ecstore::bucket_meta::BucketMetadata;
 use ecstore::disk::error::DiskError;
 use ecstore::disk::RUSTFS_META_BUCKET;
@@ -18,6 +21,7 @@ use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
+use log::warn;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::Body;
@@ -26,6 +30,7 @@ use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::str::FromStr;
 use transform_stream::AsyncTryStream;
@@ -702,53 +707,67 @@ impl S3 for FS {
             }))
             .await?;
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = lock
-            .as_ref()
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+        let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+        let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
-        let meta_obj = try_!(
-            store
-                .get_object_reader(
-                    RUSTFS_META_BUCKET,
-                    BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-                    HTTPRangeSpec::nil(),
-                    Default::default(),
-                    &ObjectOptions::default(),
-                )
-                .await
-        );
-
-        let stream = meta_obj.stream;
-
-        let mut data = vec![];
-        pin_mut!(stream);
-
-        while let Some(x) = stream.next().await {
-            let x = try_!(x);
-            data.put_slice(&x[..]);
+        let mut tag_map = HashMap::new();
+        for tag in tagging.tag_set.iter() {
+            tag_map.insert(tag.key.clone(), tag.value.clone());
         }
 
-        let mut meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
-        if tagging.tag_set.is_empty() {
-            meta.tagging = None;
-        } else {
-            meta.tagging = Some(tagging.tag_set.into_iter().map(|x| (x.key, x.value)).collect())
-        }
+        let tags = Tags::new(tag_map, false);
 
-        let data = try_!(meta.marshal_msg());
-        let len = data.len();
-        try_!(
-            store
-                .put_object(
-                    RUSTFS_META_BUCKET,
-                    BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-                    PutObjReader::new(StreamingBlob::from(Body::from(data)), len),
-                    &ObjectOptions::default(),
-                )
-                .await
-        );
+        let data = try_!(tags.marshal_msg());
+
+        let _updated = try_!(bucket_meta_sys.update(&bucket, BUCKET_TAGGING_CONFIG, data).await);
+
+        // let layer = new_object_layer_fn();
+        // let lock = layer.read().await;
+        // let store = lock
+        //     .as_ref()
+        //     .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        // let meta_obj = try_!(
+        //     store
+        //         .get_object_reader(
+        //             RUSTFS_META_BUCKET,
+        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
+        //             HTTPRangeSpec::nil(),
+        //             Default::default(),
+        //             &ObjectOptions::default(),
+        //         )
+        //         .await
+        // );
+
+        // let stream = meta_obj.stream;
+
+        // let mut data = vec![];
+        // pin_mut!(stream);
+
+        // while let Some(x) = stream.next().await {
+        //     let x = try_!(x);
+        //     data.put_slice(&x[..]);
+        // }
+
+        // let mut meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
+        // if tagging.tag_set.is_empty() {
+        //     meta.tagging = None;
+        // } else {
+        //     meta.tagging = Some(tagging.tag_set.into_iter().map(|x| (x.key, x.value)).collect())
+        // }
+
+        // let data = try_!(meta.marshal_msg());
+        // let len = data.len();
+        // try_!(
+        //     store
+        //         .put_object(
+        //             RUSTFS_META_BUCKET,
+        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
+        //             PutObjReader::new(StreamingBlob::from(Body::from(data)), len),
+        //             &ObjectOptions::default(),
+        //         )
+        //         .await
+        // );
 
         Ok(S3Response::new(Default::default()))
     }
@@ -764,15 +783,29 @@ impl S3 for FS {
             }))
             .await?;
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = lock
-            .as_ref()
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+        // let layer = new_object_layer_fn();
+        // let lock = layer.read().await;
+        // let store = lock
+        //     .as_ref()
+        //     .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        // let a = get_bucket_metadata_sys();
+        let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+        let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+        let tag_set: Vec<Tag> = match bucket_meta_sys.get_tagging_config(&bucket).await {
+            Ok((tags, _)) => tags
+                .tag_set
+                .tag_map
+                .into_iter()
+                .map(|(key, value)| Tag { key, value })
+                .collect(),
+            Err(err) => {
+                warn!("get_tagging_config err {:?}", &err);
+                // TODO: check not found
+                Vec::new()
+            }
+        };
 
-        Ok(S3Response::new(GetBucketTaggingOutput { ..Default::default() }))
+        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
 
         // let meta_obj = try_!(
         //     store
@@ -842,48 +875,59 @@ impl S3 for FS {
             }))
             .await?;
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = lock
-            .as_ref()
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+        let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+        let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
-        let meta_obj = try_!(
-            store
-                .get_object_reader(
-                    RUSTFS_META_BUCKET,
-                    BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-                    HTTPRangeSpec::nil(),
-                    Default::default(),
-                    &ObjectOptions::default(),
-                )
-                .await
-        );
+        let tag_map = HashMap::new();
 
-        let stream = meta_obj.stream;
+        let tags = Tags::new(tag_map, false);
 
-        let mut data = vec![];
-        pin_mut!(stream);
+        let data = try_!(tags.marshal_msg());
 
-        while let Some(x) = stream.next().await {
-            let x = try_!(x);
-            data.put_slice(&x[..]);
-        }
+        let _updated = try_!(bucket_meta_sys.update(&bucket, BUCKET_TAGGING_CONFIG, data).await);
 
-        let mut meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
-        meta.tagging = None;
-        let data = try_!(meta.marshal_msg());
-        let len = data.len();
-        try_!(
-            store
-                .put_object(
-                    RUSTFS_META_BUCKET,
-                    BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-                    PutObjReader::new(StreamingBlob::from(Body::from(data)), len),
-                    &ObjectOptions::default(),
-                )
-                .await
-        );
+        // let layer = new_object_layer_fn();
+        // let lock = layer.read().await;
+        // let store = lock
+        //     .as_ref()
+        //     .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        // let meta_obj = try_!(
+        //     store
+        //         .get_object_reader(
+        //             RUSTFS_META_BUCKET,
+        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
+        //             HTTPRangeSpec::nil(),
+        //             Default::default(),
+        //             &ObjectOptions::default(),
+        //         )
+        //         .await
+        // );
+
+        // let stream = meta_obj.stream;
+
+        // let mut data = vec![];
+        // pin_mut!(stream);
+
+        // while let Some(x) = stream.next().await {
+        //     let x = try_!(x);
+        //     data.put_slice(&x[..]);
+        // }
+
+        // let mut meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
+        // meta.tagging = None;
+        // let data = try_!(meta.marshal_msg());
+        // let len = data.len();
+        // try_!(
+        //     store
+        //         .put_object(
+        //             RUSTFS_META_BUCKET,
+        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
+        //             PutObjReader::new(StreamingBlob::from(Body::from(data)), len),
+        //             &ObjectOptions::default(),
+        //         )
+        //         .await
+        // );
 
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }

@@ -31,7 +31,7 @@ pub async fn get_bucket_metadata_sys() -> Arc<RwLock<BucketMetadataSys>> {
     GLOBAL_BucketMetadataSys.clone()
 }
 
-pub async fn bucket_metadata_sys_set(bucket: &str, bm: BucketMetadata) {
+pub async fn bucket_metadata_sys_set(bucket: String, bm: BucketMetadata) {
     let sys = GLOBAL_BucketMetadataSys.write().await;
     sys.set(bucket, bm).await
 }
@@ -135,10 +135,10 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn set(&self, bucket: &str, bm: BucketMetadata) {
-        if !is_meta_bucketname(bucket) {
+    pub async fn set(&self, bucket: String, bm: BucketMetadata) {
+        if !is_meta_bucketname(&bucket) {
             let mut map = self.metadata_map.write().await;
-            map.insert(bucket.to_string(), bm);
+            map.insert(bucket, bm);
         }
     }
 
@@ -176,9 +176,28 @@ impl BucketMetadataSys {
 
         let updated = bm.update_config(config_file, data)?;
 
-        bm.save(store).await?;
+        self.save(&mut bm).await?;
 
         Ok(updated)
+    }
+
+    async fn save(&self, bm: &mut BucketMetadata) -> Result<()> {
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(Error::msg("errServerNotInitialized")),
+        };
+
+        if is_meta_bucketname(&bm.name) {
+            return Err(Error::msg("errInvalidArgument"));
+        }
+
+        bm.save(store).await?;
+
+        self.set(bm.name.clone(), bm.clone()).await;
+
+        Ok(())
     }
 
     pub async fn get_config(&self, bucket: &str) -> Result<(BucketMetadata, bool)> {
@@ -221,6 +240,7 @@ impl BucketMetadataSys {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
+                warn!("get_tagging_config err {:?}", &err);
                 if config::error::is_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::TaggingNotFound));
                 } else {

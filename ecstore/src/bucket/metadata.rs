@@ -265,7 +265,6 @@ impl BucketMetadata {
 
     fn parse_all_configs(&mut self, _api: &ECStore) -> Result<()> {
         if !self.tagging_config_xml.is_empty() {
-            warn!("self.tagging_config_xml {:?}", &self.tagging_config_xml);
             self.tagging_config = Some(tags::Tags::unmarshal(&self.tagging_config_xml)?);
         }
 
