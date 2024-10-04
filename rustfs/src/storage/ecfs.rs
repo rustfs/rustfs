@@ -1,6 +1,5 @@
 use bytes::BufMut;
 use bytes::Bytes;
-use ecstore::bucket::get_bucket_metadata_sys;
 use ecstore::bucket_meta::BucketMetadata;
 use ecstore::disk::error::DiskError;
 use ecstore::disk::RUSTFS_META_BUCKET;

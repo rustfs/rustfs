@@ -31,6 +31,11 @@ pub async fn get_bucket_metadata_sys() -> Arc<RwLock<BucketMetadataSys>> {
     GLOBAL_BucketMetadataSys.clone()
 }
 
+pub async fn bucket_metadata_sys_set(bucket: &str, bm: BucketMetadata) {
+    let sys = GLOBAL_BucketMetadataSys.write().await;
+    sys.set(bucket, bm).await
+}
+
 #[derive(Debug, Default)]
 pub struct BucketMetadataSys {
     metadata_map: RwLock<HashMap<String, BucketMetadata>>,
