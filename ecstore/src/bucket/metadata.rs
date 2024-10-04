@@ -2,6 +2,7 @@ use super::{
     encryption::BucketSSEConfig, event, lifecycle::lifecycle::Lifecycle, objectlock, policy::bucket_policy::BucketPolicy,
     quota::BucketQuota, replication, tags::Tags, target::BucketTargets, versioning::Versioning,
 };
+
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmp_serde::Serializer as rmpSerializer;
 use serde::Serializer;
@@ -10,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
 use time::OffsetDateTime;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::bucket::tags;
 use crate::config;
@@ -172,7 +173,19 @@ impl BucketMetadata {
             return Err(Error::msg("read_bucket_metadata: data invalid"));
         }
 
-        // TODO: check version
+        let format = LittleEndian::read_u16(&buf[0..2]);
+        let version = LittleEndian::read_u16(&buf[2..4]);
+
+        match format {
+            BUCKET_METADATA_FORMAT => {}
+            _ => return Err(Error::msg("read_bucket_metadata: format invalid")),
+        }
+
+        match version {
+            BUCKET_METADATA_VERSION => {}
+            _ => return Err(Error::msg("read_bucket_metadata: version invalid")),
+        }
+
         Ok(())
     }
 
@@ -252,6 +265,7 @@ impl BucketMetadata {
 
     fn parse_all_configs(&mut self, _api: &ECStore) -> Result<()> {
         if !self.tagging_config_xml.is_empty() {
+            warn!("self.tagging_config_xml {:?}", &self.tagging_config_xml);
             self.tagging_config = Some(tags::Tags::unmarshal(&self.tagging_config_xml)?);
         }
 
@@ -267,6 +281,7 @@ pub async fn load_bucket_metadata_parse(api: &ECStore, bucket: &str, parse: bool
     let mut bm = match read_bucket_metadata(api, bucket).await {
         Ok(res) => res,
         Err(err) => {
+            warn!("load_bucket_metadata_parse err {:?}", &err);
             if !config::error::is_not_found(&err) {
                 return Err(err);
             }
@@ -299,7 +314,9 @@ async fn read_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketMetad
 
     BucketMetadata::check_header(&data)?;
 
-    BucketMetadata::unmarshal(&data[4..])
+    let bm = BucketMetadata::unmarshal(&data[4..])?;
+
+    Ok(bm)
 }
 
 fn _deserialize_from_str<'de, S, D>(deserializer: D) -> core::result::Result<S, D::Error>

@@ -21,4 +21,5 @@ mod utils;
 pub mod bucket;
 
 pub use global::new_object_layer_fn;
+pub use global::set_global_endpoints;
 pub use global::update_erasure_type;

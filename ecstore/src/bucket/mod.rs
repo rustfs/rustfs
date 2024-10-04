@@ -10,7 +10,7 @@ mod quota;
 mod replication;
 mod tags;
 mod target;
-mod versioning;
 pub mod utils;
+mod versioning;
 
-pub use metadata_sys::get_bucket_metadata_sys;
+pub use metadata_sys::{get_bucket_metadata_sys, init_bucket_metadata_sys};

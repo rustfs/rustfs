@@ -34,7 +34,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ECStore {
     pub id: uuid::Uuid,
     // pub disks: Vec<DiskStore>,
@@ -46,7 +46,7 @@ pub struct ECStore {
 
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
-    pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<()> {
+    pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<Self> {
         // let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 
         let mut deployment_id = None;
@@ -145,9 +145,9 @@ impl ECStore {
             peer_sys,
         };
 
-        set_object_layer(ec).await;
+        set_object_layer(ec.clone()).await;
 
-        Ok(())
+        Ok(ec)
     }
 
     pub fn init_local_disks() {}
@@ -507,28 +507,29 @@ impl StorageAPI for ECStore {
         // TODO: delete created bucket when error
         self.peer_sys.make_bucket(bucket, opts).await?;
 
-        let meta = BucketMetadata::new(bucket);
-        let data = meta.marshal_msg()?;
-        let file_path = meta.save_file_path();
+        let mut meta = BucketMetadata::new(bucket);
+        meta.save(self).await?;
+        // let data = meta.marshal_msg()?;
+        // let file_path = meta.save_file_path();
 
-        // TODO: wrap hash reader
+        // // TODO: wrap hash reader
 
-        let content_len = data.len();
+        // let content_len = data.len();
 
-        let body = Body::from(data);
+        // let body = Body::from(data);
 
-        let reader = PutObjReader::new(StreamingBlob::from(body), content_len);
+        // let reader = PutObjReader::new(StreamingBlob::from(body), content_len);
 
-        self.put_object(
-            RUSTFS_META_BUCKET,
-            &file_path,
-            reader,
-            &ObjectOptions {
-                max_parity: true,
-                ..Default::default()
-            },
-        )
-        .await?;
+        // self.put_object(
+        //     RUSTFS_META_BUCKET,
+        //     &file_path,
+        //     reader,
+        //     &ObjectOptions {
+        //         max_parity: true,
+        //         ..Default::default()
+        //     },
+        // )
+        // .await?;
 
         // TODO: toObjectErr
 

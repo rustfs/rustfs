@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::bucket::error::BucketMetadataError;
@@ -7,21 +8,26 @@ use crate::config;
 use crate::config::error::ConfigError;
 use crate::disk::error::DiskError;
 use crate::error::{Error, Result};
-use crate::global::{is_dist_erasure, is_erasure, new_object_layer_fn};
+use crate::global::{is_dist_erasure, is_erasure, new_object_layer_fn, GLOBAL_Endpoints};
 use crate::store::ECStore;
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 
 use super::metadata::{load_bucket_metadata, BucketMetadata};
 use super::tags;
 
 lazy_static! {
-    static ref GLOBAL_BucketMetadataSys: Arc<BucketMetadataSys> = Arc::new(BucketMetadataSys::new());
+    static ref GLOBAL_BucketMetadataSys: Arc<RwLock<BucketMetadataSys>> = Arc::new(RwLock::new(BucketMetadataSys::new()));
 }
 
-pub fn get_bucket_metadata_sys() -> Arc<BucketMetadataSys> {
+pub async fn init_bucket_metadata_sys(api: ECStore, buckets: Vec<String>) {
+    let mut sys = GLOBAL_BucketMetadataSys.write().await;
+    sys.init(api, buckets).await
+}
+pub async fn get_bucket_metadata_sys() -> Arc<RwLock<BucketMetadataSys>> {
     GLOBAL_BucketMetadataSys.clone()
 }
 
@@ -37,46 +43,77 @@ impl BucketMetadataSys {
         Self::default()
     }
 
-    pub async fn init(&mut self, api: Option<ECStore>, buckets: Vec<&str>) -> Result<()> {
-        if api.is_none() {
-            return Err(Error::msg("errServerNotInitialized"));
-        }
-        self.api = api;
+    pub async fn init(&mut self, api: ECStore, buckets: Vec<String>) {
+        // if api.is_none() {
+        //     return Err(Error::msg("errServerNotInitialized"));
+        // }
+        self.api = Some(api);
 
         let _ = self.init_internal(buckets).await;
+    }
+    async fn init_internal(&self, buckets: Vec<String>) -> Result<()> {
+        let count = {
+            let endpoints = GLOBAL_Endpoints.read().await;
+            endpoints.es_count() * 10
+        };
+
+        let mut failed_buckets: HashSet<String> = HashSet::new();
+        let mut buckets = buckets.as_slice();
+
+        loop {
+            if buckets.len() < count {
+                self.concurrent_load(buckets, &mut failed_buckets).await;
+                break;
+            }
+
+            self.concurrent_load(&buckets[..count], &mut failed_buckets).await;
+
+            buckets = &buckets[count..]
+        }
+
+        let mut initialized = self.initialized.write().await;
+        *initialized = true;
+
+        if is_dist_erasure().await {
+            // TODO: refresh_buckets_metadata_loop
+        }
 
         Ok(())
     }
-    async fn init_internal(&self, buckets: Vec<&str>) -> Result<()> {
-        if self.api.is_none() {
-            return Err(Error::msg("errServerNotInitialized"));
-        }
-        let mut futures = Vec::new();
-        let mut errs = Vec::new();
-        let mut ress = Vec::new();
 
-        for &bucket in buckets.iter() {
-            futures.push(load_bucket_metadata(self.api.as_ref().unwrap(), bucket));
+    async fn concurrent_load(&self, buckets: &[String], failed_buckets: &mut HashSet<String>) {
+        let mut futures = Vec::new();
+
+        for bucket in buckets.iter() {
+            futures.push(load_bucket_metadata(self.api.as_ref().unwrap(), bucket.as_str()));
         }
 
         let results = join_all(futures).await;
 
+        let mut idx = 0;
+
+        let mut mp = self.metadata_map.write().await;
+
         for res in results {
             match res {
-                Ok(entrys) => {
-                    ress.push(Some(entrys));
-                    errs.push(None);
+                Ok(res) => {
+                    if let Some(bucket) = buckets.get(idx) {
+                        mp.insert(bucket.clone(), res);
+                    }
                 }
                 Err(e) => {
-                    ress.push(None);
-                    errs.push(Some(e));
+                    error!("Unable to load bucket metadata, will be retried: {:?}", e);
+                    if let Some(bucket) = buckets.get(idx) {
+                        failed_buckets.insert(bucket.clone());
+                    }
                 }
             }
+
+            idx += 1;
         }
-        unimplemented!()
     }
 
-    async fn concurrent_load(&self, buckets: Vec<&str>) -> Result<Vec<&str>> {
+    async fn refresh_buckets_metadata_loop(&self, failed_buckets: &HashSet<String>) -> Result<()> {
         unimplemented!()
     }
 
@@ -105,7 +142,7 @@ impl BucketMetadataSys {
         map.clear();
     }
 
-    pub async fn update(&mut self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<(OffsetDateTime)> {
+    pub async fn update(&mut self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         self.update_and_parse(bucket, config_file, data, true).await
     }
 

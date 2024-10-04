@@ -47,7 +47,7 @@ async fn save_config_with_opts(api: &ECStore, file: &str, data: &[u8], opts: &Ob
             RUSTFS_META_BUCKET,
             file,
             PutObjReader::new(StreamingBlob::from(Body::from(data.to_vec())), data.len()),
-            &ObjectOptions::default(),
+            opts,
         )
         .await?;
     Ok(())
