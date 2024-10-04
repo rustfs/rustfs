@@ -13,4 +13,4 @@ mod target;
 pub mod utils;
 mod versioning;
 
-pub use metadata_sys::{get_bucket_metadata_sys, init_bucket_metadata_sys};
+pub use metadata_sys::{bucket_metadata_sys_set, get_bucket_metadata_sys, init_bucket_metadata_sys};

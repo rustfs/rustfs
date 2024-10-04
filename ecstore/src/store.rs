@@ -1,11 +1,12 @@
 #![allow(clippy::map_entry)]
+use crate::bucket::bucket_metadata_sys_set;
 use crate::disk::endpoint::EndpointType;
 use crate::global::{is_dist_erasure, set_object_layer, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
 use crate::store_api::ObjectIO;
 use crate::{
     bucket::metadata::BucketMetadata,
     disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-    endpoints::{EndpointServerPools, SetupType},
+    endpoints::EndpointServerPools,
     error::{Error, Result},
     peer::S3PeerSys,
     sets::Sets,
@@ -21,7 +22,6 @@ use backon::{ExponentialBuilder, Retryable};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
 use http::HeaderMap;
-use s3s::{dto::StreamingBlob, Body};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -509,27 +509,8 @@ impl StorageAPI for ECStore {
 
         let mut meta = BucketMetadata::new(bucket);
         meta.save(self).await?;
-        // let data = meta.marshal_msg()?;
-        // let file_path = meta.save_file_path();
 
-        // // TODO: wrap hash reader
-
-        // let content_len = data.len();
-
-        // let body = Body::from(data);
-
-        // let reader = PutObjReader::new(StreamingBlob::from(body), content_len);
-
-        // self.put_object(
-        //     RUSTFS_META_BUCKET,
-        //     &file_path,
-        //     reader,
-        //     &ObjectOptions {
-        //         max_parity: true,
-        //         ..Default::default()
-        //     },
-        // )
-        // .await?;
+        bucket_metadata_sys_set(bucket, meta).await;
 
         // TODO: toObjectErr
 
