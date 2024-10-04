@@ -414,7 +414,11 @@ pub struct ObjectOptions {
 // }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct BucketOptions {}
+pub struct BucketOptions {
+    pub deleted: bool, // true only when site replication is enabled
+    pub cached: bool, // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+    pub no_metadata: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketInfo {

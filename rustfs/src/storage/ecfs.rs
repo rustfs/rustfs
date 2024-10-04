@@ -250,7 +250,7 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
         };
 
-        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
+        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions::default()).await {
             if DiskError::VolumeNotFound.is(&e) {
                 return Err(s3_error!(NoSuchBucket));
             } else {
@@ -324,7 +324,7 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
         };
 
-        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions {}).await {
+        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions::default()).await {
             if DiskError::VolumeNotFound.is(&e) {
                 return Err(s3_error!(NoSuchBucket));
             } else {
@@ -375,7 +375,7 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
         };
 
-        let bucket_infos = try_!(store.list_bucket(&BucketOptions {}).await);
+        let bucket_infos = try_!(store.list_bucket(&BucketOptions::default()).await);
 
         let buckets: Vec<Bucket> = bucket_infos
             .iter()

@@ -388,7 +388,7 @@ pub struct PoolEndpoints {
 
 /// list of list of endpoints
 #[derive(Debug, Clone)]
-pub struct EndpointServerPools(Vec<PoolEndpoints>);
+pub struct EndpointServerPools(pub Vec<PoolEndpoints>);
 
 impl From<Vec<PoolEndpoints>> for EndpointServerPools {
     fn from(v: Vec<PoolEndpoints>) -> Self {
@@ -409,6 +409,9 @@ impl AsMut<Vec<PoolEndpoints>> for EndpointServerPools {
 }
 
 impl EndpointServerPools {
+    pub fn reset(&mut self, eps: Vec<PoolEndpoints>) {
+        self.0 = eps;
+    }
     pub fn from_volumes(server_addr: &str, endpoints: Vec<String>) -> Result<(EndpointServerPools, SetupType)> {
         let layouts = DisksLayout::try_from(endpoints.as_slice())?;
 

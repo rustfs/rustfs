@@ -6,8 +6,11 @@ mod storage;
 use clap::Parser;
 use common::error::{Error, Result};
 use ecstore::{
+    bucket::init_bucket_metadata_sys,
     endpoints::EndpointServerPools,
+    set_global_endpoints,
     store::{init_local_disks, ECStore},
+    store_api::{BucketOptions, StorageAPI},
     update_erasure_type,
 };
 use grpc::make_server;
@@ -90,8 +93,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     // 用于rpc
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
-
+    set_global_endpoints(endpoint_pools.as_ref().clone()).await;
     update_erasure_type(setup_type).await;
+
     // 初始化本地磁盘
     init_local_disks(endpoint_pools.clone())
         .await
@@ -179,10 +183,22 @@ async fn run(opt: config::Opt) -> Result<()> {
     });
 
     // init store
-    ECStore::new(opt.address.clone(), endpoint_pools.clone())
+    let store = ECStore::new(opt.address.clone(), endpoint_pools.clone())
         .await
         .map_err(|err| Error::from_string(err.to_string()))?;
     info!(" init store success!");
+
+    let buckets_list = store
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| Error::from_string(err.to_string()))?;
+
+    let buckets = buckets_list.iter().map(|v| v.name.clone()).collect();
+
+    init_bucket_metadata_sys(store.clone(), buckets).await;
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
