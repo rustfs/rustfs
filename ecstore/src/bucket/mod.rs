@@ -8,7 +8,7 @@ mod objectlock;
 mod policy;
 mod quota;
 mod replication;
-mod tags;
+pub mod tags;
 mod target;
 pub mod utils;
 mod versioning;

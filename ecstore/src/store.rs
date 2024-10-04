@@ -510,7 +510,7 @@ impl StorageAPI for ECStore {
         let mut meta = BucketMetadata::new(bucket);
         meta.save(self).await?;
 
-        bucket_metadata_sys_set(bucket, meta).await;
+        bucket_metadata_sys_set(bucket.to_string(), meta).await;
 
         // TODO: toObjectErr
 
