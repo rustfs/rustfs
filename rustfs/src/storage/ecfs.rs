@@ -721,54 +721,6 @@ impl S3 for FS {
 
         let _updated = try_!(bucket_meta_sys.update(&bucket, BUCKET_TAGGING_CONFIG, data).await);
 
-        // let layer = new_object_layer_fn();
-        // let lock = layer.read().await;
-        // let store = lock
-        //     .as_ref()
-        //     .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
-
-        // let meta_obj = try_!(
-        //     store
-        //         .get_object_reader(
-        //             RUSTFS_META_BUCKET,
-        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-        //             HTTPRangeSpec::nil(),
-        //             Default::default(),
-        //             &ObjectOptions::default(),
-        //         )
-        //         .await
-        // );
-
-        // let stream = meta_obj.stream;
-
-        // let mut data = vec![];
-        // pin_mut!(stream);
-
-        // while let Some(x) = stream.next().await {
-        //     let x = try_!(x);
-        //     data.put_slice(&x[..]);
-        // }
-
-        // let mut meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
-        // if tagging.tag_set.is_empty() {
-        //     meta.tagging = None;
-        // } else {
-        //     meta.tagging = Some(tagging.tag_set.into_iter().map(|x| (x.key, x.value)).collect())
-        // }
-
-        // let data = try_!(meta.marshal_msg());
-        // let len = data.len();
-        // try_!(
-        //     store
-        //         .put_object(
-        //             RUSTFS_META_BUCKET,
-        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-        //             PutObjReader::new(StreamingBlob::from(Body::from(data)), len),
-        //             &ObjectOptions::default(),
-        //         )
-        //         .await
-        // );
-
         Ok(S3Response::new(Default::default()))
     }
 
@@ -782,12 +734,6 @@ impl S3 for FS {
                 expected_bucket_owner: None,
             }))
             .await?;
-
-        // let layer = new_object_layer_fn();
-        // let lock = layer.read().await;
-        // let store = lock
-        //     .as_ref()
-        //     .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
         let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
         let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -806,59 +752,6 @@ impl S3 for FS {
         };
 
         Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
-
-        // let meta_obj = try_!(
-        //     store
-        //         .get_object_reader(
-        //             RUSTFS_META_BUCKET,
-        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-        //             HTTPRangeSpec::nil(),
-        //             Default::default(),
-        //             &ObjectOptions::default(),
-        //         )
-        //         .await
-        // );
-
-        // let stream = meta_obj.stream;
-
-        // let mut data = vec![];
-        // pin_mut!(stream);
-
-        // while let Some(x) = stream.next().await {
-        //     let x = try_!(x);
-        //     data.put_slice(&x[..]);
-        // }
-
-        // if data.is_empty() {
-        //     return Err({
-        //         let mut err = S3Error::with_message(S3ErrorCode::Custom("NoSuchTagSet".into()), "The TagSet does not exist");
-        //         err.set_status_code("404".try_into().unwrap());
-        //         err
-        //     });
-        // }
-
-        // warn!("bm: 1111");
-
-        // let meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
-
-        // warn!("bm  33333");
-        // if meta.tagging.is_none() {
-        //     return Err({
-        //         let mut err = S3Error::with_message(S3ErrorCode::Custom("NoSuchTagSet".into()), "The TagSet does not exist");
-        //         err.set_status_code("404".try_into().unwrap());
-        //         err
-        //     });
-        // }
-
-        // warn!("bm:4444");
-        // Ok(S3Response::new(GetBucketTaggingOutput {
-        //     tag_set: meta
-        //         .tagging
-        //         .unwrap()
-        //         .into_iter()
-        //         .map(|(key, value)| Tag { key, value })
-        //         .collect(),
-        // }))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -885,49 +778,6 @@ impl S3 for FS {
         let data = try_!(tags.marshal_msg());
 
         let _updated = try_!(bucket_meta_sys.update(&bucket, BUCKET_TAGGING_CONFIG, data).await);
-
-        // let layer = new_object_layer_fn();
-        // let lock = layer.read().await;
-        // let store = lock
-        //     .as_ref()
-        //     .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
-
-        // let meta_obj = try_!(
-        //     store
-        //         .get_object_reader(
-        //             RUSTFS_META_BUCKET,
-        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-        //             HTTPRangeSpec::nil(),
-        //             Default::default(),
-        //             &ObjectOptions::default(),
-        //         )
-        //         .await
-        // );
-
-        // let stream = meta_obj.stream;
-
-        // let mut data = vec![];
-        // pin_mut!(stream);
-
-        // while let Some(x) = stream.next().await {
-        //     let x = try_!(x);
-        //     data.put_slice(&x[..]);
-        // }
-
-        // let mut meta = try_!(BucketMetadata::unmarshal_from(&data[..]));
-        // meta.tagging = None;
-        // let data = try_!(meta.marshal_msg());
-        // let len = data.len();
-        // try_!(
-        //     store
-        //         .put_object(
-        //             RUSTFS_META_BUCKET,
-        //             BucketMetadata::new(bucket.as_str()).save_file_path().as_str(),
-        //             PutObjReader::new(StreamingBlob::from(Body::from(data)), len),
-        //             &ObjectOptions::default(),
-        //         )
-        //         .await
-        // );
 
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
