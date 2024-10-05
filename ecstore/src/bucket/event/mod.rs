@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use name::Name;
 
 // 定义common结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 struct Common {
     pub id: String,
     pub filter: S3Key,
@@ -13,57 +13,57 @@ struct Common {
 }
 
 // 定义Queue结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 struct Queue {
     pub common: Common,
     pub arn: ARN,
 }
 
 // 定义ARN结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct ARN {
     pub target_id: TargetID,
     pub region: String,
 }
 
 // 定义TargetID结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct TargetID {
     pub id: String,
     pub name: String,
 }
 
 // 定义FilterRule结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct FilterRule {
     pub name: String,
     pub value: String,
 }
 
 // 定义FilterRuleList结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct FilterRuleList {
     pub rules: Vec<FilterRule>,
 }
 
 // 定义S3Key结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct S3Key {
     pub rule_list: FilterRuleList,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct Lambda {
     arn: String,
 }
 
 // 定义Topic结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct Topic {
     arn: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct Config {
     queue_list: Vec<Queue>,
     lambda_list: Vec<Lambda>,

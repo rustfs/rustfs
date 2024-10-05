@@ -15,12 +15,12 @@ use crate::{
     },
     endpoints::PoolEndpoints,
     error::{Error, Result},
+    global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     set_disk::SetDisks,
-    store::{GLOBAL_IsDistErasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
-        PutObjReader, StorageAPI,
+        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete,
+        PartInfo, PutObjReader, StorageAPI,
     },
     utils::hash,
 };
@@ -94,7 +94,7 @@ impl Sets {
                     continue;
                 }
 
-                if disk.as_ref().unwrap().is_local() && *GLOBAL_IsDistErasure.read().await {
+                if disk.as_ref().unwrap().is_local() && is_dist_erasure().await {
                     let local_disk = {
                         let local_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.read().await;
                         local_set_drives[pool_idx][i][j].clone()
@@ -124,7 +124,7 @@ impl Sets {
             let set_disks = SetDisks {
                 lockers: lockers[i].clone(),
                 locker_owner: GLOBAL_Local_Node_Name.read().await.to_string(),
-                ns_mutex: Arc::new(RwLock::new(NsLockMap::new(*GLOBAL_IsDistErasure.read().await))),
+                ns_mutex: Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
                 disks: RwLock::new(set_drive),
                 set_drive_count,
                 default_parity_count: partiy_count,
@@ -259,6 +259,25 @@ struct DelObj {
 }
 
 #[async_trait::async_trait]
+impl ObjectIO for Sets {
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: HTTPRangeSpec,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectReader> {
+        self.get_disks_by_key(object)
+            .get_object_reader(bucket, object, range, h, opts)
+            .await
+    }
+    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).put_object(bucket, object, data, opts).await
+    }
+}
+
+#[async_trait::async_trait]
 impl StorageAPI for Sets {
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()
@@ -381,22 +400,6 @@ impl StorageAPI for Sets {
         self.get_disks_by_key(object)
             .put_object_info(bucket, object, info, opts)
             .await
-    }
-
-    async fn get_object_reader(
-        &self,
-        bucket: &str,
-        object: &str,
-        range: HTTPRangeSpec,
-        h: HeaderMap,
-        opts: &ObjectOptions,
-    ) -> Result<GetObjectReader> {
-        self.get_disks_by_key(object)
-            .get_object_reader(bucket, object, range, h, opts)
-            .await
-    }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).put_object(bucket, object, data, opts).await
     }
 
     async fn put_object_part(

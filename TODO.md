@@ -2,18 +2,18 @@
 
 ## 基础存储
 
-- [ ] EC可用读写数量判断 Read/WriteQuorum
-- [ ] 优化并发执行，边读边取，可中断
+- [x] EC可用读写数量判断 Read/WriteQuorum
+- [ ] 优化后台并发执行，可中断
 - [ ] 小文件存储到metafile, inlinedata
 - [ ] 完善bucketmeta
-- [ ] 对象锁
-- [ ] 代码优化 使用范型？
-- [ ] 抽象出metafile存储
-- [ ] 边读写边hash
+- [x] 对象锁
+- [ ] 边读写边hash，实现reader嵌套
 - [x] 远程rpc
 - [x] 错误类型判断,程序中判断错误类型，如何统一错误
 - [x] 优化xlmeta, 自定义msg数据结构
-- [x] appendFile, createFile, readFile, walk_dir sync io
+- [ ] 优化io.reader 参考 GetObjectNInfo 方便io copy 如果 异步写，再平衡
+- [ ] 代码优化 使用范型？
+- [ ] 抽象出metafile存储
 
 ## 基础功能
 
