@@ -42,7 +42,7 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 tokio-stream.workspace = true
-tonic = { version = "0.12.1", features = ["gzip"] }
+tonic = { version = "0.12.3", features = ["gzip"] }
 tonic-reflection.workspace = true
 tower.workspace = true
 tracing-error.workspace = true
@@ -60,9 +60,9 @@ futures-util.workspace = true
 # uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
 s3s = "0.10.0"
-clap = { version = "4.5.7", features = ["derive"] }
+clap = { version = "4.5.18", features = ["derive"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
-hyper-util = { version = "0.1.5", features = [
+hyper-util = { version = "0.1.9", features = [
     "tokio",
     "server-auto",
     "server-graceful",
