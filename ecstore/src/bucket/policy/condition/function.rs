@@ -41,14 +41,14 @@ pub trait FunctionApi {
 //     }
 // }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 enum Function {
     #[default]
     Test,
 }
 
 // 定义Functions类型
-#[derive(Deserialize, Serialize, Default)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 pub struct Functions(Vec<Function>);
 
 impl Debug for Functions {

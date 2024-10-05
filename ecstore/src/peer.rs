@@ -26,7 +26,7 @@ pub trait PeerS3Client: Debug + Sync + Send + 'static {
     fn get_pools(&self) -> Option<Vec<usize>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct S3PeerSys {
     pub clients: Vec<Client>,
     pub pools_count: usize,

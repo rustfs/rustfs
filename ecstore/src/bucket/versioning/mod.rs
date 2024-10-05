@@ -25,12 +25,12 @@ impl std::fmt::Display for State {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct ExcludedPrefix {
     pub prefix: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default,Clone)]
 pub struct Versioning {
     pub status: State,
     pub excluded_prefixes: Vec<ExcludedPrefix>,

@@ -9,7 +9,7 @@ use super::{
     resource::ResourceSet,
 };
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketPolicyArgs {
     account_name: String,
     groups: Vec<String>,
@@ -20,7 +20,7 @@ pub struct BucketPolicyArgs {
     object_name: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BPStatement {
     sid: String,
     effect: Effect,
@@ -32,7 +32,7 @@ pub struct BPStatement {
     conditions: Option<Functions>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketPolicy {
     pub id: String,
     pub version: String,

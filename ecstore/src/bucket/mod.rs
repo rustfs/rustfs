@@ -1,13 +1,16 @@
 mod encryption;
+mod error;
 mod event;
 mod lifecycle;
-mod metadata;
+pub mod metadata;
+mod metadata_sys;
 mod objectlock;
 mod policy;
 mod quota;
 mod replication;
-mod tags;
+pub mod tags;
 mod target;
+pub mod utils;
 mod versioning;
 
-pub use metadata::BucketMetadata;
+pub use metadata_sys::{bucket_metadata_sys_set, get_bucket_metadata_sys, init_bucket_metadata_sys};

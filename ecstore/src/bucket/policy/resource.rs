@@ -15,11 +15,11 @@ const RESOURCE_ARN_PREFIX: &str = "arn:aws:s3:::";
 const RESOURCE_ARN_KMS_PREFIX: &str = "arn:minio:kms::::";
 
 // 定义Resource结构体
-#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Hash, Clone)]
 pub struct Resource {
     pattern: String,
     r#type: ResourceARNType,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ResourceSet(HashSet<Resource>);
