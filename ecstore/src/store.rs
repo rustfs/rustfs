@@ -47,7 +47,7 @@ pub struct ECStore {
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<Self> {
-        // let layouts = DisksLayout::try_from(endpoints.as_slice())?;
+        // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
         let mut deployment_id = None;
 

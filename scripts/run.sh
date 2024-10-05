@@ -10,7 +10,9 @@ if [ -z "$RUST_LOG" ]; then
     export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug"
 fi
 
-DATA_DIR_ARG="./target/volume/test{0...4}"
+export RUSTFS_ERASURE_SET_DRIVE_COUNT=8
+
+DATA_DIR_ARG="./target/volume/test{0...15}"
 
 if [ -n "$1" ]; then
 	DATA_DIR_ARG="$1"

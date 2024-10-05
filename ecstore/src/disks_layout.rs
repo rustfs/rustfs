@@ -2,10 +2,13 @@ use crate::error::{Error, Result};
 use crate::utils::ellipses::*;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::env;
+use tracing::debug;
 
 /// Supported set sizes this is used to find the optimal
 /// single set size.
 const SET_SIZES: [usize; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+const ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT: &str = "RUSTFS_ERASURE_SET_DRIVE_COUNT";
 
 #[derive(Deserialize, Debug, Default)]
 pub struct PoolDisksLayout {
@@ -40,19 +43,69 @@ pub struct DisksLayout {
     pub pools: Vec<PoolDisksLayout>,
 }
 
-impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
-    type Error = Error;
+// impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
+//     type Error = Error;
 
-    fn try_from(args: &[T]) -> Result<Self, Self::Error> {
+//     fn try_from(args: &[T]) -> Result<Self, Self::Error> {
+//         if args.is_empty() {
+//             return Err(Error::from_string("Invalid argument"));
+//         }
+
+//         let is_ellipses = args.iter().any(|v| has_ellipses(&[v]));
+
+//         // None of the args have ellipses use the old style.
+//         if !is_ellipses {
+//             let set_args = get_all_sets(is_ellipses, args)?;
+
+//             return Ok(DisksLayout {
+//                 legacy: true,
+//                 pools: vec![PoolDisksLayout::new(
+//                     args.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(" "),
+//                     set_args,
+//                 )],
+//             });
+//         }
+
+//         let mut layout = Vec::with_capacity(args.len());
+//         for arg in args.iter() {
+//             if !has_ellipses(&[arg]) && args.len() > 1 {
+//                 return Err(Error::from_string(
+//                     "all args must have ellipses for pool expansion (Invalid arguments specified)",
+//                 ));
+//             }
+
+//             let set_args = get_all_sets(is_ellipses, &[arg])?;
+
+//             layout.push(PoolDisksLayout::new(arg.as_ref(), set_args));
+//         }
+
+//         Ok(DisksLayout {
+//             legacy: false,
+//             pools: layout,
+//         })
+//     }
+// }
+
+impl DisksLayout {
+    pub fn from_volumes<T: AsRef<str>>(args: &[T]) -> Result<Self> {
         if args.is_empty() {
             return Err(Error::from_string("Invalid argument"));
         }
 
         let is_ellipses = args.iter().any(|v| has_ellipses(&[v]));
 
+        let set_drive_count_env = match env::var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT) {
+            Ok(res) => res,
+            Err(err) => {
+                debug!("{} not set use default:0, {:?}", ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, err);
+                format!("0")
+            }
+        };
+        let set_drive_count: usize = set_drive_count_env.parse()?;
+
         // None of the args have ellipses use the old style.
         if !is_ellipses {
-            let set_args = get_all_sets(is_ellipses, args)?;
+            let set_args = get_all_sets(set_drive_count, is_ellipses, args)?;
 
             return Ok(DisksLayout {
                 legacy: true,
@@ -71,7 +124,7 @@ impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
                 ));
             }
 
-            let set_args = get_all_sets(is_ellipses, &[arg])?;
+            let set_args = get_all_sets(set_drive_count, is_ellipses, &[arg])?;
 
             layout.push(PoolDisksLayout::new(arg.as_ref(), set_args));
         }
@@ -81,9 +134,7 @@ impl<T: AsRef<str>> TryFrom<&[T]> for DisksLayout {
             pools: layout,
         })
     }
-}
 
-impl DisksLayout {
     pub fn is_empty_layout(&self) -> bool {
         self.pools.is_empty()
             || self.pools[0].layout.is_empty()
@@ -121,12 +172,12 @@ impl DisksLayout {
 ///
 /// For example: {1...64} is divided into 4 sets each of size 16.
 /// This applies to even distributed setup syntax as well.
-fn get_all_sets<T: AsRef<str>>(is_ellipses: bool, args: &[T]) -> Result<Vec<Vec<String>>> {
+fn get_all_sets<T: AsRef<str>>(set_drive_count: usize, is_ellipses: bool, args: &[T]) -> Result<Vec<Vec<String>>> {
     let endpoint_set = if is_ellipses {
-        EndpointSet::try_from(args)?
+        EndpointSet::from_volumes(args, set_drive_count)?
     } else {
         let set_indexes = if args.len() > 1 {
-            get_set_indexes(args, &[args.len()], &[])?
+            get_set_indexes(args, &[args.len()], set_drive_count, &[])?
         } else {
             vec![vec![args.len()]]
         };
@@ -159,17 +210,52 @@ struct EndpointSet {
     set_indexes: Vec<Vec<usize>>,
 }
 
-impl<T: AsRef<str>> TryFrom<&[T]> for EndpointSet {
-    type Error = Error;
+// impl<T: AsRef<str>> TryFrom<&[T]> for EndpointSet {
+//     type Error = Error;
 
-    fn try_from(args: &[T]) -> Result<Self, Self::Error> {
+//     fn try_from(args: &[T]) -> Result<Self, Self::Error> {
+//         let mut arg_patterns = Vec::with_capacity(args.len());
+//         for arg in args {
+//             arg_patterns.push(find_ellipses_patterns(arg.as_ref())?);
+//         }
+
+//         let total_sizes = get_total_sizes(&arg_patterns);
+//         let set_indexes = get_set_indexes(args, &total_sizes, &arg_patterns)?;
+
+//         let mut endpoints = Vec::new();
+//         for ap in arg_patterns.iter() {
+//             let aps = ap.expand();
+//             for bs in aps {
+//                 endpoints.push(bs.join(""));
+//             }
+//         }
+
+//         Ok(EndpointSet {
+//             set_indexes,
+//             _arg_patterns: arg_patterns,
+//             endpoints,
+//         })
+//     }
+// }
+
+impl EndpointSet {
+    /// Create a new EndpointSet with the given endpoints and set indexes.
+    pub fn new(endpoints: Vec<String>, set_indexes: Vec<Vec<usize>>) -> Self {
+        Self {
+            endpoints,
+            set_indexes,
+            ..Default::default()
+        }
+    }
+
+    pub fn from_volumes<T: AsRef<str>>(args: &[T], set_drive_count: usize) -> Result<Self, Error> {
         let mut arg_patterns = Vec::with_capacity(args.len());
         for arg in args {
             arg_patterns.push(find_ellipses_patterns(arg.as_ref())?);
         }
 
         let total_sizes = get_total_sizes(&arg_patterns);
-        let set_indexes = get_set_indexes(args, &total_sizes, &arg_patterns)?;
+        let set_indexes = get_set_indexes(args, &total_sizes, set_drive_count, &arg_patterns)?;
 
         let mut endpoints = Vec::new();
         for ap in arg_patterns.iter() {
@@ -184,17 +270,6 @@ impl<T: AsRef<str>> TryFrom<&[T]> for EndpointSet {
             _arg_patterns: arg_patterns,
             endpoints,
         })
-    }
-}
-
-impl EndpointSet {
-    /// Create a new EndpointSet with the given endpoints and set indexes.
-    pub fn new(endpoints: Vec<String>, set_indexes: Vec<Vec<usize>>) -> Self {
-        Self {
-            endpoints,
-            set_indexes,
-            ..Default::default()
-        }
     }
 
     /// returns the sets representation of the endpoints
@@ -298,14 +373,19 @@ fn possible_set_counts_with_symmetry(set_counts: &[usize], arg_patterns: &[ArgPa
 /// on each index, this function also determines the final set size
 /// The final set size has the affinity towards choosing smaller
 /// indexes (total sets)
-fn get_set_indexes<T: AsRef<str>>(args: &[T], total_sizes: &[usize], arg_patterns: &[ArgPattern]) -> Result<Vec<Vec<usize>>> {
+fn get_set_indexes<T: AsRef<str>>(
+    args: &[T],
+    total_sizes: &[usize],
+    set_drive_count: usize,
+    arg_patterns: &[ArgPattern],
+) -> Result<Vec<Vec<usize>>> {
     if args.is_empty() || total_sizes.is_empty() {
         return Err(Error::from_string("Invalid argument"));
     }
 
     for &size in total_sizes {
         // Check if total_sizes has minimum range upto set_size
-        if size < SET_SIZES[0] {
+        if size < SET_SIZES[0] || size < set_drive_count {
             return Err(Error::from_string(format!("Incorrect number of endpoints provided, size {}", size)));
         }
     }
@@ -319,16 +399,37 @@ fn get_set_indexes<T: AsRef<str>>(args: &[T], total_sizes: &[usize], arg_pattern
         )));
     }
 
-    // TODO Add custom set drive count
-
     // Returns possible set counts with symmetry.
     set_counts = possible_set_counts_with_symmetry(&set_counts, arg_patterns);
     if set_counts.is_empty() {
         return Err(Error::from_string("No symmetric distribution detected with input endpoints provided"));
     }
 
-    // Final set size with all the symmetry accounted for.
-    let set_size = common_set_drive_count(common_size, &set_counts);
+    let set_size = {
+        if set_drive_count > 0 {
+            let has_set_drive_count = set_counts.contains(&set_drive_count);
+
+            if !has_set_drive_count {
+                return Err(Error::from_string(format!(
+                    "Invalid set drive count. Acceptable values for {:?} number drives are {:?}",
+                    common_size, &set_counts
+                )));
+            }
+            set_drive_count
+        } else {
+            set_counts = possible_set_counts_with_symmetry(&set_counts, arg_patterns);
+            if set_counts.is_empty() {
+                return Err(Error::from_string(format!(
+                    "No symmetric distribution detected with input endpoints , drives {} cannot be spread symmetrically by any supported erasure set sizes {:?}",
+                    common_size, &set_counts
+                )));
+            }
+            // Final set size with all the symmetry accounted for.
+            let set_size = common_set_drive_count(common_size, &set_counts);
+            set_size
+        }
+    };
+
     if !is_valid_set_size(set_size) {
         return Err(Error::from_string("Incorrect number of endpoints provided3"));
     }
@@ -532,7 +633,7 @@ mod test {
                 }
             }
 
-            match get_set_indexes(test_case.args.as_slice(), test_case.total_sizes.as_slice(), arg_patterns.as_slice()) {
+            match get_set_indexes(test_case.args.as_slice(), test_case.total_sizes.as_slice(), 0, arg_patterns.as_slice()) {
                 Ok(got_indexes) => {
                     if !test_case.success {
                         panic!("Test{}: Expected failure but passed instead", test_case.num);
@@ -792,7 +893,7 @@ mod test {
         ];
 
         for test_case in test_cases {
-            match EndpointSet::try_from([test_case.arg].as_slice()) {
+            match EndpointSet::from_volumes([test_case.arg].as_slice(), 0) {
                 Ok(got_es) => {
                     if !test_case.success {
                         panic!("Test{}: Expected failure but passed instead", test_case.num);

@@ -14,7 +14,7 @@ use futures::future::join_all;
 use lazy_static::lazy_static;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use super::metadata::{load_bucket_metadata, BucketMetadata};
 use super::tags;
@@ -118,10 +118,6 @@ impl BucketMetadataSys {
         }
     }
 
-    async fn refresh_buckets_metadata_loop(&self, failed_buckets: &HashSet<String>) -> Result<()> {
-        unimplemented!()
-    }
-
     pub async fn get(&self, bucket: &str) -> Result<BucketMetadata> {
         if is_meta_bucketname(bucket) {
             return Err(Error::new(ConfigError::NotFound));
@@ -142,10 +138,10 @@ impl BucketMetadataSys {
         }
     }
 
-    async fn reset(&mut self) {
-        let mut map = self.metadata_map.write().await;
-        map.clear();
-    }
+    // async fn reset(&mut self) {
+    //     let mut map = self.metadata_map.write().await;
+    //     map.clear();
+    // }
 
     pub async fn update(&mut self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         self.update_and_parse(bucket, config_file, data, true).await

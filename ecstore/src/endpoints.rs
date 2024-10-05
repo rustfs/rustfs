@@ -413,7 +413,7 @@ impl EndpointServerPools {
         self.0 = eps;
     }
     pub fn from_volumes(server_addr: &str, endpoints: Vec<String>) -> Result<(EndpointServerPools, SetupType)> {
-        let layouts = DisksLayout::try_from(endpoints.as_slice())?;
+        let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
         Self::create_server_endpoints(server_addr, &layouts)
     }
@@ -1139,7 +1139,7 @@ mod test {
         ];
 
         for test_case in test_cases {
-            let disks_layout = match DisksLayout::try_from(test_case.args.as_slice()) {
+            let disks_layout = match DisksLayout::from_volumes(test_case.args.as_slice()) {
                 Ok(v) => v,
                 Err(e) => {
                     if test_case.expected_err.is_none() {
@@ -1244,7 +1244,7 @@ mod test {
         ];
 
         for (i, test_case) in test_cases.iter().enumerate() {
-            let disks_layout = match DisksLayout::try_from(test_case.1.as_slice()) {
+            let disks_layout = match DisksLayout::from_volumes(test_case.1.as_slice()) {
                 Ok(v) => v,
                 Err(e) => {
                     if test_case.2 {
