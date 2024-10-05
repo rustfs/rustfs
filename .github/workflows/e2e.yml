@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: cache protoc bin
         id: cache-protoc-action
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         env:
           cache-name: cache-protoc-action-bin
         with:
@@ -42,7 +42,7 @@ jobs:
 
       - name: cache flatc bin
         id: cache-flatc-action
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         env:
           cache-name: cache-flatc-action-bin
         with:
@@ -65,7 +65,7 @@ jobs:
           # components: rustfmt, clippy
 
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: run fs
         working-directory: .
@@ -77,7 +77,7 @@ jobs:
         run: cargo test -p e2e_test --lib
 
       - name: cache cargo
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         env:
           cache-name: cache-cargo
         with:
