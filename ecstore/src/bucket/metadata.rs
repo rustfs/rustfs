@@ -21,8 +21,6 @@ use crate::error::{Error, Result};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::store::ECStore;
 
-type TypeConfigFile = &'static str;
-
 pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
 pub const BUCKET_METADATA_FORMAT: u16 = 1;
 pub const BUCKET_METADATA_VERSION: u16 = 1;
@@ -318,7 +316,7 @@ async fn read_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketMetad
     Ok(bm)
 }
 
-fn _deserialize_from_str<'de, S, D>(deserializer: D) -> core::result::Result<S, D::Error>
+fn _deserialize_from_str<'de, S, D>(_deserializer: D) -> core::result::Result<S, D::Error>
 where
     S: FromStr,
     S::Err: Display,
