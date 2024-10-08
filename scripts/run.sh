@@ -25,4 +25,4 @@ fi
     # "$DATA_DIR_ARG"
 
 # cargo run "$DATA_DIR_ARG"
-cargo build ./target/volume/test
+cargo run ./target/volume/test
