@@ -70,8 +70,7 @@ jobs:
       - name: run fs start
         working-directory: .
         run: |
-          nohup make e2e-server >/dev/null &
-          sleep 180
+          make e2e-server
       
       - name: run fs test
         working-directory: .
