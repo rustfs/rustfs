@@ -70,7 +70,7 @@ jobs:
       - name: run fs
         working-directory: .
         run: |
-          make e2e-server > /dev/null &
+          nohup make e2e-server >/dev/null &
           make probe-e2e
 
       - name: e2e test
