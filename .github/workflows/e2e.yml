@@ -70,6 +70,7 @@ jobs:
       - name: run fs start
         working-directory: .
         run: |
+          ls -l
           make e2e-server
       
       - name: run fs test
