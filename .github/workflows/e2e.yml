@@ -67,10 +67,15 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      - name: run fs
+      - name: run fs start
         working-directory: .
         run: |
           nohup make e2e-server >/dev/null &
+          sleep 180
+      
+      - name: run fs test
+        working-directory: .
+        run: |
           make probe-e2e
 
       - name: e2e test
