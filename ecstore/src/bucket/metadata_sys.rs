@@ -14,7 +14,7 @@ use futures::future::join_all;
 use lazy_static::lazy_static;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use super::encryption::BucketSSEConfig;
 use super::lifecycle::lifecycle::Lifecycle;
@@ -22,7 +22,7 @@ use super::metadata::{load_bucket_metadata, BucketMetadata};
 use super::policy::bucket_policy::BucketPolicy;
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
-use super::{event, objectlock, policy, replication, tags, versioning};
+use super::{event, objectlock, replication, tags, versioning};
 
 lazy_static! {
     static ref GLOBAL_BucketMetadataSys: Arc<RwLock<BucketMetadataSys>> = Arc::new(RwLock::new(BucketMetadataSys::new()));
