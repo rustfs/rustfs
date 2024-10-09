@@ -24,4 +24,5 @@ fi
     # --domain-name   127.0.0.1:9010  \
     # "$DATA_DIR_ARG"
 
-cargo run "$DATA_DIR_ARG"
+# cargo run "$DATA_DIR_ARG"
+cargo run ./target/volume/test
