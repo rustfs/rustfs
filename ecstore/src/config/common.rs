@@ -5,7 +5,6 @@ use crate::store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutOb
 use http::HeaderMap;
 use s3s::dto::StreamingBlob;
 use s3s::Body;
-use tracing::warn;
 
 use super::error::ConfigError;
 

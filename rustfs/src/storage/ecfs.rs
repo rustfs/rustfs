@@ -850,6 +850,22 @@ impl S3 for FS {
 
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
     }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn get_bucket_versioning(
+        &self,
+        _req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        Err(s3_error!(NotImplemented, "GetBucketVersioning is not implemented yet"))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_bucket_versioning(
+        &self,
+        _req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        Err(s3_error!(NotImplemented, "PutBucketVersioning is not implemented yet"))
+    }
 }
 
 #[allow(dead_code)]
