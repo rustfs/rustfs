@@ -1,3 +1,5 @@
+use crate::error::Result;
+use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 
 // 定义QuotaType枚举类型
@@ -18,4 +20,19 @@ pub struct BucketQuota {
     requests: u64,
 
     quota_type: Option<QuotaType>,
+}
+
+impl BucketQuota {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        self.serialize(&mut rmpSerializer::new(&mut buf).with_struct_map())?;
+
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: BucketQuota = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
 }
