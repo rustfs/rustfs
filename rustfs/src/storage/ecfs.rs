@@ -2,6 +2,8 @@ use bytes::Bytes;
 use ecstore::bucket::get_bucket_metadata_sys;
 use ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
 use ecstore::bucket::tags::Tags;
+use ecstore::bucket::versioning::State as VersioningState;
+use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::disk::error::DiskError;
 use ecstore::new_object_layer_fn;
 use ecstore::store_api::BucketOptions;
@@ -854,16 +856,47 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_bucket_versioning(
         &self,
-        _req: S3Request<GetBucketVersioningInput>,
+        req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        Err(s3_error!(NotImplemented, "GetBucketVersioning is not implemented yet"))
+        let GetBucketVersioningInput { bucket, .. } = req;
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+        };
+
+        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions::default()).await {
+            if DiskError::VolumeNotFound.is(&e) {
+                return Err(s3_error!(NoSuchBucket));
+            } else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            }
+        }
+
+        let cfg = try_!(BucketVersioningSys::get(&bucket).await);
+
+        let status = match cfg.status {
+            VersioningState::Enabled => Some(BucketVersioningStatus::ENABLED),
+            VersioningState::Suspended => Some(BucketVersioningStatus::SUSPENDED),
+        };
+
+        Ok(S3Response::new(GetBucketVersioningOutput {
+            mfa_delete: None,
+            status,
+        }))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn put_bucket_versioning(
         &self,
-        _req: S3Request<PutBucketVersioningInput>,
+        req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let PutBucketVersioningInput { bucket, .. } = req;
+
+        // check site replication enable
+        // check bucket object lock enable
+        // check replication suspended
         Err(s3_error!(NotImplemented, "PutBucketVersioning is not implemented yet"))
     }
 }
