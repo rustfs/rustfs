@@ -1,3 +1,5 @@
+use crate::error::Result;
+use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
@@ -25,14 +27,29 @@ impl std::fmt::Display for State {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExcludedPrefix {
     pub prefix: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Versioning {
     pub status: State,
     pub excluded_prefixes: Vec<ExcludedPrefix>,
     pub exclude_folders: bool,
+}
+
+impl Versioning {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        self.serialize(&mut rmpSerializer::new(&mut buf).with_struct_map())?;
+
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: Versioning = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
 }
