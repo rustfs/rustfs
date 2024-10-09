@@ -10,7 +10,7 @@ env:
 
 jobs:
   build:
-    timeout-minutes: 10
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: cache protoc bin
         id: cache-protoc-action
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         env:
           cache-name: cache-protoc-action-bin
         with:
@@ -42,7 +42,7 @@ jobs:
 
       - name: cache flatc bin
         id: cache-flatc-action
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         env:
           cache-name: cache-flatc-action-bin
         with:
@@ -65,19 +65,23 @@ jobs:
           # components: rustfmt, clippy
 
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      - name: run fs
+      - name: run fs start
         working-directory: .
         run: |
-          make e2e-server > /dev/null &
+          nohup make e2e-server &
+      
+      - name: run fs test
+        working-directory: .
+        run: |
           make probe-e2e
 
       - name: e2e test
         run: cargo test -p e2e_test --lib
 
       - name: cache cargo
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         env:
           cache-name: cache-cargo
         with:
