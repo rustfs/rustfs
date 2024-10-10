@@ -4,4 +4,4 @@ pub mod fs;
 pub mod hash;
 pub mod net;
 pub mod path;
-mod wildcard;
+pub mod wildcard;

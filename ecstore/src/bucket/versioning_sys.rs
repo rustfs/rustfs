@@ -1,6 +1,7 @@
 use super::get_bucket_metadata_sys;
 use super::versioning::Versioning;
 use crate::disk::RUSTFS_META_BUCKET;
+use crate::error::Result;
 use tracing::warn;
 
 pub struct BucketVersioningSys {}
@@ -52,7 +53,7 @@ impl BucketVersioningSys {
         }
 
         let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
-        let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+        let bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
         let (cfg, _) = bucket_meta_sys.get_versioning_config(bucket).await?;
 

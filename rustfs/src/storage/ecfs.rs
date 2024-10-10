@@ -1,8 +1,10 @@
 use bytes::Bytes;
 use ecstore::bucket::get_bucket_metadata_sys;
 use ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
+use ecstore::bucket::metadata::BUCKET_VERSIONING_CONFIG;
 use ecstore::bucket::tags::Tags;
 use ecstore::bucket::versioning::State as VersioningState;
+use ecstore::bucket::versioning::Versioning;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::disk::error::DiskError;
 use ecstore::new_object_layer_fn;
@@ -19,6 +21,7 @@ use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
+use http::status;
 use http::HeaderMap;
 use log::warn;
 use s3s::dto::*;
@@ -858,7 +861,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        let GetBucketVersioningInput { bucket, .. } = req;
+        let GetBucketVersioningInput { bucket, .. } = req.input;
         let layer = new_object_layer_fn();
         let lock = layer.read().await;
         let store = match lock.as_ref() {
@@ -866,7 +869,7 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
         };
 
-        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions::default()).await {
+        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
             if DiskError::VolumeNotFound.is(&e) {
                 return Err(s3_error!(NoSuchBucket));
             } else {
@@ -877,8 +880,8 @@ impl S3 for FS {
         let cfg = try_!(BucketVersioningSys::get(&bucket).await);
 
         let status = match cfg.status {
-            VersioningState::Enabled => Some(BucketVersioningStatus::ENABLED),
-            VersioningState::Suspended => Some(BucketVersioningStatus::SUSPENDED),
+            VersioningState::Enabled => Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            VersioningState::Suspended => Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
         };
 
         Ok(S3Response::new(GetBucketVersioningOutput {
@@ -892,12 +895,43 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
-        let PutBucketVersioningInput { bucket, .. } = req;
+        let PutBucketVersioningInput {
+            bucket,
+            versioning_configuration,
+            ..
+        } = req.input;
 
+        // TODO: check other sys
         // check site replication enable
         // check bucket object lock enable
         // check replication suspended
-        Err(s3_error!(NotImplemented, "PutBucketVersioning is not implemented yet"))
+
+        let mut cfg = match BucketVersioningSys::get(&bucket).await {
+            Ok(res) => res,
+            Err(err) => {
+                warn!("BucketVersioningSys::get err {:?}", err);
+                Versioning::default()
+            }
+        };
+
+        if let Some(verstatus) = versioning_configuration.status {
+            cfg.status = match verstatus.as_str() {
+                BucketVersioningStatus::ENABLED => VersioningState::Enabled,
+                BucketVersioningStatus::SUSPENDED => VersioningState::Suspended,
+                _ => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init")),
+            }
+        }
+
+        let data = try_!(cfg.marshal_msg());
+
+        let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+        let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+
+        try_!(bucket_meta_sys.update(&bucket, BUCKET_VERSIONING_CONFIG, data).await);
+
+        // TODO: globalSiteReplicationSys.BucketMetaHook
+
+        Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 }
 
