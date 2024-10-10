@@ -22,7 +22,7 @@ use hyper_util::{
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use service::hybrid;
-use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
+use std::{io::IsTerminal, net::SocketAddr, process::exit, str::FromStr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tracing::{debug, info};
@@ -93,6 +93,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     // 用于rpc
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
+
+    for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
+        debug!(
+            "created endpoints {}, set_count:{}, drives_per_set: {}, cmd: {:?}",
+            i, eps.set_count, eps.drives_per_set, eps.cmd_line
+        );
+    }
+
     set_global_endpoints(endpoint_pools.as_ref().clone()).await;
     update_erasure_type(setup_type).await;
 

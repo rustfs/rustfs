@@ -1,4 +1,3 @@
-pub mod bucket_meta;
 mod chunk_stream;
 mod config;
 pub mod disk;
