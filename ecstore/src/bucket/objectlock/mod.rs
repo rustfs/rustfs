@@ -1,3 +1,5 @@
+use crate::error::Result;
+use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Hash, Clone)]
@@ -36,4 +38,19 @@ pub struct Rule {
 pub struct Config {
     pub object_lock_enabled: String,
     pub rule: Option<Rule>,
+}
+
+impl Config {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        self.serialize(&mut rmpSerializer::new(&mut buf).with_struct_map())?;
+
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: Config = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
 }

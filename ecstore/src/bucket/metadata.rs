@@ -188,8 +188,43 @@ impl BucketMetadata {
     }
 
     fn default_timestamps(&mut self) {
+        if self.policy_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.policy_config_updated_at = self.created
+        }
+        if self.encryption_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.encryption_config_updated_at = self.created
+        }
+
         if self.tagging_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.tagging_config_updated_at = self.created
+        }
+        if self.object_lock_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.object_lock_config_updated_at = self.created
+        }
+        if self.quota_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.quota_config_updated_at = self.created
+        }
+
+        if self.replication_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.replication_config_updated_at = self.created
+        }
+
+        if self.versioning_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.versioning_config_updated_at = self.created
+        }
+
+        if self.lifecycle_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.lifecycle_config_updated_at = self.created
+        }
+        if self.notification_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.notification_config_updated_at = self.created
+        }
+
+        if self.bucket_targets_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.bucket_targets_config_updated_at = self.created
+        }
+        if self.bucket_targets_config_meta_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.bucket_targets_config_meta_updated_at = self.created
         }
     }
 
@@ -262,8 +297,38 @@ impl BucketMetadata {
     }
 
     fn parse_all_configs(&mut self, _api: &ECStore) -> Result<()> {
+        if !self.policy_config_json.is_empty() {
+            self.policy_config = Some(BucketPolicy::unmarshal(&self.policy_config_json)?);
+        }
+        if !self.notification_config_xml.is_empty() {
+            self.notification_config = Some(event::Config::unmarshal(&self.notification_config_xml)?);
+        }
+        if !self.lifecycle_config_xml.is_empty() {
+            self.lifecycle_config = Some(Lifecycle::unmarshal(&self.lifecycle_config_xml)?);
+        }
+
+        if !self.object_lock_config_xml.is_empty() {
+            self.object_lock_config = Some(objectlock::Config::unmarshal(&self.object_lock_config_xml)?);
+        }
+        if !self.versioning_config_xml.is_empty() {
+            self.versioning_config = Some(Versioning::unmarshal(&self.versioning_config_xml)?);
+        }
+        if !self.encryption_config_xml.is_empty() {
+            self.sse_config = Some(BucketSSEConfig::unmarshal(&self.encryption_config_xml)?);
+        }
         if !self.tagging_config_xml.is_empty() {
             self.tagging_config = Some(tags::Tags::unmarshal(&self.tagging_config_xml)?);
+        }
+        if !self.quota_config_json.is_empty() {
+            self.quota_config = Some(BucketQuota::unmarshal(&self.quota_config_json)?);
+        }
+        if !self.replication_config_xml.is_empty() {
+            self.replication_config = Some(replication::Config::unmarshal(&self.replication_config_xml)?);
+        }
+        if !self.bucket_targets_config_json.is_empty() {
+            self.bucket_target_config = Some(BucketTargets::unmarshal(&self.bucket_targets_config_json)?);
+        } else {
+            self.bucket_target_config = Some(BucketTargets::default())
         }
 
         Ok(())

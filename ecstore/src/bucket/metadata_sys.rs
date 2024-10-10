@@ -16,8 +16,13 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tracing::{error, warn};
 
+use super::encryption::BucketSSEConfig;
+use super::lifecycle::lifecycle::Lifecycle;
 use super::metadata::{load_bucket_metadata, BucketMetadata};
-use super::tags;
+use super::policy::bucket_policy::BucketPolicy;
+use super::quota::BucketQuota;
+use super::target::BucketTargets;
+use super::{event, objectlock, replication, tags, versioning};
 
 lazy_static! {
     static ref GLOBAL_BucketMetadataSys: Arc<RwLock<BucketMetadataSys>> = Arc::new(RwLock::new(BucketMetadataSys::new()));
@@ -232,6 +237,42 @@ impl BucketMetadataSys {
         }
     }
 
+    pub async fn get_versioning_config(&self, bucket: &str) -> Result<(versioning::Versioning, OffsetDateTime)> {
+        let bm = match self.get_config(bucket).await {
+            Ok((res, _)) => res,
+            Err(err) => {
+                warn!("get_versioning_config err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    return Ok((versioning::Versioning::default(), OffsetDateTime::UNIX_EPOCH));
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        Ok((bm.versioning_config.unwrap_or_default(), bm.versioning_config_updated_at))
+    }
+
+    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
+        let bm = match self.get_config(bucket).await {
+            Ok((res, _)) => res,
+            Err(err) => {
+                warn!("get_bucket_policy err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    return Err(Error::new(BucketMetadataError::BucketPolicyNotFound));
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        if let Some(config) = bm.policy_config {
+            Ok((config, bm.policy_config_updated_at))
+        } else {
+            Err(Error::new(BucketMetadataError::BucketPolicyNotFound))
+        }
+    }
+
     pub async fn get_tagging_config(&self, bucket: &str) -> Result<(tags::Tags, OffsetDateTime)> {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
@@ -249,6 +290,165 @@ impl BucketMetadataSys {
             Ok((config, bm.tagging_config_updated_at))
         } else {
             Err(Error::new(BucketMetadataError::TaggingNotFound))
+        }
+    }
+
+    pub async fn get_object_lock_config(&self, bucket: &str) -> Result<(objectlock::Config, OffsetDateTime)> {
+        let bm = match self.get_config(bucket).await {
+            Ok((res, _)) => res,
+            Err(err) => {
+                warn!("get_object_lock_config err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    return Err(Error::new(BucketMetadataError::BucketObjectLockConfigNotFound));
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        if let Some(config) = bm.object_lock_config {
+            Ok((config, bm.object_lock_config_updated_at))
+        } else {
+            Err(Error::new(BucketMetadataError::BucketObjectLockConfigNotFound))
+        }
+    }
+
+    pub async fn get_lifecycle_config(&self, bucket: &str) -> Result<(Lifecycle, OffsetDateTime)> {
+        let bm = match self.get_config(bucket).await {
+            Ok((res, _)) => res,
+            Err(err) => {
+                warn!("get_lifecycle_config err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    return Err(Error::new(BucketMetadataError::BucketLifecycleNotFound));
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        if let Some(config) = bm.lifecycle_config {
+            if config.rules.is_empty() {
+                Err(Error::new(BucketMetadataError::BucketLifecycleNotFound))
+            } else {
+                Ok((config, bm.lifecycle_config_updated_at))
+            }
+        } else {
+            Err(Error::new(BucketMetadataError::BucketLifecycleNotFound))
+        }
+    }
+
+    pub async fn get_notification_config(&self, bucket: &str) -> Result<Option<event::Config>> {
+        let bm = match self.get_config(bucket).await {
+            Ok((bm, _)) => bm.notification_config,
+            Err(err) => {
+                warn!("get_notification_config err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    None
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        Ok(bm)
+    }
+
+    pub async fn get_sse_config(&self, bucket: &str) -> Result<(BucketSSEConfig, OffsetDateTime)> {
+        let bm = match self.get_config(bucket).await {
+            Ok((res, _)) => res,
+            Err(err) => {
+                warn!("get_sse_config err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    return Err(Error::new(BucketMetadataError::BucketSSEConfigNotFound));
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        if let Some(config) = bm.sse_config {
+            Ok((config, bm.encryption_config_updated_at))
+        } else {
+            Err(Error::new(BucketMetadataError::BucketSSEConfigNotFound))
+        }
+    }
+
+    pub async fn created_at(&self, bucket: &str) -> Result<OffsetDateTime> {
+        let bm = match self.get_config(bucket).await {
+            Ok((bm, _)) => bm.created,
+            Err(err) => {
+                return Err(err);
+            }
+        };
+
+        Ok(bm)
+    }
+
+    pub async fn get_quota_config(&self, bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
+        let bm = match self.get_config(bucket).await {
+            Ok((res, _)) => res,
+            Err(err) => {
+                warn!("get_quota_config err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    return Err(Error::new(BucketMetadataError::BucketQuotaConfigNotFound));
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        if let Some(config) = bm.quota_config {
+            Ok((config, bm.quota_config_updated_at))
+        } else {
+            Err(Error::new(BucketMetadataError::BucketQuotaConfigNotFound))
+        }
+    }
+
+    pub async fn get_replication_config(&self, bucket: &str) -> Result<(replication::Config, OffsetDateTime)> {
+        let (bm, reload) = match self.get_config(bucket).await {
+            Ok(res) => res,
+            Err(err) => {
+                warn!("get_replication_config err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    return Err(Error::new(BucketMetadataError::BucketReplicationConfigNotFound));
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        if let Some(config) = bm.replication_config {
+            if reload {
+                // TODO: globalBucketTargetSys
+            }
+
+            Ok((config, bm.replication_config_updated_at))
+        } else {
+            Err(Error::new(BucketMetadataError::BucketReplicationConfigNotFound))
+        }
+    }
+
+    pub async fn get_bucket_targets_config(&self, bucket: &str) -> Result<BucketTargets> {
+        let (bm, reload) = match self.get_config(bucket).await {
+            Ok(res) => res,
+            Err(err) => {
+                warn!("get_replication_config err {:?}", &err);
+                if config::error::is_not_found(&err) {
+                    return Err(Error::new(BucketMetadataError::BucketRemoteTargetNotFound));
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        if let Some(config) = bm.bucket_target_config {
+            if reload {
+                // TODO: globalBucketTargetSys
+            }
+
+            Ok(config)
+        } else {
+            Err(Error::new(BucketMetadataError::BucketRemoteTargetNotFound))
         }
     }
 }
