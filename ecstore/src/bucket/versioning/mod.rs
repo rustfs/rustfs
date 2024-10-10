@@ -1,4 +1,7 @@
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    utils,
+};
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 
@@ -69,7 +72,6 @@ impl Versioning {
                     return Err(Error::new(VersioningErr::TooManyExcludedPrefixes));
                 }
             }
-            _ => return Err(Error::msg(format!("unsupported versioning status {}", self.status))),
         }
 
         Ok(())
@@ -97,7 +99,7 @@ impl Versioning {
 
         for sprefix in self.excluded_prefixes.iter() {
             let full_prefix = format!("{}*", sprefix.prefix);
-            if utils::wildcard::match_simple(full_prefix, prefix) {
+            if utils::wildcard::match_simple(&full_prefix, prefix) {
                 return false;
             }
         }
@@ -124,7 +126,7 @@ impl Versioning {
 
             for sprefix in self.excluded_prefixes.iter() {
                 let full_prefix = format!("{}*", sprefix.prefix);
-                if utils::wildcard::match_simple(full_prefix, prefix) {
+                if utils::wildcard::match_simple(&full_prefix, prefix) {
                     return true;
                 }
             }

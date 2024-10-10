@@ -6,7 +6,7 @@ pub fn match_simple(pattern: &str, name: &str) -> bool {
         return true;
     }
     // Do an extended wildcard '*' and '?' match.
-    deep_match_rune(name, pattern, true)
+    deep_match_rune(name.as_bytes(), pattern.as_bytes(), true)
 }
 
 pub fn match_pattern(pattern: &str, name: &str) -> bool {
@@ -17,11 +17,11 @@ pub fn match_pattern(pattern: &str, name: &str) -> bool {
         return true;
     }
     // Do an extended wildcard '*' and '?' match.
-    deep_match_rune(name, pattern, false)
+    deep_match_rune(name.as_bytes(), pattern.as_bytes(), false)
 }
 
-fn deep_match_rune(str_: &str, pattern: &str, simple: bool) -> bool {
-    let (mut str_, mut pattern) = (str_.as_bytes(), pattern.as_bytes());
+fn deep_match_rune(str_: &[u8], pattern: &[u8], simple: bool) -> bool {
+    let (mut str_, mut pattern) = (str_, pattern);
     while !pattern.is_empty() {
         match pattern[0] as char {
             '*' => {
