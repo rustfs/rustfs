@@ -10,9 +10,9 @@ pub enum ResourceARNType {
     ResourceARNKMS,
 }
 
-// 定义资源ARN前缀
-const RESOURCE_ARN_PREFIX: &str = "arn:aws:s3:::";
-const RESOURCE_ARN_KMS_PREFIX: &str = "arn:minio:kms::::";
+// // 定义资源ARN前缀
+// const RESOURCE_ARN_PREFIX: &str = "arn:aws:s3:::";
+// const RESOURCE_ARN_KMS_PREFIX: &str = "arn:minio:kms::::";
 
 // 定义Resource结构体
 #[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Hash, Clone)]
