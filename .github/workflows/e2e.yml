@@ -10,7 +10,7 @@ env:
 
 jobs:
   build:
-    timeout-minutes: 10
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -67,10 +67,14 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      - name: run fs
+      - name: run fs start
         working-directory: .
         run: |
-          make e2e-server > /dev/null &
+          nohup make e2e-server &
+      
+      - name: run fs test
+        working-directory: .
+        run: |
           make probe-e2e
 
       - name: e2e test

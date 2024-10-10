@@ -1,3 +1,5 @@
+use crate::error::Result;
+use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -37,4 +39,19 @@ pub struct BucketPolicy {
     pub id: String,
     pub version: String,
     pub statements: Vec<BPStatement>,
+}
+
+impl BucketPolicy {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        self.serialize(&mut rmpSerializer::new(&mut buf).with_struct_map())?;
+
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: BucketPolicy = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
 }
