@@ -11,6 +11,7 @@ mod replication;
 pub mod tags;
 mod target;
 pub mod utils;
-mod versioning;
+pub mod versioning;
+pub mod versioning_sys;
 
 pub use metadata_sys::{bucket_metadata_sys_set, get_bucket_metadata_sys, init_bucket_metadata_sys};

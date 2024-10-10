@@ -1,8 +1,10 @@
+use crate::error::Result;
+use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use time::OffsetDateTime;
 
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Credentials {
     access_key: String,
     secret_key: String,
@@ -10,13 +12,13 @@ pub struct Credentials {
     expiration: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub enum ServiceType {
     #[default]
     Replication,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct LatencyStat {
     curr: Duration, // 当前延迟
     avg: Duration,  // 平均延迟
@@ -24,7 +26,7 @@ pub struct LatencyStat {
 }
 
 // 定义BucketTarget结构体
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketTarget {
     source_bucket: String,
 
@@ -73,7 +75,22 @@ pub struct BucketTarget {
     edge: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketTargets {
     pub targets: Vec<BucketTarget>,
+}
+
+impl BucketTargets {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        self.serialize(&mut rmpSerializer::new(&mut buf).with_struct_map())?;
+
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: BucketTargets = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
 }

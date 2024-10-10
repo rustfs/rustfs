@@ -1,3 +1,5 @@
+use crate::error::Result;
+use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 
 // 定义Algorithm枚举类型
@@ -21,22 +23,37 @@ impl std::str::FromStr for Algorithm {
 }
 
 // 定义EncryptionAction结构体
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct EncryptionAction {
     algorithm: Option<Algorithm>,
     master_key_id: Option<String>,
 }
 
 // 定义Rule结构体
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Rule {
     default_encryption_action: EncryptionAction,
 }
 
 // 定义BucketSSEConfig结构体
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketSSEConfig {
     xml_ns: String,
     xml_name: String,
     rules: Vec<Rule>,
+}
+
+impl BucketSSEConfig {
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        self.serialize(&mut rmpSerializer::new(&mut buf).with_struct_map())?;
+
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: BucketSSEConfig = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
 }
