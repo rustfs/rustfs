@@ -90,9 +90,6 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all
 
-      - name: cargo check
-        run: cargo --check
-
       - name: cargo clippy
         run: cargo clippy -- -D warnings
 
