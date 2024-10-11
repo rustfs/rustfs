@@ -1,11 +1,12 @@
 mod encryption;
-mod error;
+pub mod error;
 mod event;
 mod lifecycle;
 pub mod metadata;
 mod metadata_sys;
 mod objectlock;
-mod policy;
+pub mod policy;
+pub mod policy_sys;
 mod quota;
 mod replication;
 pub mod tags;

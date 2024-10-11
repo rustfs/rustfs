@@ -1,7 +1,11 @@
 use bytes::Bytes;
+use ecstore::bucket::error::BucketMetadataError;
 use ecstore::bucket::get_bucket_metadata_sys;
+use ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
 use ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
 use ecstore::bucket::metadata::BUCKET_VERSIONING_CONFIG;
+use ecstore::bucket::policy::bucket_policy::BucketPolicy;
+use ecstore::bucket::policy_sys::PolicySys;
 use ecstore::bucket::tags::Tags;
 use ecstore::bucket::versioning::State as VersioningState;
 use ecstore::bucket::versioning::Versioning;
@@ -21,7 +25,6 @@ use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
-use http::status;
 use http::HeaderMap;
 use log::warn;
 use s3s::dto::*;
@@ -264,16 +267,6 @@ impl S3 for FS {
         }
 
         let output = GetBucketLocationOutput::default();
-        Ok(S3Response::new(output))
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn get_object_lock_configuration(
-        &self,
-        _req: S3Request<GetObjectLockConfigurationInput>,
-    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
-        // mc cp step 1
-        let output = GetObjectLockConfigurationOutput::default();
         Ok(S3Response::new(output))
     }
 
@@ -932,6 +925,207 @@ impl S3 for FS {
         // TODO: globalSiteReplicationSys.BucketMetaHook
 
         Ok(S3Response::new(PutBucketVersioningOutput {}))
+    }
+
+    async fn get_bucket_policy_status(
+        &self,
+        _req: S3Request<GetBucketPolicyStatusInput>,
+    ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
+        Err(s3_error!(NotImplemented, "GetBucketPolicyStatus is not implemented yet"))
+    }
+
+    async fn get_bucket_policy(&self, req: S3Request<GetBucketPolicyInput>) -> S3Result<S3Response<GetBucketPolicyOutput>> {
+        let GetBucketPolicyInput { bucket, .. } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
+            if DiskError::VolumeNotFound.is(&e) {
+                return Err(s3_error!(NoSuchBucket));
+            } else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            }
+        }
+
+        let cfg = match PolicySys::get(&bucket).await {
+            Ok(res) => res,
+            Err(err) => {
+                if BucketMetadataError::BucketPolicyNotFound.is(&err) {
+                    return Err(s3_error!(NoSuchBucketPolicy));
+                }
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", err)));
+            }
+        };
+
+        let policys = try_!(cfg.marshal_msg());
+
+        Ok(S3Response::new(GetBucketPolicyOutput { policy: Some(policys) }))
+    }
+
+    async fn put_bucket_policy(&self, req: S3Request<PutBucketPolicyInput>) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        let PutBucketPolicyInput { bucket, policy, .. } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
+            if DiskError::VolumeNotFound.is(&e) {
+                return Err(s3_error!(NoSuchBucket));
+            } else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            }
+        }
+
+        let cfg = try_!(BucketPolicy::unmarshal(policy.as_bytes()));
+        warn!("put_bucket_policy struct {:?}", &cfg);
+        if let Err(err) = cfg.validate(&bucket) {
+            warn!("put_bucket_policy input {:?}", &policy);
+
+            warn!("cfg.validate err {:?}", err);
+            return Err(s3_error!(InvalidPolicyDocument));
+        }
+
+        let data = try_!(cfg.marshal_msg());
+
+        let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+        let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+
+        try_!(bucket_meta_sys.update(&bucket, BUCKET_POLICY_CONFIG, data.into()).await);
+
+        Ok(S3Response::new(PutBucketPolicyOutput {}))
+    }
+
+    async fn delete_bucket_policy(
+        &self,
+        req: S3Request<DeleteBucketPolicyInput>,
+    ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        let DeleteBucketPolicyInput { bucket, .. } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
+            if DiskError::VolumeNotFound.is(&e) {
+                return Err(s3_error!(NoSuchBucket));
+            } else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            }
+        }
+
+        let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+        let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+
+        try_!(bucket_meta_sys.delete(&bucket, BUCKET_POLICY_CONFIG).await);
+
+        Ok(S3Response::new(DeleteBucketPolicyOutput {}))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        _req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        Err(s3_error!(NotImplemented, "GetBucketLifecycleConfiguration is not implemented yet"))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        _req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        Err(s3_error!(NotImplemented, "PutBucketLifecycleConfiguration is not implemented yet"))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn delete_bucket_lifecycle(
+        &self,
+        _req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        Err(s3_error!(NotImplemented, "DeleteBucketLifecycle is not implemented yet"))
+    }
+
+    async fn get_bucket_encryption(
+        &self,
+        _req: S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        Err(s3_error!(NotImplemented, "GetBucketEncryption is not implemented yet"))
+    }
+
+    async fn put_bucket_encryption(
+        &self,
+        _req: S3Request<PutBucketEncryptionInput>,
+    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        Err(s3_error!(NotImplemented, "PutBucketEncryption is not implemented yet"))
+    }
+
+    async fn delete_bucket_encryption(
+        &self,
+        _req: S3Request<DeleteBucketEncryptionInput>,
+    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        Err(s3_error!(NotImplemented, "DeleteBucketEncryption is not implemented yet"))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn get_object_lock_configuration(
+        &self,
+        _req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        // mc cp step 1
+        let output = GetObjectLockConfigurationOutput::default();
+        Ok(S3Response::new(output))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_object_lock_configuration(
+        &self,
+        _req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        Err(s3_error!(NotImplemented, "PutObjectLockConfiguration is not implemented yet"))
+    }
+
+    async fn get_bucket_replication(
+        &self,
+        _req: S3Request<GetBucketReplicationInput>,
+    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        Err(s3_error!(NotImplemented, "GetBucketReplication is not implemented yet"))
+    }
+
+    async fn put_bucket_replication(
+        &self,
+        _req: S3Request<PutBucketReplicationInput>,
+    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        Err(s3_error!(NotImplemented, "PutBucketReplication is not implemented yet"))
+    }
+
+    async fn delete_bucket_replication(
+        &self,
+        _req: S3Request<DeleteBucketReplicationInput>,
+    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        Err(s3_error!(NotImplemented, "DeleteBucketReplication is not implemented yet"))
+    }
+
+    async fn get_bucket_notification_configuration(
+        &self,
+        _req: S3Request<GetBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+        Err(s3_error!(NotImplemented, "GetBucketNotificationConfiguration is not implemented yet"))
+    }
+
+    async fn put_bucket_notification_configuration(
+        &self,
+        _req: S3Request<PutBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        Err(s3_error!(NotImplemented, "PutBucketNotificationConfiguration is not implemented yet"))
     }
 }
 
