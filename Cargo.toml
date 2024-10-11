@@ -20,10 +20,10 @@ version = "0.0.1"
 async-trait = "0.1.83"
 backon = "1.2.0"
 bytes = "1.7.2"
-clap = { version = "4.5.18", features = ["derive"] }
+clap = { version = "4.5.20", features = ["derive"] }
 ecstore = { path = "./ecstore" }
 flatbuffers = "24.3.25"
-futures = "0.3.30"
+futures = "0.3.31"
 futures-util = "0.3.30"
 common = { path = "./common/common" }
 hyper = "1.4.1"
@@ -41,7 +41,7 @@ netif = "0.1.6"
 pin-project-lite = "0.2"
 # pin-utils = "0.1.0"
 prost = "0.13.3"
-prost-build = "0.13.1"
+prost-build = "0.13.3"
 prost-types = "0.13.3"
 protobuf = "3.6"
 protos = { path = "./common/protos" }
