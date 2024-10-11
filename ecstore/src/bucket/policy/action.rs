@@ -12,6 +12,7 @@ use super::condition::{
 };
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
+
 pub struct ActionSet(HashSet<Action>);
 
 impl ActionSet {

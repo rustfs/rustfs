@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use super::{and::And, prefix::Prefix, tag::Tag};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize, Default,Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Filter {
     pub set: bool,
 
