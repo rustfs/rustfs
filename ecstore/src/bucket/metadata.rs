@@ -6,10 +6,8 @@ use super::{
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmp_serde::Serializer as rmpSerializer;
 use serde::Serializer;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Display;
-use std::str::FromStr;
 use time::OffsetDateTime;
 use tracing::{error, warn};
 
@@ -379,17 +377,6 @@ async fn read_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketMetad
     let bm = BucketMetadata::unmarshal(&data[4..])?;
 
     Ok(bm)
-}
-
-fn _deserialize_from_str<'de, S, D>(_deserializer: D) -> core::result::Result<S, D::Error>
-where
-    S: FromStr,
-    S::Err: Display,
-    D: Deserializer<'de>,
-{
-    // let s: String = Deserialize::deserialize(deserializer)?;
-    // S::from_str(&s).map_err(de::Error::custom)
-    unimplemented!()
 }
 
 fn _write_time<S>(t: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error>

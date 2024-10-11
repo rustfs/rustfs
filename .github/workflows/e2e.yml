@@ -1,6 +1,7 @@
-name: e2e
+name: E2E
 
 on:
+  workflow_dispatch:
   push:
   pull_request:
     branches: [ "main" ]
@@ -9,14 +10,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  skip-check:
+    permissions:
+      actions: write
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'same_content_newer'
+          cancel_others: true
+          paths_ignore: '["*.md"]'
+
+  e2e:
+    # See this url if required matrix jobs are hanging
+    # https://github.com/fkirc/skip-duplicate-actions#how-to-use-skip-check-with-required-matrix-jobs
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+
     timeout-minutes: 30
     runs-on: ubuntu-latest
     strategy:
       matrix:
         rust:
           - stable
-          - nightly
+          # - nightly
 
     steps:
       - name: cache protoc bin
@@ -58,14 +79,15 @@ jobs:
           chmod +x /usr/local/bin/flatc 
           rm -rf Linux.flatc.binary.g++-13.zip
 
+      - uses: actions/checkout@v4
+      
       - name: toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
           # components: rustfmt, clippy
 
-      - name: checkout
-        uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
 
       - name: run fs start
         working-directory: .
@@ -79,11 +101,3 @@ jobs:
 
       - name: e2e test
         run: cargo test -p e2e_test --lib
-
-      - name: cache cargo
-        uses: actions/cache@v4
-        env:
-          cache-name: cache-cargo
-        with:
-          path: ~/.cargo
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
