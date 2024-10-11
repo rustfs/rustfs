@@ -1,4 +1,6 @@
-#[derive(Debug, thiserror::Error)]
+use crate::error::Error;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BucketMetadataError {
     #[error("tagging not found")]
     TaggingNotFound,
@@ -16,4 +18,14 @@ pub enum BucketMetadataError {
     BucketReplicationConfigNotFound,
     #[error("bucket remote target not found")]
     BucketRemoteTargetNotFound,
+}
+
+impl BucketMetadataError {
+    pub fn is(&self, err: &Error) -> bool {
+        if let Some(e) = err.downcast_ref::<BucketMetadataError>() {
+            e == self
+        } else {
+            false
+        }
+    }
 }

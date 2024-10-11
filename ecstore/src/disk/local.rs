@@ -1643,7 +1643,7 @@ mod test {
 
     #[tokio::test]
     async fn test_make_volume() {
-        let p = "./testv";
+        let p = "./testv0";
         fs::create_dir_all(&p).await.unwrap();
 
         let ep = match Endpoint::try_from(p) {
@@ -1662,18 +1662,18 @@ mod test {
 
         println!("ppp :{:?}", &tmpp);
 
-        let volumes = vec!["a", "b", "c"];
+        let volumes = vec!["a123", "b123", "c123"];
 
         disk.make_volumes(volumes.clone()).await.unwrap();
 
         disk.make_volumes(volumes.clone()).await.unwrap();
 
-        fs::remove_dir_all(&p).await.unwrap();
+        let _ = fs::remove_dir_all(&p).await;
     }
 
     #[tokio::test]
     async fn test_delete_volume() {
-        let p = "./testv";
+        let p = "./testv1";
         fs::create_dir_all(&p).await.unwrap();
 
         let ep = match Endpoint::try_from(p) {
@@ -1692,12 +1692,12 @@ mod test {
 
         println!("ppp :{:?}", &tmpp);
 
-        let volumes = vec!["a", "b", "c"];
+        let volumes = vec!["a123", "b123", "c123"];
 
         disk.make_volumes(volumes.clone()).await.unwrap();
 
         disk.delete_volume("a").await.unwrap();
 
-        fs::remove_dir_all(&p).await.unwrap();
+        let _ = fs::remove_dir_all(&p).await;
     }
 }

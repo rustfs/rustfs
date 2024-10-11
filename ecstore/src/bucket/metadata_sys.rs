@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::bucket::error::BucketMetadataError;
-use crate::bucket::metadata::load_bucket_metadata_parse;
+use crate::bucket::metadata::{load_bucket_metadata_parse, BUCKET_LIFECYCLE_CONFIG};
 use crate::bucket::utils::is_meta_bucketname;
 use crate::config;
 use crate::config::error::ConfigError;
@@ -143,13 +143,40 @@ impl BucketMetadataSys {
         }
     }
 
-    // async fn reset(&mut self) {
-    //     let mut map = self.metadata_map.write().await;
-    //     map.clear();
-    // }
+    async fn _reset(&mut self) {
+        let mut map = self.metadata_map.write().await;
+        map.clear();
+    }
 
     pub async fn update(&mut self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         self.update_and_parse(bucket, config_file, data, true).await
+    }
+
+    pub async fn delete(&mut self, bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
+        if config_file == BUCKET_LIFECYCLE_CONFIG {
+            let meta = match self.get_config_from_disk(bucket).await {
+                Ok(res) => res,
+                Err(err) => {
+                    if !config::error::is_not_found(&err) {
+                        return Err(err);
+                    } else {
+                        BucketMetadata::new(bucket)
+                    }
+                }
+            };
+
+            if !meta.lifecycle_config_xml.is_empty() {
+                let cfg = Lifecycle::unmarshal(&meta.lifecycle_config_xml)?;
+                for _v in cfg.rules.iter() {
+                    // TODO: FIXME:
+                    break;
+                }
+            }
+
+            // TODO: other lifecycle handle
+        }
+
+        self.update_and_parse(bucket, config_file, Vec::new(), false).await
     }
 
     async fn update_and_parse(&mut self, bucket: &str, config_file: &str, data: Vec<u8>, parse: bool) -> Result<OffsetDateTime> {
@@ -199,6 +226,22 @@ impl BucketMetadataSys {
         self.set(bm.name.clone(), bm.clone()).await;
 
         Ok(())
+    }
+
+    pub async fn get_config_from_disk(&self, bucket: &str) -> Result<BucketMetadata> {
+        if self.api.as_ref().is_none() {
+            return Err(Error::msg("errBucketMetadataNotInitialized"));
+        }
+
+        if is_meta_bucketname(bucket) {
+            return Err(Error::msg("errInvalidArgument"));
+        }
+
+        if let Some(api) = self.api.as_ref() {
+            load_bucket_metadata(&api, bucket).await
+        } else {
+            Err(Error::msg("errBucketMetadataNotInitialized"))
+        }
     }
 
     pub async fn get_config(&self, bucket: &str) -> Result<(BucketMetadata, bool)> {
