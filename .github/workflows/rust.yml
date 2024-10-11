@@ -9,7 +9,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  skip-check:
+    permissions:
+      actions: write
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'same_content_newer'
+          cancel_others: true
+          paths_ignore: '["*.md"]'
+
   build:
+    # See this url if required matrix jobs are hanging
+    # https://github.com/fkirc/skip-duplicate-actions#how-to-use-skip-check-with-required-matrix-jobs
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -57,24 +77,21 @@ jobs:
           chmod +x /usr/local/bin/flatc 
           rm -rf Linux.flatc.binary.g++-13.zip
 
-      - name: toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ matrix.rust }}
-          # components: rustfmt, clippy
-
       - uses: actions/checkout@v4
 
-      - name: cargo build
-        run: cargo build
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
 
       - name: cargo test
         run: cargo test --all --exclude e2e_test
-
-      - name: cache cargo
-        uses: actions/cache@v4
-        env:
-          cache-name: cache-cargo
-        with:
-          path: ~/.cargo
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
