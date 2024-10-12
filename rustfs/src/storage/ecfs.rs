@@ -449,7 +449,12 @@ impl S3 for FS {
             .iter()
             .filter(|v| !v.name.is_empty())
             .map(|v| {
-                let mut obj = Object { key: Some(v.name.to_owned()), last_modified: v.mod_time.map(Timestamp::from), size: Some(v.size as i64), ..Default::default() };
+                let mut obj = Object {
+                    key: Some(v.name.to_owned()),
+                    last_modified: v.mod_time.map(Timestamp::from),
+                    size: Some(v.size as i64),
+                    ..Default::default()
+                };
 
                 if fetch_owner.is_some_and(|v| v) {
                     obj.owner = Some(Owner {
