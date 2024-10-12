@@ -55,9 +55,7 @@ pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) ->
     check_path_length(path.as_ref().to_string_lossy().to_string().as_str())?;
 
     if let Err(e) = reliable_mkdir_all(path.as_ref(), base_dir.as_ref()).await {
-        if is_sys_err_not_dir(&e) {
-            return Err(Error::new(DiskError::FileAccessDenied));
-        } else if is_sys_err_path_not_found(&e) {
+        if is_sys_err_not_dir(&e) || is_sys_err_path_not_found(&e) {
             return Err(Error::new(DiskError::FileAccessDenied));
         }
 
@@ -78,7 +76,7 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> Result<Vec<String>>
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        if name == "" || name == "." || name == ".." {
+        if name.is_empty() || name == "." || name == ".." {
             continue;
         }
 
@@ -103,9 +101,7 @@ pub async fn rename_all(
     base_dir: impl AsRef<Path>,
 ) -> Result<()> {
     reliable_rename(src_file_path, dst_file_path, base_dir).await.map_err(|e| {
-        if is_sys_err_not_dir(&e) || !os_is_not_exist(&e) {
-            Error::new(DiskError::FileAccessDenied)
-        } else if is_sys_err_path_not_found(&e) {
+        if is_sys_err_not_dir(&e) || !os_is_not_exist(&e) || is_sys_err_path_not_found(&e) {
             Error::new(DiskError::FileAccessDenied)
         } else if os_is_not_exist(&e) {
             Error::new(DiskError::FileNotFound)
@@ -174,10 +170,8 @@ pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Pat
 }
 
 pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
-    if !base_dir.as_ref().to_string_lossy().is_empty() {
-        if base_dir.as_ref().starts_with(dir_path.as_ref()) {
-            return Ok(());
-        }
+    if !base_dir.as_ref().to_string_lossy().is_empty() && base_dir.as_ref().starts_with(dir_path.as_ref()) {
+        return Ok(());
     }
 
     if let Some(parent) = dir_path.as_ref().parent() {

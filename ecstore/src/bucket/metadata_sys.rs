@@ -167,10 +167,11 @@ impl BucketMetadataSys {
 
             if !meta.lifecycle_config_xml.is_empty() {
                 let cfg = Lifecycle::unmarshal(&meta.lifecycle_config_xml)?;
-                for _v in cfg.rules.iter() {
-                    // TODO: FIXME:
-                    break;
-                }
+                // TODO: FIXME:
+                // for _v in cfg.rules.iter() {
+                //     break;
+                // }
+                if let Some(_v) = cfg.rules.first() {}
             }
 
             // TODO: other lifecycle handle
@@ -187,15 +188,15 @@ impl BucketMetadataSys {
             None => return Err(Error::msg("errServerNotInitialized")),
         };
 
-        if is_meta_bucketname(&bucket) {
+        if is_meta_bucketname(bucket) {
             return Err(Error::msg("errInvalidArgument"));
         }
 
-        let mut bm = match load_bucket_metadata_parse(store, &bucket, parse).await {
+        let mut bm = match load_bucket_metadata_parse(store, bucket, parse).await {
             Ok(res) => res,
             Err(err) => {
                 if !is_erasure().await && !is_dist_erasure().await && DiskError::VolumeNotFound.is(&err) {
-                    BucketMetadata::new(&bucket)
+                    BucketMetadata::new(bucket)
                 } else {
                     return Err(err);
                 }
@@ -238,7 +239,7 @@ impl BucketMetadataSys {
         }
 
         if let Some(api) = self.api.as_ref() {
-            load_bucket_metadata(&api, bucket).await
+            load_bucket_metadata(api, bucket).await
         } else {
             Err(Error::msg("errBucketMetadataNotInitialized"))
         }
@@ -248,17 +249,13 @@ impl BucketMetadataSys {
         if let Some(api) = self.api.as_ref() {
             let has_bm = {
                 let map = self.metadata_map.read().await;
-                if let Some(bm) = map.get(&bucket.to_string()) {
-                    Some(bm.clone())
-                } else {
-                    None
-                }
+                map.get(&bucket.to_string()).cloned()
             };
 
             if let Some(bm) = has_bm {
-                return Ok((bm, false));
+                Ok((bm, false))
             } else {
-                let bm = match load_bucket_metadata(&api, bucket).await {
+                let bm = match load_bucket_metadata(api, bucket).await {
                     Ok(res) => res,
                     Err(err) => {
                         if *self.initialized.read().await {

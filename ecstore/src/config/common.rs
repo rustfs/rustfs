@@ -17,7 +17,7 @@ pub async fn read_config(api: &ECStore, file: &str) -> Result<Vec<u8>> {
 async fn read_config_with_metadata(api: &ECStore, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)> {
     let range = HTTPRangeSpec::nil();
     let h = HeaderMap::new();
-    let mut rd = api.get_object_reader(RUSTFS_META_BUCKET, file, range, h, &opts).await?;
+    let mut rd = api.get_object_reader(RUSTFS_META_BUCKET, file, range, h, opts).await?;
 
     let data = rd.read_all().await?;
 

@@ -145,7 +145,7 @@ impl S3PeerSys {
     pub async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
-            futures.push(cli.delete_bucket(bucket, &opts));
+            futures.push(cli.delete_bucket(bucket, opts));
         }
 
         let mut errors = Vec::with_capacity(self.clients.len());
@@ -385,13 +385,10 @@ impl PeerS3Client for LocalPeerS3Client {
 
         // errVolumeNotEmpty 不删除，把已经删除的重新创建
 
-        let mut idx = 0;
-        for err in errs {
+        for (idx, err) in errs.into_iter().enumerate() {
             if err.is_none() && recreate {
                 let _ = local_disks[idx].make_volume(bucket).await;
             }
-
-            idx += 1;
         }
 
         if recreate {
@@ -413,7 +410,7 @@ pub struct RemotePeerS3Client {
 
 impl RemotePeerS3Client {
     fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
-        let addr = format!("{}", node.as_ref().map(|v| { v.url.to_string() }).unwrap_or_default());
+        let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default().to_string();
         Self { node, pools, addr }
     }
 }
@@ -427,7 +424,7 @@ impl PeerS3Client for RemotePeerS3Client {
         let options = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ListBucketRequest { options });
         let response = client.list_bucket(request).await?.into_inner();
         let bucket_infos = response
@@ -442,7 +439,7 @@ impl PeerS3Client for RemotePeerS3Client {
         let options = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(MakeBucketRequest {
             name: bucket.to_string(),
             options,
@@ -460,7 +457,7 @@ impl PeerS3Client for RemotePeerS3Client {
         let options = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(GetBucketInfoRequest {
             bucket: bucket.to_string(),
             options,
@@ -474,7 +471,7 @@ impl PeerS3Client for RemotePeerS3Client {
     async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err.to_string())))?;
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
 
         let request = Request::new(DeleteBucketRequest {
             bucket: bucket.to_string(),

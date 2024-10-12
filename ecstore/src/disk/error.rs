@@ -324,10 +324,8 @@ pub fn is_sys_err_path_not_found(e: &io::Error) -> bool {
             if no == 3 {
                 return true;
             }
-        } else {
-            if no == 2 {
-                return true;
-            }
+        } else if no == 2 {
+            return true;
         }
     }
     false

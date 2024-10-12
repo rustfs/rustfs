@@ -198,12 +198,11 @@ async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Ve
     }
 
     let results = join_all(futures).await;
-    let mut i = 0;
-    for result in results {
+    for (i, result) in results.into_iter().enumerate() {
         match result {
             Ok(s) => {
                 if !heal {
-                    let _ = disks[i].as_ref().unwrap().set_disk_id(Some(s.erasure.this.clone())).await;
+                    let _ = disks[i].as_ref().unwrap().set_disk_id(Some(s.erasure.this)).await;
                 }
 
                 datas.push(Some(s));
@@ -214,8 +213,6 @@ async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Ve
                 errors.push(Some(e));
             }
         }
-
-        i += 1;
     }
 
     (datas, errors)

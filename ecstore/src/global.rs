@@ -35,12 +35,12 @@ pub async fn set_object_layer(o: ECStore) {
 
 pub async fn is_dist_erasure() -> bool {
     let lock = GLOBAL_IsDistErasure.read().await;
-    *lock == true
+    *lock
 }
 
 pub async fn is_erasure() -> bool {
     let lock = GLOBAL_IsErasure.read().await;
-    *lock == true
+    *lock
 }
 
 pub async fn update_erasure_type(setup_type: SetupType) {

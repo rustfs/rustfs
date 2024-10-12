@@ -63,7 +63,7 @@ impl Versioning {
     pub fn validate(&self) -> Result<()> {
         match self.status {
             State::Suspended => {
-                if self.excluded_prefixes.len() > 0 {
+                if !self.excluded_prefixes.is_empty() {
                     return Err(Error::new(VersioningErr::ExcludedPrefixNotSupported));
                 }
             }
@@ -103,7 +103,7 @@ impl Versioning {
                 return false;
             }
         }
-        return true;
+        true
     }
 
     pub fn suspended(&self) -> bool {
@@ -131,10 +131,10 @@ impl Versioning {
                 }
             }
         }
-        return false;
+        false
     }
 
     pub fn prefixes_excluded(&self) -> bool {
-        self.excluded_prefixes.len() > 0 || self.exclude_folders
+        !self.excluded_prefixes.is_empty() || self.exclude_folders
     }
 }
