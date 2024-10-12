@@ -444,7 +444,7 @@ impl EndpointServerPools {
     }
 
     pub fn es_count(&self) -> usize {
-        self.0.iter().map(|v| v.set_count).count()
+        self.0.iter().map(|v| v.set_count).sum()
     }
 
     /// add pool endpoints

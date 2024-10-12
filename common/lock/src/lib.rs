@@ -18,7 +18,7 @@ pub mod namespace_lock;
 pub mod remote_client;
 
 lazy_static! {
-    pub static ref GLOBAL_LOCAL_SERVER: Arc<Box<RwLock<LocalLocker>>> = Arc::new(Box::new(RwLock::new(LocalLocker::new())));
+    pub static ref GLOBAL_LOCAL_SERVER: Arc<RwLock<LocalLocker>> = Arc::new(RwLock::new(LocalLocker::new()));
 }
 
 type LockClient = dyn Locker;

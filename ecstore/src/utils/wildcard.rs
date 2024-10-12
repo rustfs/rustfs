@@ -27,13 +27,10 @@ fn deep_match_rune(str_: &[u8], pattern: &[u8], simple: bool) -> bool {
             '*' => {
                 return if pattern.len() == 1 {
                     true
-                } else if deep_match_rune(&str_[..], &pattern[1..], simple)
-                    || (!str_.is_empty() && deep_match_rune(&str_[1..], pattern, simple))
-                {
-                    true
                 } else {
-                    false
-                };
+                    deep_match_rune(str_, &pattern[1..], simple)
+                        || (!str_.is_empty() && deep_match_rune(&str_[1..], pattern, simple))
+                }
             }
             '?' => {
                 if str_.is_empty() {

@@ -115,7 +115,7 @@ impl Node for NodeService {
                 return Ok(tonic::Response::new(ListBucketResponse {
                     success: false,
                     bucket_infos: Vec::new(),
-                    error_info: Some(format!("decode BucketOptions failed: {}", err.to_string())),
+                    error_info: Some(format!("decode BucketOptions failed: {}", err)),
                 }))
             }
         };
@@ -135,7 +135,7 @@ impl Node for NodeService {
             Err(err) => Ok(tonic::Response::new(ListBucketResponse {
                 success: false,
                 bucket_infos: Vec::new(),
-                error_info: Some(format!("make failed: {}", err.to_string())),
+                error_info: Some(format!("make failed: {}", err)),
             })),
         }
     }
@@ -149,7 +149,7 @@ impl Node for NodeService {
             Err(err) => {
                 return Ok(tonic::Response::new(MakeBucketResponse {
                     success: false,
-                    error_info: Some(format!("decode MakeBucketOptions failed: {}", err.to_string())),
+                    error_info: Some(format!("decode MakeBucketOptions failed: {}", err)),
                 }))
             }
         };
@@ -160,7 +160,7 @@ impl Node for NodeService {
             })),
             Err(err) => Ok(tonic::Response::new(MakeBucketResponse {
                 success: false,
-                error_info: Some(format!("make failed: {}", err.to_string())),
+                error_info: Some(format!("make failed: {}", err)),
             })),
         }
     }
@@ -175,7 +175,7 @@ impl Node for NodeService {
                 return Ok(tonic::Response::new(GetBucketInfoResponse {
                     success: false,
                     bucket_info: String::new(),
-                    error_info: Some(format!("decode BucketOptions failed: {}", err.to_string())),
+                    error_info: Some(format!("decode BucketOptions failed: {}", err)),
                 }))
             }
         };
@@ -187,7 +187,7 @@ impl Node for NodeService {
                         return Ok(tonic::Response::new(GetBucketInfoResponse {
                             success: false,
                             bucket_info: String::new(),
-                            error_info: Some(format!("encode BucketInfo failed: {}", err.to_string())),
+                            error_info: Some(format!("encode BucketInfo failed: {}", err)),
                         }));
                     }
                 };
@@ -201,7 +201,7 @@ impl Node for NodeService {
             Err(err) => Ok(tonic::Response::new(GetBucketInfoResponse {
                 success: false,
                 bucket_info: String::new(),
-                error_info: Some(format!("make failed: {}", err.to_string())),
+                error_info: Some(format!("make failed: {}", err)),
             })),
         }
     }
@@ -221,7 +221,7 @@ impl Node for NodeService {
             })),
             Err(err) => Ok(tonic::Response::new(DeleteBucketResponse {
                 success: false,
-                error_info: Some(format!("make failed: {}", err.to_string())),
+                error_info: Some(format!("make failed: {}", err)),
             })),
         }
     }
@@ -767,7 +767,7 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(StatVolumeResponse {
                         success: false,
                         volume_info: String::new(),
-                        error_info: Some(format!("encode VolumeInfo failed, {}", err.to_string())),
+                        error_info: Some(format!("encode VolumeInfo failed, {}", err)),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(StatVolumeResponse {
@@ -855,7 +855,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(WriteMetadataResponse {
                         success: false,
-                        error_info: Some(format!("decode FileInfo failed, {}", err.to_string())),
+                        error_info: Some(format!("decode FileInfo failed, {}", err)),
                     }));
                 }
             };
@@ -903,7 +903,7 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
-                        error_info: Some(format!("encode VolumeInfo failed, {}", err.to_string())),
+                        error_info: Some(format!("encode VolumeInfo failed, {}", err)),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(ReadVersionResponse {
@@ -934,7 +934,7 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(ReadXlResponse {
                         success: false,
                         raw_file_info: String::new(),
-                        error_info: Some(format!("encode RawFileInfo failed, {}", err.to_string())),
+                        error_info: Some(format!("encode RawFileInfo failed, {}", err)),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(ReadXlResponse {
@@ -1011,7 +1011,7 @@ impl Node for NodeService {
         if let Some(disk) = self.find_disk(&request.disk).await {
             let mut versions = Vec::with_capacity(request.versions.len());
             for version in request.versions.iter() {
-                match serde_json::from_str::<FileInfoVersions>(&version) {
+                match serde_json::from_str::<FileInfoVersions>(version) {
                     Ok(version) => versions.push(version),
                     Err(_) => {
                         return Ok(tonic::Response::new(DeleteVersionsResponse {
@@ -1135,12 +1135,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not lock, args: {}, err: {}", args, err.to_string())),
+                    error_info: Some(format!("can not lock, args: {}, err: {}", args, err)),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+                error_info: Some(format!("can not decode args, err: {}", err)),
             })),
         }
     }
@@ -1155,12 +1155,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not unlock, args: {}, err: {}", args, err.to_string())),
+                    error_info: Some(format!("can not unlock, args: {}, err: {}", args, err)),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+                error_info: Some(format!("can not decode args, err: {}", err)),
             })),
         }
     }
@@ -1175,12 +1175,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not rlock, args: {}, err: {}", args, err.to_string())),
+                    error_info: Some(format!("can not rlock, args: {}, err: {}", args, err)),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+                error_info: Some(format!("can not decode args, err: {}", err)),
             })),
         }
     }
@@ -1195,12 +1195,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not runlock, args: {}, err: {}", args, err.to_string())),
+                    error_info: Some(format!("can not runlock, args: {}, err: {}", args, err)),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+                error_info: Some(format!("can not decode args, err: {}", err)),
             })),
         }
     }
@@ -1215,12 +1215,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not force_unlock, args: {}, err: {}", args, err.to_string())),
+                    error_info: Some(format!("can not force_unlock, args: {}, err: {}", args, err)),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+                error_info: Some(format!("can not decode args, err: {}", err)),
             })),
         }
     }
@@ -1235,12 +1235,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not refresh, args: {}, err: {}", args, err.to_string())),
+                    error_info: Some(format!("can not refresh, args: {}, err: {}", args, err)),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err.to_string())),
+                error_info: Some(format!("can not decode args, err: {}", err)),
             })),
         }
     }

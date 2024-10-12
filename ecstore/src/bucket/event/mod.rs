@@ -17,12 +17,12 @@ struct Common {
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 struct Queue {
     pub common: Common,
-    pub arn: ARN,
+    pub arn: Arn,
 }
 
 // 定义ARN结构体
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-pub struct ARN {
+pub struct Arn {
     pub target_id: TargetID,
     pub region: String,
 }

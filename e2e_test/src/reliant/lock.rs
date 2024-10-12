@@ -1,55 +1,18 @@
 #![cfg(test)]
 
-use std::{collections::HashMap, error::Error, sync::Arc, time::Duration, vec};
+use std::{error::Error, sync::Arc, time::Duration};
 
-use lazy_static::lazy_static;
 use lock::{
     drwmutex::Options,
     lock_args::LockArgs,
     namespace_lock::{new_nslock, NsLockMap},
     new_lock_api,
 };
-use protos::proto_gen::node_service::{node_service_client::NodeServiceClient, GenerallyLockRequest};
+use protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
 use tokio::sync::RwLock;
-use tonic::{
-    metadata::MetadataValue,
-    service::interceptor::InterceptedService,
-    transport::{Channel, Endpoint},
-    Request, Status,
-};
+use tonic::Request;
 
-lazy_static! {
-    pub static ref GLOBAL_Conn_Map: RwLock<HashMap<String, Channel>> = RwLock::new(HashMap::new());
-}
-
-async fn get_client() -> Result<
-    NodeServiceClient<
-        InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
-    >,
-    Box<dyn Error>,
-> {
-    let token: MetadataValue<_> = "rustfs rpc".parse()?;
-    let channel = match GLOBAL_Conn_Map.read().await.get("local") {
-        Some(channel) => channel.clone(),
-        None => {
-            println!("get channel start");
-            let connector = Endpoint::from_static("http://localhost:9000").connect_timeout(Duration::from_secs(60));
-            let channel = connector.connect().await?;
-            // let channel = Channel::from_static("http://localhost:9000").connect().await?;
-            channel
-        }
-    };
-    GLOBAL_Conn_Map.write().await.insert("local".to_owned(), channel.clone());
-
-    // let timeout_channel = Timeout::new(channel, Duration::from_secs(60));
-    Ok(NodeServiceClient::with_interceptor(
-        channel,
-        Box::new(move |mut req: Request<()>| {
-            req.metadata_mut().insert("authorization", token.clone());
-            Ok(req)
-        }),
-    ))
-}
+const CLUSTER_ADDR: &str = "http://localhost:9000";
 
 #[tokio::test]
 async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
@@ -62,7 +25,7 @@ async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
     };
     let args = serde_json::to_string(&args)?;
 
-    let mut client = get_client().await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     println!("got client");
     let request = Request::new(GenerallyLockRequest { args: args.clone() });
 

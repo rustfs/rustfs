@@ -367,7 +367,7 @@ async fn read_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketMetad
         return Err(Error::msg("invalid argument"));
     }
 
-    let bm = BucketMetadata::new(&bucket);
+    let bm = BucketMetadata::new(bucket);
     let file_path = bm.save_file_path();
 
     let data = read_config(api, &file_path).await?;
@@ -391,7 +391,7 @@ where
     buf[1] = 0x0c; // 长度
     buf[2] = 0x05; // 时间扩展类型
     BigEndian::write_u64(&mut buf[3..], sec as u64);
-    BigEndian::write_u32(&mut buf[11..], nsec as u32);
+    BigEndian::write_u32(&mut buf[11..], nsec);
     s.serialize_bytes(&buf)
 }
 

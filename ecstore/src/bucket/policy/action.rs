@@ -16,19 +16,14 @@ use super::condition::{
 pub struct ActionSet(HashSet<Action>);
 
 impl ActionSet {
-    pub fn as_ref(&self) -> &HashSet<Action> {
-        &self.0
-    }
     pub fn is_match(&self, act: &Action) -> bool {
         for item in self.0.iter() {
             if item.is_match(act) {
                 return true;
             }
 
-            if item == &Action::GetObjectVersion {
-                if act == &Action::GetObjectVersion {
-                    return true;
-                }
+            if item == &Action::GetObjectVersion && act == &Action::GetObjectVersion {
+                return true;
             }
         }
 
@@ -37,6 +32,12 @@ impl ActionSet {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+impl AsRef<HashSet<Action>> for ActionSet {
+    fn as_ref(&self) -> &HashSet<Action> {
+        &self.0
     }
 }
 
@@ -212,10 +213,10 @@ impl Action {
         false
     }
     pub fn is_match(&self, a: &Action) -> bool {
-        utils::wildcard::match_pattern(&self.clone().as_str(), &a.clone().as_str())
+        utils::wildcard::match_pattern(self.clone().as_str(), a.clone().as_str())
     }
 
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Action::AbortMultipartUpload => "s3:AbortMultipartUpload",
             Action::CreateBucket => "s3:CreateBucket",

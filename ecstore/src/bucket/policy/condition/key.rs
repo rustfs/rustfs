@@ -24,14 +24,6 @@ impl Key {
         self.name == *name
     }
 
-    pub fn to_string(&self) -> String {
-        if !self.variable.is_empty() {
-            format!("{}/{}", self.name.as_str(), self.variable)
-        } else {
-            self.name.to_string()
-        }
-    }
-
     // VarName - returns variable key name, such as "${aws:username}"
     pub fn var_name(&self) -> String {
         self.name.var_name()
@@ -93,7 +85,11 @@ impl<'de> Deserialize<'de> for Key {
 
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_string())
+        if !self.variable.is_empty() {
+            write!(f, "{}/{}", self.name.as_str(), self.variable)
+        } else {
+            write!(f, "{}", self.name)
+        }
     }
 }
 

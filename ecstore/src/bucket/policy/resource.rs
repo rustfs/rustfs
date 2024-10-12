@@ -3,6 +3,7 @@ use crate::{
     bucket::policy::condition::keyname::COMMOM_KEYS,
     utils::{self, wildcard},
 };
+use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -18,12 +19,12 @@ pub enum ResourceARNType {
     ResourceARNKMS,
 }
 
-impl ResourceARNType {
-    pub fn to_string(&self) -> String {
+impl fmt::Display for ResourceARNType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResourceARNType::UnknownARN => "".to_string(),
-            ResourceARNType::ResourceARNS3 => RESOURCE_ARN_PREFIX.to_string(),
-            ResourceARNType::ResourceARNKMS => RESOURCE_ARN_KMS_PREFIX.to_string(),
+            ResourceARNType::UnknownARN => write!(f, ""),
+            ResourceARNType::ResourceARNS3 => write!(f, "{}", RESOURCE_ARN_PREFIX),
+            ResourceARNType::ResourceARNKMS => write!(f, "{}", RESOURCE_ARN_KMS_PREFIX),
         }
     }
 }
@@ -60,15 +61,11 @@ impl Resource {
         if self.rtype == ResourceARNType::UnknownARN {
             return false;
         }
-        if self.is_s3() {
-            if self.pattern.starts_with("/") {
-                return false;
-            }
+        if self.is_s3() && self.pattern.starts_with("/") {
+            return false;
         }
-        if self.is_kms() {
-            if self.pattern.as_bytes().iter().any(|&v| v == b'/' || v == b'\\' || v == b'.') {
-                return false;
-            }
+        if self.is_kms() && self.pattern.as_bytes().iter().any(|&v| v == b'/' || v == b'\\' || v == b'.') {
+            return false;
         }
 
         !self.pattern.is_empty()
@@ -90,8 +87,8 @@ impl Resource {
         if !condition_values.is_empty() {
             for key in COMMOM_KEYS.iter() {
                 if let Some(vals) = condition_values.get(key.name()) {
-                    if let Some(v0) = vals.get(0) {
-                        pattern = pattern.replace(key.name(), &v0);
+                    if let Some(v0) = vals.first() {
+                        pattern = pattern.replace(key.name(), v0);
                     }
                 }
             }
@@ -105,9 +102,11 @@ impl Resource {
 
         wildcard::match_pattern(&pattern, res)
     }
+}
 
-    pub fn to_string(&self) -> String {
-        format!("{}{}", self.rtype.to_string(), self.pattern)
+impl fmt::Display for Resource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.rtype, self.pattern)
     }
 }
 
@@ -193,15 +192,11 @@ pub struct ResourceSet(HashSet<Resource>);
 impl ResourceSet {
     pub fn validate_bucket(&self, bucket: &str) -> Result<()> {
         for res in self.0.iter() {
-            if let Err(err) = res.validate_bucket(bucket) {
-                return Err(err);
-            }
+            res.validate_bucket(bucket)?;
         }
         Ok(())
     }
-    pub fn as_ref(&self) -> &HashSet<Resource> {
-        &self.0
-    }
+
     pub fn is_match(&self, res: &str, condition_values: &HashMap<String, Vec<String>>) -> bool {
         for item in self.0.iter() {
             if item.is_match(res, condition_values) {
@@ -226,6 +221,12 @@ impl ResourceSet {
             }
         }
         false
+    }
+}
+
+impl AsRef<HashSet<Resource>> for ResourceSet {
+    fn as_ref(&self) -> &HashSet<Resource> {
+        &self.0
     }
 }
 
