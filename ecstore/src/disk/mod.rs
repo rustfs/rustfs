@@ -399,7 +399,7 @@ impl LocalFileWriter {
 #[async_trait::async_trait]
 impl Write for LocalFileWriter {
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        self.inner.write(buf).await?;
+        let _ = self.inner.write(buf).await?;
         self.inner.flush().await?;
 
         Ok(())

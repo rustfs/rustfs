@@ -206,7 +206,7 @@ impl FormatV3 {
             }
 
             for j in 0..self.erasure.sets[i].len() {
-                if self.erasure.sets[i][j] != self.erasure.sets[i][j] {
+                if self.erasure.sets[i][j] != other.erasure.sets[i][j] {
                     return Err(Error::from_string(format!(
                         "UUID on positions {}:{} do not match with, expected {:?} got {:?}: (%w)",
                         i,

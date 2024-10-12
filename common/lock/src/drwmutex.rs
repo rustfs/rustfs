@@ -33,8 +33,8 @@ impl Granted {
     }
 }
 
-fn is_locked(uid: &String) -> bool {
-    uid.len() > 0
+fn is_locked(uid: &str) -> bool {
+    !uid.is_empty()
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +58,14 @@ impl DRWMutex {
             refresh_interval: DRW_MUTEX_REFRESH_INTERVAL,
             lock_retry_min_interval: LOCK_RETRY_MIN_INTERVAL,
         }
+    }
+
+    fn is_locked(&self) -> bool {
+        self.write_locks.iter().any(|w_lock| is_locked(w_lock))
+    }
+
+    fn is_r_locked(&self) -> bool {
+        self.read_locks.iter().any(|r_lock| is_locked(r_lock))
     }
 }
 
@@ -134,7 +142,7 @@ impl DRWMutex {
 
     async fn inner_lock(
         &mut self,
-        locks: &mut Vec<String>,
+        locks: &mut [String],
         id: &String,
         source: &String,
         is_read_lock: bool,
@@ -201,7 +209,7 @@ impl DRWMutex {
     }
 
     pub async fn un_lock(&mut self) {
-        if self.write_locks.is_empty() || !self.write_locks.iter().any(|w_lock| is_locked(w_lock)) {
+        if self.write_locks.is_empty() || !self.is_locked() {
             panic!("Trying to un_lock() while no lock() is active, write_locks: {:?}", self.write_locks)
         }
 
@@ -222,7 +230,7 @@ impl DRWMutex {
     }
 
     pub async fn un_r_lock(&mut self) {
-        if self.read_locks.is_empty() || !self.read_locks.iter().any(|r_lock| is_locked(r_lock)) {
+        if self.read_locks.is_empty() || !self.is_r_locked() {
             panic!("Trying to un_r_lock() while no r_lock() is active, read_locks: {:?}", self.read_locks)
         }
 
@@ -242,14 +250,14 @@ impl DRWMutex {
         }
     }
 
-    async fn release_all(&mut self, tolerance: usize, locks: &mut Vec<String>, is_read_lock: bool) -> bool {
+    async fn release_all(&mut self, tolerance: usize, locks: &mut [String], is_read_lock: bool) -> bool {
         for (index, locker) in self.lockers.iter_mut().enumerate() {
             if send_release(locker, &locks[index], &self.owner, &self.names, is_read_lock).await {
                 locks[index] = "".to_string();
             }
         }
 
-        !check_failed_unlocks(&locks, tolerance)
+        !check_failed_unlocks(locks, tolerance)
     }
 }
 
@@ -277,7 +285,7 @@ impl DRWMutex {
 //     });
 // }
 
-fn check_failed_unlocks(locks: &Vec<String>, tolerance: usize) -> bool {
+fn check_failed_unlocks(locks: &[String], tolerance: usize) -> bool {
     let mut un_locks_failed = 0;
     locks.iter().for_each(|lock| {
         if is_locked(lock) {
@@ -292,15 +300,15 @@ fn check_failed_unlocks(locks: &Vec<String>, tolerance: usize) -> bool {
     un_locks_failed > tolerance
 }
 
-async fn send_release(locker: &mut LockApi, uid: &String, owner: &String, names: &Vec<String>, is_read_lock: bool) -> bool {
+async fn send_release(locker: &mut LockApi, uid: &String, owner: &str, names: &[String], is_read_lock: bool) -> bool {
     if uid.is_empty() {
         return false;
     }
 
     let args = LockArgs {
         uid: uid.to_string(),
-        owner: owner.clone(),
-        resources: names.clone(),
+        owner: owner.to_owned(),
+        resources: names.to_owned(),
         ..Default::default()
     };
 
@@ -335,7 +343,7 @@ async fn send_release(locker: &mut LockApi, uid: &String, owner: &String, names:
     true
 }
 
-fn check_quorum_locked(locks: &Vec<String>, quorum: usize) -> bool {
+fn check_quorum_locked(locks: &[String], quorum: usize) -> bool {
     let mut count = 0;
     locks.iter().for_each(|lock| {
         if is_locked(lock) {

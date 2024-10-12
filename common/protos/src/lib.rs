@@ -27,8 +27,7 @@ pub async fn node_service_time_out_client(
         Some(channel) => channel.clone(),
         None => {
             let connector = Endpoint::from_shared(addr.to_string())?.connect_timeout(Duration::from_secs(60));
-            let channel = connector.connect().await?;
-            channel
+            connector.connect().await?
         }
     };
     GLOBAL_Conn_Map.write().await.insert(addr.to_string(), channel.clone());

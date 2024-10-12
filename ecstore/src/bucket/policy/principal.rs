@@ -16,10 +16,10 @@ impl Principal {
     }
     pub fn is_match(&self, parincipal: &str) -> bool {
         for pattern in self.aws.iter() {
-            if utils::wildcard::match_simple(&pattern, parincipal) {
+            if utils::wildcard::match_simple(pattern, parincipal) {
                 return true;
             }
         }
-        return false;
+        false
     }
 }

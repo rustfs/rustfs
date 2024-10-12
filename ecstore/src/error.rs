@@ -67,11 +67,8 @@ impl Error {
     }
 
     pub fn to_io_err(&self) -> Option<io::Error> {
-        if let Some(e) = self.downcast_ref::<io::Error>() {
-            Some(io::Error::new(e.kind(), e.to_string()))
-        } else {
-            None
-        }
+        self.downcast_ref::<io::Error>()
+            .map(|e| io::Error::new(e.kind(), e.to_string()))
     }
 }
 

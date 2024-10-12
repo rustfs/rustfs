@@ -79,7 +79,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         try_!(
@@ -112,7 +112,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
         try_!(
             store
@@ -147,7 +147,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
         let (dobjs, _errs) = try_!(store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
 
@@ -205,7 +205,7 @@ impl S3 for FS {
                     .unwrap_or_default();
                 ObjectToDelete {
                     object_name: v.key.clone(),
-                    version_id: version_id,
+                    version_id,
                 }
             })
             .collect();
@@ -214,7 +214,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         let (dobjs, _errs) = try_!(store.delete_objects(&bucket, objects, ObjectOptions::default()).await);
@@ -255,7 +255,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions::default()).await {
@@ -289,7 +289,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         let reader = try_!(store.get_object_reader(bucket.as_str(), key.as_str(), range, h, opts).await);
@@ -319,7 +319,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions::default()).await {
@@ -343,7 +343,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         let info = try_!(store.get_object_info(&bucket, &key, &ObjectOptions::default()).await);
@@ -370,7 +370,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         let bucket_infos = try_!(store.list_bucket(&BucketOptions::default()).await);
@@ -425,7 +425,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         let object_infos = try_!(
@@ -449,10 +449,7 @@ impl S3 for FS {
             .iter()
             .filter(|v| !v.name.is_empty())
             .map(|v| {
-                let mut obj = Object::default();
-                obj.key = Some(v.name.to_owned());
-                obj.last_modified = v.mod_time.map(Timestamp::from);
-                obj.size = Some(v.size as i64);
+                let mut obj = Object { key: Some(v.name.to_owned()), last_modified: v.mod_time.map(Timestamp::from), size: Some(v.size as i64), ..Default::default() };
 
                 if fetch_owner.is_some_and(|v| v) {
                     obj.owner = Some(Owner {
@@ -512,7 +509,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         try_!(store.put_object(&bucket, &key, reader, &ObjectOptions::default()).await);
@@ -540,7 +537,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         let MultipartUploadResult { upload_id, .. } =
@@ -583,7 +580,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         try_!(store.put_object_part(&bucket, &key, &upload_id, part_id, data, &opts).await);
@@ -646,7 +643,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         try_!(
@@ -676,7 +673,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         let opts = &ObjectOptions::default();
@@ -819,7 +816,7 @@ impl S3 for FS {
             tag_set: object_info
                 .tags
                 .map(|tags| tags.into_iter().map(|(key, value)| Tag { key, value }).collect())
-                .unwrap_or_else(|| vec![]),
+                .unwrap_or_else(Vec::new),
             version_id: None,
         }))
     }
@@ -859,7 +856,7 @@ impl S3 for FS {
         let lock = layer.read().await;
         let store = match lock.as_ref() {
             Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("Not init",))),
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
         if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {

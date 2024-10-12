@@ -194,7 +194,7 @@ impl ECStore {
         let mut uniq = HashSet::new();
 
         for (disks_ress, _disks_errs) in results {
-            for (_i, disks_res) in disks_ress.iter().enumerate() {
+            for disks_res in disks_ress.iter() {
                 if disks_res.is_none() {
                     // TODO handle errs
                     continue;
