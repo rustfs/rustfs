@@ -3,17 +3,13 @@
 use ecstore::disk::VolumeInfo;
 use protos::{
     models::{PingBody, PingBodyBuilder},
-    proto_gen::node_service::{
-        node_service_client::NodeServiceClient, ListVolumesRequest, MakeVolumeRequest, PingRequest, PingResponse, ReadAllRequest,
-    },
+    node_service_time_out_client,
+    proto_gen::node_service::{ListVolumesRequest, MakeVolumeRequest, PingRequest, PingResponse, ReadAllRequest},
 };
 use std::error::Error;
 use tonic::Request;
 
-async fn get_client() -> Result<NodeServiceClient<tonic::transport::Channel>, Box<dyn Error>> {
-    // Ok(NodeServiceClient::connect("http://220.181.1.138:9000").await?)
-    Ok(NodeServiceClient::connect("http://localhost:9000").await?)
-}
+const CLUSTER_ADDR: &str = "http://localhost:9000";
 
 #[tokio::test]
 async fn ping() -> Result<(), Box<dyn Error>> {
@@ -31,7 +27,7 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     assert!(decoded_payload.is_ok());
 
     // 创建客户端
-    let mut client = get_client().await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
 
     // 构造 PingRequest
     let request = Request::new(PingRequest {
@@ -55,7 +51,7 @@ async fn ping() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn make_volume() -> Result<(), Box<dyn Error>> {
-    let mut client = get_client().await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(MakeVolumeRequest {
         disk: "data".to_string(),
         volume: "dandan".to_string(),
@@ -72,7 +68,7 @@ async fn make_volume() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn list_volumes() -> Result<(), Box<dyn Error>> {
-    let mut client = get_client().await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(ListVolumesRequest {
         disk: "data".to_string(),
     });
@@ -90,7 +86,7 @@ async fn list_volumes() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn read_all() -> Result<(), Box<dyn Error>> {
-    let mut client = get_client().await?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(ReadAllRequest {
         disk: "data".to_string(),
         volume: "ff".to_string(),
