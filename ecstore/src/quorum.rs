@@ -41,12 +41,12 @@ pub fn object_op_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
 }
 
 // 用于检查错误是否被忽略的函数
-fn is_err_ignored(err: &Error, ignored_errs: &Vec<Box<dyn CheckErrorFn>>) -> bool {
+fn is_err_ignored(err: &Error, ignored_errs: &[Box<dyn CheckErrorFn>]) -> bool {
     ignored_errs.iter().any(|ignored_err| ignored_err.is(err))
 }
 
 // 减少错误数量并返回出现次数最多的错误
-fn reduce_errs(errs: &Vec<Option<Error>>, ignored_errs: &Vec<Box<dyn CheckErrorFn>>) -> (usize, Option<Error>) {
+fn reduce_errs(errs: &[Option<Error>], ignored_errs: &[Box<dyn CheckErrorFn>]) -> (usize, Option<Error>) {
     let mut error_counts: HashMap<String, usize> = HashMap::new();
     let mut error_map: HashMap<String, usize> = HashMap::new(); // 存err位置
     let nil = "nil".to_string();
@@ -59,7 +59,7 @@ fn reduce_errs(errs: &Vec<Option<Error>>, ignored_errs: &Vec<Box<dyn CheckErrorF
 
         let err = operr.as_ref().unwrap();
 
-        if is_err_ignored(err, &ignored_errs) {
+        if is_err_ignored(err, ignored_errs) {
             continue;
         }
 
@@ -71,7 +71,7 @@ fn reduce_errs(errs: &Vec<Option<Error>>, ignored_errs: &Vec<Box<dyn CheckErrorF
 
     let mut max = 0;
     let mut max_err = nil.clone();
-    for (&ref err, &count) in error_counts.iter() {
+    for (err, &count) in error_counts.iter() {
         if count > max || (count == max && *err == nil) {
             max = count;
             max_err = err.clone();
@@ -93,8 +93,8 @@ fn reduce_errs(errs: &Vec<Option<Error>>, ignored_errs: &Vec<Box<dyn CheckErrorF
 
 // 根据quorum验证错误数量
 fn reduce_quorum_errs(
-    errs: &Vec<Option<Error>>,
-    ignored_errs: &Vec<Box<dyn CheckErrorFn>>,
+    errs: &[Option<Error>],
+    ignored_errs: &[Box<dyn CheckErrorFn>],
     quorum: usize,
     quorum_err: QuorumError,
 ) -> Option<Error> {
@@ -109,8 +109,8 @@ fn reduce_quorum_errs(
 // 根据读quorum验证错误数量
 // 返回最大错误数量的下标，或QuorumError
 pub fn reduce_read_quorum_errs(
-    errs: &Vec<Option<Error>>,
-    ignored_errs: &Vec<Box<dyn CheckErrorFn>>,
+    errs: &[Option<Error>],
+    ignored_errs: &[Box<dyn CheckErrorFn>],
     read_quorum: usize,
 ) -> Option<Error> {
     reduce_quorum_errs(errs, ignored_errs, read_quorum, QuorumError::Read)
@@ -119,8 +119,8 @@ pub fn reduce_read_quorum_errs(
 // 根据写quorum验证错误数量
 // 返回最大错误数量的下标，或QuorumError
 pub fn reduce_write_quorum_errs(
-    errs: &Vec<Option<Error>>,
-    ignored_errs: &Vec<Box<dyn CheckErrorFn>>,
+    errs: &[Option<Error>],
+    ignored_errs: &[Box<dyn CheckErrorFn>],
     write_quorum: usize,
 ) -> Option<Error> {
     reduce_quorum_errs(errs, ignored_errs, write_quorum, QuorumError::Write)

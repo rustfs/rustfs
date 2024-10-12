@@ -45,8 +45,8 @@ impl NsLockMap {
         &mut self,
         volume: &String,
         path: &String,
-        lock_source: &String,
-        ops_id: &String,
+        lock_source: &str,
+        ops_id: &str,
         read_lock: bool,
         timeout: Duration,
     ) -> bool {
@@ -58,12 +58,11 @@ impl NsLockMap {
         });
         nslk.reference += 1;
 
-        let locked: bool;
-        if read_lock {
-            locked = nslk.lock.get_r_lock(ops_id, lock_source, &timeout).await;
+        let locked = if read_lock {
+            nslk.lock.get_r_lock(ops_id, lock_source, &timeout).await
         } else {
-            locked = nslk.lock.get_lock(ops_id, lock_source, &timeout).await;
-        }
+            nslk.lock.get_lock(ops_id, lock_source, &timeout).await
+        };
 
         if !locked {
             nslk.reference -= 1;
@@ -72,7 +71,7 @@ impl NsLockMap {
             }
         }
 
-        return locked;
+        locked
     }
 
     async fn un_lock(&mut self, volume: &String, path: &String, read_lock: bool) {
@@ -90,8 +89,6 @@ impl NsLockMap {
             if nslk.reference == 0 {
                 w_lock_map.remove(&resource);
             }
-        } else {
-            return;
         }
     }
 }
@@ -138,7 +135,8 @@ impl RWLocker for DistLockInstance {
     }
 
     async fn un_lock(&mut self) -> Result<()> {
-        Ok(self.lock.un_lock().await)
+        self.lock.un_lock().await;
+        Ok(())
     }
 
     async fn get_u_lock(&mut self, opts: &Options) -> Result<bool> {
@@ -148,7 +146,8 @@ impl RWLocker for DistLockInstance {
     }
 
     async fn un_r_lock(&mut self) -> Result<()> {
-        Ok(self.lock.un_r_lock().await)
+        self.lock.un_r_lock().await;
+        Ok(())
     }
 }
 

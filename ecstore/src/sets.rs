@@ -68,7 +68,7 @@ impl Sets {
             }
 
             if !endpoint.is_local {
-                let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap().to_string());
+                let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
                 if !unique[set_idx].contains(&host_port) {
                     unique[set_idx].push(host_port);
                     lockers[set_idx].push(new_lock_api(false, Some(endpoint.url.clone())));

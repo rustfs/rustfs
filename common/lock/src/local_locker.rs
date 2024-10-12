@@ -75,7 +75,7 @@ impl LocalLocker {
         };
 
         self.lock_map.iter().for_each(|(_, value)| {
-            if value.len() > 0 {
+            if !value.is_empty() {
                 if value[0].writer {
                     st.writes += 1;
                 } else {
@@ -84,7 +84,7 @@ impl LocalLocker {
             }
         });
 
-        return st;
+        st
     }
 
     fn dump_lock_map(&mut self) -> HashMap<String, Vec<LockRequesterInfo>> {
@@ -93,7 +93,7 @@ impl LocalLocker {
             lock_copy.insert(key.to_string(), value.to_vec());
         });
 
-        return lock_copy;
+        lock_copy
     }
 
     fn expire_old_locks(&mut self, interval: Duration) {
@@ -109,8 +109,6 @@ impl LocalLocker {
                 true
             });
         });
-
-        return;
     }
 }
 
@@ -165,9 +163,9 @@ impl Locker for LocalLocker {
         for resource in args.resources.iter() {
             match self.lock_map.get_mut(resource) {
                 Some(lris) => {
-                    if !is_write_lock(&lris) {
+                    if !is_write_lock(lris) {
                         if err_info.is_empty() {
-                            err_info = String::from(format!("unlock attempted on a read locked entity: {}", resource));
+                            err_info = format!("unlock attempted on a read locked entity: {}", resource);
                         } else {
                             err_info.push_str(&format!(", {}", resource));
                         }
@@ -184,7 +182,7 @@ impl Locker for LocalLocker {
                             true
                         });
                     }
-                    if lris.len() == 0 {
+                    if lris.is_empty() {
                         self.lock_map.remove(resource);
                     }
                 }
@@ -250,7 +248,7 @@ impl Locker for LocalLocker {
         let resource = &args.resources[0];
         match self.lock_map.get_mut(resource) {
             Some(lris) => {
-                if is_write_lock(&lris) {
+                if is_write_lock(lris) {
                     return Err(Error::from_string(format!("runlock attempted on a write locked entity: {}", resource)));
                 } else {
                     lris.retain(|lri| {
@@ -265,12 +263,12 @@ impl Locker for LocalLocker {
                         true
                     });
                 }
-                if lris.len() == 0 {
+                if lris.is_empty() {
                     self.lock_map.remove(resource);
                 }
             }
             None => {
-                return Ok(reply || true);
+                return Ok(reply);
             }
         };
 
@@ -291,18 +289,17 @@ impl Locker for LocalLocker {
     async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
         let mut reply: bool;
         if args.uid.is_empty() {
-            args.resources.iter().for_each(|resource| match self.lock_map.get(resource) {
-                Some(lris) => {
+            args.resources.iter().for_each(|resource| {
+                if let Some(lris) = self.lock_map.get(resource) {
                     lris.iter().for_each(|lri| {
                         let mut key = lri.uid.to_string();
                         format_uuid(&mut key, &lri.idx);
                         self.lock_uid.remove(&key);
                     });
-                    if lris.len() == 0 {
+                    if lris.is_empty() {
                         self.lock_map.remove(resource);
                     }
                 }
-                None => (),
             });
 
             return Ok(true);
@@ -330,7 +327,7 @@ impl Locker for LocalLocker {
                             });
                         }
                         idx += 1;
-                        if lris.len() == 0 {
+                        if lris.is_empty() {
                             need_remove_resource.push(resource.to_string());
                         }
                     }

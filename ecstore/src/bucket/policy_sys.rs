@@ -16,7 +16,6 @@ impl PolicySys {
                 if !BucketMetadataError::BucketPolicyNotFound.is(&err) {
                     warn!("config get err {:?}", err);
                 }
-                ()
             }
         }
 

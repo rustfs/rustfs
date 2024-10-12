@@ -18,7 +18,7 @@ impl ConfigError {
 
 pub fn is_not_found(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<ConfigError>() {
-        ConfigError::is_not_found(&e)
+        ConfigError::is_not_found(e)
     } else {
         false
     }

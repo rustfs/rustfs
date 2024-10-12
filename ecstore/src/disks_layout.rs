@@ -98,7 +98,7 @@ impl DisksLayout {
             Ok(res) => res,
             Err(err) => {
                 debug!("{} not set use default:0, {:?}", ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, err);
-                format!("0")
+                "0".to_string()
             }
         };
         let set_drive_count: usize = set_drive_count_env.parse()?;
@@ -425,8 +425,7 @@ fn get_set_indexes<T: AsRef<str>>(
                 )));
             }
             // Final set size with all the symmetry accounted for.
-            let set_size = common_set_drive_count(common_size, &set_counts);
-            set_size
+            common_set_drive_count(common_size, &set_counts)
         }
     };
 

@@ -97,13 +97,11 @@ impl BPStatement {
                         self.resources, act
                     )));
                 }
-            } else {
-                if !self.resources.bucket_resource_exists() {
-                    return Err(Error::msg(format!(
-                        "unsupported bucket Resource found {:?} for action {:?}",
-                        self.resources, act
-                    )));
-                }
+            } else if !self.resources.bucket_resource_exists() {
+                return Err(Error::msg(format!(
+                    "unsupported bucket Resource found {:?} for action {:?}",
+                    self.resources, act
+                )));
             }
 
             let key_diff = self.conditions.keys().difference(&IAMActionConditionKeyMap.lookup(act));
@@ -129,7 +127,7 @@ impl BPStatement {
             let mut resource = args.bucket_name.clone();
             if !args.object_name.is_empty() {
                 if !args.object_name.starts_with("/") {
-                    resource.push_str("/");
+                    resource.push('/');
                 }
 
                 resource.push_str(&args.object_name);
@@ -160,10 +158,8 @@ pub struct BucketPolicy {
 impl BucketPolicy {
     pub fn is_allowed(&self, args: &BucketPolicyArgs) -> bool {
         for statement in self.statements.iter() {
-            if statement.effect == Effect::Deny {
-                if !statement.is_allowed(args) {
-                    return false;
-                }
+            if statement.effect == Effect::Deny && !statement.is_allowed(args) {
+                return false;
             }
         }
 
@@ -172,10 +168,8 @@ impl BucketPolicy {
         }
 
         for statement in self.statements.iter() {
-            if statement.effect == Effect::Allow {
-                if statement.is_allowed(args) {
-                    return true;
-                }
+            if statement.effect == Effect::Allow && statement.is_allowed(args) {
+                return true;
             }
         }
 
@@ -196,9 +190,7 @@ impl BucketPolicy {
         }
 
         for statement in self.statements.iter() {
-            if let Err(err) = statement.is_valid() {
-                return Err(err);
-            }
+            statement.is_valid()?;
         }
         Ok(())
     }
@@ -219,7 +211,7 @@ impl BucketPolicy {
     }
 
     pub fn unmarshal(buf: &[u8]) -> Result<Self> {
-        let mut p = serde_json::from_slice::<BucketPolicy>(&buf)?;
+        let mut p = serde_json::from_slice::<BucketPolicy>(buf)?;
         p.drop_duplicate_statements();
         Ok(p)
 

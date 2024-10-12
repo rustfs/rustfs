@@ -17,13 +17,11 @@ impl LRWMutex {
         let id = self.id.read().await.clone();
         let source = self.source.read().await.clone();
         let timeout = Duration::from_secs(10000);
-        let x = self
-            .look_loop(
-                &id, &source, &timeout, // big enough
-                is_write,
-            )
-            .await;
-        x
+        self.look_loop(
+            &id, &source, &timeout, // big enough
+            is_write,
+        )
+        .await
     }
 
     pub async fn get_lock(&self, id: &str, source: &str, timeout: &Duration) -> bool {
@@ -36,13 +34,11 @@ impl LRWMutex {
         let id = self.id.read().await.clone();
         let source = self.source.read().await.clone();
         let timeout = Duration::from_secs(10000);
-        let x = self
-            .look_loop(
-                &id, &source, &timeout, // big enough
-                is_write,
-            )
-            .await;
-        x
+        self.look_loop(
+            &id, &source, &timeout, // big enough
+            is_write,
+        )
+        .await
     }
 
     pub async fn get_r_lock(&self, id: &str, source: &str, timeout: &Duration) -> bool {
@@ -61,11 +57,9 @@ impl LRWMutex {
                 *self.is_write.write().await = true;
                 locked = true;
             }
-        } else {
-            if !*self.is_write.read().await {
-                *self.refrence.write().await += 1;
-                locked = true;
-            }
+        } else if !*self.is_write.read().await {
+            *self.refrence.write().await += 1;
+            locked = true;
         }
 
         locked
@@ -112,13 +106,9 @@ impl LRWMutex {
                 *self.is_write.write().await = false;
                 unlocked = true;
             }
-        } else {
-            if !*self.is_write.read().await {
-                if *self.refrence.read().await > 0 {
-                    *self.refrence.write().await -= 1;
-                    unlocked = true;
-                }
-            }
+        } else if !*self.is_write.read().await && *self.refrence.read().await > 0 {
+            *self.refrence.write().await -= 1;
+            unlocked = true;
         }
 
         unlocked
