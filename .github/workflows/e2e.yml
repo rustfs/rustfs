@@ -2,7 +2,6 @@ name: E2E
 
 on:
   workflow_dispatch:
-  push:
   pull_request:
     branches: [ "main" ]
 
@@ -88,6 +87,8 @@ jobs:
           # components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: run fs start
         working-directory: .
