@@ -61,7 +61,7 @@ impl Resource {
         if self.rtype == ResourceARNType::UnknownARN {
             return false;
         }
-        if self.is_s3() && self.pattern.starts_with("/") {
+        if self.is_s3() && self.pattern.starts_with('/') {
             return false;
         }
         if self.is_kms() && self.pattern.as_bytes().iter().any(|&v| v == b'/' || v == b'\\' || v == b'.') {
@@ -77,10 +77,10 @@ impl Resource {
         self.rtype == ResourceARNType::ResourceARNKMS
     }
     pub fn is_bucket_pattern(&self) -> bool {
-        !self.pattern.contains("/") || self.pattern.eq("*")
+        !self.pattern.contains('/') || self.pattern.eq("*")
     }
     pub fn is_object_pattern(&self) -> bool {
-        self.pattern.contains("/") || self.pattern.contains("*")
+        self.pattern.contains('/') || self.pattern.contains('*')
     }
     pub fn is_match(&self, res: &str, condition_values: &HashMap<String, Vec<String>>) -> bool {
         let mut pattern = res.to_string();

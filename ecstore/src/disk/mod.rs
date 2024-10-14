@@ -222,7 +222,7 @@ impl MetaCacheEntry {
         Ok(wr)
     }
     pub fn is_dir(&self) -> bool {
-        self.metadata.is_empty() && self.name.ends_with("/")
+        self.metadata.is_empty() && self.name.ends_with('/')
     }
     pub fn is_object(&self) -> bool {
         !self.metadata.is_empty()

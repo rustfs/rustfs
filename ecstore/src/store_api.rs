@@ -156,7 +156,7 @@ impl FileInfo {
         ObjectInfo {
             bucket: bucket.to_string(),
             name: object.to_string(),
-            is_dir: object.starts_with("/"),
+            is_dir: object.starts_with('/'),
             parity_blocks: self.erasure.parity_blocks,
             data_blocks: self.erasure.data_blocks,
             version_id: self.version_id,
@@ -258,7 +258,11 @@ pub enum BitrotAlgorithm {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MakeBucketOptions {
-    pub force_create: bool,
+    pub lock_enabled: bool,
+    pub versioning_enabled: bool,
+    pub force_create: bool,                 // Create buckets even if they are already created.
+    pub created_at: Option<OffsetDateTime>, // only for site replication
+    pub no_lock: bool,
 }
 
 pub struct DeleteBucketOptions {
@@ -554,6 +558,7 @@ pub trait StorageAPI: ObjectIO {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
+    #[warn(clippy::too_many_arguments)]
     async fn list_objects_v2(
         &self,
         bucket: &str,

@@ -20,10 +20,11 @@ serde.workspace = true
 time.workspace = true
 serde_json.workspace = true
 tracing-error.workspace = true
+s3s.workspace = true
 http.workspace = true
 url.workspace = true
 uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
-reed-solomon-erasure = { version = "6.0.0", features = [ "simd-accel" ] }
+reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 transform-stream = "0.3.0"
 lazy_static.workspace = true
 lock.workspace = true
@@ -33,7 +34,6 @@ path-absolutize = "3.1.1"
 protos.workspace = true
 rmp-serde = "1.3.0"
 tokio-util = { version = "0.7.12", features = ["io"] }
-s3s = "0.10.0"
 crc32fast = "1.4.2"
 siphasher = "1.0.1"
 base64-simd = "0.8.0"
@@ -48,6 +48,7 @@ rmp = "0.8.14"
 byteorder = "1.5.0"
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 num_cpus = "1.16"
+s3s-policy.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 openssl = "0.10.66"

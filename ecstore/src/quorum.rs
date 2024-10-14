@@ -74,7 +74,7 @@ fn reduce_errs(errs: &[Option<Error>], ignored_errs: &[Box<dyn CheckErrorFn>]) -
     for (err, &count) in error_counts.iter() {
         if count > max || (count == max && *err == nil) {
             max = count;
-            max_err = err.clone();
+            max_err.clone_from(err);
         }
     }
 

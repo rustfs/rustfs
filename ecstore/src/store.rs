@@ -1,5 +1,7 @@
 #![allow(clippy::map_entry)]
-use crate::bucket::bucket_metadata_sys_set;
+
+use crate::bucket::metadata;
+use crate::bucket::metadata_sys::set_bucket_metadata;
 use crate::disk::endpoint::EndpointType;
 use crate::global::{is_dist_erasure, set_object_layer, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
 use crate::store_api::ObjectIO;
@@ -22,6 +24,7 @@ use backon::{ExponentialBuilder, Retryable};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
 use http::HeaderMap;
+use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -31,7 +34,7 @@ use time::OffsetDateTime;
 use tokio::fs;
 use tokio::sync::Semaphore;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -508,9 +511,24 @@ impl StorageAPI for ECStore {
         self.peer_sys.make_bucket(bucket, opts).await?;
 
         let mut meta = BucketMetadata::new(bucket);
+
+        warn!("make bucket opsts {:?}", &opts);
+
+        if opts.lock_enabled {
+            let cfg = ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                ..Default::default()
+            };
+
+            meta.object_lock_config_xml = metadata::serialize::<ObjectLockConfiguration>(&cfg)?;
+
+            warn!("make bucket add object_lock_config_xml {:?}", &meta.object_lock_config_xml);
+            // FIXME: version config
+        }
+
         meta.save(self).await?;
 
-        bucket_metadata_sys_set(bucket.to_string(), meta).await;
+        set_bucket_metadata(bucket.to_string(), meta).await;
 
         // TODO: toObjectErr
 

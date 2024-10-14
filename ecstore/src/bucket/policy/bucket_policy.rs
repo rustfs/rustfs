@@ -126,7 +126,7 @@ impl BPStatement {
 
             let mut resource = args.bucket_name.clone();
             if !args.object_name.is_empty() {
-                if !args.object_name.starts_with("/") {
+                if !args.object_name.starts_with('/') {
                     resource.push('/');
                 }
 
