@@ -1,0 +1,28 @@
+[package]
+name = "iam"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+log.workspace = true
+time = { workspace = true, features = ["serde-human-readable"] }
+serde = { workspace = true, features = ["derive", "rc"] }
+ecstore = { path = "../ecstore" }
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+strum = { version = "0.26.3", features = ["derive"] }
+arc-swap = "1.7.1"
+crypto = { path = "../crypto" }
+ipnetwork = "0.20.0"
+itertools = "0.13.0"
+futures.workspace = true
+rand.workspace = true
+base64-simd = "0.8.0"
+
+[dev-dependencies]
+test-case.workspace = true

@@ -21,10 +21,11 @@ use hyper_util::{
     server::conn::auto::Builder as ConnBuilder,
     service::TowerToHyperService,
 };
+use iam::init_iam_sys;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use service::hybrid;
-use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
+use std::{io::IsTerminal, net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tracing::{debug, error, info, warn};
@@ -195,6 +196,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_data_scanner().await;
     // init auto heal
     init_auto_heal().await;
+    init_iam_sys(store.clone()).await.unwrap();
 
     info!("server was started");
 

@@ -1,5 +1,4 @@
 [workspace]
-resolver = "2"
 members = [
     "madmin",
     "rustfs",
@@ -11,7 +10,10 @@ members = [
     "api/admin",
     "reader",
     "common/workers",
+    "iam",
+    "crypto",
 ]
+resolver = "2"
 
 [workspace.package]
 edition = "2021"
@@ -90,3 +92,4 @@ log = "0.4.22"
 axum = "0.7.9"
 md-5 = "0.10.6"
 workers = { path = "./common/workers" }
+test-case = "3.3.1"

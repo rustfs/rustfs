@@ -1,0 +1,32 @@
+[package]
+name = "crypto"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+aes-gcm = { version = "0.10.3", features = ["std"], optional = true }
+argon2 = { version = "0.5.3", features = ["std"], optional = true }
+cfg-if = "1.0.0"
+chacha20poly1305 = { version = "0.10.1", optional = true }
+jsonwebtoken = "9.3.0"
+pbkdf2 = { version = "0.12.2", optional = true }
+rand.workspace = true
+sha2 = "0.10.8"
+thiserror.workspace = true
+serde_json.workspace = true
+
+
+[dev-dependencies]
+test-case.workspace = true
+time.workspace = true
+
+[features]
+fips = []
+crypto = ["dep:aes-gcm", "dep:argon2", "dep:chacha20poly1305", "dep:pbkdf2"]
+# default = ["crypto", "fips"]
+
+[lints.clippy]
+unwrap_used = "deny"
