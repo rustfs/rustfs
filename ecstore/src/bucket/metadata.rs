@@ -1,17 +1,19 @@
-use super::{
-    encryption::BucketSSEConfig, event, lifecycle::lifecycle::Lifecycle, objectlock, policy::bucket_policy::BucketPolicy,
-    quota::BucketQuota, replication, tags::Tags, target::BucketTargets, versioning::Versioning,
-};
+use super::{quota::BucketQuota, target::BucketTargets};
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmp_serde::Serializer as rmpSerializer;
+use s3s::dto::{
+    BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
+    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
+};
+use s3s::xml;
+use s3s_policy::model::Policy;
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::{error, warn};
 
-use crate::bucket::tags;
 use crate::config;
 use crate::config::common::{read_config, save_config};
 use crate::error::{Error, Result};
@@ -34,7 +36,7 @@ pub const BUCKET_VERSIONING_CONFIG: &str = "versioning.xml";
 pub const BUCKET_REPLICATION_CONFIG: &str = "replication.xml";
 pub const BUCKET_TARGETS_FILE: &str = "bucket-targets.json";
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct BucketMetadata {
     pub name: String,
@@ -68,23 +70,23 @@ pub struct BucketMetadata {
     pub new_field_updated_at: OffsetDateTime,
 
     #[serde(skip)]
-    pub policy_config: Option<BucketPolicy>,
+    pub policy_config: Option<Policy>,
     #[serde(skip)]
-    pub notification_config: Option<event::Config>,
+    pub notification_config: Option<NotificationConfiguration>,
     #[serde(skip)]
-    pub lifecycle_config: Option<Lifecycle>,
+    pub lifecycle_config: Option<BucketLifecycleConfiguration>,
     #[serde(skip)]
-    pub object_lock_config: Option<objectlock::Config>,
+    pub object_lock_config: Option<ObjectLockConfiguration>,
     #[serde(skip)]
-    pub versioning_config: Option<Versioning>,
+    pub versioning_config: Option<VersioningConfiguration>,
     #[serde(skip)]
-    pub sse_config: Option<BucketSSEConfig>,
+    pub sse_config: Option<ServerSideEncryptionConfiguration>,
     #[serde(skip)]
-    pub tagging_config: Option<Tags>,
+    pub tagging_config: Option<Tagging>,
     #[serde(skip)]
     pub quota_config: Option<BucketQuota>,
     #[serde(skip)]
-    pub replication_config: Option<replication::Config>,
+    pub replication_config: Option<ReplicationConfiguration>,
     #[serde(skip)]
     pub bucket_target_config: Option<BucketTargets>,
     #[serde(skip)]
@@ -296,32 +298,32 @@ impl BucketMetadata {
 
     fn parse_all_configs(&mut self, _api: &ECStore) -> Result<()> {
         if !self.policy_config_json.is_empty() {
-            self.policy_config = Some(BucketPolicy::unmarshal(&self.policy_config_json)?);
+            self.policy_config = Some(serde_json::from_slice(&self.policy_config_json)?);
         }
         if !self.notification_config_xml.is_empty() {
-            self.notification_config = Some(event::Config::unmarshal(&self.notification_config_xml)?);
+            self.notification_config = Some(deserialize::<NotificationConfiguration>(&self.notification_config_xml)?);
         }
         if !self.lifecycle_config_xml.is_empty() {
-            self.lifecycle_config = Some(Lifecycle::unmarshal(&self.lifecycle_config_xml)?);
+            self.lifecycle_config = Some(deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml)?);
         }
 
         if !self.object_lock_config_xml.is_empty() {
-            self.object_lock_config = Some(objectlock::Config::unmarshal(&self.object_lock_config_xml)?);
+            self.object_lock_config = Some(deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml)?);
         }
         if !self.versioning_config_xml.is_empty() {
-            self.versioning_config = Some(Versioning::unmarshal(&self.versioning_config_xml)?);
+            self.versioning_config = Some(deserialize::<VersioningConfiguration>(&self.versioning_config_xml)?);
         }
         if !self.encryption_config_xml.is_empty() {
-            self.sse_config = Some(BucketSSEConfig::unmarshal(&self.encryption_config_xml)?);
+            self.sse_config = Some(deserialize::<ServerSideEncryptionConfiguration>(&self.encryption_config_xml)?);
         }
         if !self.tagging_config_xml.is_empty() {
-            self.tagging_config = Some(tags::Tags::unmarshal(&self.tagging_config_xml)?);
+            self.tagging_config = Some(deserialize::<Tagging>(&self.tagging_config_xml)?);
         }
         if !self.quota_config_json.is_empty() {
             self.quota_config = Some(BucketQuota::unmarshal(&self.quota_config_json)?);
         }
         if !self.replication_config_xml.is_empty() {
-            self.replication_config = Some(replication::Config::unmarshal(&self.replication_config_xml)?);
+            self.replication_config = Some(deserialize::<ReplicationConfiguration>(&self.replication_config_xml)?);
         }
         if !self.bucket_targets_config_json.is_empty() {
             self.bucket_target_config = Some(BucketTargets::unmarshal(&self.bucket_targets_config_json)?);
@@ -412,4 +414,32 @@ mod test {
 
         assert_eq!(bm.name, new.name);
     }
+}
+
+pub fn deserialize<T>(input: &[u8]) -> xml::DeResult<T>
+where
+    T: for<'xml> xml::Deserialize<'xml>,
+{
+    let mut d = xml::Deserializer::new(input);
+    let ans = T::deserialize(&mut d)?;
+    d.expect_eof()?;
+    Ok(ans)
+}
+
+pub fn serialize_content<T: xml::SerializeContent>(val: &T) -> xml::SerResult<String> {
+    let mut buf = Vec::with_capacity(256);
+    {
+        let mut ser = xml::Serializer::new(&mut buf);
+        val.serialize_content(&mut ser)?;
+    }
+    Ok(String::from_utf8(buf).unwrap())
+}
+
+pub fn serialize<T: xml::Serialize>(val: &T) -> xml::SerResult<Vec<u8>> {
+    let mut buf = Vec::with_capacity(256);
+    {
+        let mut ser = xml::Serializer::new(&mut buf);
+        val.serialize(&mut ser)?;
+    }
+    Ok(buf)
 }

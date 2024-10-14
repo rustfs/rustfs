@@ -6,7 +6,7 @@ mod storage;
 use clap::Parser;
 use common::error::{Error, Result};
 use ecstore::{
-    bucket::init_bucket_metadata_sys,
+    bucket::metadata_sys::init_bucket_metadata_sys,
     endpoints::EndpointServerPools,
     set_global_endpoints,
     store::{init_local_disks, ECStore},
@@ -128,11 +128,11 @@ async fn run(opt: config::Opt) -> Result<()> {
         info!("authentication is enabled {}, {}", &access_key, &secret_key);
         b.set_auth(SimpleAuth::from_single(access_key, secret_key));
 
-        // Enable parsing virtual-hosted-style requests
-        if let Some(dm) = opt.domain_name {
-            info!("virtual-hosted-style requests are enabled use domain_name {}", &dm);
-            b.set_base_domain(dm);
-        }
+        // // Enable parsing virtual-hosted-style requests
+        // if let Some(dm) = opt.domain_name {
+        //     info!("virtual-hosted-style requests are enabled use domain_name {}", &dm);
+        //     b.set_base_domain(dm);
+        // }
 
         // if domain_name.is_some() {
         //     info!(

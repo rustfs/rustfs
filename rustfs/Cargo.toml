@@ -59,7 +59,7 @@ futures.workspace = true
 futures-util.workspace = true
 # uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
-s3s = "0.10.0"
+s3s.workspace = true
 clap = { version = "4.5.20", features = ["derive"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 hyper-util = { version = "0.1.9", features = [

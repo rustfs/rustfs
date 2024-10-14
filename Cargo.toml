@@ -46,7 +46,10 @@ prost-types = "0.13.3"
 protobuf = "3.6"
 protos = { path = "./common/protos" }
 rand = "0.8.5"
-s3s = { version = "0.10.1", default-features = true, features = ["tower"] }
+s3s = { git = "https://github.com/Nugine/s3s.git", rev = "0caf79822ae1f2e7a7fad3c4a093c94dd2e2c33f", default-features = true, features = [
+    "tower",
+] }
+s3s-policy = { git = "https://github.com/Nugine/s3s.git", rev = "0caf79822ae1f2e7a7fad3c4a093c94dd2e2c33f" }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
 thiserror = "1.0.64"

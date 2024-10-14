@@ -11,18 +11,20 @@ use crate::error::{Error, Result};
 use crate::global::{is_dist_erasure, is_erasure, new_object_layer_fn, GLOBAL_Endpoints};
 use crate::store::ECStore;
 use futures::future::join_all;
-use lazy_static::lazy_static;
+use s3s::dto::{
+    BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
+    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
+};
+use s3s_policy::model::Policy;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tracing::{error, warn};
 
-use super::encryption::BucketSSEConfig;
-use super::lifecycle::lifecycle::Lifecycle;
-use super::metadata::{load_bucket_metadata, BucketMetadata};
-use super::policy::bucket_policy::BucketPolicy;
+use super::metadata::{deserialize, load_bucket_metadata, BucketMetadata};
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
-use super::{event, objectlock, replication, tags, versioning};
+
+use lazy_static::lazy_static;
 
 lazy_static! {
     static ref GLOBAL_BucketMetadataSys: Arc<RwLock<BucketMetadataSys>> = Arc::new(RwLock::new(BucketMetadataSys::new()));
@@ -32,24 +34,95 @@ pub async fn init_bucket_metadata_sys(api: ECStore, buckets: Vec<String>) {
     let mut sys = GLOBAL_BucketMetadataSys.write().await;
     sys.init(api, buckets).await
 }
-pub async fn get_bucket_metadata_sys() -> Arc<RwLock<BucketMetadataSys>> {
+
+pub(super) async fn get_bucket_metadata_sys() -> Arc<RwLock<BucketMetadataSys>> {
     GLOBAL_BucketMetadataSys.clone()
 }
 
-pub async fn bucket_metadata_sys_set(bucket: String, bm: BucketMetadata) {
+pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) {
     let sys = GLOBAL_BucketMetadataSys.write().await;
-    sys.set(bucket, bm).await
+    sys.set(bucket, Arc::new(bm)).await
+}
+
+pub async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+
+    bucket_meta_sys.update(bucket, config_file, data).await
+}
+
+pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+
+    bucket_meta_sys.delete(&bucket, config_file).await
+}
+
+pub async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_tagging_config(bucket).await
+}
+
+pub async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_lifecycle_config(bucket).await
+}
+
+pub async fn get_sse_config(bucket: &str) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_sse_config(bucket).await
+}
+
+pub async fn get_object_lock_config(bucket: &str) -> Result<(ObjectLockConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_object_lock_config(bucket).await
+}
+
+pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_replication_config(bucket).await
+}
+
+pub async fn get_notification_config(bucket: &str) -> Result<Option<NotificationConfiguration>> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_notification_config(bucket).await
+}
+
+pub async fn get_versioning_config(bucket: &str) -> Result<(VersioningConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_versioning_config(bucket).await
+}
+
+pub async fn get_config_from_disk(bucket: &str) -> Result<BucketMetadata> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_config_from_disk(bucket).await
 }
 
 #[derive(Debug, Default)]
 pub struct BucketMetadataSys {
-    metadata_map: RwLock<HashMap<String, BucketMetadata>>,
+    metadata_map: RwLock<HashMap<String, Arc<BucketMetadata>>>,
     api: Option<ECStore>,
     initialized: RwLock<bool>,
 }
 
 impl BucketMetadataSys {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -108,7 +181,7 @@ impl BucketMetadataSys {
             match res {
                 Ok(res) => {
                     if let Some(bucket) = buckets.get(idx) {
-                        mp.insert(bucket.clone(), res);
+                        mp.insert(bucket.clone(), Arc::new(res));
                     }
                 }
                 Err(e) => {
@@ -123,7 +196,7 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn get(&self, bucket: &str) -> Result<BucketMetadata> {
+    pub async fn get(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         if is_meta_bucketname(bucket) {
             return Err(Error::new(ConfigError::NotFound));
         }
@@ -136,7 +209,7 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn set(&self, bucket: String, bm: BucketMetadata) {
+    pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
         if !is_meta_bucketname(&bucket) {
             let mut map = self.metadata_map.write().await;
             map.insert(bucket, bm);
@@ -166,7 +239,7 @@ impl BucketMetadataSys {
             };
 
             if !meta.lifecycle_config_xml.is_empty() {
-                let cfg = Lifecycle::unmarshal(&meta.lifecycle_config_xml)?;
+                let cfg = deserialize::<BucketLifecycleConfiguration>(&meta.lifecycle_config_xml)?;
                 // TODO: FIXME:
                 // for _v in cfg.rules.iter() {
                 //     break;
@@ -205,12 +278,12 @@ impl BucketMetadataSys {
 
         let updated = bm.update_config(config_file, data)?;
 
-        self.save(&mut bm).await?;
+        self.save(bm).await?;
 
         Ok(updated)
     }
 
-    async fn save(&self, bm: &mut BucketMetadata) -> Result<()> {
+    async fn save(&self, bm: BucketMetadata) -> Result<()> {
         let layer = new_object_layer_fn();
         let lock = layer.read().await;
         let store = match lock.as_ref() {
@@ -222,9 +295,11 @@ impl BucketMetadataSys {
             return Err(Error::msg("errInvalidArgument"));
         }
 
+        let mut bm = bm;
+
         bm.save(store).await?;
 
-        self.set(bm.name.clone(), bm.clone()).await;
+        self.set(bm.name.clone(), Arc::new(bm)).await;
 
         Ok(())
     }
@@ -245,7 +320,7 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn get_config(&self, bucket: &str) -> Result<(BucketMetadata, bool)> {
+    pub async fn get_config(&self, bucket: &str) -> Result<(Arc<BucketMetadata>, bool)> {
         if let Some(api) = self.api.as_ref() {
             let has_bm = {
                 let map = self.metadata_map.read().await;
@@ -268,6 +343,7 @@ impl BucketMetadataSys {
 
                 let mut map = self.metadata_map.write().await;
 
+                let bm = Arc::new(bm);
                 map.insert(bucket.to_string(), bm.clone());
 
                 Ok((bm, true))
@@ -277,23 +353,27 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn get_versioning_config(&self, bucket: &str) -> Result<(versioning::Versioning, OffsetDateTime)> {
+    pub async fn get_versioning_config(&self, bucket: &str) -> Result<(VersioningConfiguration, OffsetDateTime)> {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_versioning_config err {:?}", &err);
                 if config::error::is_not_found(&err) {
-                    return Ok((versioning::Versioning::default(), OffsetDateTime::UNIX_EPOCH));
+                    return Ok((VersioningConfiguration::default(), OffsetDateTime::UNIX_EPOCH));
                 } else {
                     return Err(err);
                 }
             }
         };
 
-        Ok((bm.versioning_config.unwrap_or_default(), bm.versioning_config_updated_at))
+        if let Some(config) = &bm.versioning_config {
+            Ok((config.clone(), bm.versioning_config_updated_at))
+        } else {
+            Ok((VersioningConfiguration::default(), bm.versioning_config_updated_at))
+        }
     }
 
-    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
+    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(Policy, OffsetDateTime)> {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
@@ -306,14 +386,14 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = bm.policy_config {
-            Ok((config, bm.policy_config_updated_at))
+        if let Some(config) = &bm.policy_config {
+            Ok((config.clone(), bm.policy_config_updated_at))
         } else {
             Err(Error::new(BucketMetadataError::BucketPolicyNotFound))
         }
     }
 
-    pub async fn get_tagging_config(&self, bucket: &str) -> Result<(tags::Tags, OffsetDateTime)> {
+    pub async fn get_tagging_config(&self, bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
@@ -326,14 +406,14 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = bm.tagging_config {
-            Ok((config, bm.tagging_config_updated_at))
+        if let Some(config) = &bm.tagging_config {
+            Ok((config.clone(), bm.tagging_config_updated_at))
         } else {
             Err(Error::new(BucketMetadataError::TaggingNotFound))
         }
     }
 
-    pub async fn get_object_lock_config(&self, bucket: &str) -> Result<(objectlock::Config, OffsetDateTime)> {
+    pub async fn get_object_lock_config(&self, bucket: &str) -> Result<(ObjectLockConfiguration, OffsetDateTime)> {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
@@ -346,14 +426,14 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = bm.object_lock_config {
-            Ok((config, bm.object_lock_config_updated_at))
+        if let Some(config) = &bm.object_lock_config {
+            Ok((config.clone(), bm.object_lock_config_updated_at))
         } else {
             Err(Error::new(BucketMetadataError::BucketObjectLockConfigNotFound))
         }
     }
 
-    pub async fn get_lifecycle_config(&self, bucket: &str) -> Result<(Lifecycle, OffsetDateTime)> {
+    pub async fn get_lifecycle_config(&self, bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
@@ -366,20 +446,20 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = bm.lifecycle_config {
+        if let Some(config) = &bm.lifecycle_config {
             if config.rules.is_empty() {
                 Err(Error::new(BucketMetadataError::BucketLifecycleNotFound))
             } else {
-                Ok((config, bm.lifecycle_config_updated_at))
+                Ok((config.clone(), bm.lifecycle_config_updated_at))
             }
         } else {
             Err(Error::new(BucketMetadataError::BucketLifecycleNotFound))
         }
     }
 
-    pub async fn get_notification_config(&self, bucket: &str) -> Result<Option<event::Config>> {
+    pub async fn get_notification_config(&self, bucket: &str) -> Result<Option<NotificationConfiguration>> {
         let bm = match self.get_config(bucket).await {
-            Ok((bm, _)) => bm.notification_config,
+            Ok((bm, _)) => bm.notification_config.clone(),
             Err(err) => {
                 warn!("get_notification_config err {:?}", &err);
                 if config::error::is_not_found(&err) {
@@ -393,7 +473,7 @@ impl BucketMetadataSys {
         Ok(bm)
     }
 
-    pub async fn get_sse_config(&self, bucket: &str) -> Result<(BucketSSEConfig, OffsetDateTime)> {
+    pub async fn get_sse_config(&self, bucket: &str) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime)> {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
@@ -406,8 +486,8 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = bm.sse_config {
-            Ok((config, bm.encryption_config_updated_at))
+        if let Some(config) = &bm.sse_config {
+            Ok((config.clone(), bm.encryption_config_updated_at))
         } else {
             Err(Error::new(BucketMetadataError::BucketSSEConfigNotFound))
         }
@@ -437,14 +517,14 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = bm.quota_config {
-            Ok((config, bm.quota_config_updated_at))
+        if let Some(config) = &bm.quota_config {
+            Ok((config.clone(), bm.quota_config_updated_at))
         } else {
             Err(Error::new(BucketMetadataError::BucketQuotaConfigNotFound))
         }
     }
 
-    pub async fn get_replication_config(&self, bucket: &str) -> Result<(replication::Config, OffsetDateTime)> {
+    pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
         let (bm, reload) = match self.get_config(bucket).await {
             Ok(res) => res,
             Err(err) => {
@@ -457,12 +537,12 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = bm.replication_config {
+        if let Some(config) = &bm.replication_config {
             if reload {
                 // TODO: globalBucketTargetSys
             }
 
-            Ok((config, bm.replication_config_updated_at))
+            Ok((config.clone(), bm.replication_config_updated_at))
         } else {
             Err(Error::new(BucketMetadataError::BucketReplicationConfigNotFound))
         }
@@ -481,12 +561,12 @@ impl BucketMetadataSys {
             }
         };
 
-        if let Some(config) = bm.bucket_target_config {
+        if let Some(config) = &bm.bucket_target_config {
             if reload {
                 // TODO: globalBucketTargetSys
             }
 
-            Ok(config)
+            Ok(config.clone())
         } else {
             Err(Error::new(BucketMetadataError::BucketRemoteTargetNotFound))
         }

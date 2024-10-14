@@ -485,7 +485,7 @@ impl LocalDisk {
     async fn write_all_public(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
         if volume == super::RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let mut format_info = self.format_info.write().await;
-            format_info.data = data.clone();
+            format_info.data.clone_from(&data);
         }
 
         let volume_dir = self.get_bucket_path(volume)?;
