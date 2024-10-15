@@ -1,10 +1,12 @@
 use super::error::{is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files, os_is_not_exist, os_is_permission};
+use super::os::is_root_disk;
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter,
-    MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
-    WalkDirOptions,
+    Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
+    WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
 };
+use crate::cache_value::cache::Cache;
 use crate::disk::error::{
     convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
     map_err_not_exists, os_err_to_file_err,
@@ -12,14 +14,19 @@ use crate::disk::error::{
 use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
-use crate::utils::fs::{lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
+use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
+use crate::heal::heal_commands::HealingTracker;
+use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
+use crate::utils::fs::{lstat, read_file, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::path::{clean, has_suffix, SLASH_SEPARATOR};
+use crate::utils::stat_linux::get_info;
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
 use path_absolutize::Absolutize;
+use std::fmt::Debug;
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
@@ -49,16 +56,27 @@ impl FormatInfo {
     }
 }
 
-#[derive(Debug)]
 pub struct LocalDisk {
     pub root: PathBuf,
     pub format_path: PathBuf,
     pub format_info: RwLock<FormatInfo>,
     pub endpoint: Endpoint,
+    disk_info_cache: Cache<DiskInfo>,
     // pub id: Mutex<Option<Uuid>>,
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
     // pub format_last_check: Mutex<Option<OffsetDateTime>>,
+}
+
+impl Debug for LocalDisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalDisk")
+            .field("root", &self.root)
+            .field("format_path", &self.format_path)
+            .field("format_info", &self.format_info)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 impl LocalDisk {
@@ -99,6 +117,33 @@ impl LocalDisk {
             data: format_data,
             file_info: format_meta,
             last_check: format_last_check,
+        };
+
+        let derive_path = root.to_string_lossy().to_string();
+        let disk_id = id.map_or("".to_string(), |id| id.to_string());
+        let update_fn = || async move {
+            if let Ok((info, root)) = get_disk_info(&derive_path).await {
+                let mut disk_info = DiskInfo {
+                    total: info.total,
+                    free: info.free,
+                    used: info.used,
+                    used_inodes: info.files - info.ffree,
+                    free_inodes: info.ffree,
+                    major: info.major,
+                    minor: info.minor,
+                    fs_type: info.fstype,
+                    root_disk: root,
+                    id: disk_id,
+                    ..Default::default()
+                };
+                if root {
+                    return Err(Error::new(DiskError::DriveIsRoot));
+                }
+
+                // disk_info.healing =
+            } else {
+                return Ok(DiskInfo::default());
+            }
         };
 
         // TODO: DIRECT suport
@@ -1610,6 +1655,27 @@ impl DiskAPI for LocalDisk {
 
         Ok(info)
     }
+}
+
+async fn get_disk_info(drive_path: &str) -> Result<(Info, bool)> {
+    check_path_length(drive_path)?;
+
+    let disk_info = get_info(drive_path, false)?;
+    let root_drive = if !*GLOBAL_IsErasureSD.read().await {
+        let root_disk_threshold = *GLOBAL_RootDiskThreshold.read().await;
+        if root_disk_threshold > 0 {
+            disk_info.total <= root_disk_threshold
+        } else {
+            match is_root_disk(drive_path, SLASH_SEPARATOR) {
+                Ok(result) => result,
+                Err(_) => false,
+            }
+        }
+    } else {
+        false
+    };
+
+    Ok((disk_info, root_drive))
 }
 
 #[cfg(test)]

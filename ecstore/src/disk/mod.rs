@@ -14,10 +14,7 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 use crate::{
-    erasure::{ReadAt, Write},
-    error::{Error, Result},
-    file_meta::FileMeta,
-    store_api::{FileInfo, RawFileInfo},
+    erasure::{ReadAt, Write}, error::{Error, Result}, file_meta::FileMeta, heal::heal_commands::HealingTracker, store_api::{FileInfo, RawFileInfo}
 };
 
 use endpoint::Endpoint;
@@ -167,8 +164,8 @@ pub struct DiskInfo {
     pub used: u64,
     pub used_inodes: u64,
     pub free_inodes: u64,
-    pub major: u32,
-    pub minor: u32,
+    pub major: u64,
+    pub minor: u64,
     pub nr_requests: u64,
     pub fs_type: String,
     pub root_disk: bool,
@@ -190,6 +187,21 @@ pub struct DiskMetrics {
     total_errors_timeout: u64,
     total_writes: u64,
     total_deletes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Info {
+    pub total: u64,
+    pub free: u64,
+    pub used: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub fstype: String,
+    pub major: u64,
+    pub minor: u64,
+    pub name: String,
+    pub rotational: bool,
+    pub nrrequests: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
