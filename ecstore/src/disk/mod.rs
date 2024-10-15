@@ -26,7 +26,7 @@ use protos::proto_gen::node_service::{
     node_service_client::NodeServiceClient, ReadAtRequest, ReadAtResponse, WriteRequest, WriteResponse,
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc, usize};
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
@@ -133,6 +133,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,6 +151,45 @@ impl DiskLocation {
     pub fn valid(&self) -> bool {
         self.pool_idx.is_some() && self.set_idx.is_some() && self.disk_idx.is_some()
     }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct DiskInfoOptions {
+    pub disk_id: String,
+    pub metrics: bool,
+    pub noop: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiskInfo {
+    pub total: u64,
+    pub free: u64,
+    pub used: u64,
+    pub used_inodes: u64,
+    pub free_inodes: u64,
+    pub major: u32,
+    pub minor: u32,
+    pub nr_requests: u64,
+    pub fs_type: String,
+    pub root_disk: bool,
+    pub healing: bool,
+    pub scanning: bool,
+    pub endpoint: String,
+    pub mount_path: String,
+    pub id: String,
+    pub rotational: bool,
+    pub metrics: DiskMetrics,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiskMetrics {
+    api_calls: HashMap<String, u64>,
+    total_waiting: u32,
+    total_errors_availability: u64,
+    total_errors_timeout: u64,
+    total_writes: u64,
+    total_deletes: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -262,6 +302,26 @@ impl MetaCacheEntry {
         let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
 
         return Ok(Some(fi));
+    }
+
+    pub fn file_info_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
+        if self.is_dir() {
+            return Ok(FileInfoVersions {
+                volume: bucket.to_string(),
+                name: self.name.clone(),
+                versions: vec![FileInfo {
+                    volume: bucket.to_string(),
+                    name: self.name.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+
+        let mut fm = FileMeta::new();
+        fm.unmarshal_msg(&self.metadata)?;
+
+        Ok(fm.into_file_info_versions(bucket, self.name.as_str(), false)?)
     }
 }
 

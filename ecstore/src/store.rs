@@ -3,7 +3,10 @@
 use crate::bucket::metadata;
 use crate::bucket::metadata_sys::set_bucket_metadata;
 use crate::disk::endpoint::EndpointType;
+use crate::disk::MetaCacheEntry;
 use crate::global::{is_dist_erasure, set_object_layer, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode};
+use crate::heal::heal_ops::HealObjectFn;
 use crate::store_api::ObjectIO;
 use crate::{
     bucket::metadata::BucketMetadata,
@@ -23,6 +26,7 @@ use crate::{
 use backon::{ExponentialBuilder, Retryable};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
+use glob::Pattern;
 use http::HeaderMap;
 use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
 use std::{
@@ -775,6 +779,138 @@ impl StorageAPI for ECStore {
                 .await;
         }
         unimplemented!()
+    }
+
+    async fn heal_format(&self, dry_run: bool) -> Result<HealResultItem> {
+        unimplemented!()
+    }
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        unimplemented!()
+    }
+    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        let object = utils::path::encode_dir_object(object);
+        let mut errs = HashMap::new();
+        let mut results = HashMap::new();
+        for (idx, pool) in self.pools.iter().enumerate() {
+            //TODO: IsSuspended
+            match pool.heal_object(bucket, &object, version_id, opts).await {
+                Ok(mut result) => {
+                    result.object = utils::path::decode_dir_object(&result.object);
+                    results.insert(idx, result);
+                }
+                Err(err) => {
+                    errs.insert(idx, err);
+                }
+            }
+        }
+
+        // Return the first nil error
+        for i in 0..self.pools.len() {
+            if errs.get(&i).is_none() {
+                return Ok(results.remove(&i).unwrap());
+            }
+        }
+
+        // No pool returned a nil error, return the first non 'not found' error
+        for (k, err) in errs.iter() {
+            match err.downcast_ref::<DiskError>() {
+                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                _ => return Ok(results.remove(&k).unwrap()),
+            }
+        }
+
+        // At this stage, all errors are 'not found'
+        if !version_id.is_empty() {
+            return Err(Error::new(DiskError::FileVersionNotFound));
+        }
+
+        Err(Error::new(DiskError::FileNotFound))
+    }
+    async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()> {
+        let heal_entry = |bucket: String, entry: MetaCacheEntry, scan_mode: HealScanMode| async move {
+            if entry.is_dir() {
+                return Ok(());
+            }
+
+            // We might land at .metacache, .trash, .multipart
+            // no need to heal them skip, only when bucket
+            // is '.minio.sys'
+            if bucket == RUSTFS_META_BUCKET {
+                if Pattern::new("buckets/*/.metacache/*")
+                    .map(|p| p.matches(&entry.name))
+                    .unwrap_or(false)
+                    || Pattern::new("tmp/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+                    || Pattern::new("multipart/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+                    || Pattern::new("tmp-old/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+                {
+                    return Ok(());
+                }
+            }
+
+            match entry.file_info_versions(&bucket) {
+                Ok(fivs) => {
+                    if opts.remove && !opts.dry_run {
+                        if let Err(err) = self.check_abandoned_parts(&bucket, &entry.name, opts).await {
+                            return Err(Error::from_string(format!(
+                                "unable to check object {}/{} for abandoned data: {}",
+                                bucket, entry.name, err
+                            )));
+                        }
+                    }
+
+                    for version in fivs.versions.iter() {
+                        let version_id = version.version_id.map_or("".to_string(), |version_id| version_id.to_string());
+                        if let Err(err) = func(&bucket, &entry.name, &version_id, scan_mode) {
+                            match err.downcast_ref::<DiskError>() {
+                                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                                _ => return Err(err),
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    return func(&bucket, &entry.name, "", scan_mode);
+                }
+            }
+            Ok(())
+        };
+
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if opts.pool.is_some() && opts.pool.unwrap() != idx {
+                continue;
+            }
+            //TODO: IsSuspended
+
+            for (idx, set) in pool.disk_set.iter().enumerate() {
+                if opts.set.is_some() && opts.set.unwrap() != idx {
+                    continue;
+                }
+
+                set.list
+            }
+        }
+        todo!()
+    }
+
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
+        let object = utils::path::encode_dir_object(object);
+        if self.single_pool() {
+            return self.pools[0].check_abandoned_parts(bucket, &object, opts).await;
+        }
+
+        let mut errs = Vec::new();
+        for pool in self.pools.iter() {
+            //TODO: IsSuspended
+            if let Err(err) = pool.check_abandoned_parts(bucket, &object, opts).await {
+                errs.push(err);
+            }
+        }
+
+        if !errs.is_empty() {
+            return Err(errs[0]);
+        }
+
+        Ok(())
     }
 }
 

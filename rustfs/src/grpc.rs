@@ -1125,6 +1125,47 @@ impl Node for NodeService {
         }
     }
 
+    async fn disk_info(&self, request: Request<DiskInfoRequest>) -> Result<Response<DiskInfoResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let opts = match serde_json::from_str::<DiskInfoOptions>(&request.opts) {
+                Ok(opts) => opts,
+                Err(_) => {
+                    return Ok(tonic::Response::new(ReadMultipleResponse {
+                        success: false,
+                        read_multiple_resps: Vec::new(),
+                        error_info: Some("can not decode ReadMultipleReq".to_string()),
+                    }));
+                }
+            };
+            match disk.disk_info(&opts).await {
+                Ok(disk_info) => match serde_json::to_string(&disk_info) {
+                    Ok(disk_info) => Ok(tonic::Response::new(DiskInfoResponse {
+                        success: true,
+                        disk_info,
+                        error_info: None,
+                    })),
+                    Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
+                        success: false,
+                        disk_info: "".to_string(),
+                        error_info: Some(err.to_string()),
+                    })),
+                },
+                Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
+                    success: false,
+                    disk_info: "".to_string(),
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(DiskInfoResponse {
+                success: false,
+                disk_info: "".to_string(),
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
         match &serde_json::from_str::<LockArgs>(&request.args) {

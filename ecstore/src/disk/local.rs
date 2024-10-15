@@ -1,8 +1,9 @@
 use super::error::{is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files, os_is_not_exist, os_is_permission};
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
-    os, DeleteOptions, DiskAPI, DiskLocation, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    os, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter,
+    MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
+    WalkDirOptions,
 };
 use crate::disk::error::{
     convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
@@ -559,6 +560,10 @@ impl LocalDisk {
         })?;
 
         Ok(f)
+    }
+
+    fn get_metrics(&self) -> DiskMetrics {
+        DiskMetrics::default()
     }
 }
 
@@ -1598,6 +1603,12 @@ impl DiskAPI for LocalDisk {
         }
 
         Ok(())
+    }
+
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
+        let mut info = DiskInfo::default();
+
+        Ok(info)
     }
 }
 

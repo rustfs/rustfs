@@ -345,6 +345,17 @@ message DeleteVolumeResponse {
   optional string error_info = 2;
 }
 
+message DiskInfoRequest {
+  string disk = 1;
+  string opts = 2;
+}
+
+message DiskInfoResponse {
+  bool success = 1;
+  string disk_info = 2;
+  optional string error_info = 3;
+}
+
 // lock api have same argument type
 message GenerallyLockRequest {
     string args = 1;
@@ -392,6 +403,7 @@ service NodeService {
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {};
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
+  rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {};
 
 /* -------------------------------lock service-------------------------- */
 

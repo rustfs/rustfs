@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    heal::{
+        heal_commands::{HealOpts, HealResultItem},
+        heal_ops::HealObjectFn,
+    },
+};
 use futures::StreamExt;
 use http::HeaderMap;
 use rmp_serde::Serializer;
@@ -601,4 +607,9 @@ pub trait StorageAPI: ObjectIO {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo>;
+    async fn heal_format(&self, dry_run: bool) -> Result<HealResultItem>;
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
+    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<HealResultItem>;
+    async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()>;
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
 }
