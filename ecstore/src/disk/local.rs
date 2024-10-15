@@ -12,7 +12,7 @@ use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::utils::fs::{lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
-use crate::utils::path::{has_suffix, SLASH_SEPARATOR};
+use crate::utils::path::{clean, has_suffix, SLASH_SEPARATOR};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
@@ -1338,7 +1338,7 @@ impl DiskAPI for LocalDisk {
             }
 
             volumes.push(VolumeInfo {
-                name: entry,
+                name: clean(&entry),
                 created: None,
             });
         }
