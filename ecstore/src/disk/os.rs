@@ -8,7 +8,7 @@ use tokio::fs;
 use crate::{
     disk::error::{is_sys_err_not_dir, is_sys_err_path_not_found, os_is_not_exist},
     error::{Error, Result},
-    utils,
+    utils::{self, stat_linux::same_disk},
 };
 
 use super::error::{os_err_to_file_err, os_is_exist, DiskError};
@@ -49,6 +49,14 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
 
     // Success.
     Ok(())
+}
+
+pub fn is_root_disk(disk_path: &str, root_disk: &str) -> Result<bool> {
+    if cfg!(target_os = "windows") {
+        return Ok(false);
+    }
+
+    same_disk(disk_path, root_disk)
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> Result<()> {

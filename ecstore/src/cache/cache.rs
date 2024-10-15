@@ -8,6 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use tokio::{spawn, sync::Mutex};
 
 use crate::error::Result;
@@ -20,6 +21,7 @@ pub struct Opts {
     no_wait: bool,
 }
 
+#[derive(Deserialize, Serialize)]
 pub struct Cache<T: Clone + Debug + Send> {
     update_fn: UpdateFn<T>,
     ttl: Duration,

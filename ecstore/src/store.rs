@@ -892,6 +892,20 @@ impl StorageAPI for ECStore {
         todo!()
     }
 
+    async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
+        for (pool_idx, pool) in self.pools.iter().enumerate(){
+            for (set_idx, set) in pool.format.erasure.sets.iter().enumerate() {
+                for (disk_idx, disk_id) in set.iter().enumerate() {
+                    if disk_id.to_string() == id {
+                        return Ok((Some(pool_idx), Some(set_idx), Some(disk_idx)));
+                    }
+                }
+            }
+        }
+
+        Err(Error::new(DiskError::DiskNotFound))
+    }
+
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
         let object = utils::path::encode_dir_object(object);
         if self.single_pool() {

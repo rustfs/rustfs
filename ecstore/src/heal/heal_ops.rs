@@ -15,8 +15,9 @@ pub type HealEntryFn = Box<dyn Fn(String, MetaCacheEntry, HealScanMode) -> Resul
 
 lazy_static! {
     static ref HEAL_NOT_STARTED_STATUS: HealStatusSummary = String::from("not started");
-    static ref bgHealingUUID: String = String::from("0000-0000-0000-0000");
 }
+pub const BG_HEALING_UUID: &str = "0000-0000-0000-0000";
+pub const HEALING_TRACKER_FILENAME: &str = ".healing.bin";
 
 lazy_static! {}
 
@@ -119,7 +120,7 @@ impl HealSequence {
     }
 
     fn has_ended(&self) -> bool {
-        if self.client_token == bgHealingUUID.to_string() {
+        if self.client_token == BG_HEALING_UUID.to_string() {
             return false;
         }
 
@@ -139,7 +140,7 @@ impl HealSequence {
     }
 
     fn heal_items(&self, buckets_only: bool) -> Result<()> {
-        if self.client_token == bgHealingUUID.to_string() {
+        if self.client_token == BG_HEALING_UUID.to_string() {
             return Ok(());
         }
 
