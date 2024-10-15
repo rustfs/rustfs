@@ -4,10 +4,10 @@ use futures::lock::Mutex;
 use protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
-        DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, ListDirRequest,
-        ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest, ReadMultipleRequest, ReadVersionRequest,
-        ReadXlRequest, RenameDataRequest, RenameFileRequst, StatVolumeRequest, UpdateMetadataRequest, WalkDirRequest,
-        WriteAllRequest, WriteMetadataRequest,
+        DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest,
+        ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest, ReadMultipleRequest,
+        ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequst, StatVolumeRequest, UpdateMetadataRequest,
+        WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
 use tonic::Request;
@@ -15,9 +15,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::{
-    endpoint::Endpoint, DeleteOptions, DiskAPI, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter,
-    MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    endpoint::Endpoint, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
+    FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter,
+    RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::{
     disk::error::DiskError,
@@ -657,5 +657,27 @@ impl DiskAPI for RemoteDisk {
         }
 
         Ok(())
+    }
+
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
+        info!("delete_volume");
+        let opts = serde_json::to_string(&opts)?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(DiskInfoRequest {
+            disk: self.root.to_string_lossy().to_string(),
+            opts,
+        });
+
+        let response = client.disk_info(request).await?.into_inner();
+
+        if !response.success {
+            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+        }
+
+        let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
+
+        Ok(disk_info)
     }
 }
