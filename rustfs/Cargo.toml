@@ -49,6 +49,8 @@ tracing-error.workspace = true
 tracing-subscriber.workspace = true
 transform-stream.workspace = true
 uuid = "1.10.0"
+admin = { path = "../admin" }
+axum.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
@@ -67,7 +69,6 @@ hyper-util = { version = "0.1.9", features = [
     "server-auto",
     "server-graceful",
 ] }
-mime = "0.3.17"
 transform-stream = "0.3.0"
 netif = "0.1.6"
 # pin-utils = "0.1.0"

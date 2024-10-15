@@ -58,4 +58,10 @@ pub async fn update_erasure_type(setup_type: SetupType) {
     *is_erasure_sd = setup_type == SetupType::ErasureSD;
 }
 
+pub async fn is_legacy() -> bool {
+    let lock = GLOBAL_Endpoints.read().await;
+    let endpoints = lock.as_ref();
+    endpoints.len() == 1 && endpoints[0].legacy
+}
+
 type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
