@@ -11,7 +11,7 @@ axum.workspace = true
 mime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ecstore = { path = "../ecstore" }
+ecstore = { path = "../../ecstore" }
 time = { workspace = true, features = ["serde"] }
 tower.workspace = true
 futures-util = "0.3.31"
