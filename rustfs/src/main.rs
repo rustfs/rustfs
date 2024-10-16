@@ -147,54 +147,58 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
-    tokio::spawn(async move {
-        let hyper_service = service.into_shared();
-
-        let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, rpc_service));
-
-        let http_server = ConnBuilder::new(TokioExecutor::new());
-        let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
-        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-        info!("server is running at http://{local_addr}");
-
-        loop {
-            let (socket, _) = tokio::select! {
-                res =  listener.accept() => {
-                    match res {
-                        Ok(conn) => conn,
-                        Err(err) => {
-                            tracing::error!("error accepting connection: {err}");
-                            continue;
-                        }
-                    }
-                }
-                _ = ctrl_c.as_mut() => {
-                    break;
-                }
-            };
-
-            let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
-            let conn = graceful.watch(conn.into_owned());
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-        }
-
-        tokio::select! {
-            () = graceful.shutdown() => {
-                 tracing::debug!("Gracefully shutdown!");
-            },
-            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                 tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
-            }
-        }
-    });
-
     // init store
     let store = ECStore::new(opt.address.clone(), endpoint_pools.clone())
         .await
         .map_err(|err| Error::from_string(err.to_string()))?;
     info!(" init store success!");
+
+    tokio::spawn({
+        let store = store.clone();
+        async move {
+            let hyper_service = service.into_shared();
+            let adm_service = admin::register_admin_router(Some(store));
+
+            let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, rpc_service, adm_service));
+
+            let http_server = ConnBuilder::new(TokioExecutor::new());
+            let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+            let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+            info!("server is running at http://{local_addr}");
+
+            loop {
+                let (socket, _) = tokio::select! {
+                    res =  listener.accept() => {
+                        match res {
+                            Ok(conn) => conn,
+                            Err(err) => {
+                                tracing::error!("error accepting connection: {err}");
+                                continue;
+                            }
+                        }
+                    }
+                    _ = ctrl_c.as_mut() => {
+                        break;
+                    }
+                };
+
+                let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
+                let conn = graceful.watch(conn.into_owned());
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+            }
+
+            tokio::select! {
+                () = graceful.shutdown() => {
+                     tracing::debug!("Gracefully shutdown!");
+                },
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                     tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
+                }
+            }
+        }
+    });
 
     let buckets_list = store
         .list_bucket(&BucketOptions {
