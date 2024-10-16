@@ -11,11 +11,16 @@ use tower::Service;
 
 pub type Result<T> = std::result::Result<T, ErrorCode>;
 
+const API_VERSION: &str = "/v3";
+
 pub fn register_admin_router(
     ec_store: Option<ECStore>,
 ) -> impl Service<Request, Response = Response, Error: Into<BoxError>, Future: Send> + Clone {
     Router::new()
-        .nest("/admin/v3", Router::new().route("/pools/list", get(list_pools::handler)))
+        .nest(
+            "/rustfs/admin",
+            Router::new().nest(API_VERSION, Router::new().route("/pools/list", get(list_pools::handler))),
+        )
         .with_state::<()>(ObjectApi::new(ec_store))
         .into_service()
 }

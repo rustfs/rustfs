@@ -72,7 +72,7 @@ where
                 grpc_future: self.grpc.call(req),
             },
 
-            _ if req.uri().path().starts_with("/admin/v3") => HybridFuture::Admin {
+            _ if req.uri().path().starts_with("/rustfs") => HybridFuture::Admin {
                 admin_future: self.admin.call({
                     let (parts, body) = req.into_parts();
                     Request::from_parts(parts, Body::new(body).into())
