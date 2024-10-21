@@ -4,9 +4,9 @@ use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter,
     Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
-    WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
+    WalkDirOptions,
 };
-use crate::cache_value::cache::Cache;
+use crate::cache_value::cache::{Cache, Opts};
 use crate::disk::error::{
     convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
     map_err_not_exists, os_err_to_file_err,
@@ -15,9 +15,7 @@ use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
-use crate::heal::heal_commands::HealingTracker;
-use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
-use crate::utils::fs::{lstat, read_file, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
+use crate::utils::fs::{lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::path::{clean, has_suffix, SLASH_SEPARATOR};
 use crate::utils::stat_linux::get_info;
 use crate::{
@@ -26,7 +24,11 @@ use crate::{
     utils,
 };
 use path_absolutize::Absolutize;
+use tokio::runtime::Runtime;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
@@ -61,7 +63,13 @@ pub struct LocalDisk {
     pub format_path: PathBuf,
     pub format_info: RwLock<FormatInfo>,
     pub endpoint: Endpoint,
-    disk_info_cache: Cache<DiskInfo>,
+    pub disk_info_cache: Arc<Cache<DiskInfo>>,
+    pub scanning: AtomicU32,
+    pub rotational: bool,
+    pub fstype: String,
+    pub major: u64,
+    pub minor: u64,
+    pub nrrequests: u64,
     // pub id: Mutex<Option<Uuid>>,
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
@@ -118,46 +126,77 @@ impl LocalDisk {
             file_info: format_meta,
             last_check: format_last_check,
         };
-
-        let derive_path = root.to_string_lossy().to_string();
-        let disk_id = id.map_or("".to_string(), |id| id.to_string());
-        let update_fn = || async move {
-            if let Ok((info, root)) = get_disk_info(&derive_path).await {
-                let mut disk_info = DiskInfo {
-                    total: info.total,
-                    free: info.free,
-                    used: info.used,
-                    used_inodes: info.files - info.ffree,
-                    free_inodes: info.ffree,
-                    major: info.major,
-                    minor: info.minor,
-                    fs_type: info.fstype,
-                    root_disk: root,
-                    id: disk_id,
-                    ..Default::default()
-                };
-                if root {
-                    return Err(Error::new(DiskError::DriveIsRoot));
+        let root_clone = root.clone();
+        let disk_id = Arc::new(id.map_or("".to_string(), |id| id.to_string()));
+        let update_fn = move || {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async {
+                match get_disk_info(root.clone()).await {
+                    Ok((info, root)) => {
+                        let disk_info = DiskInfo {
+                            total: info.total,
+                            free: info.free,
+                            used: info.used,
+                            used_inodes: info.files - info.ffree,
+                            free_inodes: info.ffree,
+                            major: info.major,
+                            minor: info.minor,
+                            fs_type: info.fstype,
+                            root_disk: root,
+                            id: disk_id.to_string(),
+                            ..Default::default()
+                        };
+                        if root {
+                            return Err(Error::new(DiskError::DriveIsRoot));
+                        }
+        
+                        // disk_info.healing =
+                        Ok(disk_info)
+                    },
+                    Err(err) => {
+                        Err(err)
+                    }
                 }
-
-                // disk_info.healing =
-            } else {
-                return Ok(DiskInfo::default());
-            }
+            })
         };
-
+        
+        let cache = Cache::new(Box::new(update_fn), Duration::from_secs(1), Opts::default());
+        
         // TODO: DIRECT suport
         // TODD: DiskInfo
-        let disk = Self {
-            root,
+        let mut disk = Self {
+            root: root_clone.clone(),
             endpoint: ep.clone(),
             format_path,
             format_info: RwLock::new(format_info),
+            disk_info_cache: Arc::new(cache),
+            scanning: AtomicU32::new(0),
+            rotational: Default::default(),
+            fstype: Default::default(),
+            minor: Default::default(),
+            major: Default::default(),
+            nrrequests: Default::default(),
             // // format_legacy,
             // format_file_info: Mutex::new(format_meta),
             // format_data: Mutex::new(format_data),
             // format_last_check: Mutex::new(format_last_check),
         };
+        let (info, root) = get_disk_info(root_clone).await?;
+        disk.major = info.major;
+        disk.minor = info.minor;
+        disk.fstype = info.fstype;
+
+        if root {
+            return Err(Error::new(DiskError::DriveIsRoot));
+        }
+
+        if info.nrrequests > 0 {
+            disk.nrrequests = info.nrrequests;
+        }
+
+        if info.rotational {
+            disk.rotational = true;
+        }
 
         disk.make_meta_volumes().await?;
 
@@ -607,6 +646,7 @@ impl LocalDisk {
         Ok(f)
     }
 
+    #[allow(dead_code)]
     fn get_metrics(&self) -> DiskMetrics {
         DiskMetrics::default()
     }
@@ -1650,23 +1690,30 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
-        let mut info = DiskInfo::default();
+    async fn disk_info(&self, _: &DiskInfoOptions) -> Result<DiskInfo> {
+        let mut info = Cache::get(self.disk_info_cache.clone()).await?;
+        // TODO: nr_requests, rotational
+        info.nr_requests = self.nrrequests;
+        info.rotational = self.rotational;
+        info.mount_path = self.path().to_str().unwrap().to_string();
+        info.endpoint = self.endpoint.to_string();
+        info.scanning = self.scanning.load(Ordering::SeqCst) == 1;
 
         Ok(info)
     }
 }
 
-async fn get_disk_info(drive_path: &str) -> Result<(Info, bool)> {
-    check_path_length(drive_path)?;
+async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
+    let drive_path = drive_path.to_string_lossy().to_string();
+    check_path_length(&drive_path)?;
 
-    let disk_info = get_info(drive_path, false)?;
+    let disk_info = get_info(&drive_path, false)?;
     let root_drive = if !*GLOBAL_IsErasureSD.read().await {
         let root_disk_threshold = *GLOBAL_RootDiskThreshold.read().await;
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
         } else {
-            match is_root_disk(drive_path, SLASH_SEPARATOR) {
+            match is_root_disk(&drive_path, SLASH_SEPARATOR) {
                 Ok(result) => result,
                 Err(_) => false,
             }

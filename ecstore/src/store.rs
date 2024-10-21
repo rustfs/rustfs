@@ -7,6 +7,7 @@ use crate::disk::MetaCacheEntry;
 use crate::global::{is_dist_erasure, set_object_layer, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
 use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode};
 use crate::heal::heal_ops::HealObjectFn;
+use crate::new_object_layer_fn;
 use crate::store_api::ObjectIO;
 use crate::{
     bucket::metadata::BucketMetadata,
@@ -827,54 +828,7 @@ impl StorageAPI for ECStore {
         Err(Error::new(DiskError::FileNotFound))
     }
     async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()> {
-        let heal_entry = |bucket: String, entry: MetaCacheEntry, scan_mode: HealScanMode| async move {
-            if entry.is_dir() {
-                return Ok(());
-            }
-
-            // We might land at .metacache, .trash, .multipart
-            // no need to heal them skip, only when bucket
-            // is '.rustfs.sys'
-            if bucket == RUSTFS_META_BUCKET {
-                if Pattern::new("buckets/*/.metacache/*")
-                    .map(|p| p.matches(&entry.name))
-                    .unwrap_or(false)
-                    || Pattern::new("tmp/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-                    || Pattern::new("multipart/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-                    || Pattern::new("tmp-old/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-                {
-                    return Ok(());
-                }
-            }
-
-            match entry.file_info_versions(&bucket) {
-                Ok(fivs) => {
-                    if opts.remove && !opts.dry_run {
-                        if let Err(err) = self.check_abandoned_parts(&bucket, &entry.name, opts).await {
-                            return Err(Error::from_string(format!(
-                                "unable to check object {}/{} for abandoned data: {}",
-                                bucket, entry.name, err
-                            )));
-                        }
-                    }
-
-                    for version in fivs.versions.iter() {
-                        let version_id = version.version_id.map_or("".to_string(), |version_id| version_id.to_string());
-                        if let Err(err) = func(&bucket, &entry.name, &version_id, scan_mode) {
-                            match err.downcast_ref::<DiskError>() {
-                                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
-                                _ => return Err(err),
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    return func(&bucket, &entry.name, "", scan_mode);
-                }
-            }
-            Ok(())
-        };
-
+        let mut first_err = None;
         for (idx, pool) in self.pools.iter().enumerate() {
             if opts.pool.is_some() && opts.pool.unwrap() != idx {
                 continue;
@@ -886,14 +840,23 @@ impl StorageAPI for ECStore {
                     continue;
                 }
 
-                set.list
+                if let Err(err) = set.list_and_heal(bucket, prefix, opts, func.clone()).await {
+                    if first_err.is_none() {
+                        first_err = Some(err)
+                    }
+                }
             }
         }
-        todo!()
+
+        if first_err.is_some() {
+            return Err(first_err.unwrap());
+        }
+
+        Ok(())
     }
 
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
-        for (pool_idx, pool) in self.pools.iter().enumerate(){
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
             for (set_idx, set) in pool.format.erasure.sets.iter().enumerate() {
                 for (disk_idx, disk_id) in set.iter().enumerate() {
                     if disk_id.to_string() == id {
@@ -921,7 +884,7 @@ impl StorageAPI for ECStore {
         }
 
         if !errs.is_empty() {
-            return Err(errs[0]);
+            return Err(errs[0].clone());
         }
 
         Ok(())
@@ -949,4 +912,65 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
     }
 
     *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
+}
+
+pub async fn heal_entry(
+    bucket: String,
+    entry: MetaCacheEntry,
+    scan_mode: HealScanMode,
+    opts: HealOpts,
+    func: HealObjectFn,
+) -> Result<()> {
+    if entry.is_dir() {
+        return Ok(());
+    }
+
+    // We might land at .metacache, .trash, .multipart
+    // no need to heal them skip, only when bucket
+    // is '.rustfs.sys'
+    if bucket == RUSTFS_META_BUCKET {
+        if Pattern::new("buckets/*/.metacache/*")
+            .map(|p| p.matches(&entry.name))
+            .unwrap_or(false)
+            || Pattern::new("tmp/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+            || Pattern::new("multipart/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+            || Pattern::new("tmp-old/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+
+    let layer = new_object_layer_fn();
+    let lock = layer.read().await;
+    let store = match lock.as_ref() {
+        Some(s) => s,
+        None => return Err(Error::msg("errServerNotInitialized")),
+    };
+
+    match entry.file_info_versions(&bucket) {
+        Ok(fivs) => {
+            if opts.remove && !opts.dry_run {
+                if let Err(err) = store.check_abandoned_parts(&bucket, &entry.name, &opts).await {
+                    return Err(Error::from_string(format!(
+                        "unable to check object {}/{} for abandoned data: {}",
+                        bucket, entry.name, err
+                    )));
+                }
+            }
+
+            for version in fivs.versions.iter() {
+                let version_id = version.version_id.map_or("".to_string(), |version_id| version_id.to_string());
+                if let Err(err) = func(&bucket, &entry.name, &version_id, scan_mode) {
+                    match err.downcast_ref::<DiskError>() {
+                        Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                        _ => return Err(err),
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            return func(&bucket, &entry.name, "", scan_mode);
+        }
+    }
+    Ok(())
 }

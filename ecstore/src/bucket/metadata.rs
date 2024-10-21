@@ -19,7 +19,6 @@ use crate::config::common::{read_config, save_config};
 use crate::error::{Error, Result};
 
 use crate::disk::BUCKET_META_PREFIX;
-use crate::file_meta::FileMetaShallowVersion;
 use crate::store::ECStore;
 
 pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
@@ -396,16 +395,6 @@ where
     BigEndian::write_u64(&mut buf[3..], sec as u64);
     BigEndian::write_u32(&mut buf[11..], nsec);
     s.serialize_bytes(&buf)
-}
-
-#[derive(Debug, Default)]
-pub struct MetadataResolutionParams {
-    pub dir_quorum: usize,
-    pub obj_quorum: usize,
-    pub requested_versions: usize,
-    pub bucket: String,
-    pub strict: bool,
-    pub candidates: Vec<Vec<FileMetaShallowVersion>>,
 }
 
 #[cfg(test)]

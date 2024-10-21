@@ -12,7 +12,7 @@ use tokio::{spawn, sync::Mutex};
 
 use crate::error::Result;
 
-type UpdateFn<T> = Arc<dyn Fn() -> Result<T> + Send + Sync>;
+type UpdateFn<T> = Box<dyn Fn() -> Result<T> + Send + Sync>;
 
 #[derive(Clone, Debug, Default)]
 pub struct Opts {
