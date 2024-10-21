@@ -38,6 +38,18 @@ pub fn retain_slash(s: &str) -> String {
     }
 }
 
+pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && (s[..prefix.len()] == *prefix || s[..prefix.len()].eq_ignore_ascii_case(prefix))
+}
+
+pub fn has_profix(s: &str, prefix: &str) -> bool {
+    if cfg!(target_os = "windows") {
+        return strings_has_prefix_fold(s, prefix);
+    }
+
+    s.starts_with(prefix)
+}
+
 pub struct LazyBuf {
     s: String,
     buf: Option<Vec<u8>>,

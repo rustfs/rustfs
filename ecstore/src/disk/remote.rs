@@ -20,7 +20,9 @@ use super::{
     RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::{
-    disk::error::DiskError, error::{Error, Result}, heal::heal_commands::HealingTracker, store_api::{FileInfo, RawFileInfo}
+    disk::error::DiskError,
+    error::{Error, Result},
+    store_api::{FileInfo, RawFileInfo},
 };
 use protos::proto_gen::node_service::RenamePartRequst;
 

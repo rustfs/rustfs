@@ -16,7 +16,7 @@ pub enum EndpointType {
 }
 
 /// any type of endpoint.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct Endpoint {
     pub url: url::Url,
     pub is_local: bool,

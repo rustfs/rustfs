@@ -14,7 +14,10 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 use crate::{
-    erasure::{ReadAt, Write}, error::{Error, Result}, file_meta::FileMeta, heal::heal_commands::HealingTracker, store_api::{FileInfo, RawFileInfo}
+    erasure::{ReadAt, Write},
+    error::{Error, Result},
+    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
+    store_api::{FileInfo, RawFileInfo},
 };
 
 use endpoint::Endpoint;
@@ -23,7 +26,7 @@ use protos::proto_gen::node_service::{
     node_service_client::NodeServiceClient, ReadAtRequest, ReadAtResponse, WriteRequest, WriteResponse,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc, usize};
+use std::{cmp::Ordering, collections::HashMap, fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc, usize};
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
@@ -247,7 +250,17 @@ pub struct WalkDirOptions {
     pub disk_id: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
+pub struct MetadataResolutionParams {
+    pub dir_quorum: usize,
+    pub obj_quorum: usize,
+    pub requested_versions: usize,
+    pub bucket: String,
+    pub strict: bool,
+    pub candidates: Vec<Vec<FileMetaShallowVersion>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MetaCacheEntry {
     // name is the full name of the object including prefixes
     pub name: String,
@@ -334,6 +347,184 @@ impl MetaCacheEntry {
         fm.unmarshal_msg(&self.metadata)?;
 
         Ok(fm.into_file_info_versions(bucket, self.name.as_str(), false)?)
+    }
+
+    pub fn matches(&self, other: &MetaCacheEntry, strict: bool) -> Result<(Option<MetaCacheEntry>, bool)> {
+        let mut prefer = None;
+        if self.name != other.name {
+            if self.name < other.name {
+                return Ok((Some(self.clone()), false));
+            }
+            return Ok((Some(other.clone()), false));
+        }
+
+        if other.is_dir() || self.is_dir() {
+            if self.is_dir() {
+                return Ok((Some(self.clone()), other.is_dir()));
+            }
+
+            return Ok((Some(other.clone()), other.is_dir() == self.is_dir()));
+        }
+        let self_vers = match &self.cached {
+            Some(file_meta) => file_meta.clone(),
+            None => FileMeta::load(&self.metadata)?,
+        };
+        let other_vers = match &other.cached {
+            Some(file_meta) => file_meta.clone(),
+            None => FileMeta::load(&other.metadata)?,
+        };
+
+        if self_vers.versions.len() != other_vers.versions.len() {
+            match self_vers.lastest_mod_time().cmp(&other_vers.lastest_mod_time()) {
+                Ordering::Greater => {
+                    return Ok((Some(self.clone()), false));
+                }
+                Ordering::Less => {
+                    return Ok((Some(self.clone()), false));
+                }
+                _ => {}
+            }
+
+            if self_vers.versions.len() > other_vers.versions.len() {
+                return Ok((Some(self.clone()), false));
+            }
+            return Ok((Some(self.clone()), false));
+        }
+
+        for (s_version, o_version) in self_vers.versions.iter().zip(other_vers.versions.iter()) {
+            if s_version.header != o_version.header {
+                if s_version.header.has_ec() != o_version.header.has_ec() {
+                    // One version has EC and the other doesn't - may have been written later.
+                    // Compare without considering EC.
+                    let (mut a, mut b) = (s_version.header.clone(), o_version.header.clone());
+                    (a.ec_n, a.ec_m, b.ec_n, b.ec_m) = (0, 0, 0, 0);
+                    if a == b {
+                        continue;
+                    }
+                }
+
+                if !strict && s_version.header.matches_not_strict(&o_version.header) {
+                    if prefer.is_none() {
+                        if s_version.header.sorts_before(&o_version.header) {
+                            prefer = Some(self.clone());
+                        } else {
+                            prefer = Some(other.clone());
+                        }
+                    }
+
+                    continue;
+                }
+
+                if prefer.is_some() {
+                    return Ok((prefer, false));
+                }
+
+                if s_version.header.sorts_before(&o_version.header) {
+                    return Ok((Some(self.clone()), false));
+                }
+
+                return Ok((Some(other.clone()), false));
+            }
+        }
+
+        if prefer.is_none() {
+            prefer = Some(self.clone());
+        }
+
+        Ok((prefer, true))
+    }
+}
+
+pub struct MetaCacheEntries(pub Vec<MetaCacheEntry>);
+
+impl MetaCacheEntries {
+    pub fn resolve(&self, mut params: MetadataResolutionParams) -> Result<Option<MetaCacheEntry>> {
+        if self.0.is_empty() {
+            return Ok(None);
+        }
+
+        let mut dir_exists = 0;
+        let mut selected = None;
+
+        params.candidates.clear();
+        let mut objs_agree = 0;
+        let mut objs_valid = 0;
+
+        for entry in self.0.iter() {
+            if entry.name.is_empty() {
+                continue;
+            }
+            if entry.is_dir() {
+                dir_exists += 1;
+                selected = Some(entry.clone());
+                continue;
+            }
+
+            objs_valid += 1;
+
+            match &entry.cached {
+                Some(file_meta) => {
+                    params.candidates.push(file_meta.versions.clone());
+                }
+                None => {
+                    params.candidates.push(FileMeta::load(&entry.metadata)?.versions);
+                }
+            }
+
+            if selected.is_none() {
+                selected = Some(entry.clone());
+                objs_agree = 1;
+                continue;
+            }
+
+            if let (Some(prefer), true) = entry.matches(selected.as_ref().unwrap(), params.strict)? {
+                selected = Some(prefer);
+                objs_agree += 1;
+                continue;
+            }
+        }
+
+        // Return dir entries, if enough...
+        if selected.is_some() && selected.as_ref().unwrap().is_dir() && dir_exists >= params.dir_quorum {
+            return Ok(selected);
+        }
+        // If we would never be able to reach read quorum.
+        if objs_valid < params.obj_quorum {
+            return Ok(None);
+        }
+        // If all objects agree.
+        if selected.is_some() && objs_agree == objs_valid {
+            return Ok(selected);
+        }
+        // If cached is nil we shall skip the entry.
+        if selected.is_none() || (selected.is_some() && selected.as_ref().unwrap().cached.is_none()) {
+            return Ok(None);
+        }
+        // Merge if we have disagreement.
+        // Create a new merged result.
+        selected = Some(MetaCacheEntry {
+            name: selected.as_ref().unwrap().name.clone(),
+            cached: Some(FileMeta {
+                meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver.clone(),
+                ..Default::default()
+            }),
+            _reusable: true,
+            ..Default::default()
+        });
+
+        selected.as_mut().unwrap().cached.as_mut().unwrap().versions =
+            merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates);
+        if selected.as_ref().unwrap().cached.as_ref().unwrap().versions.is_empty() {
+            return Ok(None);
+        }
+
+        selected.as_mut().unwrap().metadata = selected.as_ref().unwrap().cached.as_ref().unwrap().marshal_msg()?;
+
+        Ok(selected)
+    }
+
+    pub fn first_found(&self) -> (Option<MetaCacheEntry>, usize) {
+        (self.0.iter().find(|x| !x.name.is_empty()).cloned(), self.0.len())
     }
 }
 
