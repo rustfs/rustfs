@@ -22,6 +22,11 @@ pub const HEAL_UNKNOWN_SCAN: HealScanMode = 0;
 pub const HEAL_NORMAL_SCAN: HealScanMode = 1;
 pub const HEAL_DEEP_SCAN: HealScanMode = 2;
 
+pub const HEAL_ITEM_METADATA: &str = "metadata";
+pub const HEAL_ITEM_BUCKET: &str = "bucket";
+pub const HEAL_ITEM_BUCKET_METADATA: &str = "bucket-metadata";
+pub const HEAL_ITEM_OBJECT: &str = "object";
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HealOpts {
     pub recursive: bool,
