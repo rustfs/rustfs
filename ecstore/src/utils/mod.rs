@@ -4,5 +4,5 @@ pub mod fs;
 pub mod hash;
 pub mod net;
 pub mod path;
-pub mod stat_linux;
+pub mod os;
 pub mod wildcard;

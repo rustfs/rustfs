@@ -518,6 +518,7 @@ dependencies = [
  "transform-stream",
  "url",
  "uuid",
+ "winapi",
  "xxhash-rust",
 ]
 

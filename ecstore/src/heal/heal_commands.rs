@@ -27,6 +27,16 @@ pub const HEAL_ITEM_BUCKET: &str = "bucket";
 pub const HEAL_ITEM_BUCKET_METADATA: &str = "bucket-metadata";
 pub const HEAL_ITEM_OBJECT: &str = "object";
 
+pub const DRIVE_STATE_OK: &str = "ok";
+pub const DRIVE_STATE_OFFLINE: &str = "offline";
+pub const DRIVE_STATE_CORRUPT: &str = "corrupt";
+pub const DRIVE_STATE_MISSING: &str = "missing";
+pub const DRIVE_STATE_PERMISSION: &str = "permission-denied";
+pub const DRIVE_STATE_FAULTY: &str = "faulty";
+pub const DRIVE_STATE_ROOT_MOUNT: &str = "root-mount";
+pub const DRIVE_STATE_UNKNOWN: &str = "unknown";
+pub const DRIVE_STATE_UNFORMATTED: &str = "unformatted"; // only returned by disk
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HealOpts {
     pub recursive: bool,
@@ -41,10 +51,10 @@ pub struct HealOpts {
 }
 
 #[derive(Clone, Debug)]
-struct HealDriveInfo {
-    uuid: String,
-    endpoint: String,
-    state: String,
+pub struct HealDriveInfo {
+    pub uuid: String,
+    pub endpoint: String,
+    pub state: String,
 }
 
 #[derive(Clone, Debug, Default)]
