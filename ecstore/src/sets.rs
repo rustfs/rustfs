@@ -441,7 +441,7 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
     async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<HealResultItem> {
-        unimplemented!()
+        self.get_disks_by_key(object).heal_object(bucket, object, version_id, opts).await
     }
     async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()> {
         unimplemented!()
