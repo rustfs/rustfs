@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::utils::fs::{lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::path::{clean, has_suffix, SLASH_SEPARATOR};
-use crate::utils::stat_linux::get_info;
+use crate::utils::os::get_info;
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},

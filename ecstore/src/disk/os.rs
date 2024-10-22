@@ -8,7 +8,7 @@ use tokio::fs;
 use crate::{
     disk::error::{is_sys_err_not_dir, is_sys_err_path_not_found, os_is_not_exist},
     error::{Error, Result},
-    utils::{self, stat_linux::same_disk},
+    utils::{self, os::same_disk},
 };
 
 use super::error::{os_err_to_file_err, os_is_exist, DiskError};
