@@ -127,6 +127,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // CheckParts
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     // VerifyFile
+    async fn verify_file(&self, volume: &str, path: &str, fi: FileInfo) -> Result<CheckPartsResp>;
     // StatInfoFile
     // ReadParts
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
@@ -134,6 +135,10 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
+}
+
+pub struct CheckPartsResp {
+    pub results: Vec<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

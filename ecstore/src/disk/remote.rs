@@ -15,9 +15,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::{
-    endpoint::Endpoint, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
-    FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter,
-    RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions
 };
 use crate::{
     disk::error::DiskError,
@@ -163,6 +161,11 @@ impl DiskAPI for RemoteDisk {
 
         Ok(())
     }
+
+    async fn verify_file(&self, volume: &str, path: &str, fi: FileInfo) -> Result<CheckPartsResp> {
+        unimplemented!()
+    }
+
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
         info!("rename_part");
         let mut client = node_service_time_out_client(&self.addr)

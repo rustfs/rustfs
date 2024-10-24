@@ -2,9 +2,9 @@ use super::error::{is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_file
 use super::os::is_root_disk;
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
-    os, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter,
-    Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
-    WalkDirOptions,
+    os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions,
+    FileReader, FileWriter, Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::cache_value::cache::{Cache, Opts};
 use crate::disk::error::{
@@ -15,16 +15,16 @@ use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
+use crate::store_api::BitrotAlgorithm;
 use crate::utils::fs::{lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
-use crate::utils::path::{clean, has_suffix, SLASH_SEPARATOR};
 use crate::utils::os::get_info;
+use crate::utils::path::{clean, has_suffix, SLASH_SEPARATOR};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
 use path_absolutize::Absolutize;
-use tokio::runtime::Runtime;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -36,6 +36,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
+use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -149,19 +150,17 @@ impl LocalDisk {
                         if root {
                             return Err(Error::new(DiskError::DriveIsRoot));
                         }
-        
+
                         // disk_info.healing =
                         Ok(disk_info)
-                    },
-                    Err(err) => {
-                        Err(err)
                     }
+                    Err(err) => Err(err),
                 }
             })
         };
-        
+
         let cache = Cache::new(Box::new(update_fn), Duration::from_secs(1), Opts::default());
-        
+
         // TODO: DIRECT suport
         // TODD: DiskInfo
         let mut disk = Self {
@@ -650,6 +649,22 @@ impl LocalDisk {
     fn get_metrics(&self) -> DiskMetrics {
         DiskMetrics::default()
     }
+
+    async fn bitrot_verify(
+        &self,
+        part_path: &PathBuf,
+        part_size: u64,
+        algo: BitrotAlgorithm,
+        sum: &[u8],
+        shard_size: u64,
+    ) -> Result<()> {
+        let file = utils::fs::open_file(part_path, O_CREATE | O_WRONLY)
+            .await
+            .map_err(os_err_to_file_err)?;
+
+
+        todo!()
+    }
 }
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
@@ -844,6 +859,30 @@ impl DiskAPI for LocalDisk {
             .await?;
 
         Ok(())
+    }
+
+    async fn verify_file(&self, volume: &str, path: &str, fi: FileInfo) -> Result<CheckPartsResp> {
+        let volume_dir = self.get_bucket_path(volume)?;
+        if !skip_access_checks(volume) {
+            if let Err(e) = utils::fs::access(&volume_dir).await {
+                return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
+            }
+        }
+
+        let mut resp = CheckPartsResp {
+            results: Vec::with_capacity(fi.parts.len()),
+        };
+
+        let erasure = fi.erasure;
+        fi.parts.iter().enumerate().for_each(|(i, part)| {
+            let checksum_info = erasure.get_checksum_info(part.number);
+            let part_path = Path::new(&volume_dir)
+                .join(path)
+                .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
+                .join(format!("part.{}", part.number));
+
+            self.bi
+        });
     }
 
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {

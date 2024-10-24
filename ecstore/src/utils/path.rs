@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
 pub const SLASH_SEPARATOR: &str = "/";
@@ -48,6 +50,16 @@ pub fn has_profix(s: &str, prefix: &str) -> bool {
     }
 
     s.starts_with(prefix)
+}
+
+pub fn path_join(elem: &[PathBuf]) -> PathBuf {
+    let mut joined_path = PathBuf::new();
+    
+    for path in elem {
+        joined_path.push(path);
+    }
+
+    joined_path
 }
 
 pub struct LazyBuf {
