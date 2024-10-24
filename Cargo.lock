@@ -277,6 +277,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b048fb63fd8b5923fc5aa7b340d8e156aec7ec02f0c78fa8a6ddc2613f6f71de"
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -479,6 +488,7 @@ dependencies = [
  "async-trait",
  "backon",
  "base64-simd",
+ "blake2",
  "byteorder",
  "bytes",
  "common",
@@ -486,6 +496,7 @@ dependencies = [
  "futures",
  "glob",
  "hex-simd",
+ "highway",
  "http",
  "lazy_static",
  "lock",
@@ -795,6 +806,12 @@ dependencies = [
  "outref",
  "vsimd",
 ]
+
+[[package]]
+name = "highway"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c706f1711006204c2ba8fb1a7bd55f689bbf7feca9ff40325206b5e140cff6df"
 
 [[package]]
 name = "hmac"

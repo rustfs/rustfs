@@ -12,6 +12,7 @@ use http::HeaderMap;
 use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -240,6 +241,18 @@ pub struct ErasureInfo {
     pub checksums: Vec<ChecksumInfo>,
 }
 
+impl ErasureInfo {
+    pub fn get_checksum_info(&self, part_number: usize) -> ChecksumInfo {
+        for sum in &self.checksums {
+            if sum.part_number == part_number {
+                return sum.clone();
+            }
+        }
+
+        ChecksumInfo {algorithm: BitrotAlgorithm::HighwayHash256S, ..Default::default()}
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
 // ChecksumInfo - carries checksums of individual scattered parts per disk.
 pub struct ChecksumInfo {
@@ -248,7 +261,7 @@ pub struct ChecksumInfo {
     pub hash: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone, Eq, Hash)]
 // BitrotAlgorithm specifies a algorithm used for bitrot protection.
 pub enum BitrotAlgorithm {
     // SHA256 represents the SHA-256 hash function
