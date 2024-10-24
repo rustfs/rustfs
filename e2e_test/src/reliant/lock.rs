@@ -50,7 +50,7 @@ async fn test_lock_unlock_ns_lock() -> Result<(), Box<dyn Error>> {
     let url = url::Url::parse("http://127.0.0.1:9000/data")?;
     let locker = new_lock_api(false, Some(url));
     let ns_mutex = Arc::new(RwLock::new(NsLockMap::new(true)));
-    let mut ns = new_nslock(
+    let ns = new_nslock(
         Arc::clone(&ns_mutex),
         "local".to_string(),
         "dandan".to_string(),
@@ -59,7 +59,7 @@ async fn test_lock_unlock_ns_lock() -> Result<(), Box<dyn Error>> {
     )
     .await;
     assert_eq!(
-        ns.get_lock(&Options {
+        ns.0.write().await.get_lock(&Options {
             timeout: Duration::from_secs(5),
             retry_interval: Duration::from_secs(1),
         })
@@ -68,6 +68,6 @@ async fn test_lock_unlock_ns_lock() -> Result<(), Box<dyn Error>> {
         true
     );
 
-    ns.un_lock().await.unwrap();
+    ns.0.write().await.un_lock().await.unwrap();
     Ok(())
 }

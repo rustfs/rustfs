@@ -11,7 +11,7 @@ use crate::{
 };
 use common::error::Result;
 
-pub type RWLockerImpl = Box<dyn RWLocker + Send>;
+pub type RWLockerImpl = Box<dyn RWLocker + Send + Sync>;
 
 #[async_trait]
 pub trait RWLocker {
@@ -93,22 +93,33 @@ impl NsLockMap {
     }
 }
 
+pub struct WrapperLocker(pub Arc<RwLock<RWLockerImpl>>);
+
+impl Drop for WrapperLocker {
+    fn drop(&mut self) {
+        let inner = self.0.clone();
+        tokio::spawn(async move {
+            let _ = inner.write().await.un_lock().await;
+        });
+    }
+}
+
 pub async fn new_nslock(
     ns: Arc<RwLock<NsLockMap>>,
     owner: String,
     volume: String,
     paths: Vec<String>,
     lockers: Vec<LockApi>,
-) -> RWLockerImpl {
+) -> WrapperLocker {
     if ns.read().await.is_dist_erasure {
         let names = paths
             .iter()
             .map(|path| Path::new(&volume).join(path).to_str().unwrap().to_string())
             .collect();
-        return Box::new(DistLockInstance::new(owner, names, lockers));
+        return WrapperLocker(Arc::new(RwLock::new(Box::new(DistLockInstance::new(owner, names, lockers)))));
     }
 
-    Box::new(LocalLockInstance::new(ns, volume, paths))
+    WrapperLocker(Arc::new(RwLock::new(Box::new(LocalLockInstance::new(ns, volume, paths)))))
 }
 
 struct DistLockInstance {
@@ -258,7 +269,7 @@ mod test {
     #[tokio::test]
     async fn test_local_instance() -> Result<()> {
         let ns_lock_map = Arc::new(RwLock::new(NsLockMap::default()));
-        let mut ns = new_nslock(
+        let ns = new_nslock(
             Arc::clone(&ns_lock_map),
             "local".to_string(),
             "test".to_string(),
@@ -267,7 +278,7 @@ mod test {
         )
         .await;
 
-        let result = ns
+        let result = ns.0.write().await
             .get_lock(&Options {
                 timeout: Duration::from_secs(5),
                 retry_interval: Duration::from_secs(1),
