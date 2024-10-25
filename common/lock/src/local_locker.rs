@@ -287,7 +287,6 @@ impl Locker for LocalLocker {
 
     // TODO: need add timeout mechanism
     async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
-        let mut reply: bool;
         if args.uid.is_empty() {
             args.resources.iter().for_each(|resource| {
                 if let Some(lris) = self.lock_map.get(resource) {
@@ -307,13 +306,12 @@ impl Locker for LocalLocker {
         let mut idx = 0;
         let mut need_remove_resource = Vec::new();
         let mut need_remove_map_id = Vec::new();
-        loop {
+        let reply = loop {
             let mut map_id = args.uid.to_string();
             format_uuid(&mut map_id, &idx);
             match self.lock_uid.get(&map_id) {
                 Some(resource) => match self.lock_map.get_mut(resource) {
                     Some(lris) => {
-                        reply = true;
                         {
                             lris.retain(|lri| {
                                 if lri.uid == args.uid && (args.owner.is_empty() || lri.owner == args.owner) {
@@ -338,11 +336,10 @@ impl Locker for LocalLocker {
                     }
                 },
                 None => {
-                    reply = idx > 0;
-                    break;
+                    break idx > 0;
                 }
             }
-        }
+        };
         need_remove_resource.into_iter().for_each(|resource| {
             self.lock_map.remove(&resource);
         });

@@ -278,12 +278,14 @@ mod test {
         )
         .await;
 
-        let result = ns.0.write().await
-            .get_lock(&Options {
-                timeout: Duration::from_secs(5),
-                retry_interval: Duration::from_secs(1),
-            })
-            .await?;
+        let result =
+            ns.0.write()
+                .await
+                .get_lock(&Options {
+                    timeout: Duration::from_secs(5),
+                    retry_interval: Duration::from_secs(1),
+                })
+                .await?;
 
         assert_eq!(result, true);
         Ok(())
