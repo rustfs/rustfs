@@ -59,12 +59,14 @@ async fn test_lock_unlock_ns_lock() -> Result<(), Box<dyn Error>> {
     )
     .await;
     assert_eq!(
-        ns.0.write().await.get_lock(&Options {
-            timeout: Duration::from_secs(5),
-            retry_interval: Duration::from_secs(1),
-        })
-        .await
-        .unwrap(),
+        ns.0.write()
+            .await
+            .get_lock(&Options {
+                timeout: Duration::from_secs(5),
+                retry_interval: Duration::from_secs(1),
+            })
+            .await
+            .unwrap(),
         true
     );
 
