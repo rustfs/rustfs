@@ -881,8 +881,9 @@ impl DiskAPI for LocalDisk {
                 .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
                 .join(format!("part.{}", part.number));
 
-            self.bi
+            // self.bi
         });
+        todo!()
     }
 
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
