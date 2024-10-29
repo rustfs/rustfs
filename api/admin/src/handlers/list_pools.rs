@@ -1,5 +1,5 @@
+use crate::error::ErrorCode;
 use crate::Result as LocalResult;
-use crate::{error::ErrorCode, object_api::ObjectApi};
 
 use axum::{extract::State, Json};
 use serde::Serialize;
@@ -39,12 +39,17 @@ struct PoolDecommissionInfo {
     bytes_failed: i64,
 }
 
-pub async fn handler(State(ec_store): State<ObjectApi>) -> LocalResult<Json<Vec<PoolStatus>>> {
+pub async fn handler() -> LocalResult<Json<Vec<PoolStatus>>> {
     // if ecstore::is_legacy().await {
     //     return Err(ErrorCode::ErrNotImplemented);
     // }
+    //
+    //
 
-    let pools = (*ec_store).as_ref().ok_or(ErrorCode::ErrNotImplemented)?;
+    // todo 实用oncelock作为全局变量
+    let layer = ecstore::new_object_layer_fn();
+    let lock = layer.read().await;
+    let pools = lock.as_ref().ok_or(ErrorCode::ErrNotImplemented)?;
 
     // todo, 调用pool.status()接口获取每个池的数据
     //
