@@ -1,0 +1,42 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0' # at midnight of each sunday
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install protoc
+        run: |
+          wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip
+          unzip protoc-27.0-linux-x86_64.zip -d protoc3
+          mv protoc3/bin/* /usr/local/bin/
+          chmod +x /usr/local/bin/protoc
+          rm -rf protoc-27.0-linux-x86_64.zip protoc3
+
+      - run: protoc --version
+
+      - name: install flatc
+        run: |
+          wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
+          unzip Linux.flatc.binary.g++-13.zip
+          mv flatc /usr/local/bin/ 
+          chmod +x /usr/local/bin/flatc 
+          rm -rf Linux.flatc.binary.g++-13.zip
+
+      - run: flatc --version
+
+      - run: cargo build -p rustfs --bins --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          path: ./target/release/rustfs
