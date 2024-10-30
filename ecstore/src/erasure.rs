@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use futures::{Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use std::any::Any;
 use std::fmt::Debug;
 use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;
@@ -325,6 +326,7 @@ impl Erasure {
 
 #[async_trait::async_trait]
 pub trait Write {
+    fn as_any(&self) -> &dyn Any;
     async fn write(&mut self, buf: &[u8]) -> Result<()>;
 }
 

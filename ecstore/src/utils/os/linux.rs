@@ -1,79 +1,107 @@
-use nix::sys::{
-    stat::{major, minor, stat},
-    statfs::{statfs, FsType},
-};
+use nix::sys::stat::{self, stat};
+use nix::sys::statfs::{self, statfs, FsType};
+use std::io::{Error, ErrorKind};
+use std::path::Path;
 
-use crate::{
-    disk::Info,
-    error::{Error, Result},
-};
+use crate::{disk::Info, error::Result};
 
-use lazy_static::lazy_static;
-use std::collections::HashMap;
+/// returns total and free bytes available in a directory, e.g. `/`.
+pub fn get_info(p: impl AsRef<Path>, _first_time: bool) -> std::io::Result<Info> {
+    let stat_fs = statfs(p.as_ref())?;
 
-lazy_static! {
-    static ref FS_TYPE_TO_STRING_MAP: HashMap<&'static str, &'static str> = {
-        let mut m = HashMap::new();
-        m.insert("1021994", "TMPFS");
-        m.insert("137d", "EXT");
-        m.insert("4244", "HFS");
-        m.insert("4d44", "MSDOS");
-        m.insert("52654973", "REISERFS");
-        m.insert("5346544e", "NTFS");
-        m.insert("58465342", "XFS");
-        m.insert("61756673", "AUFS");
-        m.insert("6969", "NFS");
-        m.insert("ef51", "EXT2OLD");
-        m.insert("ef53", "EXT4");
-        m.insert("f15f", "ecryptfs");
-        m.insert("794c7630", "overlayfs");
-        m.insert("2fc12fc1", "zfs");
-        m.insert("ff534d42", "cifs");
-        m.insert("53464846", "wslfs");
-        m
+    let bsize = stat_fs.block_size() as u64;
+    let bfree = stat_fs.blocks_free() as u64;
+    let bavail = stat_fs.blocks_available() as u64;
+    let blocks = stat_fs.blocks() as u64;
+
+    let reserved = match bfree.checked_sub(bavail) {
+        Some(reserved) => reserved,
+        None => {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "detected f_bavail space ({}) > f_bfree space ({}), fs corruption at ({}). please run 'fsck'",
+                    bavail,
+                    bfree,
+                    p.as_ref().display()
+                ),
+            ))
+        }
     };
-}
 
-fn get_fs_type(ftype: FsType) -> String {
-    let binding = format!("{:?}", ftype);
-    let fs_type_hex = binding.as_str();
-    match FS_TYPE_TO_STRING_MAP.get(fs_type_hex) {
-        Some(fs_type_string) => fs_type_string.to_string(),
-        None => "UNKNOWN".to_string(),
-    }
-}
+    let total = match blocks.checked_sub(reserved) {
+        Some(total) => total * bsize,
+        None => {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "detected reserved space ({}) > blocks space ({}), fs corruption at ({}). please run 'fsck'",
+                    reserved,
+                    blocks,
+                    p.as_ref().display()
+                ),
+            ))
+        }
+    };
 
-pub fn get_info(path: &str, first_time: bool) -> Result<Info> {
-    let statfs = statfs(path)?;
-    let reserved_blocks = statfs.blocks_free() - statfs.blocks_available();
-    let mut info = Info {
-        total: statfs.block_size() as u64 * (statfs.blocks() - reserved_blocks),
-        free: statfs.blocks() as u64 * statfs.blocks_available(),
-        files: statfs.files(),
-        ffree: statfs.files_free(),
-        fstype: get_fs_type(statfs.filesystem_type()),
+    let free = bavail * bsize;
+    let used = match total.checked_sub(free) {
+        Some(used) => used,
+        None => {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "detected free space ({}) > total drive space ({}), fs corruption at ({}). please run 'fsck'",
+                    free,
+                    total,
+                    p.as_ref().display()
+                ),
+            ))
+        }
+    };
+
+    let st = stat(p.as_ref())?;
+
+    Ok(Info {
+        total,
+        free,
+        used,
+        files: stat_fs.files(),
+        ffree: stat_fs.files_free(),
+        fstype: get_fs_type(stat_fs.filesystem_type()).to_string(),
+
+        major: stat::major(st.st_dev),
+        minor: stat::minor(st.st_dev),
+
         ..Default::default()
-    };
+    })
+}
 
-    let stat = stat(path)?;
-    let dev_id = stat.st_dev as u64;
-    info.major = major(dev_id);
-    info.minor = minor(dev_id);
+/// returns the filesystem type of the underlying mounted filesystem
+///
+/// TODO The following mapping could not find the corresponding constant in `nix`:
+///
+/// "137d" => "EXT",
+/// "4244" => "HFS",
+/// "5346544e" => "NTFS",
+/// "61756673" => "AUFS",
+/// "ef51" => "EXT2OLD",
+/// "2fc12fc1" => "zfs",
+/// "ff534d42" => "cifs",
+/// "53464846" => "wslfs",
+fn get_fs_type(fs_type: FsType) -> &'static str {
+    match fs_type {
+        statfs::TMPFS_MAGIC => "TMPFS",
+        statfs::MSDOS_SUPER_MAGIC => "MSDOS",
+        statfs::XFS_SUPER_MAGIC => "XFS",
+        statfs::NFS_SUPER_MAGIC => "NFS",
+        statfs::EXT4_SUPER_MAGIC => "EXT4",
+        statfs::ECRYPTFS_SUPER_MAGIC => "ecryptfs",
+        statfs::OVERLAYFS_SUPER_MAGIC => "overlayfs",
+        statfs::REISERFS_SUPER_MAGIC => "REISERFS",
 
-    if info.free > info.total {
-        return Err(Error::from_string(format!(
-            "detected free space {} > total drive space {}, fs corruption at {}. please run 'fsck'",
-            info.free, info.total, path
-        )));
+        _ => "UNKNOWN",
     }
-
-    info.used = info.total - info.free;
-
-    if first_time {
-        // todo
-    }
-
-    Ok(info)
 }
 
 pub fn same_disk(disk1: &str, disk2: &str) -> Result<bool> {

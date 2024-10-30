@@ -26,7 +26,7 @@ use protos::proto_gen::node_service::{
     node_service_client::NodeServiceClient, ReadAtRequest, ReadAtResponse, WriteRequest, WriteResponse,
 };
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::HashMap, fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc, usize};
+use std::{any::Any, cmp::Ordering, collections::HashMap, fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc, usize};
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
@@ -646,6 +646,10 @@ pub enum FileWriter {
 
 #[async_trait::async_trait]
 impl Write for FileWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         match self {
             Self::Local(local_file_writer) => local_file_writer.write(buf).await,
@@ -666,6 +670,10 @@ impl LocalFileWriter {
 
 #[async_trait::async_trait]
 impl Write for LocalFileWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         let _ = self.inner.write(buf).await?;
         self.inner.flush().await?;
@@ -714,6 +722,10 @@ impl RemoteFileWriter {
 
 #[async_trait::async_trait]
 impl Write for RemoteFileWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         let request = WriteRequest {
             disk: self.root.to_string_lossy().to_string(),
