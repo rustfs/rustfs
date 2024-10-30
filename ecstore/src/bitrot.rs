@@ -1,7 +1,6 @@
 use std::{any::Any, collections::HashMap, io::Cursor};
 
 use blake2::Blake2b512;
-use hex_simd::{decode_to_vec, encode_to_string};
 use highway::{HighwayHash, HighwayHasher, Key};
 use lazy_static::lazy_static;
 use sha2::{digest::core_api::BlockSizeUser, Digest, Sha256};
@@ -30,6 +29,7 @@ lazy_static! {
 // ];
 const MAGIC_HIGHWAY_HASH256_KEY: &[u64; 4] = &[3, 4, 2, 1];
 
+#[derive(Clone)]
 pub enum Hasher {
     SHA256(Sha256),
     HighwayHash256(HighwayHasher),
@@ -85,8 +85,8 @@ impl Hasher {
             Hasher::HighwayHash256(highway_hasher) => {
                 let key = Key(*MAGIC_HIGHWAY_HASH256_KEY);
                 *highway_hasher = HighwayHasher::new(key);
-            } ,
-            Hasher::BLAKE2b512(core_wrapper) =>core_wrapper.reset(),
+            }
+            Hasher::BLAKE2b512(core_wrapper) => core_wrapper.reset(),
         }
     }
 }
@@ -165,6 +165,14 @@ pub fn new_bitrot_reader(
     Box::new(WholeBitrotReader::new(disk, bucket, file_path, algo, till_offset, sum))
 }
 
+pub fn bitrot_writer_sum(w: &BitrotWriter) -> Vec<u8> {
+    if let Some(w) = w.as_any().downcast_ref::<WholeBitrotWriter>() {
+        return w.hash.clone().finalize();
+    }
+
+    Vec::new()
+}
+
 pub fn bitrot_shard_file_size(size: i64, _shard_size: i64, algo: BitrotAlgorithm) -> i64 {
     if algo != BitrotAlgorithm::HighwayHash256S {
         return size;
@@ -195,21 +203,17 @@ pub struct WholeBitrotWriter {
     disk: DiskStore,
     volume: String,
     file_path: String,
-    shard_size: usize,
-    hash: Hasher,
+    _shard_size: usize,
+    pub hash: Hasher,
 }
 
 impl WholeBitrotWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     pub fn new(disk: DiskStore, volume: &str, file_path: &str, algo: BitrotAlgorithm, shard_size: usize) -> Self {
         WholeBitrotWriter {
             disk,
             volume: volume.to_string(),
             file_path: file_path.to_string(),
-            shard_size,
+            _shard_size: shard_size,
             hash: algo.new(),
         }
     }
@@ -217,6 +221,10 @@ impl WholeBitrotWriter {
 
 #[async_trait::async_trait]
 impl Write for WholeBitrotWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         let mut file = self.disk.append_file(&self.volume, &self.file_path).await?;
         let _ = file.write(buf).await?;
@@ -230,7 +238,7 @@ pub struct WholeBitrotReader {
     disk: DiskStore,
     volume: String,
     file_path: String,
-    verifier: BitrotVerifier,
+    _verifier: BitrotVerifier,
     till_offset: usize,
     buf: Option<Vec<u8>>,
 }
@@ -241,7 +249,7 @@ impl WholeBitrotReader {
             disk,
             volume: volume.to_string(),
             file_path: file_path.to_string(),
-            verifier: BitrotVerifier::new(algo, sum),
+            _verifier: BitrotVerifier::new(algo, sum),
             till_offset,
             buf: None,
         }
@@ -270,39 +278,108 @@ impl ReadAt for WholeBitrotReader {
     }
 }
 
-#[test]
-fn bitrot_self_test() -> Result<()> {
-    let mut checksums = HashMap::new();
-    checksums.insert(BitrotAlgorithm::SHA256, "a7677ff19e0182e4d52e3a3db727804abc82a5818749336369552e54b838b004");
-    checksums.insert(BitrotAlgorithm::BLAKE2b512, "e519b7d84b1c3c917985f544773a35cf265dcab10948be3550320d156bab612124a5ae2ae5a8c73c0eea360f68b0e28136f26e858756dbfe7375a7389f26c669");
-    checksums.insert(BitrotAlgorithm::HighwayHash256, "c81c2386a1f565e805513d630d4e50ff26d11269b21c221cf50fc6c29d6ff75b");
-    checksums.insert(BitrotAlgorithm::HighwayHash256S, "c81c2386a1f565e805513d630d4e50ff26d11269b21c221cf50fc6c29d6ff75b");
+#[cfg(test)]
+mod test {
+    use std::{collections::HashMap, fs};
 
-    let iter = [BitrotAlgorithm::SHA256, BitrotAlgorithm::BLAKE2b512, BitrotAlgorithm:: HighwayHash256];
+    use hex_simd::decode_to_vec;
+    use tempfile::TempDir;
 
-    for algo in iter.iter() {
-        if !algo.available() || *algo != BitrotAlgorithm::HighwayHash256 {
-            continue;
+    use crate::{
+        bitrot::{new_bitrot_writer, BITROT_ALGORITHMS},
+        disk::{endpoint::Endpoint, error::DiskError, new_disk, DiskOption},
+        error::{Error, Result},
+        store_api::BitrotAlgorithm,
+    };
+
+    use super::{bitrot_writer_sum, new_bitrot_reader};
+
+    #[test]
+    fn bitrot_self_test() -> Result<()> {
+        let mut checksums = HashMap::new();
+        checksums.insert(
+            BitrotAlgorithm::SHA256,
+            "a7677ff19e0182e4d52e3a3db727804abc82a5818749336369552e54b838b004",
+        );
+        checksums.insert(BitrotAlgorithm::BLAKE2b512, "e519b7d84b1c3c917985f544773a35cf265dcab10948be3550320d156bab612124a5ae2ae5a8c73c0eea360f68b0e28136f26e858756dbfe7375a7389f26c669");
+        checksums.insert(
+            BitrotAlgorithm::HighwayHash256,
+            "c81c2386a1f565e805513d630d4e50ff26d11269b21c221cf50fc6c29d6ff75b",
+        );
+        checksums.insert(
+            BitrotAlgorithm::HighwayHash256S,
+            "c81c2386a1f565e805513d630d4e50ff26d11269b21c221cf50fc6c29d6ff75b",
+        );
+
+        let iter = [
+            BitrotAlgorithm::SHA256,
+            BitrotAlgorithm::BLAKE2b512,
+            BitrotAlgorithm::HighwayHash256,
+        ];
+
+        for algo in iter.iter() {
+            if !algo.available() || *algo != BitrotAlgorithm::HighwayHash256 {
+                continue;
+            }
+            let checksum = decode_to_vec(checksums.get(algo).unwrap()).unwrap();
+
+            let mut h = algo.new();
+            let mut msg = Vec::with_capacity(h.size() * h.block_size());
+            let mut sum = Vec::with_capacity(h.size());
+
+            for _ in (0..h.size() * h.block_size()).step_by(h.size()) {
+                h.update(&msg);
+                sum = h.finalize();
+                msg.extend(sum.clone());
+                h = algo.new();
+            }
+
+            if checksum != sum {
+                println!("failed: {:?}, expect: {:?}, actual: {:?}", algo, checksum, sum);
+                return Err(Error::new(DiskError::FileCorrupt));
+            }
+            println!("success: {:?}", algo);
         }
-        let checksum = decode_to_vec(checksums.get(algo).unwrap()).unwrap();
-        
-        let mut h = algo.new();
-        let mut msg = Vec::with_capacity(h.size() * h.block_size());
-        let mut sum = Vec::with_capacity(h.size());
 
-        for i in (0..h.size()*h.block_size()).step_by(h.size()) {
-            h.update(&msg);
-            sum = h.finalize();
-            msg.extend(sum.clone());
-            h = algo.new();
-        }
-
-        if checksum != sum {
-            println!("failed: {:?}, expect: {:?}, actual: {:?}", algo, checksum, sum);
-            return Err(Error::new(DiskError::FileCorrupt));
-        }
-        println!("success: {:?}", algo);
+        Ok(())
     }
 
-    Ok(())
+    #[tokio::test]
+    async fn test_all_bitrot_algorithms() -> Result<()> {
+        for algo in BITROT_ALGORITHMS.keys() {
+            if *algo == BitrotAlgorithm::HighwayHash256S {
+                continue;
+            }
+            test_bitrot_reader_writer_algo(algo.clone()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn test_bitrot_reader_writer_algo(algo: BitrotAlgorithm) -> Result<()> {
+        let temp_dir = TempDir::new().unwrap().path().to_string_lossy().to_string();
+        fs::create_dir_all(&temp_dir)?;
+        let volume = "testvol";
+        let file_path = "testfile";
+
+        let ep = Endpoint::try_from(temp_dir.as_str())?;
+        let opt = DiskOption::default();
+        let disk = new_disk(&ep, &opt).await?;
+        let _ = disk.make_volume(volume).await?;
+        let mut writer = new_bitrot_writer(disk.clone(), "", volume, file_path, 35, algo.clone(), 10);
+
+        let _ = writer.write(b"aaaaaaaaaa").await?;
+        let _ = writer.write(b"aaaaaaaaaa").await?;
+        let _ = writer.write(b"aaaaaaaaaa").await?;
+        let _ = writer.write(b"aaaaa").await?;
+
+        let mut reader = new_bitrot_reader(disk, b"", volume, file_path, 35, algo, &bitrot_writer_sum(&writer), 10);
+        let read_len = 10;
+        (_, _) = reader.read_at(0, read_len).await?;
+        (_, _) = reader.read_at(0, read_len).await?;
+        (_, _) = reader.read_at(0, read_len).await?;
+        (_, _) = reader.read_at(0, read_len / 2).await?;
+
+        Ok(())
+    }
 }
