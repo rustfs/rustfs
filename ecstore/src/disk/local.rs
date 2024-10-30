@@ -147,9 +147,9 @@ impl LocalDisk {
                             id: disk_id.to_string(),
                             ..Default::default()
                         };
-                        if root {
-                            return Err(Error::new(DiskError::DriveIsRoot));
-                        }
+                        // if root {
+                        //     return Err(Error::new(DiskError::DriveIsRoot));
+                        // }
 
                         // disk_info.healing =
                         Ok(disk_info)
@@ -185,9 +185,9 @@ impl LocalDisk {
         disk.minor = info.minor;
         disk.fstype = info.fstype;
 
-        if root {
-            return Err(Error::new(DiskError::DriveIsRoot));
-        }
+        // if root {
+        //     return Err(Error::new(DiskError::DriveIsRoot));
+        // }
 
         if info.nrrequests > 0 {
             disk.nrrequests = info.nrrequests;

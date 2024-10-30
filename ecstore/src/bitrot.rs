@@ -4,6 +4,10 @@ use blake2::Blake2b512;
 use highway::{HighwayHash, HighwayHasher, Key};
 use lazy_static::lazy_static;
 use sha2::{digest::core_api::BlockSizeUser, Digest, Sha256};
+use tokio::{
+    spawn,
+    sync::mpsc::{self, Sender}, task::JoinHandle,
+};
 
 use crate::{
     disk::{error::DiskError, DiskStore},
@@ -113,15 +117,15 @@ impl BitrotAlgorithm {
 }
 
 pub struct BitrotVerifier {
-    algorithm: BitrotAlgorithm,
-    sum: Vec<u8>,
+    _algorithm: BitrotAlgorithm,
+    _sum: Vec<u8>,
 }
 
 impl BitrotVerifier {
     pub fn new(algorithm: BitrotAlgorithm, checksum: &[u8]) -> BitrotVerifier {
         BitrotVerifier {
-            algorithm,
-            sum: checksum.to_vec(),
+            _algorithm: algorithm,
+            _sum: checksum.to_vec(),
         }
     }
 }
@@ -136,32 +140,40 @@ pub fn bitrot_algorithm_from_string(s: &str) -> BitrotAlgorithm {
     BitrotAlgorithm::HighwayHash256S
 }
 
-type BitrotWriter = Box<dyn Write>;
+type BitrotWriter = Box<dyn Write + Send>;
 
-pub fn new_bitrot_writer(
+pub async fn new_bitrot_writer(
     disk: DiskStore,
-    _orig_volume: &str,
+    orig_volume: &str,
     volume: &str,
     file_path: &str,
-    _length: usize,
+    length: usize,
     algo: BitrotAlgorithm,
     shard_size: usize,
-) -> BitrotWriter {
-    Box::new(WholeBitrotWriter::new(disk, volume, file_path, algo, shard_size))
+) -> Result<BitrotWriter> {
+    if algo == BitrotAlgorithm::HighwayHash256S {
+        return Ok(Box::new(
+            StreamingBitrotWriter::new(disk, orig_volume, volume, file_path, length, algo, shard_size).await?,
+        ));
+    }
+    Ok(Box::new(WholeBitrotWriter::new(disk, volume, file_path, algo, shard_size)))
 }
 
 type BitrotReader = Box<dyn ReadAt>;
 
 pub fn new_bitrot_reader(
     disk: DiskStore,
-    _data: &[u8],
+    data: &[u8],
     bucket: &str,
     file_path: &str,
     till_offset: usize,
     algo: BitrotAlgorithm,
     sum: &[u8],
-    _shard_size: usize,
+    shard_size: usize,
 ) -> BitrotReader {
+    if algo == BitrotAlgorithm::HighwayHash256S {
+        return Box::new(StreamingBitrotReader::new(disk, data, bucket, file_path, algo, till_offset, shard_size));
+    }
     Box::new(WholeBitrotReader::new(disk, bucket, file_path, algo, till_offset, sum))
 }
 
@@ -173,12 +185,11 @@ pub fn bitrot_writer_sum(w: &BitrotWriter) -> Vec<u8> {
     Vec::new()
 }
 
-pub fn bitrot_shard_file_size(size: i64, _shard_size: i64, algo: BitrotAlgorithm) -> i64 {
+pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: BitrotAlgorithm) -> usize {
     if algo != BitrotAlgorithm::HighwayHash256S {
         return size;
     }
-    todo!()
-    // ceil_frac(size, shard_size) * algo.new().size() + size
+    size.div_ceil(shard_size) * algo.new().size() + size
 }
 
 pub fn bitrot_verify(
@@ -278,6 +289,148 @@ impl ReadAt for WholeBitrotReader {
     }
 }
 
+struct StreamingBitrotWriter {
+    hasher: Hasher,
+    tx: Sender<Option<Vec<u8>>>,
+    task: JoinHandle<()>,
+}
+
+impl StreamingBitrotWriter {
+    pub async fn new(
+        disk: DiskStore,
+        orig_volume: &str,
+        volume: &str,
+        file_path: &str,
+        length: usize,
+        algo: BitrotAlgorithm,
+        shard_size: usize,
+    ) -> Result<Self> {
+        let hasher = algo.new();
+        let (tx, mut rx) = mpsc::channel::<Option<Vec<u8>>>(10);
+
+        let total_file_size = length.div_ceil(shard_size) * hasher.size() + length;
+        let mut writer = disk.create_file(orig_volume, volume, file_path, total_file_size).await?;
+
+        let task = spawn(async move {
+            loop {
+                if let Some(Some(buf)) = rx.recv().await {
+                    let _ = writer.write(&buf).await.unwrap();
+                    continue;
+                }
+
+                break;
+            }
+        });
+
+        Ok(StreamingBitrotWriter { hasher, tx, task })
+    }
+}
+
+#[async_trait::async_trait]
+impl Write for StreamingBitrotWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.hasher.reset();
+        self.hasher.update(&buf);
+        let hash_bytes = self.hasher.clone().finalize();
+        println!("hash_bytes len: {}, buf len: {}", hash_bytes.len(), buf.len());
+        let _ = self.tx.send(Some(hash_bytes)).await?;
+        let _ = self.tx.send(Some(buf.to_vec())).await?;
+
+        Ok(())
+    }
+
+    async fn close(self: Box<Self>) -> Result<()> {
+        let _ = self.tx.send(None).await?;
+        let _ = self.task.await;
+        Ok(())
+    }
+}
+
+struct StreamingBitrotReader {
+    disk: DiskStore,
+    _data: Vec<u8>,
+    volume: String,
+    file_path: String,
+    till_offset: usize,
+    curr_offset: usize,
+    hasher: Hasher,
+    shard_size: usize,
+    buf: Vec<u8>,
+    hash_bytes: Vec<u8>,
+}
+
+impl StreamingBitrotReader {
+    pub fn new(
+        disk: DiskStore,
+        data: &[u8],
+        volume: &str,
+        file_path: &str,
+        algo: BitrotAlgorithm,
+        till_offset: usize,
+        shard_size: usize,
+    ) -> Self {
+        let hasher = algo.new();
+        Self {
+            disk,
+            _data: data.to_vec(),
+            volume: volume.to_string(),
+            file_path: file_path.to_string(),
+            till_offset: till_offset.div_ceil(shard_size) * hasher.size() + till_offset,
+            curr_offset: 0,
+            hash_bytes: Vec::with_capacity(hasher.size()),
+            hasher,
+            shard_size,
+            buf: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ReadAt for StreamingBitrotReader {
+    async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
+        println!("in  read_at");
+        if offset % self.shard_size != 0 {
+            return Err(Error::new(DiskError::Unexpected));
+        }
+        if self.buf.is_empty() {
+            self.curr_offset = offset;
+            let stream_offset = (offset / self.shard_size) * self.hasher.size() + offset;
+            let buf_len = self.till_offset - stream_offset;
+            let mut file = self.disk.read_file(&self.volume, &self.file_path).await?;
+            println!("stream_offset: {}, buf_len: {}", stream_offset, buf_len);
+            let (buf, _) = file.read_at(stream_offset, buf_len).await?;
+            println!("buf: {:?}, len: {}", buf, buf.len());
+            self.buf = buf;
+        }
+        if offset != self.curr_offset {
+            return Err(Error::new(DiskError::Unexpected));
+        }
+
+        self.hash_bytes = self.buf.drain(0..self.hash_bytes.capacity()).collect();
+        let buf = self.buf.drain(0..length).collect::<Vec<_>>();
+        println!("self.buf: {:?}", self.buf);
+        self.hasher.reset();
+        self.hasher.update(&buf);
+        let actual = self.hasher.clone().finalize();
+        if actual != self.hash_bytes {
+            println!("except: {:?}, actual: {:?}", self.hash_bytes, actual);
+            return Err(Error::new(DiskError::FileCorrupt));
+        }
+
+        let readed_len = buf.len();
+        self.curr_offset += readed_len;
+
+        Ok((buf, readed_len))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::{collections::HashMap, fs};
@@ -347,9 +500,6 @@ mod test {
     #[tokio::test]
     async fn test_all_bitrot_algorithms() -> Result<()> {
         for algo in BITROT_ALGORITHMS.keys() {
-            if *algo == BitrotAlgorithm::HighwayHash256S {
-                continue;
-            }
             test_bitrot_reader_writer_algo(algo.clone()).await?;
         }
 
@@ -366,19 +516,22 @@ mod test {
         let opt = DiskOption::default();
         let disk = new_disk(&ep, &opt).await?;
         let _ = disk.make_volume(volume).await?;
-        let mut writer = new_bitrot_writer(disk.clone(), "", volume, file_path, 35, algo.clone(), 10);
+        let mut writer = new_bitrot_writer(disk.clone(), "", volume, file_path, 35, algo.clone(), 10).await?;
 
         let _ = writer.write(b"aaaaaaaaaa").await?;
         let _ = writer.write(b"aaaaaaaaaa").await?;
         let _ = writer.write(b"aaaaaaaaaa").await?;
         let _ = writer.write(b"aaaaa").await?;
 
-        let mut reader = new_bitrot_reader(disk, b"", volume, file_path, 35, algo, &bitrot_writer_sum(&writer), 10);
+        let sum = bitrot_writer_sum(&writer);
+        let _ = writer.close().await?;
+
+        let mut reader = new_bitrot_reader(disk, b"", volume, file_path, 35, algo, &sum, 10);
         let read_len = 10;
         (_, _) = reader.read_at(0, read_len).await?;
-        (_, _) = reader.read_at(0, read_len).await?;
-        (_, _) = reader.read_at(0, read_len).await?;
-        (_, _) = reader.read_at(0, read_len / 2).await?;
+        (_, _) = reader.read_at(10, read_len).await?;
+        (_, _) = reader.read_at(20, read_len).await?;
+        (_, _) = reader.read_at(30, read_len / 2).await?;
 
         Ok(())
     }

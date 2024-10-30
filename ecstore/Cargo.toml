@@ -51,6 +51,7 @@ tower.workspace = true
 rmp = "0.8.14"
 byteorder = "1.5.0"
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+num = "0.4.3"
 num_cpus = "1.16"
 s3s-policy.workspace = true
 
