@@ -483,7 +483,7 @@ impl AllHealState {
             hsp.client_address = he.client_address.clone();
             hsp.start_time = he.start_time;
 
-            he.stop();
+            he.stop().await;
 
             loop {
                 if he.has_ended().await {
@@ -493,7 +493,7 @@ impl AllHealState {
                 sleep(Duration::from_secs(1)).await;
             }
 
-            self.mu.write().await;
+            let _ = self.mu.write().await;
             self.heal_seq_map.remove(path);
         } else {
             hsp.client_token = "unknown".to_string();
@@ -526,7 +526,7 @@ impl AllHealState {
             }
         }
 
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         for (k, v) in self.heal_seq_map.iter() {
             if !v.has_ended().await && (has_profix(&k, path_s) || has_profix(path_s, &k)) {

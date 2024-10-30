@@ -328,6 +328,9 @@ impl Erasure {
 pub trait Write {
     fn as_any(&self) -> &dyn Any;
     async fn write(&mut self, buf: &[u8]) -> Result<()>;
+    async fn close(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
