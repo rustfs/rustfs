@@ -13,7 +13,7 @@ use std::{
     path::Path,
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     select, spawn,
@@ -202,7 +202,7 @@ impl HealSequence {
 
     async fn stop(&self) {
         let w = self.tx.write().await;
-        w.send(true);
+        let _ = w.send(true);
     }
 
     async fn push_heal_result_item(&self, r: &HealResultItem) -> Result<()> {
@@ -363,7 +363,7 @@ impl AllHealState {
     }
 
     async fn pop_heal_local_disks(&mut self, heal_local_disks: &[Endpoint]) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         self.heal_local_disks.retain(|k, _| {
             if heal_local_disks.contains(k) {
@@ -383,14 +383,14 @@ impl AllHealState {
     }
 
     async fn update_heal_status(&mut self, tracker: &HealingTracker) {
-        self.mu.write().await;
-        tracker.mu.read().await;
+        let _ = self.mu.write().await;
+        let _ = tracker.mu.read().await;
 
         self.heal_status.insert(tracker.id.clone(), tracker.clone());
     }
 
     async fn get_local_healing_disks(&self) -> HashMap<String, HealingDisk> {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
 
         let mut dst = HashMap::new();
         for v in self.heal_status.values() {
@@ -401,7 +401,7 @@ impl AllHealState {
     }
 
     async fn get_heal_local_disk_endpoints(&self) -> Endpoints {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
 
         let mut endpoints = Vec::new();
         self.heal_local_disks.iter().for_each(|(k, v)| {
@@ -414,13 +414,13 @@ impl AllHealState {
     }
 
     async fn set_disk_healing_status(&mut self, ep: Endpoint, healing: bool) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         self.heal_local_disks.insert(ep, healing);
     }
 
     async fn push_heal_local_disks(&mut self, heal_local_disks: &[Endpoint]) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         heal_local_disks.iter().for_each(|heal_local_disk| {
             self.heal_local_disks.insert(heal_local_disk.clone(), false);
@@ -436,7 +436,7 @@ impl AllHealState {
                     }
                 }
                 _ = sleep(Duration::from_secs(5 * 60)) => {
-                    self.mu.write().await;
+                    let _ = self.mu.write().await;
                     let now = SystemTime::now();
                     
                     let mut keys_to_reomve = Vec::new();
@@ -454,7 +454,7 @@ impl AllHealState {
     }
 
     async fn get_heal_sequence_by_token(&self, token: &str) -> (Option<HealSequence>, bool) {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
 
         for v in self.heal_seq_map.values() {
             if v.client_token == token {
@@ -466,7 +466,7 @@ impl AllHealState {
     }
 
     async fn get_heal_sequence(&self, path: &str) -> Option<HealSequence> {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
 
         self.heal_seq_map.get(path).cloned()
     }
