@@ -12,7 +12,6 @@ use http::HeaderMap;
 use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -249,7 +248,7 @@ impl ErasureInfo {
             }
         }
 
-        ChecksumInfo {algorithm: BitrotAlgorithm::HighwayHash256S, ..Default::default()}
+        ChecksumInfo {algorithm: DEFAULT_BITROT_ALGO, ..Default::default()}
     }
 }
 
@@ -260,6 +259,8 @@ pub struct ChecksumInfo {
     pub algorithm: BitrotAlgorithm,
     pub hash: Vec<u8>,
 }
+
+pub const DEFAULT_BITROT_ALGO: BitrotAlgorithm = BitrotAlgorithm::HighwayHash256S;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone, Eq, Hash)]
 // BitrotAlgorithm specifies a algorithm used for bitrot protection.

@@ -160,7 +160,7 @@ impl HealingTracker {
     }
 
     pub async fn reset_healing(&mut self) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
         self.items_healed = 0;
         self.items_failed = 0;
         self.bytes_done = 0;
@@ -178,37 +178,37 @@ impl HealingTracker {
     }
 
     pub async fn get_last_update(&self) -> u64 {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
 
         self.last_update
     }
 
     pub async fn get_bucket(&self) -> String {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
 
         self.bucket.clone()
     }
 
     pub async fn set_bucket(&mut self, bucket: &str) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         self.bucket = bucket.to_string();
     }
 
     pub async fn get_object(&self) -> String {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
 
         self.object.clone()
     }
 
     pub async fn set_object(&mut self, object: &str) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         self.object = object.to_string();
     }
 
     pub async fn update_progress(&mut self, success: bool, skipped: bool, by: u64) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         if success {
             self.items_healed += 1;
@@ -227,7 +227,7 @@ impl HealingTracker {
             if healing(&disk.path().to_string_lossy().to_string()).await?.is_none() {
                 return Err(Error::from_string(format!("healingTracker: drive {} is not marked as healing", self.id)));
             }
-            self.mu.write().await;
+            let _ = self.mu.write().await;
             if self.id.is_empty() || self.pool_index.is_none() || self.set_index.is_none() || self.disk_index.is_none() {
                 self.id = disk.get_disk_id().await?.map_or("".to_string(), |id| id.to_string());
                 let disk_location = disk.get_disk_location();
@@ -241,7 +241,7 @@ impl HealingTracker {
     }
 
     pub async fn save(&mut self) -> Result<()> {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
         if self.pool_index.is_none() || self.set_index.is_none() || self.disk_index.is_none() {
             let layer = new_object_layer_fn();
             let lock = layer.read().await;
@@ -290,7 +290,7 @@ impl HealingTracker {
     }
 
     async fn is_healed(&self, bucket: &str) -> bool {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
         for v in self.healed_buckets.iter() {
             if v == bucket {
                 return true;
@@ -301,7 +301,7 @@ impl HealingTracker {
     }
 
     async fn resume(&mut self) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         self.items_healed = self.resume_items_healed;
         self.items_failed = self.resume_items_failed;
@@ -312,7 +312,7 @@ impl HealingTracker {
     }
 
     async fn bucket_done(&mut self, bucket: &str) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         self.resume_items_healed = self.items_healed;
         self.resume_items_failed = self.items_failed;
@@ -326,7 +326,7 @@ impl HealingTracker {
     }
 
     async fn set_queue_buckets(&mut self, buckets: &[BucketInfo]) {
-        self.mu.write().await;
+        let _ = self.mu.write().await;
 
         buckets.iter().for_each(|bucket| {
             if !self.healed_buckets.contains(&bucket.name) {
@@ -336,7 +336,7 @@ impl HealingTracker {
     }
 
     pub async fn to_healing_disk(&self) -> HealingDisk {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
 
         HealingDisk {
             id: self.id.clone(),
