@@ -48,7 +48,7 @@ tower.workspace = true
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
 transform-stream.workspace = true
-uuid = "1.10.0"
+uuid = "1.11.0"
 admin = { path = "../api/admin" }
 axum.workspace = true
 
@@ -64,7 +64,7 @@ ecstore = { path = "../ecstore" }
 s3s.workspace = true
 clap = { version = "4.5.20", features = ["derive"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
-hyper-util = { version = "0.1.9", features = [
+hyper-util = { version = "0.1.10", features = [
     "tokio",
     "server-auto",
     "server-graceful",
