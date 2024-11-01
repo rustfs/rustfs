@@ -16,7 +16,7 @@ const STORAGE_FORMAT_FILE: &str = "xl.meta";
 use crate::{
     erasure::{ReadAt, Write},
     error::{Error, Result},
-    file_meta::FileMeta,
+    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
     store_api::{FileInfo, RawFileInfo},
 };
 
@@ -26,7 +26,7 @@ use protos::proto_gen::node_service::{
     node_service_client::NodeServiceClient, ReadAtRequest, ReadAtResponse, WriteRequest, WriteResponse,
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc};
+use std::{any::Any, cmp::Ordering, collections::HashMap, fmt::Debug, io::SeekFrom, path::PathBuf, sync::Arc, usize};
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
@@ -124,15 +124,23 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()>;
-    // CheckParts
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     // VerifyFile
+    async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
+    // CheckParts
+    async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
     // StatInfoFile
     // ReadParts
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
+    async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CheckPartsResp {
+    pub results: Vec<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,6 +158,60 @@ impl DiskLocation {
     pub fn valid(&self) -> bool {
         self.pool_idx.is_some() && self.set_idx.is_some() && self.disk_idx.is_some()
     }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct DiskInfoOptions {
+    pub disk_id: String,
+    pub metrics: bool,
+    pub noop: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiskInfo {
+    pub total: u64,
+    pub free: u64,
+    pub used: u64,
+    pub used_inodes: u64,
+    pub free_inodes: u64,
+    pub major: u64,
+    pub minor: u64,
+    pub nr_requests: u64,
+    pub fs_type: String,
+    pub root_disk: bool,
+    pub healing: bool,
+    pub scanning: bool,
+    pub endpoint: String,
+    pub mount_path: String,
+    pub id: String,
+    pub rotational: bool,
+    pub metrics: DiskMetrics,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiskMetrics {
+    api_calls: HashMap<String, u64>,
+    total_waiting: u32,
+    total_errors_availability: u64,
+    total_errors_timeout: u64,
+    total_writes: u64,
+    total_deletes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Info {
+    pub total: u64,
+    pub free: u64,
+    pub used: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub fstype: String,
+    pub major: u64,
+    pub minor: u64,
+    pub name: String,
+    pub rotational: bool,
+    pub nrrequests: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -195,7 +257,17 @@ pub struct WalkDirOptions {
     pub disk_id: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
+pub struct MetadataResolutionParams {
+    pub dir_quorum: usize,
+    pub obj_quorum: usize,
+    pub requested_versions: usize,
+    pub bucket: String,
+    pub strict: bool,
+    pub candidates: Vec<Vec<FileMetaShallowVersion>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MetaCacheEntry {
     // name is the full name of the object including prefixes
     pub name: String,
@@ -262,6 +334,204 @@ impl MetaCacheEntry {
         let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
 
         return Ok(Some(fi));
+    }
+
+    pub fn file_info_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
+        if self.is_dir() {
+            return Ok(FileInfoVersions {
+                volume: bucket.to_string(),
+                name: self.name.clone(),
+                versions: vec![FileInfo {
+                    volume: bucket.to_string(),
+                    name: self.name.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+
+        let mut fm = FileMeta::new();
+        fm.unmarshal_msg(&self.metadata)?;
+
+        Ok(fm.into_file_info_versions(bucket, self.name.as_str(), false)?)
+    }
+
+    pub fn matches(&self, other: &MetaCacheEntry, strict: bool) -> Result<(Option<MetaCacheEntry>, bool)> {
+        let mut prefer = None;
+        if self.name != other.name {
+            if self.name < other.name {
+                return Ok((Some(self.clone()), false));
+            }
+            return Ok((Some(other.clone()), false));
+        }
+
+        if other.is_dir() || self.is_dir() {
+            if self.is_dir() {
+                return Ok((Some(self.clone()), other.is_dir()));
+            }
+
+            return Ok((Some(other.clone()), other.is_dir() == self.is_dir()));
+        }
+        let self_vers = match &self.cached {
+            Some(file_meta) => file_meta.clone(),
+            None => FileMeta::load(&self.metadata)?,
+        };
+        let other_vers = match &other.cached {
+            Some(file_meta) => file_meta.clone(),
+            None => FileMeta::load(&other.metadata)?,
+        };
+
+        if self_vers.versions.len() != other_vers.versions.len() {
+            match self_vers.lastest_mod_time().cmp(&other_vers.lastest_mod_time()) {
+                Ordering::Greater => {
+                    return Ok((Some(self.clone()), false));
+                }
+                Ordering::Less => {
+                    return Ok((Some(self.clone()), false));
+                }
+                _ => {}
+            }
+
+            if self_vers.versions.len() > other_vers.versions.len() {
+                return Ok((Some(self.clone()), false));
+            }
+            return Ok((Some(self.clone()), false));
+        }
+
+        for (s_version, o_version) in self_vers.versions.iter().zip(other_vers.versions.iter()) {
+            if s_version.header != o_version.header {
+                if s_version.header.has_ec() != o_version.header.has_ec() {
+                    // One version has EC and the other doesn't - may have been written later.
+                    // Compare without considering EC.
+                    let (mut a, mut b) = (s_version.header.clone(), o_version.header.clone());
+                    (a.ec_n, a.ec_m, b.ec_n, b.ec_m) = (0, 0, 0, 0);
+                    if a == b {
+                        continue;
+                    }
+                }
+
+                if !strict && s_version.header.matches_not_strict(&o_version.header) {
+                    if prefer.is_none() {
+                        if s_version.header.sorts_before(&o_version.header) {
+                            prefer = Some(self.clone());
+                        } else {
+                            prefer = Some(other.clone());
+                        }
+                    }
+
+                    continue;
+                }
+
+                if prefer.is_some() {
+                    return Ok((prefer, false));
+                }
+
+                if s_version.header.sorts_before(&o_version.header) {
+                    return Ok((Some(self.clone()), false));
+                }
+
+                return Ok((Some(other.clone()), false));
+            }
+        }
+
+        if prefer.is_none() {
+            prefer = Some(self.clone());
+        }
+
+        Ok((prefer, true))
+    }
+}
+
+pub struct MetaCacheEntries(pub Vec<MetaCacheEntry>);
+
+impl MetaCacheEntries {
+    pub fn resolve(&self, mut params: MetadataResolutionParams) -> Result<Option<MetaCacheEntry>> {
+        if self.0.is_empty() {
+            return Ok(None);
+        }
+
+        let mut dir_exists = 0;
+        let mut selected = None;
+
+        params.candidates.clear();
+        let mut objs_agree = 0;
+        let mut objs_valid = 0;
+
+        for entry in self.0.iter() {
+            if entry.name.is_empty() {
+                continue;
+            }
+            if entry.is_dir() {
+                dir_exists += 1;
+                selected = Some(entry.clone());
+                continue;
+            }
+
+            objs_valid += 1;
+
+            match &entry.cached {
+                Some(file_meta) => {
+                    params.candidates.push(file_meta.versions.clone());
+                }
+                None => {
+                    params.candidates.push(FileMeta::load(&entry.metadata)?.versions);
+                }
+            }
+
+            if selected.is_none() {
+                selected = Some(entry.clone());
+                objs_agree = 1;
+                continue;
+            }
+
+            if let (Some(prefer), true) = entry.matches(selected.as_ref().unwrap(), params.strict)? {
+                selected = Some(prefer);
+                objs_agree += 1;
+                continue;
+            }
+        }
+
+        // Return dir entries, if enough...
+        if selected.is_some() && selected.as_ref().unwrap().is_dir() && dir_exists >= params.dir_quorum {
+            return Ok(selected);
+        }
+        // If we would never be able to reach read quorum.
+        if objs_valid < params.obj_quorum {
+            return Ok(None);
+        }
+        // If all objects agree.
+        if selected.is_some() && objs_agree == objs_valid {
+            return Ok(selected);
+        }
+        // If cached is nil we shall skip the entry.
+        if selected.is_none() || (selected.is_some() && selected.as_ref().unwrap().cached.is_none()) {
+            return Ok(None);
+        }
+        // Merge if we have disagreement.
+        // Create a new merged result.
+        selected = Some(MetaCacheEntry {
+            name: selected.as_ref().unwrap().name.clone(),
+            cached: Some(FileMeta {
+                meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver.clone(),
+                ..Default::default()
+            }),
+            _reusable: true,
+            ..Default::default()
+        });
+
+        selected.as_mut().unwrap().cached.as_mut().unwrap().versions =
+            merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates);
+        if selected.as_ref().unwrap().cached.as_ref().unwrap().versions.is_empty() {
+            return Ok(None);
+        }
+
+        selected.as_mut().unwrap().metadata = selected.as_ref().unwrap().cached.as_ref().unwrap().marshal_msg()?;
+
+        Ok(selected)
+    }
+
+    pub fn first_found(&self) -> (Option<MetaCacheEntry>, usize) {
+        (self.0.iter().find(|x| !x.name.is_empty()).cloned(), self.0.len())
     }
 }
 
@@ -378,6 +648,10 @@ pub enum FileWriter {
 
 #[async_trait::async_trait]
 impl Write for FileWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         match self {
             Self::Local(local_file_writer) => local_file_writer.write(buf).await,
@@ -398,6 +672,10 @@ impl LocalFileWriter {
 
 #[async_trait::async_trait]
 impl Write for LocalFileWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         let _ = self.inner.write(buf).await?;
         self.inner.flush().await?;
@@ -446,6 +724,10 @@ impl RemoteFileWriter {
 
 #[async_trait::async_trait]
 impl Write for RemoteFileWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         let request = WriteRequest {
             disk: self.root.to_string_lossy().to_string(),

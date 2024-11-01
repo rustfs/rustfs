@@ -11,10 +11,12 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 backon.workspace = true
+blake2 = "0.10.6"
 bytes.workspace = true
+common.workspace = true
+glob = "0.3.1"
 thiserror.workspace = true
 futures.workspace = true
-common.workspace = true
 tracing.workspace = true
 serde.workspace = true
 time.workspace = true
@@ -22,6 +24,7 @@ serde_json.workspace = true
 tracing-error.workspace = true
 s3s.workspace = true
 http.workspace = true
+highway = "1.2.0"
 url.workspace = true
 uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
@@ -40,6 +43,7 @@ base64-simd = "0.8.0"
 sha2 = { version = "0.10.8", features = ["asm"] }
 hex-simd = "0.8.0"
 path-clean = "1.0.1"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync"] }
 tokio-stream = "0.1.15"
 tonic.workspace = true
@@ -47,11 +51,16 @@ tower.workspace = true
 rmp = "0.8.14"
 byteorder = "1.5.0"
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+num = "0.4.3"
 num_cpus = "1.16"
 s3s-policy.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
+nix = { version = "0.29.0", features = ["fs"] }
 openssl = "0.10.66"
+
+[target.'cfg(windows)'.dependencies]
+winapi = "0.3.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

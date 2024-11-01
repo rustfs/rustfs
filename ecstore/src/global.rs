@@ -11,12 +11,13 @@ use crate::{
 lazy_static! {
     pub static ref GLOBAL_OBJECT_API: Arc<RwLock<Option<ECStore>>> = Arc::new(RwLock::new(None));
     pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
-    static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
-    static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
-    static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_Endpoints: RwLock<EndpointServerPools> = RwLock::new(EndpointServerPools(Vec::new()));
+    pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
 }
 
 pub async fn set_global_endpoints(eps: Vec<PoolEndpoints>) {

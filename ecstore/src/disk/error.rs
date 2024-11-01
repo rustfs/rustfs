@@ -100,6 +100,12 @@ pub enum DiskError {
 
     #[error("more data was sent than what was advertised")]
     MoreData,
+
+    #[error("outdated XL meta")]
+    OutdatedXLMeta,
+
+    #[error("part missing or corrupt")]
+    PartMissingOrCorrupt,
 }
 
 impl DiskError {
@@ -202,6 +208,8 @@ pub fn clone_disk_err(e: &DiskError) -> Error {
         DiskError::CrossDeviceLink => Error::new(DiskError::CrossDeviceLink),
         DiskError::LessData => Error::new(DiskError::LessData),
         DiskError::MoreData => Error::new(DiskError::MoreData),
+        DiskError::OutdatedXLMeta => Error::new(DiskError::OutdatedXLMeta),
+        DiskError::PartMissingOrCorrupt => Error::new(DiskError::PartMissingOrCorrupt),
     }
 }
 
@@ -400,4 +408,21 @@ pub fn convert_access_error(e: io::Error, per_err: DiskError) -> Error {
     }
 
     Error::new(e)
+}
+
+pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
+    for err in errs.iter() {
+        if let Some(err) = err {
+            if let Some(err) = err.downcast_ref::<DiskError>() {
+                match err {
+                    DiskError::FileNotFound | DiskError::VolumeNotFound | &DiskError::FileVersionNotFound =>{
+                        continue;
+                    },
+                    _ => return false,
+                }
+            }
+        }
+    }
+
+    !errs.is_empty()
 }

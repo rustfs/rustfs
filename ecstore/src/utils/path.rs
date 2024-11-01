@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
 pub const SLASH_SEPARATOR: &str = "/";
@@ -36,6 +38,28 @@ pub fn retain_slash(s: &str) -> String {
     } else {
         format!("{}{}", s, SLASH_SEPARATOR)
     }
+}
+
+pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && (s[..prefix.len()] == *prefix || s[..prefix.len()].eq_ignore_ascii_case(prefix))
+}
+
+pub fn has_profix(s: &str, prefix: &str) -> bool {
+    if cfg!(target_os = "windows") {
+        return strings_has_prefix_fold(s, prefix);
+    }
+
+    s.starts_with(prefix)
+}
+
+pub fn path_join(elem: &[PathBuf]) -> PathBuf {
+    let mut joined_path = PathBuf::new();
+    
+    for path in elem {
+        joined_path.push(path);
+    }
+
+    joined_path
 }
 
 pub struct LazyBuf {

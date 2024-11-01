@@ -1,3 +1,5 @@
+pub mod bitrot;
+pub mod cache_value;
 mod chunk_stream;
 mod config;
 pub mod disk;
@@ -7,6 +9,7 @@ pub mod erasure;
 pub mod error;
 mod file_meta;
 mod global;
+mod heal;
 pub mod peer;
 mod quorum;
 pub mod set_disk;
