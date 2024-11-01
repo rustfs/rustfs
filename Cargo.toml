@@ -20,15 +20,15 @@ version = "0.0.1"
 [workspace.dependencies]
 async-trait = "0.1.83"
 backon = "1.2.0"
-bytes = "1.7.2"
+bytes = "1.8.0"
 clap = { version = "4.5.20", features = ["derive"] }
 ecstore = { path = "./ecstore" }
 flatbuffers = "24.3.25"
 futures = "0.3.31"
 futures-util = "0.3.30"
 common = { path = "./common/common" }
-hyper = "1.4.1"
-hyper-util = { version = "0.1.9", features = [
+hyper = "1.5.0"
+hyper-util = { version = "0.1.10", features = [
     "tokio",
     "server-auto",
     "server-graceful",
@@ -44,17 +44,17 @@ pin-project-lite = "0.2"
 prost = "0.13.3"
 prost-build = "0.13.3"
 prost-types = "0.13.3"
-protobuf = "3.6"
+protobuf = "3.7"
 protos = { path = "./common/protos" }
 rand = "0.8.5"
 s3s = { git = "https://github.com/Nugine/s3s.git", rev = "0caf79822ae1f2e7a7fad3c4a093c94dd2e2c33f", default-features = true, features = [
     "tower",
 ] }
 s3s-policy = { git = "https://github.com/Nugine/s3s.git", rev = "0caf79822ae1f2e7a7fad3c4a093c94dd2e2c33f" }
-serde = { version = "1.0.210", features = ["derive"] }
-serde_json = "1.0.128"
+serde = { version = "1.0.214", features = ["derive"] }
+serde_json = "1.0.132"
 tempfile = "3.13.0"
-thiserror = "1.0.64"
+thiserror = "1.0.66"
 time = { version = "0.3.36", features = [
     "std",
     "parsing",
@@ -62,18 +62,18 @@ time = { version = "0.3.36", features = [
     "macros",
     "serde",
 ] }
-tokio = { version = "1.40.0", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.41.0", features = ["fs", "rt-multi-thread"] }
 tonic = { version = "0.12.3", features = ["gzip"] }
 tonic-build = "0.12.3"
 tonic-reflection = "0.12"
 tokio-stream = "0.1.16"
-tower = { version = "0.4.13", features = ["timeout"] }
+tower = { version = "0.5.1", features = ["timeout"] }
 tracing = "0.1.40"
 tracing-error = "0.2.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 transform-stream = "0.3.0"
 url = "2.5.2"
-uuid = { version = "1.10.0", features = [
+uuid = { version = "1.11.0", features = [
     "v4",
     "fast-rng",
     "macro-diagnostics",
