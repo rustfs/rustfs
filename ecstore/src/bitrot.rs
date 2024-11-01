@@ -1,4 +1,8 @@
-use std::{any::Any, collections::HashMap, io::Cursor};
+use std::{
+    any::Any,
+    collections::HashMap,
+    io::{Cursor, Read},
+};
 
 use blake2::Blake2b512;
 use highway::{HighwayHash, HighwayHasher, Key};
@@ -205,21 +209,49 @@ pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: BitrotAlgori
 }
 
 pub fn bitrot_verify(
-    r: Cursor<Vec<u8>>,
-    _want_size: usize,
-    _part_size: usize,
+    r: &mut Cursor<Vec<u8>>,
+    want_size: usize,
+    part_size: usize,
     algo: BitrotAlgorithm,
     want: Vec<u8>,
-    _shard_size: usize,
+    mut shard_size: usize,
 ) -> Result<()> {
     if algo != BitrotAlgorithm::HighwayHash256S {
         let mut h = algo.new();
-        h.update(r.into_inner());
+        h.update(r.get_ref());
         if h.finalize() != want {
             return Err(Error::new(DiskError::FileCorrupt));
         }
+
+        return Ok(());
     }
-    todo!()
+    let mut h = algo.new();
+    let mut hash_buf = vec![0; h.size()];
+    let mut left = want_size;
+
+    if left != bitrot_shard_file_size(part_size, shard_size, algo) {
+        return Err(Error::new(DiskError::FileCorrupt));
+    }
+
+    while left > 0 {
+        h.reset();
+        let n = r.read(&mut hash_buf)?;
+        left -= n;
+
+        if left < shard_size {
+            shard_size = left;
+        }
+
+        let mut buf = vec![0; shard_size];
+        let read = r.read(&mut buf)?;
+        h.update(buf);
+        left -= read;
+        if h.clone().finalize() != hash_buf[0..n] {
+            return Err(Error::new(DiskError::FileCorrupt));
+        }
+    }
+
+    Ok(())
 }
 
 pub struct WholeBitrotWriter {
@@ -295,7 +327,7 @@ impl ReadAt for WholeBitrotReader {
                 return Err(Error::new(DiskError::LessData));
             }
 
-            return Ok((buf.split_off(length), length));
+            return Ok((buf.drain(0..length).collect::<Vec<_>>(), length));
         }
 
         Err(Error::new(DiskError::LessData))
@@ -453,10 +485,7 @@ mod test {
     use tempfile::TempDir;
 
     use crate::{
-        bitrot::{new_bitrot_writer, BITROT_ALGORITHMS},
-        disk::{endpoint::Endpoint, error::DiskError, new_disk, DiskOption},
-        error::{Error, Result},
-        store_api::BitrotAlgorithm,
+        bitrot::{new_bitrot_writer, BITROT_ALGORITHMS}, disk::{endpoint::Endpoint, error::DiskError, new_disk, DiskOption}, error::{Error, Result}, store_api::BitrotAlgorithm
     };
 
     use super::{bitrot_writer_sum, new_bitrot_reader};
@@ -512,9 +541,6 @@ mod test {
     #[tokio::test]
     async fn test_all_bitrot_algorithms() -> Result<()> {
         for algo in BITROT_ALGORITHMS.keys() {
-            if *algo != BitrotAlgorithm::HighwayHash256S {
-                continue;
-            }
             test_bitrot_reader_writer_algo(algo.clone()).await?;
         }
 

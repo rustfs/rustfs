@@ -124,10 +124,11 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()>;
-    // CheckParts
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     // VerifyFile
-    async fn verify_file(&self, volume: &str, path: &str, fi: FileInfo) -> Result<CheckPartsResp>;
+    async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
+    // CheckParts
+    async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
     // StatInfoFile
     // ReadParts
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
@@ -137,6 +138,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CheckPartsResp {
     pub results: Vec<usize>,
 }

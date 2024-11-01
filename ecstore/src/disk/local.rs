@@ -6,6 +6,7 @@ use super::{
     FileReader, FileWriter, Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
     UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
+use crate::bitrot::bitrot_verify;
 use crate::cache_value::cache::{Cache, Opts};
 use crate::disk::error::{
     convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
@@ -15,8 +16,9 @@ use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
+use crate::set_disk::{conv_part_err_to_int, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN, CHECK_PART_VOLUME_NOT_FOUND};
 use crate::store_api::BitrotAlgorithm;
-use crate::utils::fs::{lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
+use crate::utils::fs::{access, lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::os::get_info;
 use crate::utils::path::{clean, has_suffix, SLASH_SEPARATOR};
 use crate::{
@@ -26,6 +28,8 @@ use crate::{
 };
 use path_absolutize::Absolutize;
 use std::fmt::Debug;
+use std::io::Cursor;
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +42,7 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -180,7 +184,7 @@ impl LocalDisk {
             // format_data: Mutex::new(format_data),
             // format_last_check: Mutex::new(format_last_check),
         };
-        let (info, root) = get_disk_info(root_clone).await?;
+        let (info, _root) = get_disk_info(root_clone).await?;
         disk.major = info.major;
         disk.minor = info.minor;
         disk.fstype = info.fstype;
@@ -653,17 +657,18 @@ impl LocalDisk {
     async fn bitrot_verify(
         &self,
         part_path: &PathBuf,
-        part_size: u64,
+        part_size: usize,
         algo: BitrotAlgorithm,
         sum: &[u8],
-        shard_size: u64,
+        shard_size: usize,
     ) -> Result<()> {
-        let file = utils::fs::open_file(part_path, O_CREATE | O_WRONLY)
+        let mut file = utils::fs::open_file(part_path, O_CREATE | O_WRONLY)
             .await
             .map_err(os_err_to_file_err)?;
 
-
-        todo!()
+        let mut data = Vec::new();
+        let n = file.read_to_end(&mut data).await?;
+        bitrot_verify(&mut Cursor::new(data), n, part_size, algo, sum.to_vec(), shard_size)
     }
 }
 
@@ -861,7 +866,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    async fn verify_file(&self, volume: &str, path: &str, fi: FileInfo) -> Result<CheckPartsResp> {
+    async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             if let Err(e) = utils::fs::access(&volume_dir).await {
@@ -873,17 +878,92 @@ impl DiskAPI for LocalDisk {
             results: Vec::with_capacity(fi.parts.len()),
         };
 
-        let erasure = fi.erasure;
-        fi.parts.iter().enumerate().for_each(|(i, part)| {
+        let erasure = &fi.erasure;
+        for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let part_path = Path::new(&volume_dir)
                 .join(path)
                 .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
                 .join(format!("part.{}", part.number));
+            let err = match self
+                .bitrot_verify(
+                    &part_path,
+                    erasure.shard_file_size(part.size),
+                    checksum_info.algorithm,
+                    &checksum_info.hash,
+                    erasure.shard_size(erasure.block_size),
+                )
+                .await
+            {
+                Ok(_) => None,
+                Err(err) => Some(err),
+            };
+            resp.results[i] = conv_part_err_to_int(&err);
+            if resp.results[i] == CHECK_PART_UNKNOWN {
+                if let Some(err) = err {
+                    match err.downcast_ref::<DiskError>() {
+                        Some(DiskError::FileAccessDenied) => {}
+                        _ => {
+                            info!("part unknown, disk: {}, path: {:?}", self.to_string(), part_path);
+                        }
+                    }
+                }
+            }
+        }
 
-            // self.bi
-        });
-        todo!()
+        Ok(resp)
+    }
+
+    async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
+        let volume_dir = self.get_bucket_path(&volume)?;
+        check_path_length(volume_dir.join(path).to_string_lossy().as_ref())?;
+        let mut resp = CheckPartsResp {
+            results: vec![0; fi.parts.len()],
+        };
+
+        for (i, part) in fi.parts.iter().enumerate() {
+            let file_path = Path::new(&volume_dir)
+                .join(path)
+                .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
+                .join(format!("part.{}", part.number));
+
+            match lstat(file_path).await {
+                Ok(st) => {
+                    if st.is_dir() {
+                        resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
+                        continue;
+                    }
+                    if (st.size() as usize) < fi.erasure.shard_file_size(part.size) {
+                        resp.results[i] = CHECK_PART_FILE_CORRUPT;
+                        continue;
+                    }
+
+                    resp.results[i] = CHECK_PART_SUCCESS;
+                },
+                Err(err) => {
+                    match os_err_to_file_err(err).downcast_ref() {
+                        Some(DiskError::FileNotFound) => {
+                            if !skip_access_checks(volume) {
+                                if let Err(err) = access(&volume_dir).await {
+                                    match err.kind() {
+                                        ErrorKind::NotFound => {
+                                            resp.results[i] = CHECK_PART_VOLUME_NOT_FOUND;
+                                            continue;
+                                        },
+                                        _ => {},
+                                    }
+                                }
+                            }
+                            resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
+                        },
+                        _ => {},
+                    }
+                    continue;
+                }
+            }
+        }
+        
+        Ok(resp)
     }
 
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {

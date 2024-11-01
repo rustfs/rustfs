@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    error::{Error, Result},
-    heal::{
+    disk::error::DiskError, error::{Error, Result}, heal::{
         heal_commands::{HealOpts, HealResultItem},
         heal_ops::HealObjectFn,
-    },
+    }
 };
 use futures::StreamExt;
 use http::HeaderMap;
@@ -17,6 +16,8 @@ use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
+pub const RESERVED_METADATA_PREFIX: &str = "X-Rustfs-Internal-";
+pub const RESERVED_METADATA_PREFIX_LOWER: &str = "X-Rustfs-Internal-";
 
 // #[derive(Debug, Clone)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -172,6 +173,7 @@ impl FileInfo {
             parts: self.parts.clone(),
             is_latest: self.is_latest,
             tags: self.tags.clone(),
+            ..Default::default()
         }
     }
     // to_part_offset 取offset 所在的part index, 返回part index, offset
@@ -249,6 +251,29 @@ impl ErasureInfo {
         }
 
         ChecksumInfo {algorithm: DEFAULT_BITROT_ALGO, ..Default::default()}
+    }
+
+    // 算出每个分片大小
+    pub fn shard_size(&self, data_size: usize) -> usize {
+        (data_size + self.data_blocks - 1) / self.data_blocks
+    }
+
+    // returns final erasure size from original size.
+    pub fn shard_file_size(&self, total_size: usize) -> usize {
+        if total_size == 0 {
+            return 0;
+        }
+
+        let num_shards = total_size / self.block_size;
+        let last_block_size = total_size % self.block_size;
+        let last_shard_size = (last_block_size + self.data_blocks - 1) / self.data_blocks;
+        num_shards * self.shard_size(self.block_size) + last_shard_size
+
+        // // 因为写入的时候ec需要补全，所以最后一个长度应该也是一样的
+        // if last_block_size != 0 {
+        //     num_shards += 1
+        // }
+        // num_shards * self.shard_size(self.block_size)
     }
 }
 
@@ -481,7 +506,10 @@ pub struct ObjectInfo {
     pub name: String,
     pub mod_time: Option<OffsetDateTime>,
     pub size: usize,
+    // Actual size is the real size of the object uploaded by client.
+    pub actual_size: Option<usize>,
     pub is_dir: bool,
+    pub user_defined: HashMap<String, String>,
     pub parity_blocks: usize,
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
@@ -489,6 +517,40 @@ pub struct ObjectInfo {
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
     pub tags: Option<HashMap<String, String>>,
+}
+
+impl ObjectInfo {
+    pub fn is_compressed(&self) -> bool {
+        self.user_defined.contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX))
+    }
+
+    pub fn get_actual_size(&self) -> Result<usize> {
+        if let Some(actual_size) = self.actual_size {
+            return Ok(actual_size);
+        }
+
+        if self.is_compressed() {
+            if let Some(size_str) = self.user_defined.get(&format!("{}actual-size", RESERVED_METADATA_PREFIX)) {
+                if !size_str.is_empty() {
+                    // Todo: deal with error
+                    let size = size_str.parse::<usize>()?;
+                    return Ok(size);
+                }
+            }
+            let mut actual_size = 0;
+            self.parts.iter().for_each(|part| {
+                actual_size += part.actual_size;
+            });
+            if actual_size == 0 && actual_size != self.size {
+                return Err(Error::from_string("invalid decompressed size"));
+            }
+            return Ok(actual_size);
+        }
+
+        // TODO: IsEncrypted
+
+        Ok(self.size)
+    }
 }
 
 #[derive(Debug, Default)]
