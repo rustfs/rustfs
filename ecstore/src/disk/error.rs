@@ -100,6 +100,12 @@ pub enum DiskError {
 
     #[error("more data was sent than what was advertised")]
     MoreData,
+
+    #[error("outdated XL meta")]
+    OutdatedXLMeta,
+
+    #[error("part missing or corrupt")]
+    PartMissingOrCorrupt,
 }
 
 impl DiskError {
@@ -202,6 +208,8 @@ pub fn clone_disk_err(e: &DiskError) -> Error {
         DiskError::CrossDeviceLink => Error::new(DiskError::CrossDeviceLink),
         DiskError::LessData => Error::new(DiskError::LessData),
         DiskError::MoreData => Error::new(DiskError::MoreData),
+        DiskError::OutdatedXLMeta => Error::new(DiskError::OutdatedXLMeta),
+        DiskError::PartMissingOrCorrupt => Error::new(DiskError::PartMissingOrCorrupt),
     }
 }
 
