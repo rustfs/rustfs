@@ -4,10 +4,10 @@
 
 - [x] EC可用读写数量判断 Read/WriteQuorum
 - [ ] 优化后台并发执行，可中断
-- [ ] 小文件存储到metafile, inlinedata
-- [ ] 完善bucketmeta
+- [x] 小文件存储到metafile, inlinedata
+- [x] 完善bucketmeta
 - [x] 对象锁
-- [ ] 边读写边hash，实现reader嵌套
+- [x] 边读写边hash，实现reader嵌套
 - [x] 远程rpc
 - [x] 错误类型判断,程序中判断错误类型，如何统一错误
 - [x] 优化xlmeta, 自定义msg数据结构

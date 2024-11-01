@@ -41,6 +41,7 @@ impl AsRef<HashSet<Action>> for ActionSet {
     }
 }
 
+// TODO:: 使用字符串
 // 定义Action枚举类型
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default, Hash)]
 pub enum Action {
@@ -281,7 +282,7 @@ impl Action {
         }
     }
 
-    fn _from_str(s: &str) -> Option<Self> {
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "s3:AbortMultipartUpload" => Some(Action::AbortMultipartUpload),
             "s3:CreateBucket" => Some(Action::CreateBucket),

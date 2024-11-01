@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 
 use crate::{
-    disk::error::DiskError, error::{Error, Result}, heal::{
+    disk::DiskStore,
+    error::{Error, Result},
+    heal::{
         heal_commands::{HealOpts, HealResultItem},
         heal_ops::HealObjectFn,
-    }
+    },
+    utils::path::decode_dir_object,
+    xhttp,
 };
 use futures::StreamExt;
 use http::HeaderMap;
@@ -22,43 +26,33 @@ pub const RESERVED_METADATA_PREFIX_LOWER: &str = "X-Rustfs-Internal-";
 // #[derive(Debug, Clone)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct FileInfo {
-    pub name: String,
     pub volume: String,
+    pub name: String,
     pub version_id: Option<Uuid>,
-    pub erasure: ErasureInfo,
+    pub is_latest: bool,
     pub deleted: bool,
-    // DataDir of the file
+    // TransitionStatus
+    // TransitionedObjName
+    // TransitionTier
+    // TransitionVersionID
+    // ExpireRestored
     pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
     pub size: usize,
-    pub data: Option<Vec<u8>>,
-    pub fresh: bool, // indicates this is a first time call to write FileInfo.
-    pub parts: Vec<ObjectPartInfo>,
-    pub is_latest: bool,
-    // #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tags: Option<HashMap<String, String>>,
+    // Mode
     pub metadata: Option<HashMap<String, String>>,
+    pub parts: Vec<ObjectPartInfo>,
+    pub erasure: ErasureInfo,
+    // MarkDeleted
+    // ReplicationState
+    pub data: Option<Vec<u8>>,
     pub num_versions: usize,
+    pub successor_mod_time: Option<OffsetDateTime>,
+    pub fresh: bool,
+    pub idx: usize,
+    // Checksum
+    pub versioned: bool,
 }
-
-// impl Default for FileInfo {
-//     fn default() -> Self {
-//         Self {
-//             version_id: Default::default(),
-//             erasure: Default::default(),
-//             deleted: Default::default(),
-//             data_dir: Default::default(),
-//             mod_time: None,
-//             size: Default::default(),
-//             data: Default::default(),
-//             fresh: Default::default(),
-//             name: Default::default(),
-//             volume: Default::default(),
-//             parts: Default::default(),
-//             is_latest: Default::default(),
-//         }
-//     }
-// }
 
 impl FileInfo {
     pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
@@ -139,8 +133,16 @@ impl FileInfo {
         Ok(t)
     }
 
-    pub fn add_object_part(&mut self, num: usize, part_size: usize, mod_time: Option<OffsetDateTime>, actual_size: usize) {
+    pub fn add_object_part(
+        &mut self,
+        num: usize,
+        etag: Option<String>,
+        part_size: usize,
+        mod_time: Option<OffsetDateTime>,
+        actual_size: usize,
+    ) {
         let part = ObjectPartInfo {
+            etag,
             number: num,
             size: part_size,
             mod_time,
@@ -159,23 +161,81 @@ impl FileInfo {
         self.parts.sort_by(|a, b| a.number.cmp(&b.number));
     }
 
-    pub fn to_object_info(&self, bucket: &str, object: &str, _versioned: bool) -> ObjectInfo {
+    pub fn to_object_info(&self, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+        let name = decode_dir_object(object);
+
+        let mut version_id = self.version_id;
+
+        if versioned && version_id.is_none() {
+            version_id = Some(Uuid::nil())
+        }
+
+        let (content_type, content_encoding, etag) = {
+            if let Some(ref meta) = self.metadata {
+                let content_type = {
+                    if let Some(ty) = meta.get("content-type") {
+                        Some(ty.clone())
+                    } else {
+                        None
+                    }
+                };
+                let content_encoding = {
+                    if let Some(encoding) = meta.get("content-encoding") {
+                        Some(encoding.clone())
+                    } else {
+                        None
+                    }
+                };
+                let etag = {
+                    if let Some(etag) = meta.get("etag") {
+                        Some(etag.clone())
+                    } else {
+                        None
+                    }
+                };
+
+                (content_type, content_encoding, etag)
+            } else {
+                (None, None, None)
+            }
+        };
+        let user_tags = self
+            .metadata
+            .as_ref()
+            .map(|m| {
+                if let Some(tags) = m.get(xhttp::AMZ_OBJECT_TAGGING) {
+                    tags.clone()
+                } else {
+                    "".to_string()
+                }
+            })
+            .unwrap_or_default();
+
+        let inlined = self.inline_data();
+
         ObjectInfo {
             bucket: bucket.to_string(),
-            name: object.to_string(),
+            name,
             is_dir: object.starts_with('/'),
             parity_blocks: self.erasure.parity_blocks,
             data_blocks: self.erasure.data_blocks,
-            version_id: self.version_id,
+            version_id,
             delete_marker: self.deleted,
             mod_time: self.mod_time,
             size: self.size,
             parts: self.parts.clone(),
             is_latest: self.is_latest,
-            tags: self.tags.clone(),
+            user_tags,
+            content_type,
+            content_encoding,
+            num_versions: self.num_versions,
+            successor_mod_time: self.successor_mod_time,
+            etag,
+            inlined,
             ..Default::default()
         }
     }
+
     // to_part_offset 取offset 所在的part index, 返回part index, offset
     pub fn to_part_offset(&self, offset: i64) -> Result<(usize, i64)> {
         if offset == 0 {
@@ -194,11 +254,32 @@ impl FileInfo {
 
         Err(Error::msg("part not found"))
     }
+
+    pub fn set_inline_data(&mut self) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.insert("x-rustfs-inline-data".to_owned(), "true".to_owned());
+        } else {
+            let mut meta = HashMap::new();
+            meta.insert("x-rustfs-inline-data".to_owned(), "true".to_owned());
+            self.metadata = Some(meta);
+        }
+    }
+    pub fn inline_data(&self) -> bool {
+        if let Some(ref meta) = self.metadata {
+            if let Some(val) = meta.get("x-rustfs-inline-data") {
+                val.as_str() == "true"
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
-    // pub etag: Option<String>,
+    pub etag: Option<String>,
     pub number: usize,
     pub size: usize,
     pub actual_size: usize, // 源数据大小
@@ -250,7 +331,10 @@ impl ErasureInfo {
             }
         }
 
-        ChecksumInfo {algorithm: DEFAULT_BITROT_ALGO, ..Default::default()}
+        ChecksumInfo {
+            algorithm: DEFAULT_BITROT_ALGO,
+            ..Default::default()
+        }
     }
 
     // 算出每个分片大小
@@ -310,8 +394,20 @@ pub struct MakeBucketOptions {
     pub no_lock: bool,
 }
 
+#[derive(Debug, Default, Clone)]
+pub enum SRBucketDeleteOp {
+    #[default]
+    NoOp,
+    MarkDelete,
+    Purge,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct DeleteBucketOptions {
+    pub no_lock: bool,
+    pub no_recreate: bool,
     pub force: bool, // Force deletion
+    pub srdelete_op: SRBucketDeleteOp,
 }
 
 #[derive(Debug)]
@@ -448,8 +544,17 @@ pub struct ObjectOptions {
     pub part_number: usize,
 
     pub delete_prefix: bool,
-    pub version_id: String,
+    pub version_id: Option<String>,
     pub no_lock: bool,
+
+    pub versioned: bool,
+    pub version_suspended: bool,
+
+    pub skip_decommissioned: bool,
+    pub skip_rebalancing: bool,
+
+    pub data_movement: bool,
+    pub src_pool_idx: usize,
 }
 
 // impl Default for ObjectOptions {
@@ -469,10 +574,13 @@ pub struct BucketOptions {
     pub no_metadata: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BucketInfo {
     pub name: String,
     pub created: Option<OffsetDateTime>,
+    pub deleted: Option<OffsetDateTime>,
+    pub versionning: bool,
+    pub object_locking: bool,
 }
 
 #[derive(Debug)]
@@ -485,9 +593,10 @@ pub struct PartInfo {
     pub part_num: usize,
     pub last_mod: Option<OffsetDateTime>,
     pub size: usize,
+    pub etag: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompletePart {
     pub part_num: usize,
 }
@@ -514,14 +623,22 @@ pub struct ObjectInfo {
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
     pub delete_marker: bool,
+    pub user_tags: String,
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
-    pub tags: Option<HashMap<String, String>>,
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub num_versions: usize,
+    pub successor_mod_time: Option<OffsetDateTime>,
+    pub put_object_reader: Option<PutObjReader>,
+    pub etag: Option<String>,
+    pub inlined: bool,
 }
 
 impl ObjectInfo {
     pub fn is_compressed(&self) -> bool {
-        self.user_defined.contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX))
+        self.user_defined
+            .contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX))
     }
 
     pub fn get_actual_size(&self) -> Result<usize> {
@@ -597,6 +714,71 @@ pub struct ListObjectsV2Info {
     pub prefixes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MultipartInfo {
+    // Name of the bucket.
+    pub bucket: String,
+
+    // Name of the object.
+    pub object: String,
+
+    // Upload ID identifying the multipart upload whose parts are being listed.
+    pub upload_id: String,
+
+    // Date and time at which the multipart upload was initiated.
+    pub initiated: Option<OffsetDateTime>,
+
+    // Any metadata set during InitMultipartUpload, including encryption headers.
+    pub user_defined: HashMap<String, String>,
+}
+
+// ListMultipartsInfo - represents bucket resources for incomplete multipart uploads.
+#[derive(Debug, Clone, Default)]
+pub struct ListMultipartsInfo {
+    // Together with upload-id-marker, this parameter specifies the multipart upload
+    // after which listing should begin.
+    pub key_marker: String,
+
+    // Together with key-marker, specifies the multipart upload after which listing
+    // should begin. If key-marker is not specified, the upload-id-marker parameter
+    // is ignored.
+    pub upload_id_marker: String,
+
+    // When a list is truncated, this element specifies the value that should be
+    // used for the key-marker request parameter in a subsequent request.
+    pub next_key_marker: String,
+
+    // When a list is truncated, this element specifies the value that should be
+    // used for the upload-id-marker request parameter in a subsequent request.
+    pub next_upload_id_marker: String,
+
+    // Maximum number of multipart uploads that could have been included in the
+    // response.
+    pub max_uploads: usize,
+
+    // Indicates whether the returned list of multipart uploads is truncated. A
+    // value of true indicates that the list was truncated. The list can be truncated
+    // if the number of multipart uploads exceeds the limit allowed or specified
+    // by max uploads.
+    pub is_truncated: bool,
+
+    // List of all pending uploads.
+    pub uploads: Vec<MultipartInfo>,
+
+    // When a prefix is provided in the request, The result contains only keys
+    // starting with the specified prefix.
+    pub prefix: String,
+
+    // A character used to truncate the object prefixes.
+    // NOTE: only supported delimiter is '/'.
+    pub delimiter: String,
+
+    // CommonPrefixes contains all (if there are any) keys between Prefix and the
+    // next occurrence of the string specified by delimiter.
+    pub common_prefixes: Vec<String>,
+    // encoding_type: String, // Not supported yet.
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
@@ -616,6 +798,7 @@ pub struct DeletedObject {
 
 #[async_trait::async_trait]
 pub trait ObjectIO: Send + Sync + 'static {
+    // GetObjectNInfo
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -624,23 +807,24 @@ pub trait ObjectIO: Send + Sync + 'static {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader>;
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
+    // PutObject
+    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
 }
 
 #[async_trait::async_trait]
 pub trait StorageAPI: ObjectIO {
+    // NewNSLock
+    // Shutdown
+    // NSScanner
+    // BackendInfo
+    // StorageInfo
+    // LocalStorageInfo
+
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
-    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
-    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
-    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
-    async fn delete_objects(
-        &self,
-        bucket: &str,
-        objects: Vec<ObjectToDelete>,
-        opts: ObjectOptions,
-    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
-    #[warn(clippy::too_many_arguments)]
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
+    // ListObjects
     async fn list_objects_v2(
         &self,
         bucket: &str,
@@ -651,29 +835,61 @@ pub trait StorageAPI: ObjectIO {
         fetch_owner: bool,
         start_after: &str,
     ) -> Result<ListObjectsV2Info>;
+    // ListObjectVersions
+    // Walk
+
+    // GetObjectNInfo ObjectIO
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+    // PutObject ObjectIO
+    // CopyObject
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
+    #[warn(clippy::too_many_arguments)]
+    // TransitionObject
+    // RestoreTransitionedObject
 
-    async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()>;
-
-    // async fn get_object_reader(
-    //     &self,
-    //     bucket: &str,
-    //     object: &str,
-    //     range: HTTPRangeSpec,
-    //     h: HeaderMap,
-    //     opts: &ObjectOptions,
-    // ) -> Result<GetObjectReader>;
-    // async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
+    // ListMultipartUploads
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: &str,
+        upload_id_marker: &str,
+        delimiter: &str,
+        max_uploads: usize,
+    ) -> Result<ListMultipartsInfo>;
+    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;
+    // CopyObjectPart
+    async fn copy_object_part(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        upload_id: &str,
+        part_id: usize,
+        start_offset: i64,
+        length: i64,
+        src_info: &ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<()>;
     async fn put_object_part(
         &self,
         bucket: &str,
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: PutObjReader,
+        data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo>;
-    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;
+    // GetMultipartInfo
+    // ListObjectParts
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()>;
     async fn complete_multipart_upload(
         &self,
@@ -683,6 +899,22 @@ pub trait StorageAPI: ObjectIO {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo>;
+    // GetDisks
+    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>>;
+    // SetDriveCounts
+    fn set_drive_counts(&self) -> Vec<usize>;
+    // HealFormat
+    // HealBucket
+    // HealObject
+    // HealObjects
+    // CheckAbandonedParts
+    // Health
+    // PutObjectMetadata
+    // DecomTieredObject
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String>;
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
+
     async fn heal_format(&self, dry_run: bool) -> Result<HealResultItem>;
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
     async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<HealResultItem>;

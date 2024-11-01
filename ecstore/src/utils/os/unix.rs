@@ -1,5 +1,5 @@
-use crate::disk::Info;
-use nix::sys::{statfs::statfs, stat::stat};
+use crate::{disk::Info, error::Result};
+use nix::sys::{stat::stat, statfs::statfs};
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 

@@ -3,7 +3,7 @@ use crate::error::{Error, Result, StdError};
 use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
 use bytes::Bytes;
 use futures::future::join_all;
-use futures::{Stream, StreamExt};
+use futures::{pin_mut, Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::any::Any;
 use std::fmt::Debug;
@@ -14,7 +14,8 @@ use tracing::warn;
 // use tracing::debug;
 use uuid::Uuid;
 
-use crate::chunk_stream::ChunkedStream;
+use reader::reader::ChunkedStream;
+// use crate::chunk_stream::ChunkedStream;
 use crate::disk::error::DiskError;
 
 pub struct Erasure {
@@ -45,6 +46,7 @@ impl Erasure {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self, body,writers))]
     pub async fn encode<S>(
         &self,
         body: S,
@@ -54,73 +56,78 @@ impl Erasure {
         write_quorum: usize,
     ) -> Result<usize>
     where
-        S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
+        S: Stream<Item = Result<Bytes, StdError>> + Send + Sync,
     {
-        let mut stream = ChunkedStream::new(body, total_size, self.block_size, false);
+        let stream = ChunkedStream::new(body, self.block_size);
+        // let mut stream = ChunkedStream::new(body, total_size, self.block_size, false);
         let mut total: usize = 0;
         // let mut idx = 0;
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(data) => {
-                    total += data.len();
+        pin_mut!(stream);
 
-                    // EOF
-                    if data.is_empty() {
-                        break;
-                    }
+        // warn!("encode start...");
 
-                    // idx += 1;
-                    // debug!("encode {} get data {}", idx, data.len());
+        loop {
+            match stream.next().await {
+                Some(result) => match result {
+                    Ok(data) => {
+                        total += data.len();
 
-                    let blocks = self.encode_data(data.as_ref())?;
+                        // EOF
+                        if data.is_empty() {
+                            break;
+                        }
 
-                    // debug!(
-                    //     "encode shard {} size: {}/{} from block_size {}, total_size {} ",
-                    //     idx,
-                    //     blocks[0].len(),
-                    //     blocks.len(),
-                    //     data.len(),
-                    //     total_size
-                    // );
+                        // idx += 1;
+                        // warn!("encode {} get data {:?}", data.len(), data.to_vec());
 
-                    let mut errs = Vec::new();
+                        let blocks = self.encode_data(data.as_ref())?;
 
-                    for (i, w) in writers.iter_mut().enumerate() {
-                        if w.is_none() {
+                        // debug!(
+                        //     "encode shard {} size: {}/{} from block_size {}, total_size {} ",
+                        //     idx,
+                        //     blocks[0].len(),
+                        //     blocks.len(),
+                        //     data.len(),
+                        //     total_size
+                        // );
+
+                        let mut errs = Vec::new();
+
+                        for (i, w) in writers.iter_mut().enumerate() {
+                            if w.is_none() {
+                                continue;
+                            }
+                            match w.as_mut().unwrap().write(blocks[i].as_ref()).await {
+                                Ok(_) => errs.push(None),
+                                Err(e) => errs.push(Some(e)),
+                            }
+                        }
+
+                        let none_count = errs.iter().filter(|&x| x.is_none()).count();
+                        if none_count >= write_quorum {
                             continue;
                         }
-                        match w.as_mut().unwrap().write(blocks[i].as_ref()).await {
-                            Ok(_) => errs.push(None),
-                            Err(e) => errs.push(Some(e)),
+
+                        if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
+                            warn!("Erasure encode errs {:?}", &errs);
+                            return Err(err);
                         }
                     }
-
-                    let none_count = errs.iter().filter(|&x| x.is_none()).count();
-                    if none_count >= write_quorum {
-                        continue;
+                    Err(e) => {
+                        warn!("poll result err {:?}", &e);
+                        return Err(Error::msg(e.to_string()));
                     }
-
-                    if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
-                        warn!("Erasure encode errs {:?}", &errs);
-                        return Err(err);
-                    }
+                },
+                None => {
+                    // warn!("poll empty result");
+                    break;
                 }
-                Err(e) => return Err(Error::from_std_error(e)),
             }
         }
-
-        // debug!(" encode_data done shard block num {}", idx);
 
         let _ = close_bitrot_writers(writers).await?;
 
         Ok(total)
-
-        // loop {
-        //     match rd.next().await {
-        //         Some(res) => todo!(),
-        //         None => todo!(),
-        //     }
-        // }
     }
 
     pub async fn decode(
@@ -308,7 +315,7 @@ impl Erasure {
         (data_size + self.data_shards - 1) / self.data_shards
     }
     // returns final erasure size from original size.
-    fn shard_file_size(&self, total_size: usize) -> usize {
+    pub fn shard_file_size(&self, total_size: usize) -> usize {
         if total_size == 0 {
             return 0;
         }
@@ -355,7 +362,7 @@ pub trait ReadAt: Debug {
 #[derive(Debug)]
 pub struct ShardReader {
     readers: Vec<Option<BitrotReader>>, // 磁盘
-    data_block_count: usize,          // 总的分片数量
+    data_block_count: usize,            // 总的分片数量
     parity_block_count: usize,
     shard_size: usize,      // 每个分片的块大小 一次读取一块
     shard_file_size: usize, // 分片文件总长度

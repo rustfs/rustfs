@@ -1,12 +1,18 @@
 use lazy_static::lazy_static;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::{
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
     store::ECStore,
 };
+
+pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
+pub const DISK_MIN_INODES: u64 = 1000;
+pub const DISK_FILL_FRACTION: f64 = 0.99;
+pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 
 lazy_static! {
     pub static ref GLOBAL_OBJECT_API: Arc<RwLock<Option<ECStore>>> = Arc::new(RwLock::new(None));
@@ -18,6 +24,17 @@ lazy_static! {
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_Endpoints: RwLock<EndpointServerPools> = RwLock::new(EndpointServerPools(Vec::new()));
     pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
+    static ref globalDeploymentIDPtr: RwLock<Uuid> = RwLock::new(Uuid::nil());
+}
+
+pub async fn set_global_deployment_id(id: Uuid) {
+    let mut id_ptr = globalDeploymentIDPtr.write().await;
+    *id_ptr = id
+}
+pub async fn get_global_deployment_id() -> Uuid {
+    let id_ptr = globalDeploymentIDPtr.read().await;
+
+    id_ptr.clone()
 }
 
 pub async fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
@@ -36,6 +53,11 @@ pub async fn set_object_layer(o: ECStore) {
 
 pub async fn is_dist_erasure() -> bool {
     let lock = GLOBAL_IsDistErasure.read().await;
+    *lock
+}
+
+pub async fn is_erasure_sd() -> bool {
+    let lock = GLOBAL_IsErasureSD.read().await;
     *lock
 }
 

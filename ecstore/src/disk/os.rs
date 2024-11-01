@@ -56,7 +56,7 @@ pub fn is_root_disk(disk_path: &str, root_disk: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    same_disk(disk_path, root_disk)
+    Ok(same_disk(disk_path, root_disk)?)
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> Result<()> {
@@ -90,13 +90,14 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> Result<Vec<String>>
 
         let file_type = entry.file_type().await?;
 
-        if file_type.is_dir() {
-            count -= 1;
+        if file_type.is_file() {
+            volumes.push(name);
+        } else if file_type.is_dir() {
             volumes.push(format!("{}{}", name, utils::path::SLASH_SEPARATOR));
-
-            if count == 0 {
-                break;
-            }
+        }
+        count -= 1;
+        if count == 0 {
+            break;
         }
     }
 
@@ -108,17 +109,19 @@ pub async fn rename_all(
     dst_file_path: impl AsRef<Path>,
     base_dir: impl AsRef<Path>,
 ) -> Result<()> {
-    reliable_rename(src_file_path, dst_file_path, base_dir).await.map_err(|e| {
-        if is_sys_err_not_dir(&e) || !os_is_not_exist(&e) || is_sys_err_path_not_found(&e) {
-            Error::new(DiskError::FileAccessDenied)
-        } else if os_is_not_exist(&e) {
-            Error::new(DiskError::FileNotFound)
-        } else if os_is_exist(&e) {
-            Error::new(DiskError::IsNotRegular)
-        } else {
-            Error::new(e)
-        }
-    })?;
+    reliable_rename(src_file_path, dst_file_path.as_ref(), base_dir)
+        .await
+        .map_err(|e| {
+            if is_sys_err_not_dir(&e) || !os_is_not_exist(&e) || is_sys_err_path_not_found(&e) {
+                Error::new(DiskError::FileAccessDenied)
+            } else if os_is_not_exist(&e) {
+                Error::new(DiskError::FileNotFound)
+            } else if os_is_exist(&e) {
+                Error::new(DiskError::IsNotRegular)
+            } else {
+                Error::new(e)
+            }
+        })?;
 
     Ok(())
 }

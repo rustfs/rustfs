@@ -438,7 +438,7 @@ impl AllHealState {
                 _ = sleep(Duration::from_secs(5 * 60)) => {
                     let _ = self.mu.write().await;
                     let now = SystemTime::now();
-                    
+
                     let mut keys_to_reomve = Vec::new();
                     for (k, v) in self.heal_seq_map.iter() {
                         if v.has_ended().await && (UNIX_EPOCH + Duration::from_secs(*(v.end_time.read().await)) + KEEP_HEAL_SEQ_STATE_DURATION) < now {

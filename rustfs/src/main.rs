@@ -6,11 +6,10 @@ mod storage;
 use clap::Parser;
 use common::error::{Error, Result};
 use ecstore::{
-    bucket::metadata_sys::init_bucket_metadata_sys,
+    config::GLOBAL_ConfigSys,
     endpoints::EndpointServerPools,
     set_global_endpoints,
     store::{init_local_disks, ECStore},
-    store_api::{BucketOptions, StorageAPI},
     update_erasure_type,
 };
 use grpc::make_server;
@@ -74,22 +73,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     //获取监听地址
     let local_addr: SocketAddr = listener.local_addr()?;
 
-    // let mut domain_name = {
-    //     netif::up()?
-    //         .map(|x| x.address().to_owned())
-    //         .filter(|v| v.is_ipv4())
-    //         // .filter(|v| v.is_ipv4() && !v.is_loopback() && !v.is_unspecified())
-    //         .map(|v| format!("{}", v))
-    //         .next()
-    //         .and_then(|ip| {
-    //             if let SocketAddr::V4(ipv4) = local_addr {
-    //                 Some(format!("{}:{}", ip, ipv4.port()))
-    //             } else {
-    //                 None
-    //             }
-    //         })
-    // };
-
     // 用于rpc
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
@@ -112,8 +95,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Setup S3 service
     // 本项目使用s3s库来实现s3服务
     let service = {
+        let store = storage::ecfs::FS::new();
         // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), endpoint_pools).await?);
-        let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new());
+        let mut b = S3ServiceBuilder::new(store.clone());
         //设置AK和SK
         //其中部份内容从config配置文件中读取
         let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
@@ -127,6 +111,8 @@ async fn run(opt: config::Opt) -> Result<()> {
         //显示info信息
         info!("authentication is enabled {}, {}", &access_key, &secret_key);
         b.set_auth(SimpleAuth::from_single(access_key, secret_key));
+
+        b.set_access(store.clone());
 
         // // Enable parsing virtual-hosted-style requests
         // if let Some(dm) = opt.domain_name {
@@ -197,17 +183,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(|err| Error::from_string(err.to_string()))?;
 
-    let buckets_list = store
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .map_err(|err| Error::from_string(err.to_string()))?;
-
-    let buckets = buckets_list.iter().map(|v| v.name.clone()).collect();
-
-    init_bucket_metadata_sys(store.clone(), buckets).await;
+    store.init().await.map_err(|err| Error::from_string(err.to_string()))?;
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

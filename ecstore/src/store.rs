@@ -1,14 +1,25 @@
 #![allow(clippy::map_entry)]
 
 use crate::bucket::metadata;
-use crate::bucket::metadata_sys::set_bucket_metadata;
+use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, set_bucket_metadata};
+use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
+use crate::config::{self, storageclass, GLOBAL_ConfigSys};
 use crate::disk::endpoint::EndpointType;
-use crate::disk::MetaCacheEntry;
-use crate::global::{is_dist_erasure, set_object_layer, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+use crate::disk::{DiskInfo, DiskInfoOptions, MetaCacheEntry};
+use crate::global::{
+    is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION,
+    DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
+};
 use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode};
 use crate::heal::heal_ops::HealObjectFn;
 use crate::new_object_layer_fn;
-use crate::store_api::ObjectIO;
+use crate::store_api::{ListMultipartsInfo, ObjectIO};
+use crate::store_err::{
+    is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found, StorageError,
+};
+use crate::store_init::ec_drives_no_config;
+use crate::utils::crypto::base64_decode;
+use crate::utils::path::{decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
 use crate::{
     bucket::metadata::BucketMetadata,
     disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
@@ -16,7 +27,6 @@ use crate::{
     error::{Error, Result},
     peer::S3PeerSys,
     sets::Sets,
-    storage_class::default_partiy_count,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
         ListObjectsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete,
@@ -29,7 +39,11 @@ use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_
 use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
-use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
+use lazy_static::lazy_static;
+use rand::Rng;
+use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
+use std::cmp::Ordering;
+use std::slice::Iter;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -39,8 +53,10 @@ use time::OffsetDateTime;
 use tokio::fs;
 use tokio::sync::Semaphore;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
+
+const MAX_UPLOADS_LIST: usize = 10000;
 
 #[derive(Debug, Clone)]
 pub struct ECStore {
@@ -77,9 +93,14 @@ impl ECStore {
 
         debug!("endpoint_pools: {:?}", endpoint_pools);
 
+        let mut common_parity_drives = 0;
+
         for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
-            // TODO: read from config parseStorageClass
-            let partiy_count = default_partiy_count(pool_eps.drives_per_set);
+            if common_parity_drives == 0 {
+                let parity_drives = ec_drives_no_config(pool_eps.drives_per_set)?;
+                storageclass::validate_parity(parity_drives, pool_eps.drives_per_set)?;
+                common_parity_drives = parity_drives;
+            }
 
             // validate_parity(partiy_count, pool_eps.drives_per_set)?;
 
@@ -129,7 +150,7 @@ impl ECStore {
                 }
             }
 
-            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, partiy_count).await?;
+            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, common_parity_drives).await?;
             pools.push(sets);
 
             disk_map.insert(i, disks);
@@ -155,7 +176,30 @@ impl ECStore {
 
         set_object_layer(ec.clone()).await;
 
+        if let Some(dep_id) = deployment_id {
+            set_global_deployment_id(dep_id).await;
+        }
+
         Ok(ec)
+    }
+
+    pub async fn init(&self) -> Result<()> {
+        config::init();
+        GLOBAL_ConfigSys.init(self).await?;
+
+        let buckets_list = self
+            .list_bucket(&BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|err| Error::from_string(err.to_string()))?;
+
+        let buckets = buckets_list.iter().map(|v| v.name.clone()).collect();
+
+        init_bucket_metadata_sys(self.clone(), buckets).await;
+
+        Ok(())
     }
 
     pub fn init_local_disks() {}
@@ -285,6 +329,138 @@ impl ECStore {
         unimplemented!()
     }
 
+    async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
+        let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
+        server_pools.filter_max_used(100 - (100 as f64 * DISK_RESERVE_FRACTION) as u64);
+        let total = server_pools.total_available();
+
+        if total == 0 {
+            return None;
+        }
+
+        let mut rng = rand::thread_rng();
+        let random_u64: u64 = rng.gen();
+
+        let choose = random_u64 % total;
+        let mut at_total = 0;
+
+        for pool in server_pools.iter() {
+            at_total += pool.available;
+            if at_total > choose && pool.available > 0 {
+                return Some(pool.index);
+            }
+        }
+
+        None
+    }
+
+    async fn get_server_pools_available_space(&self, bucket: &str, object: &str, size: i64) -> ServerPoolsAvailableSpace {
+        let mut n_sets = vec![0; self.pools.len()];
+        let mut infos = vec![Vec::new(); self.pools.len()];
+
+        // TODO: 并发
+        for (idx, pool) in self.pools.iter().enumerate() {
+            // TODO: IsSuspended
+
+            n_sets[idx] = pool.set_count;
+
+            if let Ok(disks) = pool.get_disks_by_key(object).get_disks(0, 0).await {
+                let disk_infos = get_disk_infos(&disks).await;
+                infos[idx] = disk_infos;
+            }
+        }
+
+        let mut server_pools = Vec::new();
+        for (i, zinfo) in infos.iter().enumerate() {
+            if zinfo.is_empty() {
+                server_pools.push(PoolAvailableSpace {
+                    index: i,
+                    ..Default::default()
+                });
+
+                continue;
+            }
+
+            if !is_meta_bucketname(bucket) {
+                let avail = match has_space_for(zinfo, size).await {
+                    Ok(res) => res,
+                    Err(_err) => false,
+                };
+
+                if !avail {
+                    server_pools.push(PoolAvailableSpace {
+                        index: i,
+                        ..Default::default()
+                    });
+
+                    continue;
+                }
+            }
+
+            let mut available = 0;
+            let mut max_used_pct = 0;
+            for disk_op in zinfo.iter() {
+                if let Some(disk) = disk_op {
+                    if disk.total == 0 {
+                        continue;
+                    }
+
+                    available += disk.total - disk.used;
+
+                    let pct_used = disk.used * 100 / disk.total;
+
+                    if pct_used > max_used_pct {
+                        max_used_pct = pct_used;
+                    }
+                }
+            }
+
+            available *= n_sets[i] as u64;
+
+            server_pools[i] = PoolAvailableSpace {
+                index: i,
+                available,
+                max_used_pct,
+            }
+        }
+
+        ServerPoolsAvailableSpace(server_pools)
+    }
+
+    async fn get_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Result<usize> {
+        let idx = match self
+            .get_pool_idx_existing_with_opts(
+                bucket,
+                object,
+                &ObjectOptions {
+                    skip_decommissioned: true,
+                    skip_rebalancing: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                if !is_err_object_not_found(&err) {
+                    return Err(err);
+                }
+
+                if let Some(hit_idx) = self.get_available_pool_idx(bucket, object, size).await {
+                    hit_idx
+                } else {
+                    return Err(Error::new(DiskError::DiskFull));
+                }
+            }
+        };
+
+        Ok(idx)
+    }
+
+    async fn get_pool_idx_existing_with_opts(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<usize> {
+        let (pinfo, _) = self.get_pool_info_existing_with_opts(bucket, object, opts).await?;
+        Ok(pinfo.index)
+    }
     async fn get_pool_info_existing_with_opts(
         &self,
         bucket: &str,
@@ -292,6 +468,100 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<(PoolObjInfo, Vec<Error>)> {
         internal_get_pool_info_existing_with_opts(&self.pools, bucket, object, opts).await
+    }
+
+    async fn get_latest_object_info_with_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, usize)> {
+        let mut futures = Vec::with_capacity(self.pools.len());
+        for pool in self.pools.iter() {
+            futures.push(pool.get_object_info(bucket, object, opts));
+        }
+
+        let results = join_all(futures).await;
+
+        struct IndexRes {
+            res: Option<ObjectInfo>,
+            idx: usize,
+            err: Option<Error>,
+        }
+
+        let mut idx_res = Vec::with_capacity(self.pools.len());
+
+        let mut idx = 0;
+        for result in results {
+            match result {
+                Ok(res) => {
+                    idx_res.push(IndexRes {
+                        res: Some(res),
+                        idx,
+                        err: None,
+                    });
+                }
+                Err(e) => {
+                    idx_res.push(IndexRes {
+                        res: None,
+                        idx,
+                        err: Some(e),
+                    });
+                }
+            }
+
+            idx += 1;
+        }
+
+        // TODO: test order
+        idx_res.sort_by(|a, b| {
+            if let Some(obj1) = &a.res {
+                if let Some(obj2) = &b.res {
+                    let cmp = obj1.mod_time.cmp(&obj2.mod_time);
+                    match cmp {
+                        // eq use lowest
+                        Ordering::Equal => {
+                            if a.idx < b.idx {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            }
+                        }
+                        _ => cmp,
+                    }
+                } else {
+                    Ordering::Greater
+                }
+            } else {
+                Ordering::Less
+            }
+        });
+
+        for res in idx_res {
+            if let Some(obj) = res.res {
+                return Ok((obj, res.idx));
+            }
+
+            if let Some(err) = res.err {
+                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                    return Err(err);
+                }
+
+                // TODO: delete marker
+            }
+        }
+
+        let object = decode_dir_object(object);
+
+        if opts.version_id.is_none() {
+            Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
+        } else {
+            Err(Error::new(StorageError::VersionNotFound(
+                bucket.to_owned(),
+                object.to_owned(),
+                opts.version_id.clone().unwrap_or_default(),
+            )))
+        }
     }
 }
 
@@ -478,10 +748,20 @@ impl ObjectIO for ECStore {
             return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, opts).await;
         }
 
-        unimplemented!()
+        // TODO: nslock
+
+        let mut opts = opts.clone();
+
+        opts.no_lock = true;
+
+        let (_oi, idx) = self.get_latest_object_info_with_idx(bucket, &object, &opts).await?;
+
+        self.pools[idx]
+            .get_object_reader(bucket, object.as_str(), range, h, &opts)
+            .await
     }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        // checkPutObjectArgs
+    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        check_put_object_args(bucket, object)?;
 
         let object = utils::path::encode_dir_object(object);
 
@@ -489,20 +769,68 @@ impl ObjectIO for ECStore {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
-        unimplemented!()
+        let idx = self.get_pool_idx(&bucket, &object, data.content_length as i64).await?;
+
+        if opts.data_movement && idx == opts.src_pool_idx {
+            return Err(Error::new(StorageError::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                opts.version_id.clone().unwrap_or_default(),
+            )));
+        }
+
+        self.pools[idx].put_object(bucket, &object, data, opts).await
     }
+}
+
+lazy_static! {
+    static ref enableObjcetLockConfig: ObjectLockConfiguration = ObjectLockConfiguration {
+        object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        ..Default::default()
+    };
+    static ref enableVersioningConfig: VersioningConfiguration = VersioningConfiguration {
+        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        ..Default::default()
+    };
 }
 
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        let buckets = self.peer_sys.list_bucket(opts).await?;
+        // TODO: opts.cached
 
+        let mut buckets = self.peer_sys.list_bucket(opts).await?;
+
+        if !opts.no_metadata {
+            for bucket in buckets.iter_mut() {
+                if let Ok(created) = metadata_sys::created_at(&bucket.name).await {
+                    bucket.created = Some(created);
+                }
+            }
+        }
         Ok(buckets)
     }
 
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
-        self.peer_sys.delete_bucket(bucket, opts).await?;
+        if is_meta_bucketname(&bucket) {
+            return Err(StorageError::BucketNameInvalid(bucket.to_string()).into());
+        }
+
+        if let Err(err) = check_valid_bucket_name(&bucket) {
+            return Err(StorageError::BucketNameInvalid(err.to_string()).into());
+        }
+
+        // TODO: nslock
+
+        let mut opts = opts.clone();
+        if !opts.force {
+            // TODO: check bucket exists
+            opts.force = true
+        }
+
+        self.peer_sys.delete_bucket(bucket, &opts).await?;
+
+        // TODO: replication opts.srdelete_op
 
         // 删除meta
         self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
@@ -510,40 +838,63 @@ impl StorageAPI for ECStore {
         Ok(())
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        // TODO:  check valid bucket name
+        if !is_meta_bucketname(&bucket) {
+            if let Err(err) = check_valid_bucket_name_strict(&bucket) {
+                return Err(StorageError::BucketNameInvalid(err.to_string()).into());
+            }
 
-        // TODO: delete created bucket when error
-        self.peer_sys.make_bucket(bucket, opts).await?;
+            // TODO: nslock
+        }
+
+        if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
+            if !is_err_bucket_exists(&err) {
+                let _ = self
+                    .delete_bucket(
+                        bucket,
+                        &DeleteBucketOptions {
+                            no_lock: true,
+                            no_recreate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            }
+        };
 
         let mut meta = BucketMetadata::new(bucket);
 
-        warn!("make bucket opsts {:?}", &opts);
+        if let Some(crd) = opts.created_at {
+            meta.set_created(crd);
+        }
 
         if opts.lock_enabled {
-            let cfg = ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-                ..Default::default()
-            };
+            meta.object_lock_config_xml = metadata::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
+            meta.versioning_config_xml = metadata::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+        }
 
-            meta.object_lock_config_xml = metadata::serialize::<ObjectLockConfiguration>(&cfg)?;
-
-            warn!("make bucket add object_lock_config_xml {:?}", &meta.object_lock_config_xml);
-            // FIXME: version config
+        if opts.versioning_enabled {
+            meta.versioning_config_xml = metadata::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
         meta.save(self).await?;
 
         set_bucket_metadata(bucket.to_string(), meta).await;
 
-        // TODO: toObjectErr
-
         Ok(())
     }
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        let info = self.peer_sys.get_bucket_info(bucket, opts).await?;
+        let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
+
+        if let Ok(sys) = metadata_sys::get(&bucket).await {
+            info.created = Some(sys.created);
+            info.versionning = sys.versioning();
+            info.object_locking = sys.object_locking();
+        }
 
         Ok(info)
     }
+
+    // TODO: review
     async fn delete_objects(
         &self,
         bucket: &str,
@@ -567,6 +918,8 @@ impl StorageAPI for ECStore {
         for _ in 0..objects.len() {
             del_errs.push(None)
         }
+
+        // TODO: nslock
 
         let mut jhs = Vec::new();
         let semaphore = Arc::new(Semaphore::new(num_cpus::get()));
@@ -598,7 +951,7 @@ impl StorageAPI for ECStore {
         for (i, res) in results.into_iter().enumerate() {
             match res {
                 Ok((pinfo, _)) => {
-                    if pinfo.object_info.delete_marker && opts.version_id.is_empty() {
+                    if pinfo.object_info.delete_marker && opts.version_id.is_none() {
                         del_objects[i] = DeletedObject {
                             delete_marker: pinfo.object_info.delete_marker,
                             delete_marker_version_id: pinfo.object_info.version_id.map(|v| v.to_string()),
@@ -672,7 +1025,7 @@ impl StorageAPI for ECStore {
 
         // 查询在哪个pool
         let (mut pinfo, errs) = self.get_pool_info_existing_with_opts(bucket, object, &opts).await?;
-        if pinfo.object_info.delete_marker && opts.version_id.is_empty() {
+        if pinfo.object_info.delete_marker && opts.version_id.is_none() {
             pinfo.object_info.name = utils::path::decode_dir_object(object);
             return Ok(pinfo.object_info);
         }
@@ -686,6 +1039,8 @@ impl StorageAPI for ECStore {
 
         Ok(obj)
     }
+
+    // TODO: review
     async fn list_objects_v2(
         &self,
         bucket: &str,
@@ -717,54 +1072,221 @@ impl StorageAPI for ECStore {
         Ok(v2)
     }
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        check_object_args(bucket, object)?;
+
         let object = utils::path::encode_dir_object(object);
 
         if self.single_pool() {
             return self.pools[0].get_object_info(bucket, object.as_str(), opts).await;
         }
 
-        unimplemented!()
+        // TODO: nslock
+
+        let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
+
+        Ok(info)
     }
 
-    async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()> {
-        let object = utils::path::encode_dir_object(object);
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
+        let object = encode_dir_object(object);
 
         if self.single_pool() {
-            return self.pools[0].put_object_info(bucket, object.as_str(), info, opts).await;
+            return self.pools[0].get_object_tags(bucket, object.as_str(), opts).await;
         }
+
+        let (oi, _) = self.get_latest_object_info_with_idx(bucket, &object, opts).await?;
+
+        Ok(oi.user_tags)
+    }
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].put_object_tags(bucket, object.as_str(), tags, opts).await;
+        }
+
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+
+        self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
+    }
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].delete_object_tags(bucket, object.as_str(), opts).await;
+        }
+
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+
+        self.pools[idx].delete_object_tags(bucket, object.as_str(), opts).await
+    }
+    async fn copy_object_part(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        _dst_bucket: &str,
+        _dst_object: &str,
+        _upload_id: &str,
+        _part_id: usize,
+        _start_offset: i64,
+        _length: i64,
+        _src_info: &ObjectInfo,
+        _src_opts: &ObjectOptions,
+        _dst_opts: &ObjectOptions,
+    ) -> Result<()> {
+        check_new_multipart_args(src_bucket, src_object)?;
+
+        // TODO: PutObjectReader
+        // self.put_object_part(dst_bucket, dst_object, upload_id, part_id, data, opts)
 
         unimplemented!()
     }
-
     async fn put_object_part(
         &self,
         bucket: &str,
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: PutObjReader,
+        data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
+        check_put_object_part_args(bucket, object, upload_id)?;
+
         if self.single_pool() {
             return self.pools[0]
                 .put_object_part(bucket, object, upload_id, part_id, data, opts)
                 .await;
         }
-        unimplemented!()
+
+        for pool in self.pools.iter() {
+            // TODO: IsSuspended
+            let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
+                Ok(res) => return Ok(res),
+                Err(err) => {
+                    if is_err_invalid_upload_id(&err) {
+                        None
+                    } else {
+                        Some(err)
+                    }
+                }
+            };
+
+            if let Some(err) = err {
+                return Err(err);
+            }
+        }
+
+        Err(Error::new(StorageError::InvalidUploadID(
+            bucket.to_owned(),
+            object.to_owned(),
+            upload_id.to_owned(),
+        )))
     }
 
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: &str,
+        upload_id_marker: &str,
+        delimiter: &str,
+        max_uploads: usize,
+    ) -> Result<ListMultipartsInfo> {
+        check_list_multipart_args(bucket, prefix, key_marker, upload_id_marker, delimiter)?;
+
+        if prefix.is_empty() {
+            // TODO: return from cache
+        }
+
+        if self.single_pool() {
+            return self.pools[0]
+                .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
+                .await;
+        }
+
+        let mut uploads = Vec::new();
+
+        for pool in self.pools.iter() {
+            let res = pool
+                .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
+                .await?;
+            uploads.extend(res.uploads);
+        }
+
+        Ok(ListMultipartsInfo {
+            key_marker: key_marker.to_owned(),
+            upload_id_marker: upload_id_marker.to_owned(),
+            max_uploads: max_uploads,
+            uploads,
+            prefix: prefix.to_owned(),
+            delimiter: delimiter.to_owned(),
+            ..Default::default()
+        })
+    }
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
+        check_new_multipart_args(bucket, object)?;
+
         if self.single_pool() {
             return self.pools[0].new_multipart_upload(bucket, object, opts).await;
         }
-        unimplemented!()
+
+        for (idx, pool) in self.pools.iter().enumerate() {
+            // // TODO: IsSuspended
+            let res = pool
+                .list_multipart_uploads(bucket, &object, "", "", "", MAX_UPLOADS_LIST)
+                .await?;
+
+            if !res.uploads.is_empty() {
+                return self.pools[idx].new_multipart_upload(bucket, object, opts).await;
+            }
+        }
+
+        let idx = self.get_pool_idx(bucket, object, -1).await?;
+        if opts.data_movement && idx == opts.src_pool_idx {
+            return Err(Error::new(StorageError::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                "".to_owned(),
+            )));
+        }
+
+        self.pools[idx].new_multipart_upload(bucket, object, opts).await
     }
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
+        check_abort_multipart_args(bucket, object, upload_id)?;
+
+        // TODO: defer
+
         if self.single_pool() {
             return self.pools[0].abort_multipart_upload(bucket, object, upload_id, opts).await;
         }
 
-        unimplemented!()
+        for pool in self.pools.iter() {
+            // TODO: IsSuspended
+
+            let err = match pool.abort_multipart_upload(bucket, object, upload_id, opts).await {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    //
+                    if is_err_invalid_upload_id(&err) {
+                        None
+                    } else {
+                        Some(err)
+                    }
+                }
+            };
+
+            if let Some(er) = err {
+                return Err(er);
+            }
+        }
+
+        Err(Error::new(StorageError::InvalidUploadID(
+            bucket.to_owned(),
+            object.to_owned(),
+            upload_id.to_owned(),
+        )))
     }
     async fn complete_multipart_upload(
         &self,
@@ -774,17 +1296,64 @@ impl StorageAPI for ECStore {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
+        check_complete_multipart_args(bucket, object, upload_id)?;
+
         if self.single_pool() {
             return self.pools[0]
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await;
         }
-        unimplemented!()
+
+        for pool in self.pools.iter() {
+            // TODO: IsSuspended
+
+            let err = match pool
+                .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
+                .await
+            {
+                Ok(res) => return Ok(res),
+                Err(err) => {
+                    //
+                    if is_err_invalid_upload_id(&err) {
+                        None
+                    } else {
+                        Some(err)
+                    }
+                }
+            };
+
+            if let Some(er) = err {
+                return Err(er);
+            }
+        }
+
+        Err(Error::new(StorageError::InvalidUploadID(
+            bucket.to_owned(),
+            object.to_owned(),
+            upload_id.to_owned(),
+        )))
     }
 
+    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+        if pool_idx < self.pools.len() && set_idx < self.pools[pool_idx].disk_set.len() {
+            self.pools[pool_idx].disk_set[set_idx].get_disks(0, 0).await
+        } else {
+            Err(Error::msg(format!("pool idx {}, set idx {}, not found", pool_idx, set_idx)))
+        }
+    }
+
+    fn set_drive_counts(&self) -> Vec<usize> {
+        let mut counts = vec![0; self.pools.len()];
+
+        for (i, pool) in self.pools.iter().enumerate() {
+            counts[i] = pool.set_drive_count();
+        }
+        counts
+    }
     async fn heal_format(&self, dry_run: bool) -> Result<HealResultItem> {
         unimplemented!()
     }
+
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         unimplemented!()
     }
@@ -914,6 +1483,173 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
     *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
 }
 
+fn is_valid_object_prefix(object: &str) -> bool {
+    // Implement object prefix validation
+    !object.is_empty() // Placeholder
+}
+
+fn is_valid_object_name(object: &str) -> bool {
+    // Implement object name validation
+    !object.is_empty() // Placeholder
+}
+
+fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<()> {
+    if object.len() > 1024 {
+        return Err(Error::new(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned())));
+    }
+
+    if object.starts_with(SLASH_SEPARATOR) {
+        return Err(Error::new(StorageError::ObjectNamePrefixAsSlash(bucket.to_owned(), object.to_owned())));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if object.contains('\\')
+            || object.contains(':')
+            || object.contains('*')
+            || object.contains('?')
+            || object.contains('"')
+            || object.contains('|')
+            || object.contains('<')
+            || object.contains('>')
+        {
+            return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned())));
+        }
+    }
+
+    Ok(())
+}
+
+fn _check_copy_obj_args(bucket: &str, object: &str) -> Result<()> {
+    _check_bucket_and_object_names(bucket, object)
+}
+
+fn _check_get_obj_args(bucket: &str, object: &str) -> Result<()> {
+    _check_bucket_and_object_names(bucket, object)
+}
+
+fn _check_del_obj_args(bucket: &str, object: &str) -> Result<()> {
+    _check_bucket_and_object_names(bucket, object)
+}
+
+fn _check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
+    if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
+        return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
+    }
+
+    if object.is_empty() {
+        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+    }
+
+    if !is_valid_object_prefix(object) {
+        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+    }
+
+    if cfg!(target_os = "windows") && object.contains('\\') {
+        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+    }
+
+    Ok(())
+}
+
+fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &str) -> Result<()> {
+    if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
+        return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
+    }
+
+    if !is_valid_object_prefix(prefix) {
+        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), prefix.to_string())));
+    }
+
+    Ok(())
+}
+
+fn check_list_multipart_args(
+    bucket: &str,
+    prefix: &str,
+    key_marker: &str,
+    upload_id_marker: &str,
+    _delimiter: &str,
+) -> Result<()> {
+    check_list_objs_args(bucket, prefix, key_marker)?;
+
+    if !upload_id_marker.is_empty() {
+        if key_marker.ends_with('/') {
+            return Err(Error::new(StorageError::InvalidUploadIDKeyCombination(
+                upload_id_marker.to_string(),
+                key_marker.to_string(),
+            )));
+        }
+
+        if let Err(_e) = base64_decode(upload_id_marker.as_bytes()) {
+            return Err(Error::new(StorageError::MalformedUploadID(upload_id_marker.to_owned())));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_object_args(bucket: &str, object: &str) -> Result<()> {
+    if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
+        return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
+    }
+
+    check_object_name_for_length_and_slash(bucket, object)?;
+
+    if !is_valid_object_name(object) {
+        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+    }
+
+    Ok(())
+}
+
+fn check_new_multipart_args(bucket: &str, object: &str) -> Result<()> {
+    check_object_args(bucket, object)
+}
+
+fn check_multipart_object_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
+    if let Err(e) = base64_decode(upload_id.as_bytes()) {
+        return Err(Error::new(StorageError::MalformedUploadID(format!(
+            "{}/{}-{},err:{}",
+            bucket,
+            object,
+            upload_id,
+            e.to_string()
+        ))));
+    };
+    check_object_args(bucket, object)
+}
+
+fn check_put_object_part_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
+    check_multipart_object_args(bucket, object, upload_id)
+}
+
+fn _check_list_parts_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
+    check_multipart_object_args(bucket, object, upload_id)
+}
+
+fn check_complete_multipart_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
+    check_multipart_object_args(bucket, object, upload_id)
+}
+
+fn check_abort_multipart_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
+    check_multipart_object_args(bucket, object, upload_id)
+}
+
+fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
+    if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
+        return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
+    }
+
+    check_object_name_for_length_and_slash(bucket, object)?;
+
+    if object.is_empty() || !is_valid_object_prefix(object) {
+        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+    }
+
+    Ok(())
+}
+
 pub async fn heal_entry(
     bucket: String,
     entry: MetaCacheEntry,
@@ -973,4 +1709,123 @@ pub async fn heal_entry(
         }
     }
     Ok(())
+}
+
+async fn get_disk_infos(disks: &Vec<Option<DiskStore>>) -> Vec<Option<DiskInfo>> {
+    let opts = &DiskInfoOptions::default();
+    let mut res = vec![None; disks.len()];
+    for (idx, disk_op) in disks.iter().enumerate() {
+        if let Some(disk) = disk_op {
+            if let Ok(info) = disk.disk_info(opts).await {
+                res[idx] = Some(info);
+            }
+        }
+    }
+
+    res
+}
+
+#[derive(Debug, Default)]
+pub struct PoolAvailableSpace {
+    pub index: usize,
+    pub available: u64,    // in bytes
+    pub max_used_pct: u64, // Used disk percentage of most filled disk, rounded down.
+}
+
+pub struct ServerPoolsAvailableSpace(Vec<PoolAvailableSpace>);
+
+impl ServerPoolsAvailableSpace {
+    fn iter(&self) -> Iter<'_, PoolAvailableSpace> {
+        self.0.iter()
+    }
+    // TotalAvailable - total available space
+    fn total_available(&self) -> u64 {
+        let mut total = 0;
+        for pool in &self.0 {
+            total += pool.available;
+        }
+        total
+    }
+
+    // FilterMaxUsed will filter out any pools that has used percent bigger than max,
+    // unless all have that, in which case all are preserved.
+    fn filter_max_used(&mut self, max: u64) {
+        if self.0.len() <= 1 {
+            // Nothing to do.
+            return;
+        }
+        let mut ok = false;
+        for pool in &self.0 {
+            if pool.available > 0 && pool.max_used_pct < max {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            // All above limit.
+            // Do not modify
+            return;
+        }
+
+        // Remove entries that are above.
+        for pool in self.0.iter_mut() {
+            if pool.available > 0 && pool.max_used_pct < max {
+                pool.available = 0
+            }
+        }
+    }
+}
+
+async fn has_space_for(dis: &Vec<Option<DiskInfo>>, size: i64) -> Result<bool> {
+    let size = {
+        if size < 0 {
+            DISK_ASSUME_UNKNOWN_SIZE
+        } else {
+            size as u64 * 2
+        }
+    };
+
+    let mut available = 0;
+    let mut total = 0;
+    let mut disks_num = 0;
+
+    for disk_op in dis.iter() {
+        if let Some(disk) = disk_op {
+            disks_num += 1;
+            total += disk.total;
+            available += disk.total - disk.used;
+        }
+    }
+
+    if disks_num < dis.len() / 2 || disks_num <= 0 {
+        return Err(Error::msg(format!(
+            "not enough online disks to calculate the available space,need {}, found {}",
+            (dis.len() / 2) + 1,
+            disks_num,
+        )));
+    }
+
+    let per_disk = size / disks_num as u64;
+
+    for disk_op in dis.iter() {
+        if let Some(disk) = disk_op {
+            if !is_erasure_sd().await && disk.free_inodes < DISK_MIN_INODES && disk.used_inodes > 0 {
+                return Ok(false);
+            }
+
+            if disk.free <= per_disk {
+                return Ok(false);
+            }
+        }
+    }
+
+    if available < size {
+        return Ok(false);
+    }
+
+    available -= size;
+
+    let want = total as f64 * (1.0 - DISK_FILL_FRACTION);
+
+    Ok(available > want as u64)
 }

@@ -16,7 +16,18 @@ use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
-        node_service_server::NodeService as Node, CheckPartsRequest, CheckPartsResponse, DeleteBucketRequest, DeleteBucketResponse, DeletePathsRequest, DeletePathsResponse, DeleteRequest, DeleteResponse, DeleteVersionRequest, DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse, DiskInfoRequest, DiskInfoResponse, GenerallyLockRequest, GenerallyLockResponse, GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse, StatVolumeRequest, StatVolumeResponse, UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest, VerifyFileResponse, WalkDirRequest, WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse
+        node_service_server::NodeService as Node, CheckPartsRequest, CheckPartsResponse, DeleteBucketRequest,
+        DeleteBucketResponse, DeletePathsRequest, DeletePathsResponse, DeleteRequest, DeleteResponse, DeleteVersionRequest,
+        DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse,
+        DiskInfoRequest, DiskInfoResponse, GenerallyLockRequest, GenerallyLockResponse, GetBucketInfoRequest,
+        GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse, ListVolumesRequest,
+        ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest,
+        MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse,
+        ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse,
+        RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse,
+        StatVolumeRequest, StatVolumeResponse, UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest,
+        VerifyFileResponse, WalkDirRequest, WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest,
+        WriteMetadataResponse, WriteRequest, WriteResponse,
     },
 };
 use tokio::sync::mpsc;
@@ -205,7 +216,13 @@ impl Node for NodeService {
         let request = request.into_inner();
         match self
             .local_peer
-            .delete_bucket(&request.bucket, &DeleteBucketOptions { force: false })
+            .delete_bucket(
+                &request.bucket,
+                &DeleteBucketOptions {
+                    force: false,
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(_) => Ok(tonic::Response::new(DeleteBucketResponse {
@@ -326,7 +343,7 @@ impl Node for NodeService {
                         check_parts_resp,
                         error_info: None,
                     }))
-                },
+                }
                 Err(err) => Ok(tonic::Response::new(VerifyFileResponse {
                     success: false,
                     check_parts_resp: "".to_string(),
@@ -372,7 +389,7 @@ impl Node for NodeService {
                         check_parts_resp,
                         error_info: None,
                     }))
-                },
+                }
                 Err(err) => Ok(tonic::Response::new(CheckPartsResponse {
                     success: false,
                     check_parts_resp: "".to_string(),
@@ -914,7 +931,7 @@ impl Node for NodeService {
                 }
             };
 
-            match disk.update_metadata(&request.volume, &request.path, file_info, opts).await {
+            match disk.update_metadata(&request.volume, &request.path, file_info, &opts).await {
                 Ok(_) => Ok(tonic::Response::new(UpdateMetadataResponse {
                     success: true,
                     error_info: None,

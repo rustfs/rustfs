@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use common::error::Result;
 use ecstore::bucket::error::BucketMetadataError;
 use ecstore::bucket::metadata;
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -12,9 +13,12 @@ use ecstore::bucket::metadata::OBJECT_LOCK_CONFIG;
 use ecstore::bucket::metadata_sys;
 use ecstore::bucket::policy::bucket_policy::BucketPolicy;
 use ecstore::bucket::policy_sys::PolicySys;
+use ecstore::bucket::tagging::decode_tags;
+use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::disk::error::DiskError;
 use ecstore::new_object_layer_fn;
+use ecstore::options::put_opts;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
 use ecstore::store_api::DeleteBucketOptions;
@@ -29,6 +33,7 @@ use ecstore::store_api::StorageAPI;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
+use lazy_static::lazy_static;
 use log::warn;
 use s3s::dto::*;
 use s3s::s3_error;
@@ -39,12 +44,10 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use tracing::debug;
 use tracing::info;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
-
-use common::error::Result;
-use tracing::debug;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -57,7 +60,13 @@ macro_rules! try_ {
     };
 }
 
-#[derive(Debug)]
+lazy_static! {
+    static ref RUSTFS_OWNER: Owner = Owner {
+        display_name: Some("rustfs".to_owned()),
+        id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
+    };
+}
+#[derive(Debug, Clone)]
 pub struct FS {
     // pub store: ECStore,
 }
@@ -130,7 +139,13 @@ impl S3 for FS {
         };
         try_!(
             store
-                .delete_bucket(&input.bucket, &DeleteBucketOptions { force: false })
+                .delete_bucket(
+                    &input.bucket,
+                    &DeleteBucketOptions {
+                        force: false,
+                        ..Default::default()
+                    }
+                )
                 .await
         );
 
@@ -399,6 +414,7 @@ impl S3 for FS {
 
         let output = ListBucketsOutput {
             buckets: Some(buckets),
+            owner: Some(RUSTFS_OWNER.to_owned()),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -513,16 +529,17 @@ impl S3 for FS {
             key,
             metadata,
             content_length,
+            content_type,
+            checksum_sha256,
+            content_md5,
             ..
         } = input;
-
-        debug!("put_object metadata {:?}", metadata);
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         let Some(content_length) = content_length else { return Err(s3_error!(IncompleteBody)) };
 
-        let reader = PutObjReader::new(body, content_length as usize);
+        let mut reader = PutObjReader::new(body, content_length as usize);
 
         let layer = new_object_layer_fn();
         let lock = layer.read().await;
@@ -531,11 +548,18 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        try_!(store.put_object(&bucket, &key, reader, &ObjectOptions::default()).await);
+        let opts: ObjectOptions = try_!(put_opts(&bucket, &key, None, &req.headers, metadata).await);
+
+        let obj_info = try_!(store.put_object(&bucket, &key, &mut reader, &opts).await);
+
+        let e_tag = obj_info.etag;
 
         // store.put_object(bucket, object, data, opts);
 
-        let output = PutObjectOutput { ..Default::default() };
+        let output = PutObjectOutput {
+            e_tag,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
@@ -592,7 +616,7 @@ impl S3 for FS {
         let content_length = content_length.ok_or_else(|| s3_error!(IncompleteBody))?;
 
         // mc cp step 4
-        let data = PutObjReader::new(body, content_length as usize);
+        let mut data = PutObjReader::new(body, content_length as usize);
         let opts = ObjectOptions::default();
 
         let layer = new_object_layer_fn();
@@ -602,9 +626,16 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        try_!(store.put_object_part(&bucket, &key, &upload_id, part_id, data, &opts).await);
+        let info = try_!(
+            store
+                .put_object_part(&bucket, &key, &upload_id, part_id, &mut data, &opts)
+                .await
+        );
 
-        let output = UploadPartOutput { ..Default::default() };
+        let output = UploadPartOutput {
+            e_tag: info.etag,
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
@@ -766,7 +797,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
         let PutObjectTaggingInput {
             bucket,
@@ -781,12 +812,15 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        let mut object_info = try_!(store.get_object_info(&bucket, &object, &ObjectOptions::default()).await);
-        object_info.tags = Some(tagging.tag_set.into_iter().map(|Tag { key, value }| (key, value)).collect());
+        // let mut object_info = try_!(store.get_object_info(&bucket, &object, &ObjectOptions::default()).await);
 
+        let tags = encode_tags(tagging.tag_set);
+
+        // TODO: getOpts
+        // TODO: Replicate
         try_!(
             store
-                .put_object_info(&bucket, &object, object_info, &ObjectOptions::default())
+                .put_object_tags(&bucket, &object, &tags, &ObjectOptions::default())
                 .await
         );
 
@@ -803,13 +837,13 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        let object_info = try_!(store.get_object_info(&bucket, &object, &ObjectOptions::default()).await);
+        // TODO: version
+        let tags = try_!(store.get_object_tags(&bucket, &object, &ObjectOptions::default()).await);
+
+        let tag_set = decode_tags(tags.as_str());
 
         Ok(S3Response::new(GetObjectTaggingOutput {
-            tag_set: object_info
-                .tags
-                .map(|tags| tags.into_iter().map(|(key, value)| Tag { key, value }).collect())
-                .unwrap_or_else(Vec::new),
+            tag_set,
             version_id: None,
         }))
     }
@@ -827,16 +861,19 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        let mut object_info = try_!(store.get_object_info(&bucket, &object, &ObjectOptions::default()).await);
-        object_info.tags = None;
-
-        try_!(
-            store
-                .put_object_info(&bucket, &object, object_info, &ObjectOptions::default())
-                .await
-        );
+        // TODO: Replicate
+        // TODO: version
+        try_!(store.delete_object_tags(&bucket, &object, &ObjectOptions::default()).await);
 
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn list_object_versions(
+        &self,
+        _req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        Err(s3_error!(NotImplemented, "ListObjectVersions is not implemented yet"))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -949,7 +986,11 @@ impl S3 for FS {
             }
         }
 
+        // warn!("input policy {}", &policy);
+
         let cfg = try_!(BucketPolicy::unmarshal(policy.as_bytes()));
+
+        // warn!("parse policy {:?}", &cfg);
 
         if let Err(err) = cfg.validate(&bucket) {
             warn!("put_bucket_policy err input {:?}, {:?}", &policy, err);
@@ -1037,7 +1078,7 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        warn!("lifecycle_configuration {:?}", &lifecycle_configuration);
+        // warn!("lifecycle_configuration {:?}", &lifecycle_configuration);
 
         // TODO: objcetLock
 
@@ -1183,7 +1224,7 @@ impl S3 for FS {
             }
         };
 
-        warn!("object_lock_configuration {:?}", &object_lock_configuration);
+        // warn!("object_lock_configuration {:?}", &object_lock_configuration);
 
         Ok(S3Response::new(GetObjectLockConfigurationOutput {
             object_lock_configuration,
@@ -1394,6 +1435,167 @@ impl S3 for FS {
         // TODO: event notice add rule
 
         Ok(S3Response::new(PutBucketNotificationConfigurationOutput::default()))
+    }
+
+    async fn get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
+        let GetBucketAclInput { bucket, .. } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
+            if DiskError::VolumeNotFound.is(&e) {
+                return Err(s3_error!(NoSuchBucket));
+            } else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            }
+        }
+
+        let mut grants = Vec::new();
+
+        grants.push(Grant {
+            grantee: Some(Grantee {
+                type_: Type::from_static(Type::CANONICAL_USER),
+                display_name: None,
+                email_address: None,
+                id: None,
+                uri: None,
+            }),
+            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
+        });
+
+        Ok(S3Response::new(GetBucketAclOutput {
+            grants: Some(grants),
+            owner: Some(RUSTFS_OWNER.to_owned()),
+            ..Default::default()
+        }))
+    }
+
+    async fn put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
+        let PutBucketAclInput {
+            bucket,
+            acl,
+            access_control_policy,
+            ..
+        } = req.input;
+
+        // TODO:checkRequestAuthType
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
+            if DiskError::VolumeNotFound.is(&e) {
+                return Err(s3_error!(NoSuchBucket));
+            } else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            }
+        }
+
+        if let Some(canned_acl) = acl {
+            if canned_acl.as_str() != BucketCannedACL::PRIVATE {
+                return Err(s3_error!(NotImplemented));
+            }
+        } else {
+            let is_full_control = access_control_policy.is_some_and(|v| {
+                v.grants.is_some_and(|gs| {
+                    //
+                    !gs.is_empty()
+                        && gs.get(0).is_some_and(|g| {
+                            g.to_owned()
+                                .permission
+                                .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
+                        })
+                })
+            });
+
+            if !is_full_control {
+                return Err(s3_error!(NotImplemented));
+            }
+        }
+        Ok(S3Response::new(PutBucketAclOutput::default()))
+    }
+
+    async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
+        let GetObjectAclInput { bucket, key, .. } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+        }
+
+        let mut grants = Vec::new();
+
+        grants.push(Grant {
+            grantee: Some(Grantee {
+                type_: Type::from_static(Type::CANONICAL_USER),
+                display_name: None,
+                email_address: None,
+                id: None,
+                uri: None,
+            }),
+            permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
+        });
+
+        Ok(S3Response::new(GetObjectAclOutput {
+            grants: Some(grants),
+            owner: Some(RUSTFS_OWNER.to_owned()),
+            ..Default::default()
+        }))
+    }
+
+    async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
+        let PutObjectAclInput {
+            bucket,
+            key,
+            acl,
+            access_control_policy,
+            ..
+        } = req.input;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock
+            .as_ref()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+
+        if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+        }
+
+        if let Some(canned_acl) = acl {
+            if canned_acl.as_str() != BucketCannedACL::PRIVATE {
+                return Err(s3_error!(NotImplemented));
+            }
+        } else {
+            let is_full_control = access_control_policy.is_some_and(|v| {
+                v.grants.is_some_and(|gs| {
+                    //
+                    !gs.is_empty()
+                        && gs.get(0).is_some_and(|g| {
+                            g.to_owned()
+                                .permission
+                                .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
+                        })
+                })
+            });
+
+            if !is_full_control {
+                return Err(s3_error!(NotImplemented));
+            }
+        }
+        Ok(S3Response::new(PutObjectAclOutput::default()))
     }
 }
 

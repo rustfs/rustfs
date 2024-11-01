@@ -1,5 +1,8 @@
+use super::policy::bucket_policy::BucketPolicy;
 use super::{quota::BucketQuota, target::BucketTargets};
 
+use super::object_lock::ObjectLockApi;
+use super::versioning::VersioningApi;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmp_serde::Serializer as rmpSerializer;
 use s3s::dto::{
@@ -7,7 +10,6 @@ use s3s::dto::{
     ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
 use s3s::xml;
-use s3s_policy::model::Policy;
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -70,7 +72,7 @@ pub struct BucketMetadata {
     pub new_field_updated_at: OffsetDateTime,
 
     #[serde(skip)]
-    pub policy_config: Option<Policy>,
+    pub policy_config: Option<BucketPolicy>,
     #[serde(skip)]
     pub notification_config: Option<NotificationConfiguration>,
     #[serde(skip)]
@@ -149,9 +151,15 @@ impl BucketMetadata {
         format!("{}/{}/{}", BUCKET_META_PREFIX, self.name.as_str(), BUCKET_METADATA_FILE)
     }
 
-    // fn msg_size(&self) -> usize {
-    //     unimplemented!()
-    // }
+    pub fn versioning(&self) -> bool {
+        self.lock_enabled
+            || (self.object_lock_config.as_ref().is_some_and(|v| v.enabled())
+                || self.versioning_config.as_ref().is_some_and(|v| v.enabled()))
+    }
+
+    pub fn object_locking(&self) -> bool {
+        self.lock_enabled || (self.versioning_config.as_ref().is_some_and(|v| v.enabled()))
+    }
 
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
@@ -276,6 +284,10 @@ impl BucketMetadata {
         }
 
         Ok(updated)
+    }
+
+    pub fn set_created(&mut self, created: OffsetDateTime) {
+        self.created = created
     }
 
     pub async fn save(&mut self, api: &ECStore) -> Result<()> {

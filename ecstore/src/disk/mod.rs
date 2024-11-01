@@ -19,7 +19,6 @@ use crate::{
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
     store_api::{FileInfo, RawFileInfo},
 };
-
 use endpoint::Endpoint;
 use futures::StreamExt;
 use protos::proto_gen::node_service::{
@@ -35,6 +34,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{service::interceptor::InterceptedService, transport::Channel, Request, Status, Streaming};
+use tracing::error;
 use tracing::info;
 use uuid::Uuid;
 
@@ -96,7 +96,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<Vec<Option<Error>>>;
     async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()>;
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
-    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) -> Result<()>;
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()>;
     async fn read_version(
         &self,
         org_volume: &str,
@@ -143,7 +143,7 @@ pub struct CheckPartsResp {
     pub results: Vec<usize>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct UpdateMetadataOpts {
     pub no_persistence: bool,
 }
@@ -597,7 +597,7 @@ pub struct VolumeInfo {
     pub created: Option<OffsetDateTime>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct ReadOptions {
     pub read_data: bool,
     pub healing: bool,
@@ -644,6 +644,7 @@ pub struct ReadOptions {
 pub enum FileWriter {
     Local(LocalFileWriter),
     Remote(RemoteFileWriter),
+    Buffer(Vec<u8>),
 }
 
 #[async_trait::async_trait]
@@ -656,6 +657,10 @@ impl Write for FileWriter {
         match self {
             Self::Local(local_file_writer) => local_file_writer.write(buf).await,
             Self::Remote(remote_file_writer) => remote_file_writer.write(buf).await,
+            Self::Buffer(buffer) => {
+                buffer.extend_from_slice(buf);
+                Ok(())
+            }
         }
     }
 }
@@ -773,6 +778,7 @@ impl Write for RemoteFileWriter {
 pub enum FileReader {
     Local(LocalFileReader),
     Remote(RemoteFileReader),
+    Buffer(Vec<u8>),
 }
 
 #[async_trait::async_trait]
@@ -781,6 +787,10 @@ impl ReadAt for FileReader {
         match self {
             Self::Local(local_file_writer) => local_file_writer.read_at(offset, length).await,
             Self::Remote(remote_file_writer) => remote_file_writer.read_at(offset, length).await,
+            Self::Buffer(buffer) => {
+                let s = &buffer[offset..offset + length];
+                Ok((s.to_vec(), s.len()))
+            }
         }
     }
 }

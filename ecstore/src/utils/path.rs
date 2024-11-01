@@ -4,6 +4,8 @@ const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
 pub const SLASH_SEPARATOR: &str = "/";
 
+pub const GLOBAL_DIR_SUFFIX_WITH_SLASH: &str = "__XLDIR__/";
+
 pub fn has_suffix(s: &str, suffix: &str) -> bool {
     if cfg!(target_os = "windows") {
         s.to_lowercase().ends_with(&suffix.to_lowercase())
@@ -18,6 +20,11 @@ pub fn encode_dir_object(object: &str) -> String {
     } else {
         object.to_string()
     }
+}
+
+pub fn is_dir_object(object: &str) -> bool {
+    let obj = encode_dir_object(object);
+    obj.ends_with(GLOBAL_DIR_SUFFIX)
 }
 
 #[allow(dead_code)]
@@ -54,7 +61,7 @@ pub fn has_profix(s: &str, prefix: &str) -> bool {
 
 pub fn path_join(elem: &[PathBuf]) -> PathBuf {
     let mut joined_path = PathBuf::new();
-    
+
     for path in elem {
         joined_path.push(path);
     }
