@@ -88,6 +88,32 @@ message DeleteResponse {
   optional string error_info = 2;
 }
 
+message VerifyFileRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+  string file_info = 4;
+}
+
+message VerifyFileResponse {
+  bool success = 1;
+  string check_parts_resp = 2;
+  optional string error_info = 3;
+}
+
+message CheckPartsRequest {
+  string disk = 1;  // indicate which one in the disks
+  string volume = 2;
+  string path = 3;
+  string file_info = 4;
+}
+
+message CheckPartsResponse {
+  bool success = 1;
+  string check_parts_resp = 2;
+  optional string error_info = 3;
+}
+
 message RenamePartRequst {
   string disk = 1;
   string src_volume = 2;
@@ -345,6 +371,17 @@ message DeleteVolumeResponse {
   optional string error_info = 2;
 }
 
+message DiskInfoRequest {
+  string disk = 1;
+  string opts = 2;
+}
+
+message DiskInfoResponse {
+  bool success = 1;
+  string disk_info = 2;
+  optional string error_info = 3;
+}
+
 // lock api have same argument type
 message GenerallyLockRequest {
     string args = 1;
@@ -370,6 +407,8 @@ service NodeService {
   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {};
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {};
   rpc Delete(DeleteRequest) returns (DeleteResponse) {};
+  rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {};
+  rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {};
   rpc RenamePart(RenamePartRequst) returns (RenamePartResponse) {};
   rpc RenameFile(RenameFileRequst) returns (RenameFileResponse) {};
   rpc Write(WriteRequest) returns (WriteResponse) {};
@@ -392,6 +431,7 @@ service NodeService {
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {};
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
+  rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {};
 
 /* -------------------------------lock service-------------------------- */
 

@@ -1,9 +1,11 @@
+use crate::bitrot::{close_bitrot_writers, BitrotReader, BitrotWriter};
 use crate::error::{Error, Result, StdError};
 use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
 use bytes::Bytes;
 use futures::future::join_all;
 use futures::{Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use std::any::Any;
 use std::fmt::Debug;
 use tokio::io::AsyncWriteExt;
 use tokio::io::DuplexStream;
@@ -14,13 +16,12 @@ use uuid::Uuid;
 
 use crate::chunk_stream::ChunkedStream;
 use crate::disk::error::DiskError;
-use crate::disk::{FileReader, FileWriter};
 
 pub struct Erasure {
     data_shards: usize,
     parity_shards: usize,
     encoder: Option<ReedSolomon>,
-    block_size: usize,
+    pub block_size: usize,
     _id: Uuid,
 }
 
@@ -47,7 +48,7 @@ impl Erasure {
     pub async fn encode<S>(
         &self,
         body: S,
-        writers: &mut [Option<FileWriter>],
+        writers: &mut [Option<BitrotWriter>],
         // block_size: usize,
         total_size: usize,
         write_quorum: usize,
@@ -110,6 +111,8 @@ impl Erasure {
 
         // debug!(" encode_data done shard block num {}", idx);
 
+        let _ = close_bitrot_writers(writers).await?;
+
         Ok(total)
 
         // loop {
@@ -123,7 +126,7 @@ impl Erasure {
     pub async fn decode(
         &self,
         writer: &mut DuplexStream,
-        readers: Vec<Option<FileReader>>,
+        readers: Vec<Option<BitrotReader>>,
         offset: usize,
         length: usize,
         total_length: usize,
@@ -301,7 +304,7 @@ impl Erasure {
     }
 
     // 算出每个分片大小
-    fn shard_size(&self, data_size: usize) -> usize {
+    pub fn shard_size(&self, data_size: usize) -> usize {
         (data_size + self.data_shards - 1) / self.data_shards
     }
     // returns final erasure size from original size.
@@ -321,21 +324,37 @@ impl Erasure {
         // }
         // num_shards * self.shard_size(self.block_size)
     }
+
+    pub fn shard_file_offset(&self, start_offset: usize, length: usize, total_length: usize) -> usize {
+        let shard_size = self.shard_size(self.block_size);
+        let shard_file_size = self.shard_file_size(total_length);
+        let end_shard = (start_offset + length) / self.block_size;
+        let mut till_offset = end_shard * shard_size + shard_size;
+        if till_offset > shard_file_size {
+            till_offset = shard_file_size;
+        }
+
+        till_offset
+    }
 }
 
 #[async_trait::async_trait]
 pub trait Write {
+    fn as_any(&self) -> &dyn Any;
     async fn write(&mut self, buf: &[u8]) -> Result<()>;
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
-pub trait ReadAt {
+pub trait ReadAt: Debug {
     async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)>;
 }
 
 #[derive(Debug)]
 pub struct ShardReader {
-    readers: Vec<Option<FileReader>>, // 磁盘
+    readers: Vec<Option<BitrotReader>>, // 磁盘
     data_block_count: usize,          // 总的分片数量
     parity_block_count: usize,
     shard_size: usize,      // 每个分片的块大小 一次读取一块
@@ -344,7 +363,7 @@ pub struct ShardReader {
 }
 
 impl ShardReader {
-    pub fn new(readers: Vec<Option<FileReader>>, ec: &Erasure, offset: usize, total_length: usize) -> Self {
+    pub fn new(readers: Vec<Option<BitrotReader>>, ec: &Erasure, offset: usize, total_length: usize) -> Self {
         Self {
             readers,
             data_block_count: ec.data_shards,
@@ -381,7 +400,7 @@ impl ShardReader {
                 continue;
             }
 
-            let disk: &mut FileReader = disk.as_mut().unwrap();
+            let disk: &mut BitrotReader = disk.as_mut().unwrap();
             futures.push(disk.read_at(self.offset, read_length));
         }
 

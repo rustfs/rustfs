@@ -12,17 +12,11 @@ use crate::{
     disk::{
         format::{DistributionAlgoVersion, FormatV3},
         DiskStore,
-    },
-    endpoints::PoolEndpoints,
-    error::{Error, Result},
-    global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
-    set_disk::SetDisks,
-    store_api::{
+    }, endpoints::PoolEndpoints, error::{Error, Result}, global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES}, heal::{heal_commands::{HealOpts, HealResultItem}, heal_ops::HealObjectFn}, set_disk::SetDisks, store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
         ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete,
         PartInfo, PutObjReader, StorageAPI,
-    },
-    utils::hash,
+    }, utils::hash
 };
 
 use tokio::time::Duration;
@@ -438,6 +432,24 @@ impl StorageAPI for Sets {
     }
 
     async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+        unimplemented!()
+    }
+    async fn heal_format(&self, dry_run: bool) -> Result<HealResultItem> {
+        unimplemented!()
+    }
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        unimplemented!()
+    }
+    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        self.get_disks_by_key(object).heal_object(bucket, object, version_id, opts).await
+    }
+    async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()> {
+        unimplemented!()
+    }
+    async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
+        unimplemented!()
+    }
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
         unimplemented!()
     }
 }

@@ -1,7 +1,10 @@
 use std::{error::Error, io::ErrorKind, pin::Pin};
 
 use ecstore::{
-    disk::{DeleteOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts, WalkDirOptions},
+    disk::{
+        DeleteOptions, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
+        WalkDirOptions,
+    },
     erasure::{ReadAt, Write},
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
@@ -13,17 +16,7 @@ use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{
-        node_service_server::NodeService as Node, DeleteBucketRequest, DeleteBucketResponse, DeletePathsRequest,
-        DeletePathsResponse, DeleteRequest, DeleteResponse, DeleteVersionRequest, DeleteVersionResponse, DeleteVersionsRequest,
-        DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse, GenerallyLockRequest, GenerallyLockResponse,
-        GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse,
-        ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse,
-        MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest,
-        ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest,
-        ReadXlResponse, RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, RenamePartRequst,
-        RenamePartResponse, StatVolumeRequest, StatVolumeResponse, UpdateMetadataRequest, UpdateMetadataResponse, WalkDirRequest,
-        WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest,
-        WriteResponse,
+        node_service_server::NodeService as Node, CheckPartsRequest, CheckPartsResponse, DeleteBucketRequest, DeleteBucketResponse, DeletePathsRequest, DeletePathsResponse, DeleteRequest, DeleteResponse, DeleteVersionRequest, DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse, DiskInfoRequest, DiskInfoResponse, GenerallyLockRequest, GenerallyLockResponse, GetBucketInfoRequest, GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse, StatVolumeRequest, StatVolumeResponse, UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest, VerifyFileResponse, WalkDirRequest, WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse
     },
 };
 use tokio::sync::mpsc;
@@ -298,6 +291,98 @@ impl Node for NodeService {
         } else {
             Ok(tonic::Response::new(DeleteResponse {
                 success: false,
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
+    async fn verify_file(&self, request: Request<VerifyFileRequest>) -> Result<Response<VerifyFileResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+                Ok(file_info) => file_info,
+                Err(_) => {
+                    return Ok(tonic::Response::new(VerifyFileResponse {
+                        success: false,
+                        check_parts_resp: "".to_string(),
+                        error_info: Some("can not decode FileInfo".to_string()),
+                    }));
+                }
+            };
+            match disk.verify_file(&request.volume, &request.path, &file_info).await {
+                Ok(check_parts_resp) => {
+                    let check_parts_resp = match serde_json::to_string(&check_parts_resp) {
+                        Ok(check_parts_resp) => check_parts_resp,
+                        Err(_) => {
+                            return Ok(tonic::Response::new(VerifyFileResponse {
+                                success: false,
+                                check_parts_resp: String::new(),
+                                error_info: Some("can not encode RenameDataResp".to_string()),
+                            }));
+                        }
+                    };
+                    Ok(tonic::Response::new(VerifyFileResponse {
+                        success: true,
+                        check_parts_resp,
+                        error_info: None,
+                    }))
+                },
+                Err(err) => Ok(tonic::Response::new(VerifyFileResponse {
+                    success: false,
+                    check_parts_resp: "".to_string(),
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(VerifyFileResponse {
+                success: false,
+                check_parts_resp: "".to_string(),
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
+    async fn check_parts(&self, request: Request<CheckPartsRequest>) -> Result<Response<CheckPartsResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+                Ok(file_info) => file_info,
+                Err(_) => {
+                    return Ok(tonic::Response::new(CheckPartsResponse {
+                        success: false,
+                        check_parts_resp: "".to_string(),
+                        error_info: Some("can not decode FileInfo".to_string()),
+                    }));
+                }
+            };
+            match disk.verify_file(&request.volume, &request.path, &file_info).await {
+                Ok(check_parts_resp) => {
+                    let check_parts_resp = match serde_json::to_string(&check_parts_resp) {
+                        Ok(check_parts_resp) => check_parts_resp,
+                        Err(_) => {
+                            return Ok(tonic::Response::new(CheckPartsResponse {
+                                success: false,
+                                check_parts_resp: String::new(),
+                                error_info: Some("can not encode RenameDataResp".to_string()),
+                            }));
+                        }
+                    };
+                    Ok(tonic::Response::new(CheckPartsResponse {
+                        success: true,
+                        check_parts_resp,
+                        error_info: None,
+                    }))
+                },
+                Err(err) => Ok(tonic::Response::new(CheckPartsResponse {
+                    success: false,
+                    check_parts_resp: "".to_string(),
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(CheckPartsResponse {
+                success: false,
+                check_parts_resp: "".to_string(),
                 error_info: Some("can not find disk".to_string()),
             }))
         }
@@ -1120,6 +1205,47 @@ impl Node for NodeService {
         } else {
             Ok(tonic::Response::new(DeleteVolumeResponse {
                 success: false,
+                error_info: Some("can not find disk".to_string()),
+            }))
+        }
+    }
+
+    async fn disk_info(&self, request: Request<DiskInfoRequest>) -> Result<Response<DiskInfoResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let opts = match serde_json::from_str::<DiskInfoOptions>(&request.opts) {
+                Ok(opts) => opts,
+                Err(_) => {
+                    return Ok(tonic::Response::new(DiskInfoResponse {
+                        success: false,
+                        disk_info: "".to_string(),
+                        error_info: Some("can not decode DiskInfoOptions".to_string()),
+                    }));
+                }
+            };
+            match disk.disk_info(&opts).await {
+                Ok(disk_info) => match serde_json::to_string(&disk_info) {
+                    Ok(disk_info) => Ok(tonic::Response::new(DiskInfoResponse {
+                        success: true,
+                        disk_info,
+                        error_info: None,
+                    })),
+                    Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
+                        success: false,
+                        disk_info: "".to_string(),
+                        error_info: Some(err.to_string()),
+                    })),
+                },
+                Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
+                    success: false,
+                    disk_info: "".to_string(),
+                    error_info: Some(err.to_string()),
+                })),
+            }
+        } else {
+            Ok(tonic::Response::new(DiskInfoResponse {
+                success: false,
+                disk_info: "".to_string(),
                 error_info: Some("can not find disk".to_string()),
             }))
         }
