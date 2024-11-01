@@ -1,3 +1,4 @@
+use crate::config::{storageclass, KVS};
 use crate::{
     disk::{
         error::DiskError,
@@ -281,6 +282,11 @@ async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -
     disk.set_disk_id(Some(format.erasure.this)).await?;
 
     Ok(())
+}
+
+pub fn ec_drives_no_config(set_drive_count: usize) -> Result<usize> {
+    let sc = storageclass::lookup_config(&KVS::new(), set_drive_count)?;
+    Ok(sc.get_parity_for_sc(storageclass::STANDARD).unwrap_or_default())
 }
 
 #[derive(Debug, thiserror::Error)]

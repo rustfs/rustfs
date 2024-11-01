@@ -6,9 +6,10 @@ mod unix;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::get_info;
-pub use linux::same_disk;
+pub use linux::{get_info, same_disk};
+// pub use linux::same_disk;
+
 #[cfg(all(unix, not(target_os = "linux")))]
-pub use unix::get_info;
+pub use unix::{get_info, same_disk};
 #[cfg(target_os = "windows")]
-pub use windows::get_info;
+pub use windows::{get_info, same_disk};

@@ -1,4 +1,6 @@
-use super::error::{is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files, os_is_not_exist, os_is_permission};
+use super::error::{
+    is_err_file_not_found, is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files, os_is_not_exist, os_is_permission,
+};
 use super::os::is_root_disk;
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
@@ -16,17 +18,21 @@ use crate::disk::os::check_path_length;
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
-use crate::set_disk::{conv_part_err_to_int, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN, CHECK_PART_VOLUME_NOT_FOUND};
+use crate::set_disk::{
+    conv_part_err_to_int, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
+    CHECK_PART_VOLUME_NOT_FOUND,
+};
 use crate::store_api::BitrotAlgorithm;
 use crate::utils::fs::{access, lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::os::get_info;
-use crate::utils::path::{clean, has_suffix, SLASH_SEPARATOR};
+use crate::utils::path::{clean, has_suffix, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
 use path_absolutize::Absolutize;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::os::unix::fs::MetadataExt;
@@ -411,7 +417,7 @@ impl LocalDisk {
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
 
-        let mut f = utils::fs::open_file(file_path, O_RDONLY).await?;
+        let mut f = utils::fs::open_file(file_path.as_ref(), O_RDONLY).await?;
 
         let meta = f.metadata().await?;
 
@@ -682,7 +688,7 @@ pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Vec<u8>, Option
     let (data, meta) = match read_file_all(&p).await {
         Ok((data, meta)) => (data, Some(meta)),
         Err(e) => {
-            if DiskError::FileNotFound.is(&e) {
+            if is_err_file_not_found(&e) {
                 (Vec::new(), None)
             } else {
                 return Err(e);
@@ -939,7 +945,7 @@ impl DiskAPI for LocalDisk {
                     }
 
                     resp.results[i] = CHECK_PART_SUCCESS;
-                },
+                }
                 Err(err) => {
                     match os_err_to_file_err(err).downcast_ref() {
                         Some(DiskError::FileNotFound) => {
@@ -949,20 +955,20 @@ impl DiskAPI for LocalDisk {
                                         ErrorKind::NotFound => {
                                             resp.results[i] = CHECK_PART_VOLUME_NOT_FOUND;
                                             continue;
-                                        },
-                                        _ => {},
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
                             resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
-                        },
-                        _ => {},
+                        }
+                        _ => {}
                     }
                     continue;
                 }
             }
         }
-        
+
         Ok(resp)
     }
 
@@ -1229,7 +1235,7 @@ impl DiskAPI for LocalDisk {
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
             Err(e) => {
-                if DiskError::FileNotFound.is(&e) && !skip_access_checks(volume) {
+                if is_err_file_not_found(&e) && !skip_access_checks(volume) {
                     if let Err(e) = utils::fs::access(&volume_dir).await {
                         return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
                     }
@@ -1246,12 +1252,12 @@ impl DiskAPI for LocalDisk {
         let mut entries = match self.list_dir("", &opts.bucket, &opts.base_dir, -1).await {
             Ok(res) => res,
             Err(e) => {
-                if !DiskError::VolumeNotFound.is(&e) && !DiskError::FileNotFound.is(&e) {
+                if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
                     error!("list_dir err {:?}", &e);
                 }
 
-                if opts.report_notfound && DiskError::FileNotFound.is(&e) {
-                    return Err(Error::new(DiskError::FileNotFound));
+                if opts.report_notfound && is_err_file_not_found(&e) {
+                    return Err(e);
                 }
                 return Ok(Vec::new());
             }
@@ -1270,6 +1276,8 @@ impl DiskAPI for LocalDisk {
 
         let mut metas = Vec::new();
 
+        let mut dir_objes = HashSet::new();
+
         // 第一层过滤
         for entry in entries.iter() {
             // check limit
@@ -1283,14 +1291,24 @@ impl DiskAPI for LocalDisk {
 
             // warn!("walk_dir entry {}", entry);
 
-            let mut meta = MetaCacheEntry {
-                name: entry.clone(),
-                ..Default::default()
-            };
+            let mut meta = MetaCacheEntry { ..Default::default() };
 
-            let fpath = self.get_object_path(bucket, format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE).as_str())?;
+            let fpath = self.get_object_path(bucket, format!("{}/{}", &entry, STORAGE_FORMAT_FILE).as_str())?;
 
-            meta.metadata = self.read_metadata(&fpath).await.unwrap_or_default();
+            if let Ok(data) = self.read_metadata(&fpath).await {
+                meta.metadata = data;
+            }
+
+            let mut name = entry.clone();
+            if name.ends_with(SLASH_SEPARATOR) {
+                if name.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
+                    name = format!("{}{}", name.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
+                    dir_objes.insert(name.clone());
+                } else {
+                    name = name.as_str().trim_end_matches(SLASH_SEPARATOR).to_owned();
+                }
+            }
+            meta.name = name;
 
             metas.push(meta);
         }
@@ -1535,7 +1553,7 @@ impl DiskAPI for LocalDisk {
         let mut volumes = Vec::new();
 
         let entries = os::read_dir(&self.root, -1).await.map_err(|e| {
-            if DiskError::FileAccessDenied.is(&e) || DiskError::FileNotFound.is(&e) {
+            if DiskError::FileAccessDenied.is(&e) || is_err_file_not_found(&e) {
                 Error::new(DiskError::DiskAccessDenied)
             } else {
                 e
@@ -1543,7 +1561,7 @@ impl DiskAPI for LocalDisk {
         })?;
 
         for entry in entries {
-            if !utils::path::has_suffix(&entry, SLASH_SEPARATOR) || !Self::is_valid_volname(&entry) {
+            if !utils::path::has_suffix(&entry, SLASH_SEPARATOR) || !Self::is_valid_volname(utils::path::clean(&entry).as_str()) {
                 continue;
             }
 
@@ -1600,7 +1618,7 @@ impl DiskAPI for LocalDisk {
 
         Ok(())
     }
-    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) -> Result<()> {
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         if fi.metadata.is_some() {
             let volume_dir = self.get_bucket_path(volume)?;
             let file_path = volume_dir.join(Path::new(&path));
@@ -1611,7 +1629,7 @@ impl DiskAPI for LocalDisk {
                 .read_all(volume, format!("{}/{}", &path, super::STORAGE_FORMAT_FILE).as_str())
                 .await
                 .map_err(|e| {
-                    if DiskError::FileNotFound.is(&e) && fi.version_id.is_some() {
+                    if is_err_file_not_found(&e) && fi.version_id.is_some() {
                         Error::new(DiskError::FileVersionNotFound)
                     } else {
                         e
@@ -1665,6 +1683,7 @@ impl DiskAPI for LocalDisk {
         return Ok(());
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn read_version(
         &self,
         _org_volume: &str,
@@ -1683,7 +1702,7 @@ impl DiskAPI for LocalDisk {
         let mut meta = FileMeta::default();
         meta.unmarshal_msg(&data)?;
 
-        let fi = meta.into_fileinfo(volume, path, version_id, false, true)?;
+        let fi = meta.into_fileinfo(volume, path, version_id, read_data, true)?;
         Ok(fi)
     }
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
@@ -1770,7 +1789,7 @@ impl DiskAPI for LocalDisk {
                     }
                 }
                 Err(e) => {
-                    if !(DiskError::FileNotFound.is(&e) || DiskError::VolumeNotFound.is(&e)) {
+                    if !(is_err_file_not_found(&e) || DiskError::VolumeNotFound.is(&e)) {
                         res.exists = true;
                         res.error = e.to_string();
                     }
@@ -1827,7 +1846,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
 
-    let disk_info = get_info(&drive_path, false)?;
+    let disk_info = get_info(&drive_path)?;
     let root_drive = if !*GLOBAL_IsErasureSD.read().await {
         let root_disk_threshold = *GLOBAL_RootDiskThreshold.read().await;
         if root_disk_threshold > 0 {

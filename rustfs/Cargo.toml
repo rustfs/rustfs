@@ -41,6 +41,7 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
 ] }
+lazy_static.workspace = true
 tokio-stream.workspace = true
 tonic = { version = "0.12.3", features = ["gzip"] }
 tonic-reflection.workspace = true

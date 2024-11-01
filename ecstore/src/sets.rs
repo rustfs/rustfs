@@ -12,11 +12,21 @@ use crate::{
     disk::{
         format::{DistributionAlgoVersion, FormatV3},
         DiskStore,
-    }, endpoints::PoolEndpoints, error::{Error, Result}, global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES}, heal::{heal_commands::{HealOpts, HealResultItem}, heal_ops::HealObjectFn}, set_disk::SetDisks, store_api::{
+    },
+    endpoints::PoolEndpoints,
+    error::{Error, Result},
+    global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
+    heal::{
+        heal_commands::{HealOpts, HealResultItem},
+        heal_ops::HealObjectFn,
+    },
+    set_disk::SetDisks,
+    store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete,
-        PartInfo, PutObjReader, StorageAPI,
-    }, utils::hash
+        ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOptions,
+        ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+    },
+    utils::hash,
 };
 
 use tokio::time::Duration;
@@ -153,6 +163,9 @@ impl Sets {
         Ok(sets)
     }
 
+    pub fn set_drive_count(&self) -> usize {
+        self.set_drive_count
+    }
     pub async fn monitor_and_connect_endpoints(&self) {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -266,7 +279,7 @@ impl ObjectIO for Sets {
             .get_object_reader(bucket, object, range, h, opts)
             .await
     }
-    async fn put_object(&self, bucket: &str, object: &str, data: PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).put_object(bucket, object, data, opts).await
     }
 }
@@ -390,26 +403,61 @@ impl StorageAPI for Sets {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
     }
 
-    async fn put_object_info(&self, bucket: &str, object: &str, info: ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
+        self.get_disks_by_key(object).get_object_tags(bucket, object, opts).await
+    }
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object)
-            .put_object_info(bucket, object, info, opts)
+            .put_object_tags(bucket, object, tags, opts)
             .await
     }
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).delete_object_tags(bucket, object, opts).await
+    }
 
+    async fn copy_object_part(
+        &self,
+        _src_bucket: &str,
+        _src_object: &str,
+        _dst_bucket: &str,
+        _dst_object: &str,
+        _upload_id: &str,
+        _part_id: usize,
+        _start_offset: i64,
+        _length: i64,
+        _src_info: &ObjectInfo,
+        _src_opts: &ObjectOptions,
+        _dst_opts: &ObjectOptions,
+    ) -> Result<()> {
+        unimplemented!()
+    }
     async fn put_object_part(
         &self,
         bucket: &str,
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: PutObjReader,
+        data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         self.get_disks_by_key(object)
             .put_object_part(bucket, object, upload_id, part_id, data, opts)
             .await
     }
-
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: &str,
+        upload_id_marker: &str,
+        delimiter: &str,
+        max_uploads: usize,
+    ) -> Result<ListMultipartsInfo> {
+        self.get_disks_by_key(&prefix)
+            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
+            .await
+    }
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
     }
@@ -430,6 +478,13 @@ impl StorageAPI for Sets {
             .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
             .await
     }
+    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+        unimplemented!()
+    }
+
+    fn set_drive_counts(&self) -> Vec<usize> {
+        unimplemented!()
+    }
 
     async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
@@ -441,7 +496,9 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
     async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<HealResultItem> {
-        self.get_disks_by_key(object).heal_object(bucket, object, version_id, opts).await
+        self.get_disks_by_key(object)
+            .heal_object(bucket, object, version_id, opts)
+            .await
     }
     async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()> {
         unimplemented!()

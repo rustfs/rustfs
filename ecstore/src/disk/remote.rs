@@ -4,7 +4,10 @@ use futures::lock::Mutex;
 use protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
-        CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequst, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest
+        CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
+        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
+        ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequst, StatVolumeRequest,
+        UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
 use tonic::Request;
@@ -12,7 +15,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::{
-    endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions
+    endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
+    FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader,
+    RemoteFileWriter, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::{
     disk::error::DiskError,
@@ -110,7 +115,7 @@ impl DiskAPI for RemoteDisk {
         info!("read_all success");
 
         if !response.success {
-            return Err(DiskError::FileNotFound.into());
+            return Err(Error::new(DiskError::FileNotFound));
         }
 
         Ok(response.data)
@@ -479,7 +484,7 @@ impl DiskAPI for RemoteDisk {
 
         Ok(())
     }
-    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: UpdateMetadataOpts) -> Result<()> {
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         info!("update_metadata");
         let file_info = serde_json::to_string(&fi)?;
         let opts = serde_json::to_string(&opts)?;

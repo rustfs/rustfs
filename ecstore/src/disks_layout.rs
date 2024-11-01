@@ -411,8 +411,8 @@ fn get_set_indexes<T: AsRef<str>>(
 
             if !has_set_drive_count {
                 return Err(Error::from_string(format!(
-                    "Invalid set drive count. Acceptable values for {:?} number drives are {:?}",
-                    common_size, &set_counts
+                    "Invalid set drive count {}. Acceptable values for {:?} number drives are {:?}",
+                    set_drive_count, common_size, &set_counts
                 )));
             }
             set_drive_count

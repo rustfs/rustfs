@@ -1,7 +1,7 @@
 pub mod bitrot;
 pub mod cache_value;
 mod chunk_stream;
-mod config;
+pub mod config;
 pub mod disk;
 pub mod disks_layout;
 pub mod endpoints;
@@ -14,13 +14,16 @@ pub mod peer;
 mod quorum;
 pub mod set_disk;
 mod sets;
-mod storage_class;
 pub mod store;
 pub mod store_api;
 mod store_init;
 mod utils;
 
 pub mod bucket;
+pub mod file_meta_inline;
+pub mod options;
+pub(crate) mod store_err;
+pub mod xhttp;
 
 pub use global::is_legacy;
 pub use global::new_object_layer_fn;

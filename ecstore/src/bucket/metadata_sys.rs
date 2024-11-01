@@ -15,12 +15,12 @@ use s3s::dto::{
     BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
     ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
-use s3s_policy::model::Policy;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tracing::{error, warn};
 
 use super::metadata::{deserialize, load_bucket_metadata, BucketMetadata};
+use super::policy::bucket_policy::BucketPolicy;
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
 
@@ -42,6 +42,11 @@ pub(super) async fn get_bucket_metadata_sys() -> Arc<RwLock<BucketMetadataSys>> 
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) {
     let sys = GLOBAL_BucketMetadataSys.write().await;
     sys.set(bucket, Arc::new(bm)).await
+}
+
+pub(crate) async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
+    let sys = GLOBAL_BucketMetadataSys.write().await;
+    sys.get(bucket).await
 }
 
 pub async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
@@ -112,6 +117,13 @@ pub async fn get_config_from_disk(bucket: &str) -> Result<BucketMetadata> {
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_config_from_disk(bucket).await
+}
+
+pub async fn created_at(bucket: &str) -> Result<OffsetDateTime> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.created_at(bucket).await
 }
 
 #[derive(Debug, Default)]
@@ -373,7 +385,7 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(Policy, OffsetDateTime)> {
+    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {

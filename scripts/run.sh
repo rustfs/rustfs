@@ -7,12 +7,15 @@ mkdir -p ./target/volume/test{0..4}
 
 
 if [ -z "$RUST_LOG" ]; then
-    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug"
+    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,reader=debug"
 fi
 
-export RUSTFS_ERASURE_SET_DRIVE_COUNT=8
+# export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
 
-DATA_DIR_ARG="./target/volume/test{0...15}"
+export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
+
+# DATA_DIR_ARG="./target/volume/test{0...4}"
+DATA_DIR_ARG="./target/volume/test"
 
 if [ -n "$1" ]; then
 	DATA_DIR_ARG="$1"
@@ -26,5 +29,5 @@ fi
     # --domain-name   127.0.0.1:9010  \
     # "$DATA_DIR_ARG"
 
-# cargo run "$DATA_DIR_ARG"
-cargo run ./target/volume/test
+cargo run "$DATA_DIR_ARG"
+# cargo run ./target/volume/test

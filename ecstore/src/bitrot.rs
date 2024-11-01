@@ -1,24 +1,23 @@
-use std::{
-    any::Any,
-    collections::HashMap,
-    io::{Cursor, Read},
-};
-
-use blake2::Blake2b512;
-use highway::{HighwayHash, HighwayHasher, Key};
-use lazy_static::lazy_static;
-use sha2::{digest::core_api::BlockSizeUser, Digest, Sha256};
-use tokio::{
-    spawn,
-    sync::mpsc::{self, Sender},
-    task::JoinHandle,
-};
-
 use crate::{
     disk::{error::DiskError, DiskStore},
     erasure::{ReadAt, Write},
     error::{Error, Result},
     store_api::BitrotAlgorithm,
+};
+use blake2::Blake2b512;
+use blake2::Digest as _;
+use highway::{HighwayHash, HighwayHasher, Key};
+use lazy_static::lazy_static;
+use sha2::{digest::core_api::BlockSizeUser, Digest, Sha256};
+use std::{
+    any::Any,
+    collections::HashMap,
+    io::{Cursor, Read},
+};
+use tokio::{
+    spawn,
+    sync::mpsc::{self, Sender},
+    task::JoinHandle,
 };
 
 lazy_static! {
@@ -84,7 +83,7 @@ impl Hasher {
         match self {
             Hasher::SHA256(_) => Sha256::block_size(),
             Hasher::HighwayHash256(_) => 64,
-            Hasher::BLAKE2b512(_) => Blake2b512::block_size(),
+            Hasher::BLAKE2b512(_) => 64,
         }
     }
 
@@ -485,7 +484,10 @@ mod test {
     use tempfile::TempDir;
 
     use crate::{
-        bitrot::{new_bitrot_writer, BITROT_ALGORITHMS}, disk::{endpoint::Endpoint, error::DiskError, new_disk, DiskOption}, error::{Error, Result}, store_api::BitrotAlgorithm
+        bitrot::{new_bitrot_writer, BITROT_ALGORITHMS},
+        disk::{endpoint::Endpoint, error::DiskError, new_disk, DiskOption},
+        error::{Error, Result},
+        store_api::BitrotAlgorithm,
     };
 
     use super::{bitrot_writer_sum, new_bitrot_reader};

@@ -1,13 +1,34 @@
+use std::collections::HashSet;
+
+use super::error::ConfigError;
+use super::{storageclass, Config, GLOBAL_StorageClass, KVS};
+use crate::config::error::is_not_found;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::store::ECStore;
-use crate::store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_err::is_err_object_not_found;
+use crate::utils::path::SLASH_SEPARATOR;
 use http::HeaderMap;
+use lazy_static::lazy_static;
 use s3s::dto::StreamingBlob;
 use s3s::Body;
+use tracing::error;
 
-use super::error::ConfigError;
+const CONFIG_PREFIX: &str = "config";
+const CONFIG_FILE: &str = "config.json";
 
+pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
+pub const DEFAULT_KV_KEY: &str = "_";
+
+lazy_static! {
+    static ref CONFIG_BUCKET: String = format!("{}{}{}", RUSTFS_META_BUCKET, SLASH_SEPARATOR, CONFIG_PREFIX);
+    static ref SubSystemsDynamic: HashSet<String> = {
+        let mut h = HashSet::new();
+        h.insert(STORAGE_CLASS_SUB_SYS.to_owned());
+        h
+    };
+}
 pub async fn read_config(api: &ECStore, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
 
@@ -17,7 +38,16 @@ pub async fn read_config(api: &ECStore, file: &str) -> Result<Vec<u8>> {
 async fn read_config_with_metadata(api: &ECStore, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)> {
     let range = HTTPRangeSpec::nil();
     let h = HeaderMap::new();
-    let mut rd = api.get_object_reader(RUSTFS_META_BUCKET, file, range, h, opts).await?;
+    let mut rd = api
+        .get_object_reader(RUSTFS_META_BUCKET, file, range, h, opts)
+        .await
+        .map_err(|err| {
+            if is_err_object_not_found(&err) {
+                Error::new(ConfigError::NotFound)
+            } else {
+                err
+            }
+        })?;
 
     let data = rd.read_all().await?;
 
@@ -46,9 +76,120 @@ async fn save_config_with_opts(api: &ECStore, file: &str, data: &[u8], opts: &Ob
         .put_object(
             RUSTFS_META_BUCKET,
             file,
-            PutObjReader::new(StreamingBlob::from(Body::from(data.to_vec())), data.len()),
+            &mut PutObjReader::new(StreamingBlob::from(Body::from(data.to_vec())), data.len()),
             opts,
         )
         .await?;
+    Ok(())
+}
+
+fn new_server_config() -> Config {
+    Config::new()
+}
+
+async fn new_and_save_server_config(api: &ECStore) -> Result<Config> {
+    let mut cfg = new_server_config();
+    lookup_configs(&mut cfg, api).await;
+    save_server_config(api, &cfg).await?;
+
+    Ok(cfg)
+}
+
+pub async fn read_config_without_migrate(api: &ECStore) -> Result<Config> {
+    let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
+    let data = match read_config(api, config_file.as_str()).await {
+        Ok(res) => res,
+        Err(err) => {
+            if is_not_found(&err) {
+                let cfg = new_and_save_server_config(api).await?;
+                return Ok(cfg);
+            } else {
+                return Err(err);
+            }
+        }
+    };
+
+    read_server_config(api, data.as_slice()).await
+}
+
+async fn read_server_config(api: &ECStore, data: &[u8]) -> Result<Config> {
+    let cfg = {
+        if data.is_empty() {
+            let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
+            let cfg_data = match read_config(api, config_file.as_str()).await {
+                Ok(res) => res,
+                Err(err) => {
+                    if is_not_found(&err) {
+                        let cfg = new_and_save_server_config(api).await?;
+                        return Ok(cfg);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
+            // TODO: decrypt
+
+            Config::unmarshal(cfg_data.as_slice())?
+        } else {
+            Config::unmarshal(data)?
+        }
+    };
+
+    Ok(cfg.merge())
+}
+
+async fn save_server_config(api: &ECStore, cfg: &Config) -> Result<()> {
+    let data = cfg.marshal()?;
+
+    let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
+
+    save_config(api, &config_file, data.as_slice()).await
+}
+
+pub async fn lookup_configs(cfg: &mut Config, api: &ECStore) {
+    // TODO: from etcd
+    if let Err(err) = apply_dynamic_config(cfg, api).await {
+        error!("apply_dynamic_config err {:?}", &err);
+    }
+}
+
+async fn apply_dynamic_config(cfg: &mut Config, api: &ECStore) -> Result<()> {
+    for key in SubSystemsDynamic.iter() {
+        apply_dynamic_config_for_sub_sys(cfg, api, key).await?;
+    }
+
+    Ok(())
+}
+
+async fn apply_dynamic_config_for_sub_sys(cfg: &mut Config, api: &ECStore, subsys: &String) -> Result<()> {
+    let set_drive_counts = api.set_drive_counts();
+    match subsys.as_str() {
+        STORAGE_CLASS_SUB_SYS => {
+            let kvs = match cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY) {
+                Some(res) => res,
+                None => KVS::new(),
+            };
+
+            for (i, count) in set_drive_counts.iter().enumerate() {
+                match storageclass::lookup_config(&kvs, *count) {
+                    Ok(res) => {
+                        if i == 0 {
+                            if GLOBAL_StorageClass.get().is_none() {
+                                if let Err(r) = GLOBAL_StorageClass.set(res) {
+                                    error!("GLOBAL_StorageClass.set failed {:?}", r);
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        error!("init storageclass err:{:?}", &err);
+                        break;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
     Ok(())
 }

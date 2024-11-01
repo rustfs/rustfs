@@ -9,19 +9,19 @@ use transform_stream::AsyncTryStream;
 
 pub type SyncBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 
-pub struct ChunkedStream {
+pub struct ChunkedStream<'a> {
     /// inner
-    inner: AsyncTryStream<Bytes, StdError, SyncBoxFuture<'static, Result<(), StdError>>>,
+    inner: AsyncTryStream<Bytes, StdError, SyncBoxFuture<'a, Result<(), StdError>>>,
 
     remaining_length: usize,
 }
 
-impl ChunkedStream {
+impl<'a> ChunkedStream<'a> {
     pub fn new<S>(body: S, content_length: usize, chunk_size: usize, need_padding: bool) -> Self
     where
-        S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static,
+        S: Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'a,
     {
-        let inner = AsyncTryStream::<_, _, SyncBoxFuture<'static, Result<(), StdError>>>::new(|mut y| {
+        let inner = AsyncTryStream::<_, _, SyncBoxFuture<'a, Result<(), StdError>>>::new(|mut y| {
             #[allow(clippy::shadow_same)] // necessary for `pin_mut!`
             Box::pin(async move {
                 pin_mut!(body);
@@ -97,7 +97,7 @@ impl ChunkedStream {
         data_size: usize,
     ) -> Option<Result<(Vec<Bytes>, Bytes), StdError>>
     where
-        S: Stream<Item = Result<Bytes, StdError>> + Send + 'static,
+        S: Stream<Item = Result<Bytes, StdError>> + Send,
     {
         let mut bytes_buffer = Vec::new();
 
@@ -206,7 +206,7 @@ impl ChunkedStream {
     // }
 }
 
-impl Stream for ChunkedStream {
+impl Stream for ChunkedStream<'_> {
     type Item = Result<Bytes, StdError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

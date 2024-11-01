@@ -243,8 +243,11 @@ impl<'de> Deserialize<'de> for Functions {
     {
         // Instantiate our Visitor and ask the Deserializer to drive
         // it over the input data, resulting in an instance of MyMap.
-        let _map = deserializer.deserialize_map(MyMapVisitor::new())?;
+        let map = deserializer.deserialize_map(MyMapVisitor::new())?;
 
+        for (key, vals) in map.iter() {
+            println!("functions key {}, vals {:?}", key, vals);
+        }
         // TODO: FIXME: create functions from name
 
         Ok(Functions(Vec::new()))
