@@ -961,31 +961,34 @@ impl RemoteFileReader {
 #[async_trait::async_trait]
 impl Reader for RemoteFileReader {
     async fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        unimplemented!()
-        // let request = ReadAtRequest {
-        //     disk: self.root.to_string_lossy().to_string(),
-        //     volume: self.volume.to_string(),
-        //     path: self.path.to_string(),
-        //     offset: offset.try_into().unwrap(),
-        //     length: length.try_into().unwrap(),
-        // };
-        // self.tx.send(request).await?;
+        let request = ReadAtRequest {
+            disk: self.root.to_string_lossy().to_string(),
+            volume: self.volume.to_string(),
+            path: self.path.to_string(),
+            offset: offset.try_into().unwrap(),
+            // length: length.try_into().unwrap(),
+            length: 0,
+        };
+        self.tx.send(request).await?;
 
-        // if let Some(resp) = self.resp_stream.next().await {
-        //     let resp = resp?;
-        //     if resp.success {
-        //         info!("read at stream success");
-        //         Ok((resp.data, resp.read_size.try_into().unwrap()))
-        //     } else {
-        //         let error_info = resp.error_info.unwrap_or("".to_string());
-        //         info!("read at stream failed: {}", error_info);
-        //         Err(Error::from_string(error_info))
-        //     }
-        // } else {
-        //     let error_info = "can not get response";
-        //     info!("read at stream failed: {}", error_info);
-        //     Err(Error::from_string(error_info))
-        // }
+        if let Some(resp) = self.resp_stream.next().await {
+            let resp = resp?;
+            if resp.success {
+                info!("read at stream success");
+
+                buf.copy_from_slice(&resp.data);
+
+                Ok(resp.read_size.try_into().unwrap())
+            } else {
+                let error_info = resp.error_info.unwrap_or("".to_string());
+                info!("read at stream failed: {}", error_info);
+                Err(Error::from_string(error_info))
+            }
+        } else {
+            let error_info = "can not get response";
+            info!("read at stream failed: {}", error_info);
+            Err(Error::from_string(error_info))
+        }
     }
     async fn seek(&mut self, offset: usize) -> Result<()> {
         unimplemented!()
