@@ -2,7 +2,7 @@ use std::{error::Error, io::ErrorKind, pin::Pin};
 
 use ecstore::{
     disk::{
-        DeleteOptions, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
+        DeleteOptions, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, Reader, UpdateMetadataOpts,
         WalkDirOptions,
     },
     erasure::{ReadAt, Write},
@@ -624,13 +624,15 @@ impl Node for NodeService {
                             }
                         };
 
+                        let mut data = vec![0u8; v.length.try_into().unwrap()];
+
                         match file_ref
                             .as_mut()
                             .unwrap()
-                            .read_at(v.offset.try_into().unwrap(), v.length.try_into().unwrap())
+                            .read_at(v.offset.try_into().unwrap(), &mut data)
                             .await
                         {
-                            Ok((data, read_size)) => tx.send(Ok(ReadAtResponse {
+                            Ok(read_size) => tx.send(Ok(ReadAtResponse {
                                 success: true,
                                 data,
                                 read_size: read_size.try_into().unwrap(),
