@@ -644,7 +644,7 @@ pub struct ReadOptions {
 pub enum FileWriter {
     Local(LocalFileWriter),
     Remote(RemoteFileWriter),
-    Buffer(Vec<u8>),
+    Buffer(BufferWriter),
 }
 
 #[async_trait::async_trait]
@@ -655,15 +655,41 @@ impl Write for FileWriter {
 
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         match self {
-            Self::Local(local_file_writer) => local_file_writer.write(buf).await,
-            Self::Remote(remote_file_writer) => remote_file_writer.write(buf).await,
-            Self::Buffer(buffer) => {
-                buffer.extend_from_slice(buf);
-                Ok(())
-            }
+            Self::Local(writer) => writer.write(buf).await,
+            Self::Remote(writter) => writter.write(buf).await,
+            Self::Buffer(writer) => writer.write(buf).await,
         }
     }
 }
+
+#[derive(Debug)]
+pub struct BufferWriter {
+    pub inner: Vec<u8>,
+}
+
+impl BufferWriter {
+    pub fn new(inner: Vec<u8>) -> Self {
+        Self { inner }
+    }
+    pub fn as_ref(&self) -> &[u8] {
+        self.inner.as_ref()
+    }
+}
+
+#[async_trait::async_trait]
+impl Write for BufferWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> Result<()> {
+        let _ = self.inner.write(buf).await?;
+        self.inner.flush().await?;
+
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalFileWriter {
     pub inner: File,
@@ -778,20 +804,36 @@ impl Write for RemoteFileWriter {
 pub enum FileReader {
     Local(LocalFileReader),
     Remote(RemoteFileReader),
-    Buffer(Vec<u8>),
+    Buffer(BufferReader),
 }
 
 #[async_trait::async_trait]
 impl ReadAt for FileReader {
     async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
         match self {
-            Self::Local(local_file_writer) => local_file_writer.read_at(offset, length).await,
-            Self::Remote(remote_file_writer) => remote_file_writer.read_at(offset, length).await,
-            Self::Buffer(buffer) => {
-                let s = &buffer[offset..offset + length];
-                Ok((s.to_vec(), s.len()))
-            }
+            Self::Local(reader) => reader.read_at(offset, length).await,
+            Self::Remote(reader) => reader.read_at(offset, length).await,
+            Self::Buffer(reader) => reader.read_at(offset, length).await,
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct BufferReader {
+    pub inner: Vec<u8>,
+}
+
+impl BufferReader {
+    pub fn new(inner: Vec<u8>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl ReadAt for BufferReader {
+    async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
+        let s = &self.inner[offset..offset + length];
+        Ok((s.to_vec(), s.len()))
     }
 }
 

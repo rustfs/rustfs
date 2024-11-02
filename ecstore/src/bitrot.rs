@@ -1,11 +1,12 @@
 use crate::{
-    disk::{error::DiskError, DiskStore},
+    disk::{error::DiskError, DiskStore, FileReader, FileWriter},
     erasure::{ReadAt, Write},
     error::{Error, Result},
     store_api::BitrotAlgorithm,
 };
 use blake2::Blake2b512;
 use blake2::Digest as _;
+use bytes::Bytes;
 use highway::{HighwayHash, HighwayHasher, Key};
 use lazy_static::lazy_static;
 use sha2::{digest::core_api::BlockSizeUser, Digest, Sha256};
@@ -14,9 +15,14 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read},
 };
+
 use tokio::{
+    io::AsyncWriteExt,
     spawn,
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        RwLock,
+    },
     task::JoinHandle,
 };
 
@@ -145,7 +151,7 @@ pub fn bitrot_algorithm_from_string(s: &str) -> BitrotAlgorithm {
     BitrotAlgorithm::HighwayHash256S
 }
 
-pub type BitrotWriter = Box<dyn Write + Send>;
+pub type BitrotWriter = Box<dyn Write + Send + 'static>;
 
 pub async fn new_bitrot_writer(
     disk: DiskStore,
@@ -474,6 +480,115 @@ impl ReadAt for StreamingBitrotReader {
 
         Ok((buf, readed_len))
     }
+}
+
+pub struct BitrotFileWriter {
+    pub inner: FileWriter,
+    hasher: Hasher,
+    _shard_size: usize,
+}
+
+impl BitrotFileWriter {
+    pub fn new(inner: FileWriter, algo: BitrotAlgorithm, _shard_size: usize) -> Self {
+        let hasher = algo.new();
+        Self {
+            inner,
+            hasher,
+            _shard_size,
+        }
+    }
+
+    pub fn writer(&self) -> &FileWriter {
+        &self.inner
+    }
+}
+
+#[async_trait::async_trait]
+impl Write for BitrotFileWriter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.hasher.reset();
+        self.hasher.update(&buf);
+        let hash_bytes = self.hasher.clone().finalize();
+
+        let _ = self.inner.write(&hash_bytes).await?;
+        let _ = self.inner.write(buf).await?;
+
+        Ok(())
+    }
+}
+
+pub fn new_bitrot_filewriter(inner: FileWriter, algo: BitrotAlgorithm, shard_size: usize) -> Result<BitrotWriter> {
+    Ok(Box::new(BitrotFileWriter::new(inner, algo, shard_size)))
+}
+
+#[derive(Debug)]
+struct BitrotFileReader {
+    pub inner: FileReader,
+    till_offset: usize,
+    curr_offset: usize,
+    hasher: Hasher,
+    shard_size: usize,
+    buf: Vec<u8>,
+    hash_bytes: Vec<u8>,
+}
+
+impl BitrotFileReader {
+    pub fn new(inner: FileReader, algo: BitrotAlgorithm, till_offset: usize, shard_size: usize) -> Self {
+        let hasher = algo.new();
+        Self {
+            inner,
+            till_offset: till_offset.div_ceil(shard_size) * hasher.size() + till_offset,
+            curr_offset: 0,
+            hash_bytes: Vec::with_capacity(hasher.size()),
+            hasher,
+            shard_size,
+            buf: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ReadAt for BitrotFileReader {
+    async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
+        if offset % self.shard_size != 0 {
+            return Err(Error::new(DiskError::Unexpected));
+        }
+        if self.buf.is_empty() {
+            self.curr_offset = offset;
+            let stream_offset = (offset / self.shard_size) * self.hasher.size() + offset;
+            let buf_len = self.till_offset - stream_offset;
+            let (buf, _) = self.inner.read_at(stream_offset, buf_len).await?;
+            self.buf = buf;
+        }
+        if offset != self.curr_offset {
+            return Err(Error::new(DiskError::Unexpected));
+        }
+
+        self.hash_bytes = self.buf.drain(0..self.hash_bytes.capacity()).collect();
+        let buf = self.buf.drain(0..length).collect::<Vec<_>>();
+        self.hasher.reset();
+        self.hasher.update(&buf);
+        let actual = self.hasher.clone().finalize();
+        if actual != self.hash_bytes {
+            return Err(Error::new(DiskError::FileCorrupt));
+        }
+
+        let readed_len = buf.len();
+        self.curr_offset += readed_len;
+
+        Ok((buf, readed_len))
+    }
+}
+
+pub fn new_bitrot_filereader(inner: FileReader, till_offset: usize, algo: BitrotAlgorithm, shard_size: usize) -> BitrotReader {
+    Box::new(BitrotFileReader::new(inner, algo, till_offset, shard_size))
 }
 
 #[cfg(test)]

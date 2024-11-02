@@ -512,6 +512,13 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    async fn list_object_versions(
+        &self,
+        _req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        Err(s3_error!(NotImplemented, "ListObjectVersions is not implemented yet"))
+    }
+
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let input = req.input;
@@ -529,9 +536,6 @@ impl S3 for FS {
             key,
             metadata,
             content_length,
-            content_type,
-            checksum_sha256,
-            content_md5,
             ..
         } = input;
 

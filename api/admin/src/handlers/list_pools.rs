@@ -1,7 +1,7 @@
 use crate::error::ErrorCode;
 use crate::Result as LocalResult;
 
-use axum::{extract::State, Json};
+use axum::Json;
 use serde::Serialize;
 use time::OffsetDateTime;
 

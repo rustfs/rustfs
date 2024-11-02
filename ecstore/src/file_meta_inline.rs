@@ -70,7 +70,7 @@ impl InlineData {
         Ok(None)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.0.is_empty() {
             return Ok(());
         }
