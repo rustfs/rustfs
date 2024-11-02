@@ -14,7 +14,7 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 use crate::{
-    erasure::{ReadAt, Write},
+    erasure::{ReadAt, Writer},
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
     store_api::{FileInfo, RawFileInfo},
@@ -657,7 +657,7 @@ pub enum FileWriter {
 }
 
 #[async_trait::async_trait]
-impl Write for FileWriter {
+impl Writer for FileWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -686,7 +686,7 @@ impl BufferWriter {
 }
 
 #[async_trait::async_trait]
-impl Write for BufferWriter {
+impl Writer for BufferWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -711,7 +711,7 @@ impl LocalFileWriter {
 }
 
 #[async_trait::async_trait]
-impl Write for LocalFileWriter {
+impl Writer for LocalFileWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -763,7 +763,7 @@ impl RemoteFileWriter {
 }
 
 #[async_trait::async_trait]
-impl Write for RemoteFileWriter {
+impl Writer for RemoteFileWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
