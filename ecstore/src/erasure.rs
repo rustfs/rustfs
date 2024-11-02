@@ -14,8 +14,8 @@ use tracing::warn;
 // use tracing::debug;
 use uuid::Uuid;
 
-use reader::reader::ChunkedStream;
-// use crate::chunk_stream::ChunkedStream;
+// use reader::reader::ChunkedStream;
+use crate::chunk_stream::ChunkedStream;
 use crate::disk::error::DiskError;
 
 pub struct Erasure {
@@ -58,8 +58,8 @@ impl Erasure {
     where
         S: Stream<Item = Result<Bytes, StdError>> + Send + Sync,
     {
-        let stream = ChunkedStream::new(body, self.block_size);
-        // let mut stream = ChunkedStream::new(body, total_size, self.block_size, false);
+        // let stream = ChunkedStream::new(body, self.block_size);
+        let stream = ChunkedStream::new(body, total_size, self.block_size, false);
         let mut total: usize = 0;
         // let mut idx = 0;
         pin_mut!(stream);
@@ -82,9 +82,8 @@ impl Erasure {
 
                         let blocks = self.encode_data(data.as_ref())?;
 
-                        // debug!(
-                        //     "encode shard {} size: {}/{} from block_size {}, total_size {} ",
-                        //     idx,
+                        // warn!(
+                        //     "encode shard  size: {}/{} from block_size {}, total_size {} ",
                         //     blocks[0].len(),
                         //     blocks.len(),
                         //     data.len(),
@@ -93,13 +92,14 @@ impl Erasure {
 
                         let mut errs = Vec::new();
 
-                        for (i, w) in writers.iter_mut().enumerate() {
-                            if w.is_none() {
-                                continue;
-                            }
-                            match w.as_mut().unwrap().write(blocks[i].as_ref()).await {
-                                Ok(_) => errs.push(None),
-                                Err(e) => errs.push(Some(e)),
+                        for (i, w_op) in writers.iter_mut().enumerate() {
+                            if let Some(w) = w_op {
+                                match w.write(blocks[i].as_ref()).await {
+                                    Ok(_) => errs.push(None),
+                                    Err(e) => errs.push(Some(e)),
+                                }
+                            } else {
+                                errs.push(Some(Error::new(DiskError::DiskNotFound)));
                             }
                         }
 

@@ -34,8 +34,8 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{service::interceptor::InterceptedService, transport::Channel, Request, Status, Streaming};
-use tracing::error;
 use tracing::info;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Box<dyn DiskAPI>>;
@@ -855,9 +855,11 @@ impl ReadAt for LocalFileReader {
 
         let mut buffer = vec![0; length];
 
-        let bytes_read = self.inner.read(&mut buffer).await?;
+        let bytes_read = self.inner.read_exact(&mut buffer).await?;
 
-        buffer.truncate(bytes_read);
+        // buffer.truncate(bytes_read);
+
+        // warn!("LocalFileReader ReadAt need: {}, got: {}", length, bytes_read);
 
         Ok((buffer, bytes_read))
     }
