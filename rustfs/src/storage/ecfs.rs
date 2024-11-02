@@ -873,14 +873,6 @@ impl S3 for FS {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn list_object_versions(
-        &self,
-        _req: S3Request<ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        Err(s3_error!(NotImplemented, "ListObjectVersions is not implemented yet"))
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
     async fn get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
