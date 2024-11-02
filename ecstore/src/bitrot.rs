@@ -1,13 +1,12 @@
 use crate::{
-    disk::{error::DiskError, DiskStore, FileReader, FileWriter},
+    disk::{error::DiskError, DiskStore, FileReader, FileWriter, Reader},
     erasure::{ReadAt, Write},
     error::{Error, Result},
     store_api::BitrotAlgorithm,
-    utils::crypto::hex,
 };
+
 use blake2::Blake2b512;
 use blake2::Digest as _;
-use bytes::Bytes;
 use highway::{HighwayHash, HighwayHasher, Key};
 use lazy_static::lazy_static;
 use sha2::{digest::core_api::BlockSizeUser, Digest, Sha256};
@@ -16,7 +15,7 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read},
 };
-use tracing::warn;
+use tracing::{error, warn};
 
 use tokio::{
     io::AsyncWriteExt,
@@ -325,7 +324,8 @@ impl ReadAt for WholeBitrotReader {
         if self.buf.is_none() {
             let buf_len = self.till_offset - offset;
             let mut file = self.disk.read_file(&self.volume, &self.file_path).await?;
-            let (buf, _) = file.read_at(offset, buf_len).await?;
+            let mut buf = vec![0u8; buf_len];
+            file.read_at(offset, &mut buf).await?;
             self.buf = Some(buf);
         }
 
@@ -461,7 +461,8 @@ impl ReadAt for StreamingBitrotReader {
             let stream_offset = (offset / self.shard_size) * self.hasher.size() + offset;
             let buf_len = self.till_offset - stream_offset;
             let mut file = self.disk.read_file(&self.volume, &self.file_path).await?;
-            let (buf, _) = file.read_at(stream_offset, buf_len).await?;
+            let mut buf = vec![0u8; buf_len];
+            file.read_at(stream_offset, &mut buf).await?;
             self.buf = buf;
         }
         if offset != self.curr_offset {
@@ -538,6 +539,7 @@ struct BitrotFileReader {
     shard_size: usize,
     // buf: Vec<u8>,
     hash_bytes: Vec<u8>,
+    read_buf: Vec<u8>,
 }
 
 // fn ceil(a: usize, b: usize) -> usize {
@@ -551,10 +553,11 @@ impl BitrotFileReader {
             inner,
             // till_offset: ceil(till_offset, shard_size) * hasher.size() + till_offset,
             curr_offset: 0,
-            hash_bytes: Vec::with_capacity(hasher.size()),
+            hash_bytes: vec![0u8; hasher.size()],
             hasher,
             shard_size,
             // buf: Vec::new(),
+            read_buf: Vec::new(),
         }
     }
 }
@@ -563,15 +566,28 @@ impl BitrotFileReader {
 impl ReadAt for BitrotFileReader {
     async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)> {
         if offset % self.shard_size != 0 {
+            error!(
+                "BitrotFileReader read_at offset % self.shard_size != 0 , {} % {} = {}",
+                offset,
+                self.shard_size,
+                offset % self.shard_size
+            );
             return Err(Error::new(DiskError::Unexpected));
         }
 
         let stream_offset = (offset / self.shard_size) * self.hasher.size() + offset;
         let buf_len = self.hasher.size() + length;
-        let (mut read_buf, _) = self.inner.read_at(stream_offset, buf_len).await?;
 
-        self.hash_bytes = read_buf.drain(0..self.hash_bytes.capacity()).collect();
-        let buf = read_buf.drain(0..length).collect::<Vec<_>>();
+        self.read_buf.clear();
+        self.read_buf.resize(buf_len, 0u8);
+
+        self.inner.read_at(stream_offset, &mut self.read_buf).await?;
+
+        let hash_bytes = &self.read_buf.as_slice()[0..self.hash_bytes.capacity()];
+
+        self.hash_bytes.clone_from_slice(hash_bytes);
+        let buf = self.read_buf.as_slice()[self.hash_bytes.capacity()..self.hash_bytes.capacity() + length].to_vec();
+
         self.hasher.reset();
         self.hasher.update(&buf);
         let actual = self.hasher.clone().finalize();
@@ -584,32 +600,6 @@ impl ReadAt for BitrotFileReader {
         self.curr_offset += readed_len;
 
         Ok((buf, readed_len))
-
-        // if self.buf.is_empty() {
-        //     self.curr_offset = offset;
-        //     let stream_offset = (offset / self.shard_size) * self.hasher.size() + offset;
-        //     let buf_len = self.till_offset - stream_offset;
-        //     let (buf, _) = self.inner.read_at(stream_offset, buf_len).await?;
-        //     self.buf = buf;
-        // }
-        // if offset != self.curr_offset {
-        //     return Err(Error::new(DiskError::Unexpected));
-        // }
-
-        // self.hash_bytes = self.buf.drain(0..self.hash_bytes.capacity()).collect();
-        // let buf = self.buf.drain(0..length).collect::<Vec<_>>();
-        // self.hasher.reset();
-        // self.hasher.update(&buf);
-        // let actual = self.hasher.clone().finalize();
-
-        // if actual != self.hash_bytes {
-        //     return Err(Error::new(DiskError::FileCorrupt));
-        // }
-
-        // let readed_len = buf.len();
-        // self.curr_offset += readed_len;
-
-        // Ok((buf, readed_len))
     }
 }
 
