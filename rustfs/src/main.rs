@@ -6,7 +6,6 @@ mod storage;
 use clap::Parser;
 use common::error::{Error, Result};
 use ecstore::{
-    config::GLOBAL_ConfigSys,
     endpoints::EndpointServerPools,
     set_global_endpoints,
     store::{init_local_disks, ECStore},

@@ -2,7 +2,6 @@ pub mod error;
 pub mod handlers;
 
 use axum::{extract::Request, response::Response, routing::get, BoxError, Router};
-use ecstore::store::ECStore;
 use error::ErrorCode;
 use handlers::list_pools;
 use tower::Service;
