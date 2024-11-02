@@ -46,7 +46,7 @@ impl Erasure {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, body,writers))]
+    #[tracing::instrument(level = "debug", skip(self, body, writers))]
     pub async fn encode<S>(
         &self,
         body: S,
@@ -425,9 +425,8 @@ impl ShardReader {
             }
         }
 
-        // debug!("ec decode read ress {:?}", &ress);
-
         if !self.can_decode(&ress) {
+            warn!("ec decode read ress {:?}", &ress);
             warn!("ec decode read errors {:?}", &errors);
 
             return Err(Error::msg("shard reader read faild"));
