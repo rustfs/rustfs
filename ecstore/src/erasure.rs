@@ -346,7 +346,7 @@ impl Erasure {
 }
 
 #[async_trait::async_trait]
-pub trait Write {
+pub trait Writer {
     fn as_any(&self) -> &dyn Any;
     async fn write(&mut self, buf: &[u8]) -> Result<()>;
     async fn close(&mut self) -> Result<()> {

@@ -1,6 +1,6 @@
 use crate::{
     disk::{error::DiskError, DiskStore, FileReader, FileWriter, Reader},
-    erasure::{ReadAt, Write},
+    erasure::{ReadAt, Writer},
     error::{Error, Result},
     store_api::BitrotAlgorithm,
 };
@@ -15,15 +15,11 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read},
 };
-use tracing::{error, warn};
+use tracing::error;
 
 use tokio::{
-    io::AsyncWriteExt,
     spawn,
-    sync::{
-        mpsc::{self, Sender},
-        RwLock,
-    },
+    sync::mpsc::{self, Sender},
     task::JoinHandle,
 };
 
@@ -152,7 +148,7 @@ pub fn bitrot_algorithm_from_string(s: &str) -> BitrotAlgorithm {
     BitrotAlgorithm::HighwayHash256S
 }
 
-pub type BitrotWriter = Box<dyn Write + Send + 'static>;
+pub type BitrotWriter = Box<dyn Writer + Send + 'static>;
 
 pub async fn new_bitrot_writer(
     disk: DiskStore,
@@ -281,7 +277,7 @@ impl WholeBitrotWriter {
 }
 
 #[async_trait::async_trait]
-impl Write for WholeBitrotWriter {
+impl Writer for WholeBitrotWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -383,7 +379,7 @@ impl StreamingBitrotWriter {
 }
 
 #[async_trait::async_trait]
-impl Write for StreamingBitrotWriter {
+impl Writer for StreamingBitrotWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -507,7 +503,7 @@ impl BitrotFileWriter {
 }
 
 #[async_trait::async_trait]
-impl Write for BitrotFileWriter {
+impl Writer for BitrotFileWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
