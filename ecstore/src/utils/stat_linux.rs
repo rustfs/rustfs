@@ -43,7 +43,7 @@ fn get_fs_type(ftype: FsType) -> String {
     }
 }
 
-pub fn get_info(path: &str, first_time: bool) -> Result<Info> {
+pub fn get_info(path: &str) -> Result<Info> {
     let statfs = statfs(path)?;
     let reserved_blocks = statfs.blocks_free() - statfs.blocks_available();
     let mut info = Info {
@@ -68,10 +68,6 @@ pub fn get_info(path: &str, first_time: bool) -> Result<Info> {
     }
 
     info.used = info.total - info.free;
-
-    if first_time {
-        // todo
-    }
 
     Ok(info)
 }

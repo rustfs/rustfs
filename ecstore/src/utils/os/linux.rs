@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::{disk::Info, error::Result};
 
 /// returns total and free bytes available in a directory, e.g. `/`.
-pub fn get_info(p: impl AsRef<Path>, _first_time: bool) -> std::io::Result<Info> {
+pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
     let stat_fs = statfs(p.as_ref())?;
 
     let bsize = stat_fs.block_size() as u64;
