@@ -421,12 +421,12 @@ async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTracker
                 )));
             }
             healing_tracker.id = disk_id;
-            return Ok(healing_tracker);
+            Ok(healing_tracker)
         } else {
-            return Err(Error::from_string("loadHealingTracker: disk not have id"));
+            Err(Error::from_string("loadHealingTracker: disk not have id"))
         }
     } else {
-        return Err(Error::from_string("loadHealingTracker: nil drive given"));
+        Err(Error::from_string("loadHealingTracker: nil drive given"))
     }
 }
 

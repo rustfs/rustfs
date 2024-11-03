@@ -335,7 +335,7 @@ pub async fn heal_sequence_start(h: Arc<HealSequence>) {
                     }
                 },
                 None => {
-                    return;
+
                 }
             }
 
@@ -462,7 +462,7 @@ impl AllHealState {
             }
         }
 
-        return (None, false);
+        (None, false)
     }
 
     async fn get_heal_sequence(&self, path: &str) -> Option<HealSequence> {

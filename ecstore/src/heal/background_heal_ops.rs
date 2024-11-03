@@ -8,11 +8,7 @@ use tokio::{
     },
 };
 
-use crate::{
-    error::Error,
-    heal::heal_ops::NOP_HEAL,
-    utils::path::SLASH_SEPARATOR,
-};
+use crate::{error::Error, heal::heal_ops::NOP_HEAL, utils::path::SLASH_SEPARATOR};
 
 use super::{
     heal_commands::{HealOpts, HealResultItem},
