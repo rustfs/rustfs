@@ -253,12 +253,12 @@ pub fn parse_storage_class(env: &str) -> Result<StorageClass> {
 
 // ValidateParity validates standard storage class parity.
 pub fn validate_parity(ss_parity: usize, set_drive_count: usize) -> Result<()> {
-    if ss_parity > 0 && ss_parity < MIN_PARITY_DRIVES {
-        return Err(Error::msg(format!(
-            "parity {} should be greater than or equal to {}",
-            ss_parity, MIN_PARITY_DRIVES
-        )));
-    }
+    // if ss_parity > 0 && ss_parity < MIN_PARITY_DRIVES {
+    //     return Err(Error::msg(format!(
+    //         "parity {} should be greater than or equal to {}",
+    //         ss_parity, MIN_PARITY_DRIVES
+    //     )));
+    // }
 
     if ss_parity > set_drive_count / 2 {
         return Err(Error::msg(format!(
@@ -273,21 +273,21 @@ pub fn validate_parity(ss_parity: usize, set_drive_count: usize) -> Result<()> {
 
 // Validates the parity drives.
 pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_count: usize) -> Result<()> {
-    if ss_parity > 0 && ss_parity < MIN_PARITY_DRIVES {
-        return Err(Error::msg(format!(
-            "Standard storage class parity {} should be greater than or equal to {}",
-            ss_parity, MIN_PARITY_DRIVES
-        )));
-    }
+    // if ss_parity > 0 && ss_parity < MIN_PARITY_DRIVES {
+    //     return Err(Error::msg(format!(
+    //         "Standard storage class parity {} should be greater than or equal to {}",
+    //         ss_parity, MIN_PARITY_DRIVES
+    //     )));
+    // }
 
     // RRS parity drives should be greater than or equal to minParityDrives.
     // Parity below minParityDrives is not supported.
-    if rrs_parity > 0 && rrs_parity < MIN_PARITY_DRIVES {
-        return Err(Error::msg(format!(
-            "Reduced redundancy storage class parity {} should be greater than or equal to {}",
-            rrs_parity, MIN_PARITY_DRIVES
-        )));
-    }
+    // if rrs_parity > 0 && rrs_parity < MIN_PARITY_DRIVES {
+    //     return Err(Error::msg(format!(
+    //         "Reduced redundancy storage class parity {} should be greater than or equal to {}",
+    //         rrs_parity, MIN_PARITY_DRIVES
+    //     )));
+    // }
 
     if set_drive_count > 2 {
         if ss_parity > set_drive_count / 2 {

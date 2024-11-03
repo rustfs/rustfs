@@ -1797,7 +1797,7 @@ async fn has_space_for(dis: &Vec<Option<DiskInfo>>, size: i64) -> Result<bool> {
         }
     }
 
-    if disks_num < dis.len() / 2 || disks_num <= 0 {
+    if disks_num < dis.len() / 2 || disks_num == 0 {
         return Err(Error::msg(format!(
             "not enough online disks to calculate the available space,need {}, found {}",
             (dis.len() / 2) + 1,
