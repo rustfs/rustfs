@@ -3,7 +3,7 @@
 ## 基础存储
 
 - [x] EC可用读写数量判断 Read/WriteQuorum
-- [ ] 优化后台并发执行，可中断
+- [ ] 优化后台并发执行，可中断, 传引用？
 - [x] 小文件存储到metafile, inlinedata
 - [x] 完善bucketmeta
 - [x] 对象锁
