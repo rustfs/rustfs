@@ -426,9 +426,9 @@ pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
         if let Some(err) = err {
             if let Some(err) = err.downcast_ref::<DiskError>() {
                 match err {
-                    DiskError::FileNotFound | DiskError::VolumeNotFound | &DiskError::FileVersionNotFound =>{
+                    DiskError::FileNotFound | DiskError::VolumeNotFound | &DiskError::FileVersionNotFound => {
                         continue;
-                    },
+                    }
                     _ => return false,
                 }
             }

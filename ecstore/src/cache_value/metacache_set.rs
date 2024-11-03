@@ -152,7 +152,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 None => {
                     at_eof += 1;
                     continue;
-                },
+                }
             };
             // If no current, add it.
             if current.name.is_empty() {
@@ -177,7 +177,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 continue;
             }
             // We got a new, better current.
-			// Clear existing entries.
+            // Clear existing entries.
             top_entries.clear();
             agree += 1;
             top_entries.insert(i, entry.clone());
@@ -189,16 +189,14 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 finished_fn(&errs);
             }
             let mut combined_err = Vec::new();
-            errs.iter().zip(opts.disks.iter()).for_each(|(err, disk)| {
-                match (err, disk) {
-                    (Some(err), Some(disk)) => {
-                        combined_err.push(format!("drive {} returned: {}", disk.to_string(), err));
-                    },
-                    (Some(err), None) => {
-                        combined_err.push(err.to_string());
-                    },
-                    _ => {},
+            errs.iter().zip(opts.disks.iter()).for_each(|(err, disk)| match (err, disk) {
+                (Some(err), Some(disk)) => {
+                    combined_err.push(format!("drive {} returned: {}", disk.to_string(), err));
                 }
+                (Some(err), None) => {
+                    combined_err.push(err.to_string());
+                }
+                _ => {}
             });
 
             return Err(Error::from_string(combined_err.join(", ")));
