@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    disk::{DeleteOptions, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    disk::{DeleteOptions, DiskAPI, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result},
     heal::heal_ops::HEALING_TRACKER_FILENAME,
     new_object_layer_fn,
