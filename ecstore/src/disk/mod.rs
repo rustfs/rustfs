@@ -44,7 +44,7 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{service::interceptor::InterceptedService, transport::Channel, Request, Status, Streaming};
 use tracing::info;
-use tracing::{error, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Box<dyn DiskAPI>>;

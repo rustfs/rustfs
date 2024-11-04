@@ -307,10 +307,8 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
         }
     }
 
-    if ss_parity > 0 && rrs_parity > 0 {
-        if ss_parity < rrs_parity {
-            return Err(Error::msg(format!("Standard storage class parity drives {} should be greater than or equal to Reduced redundancy storage class parity drives {}", ss_parity, rrs_parity)));
-        }
+    if ss_parity > 0 && rrs_parity > 0 && ss_parity < rrs_parity {
+        return Err(Error::msg(format!("Standard storage class parity drives {} should be greater than or equal to Reduced redundancy storage class parity drives {}", ss_parity, rrs_parity)));
     }
     Ok(())
 }

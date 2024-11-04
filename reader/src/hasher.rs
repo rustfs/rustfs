@@ -78,6 +78,11 @@ impl Sha256 {
         }
     }
 }
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Hasher for Sha256 {
     fn write(&mut self, bytes: &[u8]) {
@@ -108,6 +113,11 @@ pub struct MD5 {
 impl MD5 {
     pub fn new() -> Self {
         Self { hasher: Md5::new() }
+    }
+}
+impl Default for MD5 {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -142,9 +152,7 @@ impl Uuid {
 }
 
 impl Hasher for Uuid {
-    fn write(&mut self, _bytes: &[u8]) {
-        ()
-    }
+    fn write(&mut self, _bytes: &[u8]) {}
 
     fn reset(&mut self) {}
 

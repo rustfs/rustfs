@@ -331,7 +331,7 @@ impl ECStore {
 
     async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
-        server_pools.filter_max_used(100 - (100 as f64 * DISK_RESERVE_FRACTION) as u64);
+        server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
         let total = server_pools.total_available();
 
         if total == 0 {
@@ -382,10 +382,7 @@ impl ECStore {
             }
 
             if !is_meta_bucketname(bucket) {
-                let avail = match has_space_for(zinfo, size).await {
-                    Ok(res) => res,
-                    Err(_err) => false,
-                };
+                let avail = has_space_for(zinfo, size).await.unwrap_or_default();
 
                 if !avail {
                     server_pools.push(PoolAvailableSpace {
@@ -399,19 +396,17 @@ impl ECStore {
 
             let mut available = 0;
             let mut max_used_pct = 0;
-            for disk_op in zinfo.iter() {
-                if let Some(disk) = disk_op {
-                    if disk.total == 0 {
-                        continue;
-                    }
+            for disk in zinfo.iter().flatten() {
+                if disk.total == 0 {
+                    continue;
+                }
 
-                    available += disk.total - disk.used;
+                available += disk.total - disk.used;
 
-                    let pct_used = disk.used * 100 / disk.total;
+                let pct_used = disk.used * 100 / disk.total;
 
-                    if pct_used > max_used_pct {
-                        max_used_pct = pct_used;
-                    }
+                if pct_used > max_used_pct {
+                    max_used_pct = pct_used;
                 }
             }
 
@@ -769,7 +764,7 @@ impl ObjectIO for ECStore {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
-        let idx = self.get_pool_idx(&bucket, &object, data.content_length as i64).await?;
+        let idx = self.get_pool_idx(bucket, &object, data.content_length as i64).await?;
 
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(Error::new(StorageError::DataMovementOverwriteErr(
@@ -812,11 +807,11 @@ impl StorageAPI for ECStore {
     }
 
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
-        if is_meta_bucketname(&bucket) {
+        if is_meta_bucketname(bucket) {
             return Err(StorageError::BucketNameInvalid(bucket.to_string()).into());
         }
 
-        if let Err(err) = check_valid_bucket_name(&bucket) {
+        if let Err(err) = check_valid_bucket_name(bucket) {
             return Err(StorageError::BucketNameInvalid(err.to_string()).into());
         }
 
@@ -838,8 +833,8 @@ impl StorageAPI for ECStore {
         Ok(())
     }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        if !is_meta_bucketname(&bucket) {
-            if let Err(err) = check_valid_bucket_name_strict(&bucket) {
+        if !is_meta_bucketname(bucket) {
+            if let Err(err) = check_valid_bucket_name_strict(bucket) {
                 return Err(StorageError::BucketNameInvalid(err.to_string()).into());
             }
 
@@ -885,7 +880,7 @@ impl StorageAPI for ECStore {
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
 
-        if let Ok(sys) = metadata_sys::get(&bucket).await {
+        if let Ok(sys) = metadata_sys::get(bucket).await {
             info.created = Some(sys.created);
             info.versionning = sys.versioning();
             info.object_locking = sys.object_locking();
@@ -1234,7 +1229,7 @@ impl StorageAPI for ECStore {
         for (idx, pool) in self.pools.iter().enumerate() {
             // // TODO: IsSuspended
             let res = pool
-                .list_multipart_uploads(bucket, &object, "", "", "", MAX_UPLOADS_LIST)
+                .list_multipart_uploads(bucket, object, "", "", "", MAX_UPLOADS_LIST)
                 .await?;
 
             if !res.uploads.is_empty() {
@@ -1376,7 +1371,7 @@ impl StorageAPI for ECStore {
 
         // Return the first nil error
         for i in 0..self.pools.len() {
-            if errs.get(&i).is_none() {
+            if !errs.contains_key(&i) {
                 return Ok(results.remove(&i).unwrap());
             }
         }
@@ -1385,7 +1380,7 @@ impl StorageAPI for ECStore {
         for (k, err) in errs.iter() {
             match err.downcast_ref::<DiskError>() {
                 Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
-                _ => return Ok(results.remove(&k).unwrap()),
+                _ => return Ok(results.remove(k).unwrap()),
             }
         }
 
@@ -1611,10 +1606,7 @@ fn check_multipart_object_args(bucket: &str, object: &str, upload_id: &str) -> R
     if let Err(e) = base64_decode(upload_id.as_bytes()) {
         return Err(Error::new(StorageError::MalformedUploadID(format!(
             "{}/{}-{},err:{}",
-            bucket,
-            object,
-            upload_id,
-            e.to_string()
+            bucket, object, upload_id, e
         ))));
     };
     check_object_args(bucket, object)
@@ -1711,7 +1703,7 @@ pub async fn heal_entry(
     Ok(())
 }
 
-async fn get_disk_infos(disks: &Vec<Option<DiskStore>>) -> Vec<Option<DiskInfo>> {
+async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
     let opts = &DiskInfoOptions::default();
     let mut res = vec![None; disks.len()];
     for (idx, disk_op) in disks.iter().enumerate() {
@@ -1776,7 +1768,7 @@ impl ServerPoolsAvailableSpace {
     }
 }
 
-async fn has_space_for(dis: &Vec<Option<DiskInfo>>, size: i64) -> Result<bool> {
+async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> {
     let size = {
         if size < 0 {
             DISK_ASSUME_UNKNOWN_SIZE
@@ -1789,12 +1781,10 @@ async fn has_space_for(dis: &Vec<Option<DiskInfo>>, size: i64) -> Result<bool> {
     let mut total = 0;
     let mut disks_num = 0;
 
-    for disk_op in dis.iter() {
-        if let Some(disk) = disk_op {
-            disks_num += 1;
-            total += disk.total;
-            available += disk.total - disk.used;
-        }
+    for disk in dis.iter().flatten() {
+        disks_num += 1;
+        total += disk.total;
+        available += disk.total - disk.used;
     }
 
     if disks_num < dis.len() / 2 || disks_num == 0 {
@@ -1807,15 +1797,13 @@ async fn has_space_for(dis: &Vec<Option<DiskInfo>>, size: i64) -> Result<bool> {
 
     let per_disk = size / disks_num as u64;
 
-    for disk_op in dis.iter() {
-        if let Some(disk) = disk_op {
-            if !is_erasure_sd().await && disk.free_inodes < DISK_MIN_INODES && disk.used_inodes > 0 {
-                return Ok(false);
-            }
+    for disk in dis.iter().flatten() {
+        if !is_erasure_sd().await && disk.free_inodes < DISK_MIN_INODES && disk.used_inodes > 0 {
+            return Ok(false);
+        }
 
-            if disk.free <= per_disk {
-                return Ok(false);
-            }
+        if disk.free <= per_disk {
+            return Ok(false);
         }
     }
 

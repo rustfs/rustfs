@@ -42,10 +42,7 @@ pub enum StorageError {
 
 pub fn is_err_invalid_upload_id(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<StorageError>() {
-        match e {
-            StorageError::InvalidUploadID(_, _, _) => true,
-            _ => false,
-        }
+        matches!(e, StorageError::InvalidUploadID(_, _, _))
     } else {
         false
     }
@@ -53,10 +50,7 @@ pub fn is_err_invalid_upload_id(err: &Error) -> bool {
 
 pub fn is_err_version_not_found(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<StorageError>() {
-        match e {
-            StorageError::VersionNotFound(_, _, _) => true,
-            _ => false,
-        }
+        matches!(e, StorageError::VersionNotFound(_, _, _))
     } else {
         false
     }
@@ -64,10 +58,7 @@ pub fn is_err_version_not_found(err: &Error) -> bool {
 
 pub fn is_err_bucket_exists(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<StorageError>() {
-        match e {
-            StorageError::BucketExists(_) => true,
-            _ => false,
-        }
+        matches!(e, StorageError::BucketExists(_))
     } else {
         false
     }
@@ -78,10 +69,7 @@ pub fn is_err_object_not_found(err: &Error) -> bool {
         return true;
     }
     if let Some(e) = err.downcast_ref::<StorageError>() {
-        match e {
-            StorageError::ObjectNotFound(_, _) => true,
-            _ => false,
-        }
+        matches!(e, StorageError::ObjectNotFound(_, _))
     } else {
         false
     }
