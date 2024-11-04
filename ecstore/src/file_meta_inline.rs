@@ -16,7 +16,7 @@ impl InlineData {
         self.0 = buf.to_vec()
     }
     pub fn as_slice(&self) -> &[u8] {
-        &self.0.as_slice()
+        self.0.as_slice()
     }
     pub fn version_ok(&self) -> bool {
         if self.0.is_empty() {

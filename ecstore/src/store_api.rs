@@ -172,27 +172,9 @@ impl FileInfo {
 
         let (content_type, content_encoding, etag) = {
             if let Some(ref meta) = self.metadata {
-                let content_type = {
-                    if let Some(ty) = meta.get("content-type") {
-                        Some(ty.clone())
-                    } else {
-                        None
-                    }
-                };
-                let content_encoding = {
-                    if let Some(encoding) = meta.get("content-encoding") {
-                        Some(encoding.clone())
-                    } else {
-                        None
-                    }
-                };
-                let etag = {
-                    if let Some(etag) = meta.get("etag") {
-                        Some(etag.clone())
-                    } else {
-                        None
-                    }
-                };
+                let content_type = meta.get("content-type").cloned();
+                let content_encoding = meta.get("content-encoding").cloned();
+                let etag = meta.get("etag").cloned();
 
                 (content_type, content_encoding, etag)
             } else {

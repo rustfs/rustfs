@@ -454,7 +454,7 @@ impl StorageAPI for Sets {
         delimiter: &str,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
-        self.get_disks_by_key(&prefix)
+        self.get_disks_by_key(prefix)
             .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
             .await
     }
