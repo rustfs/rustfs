@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0' # at midnight of each sunday
+  push:
+    branches:
+      - main
 
 jobs:
-  build:
+  build-rustfs:
     runs-on: ubuntu-latest
 
     steps:
@@ -15,28 +18,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: install protoc
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "27.0"
+
+      - uses: Nugine/setup-flatc@v1
+        with:
+          version: "24.3.25"
+
+      - name: Build binaries
         run: |
-          wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip
-          unzip protoc-27.0-linux-x86_64.zip -d protoc3
-          mv protoc3/bin/* /usr/local/bin/
-          chmod +x /usr/local/bin/protoc
-          rm -rf protoc-27.0-linux-x86_64.zip protoc3
+          cargo build -p rustfs --bins 
+          cargo build -p rustfs --bins --release
 
-      - run: protoc --version
-
-      - name: install flatc
-        run: |
-          wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
-          unzip Linux.flatc.binary.g++-13.zip
-          mv flatc /usr/local/bin/ 
-          chmod +x /usr/local/bin/flatc 
-          rm -rf Linux.flatc.binary.g++-13.zip
-
-      - run: flatc --version
-
-      - run: cargo build -p rustfs --bins --release
+          mkdir -p target/artifacts
+          mv ./target/debug/rustfs    ./target/artifacts/rustfs.debug.x86_64-unknown-linux-gnu
+          mv ./target/release/rustfs  ./target/artifacts/rustfs.release.x86_64-unknown-linux-gnu
 
       - uses: actions/upload-artifact@v4
         with:
-          path: ./target/release/rustfs
+          name: rustfs
+          path: ./target/artifacts/*

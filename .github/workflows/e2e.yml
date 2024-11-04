@@ -39,44 +39,13 @@ jobs:
           # - nightly
 
     steps:
-      - name: cache protoc bin
-        id: cache-protoc-action
-        uses: actions/cache@v4
-        env:
-          cache-name: cache-protoc-action-bin
+      - uses: arduino/setup-protoc@v3
         with:
-          path: /usr/local/bin/protoc
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
+          version: "27.0"
 
-      - name: install protoc
-        if: steps.cache-protoc-action.outputs.cache-hit != 'true'
-        run: |
-          wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip
-          unzip protoc-27.0-linux-x86_64.zip -d protoc3
-          mv protoc3/bin/* /usr/local/bin/
-          chmod +x /usr/local/bin/protoc
-          rm -rf protoc-27.0-linux-x86_64.zip protoc3
-
-      - name: print protoc version
-        run: protoc --version
-
-      - name: cache flatc bin
-        id: cache-flatc-action
-        uses: actions/cache@v4
-        env:
-          cache-name: cache-flatc-action-bin
+      - uses: Nugine/setup-flatc@v1
         with:
-          path: /usr/local/bin/flatc
-          key: ${{ runner.os }}-build-${{ env.cache-name }}-v0.0.1
-
-      - name: install flatc
-        if: steps.cache-flatc-action.outputs.cache-hit != 'true'
-        run: |
-          wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
-          unzip Linux.flatc.binary.g++-13.zip
-          mv flatc /usr/local/bin/ 
-          chmod +x /usr/local/bin/flatc 
-          rm -rf Linux.flatc.binary.g++-13.zip
+          version: "24.3.25"
 
       - uses: actions/checkout@v4
       
