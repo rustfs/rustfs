@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     disk::{
         format::{DistributionAlgoVersion, FormatV3},
-        DiskStore,
+        DiskAPI, DiskStore,
     },
     endpoints::PoolEndpoints,
     error::{Error, Result},

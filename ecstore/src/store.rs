@@ -5,7 +5,7 @@ use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, set_bucket_met
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::config::{self, storageclass, GLOBAL_ConfigSys};
 use crate::disk::endpoint::EndpointType;
-use crate::disk::{DiskInfo, DiskInfoOptions, MetaCacheEntry};
+use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
 use crate::global::{
     is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION,
     DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
