@@ -92,11 +92,9 @@ impl Config {
                     let mut default = HashMap::new();
                     default.insert("_".to_owned(), v.clone());
                     self.0.insert(k.clone(), default);
-                } else {
-                    if !self.0[k].contains_key("_") {
-                        if let Some(m) = self.0.get_mut(k) {
-                            m.insert("_".to_owned(), v.clone());
-                        }
+                } else if !self.0[k].contains_key("_") {
+                    if let Some(m) = self.0.get_mut(k) {
+                        m.insert("_".to_owned(), v.clone());
                     }
                 }
             }

@@ -2,8 +2,8 @@ use std::{error::Error, io::ErrorKind, pin::Pin};
 
 use ecstore::{
     disk::{
-        DeleteOptions, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, Reader, UpdateMetadataOpts,
-        WalkDirOptions,
+        DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, Reader,
+        UpdateMetadataOpts, WalkDirOptions,
     },
     erasure::{ReadAt, Writer},
     peer::{LocalPeerS3Client, PeerS3Client},

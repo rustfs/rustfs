@@ -10,7 +10,7 @@ use tokio::{
 };
 
 use crate::{
-    disk::{DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions},
+    disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions},
     error::{Error, Result},
 };
 

@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use super::ecfs::FS;
 
 use ecstore::bucket::policy::action::Action;
@@ -42,7 +44,10 @@ impl S3Access for FS {
         // 上层验证了 ak/sk
         // warn!("check s3_op {:?} cred {:?}", cx.s3_op().name(), cx.credentials());
 
-        let action = Action::from_str(format!("s3:{}", cx.s3_op().name()).as_str());
+        let action = match Action::from_str(format!("s3:{}", cx.s3_op().name()).as_str()) {
+            Ok(res) => Some(res),
+            Err(_) => None,
+        };
 
         let req_info = ReqInfo {
             card: cx.credentials().cloned(),

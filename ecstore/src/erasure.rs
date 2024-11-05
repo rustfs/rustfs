@@ -1,4 +1,4 @@
-use crate::bitrot::{close_bitrot_writers, BitrotReader, BitrotWriter};
+use crate::bitrot::{BitrotReader, BitrotWriter};
 use crate::error::{Error, Result, StdError};
 use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
 use bytes::Bytes;
@@ -7,15 +7,16 @@ use futures::{pin_mut, Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::any::Any;
 use std::fmt::Debug;
-use tokio::io::AsyncWriteExt;
+use std::io::ErrorKind;
 use tokio::io::DuplexStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 use tracing::warn;
 // use tracing::debug;
 use uuid::Uuid;
 
 // use reader::reader::ChunkedStream;
-use crate::chunk_stream::ChunkedStream;
+// use crate::chunk_stream::ChunkedStream;
 use crate::disk::error::DiskError;
 
 pub struct Erasure {
@@ -24,6 +25,7 @@ pub struct Erasure {
     encoder: Option<ReedSolomon>,
     pub block_size: usize,
     _id: Uuid,
+    buf: Vec<u8>,
 }
 
 impl Erasure {
@@ -43,12 +45,13 @@ impl Erasure {
             block_size,
             encoder,
             _id: Uuid::new_v4(),
+            buf: vec![0u8; block_size],
         }
     }
 
     #[tracing::instrument(level = "debug", skip(self, body, writers))]
     pub async fn encode<S>(
-        &self,
+        &mut self,
         body: S,
         writers: &mut [Option<BitrotWriter>],
         // block_size: usize,
@@ -58,76 +61,138 @@ impl Erasure {
     where
         S: Stream<Item = Result<Bytes, StdError>> + Send + Sync,
     {
-        // let stream = ChunkedStream::new(body, self.block_size);
-        let stream = ChunkedStream::new(body, total_size, self.block_size, false);
+        pin_mut!(body);
+        let mut reader = tokio_util::io::StreamReader::new(
+            body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+        );
+
         let mut total: usize = 0;
-        // let mut idx = 0;
-        pin_mut!(stream);
-
-        // warn!("encode start...");
-
         loop {
-            match stream.next().await {
-                Some(result) => match result {
-                    Ok(data) => {
-                        total += data.len();
-
-                        // EOF
-                        if data.is_empty() {
-                            break;
-                        }
-
-                        // idx += 1;
-                        // warn!("encode {} get data {:?}", data.len(), data.to_vec());
-
-                        let blocks = self.encode_data(data.as_ref())?;
-
-                        // warn!(
-                        //     "encode shard  size: {}/{} from block_size {}, total_size {} ",
-                        //     blocks[0].len(),
-                        //     blocks.len(),
-                        //     data.len(),
-                        //     total_size
-                        // );
-
-                        let mut errs = Vec::new();
-
-                        for (i, w_op) in writers.iter_mut().enumerate() {
-                            if let Some(w) = w_op {
-                                match w.write(blocks[i].as_ref()).await {
-                                    Ok(_) => errs.push(None),
-                                    Err(e) => errs.push(Some(e)),
-                                }
-                            } else {
-                                errs.push(Some(Error::new(DiskError::DiskNotFound)));
-                            }
-                        }
-
-                        let none_count = errs.iter().filter(|&x| x.is_none()).count();
-                        if none_count >= write_quorum {
-                            continue;
-                        }
-
-                        if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
-                            warn!("Erasure encode errs {:?}", &errs);
-                            return Err(err);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("poll result err {:?}", &e);
-                        return Err(Error::msg(e.to_string()));
-                    }
-                },
-                None => {
-                    // warn!("poll empty result");
-                    break;
+            let new_len = {
+                let remain = total_size - total;
+                if remain > self.block_size {
+                    self.block_size
+                } else {
+                    remain
                 }
+            };
+
+            if new_len == 0 {
+                break;
+            }
+
+            self.buf.resize(new_len, 0u8);
+
+            match reader.read_exact(&mut self.buf).await {
+                Ok(res) => res,
+                Err(e) => {
+                    if let ErrorKind::UnexpectedEof = e.kind() {
+                        break;
+                    } else {
+                        return Err(Error::new(e));
+                    }
+                }
+            };
+
+            total += self.buf.len();
+
+            let blocks = self.encode_data(&self.buf)?;
+            let mut errs = Vec::new();
+
+            for (i, w_op) in writers.iter_mut().enumerate() {
+                if let Some(w) = w_op {
+                    match w.write(blocks[i].as_ref()).await {
+                        Ok(_) => errs.push(None),
+                        Err(e) => errs.push(Some(e)),
+                    }
+                } else {
+                    errs.push(Some(Error::new(DiskError::DiskNotFound)));
+                }
+            }
+
+            let none_count = errs.iter().filter(|&x| x.is_none()).count();
+            if none_count >= write_quorum {
+                continue;
+            }
+
+            if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
+                warn!("Erasure encode errs {:?}", &errs);
+                return Err(err);
             }
         }
 
-        let _ = close_bitrot_writers(writers).await?;
-
         Ok(total)
+
+        // // let stream = ChunkedStream::new(body, self.block_size);
+        // let stream = ChunkedStream::new(body, total_size, self.block_size, false);
+        // let mut total: usize = 0;
+        // // let mut idx = 0;
+        // pin_mut!(stream);
+
+        // // warn!("encode start...");
+
+        // loop {
+        //     match stream.next().await {
+        //         Some(result) => match result {
+        //             Ok(data) => {
+        //                 total += data.len();
+
+        //                 // EOF
+        //                 if data.is_empty() {
+        //                     break;
+        //                 }
+
+        //                 // idx += 1;
+        //                 // warn!("encode {} get data {:?}", data.len(), data.to_vec());
+
+        //                 let blocks = self.encode_data(data.as_ref())?;
+
+        //                 // warn!(
+        //                 //     "encode shard  size: {}/{} from block_size {}, total_size {} ",
+        //                 //     blocks[0].len(),
+        //                 //     blocks.len(),
+        //                 //     data.len(),
+        //                 //     total_size
+        //                 // );
+
+        //                 let mut errs = Vec::new();
+
+        //                 for (i, w_op) in writers.iter_mut().enumerate() {
+        //                     if let Some(w) = w_op {
+        //                         match w.write(blocks[i].as_ref()).await {
+        //                             Ok(_) => errs.push(None),
+        //                             Err(e) => errs.push(Some(e)),
+        //                         }
+        //                     } else {
+        //                         errs.push(Some(Error::new(DiskError::DiskNotFound)));
+        //                     }
+        //                 }
+
+        //                 let none_count = errs.iter().filter(|&x| x.is_none()).count();
+        //                 if none_count >= write_quorum {
+        //                     continue;
+        //                 }
+
+        //                 if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
+        //                     warn!("Erasure encode errs {:?}", &errs);
+        //                     return Err(err);
+        //                 }
+        //             }
+        //             Err(e) => {
+        //                 warn!("poll result err {:?}", &e);
+        //                 return Err(Error::msg(e.to_string()));
+        //             }
+        //         },
+        //         None => {
+        //             // warn!("poll empty result");
+        //             break;
+        //         }
+        //     }
+        // }
+
+        // let _ = close_bitrot_writers(writers).await?;
+
+        // Ok(total)
     }
 
     pub async fn decode(
