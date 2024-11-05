@@ -53,6 +53,8 @@ transform-stream.workspace = true
 uuid = "1.11.0"
 admin = { path = "../api/admin" }
 axum.workspace = true
+router = { version = "0.0.1", path = "../router" }
+matchit = "0.8.4"
 
 [build-dependencies]
 prost-build.workspace = true
