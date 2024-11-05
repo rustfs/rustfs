@@ -1,0 +1,17 @@
+[package]
+name = "router"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+
+[dependencies]
+async-trait.workspace = true
+tracing.workspace = true
+s3s.workspace = true
+hyper.workspace = true
+matchit = "0.8.4"
+pin-project-lite.workspace = true
+common.workspace = true
