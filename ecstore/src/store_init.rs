@@ -1,4 +1,5 @@
 use crate::config::{storageclass, KVS};
+use crate::disk::DiskAPI;
 use crate::{
     disk::{
         error::DiskError,

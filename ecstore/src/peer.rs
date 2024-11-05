@@ -7,6 +7,7 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tonic::Request;
 use tracing::warn;
 
+use crate::disk::DiskAPI;
 use crate::store::all_local_disk;
 use crate::{
     disk::{self, error::DiskError, VolumeInfo},

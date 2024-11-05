@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use s3s::StdError;
 use std::collections::VecDeque;
-use tracing::warn;
 
 use std::pin::Pin;
 use std::task::Poll;
@@ -145,7 +144,7 @@ where
                     }
 
                     if let Some(md5) = this.md5 {
-                        let _ = md5.write(bytes);
+                        md5.write(bytes);
                     }
                 }
                 Some(Err(err)) => {
@@ -231,7 +230,7 @@ where
 
                         // println!("get len {}", bytes.len());
                         // 如果有剩余
-                        if this.remaining.len() > 0 {
+                        if !this.remaining.is_empty() {
                             let need_size = chuck_size - this.remaining.len();
                             // 传入的数据大小需要补齐的大小，使用传入数据补齐
                             if bytes.len() >= need_size {
@@ -255,7 +254,7 @@ where
                             this.streams.push_back(chuck);
                         }
 
-                        if bytes.len() > 0 {
+                        if !bytes.is_empty() {
                             this.remaining.extend_from_slice(&bytes);
                         }
 
@@ -267,21 +266,21 @@ where
                             return Poll::Pending;
                         }
 
-                        if this.remaining.len() > 0 {
+                        if !this.remaining.is_empty() {
                             let b = this.remaining.clone();
                             this.remaining.clear();
                             return Poll::Ready(Some(Ok(Bytes::from(b))));
                         }
                         Poll::Ready(None)
                     }
-                    Err(err) => return Poll::Ready(Some(Err(err))),
+                    Err(err) => Poll::Ready(Some(Err(err))),
                 },
                 None => {
                     // println!("get empty");
                     if let Some(b) = this.streams.pop_front() {
                         return Poll::Ready(Some(Ok(b)));
                     }
-                    if this.remaining.len() > 0 {
+                    if !this.remaining.is_empty() {
                         let b = this.remaining.clone();
                         this.remaining.clear();
                         return Poll::Ready(Some(Ok(Bytes::from(b))));
@@ -343,7 +342,7 @@ where
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let mut items = self.streams.len();
-        if self.remaining.len() > 0 {
+        if !self.remaining.is_empty() {
             items += 1;
         }
         (items, Some(items))

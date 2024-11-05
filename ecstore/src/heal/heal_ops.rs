@@ -325,12 +325,12 @@ pub async fn heal_sequence_start(h: Arc<HealSequence>) {
                     match err {
                         Some(err) => {
                             let mut current_status_w = h.current_status.write().await;
-                            (*current_status_w).summary = HEAL_STOPPED_STATUS.to_string();
-                            (*current_status_w).failure_detail = err.to_string();
+                            (current_status_w).summary = HEAL_STOPPED_STATUS.to_string();
+                            (current_status_w).failure_detail = err.to_string();
                         },
                         None => {
                             let mut current_status_w = h.current_status.write().await;
-                            (*current_status_w).summary = HEAL_FINISHED_STATUS.to_string();
+                            (current_status_w).summary = HEAL_FINISHED_STATUS.to_string();
                         }
                     }
                 },
@@ -529,7 +529,7 @@ impl AllHealState {
         let _ = self.mu.write().await;
 
         for (k, v) in self.heal_seq_map.iter() {
-            if !v.has_ended().await && (has_profix(&k, path_s) || has_profix(path_s, &k)) {
+            if !v.has_ended().await && (has_profix(k, path_s) || has_profix(path_s, k)) {
                 return Err(Error::from_string(format!(
                     "The provided heal sequence path overlaps with an existing heal path: {}",
                     k
@@ -546,7 +546,6 @@ impl AllHealState {
 
         if heal_sequence.client_token == BG_HEALING_UUID {
             // For background heal do nothing, do not spawn an unnecessary goroutine.
-        } else {
         }
         todo!()
     }

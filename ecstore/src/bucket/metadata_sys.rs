@@ -60,7 +60,7 @@ pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
     let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
-    bucket_meta_sys.delete(&bucket, config_file).await
+    bucket_meta_sys.delete(bucket, config_file).await
 }
 
 pub async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {

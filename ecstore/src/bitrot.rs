@@ -1,5 +1,5 @@
 use crate::{
-    disk::{error::DiskError, DiskStore, FileReader, FileWriter, Reader},
+    disk::{error::DiskError, DiskAPI, DiskStore, FileReader, FileWriter, Reader},
     erasure::{ReadAt, Writer},
     error::{Error, Result},
     store_api::BitrotAlgorithm,
@@ -612,7 +612,7 @@ mod test {
 
     use crate::{
         bitrot::{new_bitrot_writer, BITROT_ALGORITHMS},
-        disk::{endpoint::Endpoint, error::DiskError, new_disk, DiskOption},
+        disk::{endpoint::Endpoint, error::DiskError, new_disk, DiskAPI, DiskOption},
         error::{Error, Result},
         store_api::BitrotAlgorithm,
     };
