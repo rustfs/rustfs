@@ -14,6 +14,8 @@ use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
 
+use crate::ADMIN_PREFIX;
+
 pub struct S3Router<T> {
     router: Router<T>,
 }
@@ -61,7 +63,7 @@ where
             }
         }
 
-        uri.path().starts_with("/rustfs/admin")
+        uri.path().starts_with(ADMIN_PREFIX)
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
