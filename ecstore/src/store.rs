@@ -3,6 +3,7 @@
 use crate::bucket::metadata;
 use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
+use crate::config::GLOBAL_StorageClass;
 use crate::config::{self, storageclass, GLOBAL_ConfigSys};
 use crate::disk::endpoint::EndpointType;
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
@@ -13,7 +14,7 @@ use crate::global::{
 use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode};
 use crate::heal::heal_ops::HealObjectFn;
 use crate::new_object_layer_fn;
-use crate::store_api::{ListMultipartsInfo, ObjectIO};
+use crate::store_api::{BackendByte, BackendDisks, BackendInfo, ListMultipartsInfo, ObjectIO, StorageInfo};
 use crate::store_err::{
     is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found, StorageError,
 };
@@ -791,6 +792,74 @@ lazy_static! {
 
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
+    async fn backend_info(&self) -> BackendInfo {
+        let (standard_scparities, rrscparities) = {
+            if let Some(sc) = GLOBAL_StorageClass.get() {
+                let sc_parity = sc
+                    .get_parity_for_sc(storageclass::CLASS_STANDARD)
+                    .or(Some(self.pools[0].default_parity_count));
+
+                let rrs_sc_parity = sc.get_parity_for_sc(storageclass::RRS);
+
+                (sc_parity, rrs_sc_parity)
+            } else {
+                (Some(self.pools[0].default_parity_count), None)
+            }
+        };
+
+        let mut standard_scdata = Vec::new();
+        let mut rrscdata = Vec::new();
+        let mut drives_per_set = Vec::new();
+        let mut total_sets = Vec::new();
+
+        for (idx, set_count) in self.set_drive_counts().iter().enumerate() {
+            if let Some(sc_parity) = standard_scparities {
+                standard_scdata.push(set_count - sc_parity);
+            }
+            if let Some(rr_sc_parity) = rrscparities {
+                rrscdata.push(set_count - rr_sc_parity);
+            }
+            total_sets.push(self.pools[idx].set_count);
+            drives_per_set.push(*set_count);
+        }
+
+        BackendInfo {
+            backend_type: BackendByte::Erasure,
+            online_disks: BackendDisks::new(),
+            offline_disks: BackendDisks::new(),
+            standard_scdata,
+            standard_scparities,
+            rrscdata,
+            rrscparities,
+            total_sets,
+            drives_per_set,
+        }
+    }
+    async fn storage_info(&self) -> StorageInfo {
+        unimplemented!()
+    }
+    async fn local_storage_info(&self) -> StorageInfo {
+        let mut futures = Vec::with_capacity(self.pools.len());
+
+        for pool in self.pools.iter() {
+            futures.push(pool.local_storage_info())
+        }
+
+        let results = join_all(futures).await;
+
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        let backend = self.backend_info().await;
+        StorageInfo {
+            backend: Some(backend),
+            disks,
+        }
+    }
+
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         // TODO: opts.cached
 
