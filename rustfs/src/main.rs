@@ -1,6 +1,5 @@
 mod config;
 mod grpc;
-mod route;
 mod service;
 mod storage;
 
@@ -114,7 +113,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         b.set_access(store.clone());
 
-        b.set_route(route::make_admin_route()?);
+        b.set_route(router::make_admin_route()?);
 
         // // Enable parsing virtual-hosted-style requests
         // if let Some(dm) = opt.domain_name {
