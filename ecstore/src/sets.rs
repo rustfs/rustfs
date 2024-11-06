@@ -22,9 +22,9 @@ use crate::{
     },
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
+        BackendInfo, BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
         ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOptions,
-        ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        ObjectToDelete, PartInfo, PutObjReader, StorageAPI, StorageInfo,
     },
     utils::hash,
 };
@@ -47,6 +47,7 @@ pub struct Sets {
     pub partiy_count: usize,
     pub set_count: usize,
     pub set_drive_count: usize,
+    pub default_parity_count: usize,
     pub distribution_algo: DistributionAlgoVersion,
     ctx: CancellationToken,
 }
@@ -152,6 +153,7 @@ impl Sets {
             partiy_count,
             set_count,
             set_drive_count,
+            default_parity_count: partiy_count,
             distribution_algo: fm.erasure.distribution_algo.clone(),
             ctx: CancellationToken::new(),
         });
@@ -286,6 +288,28 @@ impl ObjectIO for Sets {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
+    async fn backend_info(&self) -> BackendInfo {
+        unimplemented!()
+    }
+    async fn storage_info(&self) -> StorageInfo {
+        unimplemented!()
+    }
+    async fn local_storage_info(&self) -> StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.local_storage_info())
+        }
+
+        let results = join_all(futures).await;
+
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+        StorageInfo { backend: None, disks }
+    }
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()
     }
