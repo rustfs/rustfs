@@ -183,7 +183,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itoa",
- "matchit",
+ "matchit 0.7.3",
  "memchr",
  "mime",
  "percent-encoding",
@@ -506,6 +506,7 @@ dependencies = [
  "block-buffer 0.11.0-rc.2",
  "const-oid",
  "crypto-common 0.2.0-rc.1",
+ "subtle",
 ]
 
 [[package]]
@@ -564,7 +565,7 @@ dependencies = [
  "s3s-policy",
  "serde",
  "serde_json",
- "sha2 0.11.0-pre.4",
+ "sha2",
  "siphasher",
  "tempfile",
  "thiserror",
@@ -865,11 +866,11 @@ checksum = "c706f1711006204c2ba8fb1a7bd55f689bbf7feca9ff40325206b5e140cff6df"
 
 [[package]]
 name = "hmac"
-version = "0.12.1"
+version = "0.13.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+checksum = "e4b1fb14e4df79f9406b434b60acef9f45c26c50062cccf1346c6103b8c47d58"
 dependencies = [
- "digest 0.10.7",
+ "digest 0.11.0-pre.9",
 ]
 
 [[package]]
@@ -1133,6 +1134,12 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "md-5"
@@ -1633,9 +1640,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.36.2"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
+checksum = "ffbfb3ddf5364c9cfcd65549a1e7b801d0e8d1b14c1a1590a6408aa93cfbfa84"
 dependencies = [
  "memchr",
  "serde",
@@ -1690,7 +1697,7 @@ dependencies = [
  "md-5",
  "pin-project-lite",
  "s3s",
- "sha2 0.11.0-pre.4",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",
@@ -1802,6 +1809,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "router"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "common",
+ "hyper",
+ "matchit 0.8.4",
+ "pin-project-lite",
+ "s3s",
+ "tracing",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1838,6 +1858,7 @@ dependencies = [
  "lazy_static",
  "lock",
  "log",
+ "matchit 0.8.4",
  "mime",
  "netif",
  "pin-project-lite",
@@ -1846,6 +1867,7 @@ dependencies = [
  "prost-types",
  "protobuf",
  "protos",
+ "router",
  "s3s",
  "serde_json",
  "time",
@@ -1932,7 +1954,7 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 [[package]]
 name = "s3s"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=0caf79822ae1f2e7a7fad3c4a093c94dd2e2c33f#0caf79822ae1f2e7a7fad3c4a093c94dd2e2c33f"
+source = "git+https://github.com/Nugine/s3s.git?rev=c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2#c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -1943,7 +1965,7 @@ dependencies = [
  "chrono",
  "crc32c",
  "crc32fast",
- "digest 0.10.7",
+ "digest 0.11.0-pre.9",
  "futures",
  "hex-simd",
  "hmac",
@@ -1962,7 +1984,7 @@ dependencies = [
  "serde",
  "serde_urlencoded",
  "sha1",
- "sha2 0.10.8",
+ "sha2",
  "smallvec",
  "sync_wrapper 1.0.1",
  "thiserror",
@@ -1978,7 +2000,7 @@ dependencies = [
 [[package]]
 name = "s3s-policy"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=0caf79822ae1f2e7a7fad3c4a093c94dd2e2c33f#0caf79822ae1f2e7a7fad3c4a093c94dd2e2c33f"
+source = "git+https://github.com/Nugine/s3s.git?rev=c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2#c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2"
 dependencies = [
  "indexmap 2.6.0",
  "serde",
@@ -2054,24 +2076,13 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.6"
+version = "0.11.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+checksum = "9540978cef7a8498211c1b1c14e5ce920fe5bd524ea84f4a3d72d4602515ae93"
 dependencies = [
  "cfg-if",
  "cpufeatures",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
-version = "0.10.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "793db75ad2bcafc3ffa7c68b215fee268f537982cd901d132f89c6343f3a3dc8"
-dependencies = [
- "cfg-if",
- "cpufeatures",
- "digest 0.10.7",
+ "digest 0.11.0-pre.9",
 ]
 
 [[package]]

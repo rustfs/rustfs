@@ -113,6 +113,8 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         b.set_access(store.clone());
 
+        b.set_route(router::make_admin_route()?);
+
         // // Enable parsing virtual-hosted-style requests
         // if let Some(dm) = opt.domain_name {
         //     info!("virtual-hosted-style requests are enabled use domain_name {}", &dm);
@@ -135,9 +137,8 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
-        let adm_service = admin::register_admin_router();
 
-        let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, rpc_service, adm_service));
+        let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, rpc_service));
 
         let http_server = ConnBuilder::new(TokioExecutor::new());
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
