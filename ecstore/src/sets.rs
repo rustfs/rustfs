@@ -90,7 +90,8 @@ impl Sets {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
 
-                let endpoint = endpoints.endpoints.as_ref().get(idx).cloned();
+                let endpoint = endpoints.endpoints.as_ref()[idx].clone();
+                // let endpoint = endpoints.endpoints.as_ref().get(idx).cloned();
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -292,7 +293,24 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
     async fn storage_info(&self) -> StorageInfo {
-        unimplemented!()
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.storage_info())
+        }
+
+        let results = join_all(futures).await;
+
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        StorageInfo {
+            disks,
+            ..Default::default()
+        }
     }
     async fn local_storage_info(&self) -> StorageInfo {
         let mut futures = Vec::with_capacity(self.disk_set.len());
@@ -308,7 +326,10 @@ impl StorageAPI for Sets {
         for res in results.into_iter() {
             disks.extend_from_slice(&res.disks);
         }
-        StorageInfo { backend: None, disks }
+        StorageInfo {
+            disks,
+            ..Default::default()
+        }
     }
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()

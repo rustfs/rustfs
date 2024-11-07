@@ -122,7 +122,7 @@ impl LocalDisk {
             let fm = FormatV3::try_from(s)?;
             let (set_idx, disk_idx) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
 
-            if Some(set_idx) != ep.set_idx || Some(disk_idx) != ep.disk_idx {
+            if set_idx as i32 != ep.set_idx || disk_idx as i32 != ep.disk_idx {
                 return Err(Error::from(DiskError::InconsistentDisk));
             }
 
@@ -768,9 +768,27 @@ impl DiskAPI for LocalDisk {
 
     fn get_disk_location(&self) -> DiskLocation {
         DiskLocation {
-            pool_idx: self.endpoint.pool_idx,
-            set_idx: self.endpoint.set_idx,
-            disk_idx: self.endpoint.pool_idx,
+            pool_idx: {
+                if self.endpoint.pool_idx < 0 {
+                    None
+                } else {
+                    Some(self.endpoint.pool_idx as usize)
+                }
+            },
+            set_idx: {
+                if self.endpoint.set_idx < 0 {
+                    None
+                } else {
+                    Some(self.endpoint.set_idx as usize)
+                }
+            },
+            disk_idx: {
+                if self.endpoint.disk_idx < 0 {
+                    None
+                } else {
+                    Some(self.endpoint.disk_idx as usize)
+                }
+            },
         }
     }
 
@@ -811,13 +829,8 @@ impl DiskAPI for LocalDisk {
 
         let disk_id = fm.erasure.this;
 
-        match (self.endpoint.set_idx, self.endpoint.disk_idx) {
-            (Some(set_idx), Some(disk_idx)) => {
-                if m != set_idx || n != disk_idx {
-                    return Err(Error::new(DiskError::InconsistentDisk));
-                }
-            }
-            _ => return Err(Error::new(DiskError::InconsistentDisk)),
+        if m as i32 != self.endpoint.set_idx || n as i32 != self.endpoint.disk_idx {
+            return Err(Error::new(DiskError::InconsistentDisk));
         }
 
         format_info.id = Some(disk_id);

@@ -14,6 +14,7 @@ use crate::global::{
 use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode};
 use crate::heal::heal_ops::HealObjectFn;
 use crate::new_object_layer_fn;
+use crate::pools::PoolMeta;
 use crate::store_api::{BackendByte, BackendDisks, BackendInfo, ListMultipartsInfo, ObjectIO, StorageInfo};
 use crate::store_err::{
     is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found, StorageError,
@@ -52,7 +53,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -67,6 +68,7 @@ pub struct ECStore {
     pub pools: Vec<Arc<Sets>>,
     pub peer_sys: S3PeerSys,
     // pub local_disks: Vec<DiskStore>,
+    pub pool_meta: PoolMeta,
 }
 
 impl ECStore {
@@ -167,12 +169,15 @@ impl ECStore {
         }
 
         let peer_sys = S3PeerSys::new(&endpoint_pools);
+        let mut pool_meta = PoolMeta::new(pools.clone());
+        pool_meta.dont_save = true;
 
         let ec = ECStore {
             id: deployment_id.unwrap(),
             disk_map,
             pools,
             peer_sys,
+            pool_meta,
         };
 
         set_object_layer(ec.clone()).await;
@@ -626,9 +631,7 @@ pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()>
 
             set_drives.insert(ep.disk_idx, Some(disk.clone()));
 
-            if ep.pool_idx.is_some() && ep.set_idx.is_some() && ep.disk_idx.is_some() {
-                global_set_drives[ep.pool_idx.unwrap()][ep.set_idx.unwrap()][ep.disk_idx.unwrap()] = Some(disk.clone());
-            }
+            global_set_drives[ep.pool_idx as usize][ep.set_idx as usize][ep.disk_idx as usize] = Some(disk.clone());
         }
     }
 
@@ -854,10 +857,7 @@ impl StorageAPI for ECStore {
         }
 
         let backend = self.backend_info().await;
-        StorageInfo {
-            backend: Some(backend),
-            disks,
-        }
+        StorageInfo { backend: backend, disks }
     }
 
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
