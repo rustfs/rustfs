@@ -811,15 +811,15 @@ pub struct StorageDisk {
     pub used_inodes: u64,
     pub free_inodes: u64,
     pub local: bool,
-    pub pool_index: Option<usize>,
-    pub set_index: Option<usize>,
-    pub disk_index: Option<usize>,
+    pub pool_index: i32,
+    pub set_index: i32,
+    pub disk_index: i32,
 }
 
 #[derive(Debug, Default)]
 pub struct StorageInfo {
     pub disks: Vec<StorageDisk>,
-    pub backend: Option<BackendInfo>,
+    pub backend: BackendInfo,
 }
 
 #[derive(Debug, Default)]
