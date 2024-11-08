@@ -1,4 +1,3 @@
-use crate::bucket::metadata;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::error::{Error, Result};
 use crate::store_api::ObjectOptions;
@@ -7,7 +6,6 @@ use crate::utils::path::is_dir_object;
 use http::{HeaderMap, HeaderValue};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
-use tracing::warn;
 use uuid::Uuid;
 
 pub async fn put_opts(
@@ -70,9 +68,6 @@ fn get_default_opts(
     metadata: HashMap<String, String>,
     _copy_source: bool,
 ) -> Result<ObjectOptions> {
-    warn!("get headers: {:?}", &headers);
-    warn!("get metadata: {:?}", &metadata);
-
     Ok(ObjectOptions {
         user_defined: metadata.clone(),
         ..Default::default()

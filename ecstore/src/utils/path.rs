@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
@@ -67,6 +67,20 @@ pub fn path_join(elem: &[PathBuf]) -> PathBuf {
     }
 
     joined_path
+}
+
+pub fn base_dir_from_prefix(prefix: &str) -> String {
+    let mut base_dir = dir(prefix).to_owned();
+    if base_dir == "." || base_dir == "./" || base_dir == "/" {
+        base_dir = "".to_owned();
+    }
+    if !prefix.contains('/') {
+        base_dir = "".to_owned();
+    }
+    if !base_dir.is_empty() && !base_dir.ends_with(SLASH_SEPARATOR) {
+        base_dir.push_str(SLASH_SEPARATOR);
+    }
+    base_dir
 }
 
 pub struct LazyBuf {
@@ -184,9 +198,32 @@ pub fn clean(path: &str) -> String {
 
     out.string()
 }
+
+pub fn split(path: &str) -> (&str, &str) {
+    // Find the last occurrence of the '/' character
+    if let Some(i) = path.rfind('/') {
+        // Return the directory (up to and including the last '/') and the file name
+        return (&path[..i + 1], &path[i + 1..]);
+    }
+    // If no '/' is found, return an empty string for the directory and the whole path as the file name
+    (path, "")
+}
+
+pub fn dir(path: &str) -> &str {
+    let (a, _) = split(path);
+    a
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_base_dir_from_prefix() {
+        let a = "da/";
+        println!("---- in {}", a);
+        let a = base_dir_from_prefix(a);
+        println!("---- out {}", a);
+    }
 
     #[test]
     fn test_clean() {
