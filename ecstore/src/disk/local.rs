@@ -14,7 +14,7 @@ use crate::disk::error::{
     convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
     map_err_not_exists, os_err_to_file_err,
 };
-use crate::disk::os::check_path_length;
+use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
@@ -530,7 +530,7 @@ impl LocalDisk {
 
         for fi in fis {
             let data_dir = fm.delete_version(fi)?;
-            warn!("删除版本号 对应data_dir {:?}", &data_dir);
+
             if data_dir.is_some() {
                 let dir_path = self.get_object_path(volume, format!("{}/{}", path, data_dir.unwrap()).as_str())?;
                 self.move_to_trash(&dir_path, true, false).await?;
@@ -539,8 +539,6 @@ impl LocalDisk {
 
         // 没有版本了，删除xl.meta
         if fm.versions.is_empty() {
-            warn!("没有版本了，删除xl.meta");
-
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
             return Ok(());
         }
@@ -1219,6 +1217,7 @@ impl DiskAPI for LocalDisk {
         Ok(FileReader::Local(LocalFileReader::new(f)))
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
             let origvolume_dir = self.get_bucket_path(origvolume)?;
@@ -1249,6 +1248,26 @@ impl DiskAPI for LocalDisk {
 
     // TODO: io.writer
     async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
+        // warn!("walk_dir opts {:?}", &opts);
+
+        let mut metas = Vec::new();
+
+        if opts.base_dir.ends_with(SLASH_SEPARATOR) {
+            let fpath = self.get_object_path(
+                &opts.bucket,
+                format!("{}/{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), STORAGE_FORMAT_FILE).as_str(),
+            )?;
+            if let Ok(data) = self.read_metadata(fpath).await {
+                let meta = MetaCacheEntry {
+                    name: opts.base_dir.clone(),
+                    metadata: data,
+                    ..Default::default()
+                };
+                metas.push(meta);
+                return Ok(metas);
+            }
+        }
+
         let mut entries = match self.list_dir("", &opts.bucket, &opts.base_dir, -1).await {
             Ok(res) => res,
             Err(e) => {
@@ -1274,12 +1293,12 @@ impl DiskAPI for LocalDisk {
 
         let bucket = opts.bucket.as_str();
 
-        let mut metas = Vec::new();
-
         let mut dir_objes = HashSet::new();
 
         // 第一层过滤
         for entry in entries.iter() {
+            // warn!("walk_dir  get entry {:?}", &entry);
+
             // check limit
             if opts.limit > 0 && objs_returned >= opts.limit {
                 return Ok(metas);
@@ -1289,17 +1308,16 @@ impl DiskAPI for LocalDisk {
                 continue;
             }
 
-            // warn!("walk_dir entry {}", entry);
-
             let mut meta = MetaCacheEntry { ..Default::default() };
 
-            let fpath = self.get_object_path(bucket, format!("{}/{}", &entry, STORAGE_FORMAT_FILE).as_str())?;
+            let mut name = {
+                if opts.base_dir.is_empty() {
+                    entry.clone()
+                } else {
+                    format!("{}{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), SLASH_SEPARATOR, entry)
+                }
+            };
 
-            if let Ok(data) = self.read_metadata(&fpath).await {
-                meta.metadata = data;
-            }
-
-            let mut name = entry.clone();
             if name.ends_with(SLASH_SEPARATOR) {
                 if name.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
                     name = format!("{}{}", name.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
@@ -1309,6 +1327,18 @@ impl DiskAPI for LocalDisk {
                 }
             }
             meta.name = name;
+
+            let fpath = self.get_object_path(bucket, format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE).as_str())?;
+
+            if let Ok(data) = self.read_metadata(&fpath).await {
+                meta.metadata = data;
+            } else {
+                let fpath = self.get_object_path(bucket, &meta.name)?;
+
+                if !is_empty_dir(fpath).await {
+                    meta.name = format!("{}{}", &meta.name, SLASH_SEPARATOR);
+                }
+            }
 
             metas.push(meta);
         }
@@ -1660,8 +1690,6 @@ impl DiskAPI for LocalDisk {
     }
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         let p = self.get_object_path(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;
-
-        warn!("write_metadata {:?} {:?}", &p, &fi);
 
         let mut meta = FileMeta::new();
         if !fi.fresh {
