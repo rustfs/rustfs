@@ -537,6 +537,8 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub src_pool_idx: usize,
+    pub user_defined: HashMap<String, String>,
+    pub preserve_etag: Option<String>,
 }
 
 // impl Default for ObjectOptions {
