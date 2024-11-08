@@ -73,6 +73,10 @@ pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) ->
     Ok(())
 }
 
+pub async fn is_empty_dir(path: impl AsRef<Path>) -> bool {
+    read_dir(path.as_ref(), 1).await.is_ok_and(|v| v.is_empty())
+}
+
 // read_dir  count read limit. when count == 0 unlimit.
 pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> Result<Vec<String>> {
     let mut entries = fs::read_dir(path.as_ref()).await?;

@@ -16,8 +16,11 @@ use ecstore::bucket::policy_sys::PolicySys;
 use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
+use ecstore::disk::error::is_err_file_not_found;
 use ecstore::disk::error::DiskError;
+use ecstore::error::Error as EcError;
 use ecstore::new_object_layer_fn;
+use ecstore::options::extract_metadata;
 use ecstore::options::put_opts;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
@@ -30,6 +33,7 @@ use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
+use ecstore::xhttp;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
@@ -45,6 +49,7 @@ use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
@@ -66,6 +71,15 @@ lazy_static! {
         id: Some("c19050dbcee97fda828689dda99097a6321af2248fa760517237346e5d9c8a66".to_owned()),
     };
 }
+
+fn to_s3_error(err: EcError) -> S3Error {
+    if is_err_file_not_found(&err) {
+        return S3Error::with_message(S3ErrorCode::NoSuchKey, format!(" ec err {}", err));
+    }
+
+    S3Error::with_message(S3ErrorCode::InternalError, format!(" ec err {}", err))
+}
+
 #[derive(Debug, Clone)]
 pub struct FS {
     // pub store: ECStore,
@@ -325,14 +339,28 @@ impl S3 for FS {
 
         let info = reader.object_info;
 
-        let content_type = try_!(ContentType::from_str("application/x-msdownload"));
+        let content_type = {
+            if let Some(content_type) = info.content_type {
+                let ct = match ContentType::from_str(&content_type) {
+                    Ok(res) => Some(res),
+                    Err(err) => {
+                        error!("parse content-type err {} {:?}", &content_type, err);
+                        //
+                        None
+                    }
+                };
+                ct
+            } else {
+                None
+            }
+        };
         let last_modified = info.mod_time.map(Timestamp::from);
 
         let output = GetObjectOutput {
             body: Some(reader.stream),
             content_length: Some(info.size as i64),
             last_modified,
-            content_type: Some(content_type),
+            content_type,
             ..Default::default()
         };
 
@@ -375,15 +403,32 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        let info = try_!(store.get_object_info(&bucket, &key, &ObjectOptions::default()).await);
+        let info = store
+            .get_object_info(&bucket, &key, &ObjectOptions::default())
+            .await
+            .map_err(to_s3_error)?;
         debug!("info {:?}", info);
 
-        let content_type = try_!(ContentType::from_str("application/x-msdownload"));
+        let content_type = {
+            if let Some(content_type) = info.content_type {
+                let ct = match ContentType::from_str(&content_type) {
+                    Ok(res) => Some(res),
+                    Err(err) => {
+                        error!("parse content-type err {} {:?}", &content_type, err);
+                        //
+                        None
+                    }
+                };
+                ct
+            } else {
+                None
+            }
+        };
         let last_modified = info.mod_time.map(Timestamp::from);
 
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(info.size))),
-            content_type: Some(content_type),
+            content_type,
             last_modified,
             // metadata: object_metadata,
             ..Default::default()
@@ -437,6 +482,8 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
+        // warn!("list_objects_v2 input {:?}", &req.input);
+
         let ListObjectsV2Input {
             bucket,
             continuation_token,
@@ -534,8 +581,8 @@ impl S3 for FS {
             body,
             bucket,
             key,
-            metadata,
             content_length,
+            tagging,
             ..
         } = input;
 
@@ -552,7 +599,12 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        let opts: ObjectOptions = try_!(put_opts(&bucket, &key, None, &req.headers, metadata).await);
+        let mut metadata = extract_metadata(&req.headers);
+        if let Some(tags) = tagging {
+            metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
+        }
+
+        let opts: ObjectOptions = try_!(put_opts(&bucket, &key, None, &req.headers, Some(metadata)).await);
 
         let obj_info = try_!(store.put_object(&bucket, &key, &mut reader, &opts).await);
 
@@ -573,12 +625,12 @@ impl S3 for FS {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let CreateMultipartUploadInput {
-            bucket, key, metadata, ..
+            bucket, key, tagging, ..
         } = req.input;
 
         // mc cp step 3
 
-        debug!("create_multipart_upload meta {:?}", &metadata);
+        // debug!("create_multipart_upload meta {:?}", &metadata);
 
         let layer = new_object_layer_fn();
         let lock = layer.read().await;
@@ -587,8 +639,15 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        let MultipartUploadResult { upload_id, .. } =
-            try_!(store.new_multipart_upload(&bucket, &key, &ObjectOptions::default()).await);
+        let mut metadata = extract_metadata(&req.headers);
+
+        if let Some(tags) = tagging {
+            metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
+        }
+
+        let opts: ObjectOptions = try_!(put_opts(&bucket, &key, None, &req.headers, Some(metadata)).await);
+
+        let MultipartUploadResult { upload_id, .. } = try_!(store.new_multipart_upload(&bucket, &key, &opts).await);
 
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
@@ -609,6 +668,7 @@ impl S3 for FS {
             upload_id,
             part_number,
             content_length,
+            // content_md5,
             ..
         } = req.input;
 
@@ -629,6 +689,8 @@ impl S3 for FS {
             Some(s) => s,
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
+
+        // TODO: hash_reader
 
         let info = try_!(
             store
