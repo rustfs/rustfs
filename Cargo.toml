@@ -57,7 +57,7 @@ s3s-policy = { git = "https://github.com/Nugine/s3s.git", rev = "c41ac1d30a0ae3d
 serde = { version = "1.0.214", features = ["derive"] }
 serde_json = "1.0.132"
 tempfile = "3.13.0"
-thiserror = "1.0.66"
+thiserror = "1.0.68"
 time = { version = "0.3.36", features = [
     "std",
     "parsing",
@@ -75,7 +75,7 @@ tracing = "0.1.40"
 tracing-error = "0.2.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
 transform-stream = "0.3.0"
-url = "2.5.2"
+url = "2.5.3"
 uuid = { version = "1.11.0", features = [
     "v4",
     "fast-rng",
