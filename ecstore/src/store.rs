@@ -21,7 +21,7 @@ use crate::store_err::{
 };
 use crate::store_init::ec_drives_no_config;
 use crate::utils::crypto::base64_decode;
-use crate::utils::path::{decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
+use crate::utils::path::{base_dir_from_prefix, decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
 use crate::{
     bucket::metadata::BucketMetadata,
     disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
@@ -55,7 +55,7 @@ use time::OffsetDateTime;
 use tokio::fs;
 use tokio::sync::{RwLock, Semaphore};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const MAX_UPLOADS_LIST: usize = 10000;
@@ -218,8 +218,18 @@ impl ECStore {
         self.pools.len() == 1
     }
 
-    async fn list_path(&self, opts: &ListPathOptions) -> Result<ListObjectsInfo> {
-        let objects = self.list_merged(opts).await?;
+    async fn list_path(&self, opts: &ListPathOptions, delimiter: &str) -> Result<ListObjectsInfo> {
+        // if opts.prefix.ends_with(SLASH_SEPARATOR) {
+        //     return Err(Error::msg("eof"));
+        // }
+
+        let mut opts = opts.clone();
+
+        if opts.base_dir.is_empty() {
+            opts.base_dir = base_dir_from_prefix(&opts.prefix);
+        }
+
+        let objects = self.list_merged(&opts, delimiter).await?;
 
         let info = ListObjectsInfo {
             objects,
@@ -229,9 +239,10 @@ impl ECStore {
     }
 
     // 读所有
-    async fn list_merged(&self, opts: &ListPathOptions) -> Result<Vec<ObjectInfo>> {
-        let opts = WalkDirOptions {
+    async fn list_merged(&self, opts: &ListPathOptions, delimiter: &str) -> Result<Vec<ObjectInfo>> {
+        let walk_opts = WalkDirOptions {
             bucket: opts.bucket.clone(),
+            base_dir: opts.base_dir.clone(),
             ..Default::default()
         };
 
@@ -241,7 +252,7 @@ impl ECStore {
 
         for sets in self.pools.iter() {
             for set in sets.disk_set.iter() {
-                futures.push(set.walk_dir(&opts));
+                futures.push(set.walk_dir(&walk_opts));
             }
         }
 
@@ -260,14 +271,25 @@ impl ECStore {
                 let entrys = disks_res.as_ref().unwrap();
 
                 for entry in entrys {
+                    // warn!("lst_merged entry---- {}", &entry.name);
+
+                    if !opts.prefix.is_empty() && !entry.name.starts_with(&opts.prefix) {
+                        continue;
+                    }
+
                     if !uniq.contains(&entry.name) {
                         uniq.insert(entry.name.clone());
                         // TODO: 过滤
+
                         if opts.limit > 0 && ress.len() as i32 >= opts.limit {
                             return Ok(ress);
                         }
 
                         if entry.is_object() {
+                            if !delimiter.is_empty() {
+                                // entry.name.trim_start_matches(pat)
+                            }
+
                             let fi = entry.to_fileinfo(&opts.bucket)?;
                             if let Some(f) = fi {
                                 ress.push(f.to_object_info(&opts.bucket, &entry.name, false));
@@ -703,7 +725,7 @@ pub struct PoolObjInfo {
     pub err: Option<Error>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
     pub id: String,
 
@@ -1108,9 +1130,9 @@ impl StorageAPI for ECStore {
     async fn list_objects_v2(
         &self,
         bucket: &str,
-        _prefix: &str,
+        prefix: &str,
         continuation_token: &str,
-        _delimiter: &str,
+        delimiter: &str,
         max_keys: i32,
         _fetch_owner: bool,
         _start_after: &str,
@@ -1118,10 +1140,11 @@ impl StorageAPI for ECStore {
         let opts = ListPathOptions {
             bucket: bucket.to_string(),
             limit: max_keys,
+            prefix: prefix.to_owned(),
             ..Default::default()
         };
 
-        let info = self.list_path(&opts).await?;
+        let info = self.list_path(&opts, delimiter).await?;
 
         // warn!("list_objects_v2 info {:?}", info);
 
