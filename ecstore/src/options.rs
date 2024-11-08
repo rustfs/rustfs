@@ -1,12 +1,12 @@
-use http::{HeaderMap, HeaderValue};
-use uuid::Uuid;
-
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::error::{Error, Result};
 use crate::store_api::ObjectOptions;
 use crate::store_err::StorageError;
 use crate::utils::path::is_dir_object;
+use http::{HeaderMap, HeaderValue};
+use lazy_static::lazy_static;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 pub async fn put_opts(
     bucket: &str,
@@ -58,14 +58,64 @@ pub fn put_opts_from_headers(
     headers: &HeaderMap<HeaderValue>,
     metadata: Option<HashMap<String, String>>,
 ) -> Result<ObjectOptions> {
-    // TODO custom headers
+    let metadata = metadata.unwrap_or_default();
+
     get_default_opts(headers, metadata, false)
 }
 
 fn get_default_opts(
-    _headers: &HeaderMap<HeaderValue>,
-    _metadata: Option<HashMap<String, String>>,
+    headers: &HeaderMap<HeaderValue>,
+    metadata: HashMap<String, String>,
     _copy_source: bool,
 ) -> Result<ObjectOptions> {
-    Ok(ObjectOptions::default())
+    Ok(ObjectOptions {
+        user_defined: metadata.clone(),
+        ..Default::default()
+    })
+}
+
+pub fn extract_metadata(headers: &HeaderMap<HeaderValue>) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+
+    extract_metadata_from_mime(&headers, &mut metadata);
+
+    metadata
+}
+
+fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &mut HashMap<String, String>) {
+    for (k, v) in headers.iter() {
+        if k.as_str().starts_with("x-amz-meta-") {
+            metadata.insert(k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string());
+            continue;
+        }
+
+        if k.as_str().starts_with("x-rustfs-meta-") {
+            metadata.insert(k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string());
+            continue;
+        }
+
+        for hd in SUPPORTED_HEADERS.iter() {
+            if k.as_str() == *hd {
+                metadata.insert(k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string());
+                continue;
+            }
+        }
+    }
+
+    if !metadata.contains_key("content-type") {
+        metadata.insert("content-type".to_owned(), "binary/octet-stream".to_owned());
+    }
+}
+lazy_static! {
+    static ref SUPPORTED_HEADERS: Vec<&'static str> = vec![
+        "content-type",
+        "cache-control",
+        "content-language",
+        "content-encoding",
+        "content-disposition",
+        "x-amz-storage-class",
+        "x-amz-tagging",
+        "expires",
+        "x-amz-replication-status"
+    ];
 }
