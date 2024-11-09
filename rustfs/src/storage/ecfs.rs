@@ -588,7 +588,19 @@ impl S3 for FS {
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        let Some(content_length) = content_length else { return Err(s3_error!(IncompleteBody)) };
+        let content_length = match content_length {
+            Some(c) => c,
+            None => {
+                if let Some(val) = req.headers.get(xhttp::AMZ_DECODED_CONTENT_LENGTH) {
+                    match atoi::atoi::<i64>(val.as_bytes()) {
+                        Some(x) => x,
+                        None => return Err(s3_error!(UnexpectedContent)),
+                    }
+                } else {
+                    return Err(s3_error!(UnexpectedContent));
+                }
+            }
+        };
 
         let mut reader = PutObjReader::new(body, content_length as usize);
 
@@ -677,7 +689,19 @@ impl S3 for FS {
         // let upload_id =
 
         let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
-        let content_length = content_length.ok_or_else(|| s3_error!(IncompleteBody))?;
+        let content_length = match content_length {
+            Some(c) => c,
+            None => {
+                if let Some(val) = req.headers.get(xhttp::AMZ_DECODED_CONTENT_LENGTH) {
+                    match atoi::atoi::<i64>(val.as_bytes()) {
+                        Some(x) => x,
+                        None => return Err(s3_error!(UnexpectedContent)),
+                    }
+                } else {
+                    return Err(s3_error!(UnexpectedContent));
+                }
+            }
+        };
 
         // mc cp step 4
         let mut data = PutObjReader::new(body, content_length as usize);
