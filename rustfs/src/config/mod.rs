@@ -1,4 +1,7 @@
 use clap::Parser;
+use const_str::concat;
+
+shadow_rs::shadow!(build);
 
 /// Default port that a rustfs server listens on.
 ///
@@ -7,7 +10,21 @@ pub const DEFAULT_PORT: u16 = 9000;
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
+const LONG_VERSION: &str = concat!(
+    concat!(build::PKG_VERSION, "\n"),
+    concat!("build time   : ", build::BUILD_TIME, "\n"),
+    concat!("build profile: ", build::BUILD_RUST_CHANNEL, "\n"),
+    concat!("build os     : ", build::BUILD_OS, "\n"),
+    concat!("rust version : ", build::RUST_VERSION, "\n"),
+    concat!("rust channel : ", build::RUST_CHANNEL, "\n"),
+    concat!("git branch   : ", build::BRANCH, "\n"),
+    concat!("git commit   : ", build::COMMIT_HASH, "\n"),
+    concat!("git tag      : ", build::TAG, "\n"),
+    concat!("git status   :\n", build::GIT_STATUS_FILE),
+);
+
 #[derive(Debug, Parser)]
+#[command(version, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
     #[arg(required = true)]
