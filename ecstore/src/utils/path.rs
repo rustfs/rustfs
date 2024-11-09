@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
