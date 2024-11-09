@@ -67,34 +67,36 @@ impl Erasure {
         );
 
         let mut total: usize = 0;
+
         loop {
-            let new_len = {
-                let remain = total_size - total;
-                if remain > self.block_size {
-                    self.block_size
-                } else {
-                    remain
-                }
-            };
-
-            if new_len == 0 {
-                break;
-            }
-
-            self.buf.resize(new_len, 0u8);
-
-            match reader.read_exact(&mut self.buf).await {
-                Ok(res) => res,
-                Err(e) => {
-                    if let ErrorKind::UnexpectedEof = e.kind() {
-                        break;
+            if total_size > 0 {
+                let new_len = {
+                    let remain = total_size - total;
+                    if remain > self.block_size {
+                        self.block_size
                     } else {
-                        return Err(Error::new(e));
+                        remain
                     }
-                }
-            };
+                };
 
-            total += self.buf.len();
+                if new_len == 0 && total > 0 {
+                    break;
+                }
+
+                self.buf.resize(new_len, 0u8);
+
+                match reader.read_exact(&mut self.buf).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        if let ErrorKind::UnexpectedEof = e.kind() {
+                            break;
+                        } else {
+                            return Err(Error::new(e));
+                        }
+                    }
+                };
+                total += self.buf.len();
+            }
 
             let blocks = self.encode_data(&self.buf)?;
             let mut errs = Vec::new();
@@ -112,12 +114,19 @@ impl Erasure {
 
             let none_count = errs.iter().filter(|&x| x.is_none()).count();
             if none_count >= write_quorum {
+                if total_size == 0 {
+                    break;
+                }
                 continue;
             }
 
             if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
                 warn!("Erasure encode errs {:?}", &errs);
                 return Err(err);
+            }
+
+            if total_size == 0 {
+                break;
             }
         }
 
