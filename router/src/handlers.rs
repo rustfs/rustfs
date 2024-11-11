@@ -1,17 +1,88 @@
+use crate::router::Operation;
 use hyper::StatusCode;
 use matchit::Params;
 use s3s::{s3_error, Body, S3Request, S3Response, S3Result};
+use serde::{Deserialize, Serialize};
+use serde_urlencoded::from_bytes;
 use tracing::warn;
 
-use crate::router::Operation;
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct AssumeRoleRequest {
+    pub action: String,
+    pub duration_seconds: usize,
+    pub version: String,
+    pub role_arn: String,
+    pub role_session_name: String,
+    pub policy: String,
+    pub external_id: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct AssumeRoleResponse {
+    #[serde(rename = "AssumeRoleResult")]
+    pub result: AssumeRoleResult,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct AssumeRoleResult {
+    pub credentials: Credentials,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct Credentials {
+    #[serde(rename = "AccessKeyId")]
+    pub access_key: String,
+    #[serde(rename = "SecretAccessKey")]
+    pub secret_key: String,
+    pub status: String,
+    pub expiration: usize,
+    pub session_token: String,
+    pub parent_user: String,
+}
 
 pub struct AssumeRoleHandle {}
 #[async_trait::async_trait]
 impl Operation for AssumeRoleHandle {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle AssumeRoleHandle");
 
-        return Err(s3_error!(NotImplemented));
+        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get body failed")) };
+
+        warn!("AssumeRole get cred {:?}", cred);
+
+        let mut input = req.input;
+
+        let Some(bytes) = input.take_bytes() else {
+            return Err(s3_error!(InvalidRequest, "get body failed"));
+        };
+        let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
+
+        warn!("AssumeRole get body {:?}", body);
+
+        let resp = AssumeRoleResponse {
+            result: AssumeRoleResult {
+                credentials: Credentials {
+                    access_key: "test".to_owned(),
+                    secret_key: "test".to_owned(),
+                    status: "on".to_owned(),
+                    expiration: 0,
+                    session_token: "sdf".to_owned(),
+                    parent_user: cred.access_key,
+                },
+            },
+        };
+        // getAssumeRoleCredentials
+        let output = serde_xml_rs::to_string(&resp).unwrap();
+
+        warn!("output {:?}", output);
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+
+        // return Err(s3_error!(NotImplemented));
     }
 }
 
