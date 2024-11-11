@@ -64,7 +64,7 @@ pub fn put_opts_from_headers(
 }
 
 fn get_default_opts(
-    headers: &HeaderMap<HeaderValue>,
+    _headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
     _copy_source: bool,
 ) -> Result<ObjectOptions> {
