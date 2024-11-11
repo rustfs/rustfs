@@ -141,6 +141,7 @@ impl HealSequence {
             ..Default::default()
         }
     }
+
 }
 
 impl HealSequence {
@@ -160,7 +161,7 @@ impl HealSequence {
         self.heal_failed_items_map.clone()
     }
 
-    fn count_failed(&mut self, heal_type: HealItemType) {
+    pub fn count_failed(&mut self, heal_type: HealItemType) {
         *self.heal_failed_items_map.entry(heal_type).or_insert(0) += 1;
         self.last_heal_activity = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -168,7 +169,7 @@ impl HealSequence {
             .as_secs();
     }
 
-    fn count_scanned(&mut self, heal_type: HealItemType) {
+    pub fn count_scanned(&mut self, heal_type: HealItemType) {
         *self.scanned_items_map.entry(heal_type).or_insert(0) += 1;
         self.last_heal_activity = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -176,7 +177,7 @@ impl HealSequence {
             .as_secs();
     }
 
-    fn count_healed(&mut self, heal_type: HealItemType) {
+    pub fn count_healed(&mut self, heal_type: HealItemType) {
         *self.healed_items_map.entry(heal_type).or_insert(0) += 1;
         self.last_heal_activity = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -353,10 +354,25 @@ pub struct AllHealState {
 }
 
 impl AllHealState {
-    pub fn new(cleanup: bool) -> Self {
-        let hstate = AllHealState::default();
+    pub fn new(cleanup: bool) -> Arc<RwLock<Self>> {
+        let hstate = Arc::new(RwLock::new(AllHealState::default()));
+        let (_, mut rx) = broadcast::channel(1);
         if cleanup {
-            // spawn(f);
+            let hstate_clone = hstate.clone();
+            tokio::spawn(async move {
+                loop {
+                    select! {
+                        result = rx.recv() =>{
+                            if let Ok(true) = result {
+                                return;
+                            }
+                        }
+                        _ = sleep(Duration::from_secs(5 * 60)) => {
+                            hstate_clone.write().await.periodic_heal_seqs_clean().await;
+                        }
+                    }
+                }
+            });
         }
 
         hstate
@@ -382,7 +398,7 @@ impl AllHealState {
         });
     }
 
-    async fn update_heal_status(&mut self, tracker: &HealingTracker) {
+    pub async fn update_heal_status(&mut self, tracker: &HealingTracker) {
         let _ = self.mu.write().await;
         let _ = tracker.mu.read().await;
 
@@ -427,29 +443,18 @@ impl AllHealState {
         });
     }
 
-    async fn periodic_heal_seqs_clean(&mut self, mut rx: Receiver<bool>) {
-        loop {
-            select! {
-                result = rx.recv() =>{
-                    if let Ok(true) = result {
-                        return;
-                    }
-                }
-                _ = sleep(Duration::from_secs(5 * 60)) => {
-                    let _ = self.mu.write().await;
-                    let now = SystemTime::now();
-
-                    let mut keys_to_reomve = Vec::new();
-                    for (k, v) in self.heal_seq_map.iter() {
-                        if v.has_ended().await && (UNIX_EPOCH + Duration::from_secs(*(v.end_time.read().await)) + KEEP_HEAL_SEQ_STATE_DURATION) < now {
-                            keys_to_reomve.push(k.clone())
-                        }
-                    }
-                    for key in keys_to_reomve.iter() {
-                        self.heal_seq_map.remove(key);
-                    }
-                }
+    async fn periodic_heal_seqs_clean(&mut self) {
+        let _ = self.mu.write().await;
+        let now = SystemTime::now();
+        
+        let mut keys_to_reomve = Vec::new();
+        for (k, v) in self.heal_seq_map.iter() {
+            if v.has_ended().await && (UNIX_EPOCH + Duration::from_secs(*(v.end_time.read().await)) + KEEP_HEAL_SEQ_STATE_DURATION) < now {
+                keys_to_reomve.push(k.clone())
             }
+        }
+        for key in keys_to_reomve.iter() {
+            self.heal_seq_map.remove(key);
         }
     }
 

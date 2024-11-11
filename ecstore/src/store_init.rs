@@ -2,12 +2,10 @@ use crate::config::{storageclass, KVS};
 use crate::disk::DiskAPI;
 use crate::{
     disk::{
-        error::DiskError,
-        format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
-        new_disk, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
+        error::DiskError, format::{FormatErasureVersion, FormatMetaVersion, FormatV3}, new_disk, DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET
     },
     endpoints::Endpoints,
-    error::{Error, Result},
+    error::{Error, Result}, heal::heal_commands::init_healing_tracker,
 };
 use futures::future::join_all;
 use std::{
@@ -114,7 +112,7 @@ fn init_format_erasure(
     fms
 }
 
-fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {
+pub fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {
     let mut countmap = HashMap::new();
 
     for f in formats.iter() {
@@ -148,7 +146,7 @@ fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3
     Ok(format)
 }
 
-fn check_format_erasure_values(
+pub fn check_format_erasure_values(
     formats: &[Option<FormatV3>],
     // disks: &Vec<Option<DiskStore>>,
     set_drive_count: usize,
@@ -184,7 +182,7 @@ fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
 }
 
 // load_format_erasure_all 读取所有foramt.json
-async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
+pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
     let mut futures = Vec::with_capacity(disks.len());
     let mut datas = Vec::with_capacity(disks.len());
     let mut errors = Vec::with_capacity(disks.len());
@@ -220,7 +218,7 @@ async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Ve
     (datas, errors)
 }
 
-pub async fn load_format_erasure(disk: &DiskStore, _heal: bool) -> Result<FormatV3, Error> {
+pub async fn load_format_erasure(disk: &DiskStore, heal: bool) -> Result<FormatV3, Error> {
     let data = disk
         .read_all(RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
         .await
@@ -231,9 +229,15 @@ pub async fn load_format_erasure(disk: &DiskStore, _heal: bool) -> Result<Format
             None => e,
         })?;
 
-    let fm = FormatV3::try_from(data.as_slice())?;
+    let mut fm = FormatV3::try_from(data.as_slice())?;
 
-    // TODO: heal
+    if heal {
+        let info = disk.disk_info(&DiskInfoOptions {
+            noop: heal,
+            ..Default::default()
+        }).await?;
+        fm.disk_info = Some(info);
+    }
 
     Ok(fm)
 }
@@ -242,7 +246,7 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
     let mut futures = Vec::with_capacity(disks.len());
 
     for (i, disk) in disks.iter().enumerate() {
-        futures.push(save_format_file(disk, &formats[i]));
+        futures.push(save_format_file(disk, &formats[i], ""));
     }
 
     let mut errors = Vec::with_capacity(disks.len());
@@ -262,7 +266,7 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
     errors
 }
 
-async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -> Result<()> {
+pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>, heal_id: &str) -> Result<()> {
     if disk.is_none() {
         return Err(Error::new(DiskError::DiskNotFound));
     }
@@ -281,6 +285,10 @@ async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -
         .await?;
 
     disk.set_disk_id(Some(format.erasure.this)).await?;
+    if !heal_id.is_empty() {
+        let mut ht = init_healing_tracker(disk.clone(), heal_id).await?;
+        return ht.save().await;
+    }
 
     Ok(())
 }

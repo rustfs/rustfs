@@ -106,6 +106,9 @@ pub enum DiskError {
 
     #[error("part missing or corrupt")]
     PartMissingOrCorrupt,
+
+    #[error("No healing is required")]
+    NoHealRequired,
 }
 
 impl DiskError {
@@ -210,6 +213,7 @@ pub fn clone_disk_err(e: &DiskError) -> Error {
         DiskError::MoreData => Error::new(DiskError::MoreData),
         DiskError::OutdatedXLMeta => Error::new(DiskError::OutdatedXLMeta),
         DiskError::PartMissingOrCorrupt => Error::new(DiskError::PartMissingOrCorrupt),
+        DiskError::NoHealRequired => Error::new(DiskError::NoHealRequired),
     }
 }
 

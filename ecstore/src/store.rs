@@ -10,7 +10,8 @@ use crate::global::{
     is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION,
     DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
 };
-use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode};
+use crate::heal::data_usage::DataUsageInfo;
+use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode, HEAL_ITEM_METADATA};
 use crate::heal::heal_ops::HealObjectFn;
 use crate::new_object_layer_fn;
 use crate::store_api::{ListMultipartsInfo, ObjectIO};
@@ -43,6 +44,7 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
+use tokio::sync::mpsc::Sender;
 use std::cmp::Ordering;
 use std::slice::Iter;
 use std::{
@@ -52,10 +54,11 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use crate::heal::data_usage_cache::DataUsageCache;
 
 const MAX_UPLOADS_LIST: usize = 10000;
 
@@ -486,6 +489,47 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<(PoolObjInfo, Vec<Error>)> {
         internal_get_pool_info_existing_with_opts(&self.pools, bucket, object, opts).await
+    }
+
+    pub async fn ns_scanner(&self, updates: Sender<DataUsageInfo>, want_cycle: usize, heal_scan_mode: HealScanMode) -> Result<()> {
+        let all_buckets = self.list_bucket(&BucketOptions::default()).await?;
+        if all_buckets.is_empty() {
+            let _ = updates.send(DataUsageInfo::default()).await;
+            return Ok(());
+        }
+
+        let mut total_results = 0;
+        let mut result_index = 0;
+        self.pools.iter().for_each(|pool| {
+            total_results += pool.disk_set.len();
+        });
+        let mut results = Arc::new(RwLock::new(vec![DataUsageCache::default(); total_results]));
+        let mut futures = Vec::new();
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                let index = result_index;
+                let results_clone = results.clone();
+                futures.push(async move { 
+                    let (tx, mut rx) = mpsc::channel(100);
+                    let task = tokio::spawn(async move {
+                        loop {
+                            match rx.recv().await {
+                                Some(info) => {
+                                    results_clone.write().await[index] = info;
+                                },
+                                None => {
+                                    return ;
+                                }
+                            }
+                        }
+                    });
+                    
+                    let _ = task.await;
+                });
+                result_index += 1;
+            }
+        }
+        Ok(())
     }
 
     async fn get_latest_object_info_with_idx(
@@ -1369,51 +1413,93 @@ impl StorageAPI for ECStore {
         }
         counts
     }
-    async fn heal_format(&self, dry_run: bool) -> Result<HealResultItem> {
-        unimplemented!()
+    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        let mut r = HealResultItem {
+            heal_item_type: HEAL_ITEM_METADATA.to_string(),
+            detail: "disk-format".to_string(),
+            ..Default::default()
+        };
+
+        let mut count_no_heal = 0;
+        for pool in self.pools.iter() {
+            let (mut result, err) = pool.heal_format(dry_run).await?;
+            if let Some(err) = err {
+                match err.downcast_ref::<DiskError>() {
+                    Some(DiskError::NoHealRequired) => {
+                        count_no_heal += 1;
+                    },
+                    _ => {
+
+                        continue;
+                    }
+                }
+            }
+            r.disk_count += result.disk_count;
+            r.set_count += result.set_count;
+            r.before.append(&mut result.before);
+            r.after.append(&mut result.after);
+
+        }
+        if count_no_heal == self.pools.len() {
+            return Ok((r, Some(Error::new(DiskError::NoHealRequired))));
+        }
+        Ok((r, None))
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         unimplemented!()
     }
-    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<HealResultItem> {
+    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<(HealResultItem, Option<Error>)> {
         let object = utils::path::encode_dir_object(object);
-        let mut errs = HashMap::new();
-        let mut results = HashMap::new();
+        let errs = Arc::new(RwLock::new(vec![None; self.pools.len()]));
+        let results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.pools.len()]));
+        let mut futures = Vec::with_capacity(self.pools.len());
         for (idx, pool) in self.pools.iter().enumerate() {
             //TODO: IsSuspended
-            match pool.heal_object(bucket, &object, version_id, opts).await {
-                Ok(mut result) => {
-                    result.object = utils::path::decode_dir_object(&result.object);
-                    results.insert(idx, result);
+            let object = object.clone();
+            let results = results.clone();
+            let errs = errs.clone();
+            futures.push(async move {
+                match pool.heal_object(bucket, &object, version_id, opts).await {
+                    Ok((mut result, err)) => {
+                        result.object = utils::path::decode_dir_object(&result.object);
+                        results.write().await.insert(idx, result);
+                        errs.write().await.insert(idx, err);
+                    }
+                    Err(err) => {
+                        errs.write().await.insert(idx, Some(err));
+                    }
                 }
-                Err(err) => {
-                    errs.insert(idx, err);
-                }
-            }
+            });
         }
+        let _ = join_all(futures).await;
 
         // Return the first nil error
-        for i in 0..self.pools.len() {
-            if !errs.contains_key(&i) {
-                return Ok(results.remove(&i).unwrap());
+        for (index, err) in errs.read().await.iter().enumerate() {
+            if err.is_none() {
+                return Ok((results.write().await.remove(index), None));
             }
         }
 
         // No pool returned a nil error, return the first non 'not found' error
-        for (k, err) in errs.iter() {
-            match err.downcast_ref::<DiskError>() {
-                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
-                _ => return Ok(results.remove(k).unwrap()),
+        for (index, err) in errs.read().await.iter().enumerate() {
+            match err {
+                Some(err) => match err.downcast_ref::<DiskError>() {
+                    Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                    _ => return Ok((results.write().await.remove(index), Some(err.clone()))),
+                },
+                None => {
+                    return Ok((results.write().await.remove(index), None));
+                }
             }
         }
 
         // At this stage, all errors are 'not found'
         if !version_id.is_empty() {
-            return Err(Error::new(DiskError::FileVersionNotFound));
+            return Ok((HealResultItem::default(), Some(Error::new(DiskError::FileVersionNotFound))));
         }
 
-        Err(Error::new(DiskError::FileNotFound))
+        Ok((HealResultItem::default(), Some(Error::new(DiskError::FileNotFound))))
     }
     async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()> {
         let mut first_err = None;

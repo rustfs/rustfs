@@ -467,7 +467,7 @@ pub struct DiskInfoOptions {
     pub noop: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskInfo {
     pub total: u64,
     pub free: u64,
@@ -489,7 +489,7 @@ pub struct DiskInfo {
     pub error: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskMetrics {
     api_calls: HashMap<String, u64>,
     total_waiting: u32,
@@ -835,7 +835,7 @@ impl MetaCacheEntries {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DiskOption {
     pub cleanup: bool,
     pub health_check: bool,

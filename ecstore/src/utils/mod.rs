@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod ellipses;
+pub mod bool_flag;
 pub mod fs;
 pub mod hash;
 pub mod net;
