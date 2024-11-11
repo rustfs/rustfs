@@ -10,8 +10,19 @@ pub const DEFAULT_PORT: u16 = 9000;
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
+#[allow(clippy::const_is_empty)]
+const SHORT_VERSION: &str = {
+    if !build::TAG.is_empty() {
+        build::TAG
+    } else if !build::SHORT_COMMIT.is_empty() {
+        concat!("@", build::SHORT_COMMIT)
+    } else {
+        build::PKG_VERSION
+    }
+};
+
 const LONG_VERSION: &str = concat!(
-    concat!(build::PKG_VERSION, "\n"),
+    concat!(SHORT_VERSION, "\n"),
     concat!("build time   : ", build::BUILD_TIME, "\n"),
     concat!("build profile: ", build::BUILD_RUST_CHANNEL, "\n"),
     concat!("build os     : ", build::BUILD_OS, "\n"),
@@ -24,7 +35,7 @@ const LONG_VERSION: &str = concat!(
 );
 
 #[derive(Debug, Parser)]
-#[command(version, long_version = LONG_VERSION)]
+#[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
     #[arg(required = true)]
