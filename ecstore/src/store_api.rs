@@ -22,6 +22,8 @@ pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
 pub const RESERVED_METADATA_PREFIX: &str = "X-Rustfs-Internal-";
 pub const RESERVED_METADATA_PREFIX_LOWER: &str = "X-Rustfs-Internal-";
+pub const RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
+pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
 // #[derive(Debug, Clone)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -98,6 +100,12 @@ impl FileInfo {
     pub fn is_remote(&self) -> bool {
         // TODO: when lifecycle
         false
+    }
+
+    pub fn inline_data(&self) -> bool {
+        self.metadata.as_ref().map_or(false, |metadata| {
+            metadata.contains_key(&format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER)) && !self.is_remote()
+        })
     }
 
     pub fn get_etag(&self) -> Option<String> {
@@ -235,6 +243,16 @@ impl FileInfo {
         }
 
         Err(Error::msg("part not found"))
+    }
+
+    pub fn set_healing(&mut self) {
+        if self.metadata.is_none() {
+            self.metadata = Some(HashMap::new());
+        }
+
+        if let Some(metadata) = self.metadata.as_mut() {
+            metadata.insert(RUSTFS_HEALING.to_string(), "true".to_string());
+        }
     }
 
     pub fn set_inline_data(&mut self) {
@@ -899,9 +917,9 @@ pub trait StorageAPI: ObjectIO {
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
 
-    async fn heal_format(&self, dry_run: bool) -> Result<HealResultItem>;
+    async fn heal_format(&self, dry_run: bool) ->Result<(HealResultItem, Option<Error>)>;
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
-    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<HealResultItem>;
+    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<(HealResultItem, Option<Error>)>;
     async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()>;
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;

@@ -7,12 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    disk::{DeleteOptions, DiskAPI, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-    error::{Error, Result},
-    heal::heal_ops::HEALING_TRACKER_FILENAME,
-    new_object_layer_fn,
-    store_api::{BucketInfo, StorageAPI},
-    utils::fs::read_file,
+    disk::{DeleteOptions, DiskAPI, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET}, error::{Error, Result}, global::GLOBAL_BackgroundHealState, heal::heal_ops::HEALING_TRACKER_FILENAME, new_object_layer_fn, store_api::{BucketInfo, StorageAPI}, utils::fs::read_file
 };
 
 pub type HealScanMode = usize;
@@ -50,7 +45,7 @@ pub struct HealOpts {
     pub set: Option<usize>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct HealDriveInfo {
     pub uuid: String,
     pub endpoint: String,
@@ -259,7 +254,7 @@ impl HealingTracker {
 
         let htracker_bytes = self.marshal_msg()?;
 
-        // TODO: globalBackgroundHealState
+        GLOBAL_BackgroundHealState.write().await.update_heal_status(&self).await;
 
         if let Some(disk) = &self.disk {
             let file_path = Path::new(BUCKET_META_PREFIX).join(HEALING_TRACKER_FILENAME);
@@ -430,10 +425,10 @@ async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTracker
     }
 }
 
-async fn init_healing_tracker(disk: DiskStore, heal_id: String) -> Result<HealingTracker> {
+pub async fn init_healing_tracker(disk: DiskStore, heal_id: &str) -> Result<HealingTracker> {
     let mut healing_tracker = HealingTracker::default();
     healing_tracker.id = disk.get_disk_id().await?.map_or("".to_string(), |id| id.to_string());
-    healing_tracker.heal_id = heal_id;
+    healing_tracker.heal_id = heal_id.to_string();
     healing_tracker.path = disk.to_string();
     healing_tracker.endpoint = disk.endpoint().to_string();
     healing_tracker.started = SystemTime::now()

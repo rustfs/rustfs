@@ -1,5 +1,6 @@
 pub mod common;
 pub mod error;
+pub mod heal;
 pub mod storageclass;
 
 use crate::error::Result;

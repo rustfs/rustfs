@@ -6,9 +6,12 @@ mod storage;
 use clap::Parser;
 use common::error::{Error, Result};
 use ecstore::{
+    bucket::metadata_sys::init_bucket_metadata_sys,
     endpoints::EndpointServerPools,
+    heal::data_scanner::init_data_scanner,
     set_global_endpoints,
     store::{init_local_disks, ECStore},
+    store_api::{BucketOptions, StorageAPI},
     update_erasure_type,
 };
 use grpc::make_server;
@@ -184,6 +187,8 @@ async fn run(opt: config::Opt) -> Result<()> {
         .map_err(|err| Error::from_string(err.to_string()))?;
 
     store.init().await.map_err(|err| Error::from_string(err.to_string()))?;
+    // init scanner
+    init_data_scanner().await;
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

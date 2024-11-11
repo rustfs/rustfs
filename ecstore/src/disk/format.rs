@@ -1,4 +1,4 @@
-use super::error::DiskError;
+use super::{error::DiskError, DiskInfo};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
@@ -31,7 +31,7 @@ pub enum FormatBackend {
 ///
 /// The V3 format to support "large bucket" support where a bucket
 /// can span multiple erasure sets.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct FormatErasureV3 {
     /// Version of 'xl' format.
     pub version: FormatErasureVersion,
@@ -88,7 +88,7 @@ pub enum DistributionAlgoVersion {
 ///
 /// Ideally we will never have a situation where we will have to change the
 /// fields of this struct and deal with related migration.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct FormatV3 {
     /// Version of the format config.
     pub version: FormatMetaVersion,
@@ -103,8 +103,8 @@ pub struct FormatV3 {
     pub erasure: FormatErasureV3,
     // /// DiskInfo is an extended type which returns current
     // /// disk usage per path.
-    // #[serde(skip)]
-    // pub disk_info: Option<data_types::DeskInfo>,
+    #[serde(skip)]
+    pub disk_info: Option<DiskInfo>,
 }
 
 impl TryFrom<&[u8]> for FormatV3 {
@@ -146,7 +146,7 @@ impl FormatV3 {
             format,
             id: Uuid::new_v4(),
             erasure,
-            // disk_info: None,
+            disk_info: None,
         }
     }
 
