@@ -780,7 +780,7 @@ pub struct DeletedObject {
     // pub replication_state: ReplicationState,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub enum BackendByte {
     #[default]
     Unknown,
@@ -824,7 +824,7 @@ pub struct StorageInfo {
     pub backend: BackendInfo,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct BackendDisks(HashMap<String, usize>);
 
 impl BackendDisks {
@@ -836,15 +836,24 @@ impl BackendDisks {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct BackendInfo {
     pub backend_type: BackendByte,
     pub online_disks: BackendDisks,
     pub offline_disks: BackendDisks,
-    pub standard_scdata: Vec<usize>,
-    pub standard_scparities: Option<usize>,
-    pub rrscdata: Vec<usize>,
-    pub rrscparities: Option<usize>,
+    #[serde(rename = "StandardSCData")]
+    pub standard_sc_data: Vec<usize>,
+    #[serde(rename = "StandardSCParities")]
+    pub standard_sc_parities: Vec<usize>,
+    #[serde(rename = "StandardSCParity")]
+    pub standard_sc_parity: Option<usize>,
+    #[serde(rename = "RRSCData")]
+    pub rr_sc_data: Vec<usize>,
+    #[serde(rename = "RRSCParities")]
+    pub rr_sc_parities: Vec<usize>,
+    #[serde(rename = "RRSCParity")]
+    pub rr_sc_parity: Option<usize>,
     pub total_sets: Vec<usize>,
     pub drives_per_set: Vec<usize>,
 }

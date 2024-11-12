@@ -14,8 +14,8 @@ fi
 
 export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
 
-DATA_DIR_ARG="./target/volume/test{0...4}"
-# DATA_DIR_ARG="./target/volume/test"
+# DATA_DIR_ARG="./target/volume/test{0...4}"
+DATA_DIR_ARG="./target/volume/test"
 
 if [ -n "$1" ]; then
 	DATA_DIR_ARG="$1"

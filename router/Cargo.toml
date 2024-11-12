@@ -21,3 +21,4 @@ quick-xml = "0.37.0"
 serde-xml-rs = "0.6.0"
 ecstore.workspace = true
 time.workspace = true
+serde_json.workspace = true
