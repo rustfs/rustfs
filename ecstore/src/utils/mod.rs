@@ -6,3 +6,4 @@ pub mod net;
 pub mod os;
 pub mod path;
 pub mod wildcard;
+pub mod xml;

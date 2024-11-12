@@ -2107,10 +2107,16 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "common",
+ "ecstore",
  "hyper",
  "matchit 0.8.5",
  "pin-project-lite",
+ "quick-xml",
  "s3s",
+ "serde",
+ "serde-xml-rs",
+ "serde_urlencoded",
+ "time",
  "tracing",
 ]
 
@@ -2250,7 +2256,7 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 [[package]]
 name = "s3s"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2#c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2"
+source = "git+https://github.com/Nugine/s3s.git?rev=b4ee0f7297d5ed23772fa8ba6e760c14f481990d#b4ee0f7297d5ed23772fa8ba6e760c14f481990d"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -2296,7 +2302,7 @@ dependencies = [
 [[package]]
 name = "s3s-policy"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2#c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2"
+source = "git+https://github.com/Nugine/s3s.git?rev=b4ee0f7297d5ed23772fa8ba6e760c14f481990d#b4ee0f7297d5ed23772fa8ba6e760c14f481990d"
 dependencies = [
  "indexmap 2.6.0",
  "serde",
@@ -2323,6 +2329,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f55c3193aca71c12ad7890f1785d2b73e1b9f63a0bbc353c08ef26fe03fc56b5"
 dependencies = [
  "serde_derive",
+]
+
+[[package]]
+name = "serde-xml-rs"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb3aa78ecda1ebc9ec9847d5d3aba7d618823446a049ba2491940506da6e2782"
+dependencies = [
+ "log",
+ "serde",
+ "thiserror",
+ "xml-rs",
 ]
 
 [[package]]
@@ -3199,6 +3217,12 @@ name = "writeable"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e9df38ee2d2c3c5948ea468a8406ff0db0b29ae1ffde1bcf20ef305bcc95c51"
+
+[[package]]
+name = "xml-rs"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af310deaae937e48a26602b730250b4949e125f468f11e6990be3e5304ddd96f"
 
 [[package]]
 name = "xxhash-rust"
