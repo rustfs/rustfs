@@ -17,7 +17,7 @@ mod sets;
 pub mod store;
 pub mod store_api;
 mod store_init;
-mod utils;
+pub mod utils;
 
 pub mod bucket;
 pub mod file_meta_inline;

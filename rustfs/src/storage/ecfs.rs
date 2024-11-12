@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use common::error::Result;
 use ecstore::bucket::error::BucketMetadataError;
-use ecstore::bucket::metadata;
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
 use ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
@@ -33,6 +32,7 @@ use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
+use ecstore::utils::xml;
 use ecstore::xhttp;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
@@ -868,7 +868,7 @@ impl S3 for FS {
             }
         }
 
-        let data = try_!(metadata::serialize(&tagging));
+        let data = try_!(xml::serialize(&tagging));
 
         try_!(metadata_sys::update(&bucket, BUCKET_TAGGING_CONFIG, data).await);
 
@@ -1003,7 +1003,7 @@ impl S3 for FS {
         // check bucket object lock enable
         // check replication suspended
 
-        let data = try_!(metadata::serialize(&versioning_configuration));
+        let data = try_!(xml::serialize(&versioning_configuration));
 
         try_!(metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data).await);
 
@@ -1166,7 +1166,7 @@ impl S3 for FS {
 
         let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
 
-        let data = try_!(metadata::serialize(&input_cfg));
+        let data = try_!(xml::serialize(&input_cfg));
         try_!(metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data).await);
 
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
@@ -1262,7 +1262,7 @@ impl S3 for FS {
 
         // TODO: check kms
 
-        let data = try_!(metadata::serialize(&server_side_encryption_configuration));
+        let data = try_!(xml::serialize(&server_side_encryption_configuration));
         try_!(metadata_sys::update(&bucket, BUCKET_SSECONFIG, data).await);
         Ok(S3Response::new(PutBucketEncryptionOutput::default()))
     }
@@ -1340,7 +1340,7 @@ impl S3 for FS {
             }
         }
 
-        let data = try_!(metadata::serialize(&input_cfg));
+        let data = try_!(xml::serialize(&input_cfg));
 
         try_!(metadata_sys::update(&bucket, OBJECT_LOCK_CONFIG, data).await);
 
@@ -1405,7 +1405,7 @@ impl S3 for FS {
         }
 
         // TODO: check enable, versioning enable
-        let data = try_!(metadata::serialize(&replication_configuration));
+        let data = try_!(xml::serialize(&replication_configuration));
 
         try_!(metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data).await);
 
@@ -1510,7 +1510,7 @@ impl S3 for FS {
             }
         }
 
-        let data = try_!(metadata::serialize(&notification_configuration));
+        let data = try_!(xml::serialize(&notification_configuration));
 
         try_!(metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data).await);
 

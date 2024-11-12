@@ -53,31 +53,28 @@ pub static DEFAULT_INLINE_BLOCK: usize = 128 * 1024;
 
 lazy_static! {
     pub static ref DefaultKVS: KVS = {
-        let mut kvs = Vec::new();
-
-        kvs.push(KV {
-            key: CLASS_STANDARD.to_owned(),
-            value: "".to_owned(),
-            hidden_if_empty: false,
-        });
-
-        kvs.push(KV {
-            key: CLASS_RRS.to_owned(),
-            value: "EC:1".to_owned(),
-            hidden_if_empty: false,
-        });
-
-        kvs.push(KV {
-            key: OPTIMIZE.to_owned(),
-            value: "availability".to_owned(),
-            hidden_if_empty: false,
-        });
-
-        kvs.push(KV {
-            key: INLINE_BLOCK.to_owned(),
-            value: "".to_owned(),
-            hidden_if_empty: true,
-        });
+        let kvs = vec![
+            KV {
+                key: CLASS_STANDARD.to_owned(),
+                value: "".to_owned(),
+                hidden_if_empty: false,
+            },
+            KV {
+                key: CLASS_RRS.to_owned(),
+                value: "EC:1".to_owned(),
+                hidden_if_empty: false,
+            },
+            KV {
+                key: OPTIMIZE.to_owned(),
+                value: "availability".to_owned(),
+                hidden_if_empty: false,
+            },
+            KV {
+                key: INLINE_BLOCK.to_owned(),
+                value: "".to_owned(),
+                hidden_if_empty: true,
+            },
+        ];
 
         KVS(kvs)
     };

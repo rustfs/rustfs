@@ -12,7 +12,11 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     let mut r = S3Router::new();
 
     r.insert(Method::POST, "/", AdminOperation(&handlers::AssumeRoleHandle {}))?;
-
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/accountinfo").as_str(),
+        AdminOperation(&handlers::AccountInfoHandler {}),
+    )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/service").as_str(),
