@@ -22,6 +22,7 @@ use crate::store_err::{
 use crate::store_init::ec_drives_no_config;
 use crate::utils::crypto::base64_decode;
 use crate::utils::path::{base_dir_from_prefix, decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
+use crate::utils::xml;
 use crate::{
     bucket::metadata::BucketMetadata,
     disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
@@ -954,12 +955,12 @@ impl StorageAPI for ECStore {
         }
 
         if opts.lock_enabled {
-            meta.object_lock_config_xml = metadata::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
-            meta.versioning_config_xml = metadata::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.object_lock_config_xml = xml::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
+            meta.versioning_config_xml = xml::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
         if opts.versioning_enabled {
-            meta.versioning_config_xml = metadata::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.versioning_config_xml = xml::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
         meta.save(self).await?;
