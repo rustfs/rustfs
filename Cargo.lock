@@ -2107,6 +2107,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "common",
+ "ecstore",
  "hyper",
  "matchit 0.8.5",
  "pin-project-lite",
@@ -2115,6 +2116,7 @@ dependencies = [
  "serde",
  "serde-xml-rs",
  "serde_urlencoded",
+ "time",
  "tracing",
 ]
 
@@ -2254,7 +2256,7 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 [[package]]
 name = "s3s"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2#c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2"
+source = "git+https://github.com/Nugine/s3s.git?rev=b4ee0f7297d5ed23772fa8ba6e760c14f481990d#b4ee0f7297d5ed23772fa8ba6e760c14f481990d"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -2300,7 +2302,7 @@ dependencies = [
 [[package]]
 name = "s3s-policy"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2#c41ac1d30a0ae3ded6a18cc1b5bbb98f8b7f35c2"
+source = "git+https://github.com/Nugine/s3s.git?rev=b4ee0f7297d5ed23772fa8ba6e760c14f481990d#b4ee0f7297d5ed23772fa8ba6e760c14f481990d"
 dependencies = [
  "indexmap 2.6.0",
  "serde",

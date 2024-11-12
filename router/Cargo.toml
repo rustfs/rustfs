@@ -19,3 +19,5 @@ serde_urlencoded = "0.7.1"
 serde.workspace = true
 quick-xml = "0.37.0"
 serde-xml-rs = "0.6.0"
+ecstore.workspace = true
+time.workspace = true
