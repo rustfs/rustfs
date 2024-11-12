@@ -819,7 +819,7 @@ lazy_static! {
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
     async fn backend_info(&self) -> BackendInfo {
-        let (standard_scparities, rrscparities) = {
+        let (standard_sc_parity, rr_sc_parity) = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
                 let sc_parity = sc
                     .get_parity_for_sc(storageclass::CLASS_STANDARD)
@@ -833,17 +833,17 @@ impl StorageAPI for ECStore {
             }
         };
 
-        let mut standard_scdata = Vec::new();
-        let mut rrscdata = Vec::new();
+        let mut standard_sc_data = Vec::new();
+        let mut rr_sc_data = Vec::new();
         let mut drives_per_set = Vec::new();
         let mut total_sets = Vec::new();
 
         for (idx, set_count) in self.set_drive_counts().iter().enumerate() {
-            if let Some(sc_parity) = standard_scparities {
-                standard_scdata.push(set_count - sc_parity);
+            if let Some(sc_parity) = standard_sc_parity {
+                standard_sc_data.push(set_count - sc_parity);
             }
-            if let Some(rr_sc_parity) = rrscparities {
-                rrscdata.push(set_count - rr_sc_parity);
+            if let Some(sc_parity) = rr_sc_parity {
+                rr_sc_data.push(set_count - sc_parity);
             }
             total_sets.push(self.pools[idx].set_count);
             drives_per_set.push(*set_count);
@@ -853,12 +853,13 @@ impl StorageAPI for ECStore {
             backend_type: BackendByte::Erasure,
             online_disks: BackendDisks::new(),
             offline_disks: BackendDisks::new(),
-            standard_scdata,
-            standard_scparities,
-            rrscdata,
-            rrscparities,
+            standard_sc_data,
+            standard_sc_parity,
+            rr_sc_data,
+            rr_sc_parity,
             total_sets,
             drives_per_set,
+            ..Default::default()
         }
     }
     async fn storage_info(&self) -> StorageInfo {

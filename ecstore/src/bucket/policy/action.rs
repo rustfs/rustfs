@@ -14,7 +14,7 @@ use super::condition::{
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
 
-pub struct ActionSet(HashSet<Action>);
+pub struct ActionSet(pub HashSet<Action>);
 
 impl ActionSet {
     pub fn is_match(&self, act: &Action) -> bool {
