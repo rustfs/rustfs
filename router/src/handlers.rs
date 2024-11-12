@@ -1,9 +1,14 @@
 use crate::router::Operation;
+use ecstore::utils::xml;
 use hyper::StatusCode;
 use matchit::Params;
-use s3s::{s3_error, Body, S3Request, S3Response, S3Result};
-use serde::{Deserialize, Serialize};
+use s3s::{
+    dto::{AssumeRoleOutput, Credentials, Timestamp},
+    s3_error, Body, S3Request, S3Response, S3Result,
+};
+use serde::Deserialize;
 use serde_urlencoded::from_bytes;
+use time::{Duration, OffsetDateTime};
 use tracing::warn;
 
 #[derive(Deserialize, Debug, Default)]
@@ -18,31 +23,31 @@ pub struct AssumeRoleRequest {
     pub external_id: String,
 }
 
-#[derive(Debug, Serialize, Default)]
-#[serde(rename_all = "PascalCase", default)]
-pub struct AssumeRoleResponse {
-    #[serde(rename = "AssumeRoleResult")]
-    pub result: AssumeRoleResult,
-}
+// #[derive(Debug, Serialize, Default)]
+// #[serde(rename_all = "PascalCase", default)]
+// pub struct AssumeRoleResponse {
+//     #[serde(rename = "AssumeRoleResult")]
+//     pub result: AssumeRoleResult,
+// }
 
-#[derive(Debug, Serialize, Default)]
-#[serde(rename_all = "PascalCase", default)]
-pub struct AssumeRoleResult {
-    pub credentials: Credentials,
-}
+// #[derive(Debug, Serialize, Default)]
+// #[serde(rename_all = "PascalCase", default)]
+// pub struct AssumeRoleResult {
+//     pub credentials: Credentials,
+// }
 
-#[derive(Debug, Serialize, Default)]
-#[serde(rename_all = "PascalCase", default)]
-pub struct Credentials {
-    #[serde(rename = "AccessKeyId")]
-    pub access_key: String,
-    #[serde(rename = "SecretAccessKey")]
-    pub secret_key: String,
-    pub status: String,
-    pub expiration: usize,
-    pub session_token: String,
-    pub parent_user: String,
-}
+// #[derive(Debug, Serialize, Default)]
+// #[serde(rename_all = "PascalCase", default)]
+// pub struct Credentials {
+//     #[serde(rename = "AccessKeyId")]
+//     pub access_key: String,
+//     #[serde(rename = "SecretAccessKey")]
+//     pub secret_key: String,
+//     pub status: String,
+//     pub expiration: usize,
+//     pub session_token: String,
+//     pub parent_user: String,
+// }
 
 pub struct AssumeRoleHandle {}
 #[async_trait::async_trait]
@@ -50,9 +55,7 @@ impl Operation for AssumeRoleHandle {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle AssumeRoleHandle");
 
-        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get body failed")) };
-
-        warn!("AssumeRole get cred {:?}", cred);
+        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
 
         let mut input = req.input;
 
@@ -63,26 +66,39 @@ impl Operation for AssumeRoleHandle {
 
         warn!("AssumeRole get body {:?}", body);
 
-        let resp = AssumeRoleResponse {
-            result: AssumeRoleResult {
-                credentials: Credentials {
-                    access_key: "test".to_owned(),
-                    secret_key: "test".to_owned(),
-                    status: "on".to_owned(),
-                    expiration: 0,
-                    session_token: "sdf".to_owned(),
-                    parent_user: cred.access_key,
-                },
-            },
-        };
-        // getAssumeRoleCredentials
-        let output = serde_xml_rs::to_string(&resp).unwrap();
+        let exp = OffsetDateTime::now_utc().saturating_add(Duration::days(1));
 
-        warn!("output {:?}", output);
+        // TODO: create tmp access_key
+        let resp = AssumeRoleOutput {
+            credentials: Some(Credentials {
+                access_key_id: cred.access_key,
+                expiration: Timestamp::from(exp),
+                secret_access_key: cred.secret_key.expose().to_string(),
+                session_token: "sdfsdf".to_owned(),
+            }),
+            ..Default::default()
+        };
+
+        // getAssumeRoleCredentials
+        let output = xml::serialize::<AssumeRoleOutput>(&resp).unwrap();
 
         Ok(S3Response::new((StatusCode::OK, Body::from(output))))
 
         // return Err(s3_error!(NotImplemented));
+    }
+}
+
+pub struct AccountInfoHandler {}
+#[async_trait::async_trait]
+impl Operation for AccountInfoHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle AccountInfoHandler");
+
+        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
+
+        warn!("AccountInfoHandler cread {:?}", &cred);
+
+        return Err(s3_error!(NotImplemented));
     }
 }
 

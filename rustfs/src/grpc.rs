@@ -5,7 +5,7 @@ use ecstore::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, Reader,
         UpdateMetadataOpts, WalkDirOptions,
     },
-    erasure::{ReadAt, Writer},
+    erasure::Writer,
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions},
