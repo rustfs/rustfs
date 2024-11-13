@@ -17,6 +17,10 @@ use crate::{
     erasure::{ReadAt, Writer},
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
+    heal::{
+        data_usage_cache::{DataUsageCache, DataUsageEntry},
+        heal_commands::HealScanMode,
+    },
     store_api::{FileInfo, RawFileInfo},
 };
 use endpoint::Endpoint;
@@ -436,6 +440,12 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
+    async fn ns_scanner(
+        &self,
+        cache: &DataUsageCache,
+        updates: Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache>;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

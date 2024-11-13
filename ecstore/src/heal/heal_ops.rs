@@ -60,12 +60,13 @@ pub struct HealSequenceStatus {
     pub items: Vec<HealResultItem>,
 }
 
+#[derive(Debug, Default)]
 pub struct HealSource {
     pub bucket: String,
     pub object: String,
     pub version_id: String,
     pub no_wait: bool,
-    opts: Option<HealOpts>,
+    pub opts: Option<HealOpts>,
 }
 
 #[derive(Clone, Debug)]
@@ -245,7 +246,7 @@ impl HealSequence {
         Ok(())
     }
 
-    async fn queue_heal_task(&mut self, source: HealSource, heal_type: HealItemType) -> Result<()> {
+    pub async fn queue_heal_task(&mut self, source: HealSource, heal_type: HealItemType) -> Result<()> {
         let mut task = HealTask::new(&source.bucket, &source.object, &source.version_id, &self.setting);
         if let Some(opts) = source.opts {
             task.opts = opts;
@@ -348,7 +349,7 @@ pub async fn heal_sequence_start(h: Arc<HealSequence>) {
 pub struct AllHealState {
     mu: RwLock<bool>,
 
-    heal_seq_map: HashMap<String, HealSequence>,
+    heal_seq_map: HashMap<String, Arc<RwLock<HealSequence>>>,
     heal_local_disks: HashMap<Endpoint, bool>,
     heal_status: HashMap<String, HealingTracker>,
 }
@@ -449,7 +450,8 @@ impl AllHealState {
         
         let mut keys_to_reomve = Vec::new();
         for (k, v) in self.heal_seq_map.iter() {
-            if v.has_ended().await && (UNIX_EPOCH + Duration::from_secs(*(v.end_time.read().await)) + KEEP_HEAL_SEQ_STATE_DURATION) < now {
+            let r = v.read().await;
+            if r.has_ended().await && (UNIX_EPOCH + Duration::from_secs(*(r.end_time.read().await)) + KEEP_HEAL_SEQ_STATE_DURATION) < now {
                 keys_to_reomve.push(k.clone())
             }
         }
@@ -458,11 +460,12 @@ impl AllHealState {
         }
     }
 
-    async fn get_heal_sequence_by_token(&self, token: &str) -> (Option<HealSequence>, bool) {
+    pub async fn get_heal_sequence_by_token(&self, token: &str) -> (Option<Arc<RwLock<HealSequence>>>, bool) {
         let _ = self.mu.read().await;
 
         for v in self.heal_seq_map.values() {
-            if v.client_token == token {
+            let r = v.read().await;
+            if r.client_token == token {
                 return (Some(v.clone()), true);
             }
         }
@@ -470,7 +473,7 @@ impl AllHealState {
         (None, false)
     }
 
-    async fn get_heal_sequence(&self, path: &str) -> Option<HealSequence> {
+    async fn get_heal_sequence(&self, path: &str) -> Option<Arc<RwLock<HealSequence>>> {
         let _ = self.mu.read().await;
 
         self.heal_seq_map.get(path).cloned()
@@ -479,6 +482,7 @@ impl AllHealState {
     async fn stop_heal_sequence(&mut self, path: &str) -> Result<Vec<u8>> {
         let mut hsp = HealStopSuccess::default();
         if let Some(he) = self.get_heal_sequence(path).await {
+            let he = he.read().await;
             let client_token = he.client_token.clone();
             if *GLOBAL_IsDistErasure.read().await {
                 // TODO: proxy
@@ -525,7 +529,7 @@ impl AllHealState {
             self.stop_heal_sequence(path_s).await?;
         } else {
             if let Some(hs) = self.get_heal_sequence(path_s).await {
-                if !hs.has_ended().await {
+                if !hs.read().await.has_ended().await {
                     return Err(Error::from_string(format!("Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {}, token is {}", heal_sequence.client_address, heal_sequence.start_time, heal_sequence.client_token)));
                 }
             }
@@ -534,7 +538,7 @@ impl AllHealState {
         let _ = self.mu.write().await;
 
         for (k, v) in self.heal_seq_map.iter() {
-            if !v.has_ended().await && (has_profix(k, path_s) || has_profix(path_s, k)) {
+            if !v.read().await.has_ended().await && (has_profix(&k, path_s) || has_profix(path_s, &k)) {
                 return Err(Error::from_string(format!(
                     "The provided heal sequence path overlaps with an existing heal path: {}",
                     k
@@ -542,7 +546,7 @@ impl AllHealState {
             }
         }
 
-        self.heal_seq_map.insert(path_s.to_string(), heal_sequence.clone());
+        self.heal_seq_map.insert(path_s.to_string(), Arc::new(RwLock::new(heal_sequence.clone())));
 
         let client_token = heal_sequence.client_token.clone();
         if *GLOBAL_IsDistErasure.read().await {

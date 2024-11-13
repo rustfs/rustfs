@@ -1,6 +1,14 @@
 use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    future::Future,
     io::{Cursor, Read},
-    sync::{atomic::{AtomicU32, AtomicU64}, Arc},
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU32, AtomicU64},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -8,20 +16,46 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use lazy_static::lazy_static;
 use rand::Rng;
 use rmp_serde::{Deserializer, Serializer};
+use s3s::dto::{ReplicationConfiguration, ReplicationRuleStatus};
 use serde::{Deserialize, Serialize};
-use tokio::{sync::{mpsc, RwLock}, time::sleep};
+use tokio::{
+    sync::{
+        broadcast,
+        mpsc::{self, Sender},
+        RwLock,
+    },
+    time::sleep,
+};
 use tracing::{error, info};
 
 use crate::{
-    config::{common::{read_config, save_config}, heal::Config},
+    cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
+    config::{
+        common::{read_config, save_config},
+        heal::Config,
+    },
+    disk::{error::DiskError, DiskStore, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams},
     error::{Error, Result},
-    global::GLOBAL_IsErasureSD,
-    heal::data_usage::BACKGROUND_HEAL_INFO_PATH,
+    global::{GLOBAL_BackgroundHealState, GLOBAL_IsErasure, GLOBAL_IsErasureSD},
+    heal::{
+        data_usage::BACKGROUND_HEAL_INFO_PATH,
+        data_usage_cache::{hash_path, DataUsageHashMap},
+        error::ERR_IGNORE_FILE_CONTRIB,
+        heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT},
+        heal_ops::{HealSource, BG_HEALING_UUID},
+    },
     new_object_layer_fn,
-    store::ECStore,
+    peer::is_reserved_or_invalid_bucket,
+    store::{ECStore, ListPathOptions},
+    utils::path::{path_join, path_to_bucket_object, path_to_bucket_object_with_base_path, SLASH_SEPARATOR},
 };
 
-use super::{data_scanner_metric::globalScannerMetrics, data_usage::{store_data_usage_in_backend, DATA_USAGE_BLOOM_NAME_PATH}, heal_commands::{HealScanMode, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN}};
+use super::{
+    data_scanner_metric::globalScannerMetrics,
+    data_usage::{store_data_usage_in_backend, DATA_USAGE_BLOOM_NAME_PATH},
+    data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
+    heal_commands::{HealScanMode, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
+};
 
 const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1); // Time to wait between folders.
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16; // Visit all folders every n cycles.
@@ -103,7 +137,8 @@ async fn run_data_scanner() {
         }
 
         let bg_heal_info = read_background_heal_info(store).await;
-        let scan_mode = get_cycle_scan_mode(cycle_info.current, bg_heal_info.bitrot_start_cycle, bg_heal_info.bitrot_start_time).await;
+        let scan_mode =
+            get_cycle_scan_mode(cycle_info.current, bg_heal_info.bitrot_start_cycle, bg_heal_info.bitrot_start_time).await;
         if bg_heal_info.current_scan_mode != scan_mode {
             let mut new_heal_info = bg_heal_info;
             new_heal_info.current_scan_mode = scan_mode;
@@ -166,7 +201,7 @@ async fn save_background_heal_info(store: &ECStore, info: &BackgroundHealInfo) {
 
 async fn get_cycle_scan_mode(current_cycle: u64, bitrot_start_cycle: u64, bitrot_start_time: SystemTime) -> HealScanMode {
     let bitrot_cycle = globalHealConfig.read().await.bitrot_scan_cycle();
-    let v = bitrot_cycle.as_secs_f64() ;
+    let v = bitrot_cycle.as_secs_f64();
     if v == -1.0 {
         return HEAL_NORMAL_SCAN;
     } else if v == 0.0 {
@@ -290,4 +325,607 @@ fn system_time_to_timestamp(time: &SystemTime) -> u64 {
 // 将时间戳转换为 SystemTime
 fn timestamp_to_system_time(timestamp: u64) -> SystemTime {
     UNIX_EPOCH + std::time::Duration::new(timestamp, 0)
+}
+
+#[derive(Debug, Default)]
+struct Heal {
+    enabled: bool,
+    bitrot: bool,
+}
+
+struct ScannerItem {
+    path: String,
+    bucket: String,
+    prefix: String,
+    object_name: String,
+    replication: Option<ReplicationConfiguration>,
+    // todo: lifecycle
+    // typ: fs::Permissions,
+    heal: Heal,
+    debug: bool,
+}
+
+impl ScannerItem {
+    pub fn transform_meda_dir(&mut self) {
+        let split = self
+            .prefix
+            .split(SLASH_SEPARATOR)
+            .map(|s| PathBuf::from(s))
+            .collect::<Vec<_>>();
+        if split.len() > 1 {
+            self.prefix = path_join(&split[0..split.len() - 1]).to_string_lossy().to_string();
+        } else {
+            self.prefix = "".to_string();
+        }
+        self.object_name = split.last().map_or("".to_string(), |v| v.to_string_lossy().to_string());
+    }
+
+    pub fn object_path(&self) -> PathBuf {
+        path_join(&[PathBuf::from(self.prefix.clone()), PathBuf::from(self.object_name.clone())])
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SizeSummary {
+    pub total_size: usize,
+    pub versions: usize,
+    pub delete_markers: usize,
+    pub replicated_size: usize,
+    pub replicated_count: usize,
+    pub pending_size: usize,
+    pub failed_size: usize,
+    pub replica_size: usize,
+    pub replica_count: usize,
+    pub pending_count: usize,
+    pub failed_count: usize,
+    pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
+    // Todo: tires
+}
+
+#[derive(Debug, Default)]
+pub struct ReplTargetSizeSummary {
+    pub replicated_size: usize,
+    pub replicated_count: usize,
+    pub pending_size: usize,
+    pub failed_size: usize,
+    pub pending_count: usize,
+    pub failed_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFolder {
+    name: String,
+    parent: DataUsageHash,
+    object_heal_prob_div: u32,
+}
+
+type GetSizeFn = Box<dyn Fn(&ScannerItem) -> Pin<Box<dyn Future<Output = Result<SizeSummary>>>> + Send + 'static>;
+
+struct FolderScanner {
+    root: String,
+    get_size: GetSizeFn,
+    old_cache: DataUsageCache,
+    new_cache: DataUsageCache,
+    update_cache: DataUsageCache,
+    data_usage_scanner_debug: bool,
+    heal_object_select: u32,
+    scan_mode: HealScanMode,
+    should_heal: Arc<dyn Fn() -> bool + Send + Sync>,
+    disks: Vec<Option<DiskStore>>,
+    disks_quorum: usize,
+    updates: Sender<DataUsageEntry>,
+    last_update: SystemTime,
+    update_current_path: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl FolderScanner {
+    async fn scan_folder(&mut self, folder: &CachedFolder, into: &mut DataUsageEntry) -> Result<()> {
+        let this_hash = hash_path(&folder.name);
+        let was_compacted = into.compacted;
+
+        loop {
+            let mut abandoned_children: DataUsageHashMap = if !into.compacted {
+                self.old_cache.find_children_copy(this_hash.clone())
+            } else {
+                HashSet::new()
+            };
+
+            let (_, prefix) = path_to_bucket_object_with_base_path(&self.root, &folder.name);
+            // Todo: lifeCycle
+            let replication_cfg = if self.old_cache.info.replication.is_some()
+                && has_active_rules(self.old_cache.info.replication.as_ref().unwrap(), &prefix, true)
+            {
+                self.old_cache.info.replication.clone()
+            } else {
+                None
+            };
+
+            let mut existing_folders = Vec::new();
+            let mut new_folders = Vec::new();
+            let mut found_objects: bool = false;
+
+            let path = Path::new(&self.root).join(&folder.name);
+            if path.is_dir() {
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    let sub_path = entry.path();
+                    let ent_name = Path::new(&folder.name).join(&sub_path);
+                    let (bucket, prefix) = path_to_bucket_object_with_base_path(&self.root, ent_name.to_str().unwrap());
+                    if bucket.is_empty() {
+                        continue;
+                    }
+                    if is_reserved_or_invalid_bucket(&bucket, false) {
+                        continue;
+                    }
+
+                    if !sub_path.is_dir() {
+                        let h = hash_path(ent_name.to_str().unwrap());
+                        if h == this_hash {
+                            continue;
+                        }
+                        let this = CachedFolder {
+                            name: ent_name.to_string_lossy().to_string(),
+                            parent: this_hash.clone(),
+                            object_heal_prob_div: folder.object_heal_prob_div,
+                        };
+                        abandoned_children.remove(&h.key());
+                        if self.old_cache.cache.contains_key(&h.key()) {
+                            existing_folders.push(this);
+                            self.update_cache
+                                .copy_with_children(&self.old_cache, &h, &Some(this_hash.clone()));
+                        } else {
+                            new_folders.push(this);
+                        }
+                        continue;
+                    }
+
+                    let mut item = ScannerItem {
+                        path: Path::new(&self.root).join(&ent_name).to_string_lossy().to_string(),
+                        bucket,
+                        prefix: Path::new(&prefix)
+                            .parent()
+                            .unwrap_or(Path::new(""))
+                            .to_string_lossy()
+                            .to_string(),
+                        object_name: ent_name
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        debug: self.data_usage_scanner_debug,
+                        replication: replication_cfg.clone(),
+                        heal: Heal::default(),
+                    };
+
+                    item.heal.enabled = this_hash.mod_alt(
+                        self.old_cache.info.next_cycle / folder.object_heal_prob_div,
+                        self.heal_object_select / folder.object_heal_prob_div,
+                    ) && (self.should_heal)();
+                    item.heal.bitrot = self.scan_mode == HEAL_DEEP_SCAN;
+
+                    let (sz, err) = match (self.get_size)(&item).await {
+                        Ok(sz) => (sz, None),
+                        Err(err) => {
+                            if err.to_string() != ERR_IGNORE_FILE_CONTRIB {
+                                continue;
+                            }
+                            (SizeSummary::default(), Some(err))
+                        }
+                    };
+                    // successfully read means we have a valid object.
+                    found_objects = true;
+                    // Remove filename i.e is the meta file to construct object name
+                    item.transform_meda_dir();
+                    // Object already accounted for, remove from heal map,
+                    // simply because getSize() function already heals the
+                    // object.
+                    abandoned_children.remove(
+                        &path_join(&[PathBuf::from(item.bucket.clone()), item.object_path()])
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+
+                    if err.is_none() || err.unwrap().to_string() != ERR_IGNORE_FILE_CONTRIB {
+                        into.add_sizes(&sz);
+                        into.objects += 1;
+                    }
+                }
+            }
+            if found_objects && *GLOBAL_IsErasure.read().await {
+                // If we found an object in erasure mode, we skip subdirs (only datadirs)...
+                break;
+            }
+
+            let should_compact = self.new_cache.info.name != folder.name
+                && existing_folders.len() + new_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS.try_into().unwrap()
+                || existing_folders.len() + new_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS.try_into().unwrap();
+
+            let total_folders = existing_folders.len() + new_folders.len();
+            if total_folders
+                > SCANNER_EXCESS_FOLDERS
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .try_into()
+                    .unwrap()
+            {
+                let _prefix_name = format!("{}/", folder.name.trim_end_matches('/'));
+                // todo: notification
+            }
+
+            if !into.compacted && should_compact {
+                into.compacted = true;
+                new_folders.extend(existing_folders.clone());
+                existing_folders.clear();
+            }
+
+            // Transfer existing
+            if !into.compacted {
+                for folder in existing_folders.iter() {
+                    let h = hash_path(&folder.name);
+                    self.update_cache
+                        .copy_with_children(&self.old_cache, &h, &Some(folder.parent.clone()));
+                }
+            }
+
+            // Scan new...
+            for folder in new_folders.iter() {
+                let h = hash_path(&folder.name);
+                if !into.compacted {
+                    let mut found_any = false;
+                    let mut parent = this_hash.clone();
+                    while parent != hash_path(&self.update_cache.info.name) {
+                        let e = self.update_cache.find(&parent.key());
+                        if e.is_none() || e.as_ref().unwrap().compacted {
+                            found_any = true;
+                            break;
+                        }
+                        match self.update_cache.search_parent(&parent) {
+                            Some(next) => {
+                                parent = next;
+                            }
+                            None => {
+                                found_any = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found_any {
+                        self.update_cache
+                            .replace_hashed(&h, &Some(this_hash.clone()), &DataUsageEntry::default());
+                    }
+                }
+                (self.update_current_path)(&folder.name);
+                scan(folder, into, self).await;
+                // Add new folders if this is new and we don't have existing.
+                if !into.compacted {
+                    if let Some(parent) = self.update_cache.find(&this_hash.key()) {
+                        if !parent.compacted {
+                            self.update_cache.delete_recursive(&h);
+                            self.update_cache
+                                .copy_with_children(&self.new_cache, &h, &Some(this_hash.clone()));
+                        }
+                    }
+                }
+            }
+
+            // Scan existing...
+            for folder in existing_folders.iter() {
+                let h = hash_path(&folder.name);
+                if !into.compacted && self.old_cache.is_compacted(&h) {
+                    if !h.mod_(self.old_cache.info.next_cycle, DATA_USAGE_UPDATE_DIR_CYCLES) {
+                        self.new_cache
+                            .copy_with_children(&self.old_cache, &h, &Some(folder.parent.clone()));
+                        into.add_child(&h);
+                        continue;
+                    }
+                }
+                (self.update_current_path)(&folder.name);
+                scan(folder, into, self).await;
+            }
+
+            // Scan for healing
+            if abandoned_children.is_empty() || !(self.should_heal)() {
+                break;
+            }
+
+            if self.disks.is_empty() || self.disks_quorum == 0 {
+                break;
+            }
+
+            let (bg_seq, found) = GLOBAL_BackgroundHealState
+                .read()
+                .await
+                .get_heal_sequence_by_token(BG_HEALING_UUID)
+                .await;
+            if !found {
+                break;
+            }
+            let bg_seq = bg_seq.unwrap();
+
+            let mut resolver = MetadataResolutionParams {
+                dir_quorum: self.disks_quorum,
+                obj_quorum: self.disks_quorum,
+                bucket: "".to_string(),
+                strict: false,
+                ..Default::default()
+            };
+
+            for k in abandoned_children.iter() {
+                if !(self.should_heal)() {
+                    break;
+                }
+
+                let (bucket, prefix) = path_to_bucket_object(k);
+                (self.update_current_path)(k);
+
+                if bucket != resolver.bucket {
+                    let _ = bg_seq
+                        .clone()
+                        .write()
+                        .await
+                        .queue_heal_task(
+                            HealSource {
+                                bucket: bucket.clone(),
+                                ..Default::default()
+                            },
+                            HEAL_ITEM_BUCKET.to_owned(),
+                        )
+                        .await?;
+                }
+
+                resolver.bucket = bucket.clone();
+                let found_objs = Arc::new(RwLock::new(false));
+                let found_objs_clone = found_objs.clone();
+                let (tx, rx) = broadcast::channel(1);
+                let tx_partial = tx.clone();
+                let tx_finished = tx.clone();
+                let update_current_path_agreed = self.update_current_path.clone();
+                let update_current_path_partial = self.update_current_path.clone();
+                let should_heal_clone = self.should_heal.clone();
+                let resolver_clone = resolver.clone();
+                let bg_seq_clone = bg_seq.clone();
+                let lopts = ListPathRawOptions {
+                    disks: self.disks.clone(),
+                    bucket: bucket.clone(),
+                    path: prefix.clone(),
+                    recursice: true,
+                    report_not_found: true,
+                    min_disks: self.disks_quorum,
+                    agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                        Box::pin({
+                            let update_current_path_agreed = update_current_path_agreed.clone();
+                            async move {
+                                update_current_path_agreed(&entry.name);
+                            }
+                        })
+                    })),
+                    partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                        Box::pin({
+                            let update_current_path_partial = update_current_path_partial.clone();
+                            let should_heal_partial = should_heal_clone.clone();
+                            let tx_partial = tx_partial.clone();
+                            let resolver_partial = resolver_clone.clone();
+                            let bucket_partial = bucket.clone();
+                            let found_objs_clone = found_objs_clone.clone();
+                            let bg_seq_partial = bg_seq_clone.clone();
+                            async move {
+                                if !should_heal_partial() {
+                                    let _ = tx_partial.send(true);
+                                    return;
+                                }
+                                let entry = match entries.resolve(resolver_partial) {
+                                    Ok(Some(entry)) => entry,
+                                    _ => match entries.first_found() {
+                                        (Some(entry), _) => entry,
+                                        _ => return,
+                                    },
+                                };
+
+                                update_current_path_partial(&entry.name);
+                                let mut custom = HashMap::new();
+                                if entry.is_dir() {
+                                    return;
+                                }
+
+                                // We got an entry which we should be able to heal.
+                                let fiv = match entry.file_info_versions(&bucket_partial) {
+                                    Ok(fiv) => fiv,
+                                    Err(_) => {
+                                        if let Err(err) = bg_seq_partial
+                                            .write()
+                                            .await
+                                            .queue_heal_task(
+                                                HealSource {
+                                                    bucket: bucket_partial.clone(),
+                                                    object: entry.name.clone(),
+                                                    version_id: "".to_string(),
+                                                    ..Default::default()
+                                                },
+                                                HEAL_ITEM_OBJECT.to_string(),
+                                            )
+                                            .await
+                                        {
+                                            match err.downcast_ref() {
+                                                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                                                _ => {
+                                                    info!("{}", err.to_string());
+                                                }
+                                            }
+                                        } else {
+                                            let mut w = found_objs_clone.write().await;
+                                            *w = *w || true;
+                                        }
+                                        return;
+                                    }
+                                };
+
+                                custom.insert("versions", fiv.versions.len().to_string());
+                                let (mut success_versions, mut fail_versions) = (0, 0);
+                                for ver in fiv.versions.iter() {
+                                    match bg_seq_partial
+                                        .write()
+                                        .await
+                                        .queue_heal_task(
+                                            HealSource {
+                                                bucket: bucket_partial.clone(),
+                                                object: entry.name.clone(),
+                                                version_id: "".to_string(),
+                                                ..Default::default()
+                                            },
+                                            HEAL_ITEM_OBJECT.to_string(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            success_versions += 1;
+                                            let mut w = found_objs_clone.write().await;
+                                            *w = *w || true;
+                                        }
+                                        Err(_) => fail_versions += 1,
+                                    }
+                                }
+                                custom.insert("success_versions", success_versions.to_string());
+                                custom.insert("failed_versions", fail_versions.to_string());
+                            }
+                        })
+                    })),
+                    finished: Some(Box::new(move |err: &[Option<Error>]| {
+                        Box::pin({
+                            let tx_finished = tx_finished.clone();
+                            async move {
+                                let _ = tx_finished.send(true);
+                            }
+                        })
+                    })),
+                    ..Default::default()
+                };
+                let _ = list_path_raw(rx, lopts).await;
+
+                if *found_objs.read().await {
+                    let this = CachedFolder {
+                        name: k.clone(),
+                        parent: this_hash.clone(),
+                        object_heal_prob_div: 1,
+                    };
+                    scan(&this, into, self).await;
+                }
+            }
+            break;
+        }
+        if !was_compacted {
+            self.new_cache.replace_hashed(&this_hash, &Some(folder.parent.clone()), &into);
+        }
+
+        if !into.compacted && self.new_cache.info.name != folder.name {
+            let mut flat = self
+                .new_cache
+                .size_recursive(&this_hash.key())
+                .unwrap_or(DataUsageEntry::default());
+            flat.compacted = true;
+            let mut compact = false;
+            if flat.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT.try_into().unwrap() {
+                compact = true;
+            } else {
+                // Compact if we only have objects as children...
+                compact = true;
+                for k in into.children.iter() {
+                    if let Some(v) = self.new_cache.cache.get(k) {
+                        if !v.children.is_empty() || v.objects > 1 {
+                            compact = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if compact {
+                self.new_cache.delete_recursive(&this_hash);
+                self.new_cache.replace_hashed(&this_hash, &Some(folder.parent.clone()), &flat);
+                let mut total: HashMap<String, String> = HashMap::new();
+                total.insert("objects".to_string(), flat.objects.to_string());
+                total.insert("size".to_string(), flat.size.to_string());
+                if flat.versions > 0 {
+                    total.insert("versions".to_string(), flat.versions.to_string());
+                }
+            }
+        }
+        // Compact if too many children...
+        if !into.compacted {
+            self.new_cache.reduce_children_of(
+                &this_hash,
+                DATA_SCANNER_COMPACT_AT_CHILDREN.try_into().unwrap(),
+                self.new_cache.info.name != folder.name,
+            );
+        }
+        if self.update_cache.cache.contains_key(&this_hash.key()) && !was_compacted {
+            // Replace if existed before.
+            if let Some(flat) = self.new_cache.size_recursive(&this_hash.key()) {
+                self.update_cache.delete_recursive(&this_hash);
+                self.update_cache.replace_hashed(&this_hash, &Some(folder.parent.clone()), &flat);
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_update(&mut self) {
+        if SystemTime::now().duration_since(self.last_update).unwrap() < Duration::from_secs(60) {
+            return;
+        }
+        if let Some(flat) = self.update_cache.size_recursive(&self.new_cache.info.name) {
+            let _ = self.updates.send(flat).await;
+            self.last_update = SystemTime::now();
+        }
+    }
+}
+
+async fn scan(folder: &CachedFolder, into: &mut DataUsageEntry, folder_scanner: &mut FolderScanner) {
+    let mut dst = if !into.compacted {
+        DataUsageEntry::default()
+    } else {
+        into.clone()
+    };
+
+    if Box::pin(folder_scanner.scan_folder(folder, &mut dst)).await.is_err() {
+        return;
+    }
+    if !into.compacted {
+        let h = DataUsageHash(folder.name.clone());
+        into.add_child(&h);
+        folder_scanner.update_cache.delete_recursive(&h);
+        folder_scanner
+            .update_cache
+            .copy_with_children(&folder_scanner.new_cache, &h, &Some(folder.parent.clone()));
+        folder_scanner.send_update().await;
+    }
+}
+
+pub fn has_active_rules(config: &ReplicationConfiguration, prefix: &str, recursive: bool) -> bool {
+    if config.rules.is_empty() {
+        return false;
+    }
+
+    for rule in config.rules.iter() {
+        if rule
+            .status
+            .eq(&ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED))
+        {
+            continue;
+        }
+        if !prefix.is_empty() {
+            if let Some(filter) = &rule.filter {
+                if let Some(r_prefix) = &filter.prefix {
+                    if !r_prefix.is_empty() {
+                        // incoming prefix must be in rule prefix
+                        if !recursive && !prefix.starts_with(r_prefix) {
+                            continue;
+                        }
+                        // If recursive, we can skip this rule if it doesn't match the tested prefix or level below prefix
+                        // does not match
+                        if recursive && !r_prefix.starts_with(prefix) && !prefix.starts_with(r_prefix) {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    false
 }

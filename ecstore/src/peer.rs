@@ -528,7 +528,7 @@ fn is_reserved_bucket(bucket_name: &str) -> bool {
 }
 
 // 检查桶名是否为保留名或无效名
-fn is_reserved_or_invalid_bucket(bucket_entry: &str, strict: bool) -> bool {
+pub fn is_reserved_or_invalid_bucket(bucket_entry: &str, strict: bool) -> bool {
     if bucket_entry.is_empty() {
         return true;
     }

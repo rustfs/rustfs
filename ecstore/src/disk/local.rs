@@ -9,6 +9,7 @@ use super::{
     UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::bitrot::bitrot_verify;
+use crate::bucket::metadata_sys::GLOBAL_BucketMetadataSys;
 use crate::cache_value::cache::{Cache, Opts};
 use crate::disk::error::{
     convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
@@ -18,6 +19,10 @@ use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
+use crate::heal::data_scanner::has_active_rules;
+use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
+use crate::heal::heal_commands::HealScanMode;
+use crate::new_object_layer_fn;
 use crate::set_disk::{
     conv_part_err_to_int, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND,
@@ -31,7 +36,9 @@ use crate::{
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
+use common::defer;
 use path_absolutize::Absolutize;
+use s3s::dto::{ReplicationConfiguration, ReplicationRuleStatus};
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -47,6 +54,7 @@ use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -1867,6 +1875,36 @@ impl DiskAPI for LocalDisk {
         info.scanning = self.scanning.load(Ordering::SeqCst) == 1;
 
         Ok(info)
+    }
+
+    async fn ns_scanner(
+        &self,
+        cache: &DataUsageCache,
+        updates: Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        self.scanning.fetch_add(1, Ordering::SeqCst);
+        defer!(|| { self.scanning.fetch_sub(1, Ordering::SeqCst) });
+
+        // Check if the current bucket has replication configuration
+        if let Ok((rcfg, _)) = GLOBAL_BucketMetadataSys
+            .read()
+            .await
+            .get_replication_config(&cache.info.name)
+            .await
+        {
+            if has_active_rules(&rcfg, "", true) {
+                // TODO: globalBucketTargetSys
+            }
+        }
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(Error::msg("errServerNotInitialized")),
+        };
+        todo!()
     }
 }
 
