@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use tokio::{
     spawn,
@@ -14,6 +14,10 @@ use crate::{
     error::{Error, Result},
 };
 
+type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()>>> + Send + 'static>;
+type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()>>> + Send + 'static>;
+type FinishedFn = Box<dyn Fn(&[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+
 #[derive(Default)]
 pub struct ListPathRawOptions {
     pub disks: Vec<Option<DiskStore>>,
@@ -26,9 +30,12 @@ pub struct ListPathRawOptions {
     pub min_disks: usize,
     pub report_not_found: bool,
     pub per_disk_limit: i32,
-    pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
-    pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
-    pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
+    pub agreed: Option<AgreedFn>,
+    pub partial: Option<PartialFn>,
+    pub finished: Option<FinishedFn>,
+    // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
+    // pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
+    // pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
 }
 
 impl Clone for ListPathRawOptions {
@@ -185,8 +192,8 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         }
 
         if has_err > 0 && has_err > opts.disks.len() - opts.min_disks {
-            if let Some(finished_fn) = opts.finished.clone() {
-                finished_fn(&errs);
+            if let Some(finished_fn) = opts.finished.as_ref() {
+                finished_fn(&errs).await;
             }
             let mut combined_err = Vec::new();
             errs.iter().zip(opts.disks.iter()).for_each(|(err, disk)| match (err, disk) {
@@ -205,7 +212,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         // Break if all at EOF or error.
         if at_eof + has_err == readers.len() {
             if has_err > 0 {
-                if let Some(finished_fn) = opts.finished.clone() {
+                if let Some(finished_fn) = opts.finished.as_ref() {
                     finished_fn(&errs);
                 }
                 break;
@@ -213,13 +220,13 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         }
 
         if agree == readers.len() {
-            if let Some(agreed_fn) = opts.agreed.clone() {
+            if let Some(agreed_fn) = opts.agreed.as_ref() {
                 agreed_fn(current);
             }
             continue;
         }
 
-        if let Some(partial_fn) = opts.partial.clone() {
+        if let Some(partial_fn) = opts.partial.as_ref() {
             partial_fn(MetaCacheEntries(top_entries), &errs);
         }
     }

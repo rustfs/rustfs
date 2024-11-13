@@ -10,6 +10,7 @@ use protos::{
         UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
+use tokio::sync::mpsc::Sender;
 use tonic::Request;
 use tracing::info;
 use uuid::Uuid;
@@ -20,9 +21,7 @@ use super::{
     RemoteFileWriter, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::{
-    disk::error::DiskError,
-    error::{Error, Result},
-    store_api::{FileInfo, RawFileInfo},
+    disk::error::DiskError, error::{Error, Result}, heal::{data_usage_cache::{DataUsageCache, DataUsageEntry}, heal_commands::HealScanMode}, store_api::{FileInfo, RawFileInfo}
 };
 use protos::proto_gen::node_service::RenamePartRequst;
 
@@ -728,5 +727,14 @@ impl DiskAPI for RemoteDisk {
         let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
 
         Ok(disk_info)
+    }
+
+    async fn ns_scanner(
+        &self,
+        cache: &DataUsageCache,
+        updates: Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        todo!()
     }
 }
