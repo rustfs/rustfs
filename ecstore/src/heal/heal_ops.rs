@@ -142,7 +142,6 @@ impl HealSequence {
             ..Default::default()
         }
     }
-
 }
 
 impl HealSequence {
@@ -447,11 +446,13 @@ impl AllHealState {
     async fn periodic_heal_seqs_clean(&mut self) {
         let _ = self.mu.write().await;
         let now = SystemTime::now();
-        
+
         let mut keys_to_reomve = Vec::new();
         for (k, v) in self.heal_seq_map.iter() {
             let r = v.read().await;
-            if r.has_ended().await && (UNIX_EPOCH + Duration::from_secs(*(r.end_time.read().await)) + KEEP_HEAL_SEQ_STATE_DURATION) < now {
+            if r.has_ended().await
+                && (UNIX_EPOCH + Duration::from_secs(*(r.end_time.read().await)) + KEEP_HEAL_SEQ_STATE_DURATION) < now
+            {
                 keys_to_reomve.push(k.clone())
             }
         }
@@ -546,7 +547,8 @@ impl AllHealState {
             }
         }
 
-        self.heal_seq_map.insert(path_s.to_string(), Arc::new(RwLock::new(heal_sequence.clone())));
+        self.heal_seq_map
+            .insert(path_s.to_string(), Arc::new(RwLock::new(heal_sequence.clone())));
 
         let client_token = heal_sequence.client_token.clone();
         if *GLOBAL_IsDistErasure.read().await {

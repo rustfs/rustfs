@@ -44,7 +44,6 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
-use tokio::sync::mpsc::Sender;
 use std::cmp::Ordering;
 use std::slice::Iter;
 use std::{
@@ -54,11 +53,12 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
+use crate::heal::data_usage_cache::DataUsageCache;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use crate::heal::data_usage_cache::DataUsageCache;
 
 const MAX_UPLOADS_LIST: usize = 10000;
 
@@ -491,7 +491,12 @@ impl ECStore {
         internal_get_pool_info_existing_with_opts(&self.pools, bucket, object, opts).await
     }
 
-    pub async fn ns_scanner(&self, updates: Sender<DataUsageInfo>, want_cycle: usize, heal_scan_mode: HealScanMode) -> Result<()> {
+    pub async fn ns_scanner(
+        &self,
+        updates: Sender<DataUsageInfo>,
+        want_cycle: usize,
+        heal_scan_mode: HealScanMode,
+    ) -> Result<()> {
         let all_buckets = self.list_bucket(&BucketOptions::default()).await?;
         if all_buckets.is_empty() {
             let _ = updates.send(DataUsageInfo::default()).await;
@@ -509,21 +514,21 @@ impl ECStore {
             for set in pool.disk_set.iter() {
                 let index = result_index;
                 let results_clone = results.clone();
-                futures.push(async move { 
+                futures.push(async move {
                     let (tx, mut rx) = mpsc::channel(100);
                     let task = tokio::spawn(async move {
                         loop {
                             match rx.recv().await {
                                 Some(info) => {
                                     results_clone.write().await[index] = info;
-                                },
+                                }
                                 None => {
-                                    return ;
+                                    return;
                                 }
                             }
                         }
                     });
-                    
+
                     let _ = task.await;
                 });
                 result_index += 1;
@@ -1427,9 +1432,8 @@ impl StorageAPI for ECStore {
                 match err.downcast_ref::<DiskError>() {
                     Some(DiskError::NoHealRequired) => {
                         count_no_heal += 1;
-                    },
+                    }
                     _ => {
-
                         continue;
                     }
                 }
@@ -1438,7 +1442,6 @@ impl StorageAPI for ECStore {
             r.set_count += result.set_count;
             r.before.append(&mut result.before);
             r.after.append(&mut result.after);
-
         }
         if count_no_heal == self.pools.len() {
             return Ok((r, Some(Error::new(DiskError::NoHealRequired))));
@@ -1449,7 +1452,13 @@ impl StorageAPI for ECStore {
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         unimplemented!()
     }
-    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<(HealResultItem, Option<Error>)> {
+    async fn heal_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+    ) -> Result<(HealResultItem, Option<Error>)> {
         let object = utils::path::encode_dir_object(object);
         let errs = Arc::new(RwLock::new(vec![None; self.pools.len()]));
         let results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.pools.len()]));

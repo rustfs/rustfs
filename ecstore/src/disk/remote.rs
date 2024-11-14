@@ -21,7 +21,13 @@ use super::{
     RemoteFileWriter, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::{
-    disk::error::DiskError, error::{Error, Result}, heal::{data_usage_cache::{DataUsageCache, DataUsageEntry}, heal_commands::HealScanMode}, store_api::{FileInfo, RawFileInfo}
+    disk::error::DiskError,
+    error::{Error, Result},
+    heal::{
+        data_usage_cache::{DataUsageCache, DataUsageEntry},
+        heal_commands::HealScanMode,
+    },
+    store_api::{FileInfo, RawFileInfo},
 };
 use protos::proto_gen::node_service::RenamePartRequst;
 

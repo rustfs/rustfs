@@ -1,19 +1,3 @@
-use bytesize::ByteSize;
-use http::HeaderMap;
-use path_clean::PathClean;
-use rand::Rng;
-use rmp_serde::Serializer;
-use s3s::dto::ReplicationConfiguration;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use std::u64;
-use s3s::{S3Error, S3ErrorCode};
-use tokio::sync::mpsc::Sender;
-use tokio::time::sleep;
 use crate::config::common::save_config;
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
@@ -21,6 +5,22 @@ use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
 use crate::set_disk::SetDisks;
 use crate::store_api::{HTTPRangeSpec, ObjectIO, ObjectOptions};
+use bytesize::ByteSize;
+use http::HeaderMap;
+use path_clean::PathClean;
+use rand::Rng;
+use rmp_serde::Serializer;
+use s3s::dto::ReplicationConfiguration;
+use s3s::{S3Error, S3ErrorCode};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use std::u64;
+use tokio::sync::mpsc::Sender;
+use tokio::time::sleep;
 
 use super::data_scanner::SizeSummary;
 use super::data_usage::DATA_USAGE_ROOT;
@@ -146,7 +146,7 @@ impl Default for SizeHistogram {
 impl SizeHistogram {
     fn add(&mut self, size: u64) {
         for (idx, interval) in OBJECTS_HISTOGRAM_INTERVALS.iter().enumerate() {
-            if size  >= interval.start && size <= interval.end {
+            if size >= interval.start && size <= interval.end {
                 self.0[idx] += 1;
                 break;
             }
@@ -167,7 +167,7 @@ impl Default for VersionsHistogram {
 impl VersionsHistogram {
     fn add(&mut self, size: u64) {
         for (idx, interval) in OBJECTS_VERSION_COUNT_INTERVALS.iter().enumerate() {
-            if size  >= interval.start && size <= interval.end {
+            if size >= interval.start && size <= interval.end {
                 self.0[idx] += 1;
                 break;
             }
@@ -259,7 +259,10 @@ impl DataUsageEntry {
         replication_stats.replica_count += summary.replica_count as u64;
 
         for (arn, st) in &summary.repl_target_stats {
-            let tgt_stat = replication_stats.targets.entry(arn.to_string()).or_insert(ReplicationStats::default());
+            let tgt_stat = replication_stats
+                .targets
+                .entry(arn.to_string())
+                .or_insert(ReplicationStats::default());
             tgt_stat.pending_size += st.pending_size as u64;
             tgt_stat.failed_size += st.failed_size as u64;
             tgt_stat.replicated_size += st.replicated_size as u64;
@@ -412,7 +415,7 @@ impl DataUsageCache {
         }
         Ok(d)
     }
-    
+
     pub async fn save(&self, name: &str) -> Result<()> {
         let buf = self.marshal_msg()?;
         let buf_clone = buf.clone();
@@ -429,7 +432,7 @@ impl DataUsageCache {
         });
         save_config(&store, name, &buf).await
     }
-    
+
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
         let hash = hash_path(path);
         self.cache.insert(hash.key(), e);
@@ -447,7 +450,10 @@ impl DataUsageCache {
     pub fn replace_hashed(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, e: &DataUsageEntry) {
         self.cache.insert(hash.key(), e.clone());
         if let Some(parent) = parent {
-            self.cache.entry(parent.key()).or_insert(DataUsageEntry::default()).add_child(hash);
+            self.cache
+                .entry(parent.key())
+                .or_insert(DataUsageEntry::default())
+                .add_child(hash);
         }
     }
 
@@ -456,7 +462,11 @@ impl DataUsageCache {
     }
 
     pub fn find_children_copy(&mut self, h: DataUsageHash) -> DataUsageHashMap {
-        self.cache.entry(h.string()).or_insert(DataUsageEntry::default()).children.clone()
+        self.cache
+            .entry(h.string())
+            .or_insert(DataUsageEntry::default())
+            .children
+            .clone()
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
@@ -488,7 +498,7 @@ impl DataUsageCache {
                     let p = self.cache.entry(parent.key()).or_insert(DataUsageEntry::default());
                     p.add_child(hash);
                 }
-            },
+            }
             None => return,
         }
     }
@@ -517,8 +527,8 @@ impl DataUsageCache {
                     flat.replication_stats = None;
                 }
                 return Some(flat);
-            },
-            None => None
+            }
+            None => None,
         }
     }
 
@@ -544,10 +554,8 @@ impl DataUsageCache {
 
     pub fn is_compacted(&self, hash: &DataUsageHash) -> bool {
         match self.cache.get(&hash.key()) {
-            Some(due) => {
-                due.compacted
-            },
-            None => false
+            Some(due) => due.compacted,
+            None => false,
         }
     }
 
@@ -576,9 +584,7 @@ impl DataUsageCache {
         let mut leaves = Vec::new();
         let mut remove = total - limit;
         add(self, path, &mut leaves);
-        leaves.sort_by(|a, b| {
-            a.objects.cmp(&b.objects)
-        });
+        leaves.sort_by(|a, b| a.objects.cmp(&b.objects));
 
         while remove > 0 && leaves.len() > 0 {
             let e = leaves.first().unwrap();
@@ -602,7 +608,6 @@ impl DataUsageCache {
             remove -= removing;
             leaves.remove(0);
         }
-
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
@@ -652,8 +657,13 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
         return;
     }
 
-    let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or(DataUsageEntry::default());
-    leaves.push(Inner{objects: sz.objects, path: path.clone()});
+    let sz = data_usage_cache
+        .size_recursive(&path.key())
+        .unwrap_or(DataUsageEntry::default());
+    leaves.push(Inner {
+        objects: sz.objects,
+        path: path.clone(),
+    });
     for ch in e.children.iter() {
         add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
     }

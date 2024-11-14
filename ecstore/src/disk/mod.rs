@@ -14,7 +14,7 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 use crate::{
-    erasure::{ReadAt, Writer},
+    erasure::Writer,
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
     heal::{
@@ -340,6 +340,18 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.disk_info(opts).await,
             Disk::Remote(remote_disk) => remote_disk.disk_info(opts).await,
+        }
+    }
+
+    async fn ns_scanner(
+        &self,
+        cache: &DataUsageCache,
+        updates: Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        match self {
+            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode).await,
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode).await,
         }
     }
 }
