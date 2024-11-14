@@ -135,7 +135,7 @@ impl Operation for AccountInfoHandler {
             statements: vec![BPStatement {
                 sid: "".to_owned(),
                 effect: Effect::Allow,
-                actions: ActionSet(s3_all_act),
+                actions: ActionSet(s3_all_act.clone()),
                 resources: ResourceSet(all_res),
                 ..Default::default()
             }],

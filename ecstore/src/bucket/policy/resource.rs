@@ -228,6 +228,10 @@ impl ResourceSet {
         }
         false
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl AsRef<HashSet<Resource>> for ResourceSet {
