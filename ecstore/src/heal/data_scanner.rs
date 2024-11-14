@@ -858,7 +858,8 @@ impl FolderScanner {
             // Replace if existed before.
             if let Some(flat) = self.new_cache.size_recursive(&this_hash.key()) {
                 self.update_cache.delete_recursive(&this_hash);
-                self.update_cache.replace_hashed(&this_hash, &Some(folder.parent.clone()), &flat);
+                self.update_cache
+                    .replace_hashed(&this_hash, &Some(folder.parent.clone()), &flat);
             }
         }
         Ok(())

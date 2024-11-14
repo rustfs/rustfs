@@ -2,10 +2,13 @@ use crate::config::{storageclass, KVS};
 use crate::disk::DiskAPI;
 use crate::{
     disk::{
-        error::DiskError, format::{FormatErasureVersion, FormatMetaVersion, FormatV3}, new_disk, DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET
+        error::DiskError,
+        format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
+        new_disk, DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
     },
     endpoints::Endpoints,
-    error::{Error, Result}, heal::heal_commands::init_healing_tracker,
+    error::{Error, Result},
+    heal::heal_commands::init_healing_tracker,
 };
 use futures::future::join_all;
 use std::{
@@ -232,10 +235,12 @@ pub async fn load_format_erasure(disk: &DiskStore, heal: bool) -> Result<FormatV
     let mut fm = FormatV3::try_from(data.as_slice())?;
 
     if heal {
-        let info = disk.disk_info(&DiskInfoOptions {
-            noop: heal,
-            ..Default::default()
-        }).await?;
+        let info = disk
+            .disk_info(&DiskInfoOptions {
+                noop: heal,
+                ..Default::default()
+            })
+            .await?;
         fm.disk_info = Some(info);
     }
 

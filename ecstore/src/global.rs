@@ -4,7 +4,10 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
-    disk::DiskStore, endpoints::{EndpointServerPools, PoolEndpoints, SetupType}, heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState}, store::ECStore
+    disk::DiskStore,
+    endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
+    heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState},
+    store::ECStore,
 };
 
 pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;

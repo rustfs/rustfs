@@ -4,12 +4,18 @@ use tokio::{
     select,
     sync::{
         broadcast::Receiver as B_Receiver,
-        mpsc::{self, Receiver, Sender}, RwLock,
+        mpsc::{self, Receiver, Sender},
+        RwLock,
     },
 };
 
 use crate::{
-    disk::error::DiskError, error::{Error, Result}, heal::heal_ops::NOP_HEAL, new_object_layer_fn, store_api::StorageAPI, utils::path::SLASH_SEPARATOR
+    disk::error::DiskError,
+    error::{Error, Result},
+    heal::heal_ops::NOP_HEAL,
+    new_object_layer_fn,
+    store_api::StorageAPI,
+    utils::path::SLASH_SEPARATOR,
 };
 
 use super::{
@@ -148,7 +154,7 @@ async fn heal_disk_format(opts: HealOpts) -> Result<(HealResultItem, Option<Erro
     let store = lock.as_ref().expect("Not init");
     let (res, err) = store.heal_format(opts.dry_run).await?;
     // return any error, ignore error returned when disks have
-	// already healed.
+    // already healed.
     if err.is_some() {
         return Ok((HealResultItem::default(), err));
     }

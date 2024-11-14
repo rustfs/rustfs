@@ -12,7 +12,7 @@ use crate::{
     disk::{
         error::DiskError,
         format::{DistributionAlgoVersion, FormatV3},
-        new_disk, DiskInfo, DiskOption, DiskStore,
+        new_disk, DiskAPI, DiskInfo, DiskOption, DiskStore,
     },
     endpoints::{Endpoints, PoolEndpoints},
     error::{Error, Result},
@@ -31,8 +31,7 @@ use crate::{
         ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
-   
-    utils::hash,,
+    utils::hash,
 };
 
 use tokio::time::Duration;
@@ -522,7 +521,7 @@ impl StorageAPI for Sets {
         let before_derives = formats_to_drives_info(&self.endpoints.endpoints, &formats, &errs);
         res.before = vec![HealDriveInfo::default(); before_derives.len()];
         res.after = vec![HealDriveInfo::default(); before_derives.len()];
-        
+
         for v in before_derives.iter() {
             res.before.push(v.clone());
             res.after.push(v.clone());
@@ -536,15 +535,16 @@ impl StorageAPI for Sets {
         }
 
         let format_op_id = Uuid::new_v4().to_string();
-        let (new_format_sets, current_disks_info) = new_heal_format_sets(&ref_format, self.set_count, self.set_drive_count, &formats, &errs);
+        let (new_format_sets, current_disks_info) =
+            new_heal_format_sets(&ref_format, self.set_count, self.set_drive_count, &formats, &errs);
         if !dry_run {
-            let mut tmp_new_formats = vec![None; self.set_count*self.set_drive_count];
+            let mut tmp_new_formats = vec![None; self.set_count * self.set_drive_count];
             for (i, set) in new_format_sets.iter().enumerate() {
                 for (j, fm) in set.iter().enumerate() {
                     if let Some(fm) = fm {
-                        res.after[i*self.set_drive_count+j].uuid = fm.erasure.this.to_string();
-                        res.after[i*self.set_drive_count+j].state = DRIVE_STATE_OK.to_string();
-                        tmp_new_formats[i*self.set_drive_count+j] = Some(fm.clone());
+                        res.after[i * self.set_drive_count + j].uuid = fm.erasure.this.to_string();
+                        res.after[i * self.set_drive_count + j].state = DRIVE_STATE_OK.to_string();
+                        tmp_new_formats[i * self.set_drive_count + j] = Some(fm.clone());
                     }
                 }
             }
@@ -690,7 +690,7 @@ fn new_heal_format_sets(
     let mut current_disks_info = vec![vec![DiskInfo::default(); set_drive_count]; set_count];
     for (i, set) in ref_format.erasure.sets.iter().enumerate() {
         for (j, value) in set.iter().enumerate() {
-            if let Some(Some(err)) = errs.get(i*set_drive_count+j) {
+            if let Some(Some(err)) = errs.get(i * set_drive_count + j) {
                 match err.downcast_ref::<DiskError>() {
                     Some(DiskError::UnformattedDisk) => {
                         let mut fm = FormatV3::new(set_count, set_drive_count);
@@ -702,11 +702,11 @@ fn new_heal_format_sets(
                         fm.erasure.version = ref_format.erasure.version.clone();
                         fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
                         new_formats[i][j] = Some(fm);
-                    }, 
-                    _ => {},
+                    }
+                    _ => {}
                 }
             }
-            if let (Some(format), None) = (&formats[i*set_drive_count+j], &errs[i*set_drive_count+j]) {
+            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j]) {
                 if let Some(info) = &format.disk_info {
                     if !info.endpoint.is_empty() {
                         current_disks_info[i][j] = info.clone();

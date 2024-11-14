@@ -102,12 +102,6 @@ impl FileInfo {
         false
     }
 
-    pub fn inline_data(&self) -> bool {
-        self.metadata.as_ref().map_or(false, |metadata| {
-            metadata.contains_key(&format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER)) && !self.is_remote()
-        })
-    }
-
     pub fn get_etag(&self) -> Option<String> {
         if let Some(meta) = &self.metadata {
             meta.get("etag").cloned()
@@ -917,9 +911,15 @@ pub trait StorageAPI: ObjectIO {
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
 
-    async fn heal_format(&self, dry_run: bool) ->Result<(HealResultItem, Option<Error>)>;
+    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
-    async fn heal_object(&self, bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Result<(HealResultItem, Option<Error>)>;
+    async fn heal_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+    ) -> Result<(HealResultItem, Option<Error>)>;
     async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()>;
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
