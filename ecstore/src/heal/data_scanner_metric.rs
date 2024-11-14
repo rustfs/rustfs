@@ -1,3 +1,6 @@
+use lazy_static::lazy_static;
+use std::future::Future;
+use std::pin::Pin;
 use std::{
     collections::HashMap,
     sync::{
@@ -6,11 +9,9 @@ use std::{
     },
     time::SystemTime,
 };
-
-use lazy_static::lazy_static;
 use tokio::sync::RwLock;
 
-use super::data_scanner::CurrentScannerCycle;
+use super::data_scanner::{CurrentScannerCycle, UpdateCurrentPathFn};
 
 lazy_static! {
     pub static ref globalScannerMetrics: Arc<RwLock<ScannerMetrics>> = Arc::new(RwLock::new(ScannerMetrics::new()));
@@ -55,6 +56,7 @@ pub enum ScannerMetric {
 pub struct ScannerMetrics {
     operations: Vec<AtomicU32>,
     cycle_info: RwLock<Option<CurrentScannerCycle>>,
+    current_paths: HashMap<String, String>,
 }
 
 impl ScannerMetrics {
@@ -62,6 +64,7 @@ impl ScannerMetrics {
         Self {
             operations: (0..ScannerMetric::Last as usize).map(|_| AtomicU32::new(0)).collect(),
             cycle_info: RwLock::new(None),
+            current_paths: HashMap::new(),
         }
     }
 
@@ -74,4 +77,29 @@ impl ScannerMetrics {
     pub async fn set_cycle(&mut self, c: Option<CurrentScannerCycle>) {
         *self.cycle_info.write().await = c;
     }
+}
+
+pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
+    let disk_1 = disk.to_string();
+    let disk_2 = disk.to_string();
+    (
+        Arc::new(move |path: &str| {
+            let disk_inner = disk_1.clone();
+            let path = path.to_string();
+            Box::pin(async move {
+                globalScannerMetrics
+                    .write()
+                    .await
+                    .current_paths
+                    .insert(disk_inner, path.to_string());
+            })
+        }),
+        Arc::new(move || {
+            let disk_inner = disk_2.clone();
+            Box::pin(async move {
+                globalScannerMetrics.write().await.current_paths.remove(&disk_inner);
+            })
+        }),
+    )
 }
