@@ -22,7 +22,7 @@ use std::u64;
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
 
-use super::data_scanner::SizeSummary;
+use super::data_scanner::{SizeSummary, DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS};
 use super::data_usage::DATA_USAGE_ROOT;
 
 // DATA_USAGE_BUCKET_LEN must be length of ObjectsHistogramIntervals
@@ -559,6 +559,33 @@ impl DataUsageCache {
         }
     }
 
+    pub fn force_compact(&mut self, limit: usize) {
+        if self.cache.len() < limit {
+            return;
+        }
+        let top = hash_path(&self.info.name).key();
+        let top_e = match self.find(&top) {
+            Some(e) => e,
+            None => return,
+        };
+        if top_e.children.len() > DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS.try_into().unwrap() {
+            self.reduce_children_of(&hash_path(&self.info.name), limit, true);
+        }
+        if self.cache.len() <= limit {
+            return;
+        }
+
+        let mut found = HashSet::new();
+        found.insert(top);
+        mark(self, &top_e, &mut found);
+        self.cache.retain(|k, _| {
+            if !found.contains(k) {
+                return false;
+            }
+            true
+        });
+    }
+
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
         let e = match self.cache.get(&path.key()) {
             Some(e) => e,
@@ -666,6 +693,15 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
     });
     for ch in e.children.iter() {
         add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
+    }
+}
+
+fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
+    for k in entry.children.iter() {
+        found.insert(k.to_string());
+        if let Some(ch) = duc.cache.get(k) {
+            mark(duc, ch, found);
+        }
     }
 }
 
