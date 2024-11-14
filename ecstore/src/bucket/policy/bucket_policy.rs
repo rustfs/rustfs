@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 // use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use super::{
     action::{Action, ActionSet, IAMActionConditionKeyMap},
@@ -35,11 +36,11 @@ pub struct BPStatement {
     pub principal: Principal,
     #[serde(rename = "Action")]
     pub actions: ActionSet,
-    #[serde(rename = "NotAction", default)]
+    #[serde(rename = "NotAction", skip_serializing_if = "ActionSet::is_empty")]
     pub not_actions: ActionSet,
-    #[serde(rename = "Resource")]
+    #[serde(rename = "Resource", skip_serializing_if = "ResourceSet::is_empty")]
     pub resources: ResourceSet,
-    #[serde(rename = "Condition", default)]
+    #[serde(rename = "Condition", skip_serializing_if = "Functions::is_empty")]
     pub conditions: Functions,
 }
 
