@@ -1,5 +1,6 @@
 pub mod error;
 pub mod globals;
+pub mod last_minute;
 
 /// Defers evaluation of a block of code until the end of the scope.
 #[macro_export]

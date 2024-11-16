@@ -10,7 +10,7 @@ use crate::global::{
     is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION,
     DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
 };
-use crate::heal::data_usage::DataUsageInfo;
+use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
 use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode, HEAL_ITEM_METADATA};
 use crate::heal::heal_ops::HealObjectFn;
 use crate::new_object_layer_fn;
@@ -44,19 +44,21 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
+use tokio::time::interval;
 use std::cmp::Ordering;
 use std::slice::Iter;
+use std::time::SystemTime;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
 use time::OffsetDateTime;
-use tokio::fs;
+use tokio::{fs, select};
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 
-use crate::heal::data_usage_cache::DataUsageCache;
+use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -509,11 +511,16 @@ impl ECStore {
             total_results += pool.disk_set.len();
         });
         let mut results = Arc::new(RwLock::new(vec![DataUsageCache::default(); total_results]));
+        let (cancel, _) = broadcast::channel(100);
+        let first_err = Arc::new(RwLock::new(None));
         let mut futures = Vec::new();
         for pool in self.pools.iter() {
             for set in pool.disk_set.iter() {
                 let index = result_index;
                 let results_clone = results.clone();
+                let first_err_clone = first_err.clone();
+                let cancel_clone = cancel.clone();
+                let all_buckets_clone = all_buckets.clone();
                 futures.push(async move {
                     let (tx, mut rx) = mpsc::channel(100);
                     let task = tokio::spawn(async move {
@@ -528,11 +535,60 @@ impl ECStore {
                             }
                         }
                     });
-
+                    if let Err(err) = set.ns_scanner(&all_buckets_clone, want_cycle.try_into().unwrap(), tx, heal_scan_mode).await {
+                        let mut f_w = first_err_clone.write().await;
+                        if f_w.is_none() {
+                            *f_w = Some(err);
+                        }
+                        let _ = cancel_clone.send(true);
+                        return ;
+                    }
                     let _ = task.await;
                 });
                 result_index += 1;
             }
+        }
+        let (update_closer_tx, mut update_close_rx) = mpsc::channel(10);
+        let mut ctx_clone = cancel.subscribe();
+        let all_buckets_clone = all_buckets.clone();
+        let task = tokio::spawn(async move {
+            let mut last_update = None;
+            let mut interval = interval(Duration::from_secs(30));
+            let all_merged = Arc::new(RwLock::new(DataUsageCache::default()));
+            loop {
+                select! {
+                    _ = ctx_clone.recv() => {
+                        return;
+                    }
+                    _ = update_close_rx.recv() => {
+                        last_update = match tokio::spawn(update_scan(all_merged.clone(), results.clone(), last_update.clone(), all_buckets_clone.clone(), updates.clone())).await {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                        return;
+                    }
+                    _ = interval.tick() => {
+                        last_update = match tokio::spawn(update_scan(all_merged.clone(), results.clone(), last_update.clone(), all_buckets_clone.clone(), updates.clone())).await {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                    }
+                }
+            }
+        });
+        let _ = join_all(futures).await;
+        let mut ctx_closer = cancel.subscribe();
+        select! {
+            _ = update_closer_tx.send(true) => {
+
+            }
+            _ = ctx_closer.recv() => {
+                
+            }
+        }
+        let _ = task.await;
+        if let Some(err) = first_err.read().await.as_ref() {
+            return Err(err.clone());
         }
         Ok(())
     }
@@ -630,6 +686,28 @@ impl ECStore {
             )))
         }
     }
+}
+
+async fn update_scan(all_merged: Arc<RwLock<DataUsageCache>>, results: Arc<RwLock<Vec<DataUsageCache>>>, last_update: Option<SystemTime>, all_buckets: Vec<BucketInfo>, updates: Sender<DataUsageInfo>) -> Option<SystemTime> {
+    let mut w = all_merged.write().await;
+    *w = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: DATA_USAGE_ROOT.to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for info in results.read().await.iter() {
+        if info.info.last_update.is_none() {
+            return last_update;
+        }
+        w.merge(info);
+    }
+    if w.info.last_update > last_update && w.root().is_none() {
+        let _ = updates.send(w.dui(&w.info.name, &all_buckets)).await;
+        return w.info.last_update;
+    }
+    last_update
 }
 
 pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {

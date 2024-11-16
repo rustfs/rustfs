@@ -16,7 +16,7 @@ const STORAGE_FORMAT_FILE: &str = "xl.meta";
 use crate::{
     erasure::Writer,
     error::{Error, Result},
-    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
+    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion, FileMetaVersion},
     heal::{
         data_usage_cache::{DataUsageCache, DataUsageEntry},
         heal_commands::HealScanMode,
@@ -344,14 +344,14 @@ impl DiskAPI for Disk {
     }
 
     async fn ns_scanner(
-        &self,
+        self: Arc<Self>,
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
-        match self {
-            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode).await,
-            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode).await,
+        match &*self {
+            Disk::Local(local_disk) => Arc::new(local_disk).ns_scanner(cache, updates, scan_mode).await,
+            Disk::Remote(remote_disk) => Arc::new(remote_disk).ns_scanner(cache, updates, scan_mode).await,
         }
     }
 }
@@ -453,7 +453,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     async fn ns_scanner(
-        &self,
+        self: Arc<Self>,
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
