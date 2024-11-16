@@ -382,6 +382,19 @@ message DiskInfoResponse {
   optional string error_info = 3;
 }
 
+message NsScannerRequest {
+  string disk = 1;
+  string cache = 2;
+  uint64 scan_mode = 3;
+}
+
+message NsScannerResponse {
+  bool success = 1;
+  string update = 2;
+  string data_usage_cache = 3;
+  optional string error_info = 4;
+}
+
 // lock api have same argument type
 message GenerallyLockRequest {
     string args = 1;
@@ -432,6 +445,7 @@ service NodeService {
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
   rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {};
+  rpc NsScanner(stream NsScannerRequest) returns (stream NsScannerResponse) {};
 
 /* -------------------------------lock service-------------------------- */
 

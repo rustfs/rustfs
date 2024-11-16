@@ -20,8 +20,8 @@ use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, SizeSummary};
-use crate::heal::data_scanner_metric::{globalScannerMetrics, ScannerMetric, ScannerMetrics};
-use crate::heal::data_usage_cache::{self, DataUsageCache, DataUsageEntry};
+use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
+use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
 use crate::heal::heal_commands::HealScanMode;
 use crate::new_object_layer_fn;
@@ -40,7 +40,6 @@ use crate::{
 };
 use common::defer;
 use path_absolutize::Absolutize;
-use s3s::dto::{ReplicationConfiguration, ReplicationRuleStatus};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -1880,7 +1879,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn ns_scanner(
-        self: Arc<Self>,
+        &self,
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
@@ -1908,7 +1907,7 @@ impl DiskAPI for LocalDisk {
         };
         let loc = self.get_disk_location();
         let disks = store.get_disks(loc.pool_idx.unwrap(), loc.disk_idx.unwrap()).await?;
-        let disk = self.clone();
+        let disk = Arc::new(LocalDisk::new(&self.endpoint(), false).await?);
         let disk_clone = disk.clone();
         let mut cache = cache.clone();
         cache.info.updates = Some(updates.clone());
@@ -1925,7 +1924,7 @@ impl DiskAPI for LocalDisk {
                     }
                     let stop_fn = ScannerMetrics::log(ScannerMetric::ScanObject);
                     let mut res = HashMap::new();
-                    let done_sz = ScannerMetrics::time_size(ScannerMetric::ReadMetadata);
+                    let done_sz = ScannerMetrics::time_size(ScannerMetric::ReadMetadata).await;
                     let buf = match disk.read_metadata(item.path.clone()).await {
                         Ok(buf) => buf,
                         Err(err) => {
@@ -1965,7 +1964,7 @@ impl DiskAPI for LocalDisk {
                     let mut obj_deleted = false;
                     for info in obj_infos.iter() {
                         let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);
-                        let mut sz = 0;
+                        let sz: usize;
                         (obj_deleted, sz) = item.apply_actions(&info, &size_s).await;
                         done().await;
 
@@ -1994,7 +1993,8 @@ impl DiskAPI for LocalDisk {
                     }
 
                     for frer_version in fivs.free_versions.iter() {
-                        let _obj_info = frer_version.to_object_info(&item.bucket, &item.object_path().to_string_lossy(), versioned);
+                        let _obj_info =
+                            frer_version.to_object_info(&item.bucket, &item.object_path().to_string_lossy(), versioned);
                         let done = ScannerMetrics::time(ScannerMetric::TierObjSweep);
                         done().await;
                     }

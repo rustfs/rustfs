@@ -483,7 +483,7 @@ impl StorageAPI for Sets {
             .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
             .await
     }
-    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
         unimplemented!()
     }
 
@@ -535,8 +535,7 @@ impl StorageAPI for Sets {
         }
 
         let format_op_id = Uuid::new_v4().to_string();
-        let (new_format_sets, current_disks_info) =
-            new_heal_format_sets(&ref_format, self.set_count, self.set_drive_count, &formats, &errs);
+        let (new_format_sets, _) = new_heal_format_sets(&ref_format, self.set_count, self.set_drive_count, &formats, &errs);
         if !dry_run {
             let mut tmp_new_formats = vec![None; self.set_count * self.set_drive_count];
             for (i, set) in new_format_sets.iter().enumerate() {
@@ -578,7 +577,7 @@ impl StorageAPI for Sets {
         }
         Ok((res, None))
     }
-    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+    async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
         unimplemented!()
     }
     async fn heal_object(
@@ -592,18 +591,18 @@ impl StorageAPI for Sets {
             .heal_object(bucket, object, version_id, opts)
             .await
     }
-    async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()> {
+    async fn heal_objects(&self, _bucket: &str, _prefix: &str, _opts: &HealOpts, _func: HealObjectFn) -> Result<()> {
         unimplemented!()
     }
-    async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
+    async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
         unimplemented!()
     }
-    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
+    async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
     }
 }
 
-async fn close_storage_disks(disks: &[Option<DiskStore>]) {
+async fn _close_storage_disks(disks: &[Option<DiskStore>]) {
     let mut futures = Vec::with_capacity(disks.len());
     for disk in disks.iter() {
         if let Some(disk) = disk {
@@ -652,7 +651,7 @@ fn formats_to_drives_info(endpoints: &Endpoints, formats: &[Option<FormatV3>], e
     let mut before_drives = Vec::with_capacity(endpoints.as_ref().len());
     for (index, format) in formats.iter().enumerate() {
         let drive = endpoints.get_string(index);
-        let mut state = if format.is_some() {
+        let state = if format.is_some() {
             DRIVE_STATE_OK
         } else {
             if let Some(Some(err)) = errs.get(index) {
@@ -689,7 +688,7 @@ fn new_heal_format_sets(
     let mut new_formats = vec![vec![None; set_drive_count]; set_count];
     let mut current_disks_info = vec![vec![DiskInfo::default(); set_drive_count]; set_count];
     for (i, set) in ref_format.erasure.sets.iter().enumerate() {
-        for (j, value) in set.iter().enumerate() {
+        for j in 0..set.len() {
             if let Some(Some(err)) = errs.get(i * set_drive_count + j) {
                 match err.downcast_ref::<DiskError>() {
                     Some(DiskError::UnformattedDisk) => {

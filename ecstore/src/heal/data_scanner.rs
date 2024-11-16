@@ -34,7 +34,6 @@ use super::{
     data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
     heal_commands::{HealScanMode, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
 };
-use crate::heal::data_scanner_metric::current_path_updater;
 use crate::heal::data_usage::DATA_USAGE_ROOT;
 use crate::{
     cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
@@ -54,15 +53,16 @@ use crate::{
     },
     new_object_layer_fn,
     peer::is_reserved_or_invalid_bucket,
-    store::{ECStore, ListPathOptions},
+    store::ECStore,
     utils::path::{path_join, path_to_bucket_object, path_to_bucket_object_with_base_path, SLASH_SEPARATOR},
 };
+use crate::{disk::local::LocalDisk, heal::data_scanner_metric::current_path_updater};
 use crate::{
     disk::DiskAPI,
     store_api::{FileInfo, ObjectInfo},
 };
 
-const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1); // Time to wait between folders.
+const _DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1); // Time to wait between folders.
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16; // Visit all folders every n cycles.
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: u64 = 500; // Compact when there are less than this many objects in a branch.
 const DATA_SCANNER_COMPACT_AT_CHILDREN: u64 = 10000; // Compact when there are this many children in a branch.
@@ -70,12 +70,12 @@ const DATA_SCANNER_COMPACT_AT_FOLDERS: u64 = DATA_SCANNER_COMPACT_AT_CHILDREN / 
 pub const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: u64 = 250_000; // Compact when this many subfolders in a single folder (even top level).
 const DATA_SCANNER_START_DELAY: Duration = Duration::from_secs(60); // Time to wait on startup and between cycles.
 
-const HEAL_DELETE_DANGLING: bool = true;
+pub const HEAL_DELETE_DANGLING: bool = true;
 const HEAL_OBJECT_SELECT_PROB: u64 = 1024; // Overall probability of a file being scanned; one in n.
 
 // static SCANNER_SLEEPER: () = new_dynamic_sleeper(2, Duration::from_secs(1), true); // Keep defaults same as config defaults
 static SCANNER_CYCLE: AtomicU64 = AtomicU64::new(DATA_SCANNER_START_DELAY.as_secs());
-static SCANNER_IDLE_MODE: AtomicU32 = AtomicU32::new(0); // default is throttled when idle
+static _SCANNER_IDLE_MODE: AtomicU32 = AtomicU32::new(0); // default is throttled when idle
 static SCANNER_EXCESS_OBJECT_VERSIONS: AtomicU64 = AtomicU64::new(100);
 static SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE: AtomicU64 = AtomicU64::new(1024 * 1024 * 1024 * 1024); // 1 TB
 static SCANNER_EXCESS_FOLDERS: AtomicU64 = AtomicU64::new(50_000);
@@ -167,16 +167,18 @@ async fn run_data_scanner() {
                 cycle_info.current = 0;
                 cycle_info.cycle_completed.push(SystemTime::now());
                 if cycle_info.cycle_completed.len() > DATA_USAGE_UPDATE_DIR_CYCLES as usize {
-                    cycle_info.cycle_completed = cycle_info.cycle_completed[cycle_info.cycle_completed.len() - DATA_USAGE_UPDATE_DIR_CYCLES as usize..].to_vec();
+                    cycle_info.cycle_completed = cycle_info.cycle_completed
+                        [cycle_info.cycle_completed.len() - DATA_USAGE_UPDATE_DIR_CYCLES as usize..]
+                        .to_vec();
                 }
                 globalScannerMetrics.write().await.set_cycle(Some(cycle_info.clone())).await;
                 let mut tmp = Vec::new();
                 tmp.write_u64::<LittleEndian>(cycle_info.next).unwrap();
                 let _ = save_config(store, &DATA_USAGE_BLOOM_NAME_PATH, &tmp).await;
-            },
+            }
             Err(err) => {
                 res.insert("error".to_string(), err.to_string());
-            },
+            }
         }
         stop_fn(&res).await;
         sleep(Duration::from_secs(SCANNER_CYCLE.load(std::sync::atomic::Ordering::SeqCst))).await;
@@ -265,7 +267,7 @@ impl Default for CurrentScannerCycle {
 }
 
 impl CurrentScannerCycle {
-    pub fn marshal_msg(&self, buf: &[u8]) -> Result<Vec<u8>> {
+    pub fn marshal_msg(&self, next_buf: &[u8]) -> Result<Vec<u8>> {
         let len: u32 = 4;
         let mut wr = Vec::new();
 
@@ -291,7 +293,7 @@ impl CurrentScannerCycle {
             .serialize(&mut Serializer::new(&mut buf))
             .expect("Serialization failed");
         rmp::encode::write_bin(&mut wr, &buf)?;
-        let mut result = buf.to_vec();
+        let mut result = next_buf.to_vec();
         result.extend(wr.iter());
         Ok(result)
     }
@@ -355,7 +357,7 @@ fn timestamp_to_system_time(timestamp: u64) -> SystemTime {
 }
 
 #[derive(Clone, Debug, Default)]
-struct Heal {
+pub struct Heal {
     enabled: bool,
     bitrot: bool,
 }
@@ -403,7 +405,12 @@ impl ScannerItem {
             cumulative_size += obj_info.size;
         }
 
-        if cumulative_size >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst).try_into().unwrap() {
+        if cumulative_size
+            >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE
+                .load(Ordering::SeqCst)
+                .try_into()
+                .unwrap()
+        {
             //todo
         }
 
@@ -421,7 +428,7 @@ impl ScannerItem {
         Ok(object_infos)
     }
 
-    pub async fn apply_actions(&self, oi: &ObjectInfo, size_s: &SizeSummary) -> (bool, usize) {
+    pub async fn apply_actions(&self, _oi: &ObjectInfo, _size_s: &SizeSummary) -> (bool, usize) {
         let done = ScannerMetrics::time(ScannerMetric::Ilm);
         //todo: lifecycle
         done().await;
@@ -1014,7 +1021,7 @@ pub fn has_active_rules(config: &ReplicationConfiguration, prefix: &str, recursi
     false
 }
 
-pub type LocalDrive = Arc<dyn DiskAPI>;
+pub type LocalDrive = Arc<LocalDisk>;
 pub async fn scan_data_folder(
     disks: &[Option<DiskStore>],
     drive: LocalDrive,
