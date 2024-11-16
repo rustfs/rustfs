@@ -34,13 +34,13 @@ lazy_static! {
 // - replica failed count
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BucketTargetUsageInfo {
-    replication_pending_size: u64,
-    replication_failed_size: u64,
-    replicated_size: u64,
-    replica_size: u64,
-    replication_pending_count: u64,
-    replication_failed_count: u64,
-    replicated_count: u64,
+    pub replication_pending_size: u64,
+    pub replication_failed_size: u64,
+    pub replicated_size: u64,
+    pub replica_size: u64,
+    pub replication_pending_count: u64,
+    pub replication_failed_count: u64,
+    pub replicated_count: u64,
 }
 
 // BucketUsageInfo - bucket usage info provides
@@ -49,80 +49,61 @@ pub struct BucketTargetUsageInfo {
 // - object size histogram per bucket
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BucketUsageInfo {
-    size: u64,
+    pub size: u64,
     // Following five fields suffixed with V1 are here for backward compatibility
     // Total Size for objects that have not yet been replicated
-    replication_pending_size_v1: u64,
+    pub replication_pending_size_v1: u64,
     // Total size for objects that have witness one or more failures and will be retried
-    replication_failed_size_v1: u64,
+    pub replication_failed_size_v1: u64,
     // Total size for objects that have been replicated to destination
-    replicated_size_v1: u64,
+    pub replicated_size_v1: u64,
     // Total number of objects pending replication
-    replication_pending_count_v1: u64,
+    pub replication_pending_count_v1: u64,
     // Total number of objects that failed replication
-    replication_failed_count_v1: u64,
+    pub replication_failed_count_v1: u64,
 
-    objects_count: u64,
-    object_size_histogram: HashMap<String, u64>,
-    object_versions_histogram: HashMap<String, u64>,
-    versions_count: u64,
-    delete_markers_count: u64,
-    replica_size: u64,
-    replica_count: u64,
-    replication_info: HashMap<String, BucketTargetUsageInfo>,
+    pub objects_count: u64,
+    pub object_size_histogram: HashMap<String, u64>,
+    pub object_versions_histogram: HashMap<String, u64>,
+    pub versions_count: u64,
+    pub delete_markers_count: u64,
+    pub replica_size: u64,
+    pub replica_count: u64,
+    pub replication_info: HashMap<String, BucketTargetUsageInfo>,
 }
 
 // DataUsageInfo represents data usage stats of the underlying Object API
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageInfo {
-    total_capacity: u64,
-    total_used_capacity: u64,
-    total_free_capacity: u64,
+    pub total_capacity: u64,
+    pub total_used_capacity: u64,
+    pub total_free_capacity: u64,
 
     // LastUpdate is the timestamp of when the data usage info was last updated.
     // This does not indicate a full scan.
-    last_update: SystemTime,
+    pub last_update: Option<SystemTime>,
 
     // Objects total count across all buckets
-    objects_total_count: u64,
+    pub objects_total_count: u64,
     // Versions total count across all buckets
-    versions_total_count: u64,
+    pub versions_total_count: u64,
     // Delete markers total count across all buckets
-    delete_markers_total_count: u64,
+    pub delete_markers_total_count: u64,
     // Objects total size across all buckets
-    objects_total_size: u64,
-    replication_info: HashMap<String, BucketTargetUsageInfo>,
+    pub objects_total_size: u64,
+    pub replication_info: HashMap<String, BucketTargetUsageInfo>,
 
     // Total number of buckets in this cluster
-    buckets_count: u64,
+    pub buckets_count: u64,
     // Buckets usage info provides following information across all buckets
     // - total size of the bucket
     // - total objects in a bucket
     // - object size histogram per bucket
-    buckets_usage: HashMap<String, BucketUsageInfo>,
+    pub buckets_usage: HashMap<String, BucketUsageInfo>,
     // Deprecated kept here for backward compatibility reasons.
-    bucket_sizes: HashMap<String, u64>,
+    pub bucket_sizes: HashMap<String, u64>,
     // Todo: TierStats
     // TierStats contains per-tier stats of all configured remote tiers
-}
-
-impl Default for DataUsageInfo {
-    fn default() -> Self {
-        Self {
-            total_capacity: Default::default(),
-            total_used_capacity: Default::default(),
-            total_free_capacity: Default::default(),
-            last_update: SystemTime::now(),
-            objects_total_count: Default::default(),
-            versions_total_count: Default::default(),
-            delete_markers_total_count: Default::default(),
-            objects_total_size: Default::default(),
-            replication_info: Default::default(),
-            buckets_count: Default::default(),
-            buckets_usage: Default::default(),
-            bucket_sizes: Default::default(),
-        }
-    }
 }
 
 pub async fn store_data_usage_in_backend(mut rx: Receiver<DataUsageInfo>) {

@@ -12,7 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use lazy_static::lazy_static;
 use rand::Rng;
 use rmp_serde::{Deserializer, Serializer};
@@ -29,12 +29,11 @@ use tokio::{
 use tracing::{error, info};
 
 use super::{
-    data_scanner_metric::globalScannerMetrics,
+    data_scanner_metric::{globalScannerMetrics, ScannerMetric, ScannerMetrics},
     data_usage::{store_data_usage_in_backend, DATA_USAGE_BLOOM_NAME_PATH},
     data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
     heal_commands::{HealScanMode, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
 };
-use crate::disk::DiskAPI;
 use crate::heal::data_scanner_metric::current_path_updater;
 use crate::heal::data_usage::DATA_USAGE_ROOT;
 use crate::{
@@ -57,6 +56,10 @@ use crate::{
     peer::is_reserved_or_invalid_bucket,
     store::{ECStore, ListPathOptions},
     utils::path::{path_join, path_to_bucket_object, path_to_bucket_object_with_base_path, SLASH_SEPARATOR},
+};
+use crate::{
+    disk::DiskAPI,
+    store_api::{FileInfo, ObjectInfo},
 };
 
 const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1); // Time to wait between folders.
@@ -132,6 +135,7 @@ async fn run_data_scanner() {
     }
 
     loop {
+        let stop_fn = ScannerMetrics::log(ScannerMetric::ScanCycle);
         cycle_info.current = cycle_info.next;
         cycle_info.started = SystemTime::now();
         {
@@ -155,6 +159,26 @@ async fn run_data_scanner() {
         tokio::spawn(async {
             store_data_usage_in_backend(rx).await;
         });
+        let mut res = HashMap::new();
+        res.insert("cycle".to_string(), cycle_info.current.to_string());
+        match store.ns_scanner(tx, cycle_info.current as usize, scan_mode).await {
+            Ok(_) => {
+                cycle_info.next += 1;
+                cycle_info.current = 0;
+                cycle_info.cycle_completed.push(SystemTime::now());
+                if cycle_info.cycle_completed.len() > DATA_USAGE_UPDATE_DIR_CYCLES as usize {
+                    cycle_info.cycle_completed = cycle_info.cycle_completed[cycle_info.cycle_completed.len() - DATA_USAGE_UPDATE_DIR_CYCLES as usize..].to_vec();
+                }
+                globalScannerMetrics.write().await.set_cycle(Some(cycle_info.clone())).await;
+                let mut tmp = Vec::new();
+                tmp.write_u64::<LittleEndian>(cycle_info.next).unwrap();
+                let _ = save_config(store, &DATA_USAGE_BLOOM_NAME_PATH, &tmp).await;
+            },
+            Err(err) => {
+                res.insert("error".to_string(), err.to_string());
+            },
+        }
+        stop_fn(&res).await;
         sleep(Duration::from_secs(SCANNER_CYCLE.load(std::sync::atomic::Ordering::SeqCst))).await;
     }
 }
@@ -241,7 +265,7 @@ impl Default for CurrentScannerCycle {
 }
 
 impl CurrentScannerCycle {
-    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+    pub fn marshal_msg(&self, buf: &[u8]) -> Result<Vec<u8>> {
         let len: u32 = 4;
         let mut wr = Vec::new();
 
@@ -267,8 +291,9 @@ impl CurrentScannerCycle {
             .serialize(&mut Serializer::new(&mut buf))
             .expect("Serialization failed");
         rmp::encode::write_bin(&mut wr, &buf)?;
-
-        Ok(wr)
+        let mut result = buf.to_vec();
+        result.extend(wr.iter());
+        Ok(result)
     }
 
     #[tracing::instrument]
@@ -295,10 +320,10 @@ impl CurrentScannerCycle {
                     self.current = u;
                 }
 
-                "next" => {
-                    let u: u64 = rmp::decode::read_int(&mut cur)?;
-                    self.next = u;
-                }
+                // "next" => {
+                //     let u: u64 = rmp::decode::read_int(&mut cur)?;
+                //     self.next = u;
+                // }
                 "started" => {
                     let u: u64 = rmp::decode::read_int(&mut cur)?;
                     let started = timestamp_to_system_time(u);
@@ -329,22 +354,23 @@ fn timestamp_to_system_time(timestamp: u64) -> SystemTime {
     UNIX_EPOCH + std::time::Duration::new(timestamp, 0)
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Heal {
     enabled: bool,
     bitrot: bool,
 }
 
+#[derive(Clone)]
 pub struct ScannerItem {
-    path: String,
-    bucket: String,
-    prefix: String,
-    object_name: String,
-    replication: Option<ReplicationConfiguration>,
+    pub path: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub object_name: String,
+    pub replication: Option<ReplicationConfiguration>,
     // todo: lifecycle
     // typ: fs::Permissions,
-    heal: Heal,
-    debug: bool,
+    pub heal: Heal,
+    pub debug: bool,
 }
 
 impl ScannerItem {
@@ -364,6 +390,43 @@ impl ScannerItem {
 
     pub fn object_path(&self) -> PathBuf {
         path_join(&[PathBuf::from(self.prefix.clone()), PathBuf::from(self.object_name.clone())])
+    }
+
+    pub async fn apply_versions_actions(&self, fivs: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
+        let obj_infos = self.apply_newer_noncurrent_version_limit(fivs).await?;
+        if obj_infos.len() >= SCANNER_EXCESS_OBJECT_VERSIONS.load(Ordering::SeqCst).try_into().unwrap() {
+            // todo
+        }
+
+        let mut cumulative_size = 0;
+        for obj_info in obj_infos.iter() {
+            cumulative_size += obj_info.size;
+        }
+
+        if cumulative_size >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst).try_into().unwrap() {
+            //todo
+        }
+
+        Ok(obj_infos)
+    }
+
+    pub async fn apply_newer_noncurrent_version_limit(&self, fivs: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
+        let done = ScannerMetrics::time(ScannerMetric::ApplyNonCurrent);
+        let mut object_infos = Vec::new();
+        for info in fivs.iter() {
+            object_infos.push(info.to_object_info(&self.bucket, &self.object_path().to_string_lossy(), false));
+        }
+        done().await;
+
+        Ok(object_infos)
+    }
+
+    pub async fn apply_actions(&self, oi: &ObjectInfo, size_s: &SizeSummary) -> (bool, usize) {
+        let done = ScannerMetrics::time(ScannerMetric::Ilm);
+        //todo: lifecycle
+        done().await;
+
+        (false, 0)
     }
 }
 
@@ -420,7 +483,7 @@ struct FolderScanner {
     last_update: SystemTime,
     update_current_path: UpdateCurrentPathFn,
     skip_heal: AtomicBool,
-    drive: DiskStore,
+    drive: LocalDrive,
 }
 
 impl FolderScanner {
@@ -951,9 +1014,10 @@ pub fn has_active_rules(config: &ReplicationConfiguration, prefix: &str, recursi
     false
 }
 
+pub type LocalDrive = Arc<dyn DiskAPI>;
 pub async fn scan_data_folder(
     disks: &[Option<DiskStore>],
-    drive: &DiskStore,
+    drive: LocalDrive,
     cache: &DataUsageCache,
     get_size_fn: GetSizeFn,
     heal_scan_mode: HealScanMode,
@@ -964,6 +1028,11 @@ pub async fn scan_data_folder(
 
     let base_path = drive.to_string();
     let (update_path, close_disk) = current_path_updater(&base_path, &cache.info.name);
+    let skip_heal = if *GLOBAL_IsErasure.read().await || cache.info.skip_healing {
+        AtomicBool::new(true)
+    } else {
+        AtomicBool::new(false)
+    };
     let mut s = FolderScanner {
         root: base_path,
         get_size: get_size_fn,
@@ -978,11 +1047,7 @@ pub async fn scan_data_folder(
         update_current_path: update_path,
         disks: disks.to_vec(),
         disks_quorum: disks.len() / 2,
-        skip_heal: if *GLOBAL_IsErasure.read().await || cache.info.skip_healing {
-            AtomicBool::new(true)
-        } else {
-            AtomicBool::new(false)
-        },
+        skip_heal,
         drive: drive.clone(),
     };
 
@@ -1002,7 +1067,7 @@ pub async fn scan_data_folder(
     }
     s.new_cache
         .force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN.try_into().unwrap());
-    s.new_cache.info.last_update = SystemTime::now();
+    s.new_cache.info.last_update = Some(SystemTime::now());
     s.new_cache.info.next_cycle = cache.info.next_cycle;
     close_disk().await;
     Ok(s.new_cache)

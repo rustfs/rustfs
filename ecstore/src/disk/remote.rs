@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use futures::lock::Mutex;
 use protos::{
@@ -736,7 +736,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn ns_scanner(
-        &self,
+        self: Arc<Self>,
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,

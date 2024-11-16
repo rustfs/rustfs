@@ -4,7 +4,8 @@ use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
 use crate::set_disk::SetDisks;
-use crate::store_api::{HTTPRangeSpec, ObjectIO, ObjectOptions};
+use crate::store_api::{BucketInfo, HTTPRangeSpec, ObjectIO, ObjectOptions};
+use bytes::Bytes;
 use bytesize::ByteSize;
 use http::HeaderMap;
 use path_clean::PathClean;
@@ -23,7 +24,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
 
 use super::data_scanner::{SizeSummary, DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS};
-use super::data_usage::DATA_USAGE_ROOT;
+use super::data_usage::{BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo, DATA_USAGE_ROOT};
 
 // DATA_USAGE_BUCKET_LEN must be length of ObjectsHistogramIntervals
 pub const DATA_USAGE_BUCKET_LEN: usize = 11;
@@ -152,6 +153,22 @@ impl SizeHistogram {
             }
         }
     }
+
+    pub fn to_map(&self) -> HashMap<String, u64> {
+        let mut res = HashMap::new();
+        let mut spl_count = 0;
+        for (count, oh) in self.0.iter().zip(OBJECTS_HISTOGRAM_INTERVALS.iter()) {
+            if ByteSize::kib(1).as_u64() == oh.start && oh.end == ByteSize::mib(1).as_u64() - 1 {
+                res.insert(oh.name.to_string(), spl_count);
+            } else if ByteSize::kib(1).as_u64() <= oh.start && oh.end <= ByteSize::mib(1).as_u64() - 1 {
+                spl_count += count;
+                res.insert(oh.name.to_string(), *count);
+            } else {
+                res.insert(oh.name.to_string(), *count);
+            }
+        }
+        res
+    }
 }
 
 // versionsHistogram is a histogram of number of versions in an object.
@@ -172,6 +189,14 @@ impl VersionsHistogram {
                 break;
             }
         }
+    }
+
+    pub fn to_map(&self) -> HashMap<String, u64> {
+        let mut res = HashMap::new();
+        for (count, ov) in self.0.iter().zip(OBJECTS_VERSION_COUNT_INTERVALS.iter()) {
+            res.insert(ov.name.to_string(), *count);
+        }
+        res
     }
 }
 
@@ -319,11 +344,11 @@ pub struct DataUsageEntryInfo {
     pub entry: DataUsageEntry,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DataUsageCacheInfo {
     pub name: String,
     pub next_cycle: u32,
-    pub last_update: SystemTime,
+    pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
     // todo: life_cycle
     // pub life_cycle:
@@ -333,18 +358,18 @@ pub struct DataUsageCacheInfo {
     pub replication: Option<ReplicationConfiguration>,
 }
 
-impl Default for DataUsageCacheInfo {
-    fn default() -> Self {
-        Self {
-            name: Default::default(),
-            next_cycle: Default::default(),
-            last_update: SystemTime::now(),
-            skip_healing: Default::default(),
-            updates: Default::default(),
-            replication: Default::default(),
-        }
-    }
-}
+// impl Default for DataUsageCacheInfo {
+//     fn default() -> Self {
+//         Self {
+//             name: Default::default(),
+//             next_cycle: Default::default(),
+//             last_update: SystemTime::now(),
+//             skip_healing: Default::default(),
+//             updates: Default::default(),
+//             replication: Default::default(),
+//         }
+//     }
+// }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DataUsageCache {
@@ -410,8 +435,11 @@ impl DataUsageCache {
                 },
             }
             retries += 1;
-            let mut rng = rand::thread_rng();
-            sleep(Duration::from_millis(rng.gen_range(0..1_000))).await;
+            let dur = {
+                let mut rng = rand::thread_rng();
+                rng.gen_range(0..1_000)
+            };
+            sleep(Duration::from_millis(dur)).await;
         }
         Ok(d)
     }
@@ -653,6 +681,100 @@ impl DataUsageCache {
             n += self.total_children_rec(&ch);
         }
         n
+    }
+
+    pub fn merge(&mut self, o: &DataUsageCache) {
+        let mut existing_root = self.root();
+        let other_root = o.root();
+        if existing_root.is_none() && other_root.is_none() {
+            return;
+        }
+        if other_root.is_none() {
+            return;
+        }
+        if existing_root.is_none() {
+            *self = o.clone();
+            return;
+        }
+        if o.info.last_update.gt(&self.info.last_update) {
+            self.info.last_update = o.info.last_update;
+        }
+
+        existing_root.as_mut().unwrap().merge(other_root.as_ref().unwrap());
+        self.cache.insert(hash_path(&self.info.name).key(), existing_root.unwrap());
+        let e_hash = self.root_hash();
+        for key in other_root.as_ref().unwrap().children.iter() {
+            let entry = &o.cache[key];
+            let flat = o.flatten(entry);
+            let mut existing = self.cache[key].clone();
+            existing.merge(&flat);
+            self.replace_hashed(&DataUsageHash(key.clone()), &Some(e_hash.clone()), &existing);
+        }
+    }
+
+    pub fn root_hash(&self) -> DataUsageHash {
+        hash_path(&self.info.name)
+    }
+
+    pub fn root(&self) -> Option<DataUsageEntry> {
+        self.find(&self.info.name)
+    }
+
+    pub fn dui(&self, path: &str, buckets: &[BucketInfo]) -> DataUsageInfo {
+        let e = match self.find(path) {
+            Some(e) => e,
+            None => return DataUsageInfo::default(),
+        };
+        let flat = self.flatten(&e);
+        let dui = DataUsageInfo {
+            last_update: self.info.last_update,
+            objects_total_count: flat.objects as u64,
+            versions_total_count: flat.versions as u64,
+            delete_markers_total_count: flat.delete_markers as u64,
+            objects_total_size: flat.size as u64,
+            buckets_count: e.children.len() as u64,
+            buckets_usage: self.buckets_usage_info(buckets),
+            ..Default::default()
+        };
+        dui
+    }
+
+    pub fn buckets_usage_info(&self, buckets: &[BucketInfo]) -> HashMap<String, BucketUsageInfo> {
+        let mut dst = HashMap::new();
+        for bucket in buckets.iter() {
+            let e = match self.find(&bucket.name) {
+                Some(e) => e,
+                None => continue,
+            };
+            let flat = self.flatten(&e);
+            let mut bui = BucketUsageInfo {
+                size: flat.size as u64,
+                versions_count: flat.versions as u64,
+                objects_count: flat.objects as u64,
+                delete_markers_count: flat.delete_markers as u64,
+                object_size_histogram: flat.obj_sizes.to_map(),
+                object_versions_histogram: flat.obj_versions.to_map(),
+                ..Default::default()
+            };
+            if let Some(rs) = &flat.replication_stats {
+                bui.replica_size = rs.replica_size;
+                bui.replica_count = rs.replica_count;
+
+                for (arn, stat) in rs.targets.iter() {
+                    bui.replication_info.insert(arn.clone(), BucketTargetUsageInfo {
+                        replication_pending_size: stat.pending_size,
+                        replicated_size: stat.replicated_size,
+                        replication_failed_size: stat.failed_size,
+                        replication_pending_count: stat.pending_count,
+                        replication_failed_count: stat.failed_count,
+                        replicated_count: stat.replicated_count,
+                        ..Default::default()
+                    });
+                }
+            }
+            dst.insert(bucket.name.clone(), bui);
+        }
+        dst
     }
 
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
