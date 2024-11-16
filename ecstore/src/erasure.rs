@@ -424,7 +424,7 @@ impl Erasure {
         writers: &mut [Option<BitrotWriter>],
         readers: Vec<Option<BitrotReader>>,
         total_length: usize,
-        prefer: &[bool],
+        _prefer: &[bool],
     ) -> Result<()> {
         if writers.len() != self.parity_shards + self.data_shards {
             return Err(Error::from_string("invalid argument"));
@@ -436,8 +436,6 @@ impl Erasure {
         if total_length % self.block_size != 0 {
             end_block += 1;
         }
-
-        let mut bytes_writed = 0;
 
         let mut errs = Vec::new();
         for _ in start_block..=end_block {

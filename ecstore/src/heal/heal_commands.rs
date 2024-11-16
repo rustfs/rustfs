@@ -75,11 +75,21 @@ pub struct HealResultItem {
     pub object_size: usize,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealStartSuccess {
     pub client_token: String,
     pub client_address: String,
-    pub start_time: u64,
+    pub start_time: SystemTime,
+}
+
+impl Default for HealStartSuccess {
+    fn default() -> Self {
+        Self {
+            client_token: Default::default(),
+            client_address: Default::default(),
+            start_time: SystemTime::now(),
+        }
+    }
 }
 
 pub type HealStopSuccess = HealStartSuccess;

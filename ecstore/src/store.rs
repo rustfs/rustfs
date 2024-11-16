@@ -1,6 +1,5 @@
 #![allow(clippy::map_entry)]
 
-use crate::bucket::metadata;
 use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::config::{self, storageclass, GLOBAL_ConfigSys};
@@ -44,7 +43,6 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
-use tokio::time::interval;
 use std::cmp::Ordering;
 use std::slice::Iter;
 use std::time::SystemTime;
@@ -54,12 +52,13 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
-use tokio::{fs, select};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::time::interval;
+use tokio::{fs, select};
 
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 const MAX_UPLOADS_LIST: usize = 10000;
@@ -510,7 +509,7 @@ impl ECStore {
         self.pools.iter().for_each(|pool| {
             total_results += pool.disk_set.len();
         });
-        let mut results = Arc::new(RwLock::new(vec![DataUsageCache::default(); total_results]));
+        let results = Arc::new(RwLock::new(vec![DataUsageCache::default(); total_results]));
         let (cancel, _) = broadcast::channel(100);
         let first_err = Arc::new(RwLock::new(None));
         let mut futures = Vec::new();
@@ -535,13 +534,16 @@ impl ECStore {
                             }
                         }
                     });
-                    if let Err(err) = set.ns_scanner(&all_buckets_clone, want_cycle.try_into().unwrap(), tx, heal_scan_mode).await {
+                    if let Err(err) = set
+                        .ns_scanner(&all_buckets_clone, want_cycle.try_into().unwrap(), tx, heal_scan_mode)
+                        .await
+                    {
                         let mut f_w = first_err_clone.write().await;
                         if f_w.is_none() {
                             *f_w = Some(err);
                         }
                         let _ = cancel_clone.send(true);
-                        return ;
+                        return;
                     }
                     let _ = task.await;
                 });
@@ -583,7 +585,7 @@ impl ECStore {
 
             }
             _ = ctx_closer.recv() => {
-                
+
             }
         }
         let _ = task.await;
@@ -688,7 +690,13 @@ impl ECStore {
     }
 }
 
-async fn update_scan(all_merged: Arc<RwLock<DataUsageCache>>, results: Arc<RwLock<Vec<DataUsageCache>>>, last_update: Option<SystemTime>, all_buckets: Vec<BucketInfo>, updates: Sender<DataUsageInfo>) -> Option<SystemTime> {
+async fn update_scan(
+    all_merged: Arc<RwLock<DataUsageCache>>,
+    results: Arc<RwLock<Vec<DataUsageCache>>>,
+    last_update: Option<SystemTime>,
+    all_buckets: Vec<BucketInfo>,
+    updates: Sender<DataUsageInfo>,
+) -> Option<SystemTime> {
     let mut w = all_merged.write().await;
     *w = DataUsageCache {
         info: DataUsageCacheInfo {
@@ -1527,7 +1535,7 @@ impl StorageAPI for ECStore {
         Ok((r, None))
     }
 
-    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+    async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
         unimplemented!()
     }
     async fn heal_object(

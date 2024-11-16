@@ -79,8 +79,8 @@ impl Clone for LockedLastMinuteLatency {
 }
 
 impl LockedLastMinuteLatency {
-    pub fn add(&mut self, value: &Duration) {
-        self.add_size(value, 0);
+    pub async fn add(&mut self, value: &Duration) {
+        self.add_size(value, 0).await;
     }
 
     pub async fn add_size(&mut self, value: &Duration, sz: u64) {
@@ -105,16 +105,16 @@ impl LockedLastMinuteLatency {
             a.size = old.size;
             a.total = old.total;
             a.n = old.n;
-            self.mu.write().await;
+            let _ = self.mu.write().await;
             self.latency.add_all(t - 1, &a);
         }
         self.cached.n += 1;
         self.cached.total += value.as_secs();
-        self.cached.size != sz;
+        self.cached.size += sz;
     }
 
     pub async fn total(&mut self) -> AccElem {
-        self.mu.read().await;
+        let _ = self.mu.read().await;
         self.latency.get_total()
     }
 }
@@ -147,19 +147,19 @@ impl ScannerMetrics {
     pub fn log(s: ScannerMetric) -> LogFn {
         let start = SystemTime::now();
         let s_clone = s as usize;
-        Arc::new(move |custom: &HashMap<String, String>| {
+        Arc::new(move |_custom: &HashMap<String, String>| {
             Box::pin(async move {
                 let duration = SystemTime::now().duration_since(start).unwrap_or(Duration::from_secs(0));
                 let mut sm_w = globalScannerMetrics.write().await;
                 sm_w.operations[s_clone].fetch_add(1, Ordering::SeqCst);
                 if s_clone < ScannerMetric::LastRealtime as usize {
-                    sm_w.latency[s_clone].add(&duration);
+                    sm_w.latency[s_clone].add(&duration).await;
                 }
             })
         })
     }
 
-    pub fn time_size(s: ScannerMetric) -> TimeSizeFn {
+    pub async fn time_size(s: ScannerMetric) -> TimeSizeFn {
         let start = SystemTime::now();
         let s_clone = s as usize;
         Arc::new(move |sz: u64| {
@@ -168,7 +168,7 @@ impl ScannerMetrics {
                 let mut sm_w = globalScannerMetrics.write().await;
                 sm_w.operations[s_clone].fetch_add(1, Ordering::SeqCst);
                 if s_clone < ScannerMetric::LastRealtime as usize {
-                    sm_w.latency[s_clone].add_size(&duration, sz);
+                    sm_w.latency[s_clone].add_size(&duration, sz).await;
                 }
             })
         })
@@ -183,7 +183,7 @@ impl ScannerMetrics {
                 let mut sm_w = globalScannerMetrics.write().await;
                 sm_w.operations[s_clone].fetch_add(1, Ordering::SeqCst);
                 if s_clone < ScannerMetric::LastRealtime as usize {
-                    sm_w.latency[s_clone].add(&duration);
+                    sm_w.latency[s_clone].add(&duration).await;
                 }
             })
         })
@@ -191,7 +191,7 @@ impl ScannerMetrics {
 }
 
 pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
-pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
+pub fn current_path_updater(disk: &str, _initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
     let disk_1 = disk.to_string();
     let disk_2 = disk.to_string();
     (

@@ -14,8 +14,8 @@ use crate::{
     error::{Error, Result},
 };
 
-type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()>>> + Send + 'static>;
-type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()>>> + Send + 'static>;
+type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 type FinishedFn = Box<dyn Fn(&[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 
 #[derive(Default)]
@@ -213,7 +213,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         if at_eof + has_err == readers.len() {
             if has_err > 0 {
                 if let Some(finished_fn) = opts.finished.as_ref() {
-                    finished_fn(&errs);
+                    finished_fn(&errs).await;
                 }
                 break;
             }
@@ -221,13 +221,13 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
 
         if agree == readers.len() {
             if let Some(agreed_fn) = opts.agreed.as_ref() {
-                agreed_fn(current);
+                agreed_fn(current).await;
             }
             continue;
         }
 
         if let Some(partial_fn) = opts.partial.as_ref() {
-            partial_fn(MetaCacheEntries(top_entries), &errs);
+            partial_fn(MetaCacheEntries(top_entries), &errs).await;
         }
     }
 

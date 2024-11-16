@@ -1,7 +1,7 @@
 pub mod endpoint;
 pub mod error;
 pub mod format;
-mod local;
+pub mod local;
 pub mod os;
 pub mod remote;
 
@@ -16,7 +16,7 @@ const STORAGE_FORMAT_FILE: &str = "xl.meta";
 use crate::{
     erasure::Writer,
     error::{Error, Result},
-    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion, FileMetaVersion},
+    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
     heal::{
         data_usage_cache::{DataUsageCache, DataUsageEntry},
         heal_commands::HealScanMode,
@@ -344,14 +344,14 @@ impl DiskAPI for Disk {
     }
 
     async fn ns_scanner(
-        self: Arc<Self>,
+        &self,
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
         match &*self {
-            Disk::Local(local_disk) => Arc::new(local_disk).ns_scanner(cache, updates, scan_mode).await,
-            Disk::Remote(remote_disk) => Arc::new(remote_disk).ns_scanner(cache, updates, scan_mode).await,
+            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode).await,
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode).await,
         }
     }
 }
@@ -453,7 +453,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     async fn ns_scanner(
-        self: Arc<Self>,
+        &self,
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
@@ -1303,10 +1303,10 @@ impl Reader for RemoteFileReader {
             Err(Error::from_string(error_info))
         }
     }
-    async fn seek(&mut self, offset: usize) -> Result<()> {
+    async fn seek(&mut self, _offset: usize) -> Result<()> {
         unimplemented!()
     }
-    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize> {
+    async fn read_exact(&mut self, _buf: &mut [u8]) -> Result<usize> {
         unimplemented!()
     }
 }

@@ -5,7 +5,6 @@ use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
 use crate::set_disk::SetDisks;
 use crate::store_api::{BucketInfo, HTTPRangeSpec, ObjectIO, ObjectOptions};
-use bytes::Bytes;
 use bytesize::ByteSize;
 use http::HeaderMap;
 use path_clean::PathClean;
@@ -17,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::u64;
 use tokio::sync::mpsc::Sender;
@@ -761,15 +759,18 @@ impl DataUsageCache {
                 bui.replica_count = rs.replica_count;
 
                 for (arn, stat) in rs.targets.iter() {
-                    bui.replication_info.insert(arn.clone(), BucketTargetUsageInfo {
-                        replication_pending_size: stat.pending_size,
-                        replicated_size: stat.replicated_size,
-                        replication_failed_size: stat.failed_size,
-                        replication_pending_count: stat.pending_count,
-                        replication_failed_count: stat.failed_count,
-                        replicated_count: stat.replicated_count,
-                        ..Default::default()
-                    });
+                    bui.replication_info.insert(
+                        arn.clone(),
+                        BucketTargetUsageInfo {
+                            replication_pending_size: stat.pending_size,
+                            replicated_size: stat.replicated_size,
+                            replication_failed_size: stat.failed_size,
+                            replication_pending_count: stat.pending_count,
+                            replication_failed_count: stat.failed_count,
+                            replicated_count: stat.replicated_count,
+                            ..Default::default()
+                        },
+                    );
                 }
             }
             dst.insert(bucket.name.clone(), bui);
