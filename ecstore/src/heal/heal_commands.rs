@@ -161,8 +161,7 @@ pub struct HealingTracker {
 
 impl HealingTracker {
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        serde_json::to_string(self)
-            .map(|s| s.as_bytes().to_vec())
+        serde_json::to_vec(self)
             .map_err(|err| Error::from_string(err.to_string()))
     }
 
@@ -336,7 +335,7 @@ impl HealingTracker {
         self.queue_buckets.retain(|x| x != bucket);
     }
 
-    async fn set_queue_buckets(&mut self, buckets: &[BucketInfo]) {
+    pub async fn set_queue_buckets(&mut self, buckets: &[BucketInfo]) {
         let _ = self.mu.write().await;
 
         buckets.iter().for_each(|bucket| {
@@ -417,7 +416,7 @@ impl Clone for HealingTracker {
     }
 }
 
-async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTracker> {
+pub async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTracker> {
     if let Some(disk) = disk {
         let disk_id = disk.get_disk_id().await?;
         if let Some(disk_id) = disk_id {

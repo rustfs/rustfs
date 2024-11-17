@@ -18,6 +18,8 @@ lazy_static! {
     pub static ref GLOBAL_ConfigSys: ConfigSys = ConfigSys::new();
 }
 
+pub static RUSTFS_CONFIG_PREFIX: &str = "config";
+
 pub struct ConfigSys {}
 
 impl ConfigSys {

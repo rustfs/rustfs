@@ -26,7 +26,7 @@ use crate::{
     error::{Error, Result},
     heal::{
         data_usage_cache::{DataUsageCache, DataUsageEntry},
-        heal_commands::HealScanMode,
+        heal_commands::{HealScanMode, HealingTracker},
     },
     store_api::{FileInfo, RawFileInfo},
 };
@@ -774,5 +774,9 @@ impl DiskAPI for RemoteDisk {
                 _ => return Err(Error::from_string("scan was interrupted")),
             }
         }
+    }
+
+    async fn healing(&self) -> Option<HealingTracker> {
+        None
     }
 }

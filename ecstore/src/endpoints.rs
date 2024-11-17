@@ -110,6 +110,10 @@ impl Endpoints {
         self.0
     }
 
+    pub fn into_ref(&self) -> &Vec<Endpoint> {
+        &self.0
+    }
+
     // GetString - returns endpoint string of i-th endpoint (0-based),
     // and empty string for invalid indexes.
     pub fn get_string(&self, i: usize) -> String {
@@ -118,6 +122,10 @@ impl Endpoints {
         }
 
         self.0[i].to_string()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 

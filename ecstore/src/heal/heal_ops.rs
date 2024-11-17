@@ -406,7 +406,7 @@ impl AllHealState {
         hstate
     }
 
-    async fn pop_heal_local_disks(&mut self, heal_local_disks: &[Endpoint]) {
+    pub async fn pop_heal_local_disks(&mut self, heal_local_disks: &[Endpoint]) {
         let _ = self.mu.write().await;
 
         self.heal_local_disks.retain(|k, _| {
@@ -433,7 +433,7 @@ impl AllHealState {
         self.heal_status.insert(tracker.id.clone(), tracker.clone());
     }
 
-    async fn get_local_healing_disks(&self) -> HashMap<String, HealingDisk> {
+    pub async fn get_local_healing_disks(&self) -> HashMap<String, HealingDisk> {
         let _ = self.mu.read().await;
 
         let mut dst = HashMap::new();
@@ -444,7 +444,7 @@ impl AllHealState {
         dst
     }
 
-    async fn get_heal_local_disk_endpoints(&self) -> Endpoints {
+    pub async fn get_heal_local_disk_endpoints(&self) -> Endpoints {
         let _ = self.mu.read().await;
 
         let mut endpoints = Vec::new();
@@ -471,7 +471,7 @@ impl AllHealState {
         });
     }
 
-    async fn periodic_heal_seqs_clean(&mut self) {
+    pub async fn periodic_heal_seqs_clean(&mut self) {
         let _ = self.mu.write().await;
         let now = SystemTime::now();
 
@@ -500,13 +500,13 @@ impl AllHealState {
         (None, false)
     }
 
-    async fn get_heal_sequence(&self, path: &str) -> Option<Arc<RwLock<HealSequence>>> {
+    pub async fn get_heal_sequence(&self, path: &str) -> Option<Arc<RwLock<HealSequence>>> {
         let _ = self.mu.read().await;
 
         self.heal_seq_map.get(path).cloned()
     }
 
-    async fn stop_heal_sequence(&mut self, path: &str) -> Result<Vec<u8>> {
+    pub async fn stop_heal_sequence(&mut self, path: &str) -> Result<Vec<u8>> {
         let mut hsp = HealStopSuccess::default();
         if let Some(he) = self.get_heal_sequence(path).await {
             let he = he.read().await;
