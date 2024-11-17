@@ -6,7 +6,7 @@ use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions,
     FileReader, FileWriter, Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
 };
 use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::GLOBAL_BucketMetadataSys;
@@ -23,7 +23,8 @@ use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem,
 use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
-use crate::heal::heal_commands::HealScanMode;
+use crate::heal::heal_commands::{HealScanMode, HealingTracker};
+use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
 use crate::new_object_layer_fn;
 use crate::set_disk::{
     conv_part_err_to_int, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
@@ -32,7 +33,7 @@ use crate::set_disk::{
 use crate::store_api::{BitrotAlgorithm, StorageAPI};
 use crate::utils::fs::{access, lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::os::get_info;
-use crate::utils::path::{clean, has_suffix, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
+use crate::utils::path::{clean, has_suffix, path_join, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
@@ -2012,6 +2013,26 @@ impl DiskAPI for LocalDisk {
         .await?;
         data_usage_info.info.last_update = Some(SystemTime::now());
         Ok(data_usage_info)
+    }
+
+    async fn healing(&self) -> Option<HealingTracker> {
+        let healing_file = path_join(&[
+            self.path(),
+            PathBuf::from(RUSTFS_META_BUCKET),
+            PathBuf::from(BUCKET_META_PREFIX),
+            PathBuf::from(HEALING_TRACKER_FILENAME),
+        ]);
+        let b = match fs::read(healing_file).await {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        if b.is_empty() {
+            return None;
+        }
+        match HealingTracker::unmarshal_msg(&b) {
+            Ok(h) => Some(h),
+            Err(_) => Some(HealingTracker::default())
+        }
     }
 }
 

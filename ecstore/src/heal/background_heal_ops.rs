@@ -1,18 +1,17 @@
-use std::{env, sync::Arc};
+use std::{cmp::Ordering, env, path::PathBuf, sync::Arc, time::Duration};
 
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    RwLock,
+use tokio::{
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        RwLock,
+    },
+    time::interval,
 };
+use tracing::info;
+use uuid::Uuid;
 
 use crate::{
-    endpoints::Endpoints,
-    error::{Error, Result},
-    global::{GLOBAL_BackgroundHealRoutine, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP},
-    heal::heal_ops::NOP_HEAL,
-    new_object_layer_fn,
-    store_api::StorageAPI,
-    utils::path::SLASH_SEPARATOR,
+    config::RUSTFS_CONFIG_PREFIX, disk::{endpoint::Endpoint, error::DiskError, DiskAPI, DiskInfoOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET}, error::{Error, Result}, global::{GLOBAL_BackgroundHealRoutine, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP}, heal::{data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT}, data_usage_cache::DataUsageCache, heal_commands::{init_healing_tracker, load_healing_tracker}, heal_ops::NOP_HEAL}, new_object_layer_fn, store::get_disk_via_endpoint, store_api::{BucketInfo, BucketOptions, StorageAPI}, utils::path::{path_join, SLASH_SEPARATOR}
 };
 
 use super::{
@@ -20,11 +19,17 @@ use super::{
     heal_ops::{new_bg_heal_sequence, HealSequence},
 };
 
+pub static DEFAULT_MONITOR_NEW_DISK_INTERVAL: Duration = Duration::from_secs(10);
+
 pub async fn init_auto_heal() {
     init_background_healing().await;
     if let Ok(v) = env::var("_RUSTFS_AUTO_DRIVE_HEALING") {
         if v == "on" {
-            // GLOBAL_BackgroundHealState.write().await.push_heal_local_disks(heal_local_disks).await;
+            GLOBAL_BackgroundHealState
+                .write()
+                .await
+                .push_heal_local_disks(&get_local_disks_to_heal().await)
+                .await;
         }
     }
 }
@@ -44,8 +49,142 @@ async fn init_background_healing() {
         .await;
 }
 
-async fn get_local_disks_to_heal() -> Endpoints {
-    for (_, disk) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {}
+async fn get_local_disks_to_heal() -> Vec<Endpoint> {
+    let mut disks_to_heal = Vec::new();
+    for (_, disk) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
+        if let Some(disk) = disk {
+            if let Err(err) = disk.disk_info(&DiskInfoOptions::default()).await {
+                if let Some(DiskError::UnformattedDisk) = err.downcast_ref() {
+                    disks_to_heal.push(disk.endpoint());
+                }
+            }
+            let h = disk.healing().await;
+            if let Some(h) = h {
+                if !h.finished {
+                    disks_to_heal.push(disk.endpoint());
+                }
+            }
+        }
+    }
+
+    // todo
+    // if disks_to_heal.len() == GLOBAL_Endpoints.read().await.n {
+
+    // }
+    disks_to_heal
+}
+
+async fn monitor_local_disks_and_heal() {
+    let mut interval = interval(DEFAULT_MONITOR_NEW_DISK_INTERVAL);
+
+    loop {
+        interval.tick().await;
+        let heal_disks = GLOBAL_BackgroundHealState.read().await.get_heal_local_disk_endpoints().await;
+        if heal_disks.is_empty() {
+            interval.reset();
+            continue;
+        }
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = lock.as_ref().expect("errServerNotInitialized");
+        if let (_, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
+            if let Some(DiskError::NoHealRequired) = err.downcast_ref() {
+            } else {
+                info!("heal format err: {}", err.to_string());
+                interval.reset();
+                continue;
+            }
+        }
+
+        for disk in heal_disks.into_ref().iter() {
+            let disk_clone = disk.clone();
+            tokio::spawn(async move {
+                GLOBAL_BackgroundHealState.write().await.set_disk_healing_status(disk_clone.clone(), true).await;
+                
+            });
+        }
+    }
+}
+
+async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
+    let (pool_idx, set_idx) = (endpoint.pool_idx.unwrap(), endpoint.disk_idx.unwrap());
+    let disk = match get_disk_via_endpoint(endpoint).await {
+        Some(disk) => disk,
+        None => return Err(Error::from_string(format!("Unexpected error disk must be initialized by now after formatting: {}", endpoint.to_string()))),
+    };
+
+    if let Err(err) = disk.disk_info(&DiskInfoOptions::default()).await {
+        match err.downcast_ref() {
+            Some(DiskError::DriveIsRoot) => {
+                return Ok(());
+            },
+            Some(DiskError::UnformattedDisk) => {
+            },
+            _ => {
+                return Err(err);
+            }
+        }
+    }
+
+    let mut tracker = match load_healing_tracker(&Some(disk.clone())).await {
+        Ok(tracker) => tracker,
+        Err(err) => {
+            match err.downcast_ref() {
+                Some(DiskError::FileNotFound) => {
+                    return Ok(());
+                }
+                _ => {
+                    info!("Unable to load healing tracker on '{}': {}, re-initializing..", disk.to_string(), err.to_string());
+                },
+            }
+            init_healing_tracker(disk.clone(), &Uuid::new_v4().to_string()).await?
+        }
+    };
+
+    info!("Healing drive '{}' - 'mc admin heal alias/ --verbose' to check the current status.", endpoint.to_string());
+
+    let layer = new_object_layer_fn();
+    let lock = layer.read().await;
+    let store = match lock.as_ref() {
+        Some(s) => s,
+        None => return Err(Error::msg("errServerNotInitialized")),
+    };
+    let mut buckets = store.list_bucket(&BucketOptions::default()).await?;
+    buckets.push(BucketInfo {
+        name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(RUSTFS_CONFIG_PREFIX)]).to_string_lossy().to_string(),
+        ..Default::default()
+    });
+    buckets.push(BucketInfo {
+        name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)]).to_string_lossy().to_string(),
+        ..Default::default()
+    });
+
+    buckets.sort_by(|a, b| {
+        let a_has_prefix = a.name.starts_with(RUSTFS_META_BUCKET);
+        let b_has_prefix = b.name.starts_with(RUSTFS_META_BUCKET);
+
+        match (a_has_prefix, b_has_prefix) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => b.created.cmp(&a.created),
+        }
+    });
+
+    let mut cache = match DataUsageCache::load(&store.pools[pool_idx].disk_set[set_idx], DATA_USAGE_CACHE_NAME).await {
+        Ok(cache) => {
+            let data_usage_info = cache.dui(DATA_USAGE_ROOT, &Vec::new());
+            tracker.objects_total_count = data_usage_info.objects_total_count;
+            tracker.objects_total_size = data_usage_info.objects_total_size;
+            cache
+        },
+        Err(_) => DataUsageCache::default()
+    };
+
+    let location = disk.get_disk_location();
+    tracker.set_queue_buckets(&buckets).await;
+    tracker.save().await?;
+
+    // store.pools[pool_idx].disk_set[set_idx].
     todo!()
 }
 

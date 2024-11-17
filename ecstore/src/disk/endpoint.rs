@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use crate::utils::net;
 use path_absolutize::Absolutize;
 use path_clean::PathClean;
+use std::fs;
 use std::{fmt::Display, path::Path};
 use url::{ParseError, Url};
 
@@ -29,7 +30,7 @@ pub struct Endpoint {
 impl Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.url.scheme() == "file" {
-            write!(f, "{}", self.url.path())
+            write!(f, "{}", fs::canonicalize(self.url.path()).map_err(|_| std::fmt::Error)?.to_string_lossy().to_string())
         } else {
             write!(f, "{}", self.url)
         }

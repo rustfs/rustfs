@@ -3,7 +3,7 @@
 use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::config::{self, storageclass, GLOBAL_ConfigSys};
-use crate::disk::endpoint::EndpointType;
+use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
 use crate::global::{
     is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION,
@@ -733,6 +733,14 @@ pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
         return a;
     }
     None
+}
+
+pub async fn get_disk_via_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
+    let global_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.read().await;
+    if global_set_drives.is_empty() {
+        return GLOBAL_LOCAL_DISK_MAP.read().await[&endpoint.to_string()].clone();
+    }
+    global_set_drives[endpoint.pool_idx.unwrap()][endpoint.set_idx.unwrap()][endpoint.disk_idx.unwrap()].clone()
 }
 
 pub async fn all_local_disk_path() -> Vec<String> {
