@@ -929,7 +929,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        let volume_dir = self.get_bucket_path(&volume)?;
+        let volume_dir = self.get_bucket_path(volume)?;
         check_path_length(volume_dir.join(path).to_string_lossy().as_ref())?;
         let mut resp = CheckPartsResp {
             results: vec![0; fi.parts.len()],
@@ -955,22 +955,16 @@ impl DiskAPI for LocalDisk {
                     resp.results[i] = CHECK_PART_SUCCESS;
                 }
                 Err(err) => {
-                    match os_err_to_file_err(err).downcast_ref() {
-                        Some(DiskError::FileNotFound) => {
-                            if !skip_access_checks(volume) {
-                                if let Err(err) = access(&volume_dir).await {
-                                    match err.kind() {
-                                        ErrorKind::NotFound => {
-                                            resp.results[i] = CHECK_PART_VOLUME_NOT_FOUND;
-                                            continue;
-                                        }
-                                        _ => {}
-                                    }
+                    if let Some(DiskError::FileNotFound) = os_err_to_file_err(err).downcast_ref() {
+                        if !skip_access_checks(volume) {
+                            if let Err(err) = access(&volume_dir).await {
+                                if err.kind() == ErrorKind::NotFound {
+                                    resp.results[i] = CHECK_PART_VOLUME_NOT_FOUND;
+                                    continue;
                                 }
                             }
-                            resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                         }
-                        _ => {}
+                        resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                     }
                     continue;
                 }
@@ -1966,7 +1960,7 @@ impl DiskAPI for LocalDisk {
                     for info in obj_infos.iter() {
                         let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);
                         let sz: usize;
-                        (obj_deleted, sz) = item.apply_actions(&info, &size_s).await;
+                        (obj_deleted, sz) = item.apply_actions(info, &size_s).await;
                         done().await;
 
                         if obj_deleted {
@@ -2031,7 +2025,7 @@ impl DiskAPI for LocalDisk {
         }
         match HealingTracker::unmarshal_msg(&b) {
             Ok(h) => Some(h),
-            Err(_) => Some(HealingTracker::default())
+            Err(_) => Some(HealingTracker::default()),
         }
     }
 }
@@ -2046,10 +2040,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
         } else {
-            match is_root_disk(&drive_path, SLASH_SEPARATOR) {
-                Ok(result) => result,
-                Err(_) => false,
-            }
+            is_root_disk(&drive_path, SLASH_SEPARATOR).unwrap_or_default()
         }
     } else {
         false

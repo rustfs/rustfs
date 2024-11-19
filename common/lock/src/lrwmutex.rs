@@ -135,14 +135,14 @@ mod test {
         let id = "foo";
         let source = "dandan";
         let timeout = Duration::from_secs(5);
-        assert_eq!(true, l_rw_lock.get_lock(id, source, &timeout).await);
+        assert!(l_rw_lock.get_lock(id, source, &timeout).await);
         l_rw_lock.un_lock().await;
 
         l_rw_lock.lock().await;
 
-        assert_eq!(false, l_rw_lock.get_r_lock(id, source, &timeout).await);
+        assert!(!(l_rw_lock.get_r_lock(id, source, &timeout).await));
         l_rw_lock.un_lock().await;
-        assert_eq!(true, l_rw_lock.get_r_lock(id, source, &timeout).await);
+        assert!(l_rw_lock.get_r_lock(id, source, &timeout).await);
 
         Ok(())
     }
@@ -156,7 +156,7 @@ mod test {
         let one_fn = async {
             let one = Arc::clone(&l_rw_lock);
             let timeout = Duration::from_secs(1);
-            assert_eq!(true, one.get_lock(id, source, &timeout).await);
+            assert!(one.get_lock(id, source, &timeout).await);
             sleep(Duration::from_secs(5)).await;
             l_rw_lock.un_lock().await;
         };
@@ -164,9 +164,9 @@ mod test {
         let two_fn = async {
             let two = Arc::clone(&l_rw_lock);
             let timeout = Duration::from_secs(2);
-            assert_eq!(false, two.get_r_lock(id, source, &timeout).await);
+            assert!(!(two.get_r_lock(id, source, &timeout).await));
             sleep(Duration::from_secs(5)).await;
-            assert_eq!(true, two.get_r_lock(id, source, &timeout).await);
+            assert!(two.get_r_lock(id, source, &timeout).await);
             two.un_r_lock().await;
         };
 

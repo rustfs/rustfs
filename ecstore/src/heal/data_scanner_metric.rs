@@ -101,10 +101,11 @@ impl LockedLastMinuteLatency {
         {
             let old = self.cached.clone();
             self.cached = AccElem::default();
-            let mut a = AccElem::default();
-            a.size = old.size;
-            a.total = old.total;
-            a.n = old.n;
+            let a = AccElem {
+                size: old.size,
+                total: old.total,
+                n: old.n,
+            };
             let _ = self.mu.write().await;
             self.latency.add_all(t - 1, &a);
         }
@@ -128,6 +129,12 @@ pub struct ScannerMetrics {
     latency: Vec<LockedLastMinuteLatency>,
     cycle_info: RwLock<Option<CurrentScannerCycle>>,
     current_paths: HashMap<String, String>,
+}
+
+impl Default for ScannerMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ScannerMetrics {

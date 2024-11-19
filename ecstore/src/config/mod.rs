@@ -1,5 +1,6 @@
 pub mod common;
 pub mod error;
+#[allow(dead_code)]
 pub mod heal;
 pub mod storageclass;
 
@@ -21,6 +22,12 @@ lazy_static! {
 pub static RUSTFS_CONFIG_PREFIX: &str = "config";
 
 pub struct ConfigSys {}
+
+impl Default for ConfigSys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ConfigSys {
     pub fn new() -> Self {
@@ -47,6 +54,12 @@ pub struct KV {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct KVS(Vec<KV>);
 
+impl Default for KVS {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KVS {
     pub fn new() -> Self {
         KVS(Vec::new())
@@ -71,6 +84,12 @@ impl KVS {
 
 #[derive(Debug, Clone)]
 pub struct Config(HashMap<String, HashMap<String, KVS>>);
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Config {
     pub fn new() -> Self {

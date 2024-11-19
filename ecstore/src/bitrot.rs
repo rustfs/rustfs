@@ -103,7 +103,7 @@ impl Hasher {
 }
 
 impl BitrotAlgorithm {
-    pub fn new(&self) -> Hasher {
+    pub fn new_hasher(&self) -> Hasher {
         match self {
             BitrotAlgorithm::SHA256 => Hasher::SHA256(Sha256::new()),
             BitrotAlgorithm::HighwayHash256 | BitrotAlgorithm::HighwayHash256S => {
@@ -186,10 +186,8 @@ pub fn new_bitrot_reader(
 }
 
 pub async fn close_bitrot_writers(writers: &mut [Option<BitrotWriter>]) -> Result<()> {
-    for w in writers.into_iter() {
-        if let Some(w) = w {
-            let _ = w.close().await?;
-        }
+    for w in writers.iter_mut().flatten() {
+        w.close().await?;
     }
 
     Ok(())
@@ -207,7 +205,7 @@ pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: BitrotAlgori
     if algo != BitrotAlgorithm::HighwayHash256S {
         return size;
     }
-    size.div_ceil(shard_size) * algo.new().size() + size
+    size.div_ceil(shard_size) * algo.new_hasher().size() + size
 }
 
 pub fn bitrot_verify(
@@ -219,7 +217,7 @@ pub fn bitrot_verify(
     mut shard_size: usize,
 ) -> Result<()> {
     if algo != BitrotAlgorithm::HighwayHash256S {
-        let mut h = algo.new();
+        let mut h = algo.new_hasher();
         h.update(r.get_ref());
         if h.finalize() != want {
             return Err(Error::new(DiskError::FileCorrupt));
@@ -227,7 +225,7 @@ pub fn bitrot_verify(
 
         return Ok(());
     }
-    let mut h = algo.new();
+    let mut h = algo.new_hasher();
     let mut hash_buf = vec![0; h.size()];
     let mut left = want_size;
 
@@ -271,7 +269,7 @@ impl WholeBitrotWriter {
             volume: volume.to_string(),
             file_path: file_path.to_string(),
             _shard_size: shard_size,
-            hash: algo.new(),
+            hash: algo.new_hasher(),
         }
     }
 }
@@ -353,7 +351,7 @@ impl StreamingBitrotWriter {
         algo: BitrotAlgorithm,
         shard_size: usize,
     ) -> Result<Self> {
-        let hasher = algo.new();
+        let hasher = algo.new_hasher();
         let (tx, mut rx) = mpsc::channel::<Option<Vec<u8>>>(10);
 
         let total_file_size = length.div_ceil(shard_size) * hasher.size() + length;
@@ -362,7 +360,7 @@ impl StreamingBitrotWriter {
         let task = spawn(async move {
             loop {
                 if let Some(Some(buf)) = rx.recv().await {
-                    let _ = writer.write(&buf).await.unwrap();
+                    writer.write(&buf).await.unwrap();
                     continue;
                 }
 
@@ -389,7 +387,7 @@ impl Writer for StreamingBitrotWriter {
             return Ok(());
         }
         self.hasher.reset();
-        self.hasher.update(&buf);
+        self.hasher.update(buf);
         let hash_bytes = self.hasher.clone().finalize();
         let _ = self.tx.send(Some(hash_bytes)).await?;
         let _ = self.tx.send(Some(buf.to_vec())).await?;
@@ -430,7 +428,7 @@ impl StreamingBitrotReader {
         till_offset: usize,
         shard_size: usize,
     ) -> Self {
-        let hasher = algo.new();
+        let hasher = algo.new_hasher();
         Self {
             disk,
             _data: data.to_vec(),
@@ -489,7 +487,7 @@ pub struct BitrotFileWriter {
 
 impl BitrotFileWriter {
     pub fn new(inner: FileWriter, algo: BitrotAlgorithm, _shard_size: usize) -> Self {
-        let hasher = algo.new();
+        let hasher = algo.new_hasher();
         Self {
             inner,
             hasher,
@@ -513,7 +511,7 @@ impl Writer for BitrotFileWriter {
             return Ok(());
         }
         self.hasher.reset();
-        self.hasher.update(&buf);
+        self.hasher.update(buf);
         let hash_bytes = self.hasher.clone().finalize();
         let _ = self.inner.write(&hash_bytes).await?;
         let _ = self.inner.write(buf).await?;
@@ -544,7 +542,7 @@ struct BitrotFileReader {
 
 impl BitrotFileReader {
     pub fn new(inner: FileReader, algo: BitrotAlgorithm, _till_offset: usize, shard_size: usize) -> Self {
-        let hasher = algo.new();
+        let hasher = algo.new_hasher();
         Self {
             inner,
             // till_offset: ceil(till_offset, shard_size) * hasher.size() + till_offset,
@@ -648,7 +646,7 @@ mod test {
             }
             let checksum = decode_to_vec(checksums.get(algo).unwrap()).unwrap();
 
-            let mut h = algo.new();
+            let mut h = algo.new_hasher();
             let mut msg = Vec::with_capacity(h.size() * h.block_size());
             let mut sum = Vec::with_capacity(h.size());
 
@@ -656,7 +654,7 @@ mod test {
                 h.update(&msg);
                 sum = h.finalize();
                 msg.extend(sum.clone());
-                h = algo.new();
+                h = algo.new_hasher();
             }
 
             if checksum != sum {

@@ -77,7 +77,7 @@ fn get_default_opts(
 pub fn extract_metadata(headers: &HeaderMap<HeaderValue>) -> HashMap<String, String> {
     let mut metadata = HashMap::new();
 
-    extract_metadata_from_mime(&headers, &mut metadata);
+    extract_metadata_from_mime(headers, &mut metadata);
 
     metadata
 }

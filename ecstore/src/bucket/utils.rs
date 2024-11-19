@@ -39,10 +39,8 @@ pub fn check_bucket_name_common(bucket_name: &str, strict: bool) -> Result<(), E
         if !VALID_BUCKET_NAME_STRICT.is_match(bucket_name_trimmed) {
             return Err(Error::msg("Bucket name contains invalid characters"));
         }
-    } else {
-        if !VALID_BUCKET_NAME.is_match(bucket_name_trimmed) {
-            return Err(Error::msg("Bucket name contains invalid characters"));
-        }
+    } else if !VALID_BUCKET_NAME.is_match(bucket_name_trimmed) {
+        return Err(Error::msg("Bucket name contains invalid characters"));
     }
     Ok(())
 }

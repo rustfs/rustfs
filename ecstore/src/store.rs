@@ -11,7 +11,7 @@ use crate::global::{
 };
 use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
 use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode, HEAL_ITEM_METADATA};
-use crate::heal::heal_ops::HealObjectFn;
+use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::new_object_layer_fn;
 use crate::store_api::{ListMultipartsInfo, ObjectIO};
 use crate::store_err::{
@@ -43,6 +43,7 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
+use s3s::{S3Error, S3ErrorCode};
 use std::cmp::Ordering;
 use std::slice::Iter;
 use std::time::SystemTime;
@@ -535,7 +536,7 @@ impl ECStore {
                         }
                     });
                     if let Err(err) = set
-                        .ns_scanner(&all_buckets_clone, want_cycle.try_into().unwrap(), tx, heal_scan_mode)
+                        .ns_scanner(&all_buckets_clone, want_cycle as u32, tx, heal_scan_mode)
                         .await
                     {
                         let mut f_w = first_err_clone.write().await;
@@ -554,7 +555,7 @@ impl ECStore {
         let mut ctx_clone = cancel.subscribe();
         let all_buckets_clone = all_buckets.clone();
         let task = tokio::spawn(async move {
-            let mut last_update = None;
+            let mut last_update: Option<SystemTime> = None;
             let mut interval = interval(Duration::from_secs(30));
             let all_merged = Arc::new(RwLock::new(DataUsageCache::default()));
             loop {
@@ -563,17 +564,11 @@ impl ECStore {
                         return;
                     }
                     _ = update_close_rx.recv() => {
-                        last_update = match tokio::spawn(update_scan(all_merged.clone(), results.clone(), last_update.clone(), all_buckets_clone.clone(), updates.clone())).await {
-                            Ok(v) => v,
-                            Err(_) => return,
-                        };
+                        update_scan(all_merged.clone(), results.clone(), &mut last_update, all_buckets_clone.clone(), updates.clone()).await;
                         return;
                     }
                     _ = interval.tick() => {
-                        last_update = match tokio::spawn(update_scan(all_merged.clone(), results.clone(), last_update.clone(), all_buckets_clone.clone(), updates.clone())).await {
-                            Ok(v) => v,
-                            Err(_) => return,
-                        };
+                        update_scan(all_merged.clone(), results.clone(), &mut last_update, all_buckets_clone.clone(), updates.clone()).await;
                     }
                 }
             }
@@ -616,8 +611,7 @@ impl ECStore {
 
         let mut idx_res = Vec::with_capacity(self.pools.len());
 
-        let mut idx = 0;
-        for result in results {
+        for (idx, result) in results.into_iter().enumerate() {
             match result {
                 Ok(res) => {
                     idx_res.push(IndexRes {
@@ -634,8 +628,6 @@ impl ECStore {
                     });
                 }
             }
-
-            idx += 1;
         }
 
         // TODO: test order
@@ -693,10 +685,10 @@ impl ECStore {
 async fn update_scan(
     all_merged: Arc<RwLock<DataUsageCache>>,
     results: Arc<RwLock<Vec<DataUsageCache>>>,
-    last_update: Option<SystemTime>,
+    last_update: &mut Option<SystemTime>,
     all_buckets: Vec<BucketInfo>,
     updates: Sender<DataUsageInfo>,
-) -> Option<SystemTime> {
+) {
     let mut w = all_merged.write().await;
     *w = DataUsageCache {
         info: DataUsageCacheInfo {
@@ -707,15 +699,14 @@ async fn update_scan(
     };
     for info in results.read().await.iter() {
         if info.info.last_update.is_none() {
-            return last_update;
+            return;
         }
         w.merge(info);
     }
-    if w.info.last_update > last_update && w.root().is_none() {
+    if w.info.last_update > *last_update && w.root().is_none() {
         let _ = updates.send(w.dui(&w.info.name, &all_buckets)).await;
-        return w.info.last_update;
+        *last_update = w.info.last_update;
     }
-    last_update
 }
 
 pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
@@ -1379,7 +1370,7 @@ impl StorageAPI for ECStore {
         Ok(ListMultipartsInfo {
             key_marker: key_marker.to_owned(),
             upload_id_marker: upload_id_marker.to_owned(),
-            max_uploads: max_uploads,
+            max_uploads,
             uploads,
             prefix: prefix.to_owned(),
             delimiter: delimiter.to_owned(),
@@ -1543,8 +1534,8 @@ impl StorageAPI for ECStore {
         Ok((r, None))
     }
 
-    async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
-        unimplemented!()
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        self.peer_sys.heal_bucket(bucket, opts).await
     }
     async fn heal_object(
         &self,
@@ -1604,7 +1595,95 @@ impl StorageAPI for ECStore {
 
         Ok((HealResultItem::default(), Some(Error::new(DiskError::FileNotFound))))
     }
-    async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()> {
+    async fn heal_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        opts: &HealOpts,
+        hs: Arc<RwLock<HealSequence>>,
+        is_meta: bool,
+    ) -> Result<()> {
+        let opts_clone = *opts;
+        let heal_entry: HealEntryFn = Arc::new(move |bucket: String, entry: MetaCacheEntry, scan_mode: HealScanMode| {
+            let opts_clone = opts_clone;
+            let hs_clone = hs.clone();
+            Box::pin(async move {
+                if entry.is_dir() {
+                    return Ok(());
+                }
+
+                if bucket == RUSTFS_META_BUCKET
+                    && Pattern::new("buckets/*/.metacache/*")
+                        .map(|p| p.matches(&entry.name))
+                        .unwrap_or(false)
+                    || Pattern::new("tmp/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+                    || Pattern::new("multipart/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+                    || Pattern::new("tmp-old/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                let fivs = match entry.file_info_versions(&bucket) {
+                    Ok(fivs) => fivs,
+                    Err(_) => {
+                        if is_meta {
+                            return HealSequence::heal_meta_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await;
+                        } else {
+                            return HealSequence::heal_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await;
+                        }
+                    }
+                };
+
+                if opts_clone.remove && !opts_clone.dry_run {
+                    let layer = new_object_layer_fn();
+                    let lock = layer.read().await;
+                    let store = match lock.as_ref() {
+                        Some(s) => s,
+                        None => {
+                            return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())))
+                        }
+                    };
+                    if let Err(err) = store.check_abandoned_parts(&bucket, &entry.name, &opts_clone).await {
+                        info!("unable to check object {}/{} for abandoned data: {}", bucket, entry.name, err.to_string());
+                    }
+                }
+                for version in fivs.versions.iter() {
+                    if is_meta {
+                        if let Err(err) = HealSequence::heal_meta_object(
+                            hs_clone.clone(),
+                            &bucket,
+                            &version.name,
+                            &version.version_id.map(|v| v.to_string()).unwrap_or("".to_string()),
+                            scan_mode,
+                        )
+                        .await
+                        {
+                            match err.downcast_ref() {
+                                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                                _ => {
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    } else if let Err(err) = HealSequence::heal_object(
+                        hs_clone.clone(),
+                        &bucket,
+                        &version.name,
+                        &version.version_id.map(|v| v.to_string()).unwrap_or("".to_string()),
+                        scan_mode,
+                    )
+                    .await
+                    {
+                        match err.downcast_ref() {
+                            Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                            _ => {
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+        });
         let mut first_err = None;
         for (idx, pool) in self.pools.iter().enumerate() {
             if opts.pool.is_some() && opts.pool.unwrap() != idx {
@@ -1617,7 +1696,7 @@ impl StorageAPI for ECStore {
                     continue;
                 }
 
-                if let Err(err) = set.list_and_heal(bucket, prefix, opts, func.clone()).await {
+                if let Err(err) = set.list_and_heal(bucket, prefix, opts, heal_entry.clone()).await {
                     if first_err.is_none() {
                         first_err = Some(err)
                     }
@@ -1852,67 +1931,6 @@ fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
         return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
     }
 
-    Ok(())
-}
-
-pub async fn heal_entry(
-    bucket: String,
-    entry: MetaCacheEntry,
-    scan_mode: HealScanMode,
-    opts: HealOpts,
-    func: HealObjectFn,
-) -> Result<()> {
-    if entry.is_dir() {
-        return Ok(());
-    }
-
-    // We might land at .metacache, .trash, .multipart
-    // no need to heal them skip, only when bucket
-    // is '.rustfs.sys'
-    if bucket == RUSTFS_META_BUCKET {
-        if Pattern::new("buckets/*/.metacache/*")
-            .map(|p| p.matches(&entry.name))
-            .unwrap_or(false)
-            || Pattern::new("tmp/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-            || Pattern::new("multipart/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-            || Pattern::new("tmp-old/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-        {
-            return Ok(());
-        }
-    }
-
-    let layer = new_object_layer_fn();
-    let lock = layer.read().await;
-    let store = match lock.as_ref() {
-        Some(s) => s,
-        None => return Err(Error::msg("errServerNotInitialized")),
-    };
-
-    match entry.file_info_versions(&bucket) {
-        Ok(fivs) => {
-            if opts.remove && !opts.dry_run {
-                if let Err(err) = store.check_abandoned_parts(&bucket, &entry.name, &opts).await {
-                    return Err(Error::from_string(format!(
-                        "unable to check object {}/{} for abandoned data: {}",
-                        bucket, entry.name, err
-                    )));
-                }
-            }
-
-            for version in fivs.versions.iter() {
-                let version_id = version.version_id.map_or("".to_string(), |version_id| version_id.to_string());
-                if let Err(err) = func(&bucket, &entry.name, &version_id, scan_mode) {
-                    match err.downcast_ref::<DiskError>() {
-                        Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
-                        _ => return Err(err),
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            return func(&bucket, &entry.name, "", scan_mode);
-        }
-    }
     Ok(())
 }
 

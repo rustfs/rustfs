@@ -9,7 +9,7 @@ members = [
     "common/protos",
     "api/admin",
     "reader",
-    "router",
+    "router", "common/workers",
 ]
 
 [workspace.package]
@@ -85,3 +85,4 @@ uuid = { version = "1.11.0", features = [
 log = "0.4.22"
 axum = "0.7.7"
 md-5 = "0.10.6"
+workers = { path = "./common/workers" }
