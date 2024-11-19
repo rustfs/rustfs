@@ -12,6 +12,16 @@ message PingResponse {
   bytes body = 2;
 }
 
+message HealBucketRequest {
+  string bucket = 1;
+  string options = 2;
+}
+
+message HealBucketResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
 message ListBucketRequest {
   string options = 1;
 }
@@ -410,6 +420,7 @@ message GenerallyLockResponse {
 service NodeService {
 /* -------------------------------meta service-------------------------- */
   rpc Ping(PingRequest) returns (PingResponse) {};
+  rpc HealBucket(HealBucketRequest) returns (HealBucketResponse) {};
   rpc ListBucket(ListBucketRequest) returns (ListBucketResponse) {};
   rpc MakeBucket(MakeBucketRequest) returns (MakeBucketResponse) {};
   rpc GetBucketInfo(GetBucketInfoRequest) returns (GetBucketInfoResponse) {};

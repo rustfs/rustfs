@@ -39,7 +39,6 @@ use std::{
     io::{Cursor, SeekFrom},
     path::PathBuf,
     sync::Arc,
-    usize,
 };
 use time::OffsetDateTime;
 use tokio::{
@@ -683,7 +682,7 @@ impl MetaCacheEntry {
         let mut fm = FileMeta::new();
         fm.unmarshal_msg(&self.metadata)?;
 
-        Ok(fm.into_file_info_versions(bucket, self.name.as_str(), false)?)
+        fm.into_file_info_versions(bucket, self.name.as_str(), false)
     }
 
     pub fn matches(&self, other: &MetaCacheEntry, strict: bool) -> Result<(Option<MetaCacheEntry>, bool)> {
@@ -842,7 +841,7 @@ impl MetaCacheEntries {
         selected = Some(MetaCacheEntry {
             name: selected.as_ref().unwrap().name.clone(),
             cached: Some(FileMeta {
-                meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver.clone(),
+                meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver,
                 ..Default::default()
             }),
             _reusable: true,

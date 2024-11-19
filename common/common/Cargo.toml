@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 lazy_static.workspace = true
+scopeguard = "1.2.0"
 tokio.workspace = true
 tonic.workspace = true
 tracing-error.workspace = true

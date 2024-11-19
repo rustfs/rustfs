@@ -445,7 +445,7 @@ impl Erasure {
                 self.encoder.as_ref().unwrap().reconstruct(&mut bufs)?;
             }
 
-            let shards = bufs.into_iter().filter_map(|x| x).collect::<Vec<_>>();
+            let shards = bufs.into_iter().flatten().collect::<Vec<_>>();
             if shards.len() != self.parity_shards + self.data_shards {
                 return Err(Error::from_string("can not reconstruct data"));
             }

@@ -1,5 +1,5 @@
+use s3s::{S3Error, S3ErrorCode};
 use std::{cmp::Ordering, env, path::PathBuf, sync::Arc, time::Duration};
-
 use tokio::{
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -7,16 +7,29 @@ use tokio::{
     },
     time::interval,
 };
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
-
-use crate::{
-    config::RUSTFS_CONFIG_PREFIX, disk::{endpoint::Endpoint, error::DiskError, DiskAPI, DiskInfoOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET}, error::{Error, Result}, global::{GLOBAL_BackgroundHealRoutine, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP}, heal::{data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT}, data_usage_cache::DataUsageCache, heal_commands::{init_healing_tracker, load_healing_tracker}, heal_ops::NOP_HEAL}, new_object_layer_fn, store::get_disk_via_endpoint, store_api::{BucketInfo, BucketOptions, StorageAPI}, utils::path::{path_join, SLASH_SEPARATOR}
-};
 
 use super::{
     heal_commands::{HealOpts, HealResultItem},
     heal_ops::{new_bg_heal_sequence, HealSequence},
+};
+use crate::heal::error::ERR_RETRY_HEALING;
+use crate::{
+    config::RUSTFS_CONFIG_PREFIX,
+    disk::{endpoint::Endpoint, error::DiskError, DiskAPI, DiskInfoOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    error::{Error, Result},
+    global::{GLOBAL_BackgroundHealRoutine, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP},
+    heal::{
+        data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT},
+        data_usage_cache::DataUsageCache,
+        heal_commands::{init_healing_tracker, load_healing_tracker},
+        heal_ops::NOP_HEAL,
+    },
+    new_object_layer_fn,
+    store::get_disk_via_endpoint,
+    store_api::{BucketInfo, BucketOptions, StorageAPI},
+    utils::path::{path_join, SLASH_SEPARATOR},
 };
 
 pub static DEFAULT_MONITOR_NEW_DISK_INTERVAL: Duration = Duration::from_secs(10);
@@ -30,6 +43,9 @@ pub async fn init_auto_heal() {
                 .await
                 .push_heal_local_disks(&get_local_disks_to_heal().await)
                 .await;
+            tokio::spawn(async {
+                monitor_local_disks_and_heal().await;
+            });
         }
     }
 }
@@ -99,10 +115,27 @@ async fn monitor_local_disks_and_heal() {
         for disk in heal_disks.into_ref().iter() {
             let disk_clone = disk.clone();
             tokio::spawn(async move {
-                GLOBAL_BackgroundHealState.write().await.set_disk_healing_status(disk_clone.clone(), true).await;
-                
+                GLOBAL_BackgroundHealState
+                    .write()
+                    .await
+                    .set_disk_healing_status(disk_clone.clone(), true)
+                    .await;
+                if heal_fresh_disk(&disk_clone).await.is_err() {
+                    GLOBAL_BackgroundHealState
+                        .write()
+                        .await
+                        .set_disk_healing_status(disk_clone.clone(), false)
+                        .await;
+                    return;
+                }
+                GLOBAL_BackgroundHealState
+                    .write()
+                    .await
+                    .pop_heal_local_disks(&[disk_clone])
+                    .await;
             });
         }
+        interval.reset();
     }
 }
 
@@ -110,16 +143,20 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
     let (pool_idx, set_idx) = (endpoint.pool_idx.unwrap(), endpoint.disk_idx.unwrap());
     let disk = match get_disk_via_endpoint(endpoint).await {
         Some(disk) => disk,
-        None => return Err(Error::from_string(format!("Unexpected error disk must be initialized by now after formatting: {}", endpoint.to_string()))),
+        None => {
+            return Err(Error::from_string(format!(
+                "Unexpected error disk must be initialized by now after formatting: {}",
+                endpoint
+            )))
+        }
     };
 
     if let Err(err) = disk.disk_info(&DiskInfoOptions::default()).await {
         match err.downcast_ref() {
             Some(DiskError::DriveIsRoot) => {
                 return Ok(());
-            },
-            Some(DiskError::UnformattedDisk) => {
-            },
+            }
+            Some(DiskError::UnformattedDisk) => {}
             _ => {
                 return Err(err);
             }
@@ -134,14 +171,21 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
                     return Ok(());
                 }
                 _ => {
-                    info!("Unable to load healing tracker on '{}': {}, re-initializing..", disk.to_string(), err.to_string());
-                },
+                    info!(
+                        "Unable to load healing tracker on '{}': {}, re-initializing..",
+                        disk.to_string(),
+                        err.to_string()
+                    );
+                }
             }
             init_healing_tracker(disk.clone(), &Uuid::new_v4().to_string()).await?
         }
     };
 
-    info!("Healing drive '{}' - 'mc admin heal alias/ --verbose' to check the current status.", endpoint.to_string());
+    info!(
+        "Healing drive '{}' - 'mc admin heal alias/ --verbose' to check the current status.",
+        endpoint.to_string()
+    );
 
     let layer = new_object_layer_fn();
     let lock = layer.read().await;
@@ -151,11 +195,15 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
     };
     let mut buckets = store.list_bucket(&BucketOptions::default()).await?;
     buckets.push(BucketInfo {
-        name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(RUSTFS_CONFIG_PREFIX)]).to_string_lossy().to_string(),
+        name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(RUSTFS_CONFIG_PREFIX)])
+            .to_string_lossy()
+            .to_string(),
         ..Default::default()
     });
     buckets.push(BucketInfo {
-        name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)]).to_string_lossy().to_string(),
+        name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)])
+            .to_string_lossy()
+            .to_string(),
         ..Default::default()
     });
 
@@ -170,55 +218,123 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
         }
     });
 
-    let mut cache = match DataUsageCache::load(&store.pools[pool_idx].disk_set[set_idx], DATA_USAGE_CACHE_NAME).await {
-        Ok(cache) => {
-            let data_usage_info = cache.dui(DATA_USAGE_ROOT, &Vec::new());
-            tracker.objects_total_count = data_usage_info.objects_total_count;
-            tracker.objects_total_size = data_usage_info.objects_total_size;
-            cache
-        },
-        Err(_) => DataUsageCache::default()
+    if let Ok(cache) = DataUsageCache::load(&store.pools[pool_idx].disk_set[set_idx], DATA_USAGE_CACHE_NAME).await {
+        let data_usage_info = cache.dui(DATA_USAGE_ROOT, &Vec::new());
+        tracker.objects_total_count = data_usage_info.objects_total_count;
+        tracker.objects_total_size = data_usage_info.objects_total_size;
     };
 
-    let location = disk.get_disk_location();
     tracker.set_queue_buckets(&buckets).await;
     tracker.save().await?;
 
-    // store.pools[pool_idx].disk_set[set_idx].
-    todo!()
+    let tracker = Arc::new(RwLock::new(tracker));
+    let qb = tracker.read().await.queue_buckets.clone();
+    store.pools[pool_idx].disk_set[set_idx]
+        .clone()
+        .heal_erasure_set(&qb, tracker.clone())
+        .await?;
+    let mut tracker_w = tracker.write().await;
+    if tracker_w.items_failed > 0 && tracker_w.retry_attempts < 4 {
+        tracker_w.retry_attempts += 1;
+        tracker_w.reset_healing().await;
+        if let Err(err) = tracker_w.update().await {
+            info!("update tracker failed: {}", err.to_string());
+        }
+        return Err(Error::from_string(ERR_RETRY_HEALING));
+    }
+
+    if tracker_w.items_failed > 0 {
+        info!(
+            "Healing of drive '{}' is incomplete, retried {} times (healed: {}, skipped: {}, failed: {}).",
+            disk.to_string(),
+            tracker_w.retry_attempts,
+            tracker_w.items_healed,
+            tracker_w.item_skipped,
+            tracker_w.items_failed
+        );
+    } else if tracker_w.retry_attempts > 0 {
+        info!(
+            "Healing of drive '{}' is incomplete, retried {} times (healed: {}, skipped: {}).",
+            disk.to_string(),
+            tracker_w.retry_attempts,
+            tracker_w.items_healed,
+            tracker_w.item_skipped
+        );
+    } else {
+        info!(
+            "Healing of drive '{}' is finished (healed: {}, skipped: {}).",
+            disk.to_string(),
+            tracker_w.items_healed,
+            tracker_w.item_skipped
+        );
+    }
+
+    if tracker_w.heal_id.is_empty() {
+        if let Err(err) = tracker_w.delete().await {
+            error!("delete tracker failed: {}", err.to_string());
+        }
+    }
+    let layer = new_object_layer_fn();
+    let lock = layer.read().await;
+    let store = match lock.as_ref() {
+        Some(s) => s,
+        None => return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))),
+    };
+    let disks = store.get_disks(pool_idx, set_idx).await?;
+    for disk in disks.into_iter() {
+        if disk.is_none() {
+            continue;
+        }
+        let mut tracker = match load_healing_tracker(&disk).await {
+            Ok(tracker) => tracker,
+            Err(err) => {
+                match err.downcast_ref() {
+                    Some(DiskError::FileNotFound) => {}
+                    _ => {
+                        info!("Unable to load healing tracker on '{:?}': {}, re-initializing..", disk, err.to_string());
+                    }
+                }
+                continue;
+            }
+        };
+        if tracker.heal_id == tracker_w.heal_id {
+            tracker.finished = true;
+            tracker.update().await?;
+        }
+    }
+    Ok(())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct HealTask {
     pub bucket: String,
     pub object: String,
     pub version_id: String,
     pub opts: HealOpts,
-    pub resp_tx: Option<Arc<Sender<HealResult>>>,
-    pub resp_rx: Option<Arc<Receiver<HealResult>>>,
+    pub resp_tx: Option<Sender<HealResult>>,
+    pub resp_rx: Option<Receiver<HealResult>>,
 }
 
 impl HealTask {
     pub fn new(bucket: &str, object: &str, version_id: &str, opts: &HealOpts) -> Self {
-        let (tx, rx) = mpsc::channel(10);
         Self {
             bucket: bucket.to_string(),
             object: object.to_string(),
             version_id: version_id.to_string(),
-            opts: opts.clone(),
-            resp_tx: Some(tx.into()),
-            resp_rx: Some(rx.into()),
+            opts: *opts,
+            resp_tx: None,
+            resp_rx: None,
         }
     }
 }
 
 pub struct HealResult {
     pub result: HealResultItem,
-    _err: Option<Error>,
+    pub err: Option<Error>,
 }
 
 pub struct HealRoutine {
-    tasks_tx: Sender<HealTask>,
+    pub tasks_tx: Sender<HealTask>,
     tasks_rx: Receiver<HealTask>,
     workers: usize,
 }
@@ -265,13 +381,10 @@ impl HealRoutine {
                         let lock = layer.read().await;
                         let store = lock.as_ref().expect("Not init");
                         if task.object.is_empty() {
-                            match store
-                                .heal_object(&task.bucket, &task.object, &task.version_id, &task.opts)
-                                .await
-                            {
-                                Ok((res, err)) => {
+                            match store.heal_bucket(&task.bucket, &task.opts).await {
+                                Ok(res) => {
                                     d_res = res;
-                                    d_err = err;
+                                    d_err = None;
                                 }
                                 Err(err) => d_err = Some(err),
                             }
@@ -292,7 +405,7 @@ impl HealRoutine {
                         let _ = resp_tx
                             .send(HealResult {
                                 result: d_res,
-                                _err: d_err,
+                                err: d_err,
                             })
                             .await;
                     } else {
@@ -325,5 +438,5 @@ async fn heal_disk_format(opts: HealOpts) -> Result<(HealResultItem, Option<Erro
     if err.is_some() {
         return Ok((HealResultItem::default(), err));
     }
-    return Ok((res, err));
+    Ok((res, err))
 }

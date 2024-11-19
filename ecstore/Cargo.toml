@@ -60,6 +60,7 @@ s3s-policy.workspace = true
 rand.workspace = true
 pin-project-lite.workspace = true
 md-5.workspace = true
+workers.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 

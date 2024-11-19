@@ -1,12 +1,34 @@
+use super::{
+    background_heal_ops::HealTask,
+    data_scanner::HEAL_DELETE_DANGLING,
+    error::ERR_SKIP_FILE,
+    heal_commands::{
+        HealItemType, HealOpts, HealResultItem, HealScanMode, HealStopSuccess, HealingDisk, HealingTracker,
+        HEAL_ITEM_BUCKET_METADATA,
+    },
+};
+use crate::heal::heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT};
+use crate::store_api::StorageAPI;
+use crate::{
+    config::common::CONFIG_PREFIX,
+    disk::RUSTFS_META_BUCKET,
+    global::GLOBAL_BackgroundHealRoutine,
+    heal::{
+        error::ERR_HEAL_STOP_SIGNALLED,
+        heal_commands::{HealDriveInfo, DRIVE_STATE_OK},
+    },
+};
 use crate::{
     disk::{endpoint::Endpoint, MetaCacheEntry},
     endpoints::Endpoints,
     error::{Error, Result},
     global::GLOBAL_IsDistErasure,
     heal::heal_commands::{HealStartSuccess, HEAL_UNKNOWN_SCAN},
+    new_object_layer_fn,
     utils::path::has_profix,
 };
 use lazy_static::lazy_static;
+use s3s::{S3Error, S3ErrorCode};
 use std::{
     collections::HashMap,
     future::Future,
@@ -24,19 +46,13 @@ use tokio::{
     },
     time::{interval, sleep},
 };
+use tracing::info;
 use uuid::Uuid;
-
-use super::{
-    background_heal_ops::HealTask,
-    data_scanner::HEAL_DELETE_DANGLING,
-    heal_commands::{HealItemType, HealOpts, HealResultItem, HealScanMode, HealStopSuccess, HealingDisk, HealingTracker},
-};
 
 type HealStatusSummary = String;
 type ItemsMap = HashMap<HealItemType, usize>;
-pub type HealObjectFn = Arc<dyn Fn(&str, &str, &str, HealScanMode) -> Result<()> + Send + Sync>;
 pub type HealEntryFn =
-    Box<dyn Fn(String, MetaCacheEntry, HealScanMode) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
+    Arc<dyn Fn(String, MetaCacheEntry, HealScanMode) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync + 'static>;
 
 pub const BG_HEALING_UUID: &str = "0000-0000-0000-0000";
 pub const HEALING_TRACKER_FILENAME: &str = ".healing.bin";
@@ -174,19 +190,19 @@ impl HealSequence {
 }
 
 impl HealSequence {
-    fn get_scanned_items_count(&self) -> usize {
+    fn _get_scanned_items_count(&self) -> usize {
         self.scanned_items_map.values().sum()
     }
 
-    fn get_scanned_items_map(&self) -> ItemsMap {
+    fn _get_scanned_items_map(&self) -> ItemsMap {
         self.scanned_items_map.clone()
     }
 
-    fn get_healed_items_map(&self) -> ItemsMap {
+    fn _get_healed_items_map(&self) -> ItemsMap {
         self.healed_items_map.clone()
     }
 
-    fn get_heal_failed_items_map(&self) -> ItemsMap {
+    fn _get_heal_failed_items_map(&self) -> ItemsMap {
         self.heal_failed_items_map.clone()
     }
 
@@ -223,11 +239,11 @@ impl HealSequence {
     }
 
     async fn has_ended(&self) -> bool {
-        if self.client_token == BG_HEALING_UUID.to_string() {
+        if self.client_token == *BG_HEALING_UUID {
             return false;
         }
 
-        !(*(self.end_time.read().await) == self.start_time)
+        *(self.end_time.read().await) != self.start_time
     }
 
     async fn stop(&self) {
@@ -238,6 +254,7 @@ impl HealSequence {
     async fn push_heal_result_item(&self, r: &HealResultItem) -> Result<()> {
         let mut r = r.clone();
         let mut interval_timer = interval(HEAL_UNCONSUMED_TIMEOUT);
+        #[allow(unused_assignments)]
         let mut items_len = 0;
         loop {
             {
@@ -282,31 +299,108 @@ impl HealSequence {
             task.opts.scan_mode = HEAL_UNKNOWN_SCAN;
         }
 
-        self.count_scanned(heal_type);
+        self.count_scanned(heal_type.clone());
 
-        if source.no_wait {}
-
-        todo!()
-    }
-
-    fn heal_disk_meta() -> Result<()> {
-        todo!()
-    }
-
-    fn heal_items(&self, buckets_only: bool) -> Result<()> {
-        if self.client_token == BG_HEALING_UUID.to_string() {
+        if source.no_wait {
+            let task_str = format!("{:?}", task);
+            if GLOBAL_BackgroundHealRoutine.read().await.tasks_tx.try_send(task).is_ok() {
+                info!("Task in the queue: {:?}", task_str);
+            }
             return Ok(());
         }
 
-        todo!()
+        let (resp_tx, mut resp_rx) = mpsc::channel(1);
+        task.resp_tx = Some(resp_tx);
+
+        let task_str = format!("{:?}", task);
+        if GLOBAL_BackgroundHealRoutine.read().await.tasks_tx.try_send(task).is_ok() {
+            info!("Task in the queue: {:?}", task_str);
+        }
+        let count_ok_drives = |drivers: &[HealDriveInfo]| {
+            let mut count = 0;
+            for drive in drivers.iter() {
+                if drive.state == DRIVE_STATE_OK {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        loop {
+            match resp_rx.recv().await {
+                Some(mut res) => {
+                    if res.err.is_none() {
+                        self.count_healed(heal_type.clone());
+                    } else {
+                        self.count_failed(heal_type.clone());
+                    }
+                    if !self.report_progress {
+                        if let Some(err) = res.err {
+                            if err.to_string() == ERR_SKIP_FILE {
+                                return Ok(());
+                            }
+                            return Err(err);
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    res.result.heal_item_type = heal_type.clone();
+                    if let Some(err) = res.err.as_ref() {
+                        res.result.detail = err.to_string();
+                    }
+                    if res.result.parity_blocks > 0
+                        && res.result.data_blocks > 0
+                        && res.result.data_blocks > res.result.parity_blocks
+                    {
+                        let got = count_ok_drives(&res.result.after);
+                        if got < res.result.parity_blocks {
+                            res.result.detail = format!(
+                                "quorum loss - expected {} minimum, got drive states in OK {}",
+                                res.result.parity_blocks, got
+                            );
+                        }
+                    }
+                    return self.push_heal_result_item(&res.result).await;
+                }
+                None => return Ok(()),
+            }
+        }
     }
 
-    async fn traverse_and_heal(&self) {
+    async fn heal_disk_meta(h: Arc<RwLock<HealSequence>>) -> Result<()> {
+        HealSequence::heal_rustfs_sys_meta(h, CONFIG_PREFIX).await
+    }
+
+    async fn heal_items(h: Arc<RwLock<HealSequence>>, buckets_only: bool) -> Result<()> {
+        if h.read().await.client_token == *BG_HEALING_UUID {
+            return Ok(());
+        }
+
+        Self::heal_disk_meta(h.clone()).await?;
+        let bucket = h.read().await.bucket.clone();
+        Self::heal_bucket(h.clone(), &bucket, buckets_only).await
+    }
+
+    async fn traverse_and_heal(h: Arc<RwLock<HealSequence>>) {
         let buckets_only = false;
+        let result = match Self::heal_items(h.clone(), buckets_only).await {
+            Ok(_) => None,
+            Err(err) => Some(err),
+        };
+        let _ = h.read().await.traverse_and_heal_done_tx.read().await.send(result).await;
     }
 
-    fn heal_minio_sys_meta(&self, meta_prefix: String) -> Result<()> {
-        todo!()
+    async fn heal_rustfs_sys_meta(h: Arc<RwLock<HealSequence>>, meta_prefix: &str) -> Result<()> {
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))),
+        };
+        let setting = h.read().await.setting;
+        store
+            .heal_objects(RUSTFS_META_BUCKET, meta_prefix, &setting, h.clone(), true)
+            .await
     }
 
     async fn is_done(&self) -> bool {
@@ -316,14 +410,101 @@ impl HealSequence {
         }
         false
     }
+
+    pub async fn heal_bucket(hs: Arc<RwLock<HealSequence>>, bucket: &str, bucket_only: bool) -> Result<()> {
+        let (object, setting) = {
+            let mut hs_w = hs.write().await;
+            hs_w.queue_heal_task(
+                HealSource {
+                    bucket: bucket.to_string(),
+                    ..Default::default()
+                },
+                HEAL_ITEM_BUCKET.to_string(),
+            )
+            .await?;
+
+            if bucket_only {
+                return Ok(());
+            }
+
+            if !hs_w.setting.recursive {
+                if !hs_w.object.is_empty() {
+                    HealSequence::heal_object(hs.clone(), bucket, &hs_w.object, "", hs_w.setting.scan_mode).await?;
+                }
+                return Ok(());
+            }
+            (hs_w.object.clone(), hs_w.setting)
+        };
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))),
+        };
+        store.heal_objects(bucket, &object, &setting, hs.clone(), false).await
+    }
+
+    pub async fn heal_object(
+        hs: Arc<RwLock<HealSequence>>,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        _scan_mode: HealScanMode,
+    ) -> Result<()> {
+        let mut hs_w = hs.write().await;
+        if hs_w.is_quitting().await {
+            return Err(Error::from_string(ERR_HEAL_STOP_SIGNALLED));
+        }
+
+        let setting = hs_w.setting;
+        hs_w.queue_heal_task(
+            HealSource {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                version_id: version_id.to_string(),
+                opts: Some(setting),
+                ..Default::default()
+            },
+            HEAL_ITEM_OBJECT.to_string(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn heal_meta_object(
+        hs: Arc<RwLock<HealSequence>>,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        _scan_mode: HealScanMode,
+    ) -> Result<()> {
+        let mut hs_w = hs.write().await;
+        if hs_w.is_quitting().await {
+            return Err(Error::from_string(ERR_HEAL_STOP_SIGNALLED));
+        }
+
+        hs_w.queue_heal_task(
+            HealSource {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                version_id: version_id.to_string(),
+                ..Default::default()
+            },
+            HEAL_ITEM_BUCKET_METADATA.to_string(),
+        )
+        .await?;
+
+        Ok(())
+    }
 }
 
 pub async fn heal_sequence_start(h: Arc<RwLock<HealSequence>>) {
     let r = h.read().await;
     {
         let mut current_status_w = r.current_status.write().await;
-        (*current_status_w).summary = HEAL_RUNNING_STATUS.to_string();
-        (*current_status_w).start_time = SystemTime::now()
+        current_status_w.summary = HEAL_RUNNING_STATUS.to_string();
+        current_status_w.start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
@@ -331,7 +512,7 @@ pub async fn heal_sequence_start(h: Arc<RwLock<HealSequence>>) {
 
     let h_clone = h.clone();
     spawn(async move {
-        h_clone.read().await.traverse_and_heal().await;
+        HealSequence::traverse_and_heal(h_clone).await;
     });
 
     let h_clone_1 = h.clone();
@@ -339,32 +520,27 @@ pub async fn heal_sequence_start(h: Arc<RwLock<HealSequence>>) {
     select! {
         _ = r.is_done() => {
             *(r.end_time.write().await) = SystemTime::now();
-        let mut current_status_w = r.current_status.write().await;
-        (*current_status_w).summary = HEAL_FINISHED_STATUS.to_string();
+            let mut current_status_w = r.current_status.write().await;
+            current_status_w.summary = HEAL_FINISHED_STATUS.to_string();
 
-        spawn(async move {
-            let binding = h_clone_1.read().await;
-            let mut rx_w = binding.traverse_and_heal_done_rx.write().await;
-            rx_w.recv().await;
+            spawn(async move {
+                let binding = h_clone_1.read().await;
+                let mut rx_w = binding.traverse_and_heal_done_rx.write().await;
+                rx_w.recv().await;
             });
         }
         result = x.recv() => {
-            match result {
-                Some(err) => {
-                    match err {
-                        Some(err) => {
-                            let mut current_status_w = r.current_status.write().await;
-                            (current_status_w).summary = HEAL_STOPPED_STATUS.to_string();
-                            (current_status_w).failure_detail = err.to_string();
-                        },
-                        None => {
-                            let mut current_status_w = r.current_status.write().await;
-                            (current_status_w).summary = HEAL_FINISHED_STATUS.to_string();
-                        }
+            if let Some(err) = result {
+                match err {
+                    Some(err) => {
+                        let mut current_status_w = r.current_status.write().await;
+                        (current_status_w).summary = HEAL_STOPPED_STATUS.to_string();
+                        (current_status_w).failure_detail = err.to_string();
+                    },
+                    None => {
+                        let mut current_status_w = r.current_status.write().await;
+                        (current_status_w).summary = HEAL_FINISHED_STATUS.to_string();
                     }
-                },
-                None => {
-
                 }
             }
 
@@ -555,18 +731,16 @@ impl AllHealState {
         let path_s = path.to_str().unwrap();
         if r.force_started {
             self.stop_heal_sequence(path_s).await?;
-        } else {
-            if let Some(hs) = self.get_heal_sequence(path_s).await {
-                if !hs.read().await.has_ended().await {
-                    return Err(Error::from_string(format!("Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {:?}, token is {}", r.client_address, r.start_time, r.client_token)));
-                }
+        } else if let Some(hs) = self.get_heal_sequence(path_s).await {
+            if !hs.read().await.has_ended().await {
+                return Err(Error::from_string(format!("Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {:?}, token is {}", r.client_address, r.start_time, r.client_token)));
             }
         }
 
         let _ = self.mu.write().await;
 
         for (k, v) in self.heal_seq_map.iter() {
-            if !v.read().await.has_ended().await && (has_profix(&k, path_s) || has_profix(path_s, &k)) {
+            if !v.read().await.has_ended().await && (has_profix(k, path_s) || has_profix(path_s, k)) {
                 return Err(Error::from_string(format!(
                     "The provided heal sequence path overlaps with an existing heal path: {}",
                     k

@@ -37,7 +37,7 @@ pub async fn set_global_deployment_id(id: Uuid) {
 pub async fn get_global_deployment_id() -> Uuid {
     let id_ptr = globalDeploymentIDPtr.read().await;
 
-    id_ptr.clone()
+    *id_ptr
 }
 
 pub async fn set_global_endpoints(eps: Vec<PoolEndpoints>) {

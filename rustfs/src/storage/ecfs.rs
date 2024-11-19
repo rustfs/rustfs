@@ -341,15 +341,14 @@ impl S3 for FS {
 
         let content_type = {
             if let Some(content_type) = info.content_type {
-                let ct = match ContentType::from_str(&content_type) {
+                match ContentType::from_str(&content_type) {
                     Ok(res) => Some(res),
                     Err(err) => {
                         error!("parse content-type err {} {:?}", &content_type, err);
                         //
                         None
                     }
-                };
-                ct
+                }
             } else {
                 None
             }
@@ -411,15 +410,14 @@ impl S3 for FS {
 
         let content_type = {
             if let Some(content_type) = info.content_type {
-                let ct = match ContentType::from_str(&content_type) {
+                match ContentType::from_str(&content_type) {
                     Ok(res) => Some(res),
                     Err(err) => {
                         error!("parse content-type err {} {:?}", &content_type, err);
                         //
                         None
                     }
-                };
-                ct
+                }
             } else {
                 None
             }
@@ -1536,9 +1534,7 @@ impl S3 for FS {
             }
         }
 
-        let mut grants = Vec::new();
-
-        grants.push(Grant {
+        let grants = vec![Grant {
             grantee: Some(Grantee {
                 type_: Type::from_static(Type::CANONICAL_USER),
                 display_name: None,
@@ -1547,12 +1543,11 @@ impl S3 for FS {
                 uri: None,
             }),
             permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        });
+        }];
 
         Ok(S3Response::new(GetBucketAclOutput {
             grants: Some(grants),
             owner: Some(RUSTFS_OWNER.to_owned()),
-            ..Default::default()
         }))
     }
 
@@ -1589,7 +1584,7 @@ impl S3 for FS {
                 v.grants.is_some_and(|gs| {
                     //
                     !gs.is_empty()
-                        && gs.get(0).is_some_and(|g| {
+                        && gs.first().is_some_and(|g| {
                             g.to_owned()
                                 .permission
                                 .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
@@ -1617,9 +1612,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
         }
 
-        let mut grants = Vec::new();
-
-        grants.push(Grant {
+        let grants = vec![Grant {
             grantee: Some(Grantee {
                 type_: Type::from_static(Type::CANONICAL_USER),
                 display_name: None,
@@ -1628,7 +1621,7 @@ impl S3 for FS {
                 uri: None,
             }),
             permission: Some(Permission::from_static(Permission::FULL_CONTROL)),
-        });
+        }];
 
         Ok(S3Response::new(GetObjectAclOutput {
             grants: Some(grants),
@@ -1665,7 +1658,7 @@ impl S3 for FS {
                 v.grants.is_some_and(|gs| {
                     //
                     !gs.is_empty()
-                        && gs.get(0).is_some_and(|g| {
+                        && gs.first().is_some_and(|g| {
                             g.to_owned()
                                 .permission
                                 .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)

@@ -1,12 +1,8 @@
-use std::collections::HashMap;
-
+use crate::heal::heal_ops::HealSequence;
 use crate::{
     disk::DiskStore,
     error::{Error, Result},
-    heal::{
-        heal_commands::{HealOpts, HealResultItem},
-        heal_ops::HealObjectFn,
-    },
+    heal::heal_commands::{HealOpts, HealResultItem},
     utils::path::decode_dir_object,
     xhttp,
 };
@@ -15,7 +11,10 @@ use http::HeaderMap;
 use rmp_serde::Serializer;
 use s3s::dto::StreamingBlob;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -920,7 +919,14 @@ pub trait StorageAPI: ObjectIO {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)>;
-    async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, func: HealObjectFn) -> Result<()>;
+    async fn heal_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        opts: &HealOpts,
+        hs: Arc<RwLock<HealSequence>>,
+        is_meta: bool,
+    ) -> Result<()>;
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
 }

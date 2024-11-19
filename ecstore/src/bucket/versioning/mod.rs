@@ -40,10 +40,8 @@ impl VersioningApi for VersioningConfiguration {
         }
 
         if let Some(status) = self.status.as_ref() {
-            if status.as_str() == BucketVersioningStatus::ENABLED {
-                if prefix.is_empty() {
-                    return false;
-                }
+            if status.as_str() == BucketVersioningStatus::ENABLED && prefix.is_empty() {
+                return false;
 
                 // TODO: ExcludeFolders
             }

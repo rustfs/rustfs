@@ -122,7 +122,7 @@ pub async fn store_data_usage_in_backend(mut rx: Receiver<DataUsageInfo>) {
             Some(data_usage_info) => {
                 if let Ok(data) = serde_json::to_vec(&data_usage_info) {
                     if attempts > 10 {
-                        let _ = save_config(store, &format!("{}{}", DATA_USAGE_OBJ_NAME_PATH.to_string(), ".bkp"), &data).await;
+                        let _ = save_config(store, &format!("{}{}", *DATA_USAGE_OBJ_NAME_PATH, ".bkp"), &data).await;
                         attempts += 1;
                     }
                     let _ = save_config(store, &DATA_USAGE_OBJ_NAME_PATH, &data).await;

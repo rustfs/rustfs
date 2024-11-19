@@ -37,9 +37,9 @@ fn parse_bitrot_config(s: &str) -> Result<Duration> {
     match parse_bool(s) {
         Ok(enabled) => {
             if enabled {
-                return Ok(Duration::from_secs_f64(0.0));
+                Ok(Duration::from_secs_f64(0.0))
             } else {
-                return Ok(Duration::from_secs_f64(-1.0));
+                Ok(Duration::from_secs_f64(-1.0))
             }
         }
         Err(_) => {

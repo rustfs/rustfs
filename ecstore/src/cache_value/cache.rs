@@ -54,8 +54,10 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
-        if v.is_some() && now - self.last_update_ms.load(Ordering::SeqCst) < self.ttl.as_secs() {
-            return Ok(v.unwrap());
+        if now - self.last_update_ms.load(Ordering::SeqCst) < self.ttl.as_secs() {
+            if let Some(v) = v {
+                return Ok(v);
+            }
         }
 
         if self.opts.no_wait && v.is_some() && now - self.last_update_ms.load(Ordering::SeqCst) < self.ttl.as_secs() * 2 {
@@ -110,7 +112,7 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
                     return Ok(());
                 }
 
-                return Err(err);
+                Err(err)
             }
         }
     }

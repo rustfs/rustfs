@@ -15,7 +15,7 @@ use s3s::dto::StreamingBlob;
 use s3s::Body;
 use tracing::error;
 
-const CONFIG_PREFIX: &str = "config";
+pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
@@ -161,32 +161,29 @@ async fn apply_dynamic_config(cfg: &mut Config, api: &ECStore) -> Result<()> {
     Ok(())
 }
 
-async fn apply_dynamic_config_for_sub_sys(cfg: &mut Config, api: &ECStore, subsys: &String) -> Result<()> {
+async fn apply_dynamic_config_for_sub_sys(cfg: &mut Config, api: &ECStore, subsys: &str) -> Result<()> {
     let set_drive_counts = api.set_drive_counts();
-    match subsys.as_str() {
-        STORAGE_CLASS_SUB_SYS => {
-            let kvs = match cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY) {
-                Some(res) => res,
-                None => KVS::new(),
-            };
+    if subsys == STORAGE_CLASS_SUB_SYS {
+        let kvs = match cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY) {
+            Some(res) => res,
+            None => KVS::new(),
+        };
 
-            for (i, count) in set_drive_counts.iter().enumerate() {
-                match storageclass::lookup_config(&kvs, *count) {
-                    Ok(res) => {
-                        if i == 0 && GLOBAL_StorageClass.get().is_none() {
-                            if let Err(r) = GLOBAL_StorageClass.set(res) {
-                                error!("GLOBAL_StorageClass.set failed {:?}", r);
-                            }
+        for (i, count) in set_drive_counts.iter().enumerate() {
+            match storageclass::lookup_config(&kvs, *count) {
+                Ok(res) => {
+                    if i == 0 && GLOBAL_StorageClass.get().is_none() {
+                        if let Err(r) = GLOBAL_StorageClass.set(res) {
+                            error!("GLOBAL_StorageClass.set failed {:?}", r);
                         }
                     }
-                    Err(err) => {
-                        error!("init storageclass err:{:?}", &err);
-                        break;
-                    }
+                }
+                Err(err) => {
+                    error!("init storageclass err:{:?}", &err);
+                    break;
                 }
             }
         }
-        _ => {}
     }
 
     Ok(())

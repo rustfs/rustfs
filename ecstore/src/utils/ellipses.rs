@@ -40,6 +40,10 @@ impl Pattern {
     pub fn len(&self) -> usize {
         self.seq.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.seq.is_empty()
+    }
 }
 
 /// contains a list of patterns provided in the input.

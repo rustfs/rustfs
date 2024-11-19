@@ -51,7 +51,7 @@ impl S3Access for FS {
 
         let req_info = ReqInfo {
             card: cx.credentials().cloned(),
-            action: action,
+            action,
             ..Default::default()
         };
 

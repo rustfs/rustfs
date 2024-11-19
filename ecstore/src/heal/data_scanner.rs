@@ -115,23 +115,27 @@ async fn run_data_scanner() {
     let mut buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
         .await
         .map_or(Vec::new(), |buf| buf);
-    if buf.len() == 8 {
-        cycle_info.next = match Cursor::new(buf).read_u64::<LittleEndian>() {
-            Ok(buf) => buf,
-            Err(_) => {
-                error!("can not decode DATA_USAGE_BLOOM_NAME_PATH");
-                return;
-            }
-        };
-    } else if buf.len() > 8 {
-        cycle_info.next = match Cursor::new(buf[..8].to_vec()).read_u64::<LittleEndian>() {
-            Ok(buf) => buf,
-            Err(_) => {
-                error!("can not decode DATA_USAGE_BLOOM_NAME_PATH");
-                return;
-            }
-        };
-        let _ = cycle_info.unmarshal_msg(&buf.split_off(8));
+    match buf.len().cmp(&8) {
+        std::cmp::Ordering::Less => {}
+        std::cmp::Ordering::Equal => {
+            cycle_info.next = match Cursor::new(buf).read_u64::<LittleEndian>() {
+                Ok(buf) => buf,
+                Err(_) => {
+                    error!("can not decode DATA_USAGE_BLOOM_NAME_PATH");
+                    return;
+                }
+            };
+        }
+        std::cmp::Ordering::Greater => {
+            cycle_info.next = match Cursor::new(buf[..8].to_vec()).read_u64::<LittleEndian>() {
+                Ok(buf) => buf,
+                Err(_) => {
+                    error!("can not decode DATA_USAGE_BLOOM_NAME_PATH");
+                    return;
+                }
+            };
+            let _ = cycle_info.unmarshal_msg(&buf.split_off(8));
+        }
     }
 
     loop {
@@ -377,11 +381,7 @@ pub struct ScannerItem {
 
 impl ScannerItem {
     pub fn transform_meda_dir(&mut self) {
-        let split = self
-            .prefix
-            .split(SLASH_SEPARATOR)
-            .map(|s| PathBuf::from(s))
-            .collect::<Vec<_>>();
+        let split = self.prefix.split(SLASH_SEPARATOR).map(PathBuf::from).collect::<Vec<_>>();
         if split.len() > 1 {
             self.prefix = path_join(&split[0..split.len() - 1]).to_string_lossy().to_string();
         } else {
@@ -700,13 +700,14 @@ impl FolderScanner {
             // Scan existing...
             for folder in existing_folders.iter() {
                 let h = hash_path(&folder.name);
-                if !into.compacted && self.old_cache.is_compacted(&h) {
-                    if !h.mod_(self.old_cache.info.next_cycle, DATA_USAGE_UPDATE_DIR_CYCLES) {
-                        self.new_cache
-                            .copy_with_children(&self.old_cache, &h, &Some(folder.parent.clone()));
-                        into.add_child(&h);
-                        continue;
-                    }
+                if !into.compacted
+                    && self.old_cache.is_compacted(&h)
+                    && !h.mod_(self.old_cache.info.next_cycle, DATA_USAGE_UPDATE_DIR_CYCLES)
+                {
+                    self.new_cache
+                        .copy_with_children(&self.old_cache, &h, &Some(folder.parent.clone()));
+                    into.add_child(&h);
+                    continue;
                 }
                 (self.update_current_path)(&folder.name).await;
                 scan(folder, into, self).await;
@@ -748,7 +749,7 @@ impl FolderScanner {
                 (self.update_current_path)(k).await;
 
                 if bucket != resolver.bucket {
-                    let _ = bg_seq
+                    bg_seq
                         .clone()
                         .write()
                         .await
@@ -841,7 +842,7 @@ impl FolderScanner {
                                             }
                                         } else {
                                             let mut w = found_objs_clone.write().await;
-                                            *w = *w || true;
+                                            *w = true;
                                         }
                                         return;
                                     }
@@ -866,10 +867,13 @@ impl FolderScanner {
                                     {
                                         Ok(_) => {
                                             success_versions += 1;
+
                                             let mut w = found_objs_clone.write().await;
-                                            *w = *w || true;
+                                            *w = true;
                                         }
-                                        Err(_) => fail_versions += 1,
+                                        Err(_) => {
+                                            fail_versions += 1;
+                                        }
                                     }
                                 }
                                 custom.insert("success_versions", success_versions.to_string());
@@ -901,14 +905,11 @@ impl FolderScanner {
             break;
         }
         if !was_compacted {
-            self.new_cache.replace_hashed(&this_hash, &Some(folder.parent.clone()), &into);
+            self.new_cache.replace_hashed(&this_hash, &Some(folder.parent.clone()), into);
         }
 
         if !into.compacted && self.new_cache.info.name != folder.name {
-            let mut flat = self
-                .new_cache
-                .size_recursive(&this_hash.key())
-                .unwrap_or(DataUsageEntry::default());
+            let mut flat = self.new_cache.size_recursive(&this_hash.key()).unwrap_or_default();
             flat.compacted = true;
             let compact = if flat.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT.try_into().unwrap() {
                 true
@@ -1079,3 +1080,5 @@ pub async fn scan_data_folder(
     close_disk().await;
     Ok(s.new_cache)
 }
+
+// pub fn eval_action_from_lifecycle(lc: &BucketLifecycleConfiguration, lr: &ObjectLockConfiguration, rcfg: &ReplicationConfiguration， obj: &ObjectInfo)

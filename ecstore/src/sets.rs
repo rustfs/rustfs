@@ -17,12 +17,9 @@ use crate::{
     endpoints::{Endpoints, PoolEndpoints},
     error::{Error, Result},
     global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
-    heal::{
-        heal_commands::{
-            HealDriveInfo, HealOpts, HealResultItem, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE,
-            DRIVE_STATE_OK, HEAL_ITEM_METADATA,
-        },
-        heal_ops::HealObjectFn,
+    heal::heal_commands::{
+        HealDriveInfo, HealOpts, HealResultItem, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK,
+        HEAL_ITEM_METADATA,
     },
     set_disk::SetDisks,
     store_api::{
@@ -34,6 +31,7 @@ use crate::{
     utils::hash,
 };
 
+use crate::heal::heal_ops::HealSequence;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -179,7 +177,7 @@ impl Sets {
         self.connect_disks().await;
 
         // TODO: config interval
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15 * 3));
+        let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
         let cloned_token = self.ctx.clone();
         loop {
             tokio::select! {
@@ -549,11 +547,9 @@ impl StorageAPI for Sets {
             }
             // Save new formats `format.json` on unformatted disks.
             for (fm, disk) in tmp_new_formats.iter_mut().zip(disks.iter()) {
-                if fm.is_some() && disk.is_some() {
-                    if save_format_file(disk, fm, &format_op_id).await.is_err() {
-                        let _ = disk.as_ref().unwrap().close().await;
-                        *fm = None;
-                    }
+                if fm.is_some() && disk.is_some() && save_format_file(disk, fm, &format_op_id).await.is_err() {
+                    let _ = disk.as_ref().unwrap().close().await;
+                    *fm = None;
                 }
             }
 
@@ -591,7 +587,14 @@ impl StorageAPI for Sets {
             .heal_object(bucket, object, version_id, opts)
             .await
     }
-    async fn heal_objects(&self, _bucket: &str, _prefix: &str, _opts: &HealOpts, _func: HealObjectFn) -> Result<()> {
+    async fn heal_objects(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _opts: &HealOpts,
+        _hs: Arc<RwLock<HealSequence>>,
+        _is_meta: bool,
+    ) -> Result<()> {
         unimplemented!()
     }
     async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
@@ -604,13 +607,11 @@ impl StorageAPI for Sets {
 
 async fn _close_storage_disks(disks: &[Option<DiskStore>]) {
     let mut futures = Vec::with_capacity(disks.len());
-    for disk in disks.iter() {
-        if let Some(disk) = disk {
-            let disk = disk.clone();
-            futures.push(tokio::spawn(async move {
-                let _ = disk.close().await;
-            }));
-        }
+    for disk in disks.iter().flatten() {
+        let disk = disk.clone();
+        futures.push(tokio::spawn(async move {
+            let _ = disk.close().await;
+        }));
     }
     let _ = join_all(futures).await;
 }
@@ -690,19 +691,16 @@ fn new_heal_format_sets(
     for (i, set) in ref_format.erasure.sets.iter().enumerate() {
         for j in 0..set.len() {
             if let Some(Some(err)) = errs.get(i * set_drive_count + j) {
-                match err.downcast_ref::<DiskError>() {
-                    Some(DiskError::UnformattedDisk) => {
-                        let mut fm = FormatV3::new(set_count, set_drive_count);
-                        fm.id = ref_format.id;
-                        fm.format = ref_format.format.clone();
-                        fm.version = ref_format.version.clone();
-                        fm.erasure.this = ref_format.erasure.sets[i][j];
-                        fm.erasure.sets = ref_format.erasure.sets.clone();
-                        fm.erasure.version = ref_format.erasure.version.clone();
-                        fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
-                        new_formats[i][j] = Some(fm);
-                    }
-                    _ => {}
+                if let Some(DiskError::UnformattedDisk) = err.downcast_ref::<DiskError>() {
+                    let mut fm = FormatV3::new(set_count, set_drive_count);
+                    fm.id = ref_format.id;
+                    fm.format = ref_format.format.clone();
+                    fm.version = ref_format.version.clone();
+                    fm.erasure.this = ref_format.erasure.sets[i][j];
+                    fm.erasure.sets = ref_format.erasure.sets.clone();
+                    fm.erasure.version = ref_format.erasure.version.clone();
+                    fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
+                    new_formats[i][j] = Some(fm);
                 }
             }
             if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j]) {

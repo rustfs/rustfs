@@ -45,12 +45,12 @@ impl Clone for ListPathRawOptions {
             fallback_disks: self.fallback_disks.clone(),
             bucket: self.bucket.clone(),
             path: self.path.clone(),
-            recursice: self.recursice.clone(),
+            recursice: self.recursice,
             filter_prefix: self.filter_prefix.clone(),
             forward_to: self.forward_to.clone(),
-            min_disks: self.min_disks.clone(),
-            report_not_found: self.report_not_found.clone(),
-            per_disk_limit: self.per_disk_limit.clone(),
+            min_disks: self.min_disks,
+            report_not_found: self.report_not_found,
+            per_disk_limit: self.per_disk_limit,
             ..Default::default()
         }
     }
@@ -80,7 +80,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                     .walk_dir(WalkDirOptions {
                         bucket: opts_clone.bucket.clone(),
                         base_dir: opts_clone.path.clone(),
-                        recursive: opts_clone.recursice.clone(),
+                        recursive: opts_clone.recursice,
                         report_notfound: opts_clone.report_not_found,
                         filter_prefix: opts_clone.filter_prefix.clone(),
                         forward_to: opts_clone.forward_to.clone(),
@@ -210,13 +210,11 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         }
 
         // Break if all at EOF or error.
-        if at_eof + has_err == readers.len() {
-            if has_err > 0 {
-                if let Some(finished_fn) = opts.finished.as_ref() {
-                    finished_fn(&errs).await;
-                }
-                break;
+        if at_eof + has_err == readers.len() && has_err > 0 {
+            if let Some(finished_fn) = opts.finished.as_ref() {
+                finished_fn(&errs).await;
             }
+            break;
         }
 
         if agree == readers.len() {

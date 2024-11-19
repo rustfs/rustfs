@@ -56,7 +56,7 @@ pub fn is_root_disk(disk_path: &str, root_disk: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    Ok(same_disk(disk_path, root_disk)?)
+    same_disk(disk_path, root_disk)
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> Result<()> {

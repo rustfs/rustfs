@@ -17,7 +17,6 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
-use std::u64;
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
 
@@ -158,7 +157,7 @@ impl SizeHistogram {
         for (count, oh) in self.0.iter().zip(OBJECTS_HISTOGRAM_INTERVALS.iter()) {
             if ByteSize::kib(1).as_u64() == oh.start && oh.end == ByteSize::mib(1).as_u64() - 1 {
                 res.insert(oh.name.to_string(), spl_count);
-            } else if ByteSize::kib(1).as_u64() <= oh.start && oh.end <= ByteSize::mib(1).as_u64() - 1 {
+            } else if ByteSize::kib(1).as_u64() <= oh.start && oh.end < ByteSize::mib(1).as_u64() {
                 spl_count += count;
                 res.insert(oh.name.to_string(), *count);
             } else {
@@ -310,7 +309,7 @@ impl DataUsageEntry {
             s_rep.replica_size += o_rep.replica_size;
             s_rep.replica_count += o_rep.replica_count;
             for (arn, stat) in o_rep.targets.iter() {
-                let st = s_rep.targets.entry(arn.clone()).or_insert(ReplicationStats::default());
+                let st = s_rep.targets.entry(arn.clone()).or_default();
                 *st = ReplicationStats {
                     pending_size: stat.pending_size + st.pending_size,
                     failed_size: stat.failed_size + st.failed_size,
@@ -456,7 +455,7 @@ impl DataUsageCache {
         tokio::spawn(async move {
             let _ = save_config(&store_clone, &format!("{}{}", &name_clone, ".bkp"), &buf_clone).await;
         });
-        save_config(&store, name, &buf).await
+        save_config(store, name, &buf).await
     }
 
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
@@ -465,7 +464,7 @@ impl DataUsageCache {
         if !parent.is_empty() {
             let phash = hash_path(parent);
             let p = {
-                let p = self.cache.entry(phash.key()).or_insert(DataUsageEntry::default());
+                let p = self.cache.entry(phash.key()).or_default();
                 p.add_child(&hash);
                 p.clone()
             };
@@ -476,10 +475,7 @@ impl DataUsageCache {
     pub fn replace_hashed(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, e: &DataUsageEntry) {
         self.cache.insert(hash.key(), e.clone());
         if let Some(parent) = parent {
-            self.cache
-                .entry(parent.key())
-                .or_insert(DataUsageEntry::default())
-                .add_child(hash);
+            self.cache.entry(parent.key()).or_default().add_child(hash);
         }
     }
 
@@ -488,11 +484,7 @@ impl DataUsageCache {
     }
 
     pub fn find_children_copy(&mut self, h: DataUsageHash) -> DataUsageHashMap {
-        self.cache
-            .entry(h.string())
-            .or_insert(DataUsageEntry::default())
-            .children
-            .clone()
+        self.cache.entry(h.string()).or_default().children.clone()
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
@@ -511,21 +503,18 @@ impl DataUsageCache {
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
-        match src.cache.get(&hash.string()) {
-            Some(e) => {
-                self.cache.insert(hash.key(), e.clone());
-                for ch in e.children.iter() {
-                    if *ch == hash.key() {
-                        return;
-                    }
-                    self.copy_with_children(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()));
+        if let Some(e) = src.cache.get(&hash.string()) {
+            self.cache.insert(hash.key(), e.clone());
+            for ch in e.children.iter() {
+                if *ch == hash.key() {
+                    return;
                 }
-                if let Some(parent) = parent {
-                    let p = self.cache.entry(parent.key()).or_insert(DataUsageEntry::default());
-                    p.add_child(hash);
-                }
+                self.copy_with_children(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()));
             }
-            None => return,
+            if let Some(parent) = parent {
+                let p = self.cache.entry(parent.key()).or_default();
+                p.add_child(hash);
+            }
         }
     }
 
@@ -552,7 +541,7 @@ impl DataUsageCache {
                 if flat.replication_stats.is_some() && flat.replication_stats.as_ref().unwrap().empty() {
                     flat.replication_stats = None;
                 }
-                return Some(flat);
+                Some(flat)
             }
             None => None,
         }
@@ -623,7 +612,7 @@ impl DataUsageCache {
         }
 
         if e.children.len() > limit && compact_self {
-            let mut flat = self.size_recursive(&path.key()).unwrap_or(DataUsageEntry::default());
+            let mut flat = self.size_recursive(&path.key()).unwrap_or_default();
             flat.compacted = true;
             self.delete_recursive(path);
             self.replace_hashed(path, &None, &flat);
@@ -639,7 +628,7 @@ impl DataUsageCache {
         add(self, path, &mut leaves);
         leaves.sort_by(|a, b| a.objects.cmp(&b.objects));
 
-        while remove > 0 && leaves.len() > 0 {
+        while remove > 0 && !leaves.is_empty() {
             let e = leaves.first().unwrap();
             let candidate = e.path.clone();
             if candidate == *path && !compact_self {
@@ -676,7 +665,7 @@ impl DataUsageCache {
 
         let mut n = root.children.len();
         for ch in root.children.iter() {
-            n += self.total_children_rec(&ch);
+            n += self.total_children_rec(ch);
         }
         n
     }
@@ -724,7 +713,7 @@ impl DataUsageCache {
             None => return DataUsageInfo::default(),
         };
         let flat = self.flatten(&e);
-        let dui = DataUsageInfo {
+        DataUsageInfo {
             last_update: self.info.last_update,
             objects_total_count: flat.objects as u64,
             versions_total_count: flat.versions as u64,
@@ -733,8 +722,7 @@ impl DataUsageCache {
             buckets_count: e.children.len() as u64,
             buckets_usage: self.buckets_usage_info(buckets),
             ..Default::default()
-        };
-        dui
+        }
     }
 
     pub fn buckets_usage_info(&self, buckets: &[BucketInfo]) -> HashMap<String, BucketUsageInfo> {
@@ -807,9 +795,7 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
         return;
     }
 
-    let sz = data_usage_cache
-        .size_recursive(&path.key())
-        .unwrap_or(DataUsageEntry::default());
+    let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
     leaves.push(Inner {
         objects: sz.objects,
         path: path.clone(),
