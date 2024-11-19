@@ -1,12 +1,10 @@
 #![allow(clippy::map_entry)]
 
-use crate::bucket::metadata;
 use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::config::GLOBAL_StorageClass;
 use crate::config::{self, storageclass, GLOBAL_ConfigSys};
 use crate::disk::endpoint::EndpointType;
-use crate::disk::error::is_err_file_not_found;
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
 use crate::global::{
     is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION,
@@ -56,9 +54,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs;
-use tokio::sync::{RwLock, Semaphore};
-
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 const MAX_UPLOADS_LIST: usize = 10000;
@@ -1304,10 +1300,26 @@ impl StorageAPI for ECStore {
             return self.delete_object_from_all_pools(bucket, object, &opts, errs).await;
         }
 
-        let mut obj = self.pools[pinfo.index].delete_object(bucket, object, opts.clone()).await?;
-        obj.name = utils::path::decode_dir_object(object);
+        for pool in self.pools.iter() {
+            match pool.delete_object(bucket, object, opts.clone()).await {
+                Ok(res) => {
+                    let mut obj = res;
+                    obj.name = utils::path::decode_dir_object(object);
+                    return Ok(obj);
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(err);
+                    }
+                }
+            }
+        }
 
-        Ok(obj)
+        if let Some(ver) = opts.version_id {
+            return Err(Error::new(StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), ver)));
+        }
+
+        Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
     }
 
     // TODO: review
