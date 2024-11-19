@@ -539,6 +539,10 @@ pub struct ObjectOptions {
     pub src_pool_idx: usize,
     pub user_defined: HashMap<String, String>,
     pub preserve_etag: Option<String>,
+    pub metadata_chg: bool,
+
+    pub replication_request: bool,
+    pub delete_marker: bool,
 }
 
 // impl Default for ObjectOptions {
@@ -593,7 +597,7 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
@@ -614,7 +618,7 @@ pub struct ObjectInfo {
     pub content_encoding: Option<String>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
-    pub put_object_reader: Option<PutObjReader>,
+    // pub put_object_reader: Option<PutObjReader>,
     pub etag: Option<String>,
     pub inlined: bool,
 }
