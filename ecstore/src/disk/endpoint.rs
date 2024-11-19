@@ -21,9 +21,9 @@ pub struct Endpoint {
     pub url: url::Url,
     pub is_local: bool,
 
-    pub pool_idx: Option<usize>,
-    pub set_idx: Option<usize>,
-    pub disk_idx: Option<usize>,
+    pub pool_idx: i32,
+    pub set_idx: i32,
+    pub disk_idx: i32,
 }
 
 impl Display for Endpoint {
@@ -122,9 +122,9 @@ impl TryFrom<&str> for Endpoint {
         Ok(Endpoint {
             url,
             is_local,
-            pool_idx: None,
-            set_idx: None,
-            disk_idx: None,
+            pool_idx: -1,
+            set_idx: -1,
+            disk_idx: -1,
         })
     }
 }
@@ -141,17 +141,17 @@ impl Endpoint {
 
     /// sets a specific pool number to this node
     pub fn set_pool_index(&mut self, idx: usize) {
-        self.pool_idx = Some(idx)
+        self.pool_idx = idx as i32
     }
 
     /// sets a specific set number to this node
     pub fn set_set_index(&mut self, idx: usize) {
-        self.set_idx = Some(idx)
+        self.set_idx = idx as i32
     }
 
     /// sets a specific disk number to this node
     pub fn set_disk_index(&mut self, idx: usize) {
-        self.disk_idx = Some(idx)
+        self.disk_idx = idx as i32
     }
 
     /// resolves the host and updates if it is local or not.
@@ -231,9 +231,9 @@ mod test {
                 expected_endpoint: Some(Endpoint {
                     url: root_slash_foo,
                     is_local: true,
-                    pool_idx: None,
-                    set_idx: None,
-                    disk_idx: None,
+                    pool_idx: -1,
+                    set_idx: -1,
+                    disk_idx: -1,
                 }),
                 expected_type: Some(EndpointType::Path),
                 expected_err: None,
@@ -243,9 +243,9 @@ mod test {
                 expected_endpoint: Some(Endpoint {
                     url: u2,
                     is_local: false,
-                    pool_idx: None,
-                    set_idx: None,
-                    disk_idx: None,
+                    pool_idx: -1,
+                    set_idx: -1,
+                    disk_idx: -1,
                 }),
                 expected_type: Some(EndpointType::Url),
                 expected_err: None,
@@ -255,9 +255,9 @@ mod test {
                 expected_endpoint: Some(Endpoint {
                     url: u4,
                     is_local: false,
-                    pool_idx: None,
-                    set_idx: None,
-                    disk_idx: None,
+                    pool_idx: -1,
+                    set_idx: -1,
+                    disk_idx: -1,
                 }),
                 expected_type: Some(EndpointType::Url),
                 expected_err: None,
@@ -315,9 +315,9 @@ mod test {
                 expected_endpoint: Some(Endpoint {
                     url: u6,
                     is_local: false,
-                    pool_idx: None,
-                    set_idx: None,
-                    disk_idx: None,
+                    pool_idx: -1,
+                    set_idx: -1,
+                    disk_idx: -1,
                 }),
                 expected_type: Some(EndpointType::Url),
                 expected_err: None,

@@ -2115,6 +2115,7 @@ dependencies = [
  "s3s",
  "serde",
  "serde-xml-rs",
+ "serde_json",
  "serde_urlencoded",
  "time",
  "tracing",

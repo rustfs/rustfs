@@ -41,6 +41,12 @@ pub struct Resource {
 }
 
 impl Resource {
+    pub fn new(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.to_owned(),
+            rtype: ResourceARNType::ResourceARNS3,
+        }
+    }
     pub fn validate_bucket(&self, bucket: &str) -> Result<()> {
         self.validate()?;
         if !wildcard::match_pattern(&self.pattern, bucket)
@@ -187,7 +193,7 @@ impl<'de> Deserialize<'de> for Resource {
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(transparent)]
-pub struct ResourceSet(HashSet<Resource>);
+pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
     pub fn validate_bucket(&self, bucket: &str) -> Result<()> {
@@ -221,6 +227,10 @@ impl ResourceSet {
             }
         }
         false
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 

@@ -83,9 +83,27 @@ impl DiskAPI for RemoteDisk {
 
     fn get_disk_location(&self) -> DiskLocation {
         DiskLocation {
-            pool_idx: self.endpoint.pool_idx,
-            set_idx: self.endpoint.set_idx,
-            disk_idx: self.endpoint.pool_idx,
+            pool_idx: {
+                if self.endpoint.pool_idx < 0 {
+                    None
+                } else {
+                    Some(self.endpoint.pool_idx as usize)
+                }
+            },
+            set_idx: {
+                if self.endpoint.set_idx < 0 {
+                    None
+                } else {
+                    Some(self.endpoint.set_idx as usize)
+                }
+            },
+            disk_idx: {
+                if self.endpoint.disk_idx < 0 {
+                    None
+                } else {
+                    Some(self.endpoint.disk_idx as usize)
+                }
+            },
         }
     }
 

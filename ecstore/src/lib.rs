@@ -22,6 +22,7 @@ pub mod utils;
 pub mod bucket;
 pub mod file_meta_inline;
 pub mod options;
+pub mod pools;
 pub(crate) mod store_err;
 pub mod xhttp;
 
