@@ -780,6 +780,84 @@ pub struct DeletedObject {
     // pub replication_state: ReplicationState,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub enum BackendByte {
+    #[default]
+    Unknown,
+    FS,
+    Erasure,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct StorageDisk {
+    pub endpoint: String,
+    pub root_disk: bool,
+    pub drive_path: String,
+    pub healing: bool,
+    pub scanning: bool,
+    pub state: String,
+    pub uuid: String,
+    pub major: u32,
+    pub minor: u32,
+    pub model: Option<String>,
+    pub total_space: u64,
+    pub used_space: u64,
+    pub available_space: u64,
+    pub read_throughput: f64,
+    pub write_throughput: f64,
+    pub read_latency: f64,
+    pub write_latency: f64,
+    pub utilization: f64,
+    // pub metrics: Option<DiskMetrics>,
+    // pub heal_info: Option<HealingDisk>,
+    pub used_inodes: u64,
+    pub free_inodes: u64,
+    pub local: bool,
+    pub pool_index: i32,
+    pub set_index: i32,
+    pub disk_index: i32,
+}
+
+#[derive(Debug, Default)]
+pub struct StorageInfo {
+    pub disks: Vec<StorageDisk>,
+    pub backend: BackendInfo,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct BackendDisks(HashMap<String, usize>);
+
+impl BackendDisks {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+    pub fn sum(&self) -> usize {
+        self.0.values().sum()
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct BackendInfo {
+    pub backend_type: BackendByte,
+    pub online_disks: BackendDisks,
+    pub offline_disks: BackendDisks,
+    #[serde(rename = "StandardSCData")]
+    pub standard_sc_data: Vec<usize>,
+    #[serde(rename = "StandardSCParities")]
+    pub standard_sc_parities: Vec<usize>,
+    #[serde(rename = "StandardSCParity")]
+    pub standard_sc_parity: Option<usize>,
+    #[serde(rename = "RRSCData")]
+    pub rr_sc_data: Vec<usize>,
+    #[serde(rename = "RRSCParities")]
+    pub rr_sc_parities: Vec<usize>,
+    #[serde(rename = "RRSCParity")]
+    pub rr_sc_parity: Option<usize>,
+    pub total_sets: Vec<usize>,
+    pub drives_per_set: Vec<usize>,
+}
+
 #[async_trait::async_trait]
 pub trait ObjectIO: Send + Sync + 'static {
     // GetObjectNInfo
@@ -800,9 +878,10 @@ pub trait StorageAPI: ObjectIO {
     // NewNSLock
     // Shutdown
     // NSScanner
-    // BackendInfo
-    // StorageInfo
-    // LocalStorageInfo
+
+    async fn backend_info(&self) -> BackendInfo;
+    async fn storage_info(&self) -> StorageInfo;
+    async fn local_storage_info(&self) -> StorageInfo;
 
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
