@@ -26,7 +26,7 @@ pub struct BucketPolicyArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
-// #[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct BPStatement {
     #[serde(rename = "Sid")]
     pub sid: String,
