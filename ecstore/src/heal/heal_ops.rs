@@ -326,44 +326,40 @@ impl HealSequence {
             count
         };
 
-        loop {
-            match resp_rx.recv().await {
-                Some(mut res) => {
-                    if res.err.is_none() {
-                        self.count_healed(heal_type.clone());
-                    } else {
-                        self.count_failed(heal_type.clone());
-                    }
-                    if !self.report_progress {
-                        if let Some(err) = res.err {
-                            if err.to_string() == ERR_SKIP_FILE {
-                                return Ok(());
-                            }
-                            return Err(err);
-                        } else {
+        match resp_rx.recv().await {
+            Some(mut res) => {
+                if res.err.is_none() {
+                    self.count_healed(heal_type.clone());
+                } else {
+                    self.count_failed(heal_type.clone());
+                }
+                if !self.report_progress {
+                    if let Some(err) = res.err {
+                        if err.to_string() == ERR_SKIP_FILE {
                             return Ok(());
                         }
+                        return Err(err);
+                    } else {
+                        return Ok(());
                     }
-                    res.result.heal_item_type = heal_type.clone();
-                    if let Some(err) = res.err.as_ref() {
-                        res.result.detail = err.to_string();
-                    }
-                    if res.result.parity_blocks > 0
-                        && res.result.data_blocks > 0
-                        && res.result.data_blocks > res.result.parity_blocks
-                    {
-                        let got = count_ok_drives(&res.result.after);
-                        if got < res.result.parity_blocks {
-                            res.result.detail = format!(
-                                "quorum loss - expected {} minimum, got drive states in OK {}",
-                                res.result.parity_blocks, got
-                            );
-                        }
-                    }
-                    return self.push_heal_result_item(&res.result).await;
                 }
-                None => return Ok(()),
+                res.result.heal_item_type = heal_type.clone();
+                if let Some(err) = res.err.as_ref() {
+                    res.result.detail = err.to_string();
+                }
+                if res.result.parity_blocks > 0 && res.result.data_blocks > 0 && res.result.data_blocks > res.result.parity_blocks
+                {
+                    let got = count_ok_drives(&res.result.after);
+                    if got < res.result.parity_blocks {
+                        res.result.detail = format!(
+                            "quorum loss - expected {} minimum, got drive states in OK {}",
+                            res.result.parity_blocks, got
+                        );
+                    }
+                }
+                return self.push_heal_result_item(&res.result).await;
             }
+            None => return Ok(()),
         }
     }
 
