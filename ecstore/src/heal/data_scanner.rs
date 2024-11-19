@@ -514,7 +514,9 @@ impl FolderScanner {
         let this_hash = hash_path(&folder.name);
         let was_compacted = into.compacted;
 
-        loop {
+        // do not really loop
+        let mut times = 1;
+        while times > 0 {
             let mut abandoned_children: DataUsageHashMap = if !into.compacted {
                 self.old_cache.find_children_copy(this_hash.clone())
             } else {
@@ -902,7 +904,7 @@ impl FolderScanner {
                     scan(&this, into, self).await;
                 }
             }
-            break;
+            times -= 1;
         }
         if !was_compacted {
             self.new_cache.replace_hashed(&this_hash, &Some(folder.parent.clone()), into);
