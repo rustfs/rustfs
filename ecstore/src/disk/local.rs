@@ -10,7 +10,7 @@ use super::{
 };
 use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::GLOBAL_BucketMetadataSys;
-use crate::cache_value::cache::{Cache, Opts};
+use crate::cache_value::cache::{Cache, Opts, UpdateFn};
 use crate::disk::error::{
     convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
     map_err_not_exists, os_err_to_file_err,
@@ -55,7 +55,6 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
-use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -148,10 +147,10 @@ impl LocalDisk {
             last_check: format_last_check,
         };
         let root_clone = root.clone();
-        let disk_id = Arc::new(id.map_or("".to_string(), |id| id.to_string()));
-        let update_fn = move || {
-            let rt = Runtime::new().unwrap();
-            rt.block_on(async {
+        let update_fn: UpdateFn<DiskInfo> = Box::new(move || {
+            let disk_id = id.map_or("".to_string(), |id| id.to_string());
+            let root = root_clone.clone();
+            Box::pin(async move {
                 match get_disk_info(root.clone()).await {
                     Ok((info, root)) => {
                         let disk_info = DiskInfo {
@@ -177,14 +176,14 @@ impl LocalDisk {
                     Err(err) => Err(err),
                 }
             })
-        };
+        });
 
-        let cache = Cache::new(Box::new(update_fn), Duration::from_secs(1), Opts::default());
+        let cache = Cache::new(update_fn, Duration::from_secs(1), Opts::default());
 
         // TODO: DIRECT suport
         // TODD: DiskInfo
         let mut disk = Self {
-            root: root_clone.clone(),
+            root: root.clone(),
             endpoint: ep.clone(),
             format_path,
             format_info: RwLock::new(format_info),
@@ -200,7 +199,7 @@ impl LocalDisk {
             // format_data: Mutex::new(format_data),
             // format_last_check: Mutex::new(format_last_check),
         };
-        let (info, _root) = get_disk_info(root_clone).await?;
+        let (info, _root) = get_disk_info(root).await?;
         disk.major = info.major;
         disk.minor = info.minor;
         disk.fstype = info.fstype;

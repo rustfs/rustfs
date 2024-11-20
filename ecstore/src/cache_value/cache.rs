@@ -1,5 +1,7 @@
 use std::{
     fmt::Debug,
+    future::Future,
+    pin::Pin,
     ptr,
     sync::{
         atomic::{AtomicPtr, AtomicU64, Ordering},
@@ -12,7 +14,7 @@ use tokio::{spawn, sync::Mutex};
 
 use crate::error::Result;
 
-type UpdateFn<T> = Box<dyn Fn() -> Result<T> + Send + Sync>;
+pub type UpdateFn<T> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<T>> + Send>> + Send + Sync + 'static>;
 
 #[derive(Clone, Debug, Default)]
 pub struct Opts {
@@ -96,7 +98,7 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
     }
 
     async fn update(&self) -> Result<()> {
-        match (self.update_fn)() {
+        match (self.update_fn)().await {
             Ok(val) => {
                 self.val.store(Box::into_raw(Box::new(val)), Ordering::SeqCst);
                 let now = SystemTime::now()
