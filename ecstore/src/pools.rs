@@ -35,6 +35,14 @@ impl PoolMeta {
             dont_save: false,
         }
     }
+
+    pub fn is_suspended(&self, idx: usize) -> bool {
+        if idx >= self.pools.len() {
+            return false;
+        }
+
+        self.pools[idx].decommission.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
