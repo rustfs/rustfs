@@ -58,18 +58,19 @@ pub struct PoolDecommissionInfo {
     pub bytes_failed: usize,
 }
 
-struct PoolSpaceInfo {
+#[derive(Debug)]
+pub struct PoolSpaceInfo {
     pub free: usize,
     pub total: usize,
     pub used: usize,
 }
 
 impl ECStore {
-    pub fn status(&self, idx: usize) -> Result<PoolStatus> {
+    pub fn status(&self, _idx: usize) -> Result<PoolStatus> {
         unimplemented!()
     }
 
-    async fn get_decommission_pool_space_info(&self, idx: usize) -> Result<PoolSpaceInfo> {
+    async fn _get_decommission_pool_space_info(&self, idx: usize) -> Result<PoolSpaceInfo> {
         if let Some(sets) = self.pools.get(idx) {
             let mut info = sets.storage_info().await;
             info.backend = self.backend_info().await;
@@ -81,8 +82,8 @@ impl ECStore {
     }
 }
 
-fn get_total_usable_capacity(disks: &Vec<StorageDisk>, info: &StorageInfo) -> usize {
-    for disk in disks.iter() {
+fn _get_total_usable_capacity(disks: &Vec<StorageDisk>, _info: &StorageInfo) -> usize {
+    for _disk in disks.iter() {
         // if disk.pool_index < 0 || info.backend.standard_scdata.len() <= disk.pool_index {
         //     continue;
         // }

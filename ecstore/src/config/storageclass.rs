@@ -228,7 +228,7 @@ pub fn parse_storage_class(env: &str) -> Result<StorageClass> {
 
     // only two elements allowed in the string - "scheme" and "number of parity drives"
     if s.len() != 2 {
-        return Err(Error::msg(&format!(
+        return Err(Error::msg(format!(
             "Invalid storage class format: {}. Expected 'Scheme:Number of parity drives'.",
             env
         )));
@@ -236,13 +236,13 @@ pub fn parse_storage_class(env: &str) -> Result<StorageClass> {
 
     // only allowed scheme is "EC"
     if s[0] != SCHEME_PREFIX {
-        return Err(Error::msg(&format!("Unsupported scheme {}. Supported scheme is EC.", s[0])));
+        return Err(Error::msg(format!("Unsupported scheme {}. Supported scheme is EC.", s[0])));
     }
 
     // Number of parity drives should be integer
     let parity_drives: usize = match s[1].parse() {
         Ok(num) => num,
-        Err(_) => return Err(Error::msg(&format!("Failed to parse parity value: {}.", s[1]))),
+        Err(_) => return Err(Error::msg(format!("Failed to parse parity value: {}.", s[1]))),
     };
 
     Ok(StorageClass { parity: parity_drives })

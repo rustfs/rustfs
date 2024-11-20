@@ -28,7 +28,7 @@ use super::target::BucketTargets;
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref GLOBAL_BucketMetadataSys: Arc<RwLock<BucketMetadataSys>> = Arc::new(RwLock::new(BucketMetadataSys::new()));
+    pub static ref GLOBAL_BucketMetadataSys: Arc<RwLock<BucketMetadataSys>> = Arc::new(RwLock::new(BucketMetadataSys::new()));
 }
 
 pub async fn init_bucket_metadata_sys(api: ECStore, buckets: Vec<String>) {

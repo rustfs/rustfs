@@ -1,3 +1,5 @@
+use crate::disk::RUSTFS_META_BUCKET;
+
 pub fn match_simple(pattern: &str, name: &str) -> bool {
     if pattern.is_empty() {
         return name == pattern;
@@ -64,4 +66,8 @@ pub fn match_as_pattern_prefix(pattern: &str, text: &str) -> bool {
         i += 1;
     }
     text.len() <= pattern.len()
+}
+
+pub fn is_rustfs_meta_bucket_name(bucket: &str) -> bool {
+    bucket.starts_with(RUSTFS_META_BUCKET)
 }

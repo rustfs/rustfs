@@ -1,5 +1,7 @@
 use std::{
     fmt::Debug,
+    future::Future,
+    pin::Pin,
     ptr,
     sync::{
         atomic::{AtomicPtr, AtomicU64, Ordering},
@@ -12,7 +14,7 @@ use tokio::{spawn, sync::Mutex};
 
 use crate::error::Result;
 
-type UpdateFn<T> = Box<dyn Fn() -> Result<T> + Send + Sync>;
+pub type UpdateFn<T> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<T>> + Send>> + Send + Sync + 'static>;
 
 #[derive(Clone, Debug, Default)]
 pub struct Opts {
@@ -54,8 +56,10 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
-        if v.is_some() && now - self.last_update_ms.load(Ordering::SeqCst) < self.ttl.as_secs() {
-            return Ok(v.unwrap());
+        if now - self.last_update_ms.load(Ordering::SeqCst) < self.ttl.as_secs() {
+            if let Some(v) = v {
+                return Ok(v);
+            }
         }
 
         if self.opts.no_wait && v.is_some() && now - self.last_update_ms.load(Ordering::SeqCst) < self.ttl.as_secs() * 2 {
@@ -94,7 +98,7 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
     }
 
     async fn update(&self) -> Result<()> {
-        match (self.update_fn)() {
+        match (self.update_fn)().await {
             Ok(val) => {
                 self.val.store(Box::into_raw(Box::new(val)), Ordering::SeqCst);
                 let now = SystemTime::now()
@@ -110,7 +114,7 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
                     return Ok(());
                 }
 
-                return Err(err);
+                Err(err)
             }
         }
     }

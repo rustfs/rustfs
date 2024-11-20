@@ -9,7 +9,6 @@ use s3s::dto::{
     BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
     ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
-use s3s::xml;
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

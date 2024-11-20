@@ -6,6 +6,7 @@ use ecstore::{
         UpdateMetadataOpts, WalkDirOptions,
     },
     erasure::Writer,
+    heal::{data_usage_cache::DataUsageCache, heal_commands::HealOpts},
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions},
@@ -20,14 +21,14 @@ use protos::{
         DeleteBucketResponse, DeletePathsRequest, DeletePathsResponse, DeleteRequest, DeleteResponse, DeleteVersionRequest,
         DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse,
         DiskInfoRequest, DiskInfoResponse, GenerallyLockRequest, GenerallyLockResponse, GetBucketInfoRequest,
-        GetBucketInfoResponse, ListBucketRequest, ListBucketResponse, ListDirRequest, ListDirResponse, ListVolumesRequest,
-        ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest,
-        MakeVolumesResponse, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse,
-        ReadMultipleRequest, ReadMultipleResponse, ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse,
-        RenameDataRequest, RenameDataResponse, RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse,
-        StatVolumeRequest, StatVolumeResponse, UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest,
-        VerifyFileResponse, WalkDirRequest, WalkDirResponse, WriteAllRequest, WriteAllResponse, WriteMetadataRequest,
-        WriteMetadataResponse, WriteRequest, WriteResponse,
+        GetBucketInfoResponse, HealBucketRequest, HealBucketResponse, ListBucketRequest, ListBucketResponse, ListDirRequest,
+        ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest,
+        MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, NsScannerRequest, NsScannerResponse, PingRequest,
+        PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse,
+        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse,
+        RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse, StatVolumeRequest, StatVolumeResponse,
+        UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest, VerifyFileResponse, WalkDirRequest, WalkDirResponse,
+        WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse,
     },
 };
 use tokio::sync::mpsc;
@@ -107,6 +108,32 @@ impl Node for NodeService {
             version: 1,
             body: finished_data.to_vec(),
         }))
+    }
+
+    async fn heal_bucket(&self, request: Request<HealBucketRequest>) -> Result<Response<HealBucketResponse>, Status> {
+        debug!("heal bucket");
+        let request = request.into_inner();
+        let options = match serde_json::from_str::<HealOpts>(&request.options) {
+            Ok(options) => options,
+            Err(err) => {
+                return Ok(tonic::Response::new(HealBucketResponse {
+                    success: false,
+                    error_info: Some(format!("decode HealOpts failed: {}", err)),
+                }))
+            }
+        };
+
+        match self.local_peer.heal_bucket(&request.bucket, &options).await {
+            Ok(_) => Ok(tonic::Response::new(HealBucketResponse {
+                success: true,
+                error_info: None,
+            })),
+
+            Err(err) => Ok(tonic::Response::new(HealBucketResponse {
+                success: false,
+                error_info: Some(format!("heal bucket failed: {}", err)),
+            })),
+        }
     }
 
     async fn list_bucket(&self, request: Request<ListBucketRequest>) -> Result<Response<ListBucketResponse>, Status> {
@@ -1268,6 +1295,96 @@ impl Node for NodeService {
                 error_info: Some("can not find disk".to_string()),
             }))
         }
+    }
+
+    type NsScannerStream = ResponseStream<NsScannerResponse>;
+    async fn ns_scanner(&self, request: Request<Streaming<NsScannerRequest>>) -> Result<Response<Self::NsScannerStream>, Status> {
+        info!("ns_scanner");
+
+        let mut in_stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(10);
+
+        tokio::spawn(async move {
+            match in_stream.next().await {
+                Some(Ok(request)) => {
+                    if let Some(disk) = find_local_disk(&request.disk).await {
+                        let cache = match serde_json::from_str::<DataUsageCache>(&request.cache) {
+                            Ok(cache) => cache,
+                            Err(_) => {
+                                tx.send(Ok(NsScannerResponse {
+                                    success: false,
+                                    update: "".to_string(),
+                                    data_usage_cache: "".to_string(),
+                                    error_info: Some("can not decode DataUsageCache".to_string()),
+                                }))
+                                .await
+                                .expect("working rx");
+                                return;
+                            }
+                        };
+                        let (updates_tx, mut updates_rx) = mpsc::channel(100);
+                        let tx_clone = tx.clone();
+                        let task = tokio::spawn(async move {
+                            loop {
+                                match updates_rx.recv().await {
+                                    Some(update) => {
+                                        let update = serde_json::to_string(&update).expect("encode failed");
+                                        tx_clone
+                                            .send(Ok(NsScannerResponse {
+                                                success: true,
+                                                update,
+                                                data_usage_cache: "".to_string(),
+                                                error_info: Some("can not decode DataUsageCache".to_string()),
+                                            }))
+                                            .await
+                                            .expect("working rx");
+                                    }
+                                    None => return,
+                                }
+                            }
+                        });
+                        let data_usage_cache = disk.ns_scanner(&cache, updates_tx, request.scan_mode as usize).await;
+                        let _ = task.await;
+                        match data_usage_cache {
+                            Ok(data_usage_cache) => {
+                                let data_usage_cache = serde_json::to_string(&data_usage_cache).expect("encode failed");
+                                tx.send(Ok(NsScannerResponse {
+                                    success: true,
+                                    update: "".to_string(),
+                                    data_usage_cache,
+                                    error_info: Some("can not decode DataUsageCache".to_string()),
+                                }))
+                                .await
+                                .expect("working rx");
+                            }
+                            Err(_) => {
+                                tx.send(Ok(NsScannerResponse {
+                                    success: false,
+                                    update: "".to_string(),
+                                    data_usage_cache: "".to_string(),
+                                    error_info: Some("scanner failed".to_string()),
+                                }))
+                                .await
+                                .expect("working rx");
+                            }
+                        }
+                    } else {
+                        tx.send(Ok(NsScannerResponse {
+                            success: false,
+                            update: "".to_string(),
+                            data_usage_cache: "".to_string(),
+                            error_info: Some("can not find disk".to_string()),
+                        }))
+                        .await
+                        .expect("working rx");
+                    }
+                }
+                _ => todo!(),
+            }
+        });
+
+        let out_stream = ReceiverStream::new(rx);
+        Ok(tonic::Response::new(Box::pin(out_stream)))
     }
 
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {

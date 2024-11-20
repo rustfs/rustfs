@@ -6,10 +6,11 @@ use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions,
     FileReader, FileWriter, Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
 };
 use crate::bitrot::bitrot_verify;
-use crate::cache_value::cache::{Cache, Opts};
+use crate::bucket::metadata_sys::GLOBAL_BucketMetadataSys;
+use crate::cache_value::cache::{Cache, Opts, UpdateFn};
 use crate::disk::error::{
     convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
     map_err_not_exists, os_err_to_file_err,
@@ -18,27 +19,35 @@ use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
+use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, SizeSummary};
+use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
+use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
+use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
+use crate::heal::heal_commands::{HealScanMode, HealingTracker};
+use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
+use crate::new_object_layer_fn;
 use crate::set_disk::{
     conv_part_err_to_int, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND,
 };
-use crate::store_api::BitrotAlgorithm;
+use crate::store_api::{BitrotAlgorithm, StorageAPI};
 use crate::utils::fs::{access, lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::os::get_info;
-use crate::utils::path::{clean, has_suffix, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
+use crate::utils::path::{clean, has_suffix, path_join, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
+use common::defer;
 use path_absolutize::Absolutize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{
     fs::Metadata,
     path::{Path, PathBuf},
@@ -46,7 +55,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
-use tokio::runtime::Runtime;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -138,10 +147,10 @@ impl LocalDisk {
             last_check: format_last_check,
         };
         let root_clone = root.clone();
-        let disk_id = Arc::new(id.map_or("".to_string(), |id| id.to_string()));
-        let update_fn = move || {
-            let rt = Runtime::new().unwrap();
-            rt.block_on(async {
+        let update_fn: UpdateFn<DiskInfo> = Box::new(move || {
+            let disk_id = id.map_or("".to_string(), |id| id.to_string());
+            let root = root_clone.clone();
+            Box::pin(async move {
                 match get_disk_info(root.clone()).await {
                     Ok((info, root)) => {
                         let disk_info = DiskInfo {
@@ -167,14 +176,14 @@ impl LocalDisk {
                     Err(err) => Err(err),
                 }
             })
-        };
+        });
 
-        let cache = Cache::new(Box::new(update_fn), Duration::from_secs(1), Opts::default());
+        let cache = Cache::new(update_fn, Duration::from_secs(1), Opts::default());
 
         // TODO: DIRECT suport
         // TODD: DiskInfo
         let mut disk = Self {
-            root: root_clone.clone(),
+            root: root.clone(),
             endpoint: ep.clone(),
             format_path,
             format_info: RwLock::new(format_info),
@@ -190,7 +199,7 @@ impl LocalDisk {
             // format_data: Mutex::new(format_data),
             // format_last_check: Mutex::new(format_last_check),
         };
-        let (info, _root) = get_disk_info(root_clone).await?;
+        let (info, _root) = get_disk_info(root).await?;
         disk.major = info.major;
         disk.minor = info.minor;
         disk.fstype = info.fstype;
@@ -932,7 +941,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        let volume_dir = self.get_bucket_path(&volume)?;
+        let volume_dir = self.get_bucket_path(volume)?;
         check_path_length(volume_dir.join(path).to_string_lossy().as_ref())?;
         let mut resp = CheckPartsResp {
             results: vec![0; fi.parts.len()],
@@ -958,22 +967,16 @@ impl DiskAPI for LocalDisk {
                     resp.results[i] = CHECK_PART_SUCCESS;
                 }
                 Err(err) => {
-                    match os_err_to_file_err(err).downcast_ref() {
-                        Some(DiskError::FileNotFound) => {
-                            if !skip_access_checks(volume) {
-                                if let Err(err) = access(&volume_dir).await {
-                                    match err.kind() {
-                                        ErrorKind::NotFound => {
-                                            resp.results[i] = CHECK_PART_VOLUME_NOT_FOUND;
-                                            continue;
-                                        }
-                                        _ => {}
-                                    }
+                    if let Some(DiskError::FileNotFound) = os_err_to_file_err(err).downcast_ref() {
+                        if !skip_access_checks(volume) {
+                            if let Err(err) = access(&volume_dir).await {
+                                if err.kind() == ErrorKind::NotFound {
+                                    resp.results[i] = CHECK_PART_VOLUME_NOT_FOUND;
+                                    continue;
                                 }
                             }
-                            resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                         }
-                        _ => {}
+                        resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                     }
                     continue;
                 }
@@ -1881,6 +1884,162 @@ impl DiskAPI for LocalDisk {
 
         Ok(info)
     }
+
+    async fn ns_scanner(
+        &self,
+        cache: &DataUsageCache,
+        updates: Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        self.scanning.fetch_add(1, Ordering::SeqCst);
+        defer!(|| { self.scanning.fetch_sub(1, Ordering::SeqCst) });
+
+        // Check if the current bucket has replication configuration
+        if let Ok((rcfg, _)) = GLOBAL_BucketMetadataSys
+            .read()
+            .await
+            .get_replication_config(&cache.info.name)
+            .await
+        {
+            if has_active_rules(&rcfg, "", true) {
+                // TODO: globalBucketTargetSys
+            }
+        }
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(Error::msg("errServerNotInitialized")),
+        };
+        let loc = self.get_disk_location();
+        let disks = store.get_disks(loc.pool_idx.unwrap(), loc.disk_idx.unwrap()).await?;
+        let disk = Arc::new(LocalDisk::new(&self.endpoint(), false).await?);
+        let disk_clone = disk.clone();
+        let mut cache = cache.clone();
+        cache.info.updates = Some(updates.clone());
+        let mut data_usage_info = scan_data_folder(
+            &disks,
+            disk,
+            &cache,
+            Box::new(move |item: &ScannerItem| {
+                let mut item = item.clone();
+                let disk = disk_clone.clone();
+                Box::pin(async move {
+                    if item.path.ends_with(&format!("{}{}", SLASH_SEPARATOR, STORAGE_FORMAT_FILE)) {
+                        return Err(Error::from_string(ERR_SKIP_FILE));
+                    }
+                    let stop_fn = ScannerMetrics::log(ScannerMetric::ScanObject);
+                    let mut res = HashMap::new();
+                    let done_sz = ScannerMetrics::time_size(ScannerMetric::ReadMetadata).await;
+                    let buf = match disk.read_metadata(item.path.clone()).await {
+                        Ok(buf) => buf,
+                        Err(err) => {
+                            res.insert("err".to_string(), err.to_string());
+                            stop_fn(&res).await;
+                            return Err(Error::from_string(ERR_SKIP_FILE));
+                        }
+                    };
+                    done_sz(buf.len() as u64).await;
+                    res.insert("metasize".to_string(), buf.len().to_string());
+                    item.transform_meda_dir();
+                    let meta_cache = MetaCacheEntry {
+                        name: item.object_path().to_string_lossy().to_string(),
+                        metadata: buf,
+                        ..Default::default()
+                    };
+                    let fivs = match meta_cache.file_info_versions(&item.bucket) {
+                        Ok(fivs) => fivs,
+                        Err(err) => {
+                            res.insert("err".to_string(), err.to_string());
+                            stop_fn(&res).await;
+                            return Err(Error::from_string(ERR_SKIP_FILE));
+                        }
+                    };
+                    let mut size_s = SizeSummary::default();
+                    let done = ScannerMetrics::time(ScannerMetric::ApplyAll);
+                    let obj_infos = match item.apply_versions_actions(&fivs.versions).await {
+                        Ok(obj_infos) => obj_infos,
+                        Err(err) => {
+                            res.insert("err".to_string(), err.to_string());
+                            stop_fn(&res).await;
+                            return Err(Error::from_string(ERR_SKIP_FILE));
+                        }
+                    };
+
+                    let versioned = false;
+                    let mut obj_deleted = false;
+                    for info in obj_infos.iter() {
+                        let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);
+                        let sz: usize;
+                        (obj_deleted, sz) = item.apply_actions(info, &size_s).await;
+                        done().await;
+
+                        if obj_deleted {
+                            break;
+                        }
+
+                        let actual_sz = match info.get_actual_size() {
+                            Ok(size) => size,
+                            Err(_) => continue,
+                        };
+
+                        if info.delete_marker {
+                            size_s.delete_markers += 1;
+                        }
+
+                        if info.version_id.is_some() && sz == actual_sz {
+                            size_s.versions += 1;
+                        }
+
+                        size_s.total_size += sz;
+
+                        if info.delete_marker {
+                            continue;
+                        }
+                    }
+
+                    for frer_version in fivs.free_versions.iter() {
+                        let _obj_info =
+                            frer_version.to_object_info(&item.bucket, &item.object_path().to_string_lossy(), versioned);
+                        let done = ScannerMetrics::time(ScannerMetric::TierObjSweep);
+                        done().await;
+                    }
+
+                    // todo: global trace
+                    if obj_deleted {
+                        return Err(Error::from_string(ERR_IGNORE_FILE_CONTRIB));
+                    }
+                    done().await;
+                    Ok(size_s)
+                })
+            }),
+            scan_mode,
+        )
+        .await?;
+        data_usage_info.info.last_update = Some(SystemTime::now());
+        Ok(data_usage_info)
+    }
+
+    async fn healing(&self) -> Option<HealingTracker> {
+        let healing_file = path_join(&[
+            self.path(),
+            PathBuf::from(RUSTFS_META_BUCKET),
+            PathBuf::from(BUCKET_META_PREFIX),
+            PathBuf::from(HEALING_TRACKER_FILENAME),
+        ]);
+        let b = match fs::read(healing_file).await {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        if b.is_empty() {
+            return None;
+        }
+        match HealingTracker::unmarshal_msg(&b) {
+            Ok(h) => Some(h),
+            Err(_) => Some(HealingTracker::default()),
+        }
+    }
 }
 
 async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
@@ -1893,10 +2052,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
         } else {
-            match is_root_disk(&drive_path, SLASH_SEPARATOR) {
-                Ok(result) => result,
-                Err(_) => false,
-            }
+            is_root_disk(&drive_path, SLASH_SEPARATOR).unwrap_or_default()
         }
     } else {
         false

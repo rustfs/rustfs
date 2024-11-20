@@ -1,14 +1,14 @@
-use std::{
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::Path, time::SystemTime};
 
+use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 use crate::{
     disk::{DeleteOptions, DiskAPI, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result},
+    global::GLOBAL_BackgroundHealState,
     heal::heal_ops::HEALING_TRACKER_FILENAME,
     new_object_layer_fn,
     store_api::{BucketInfo, StorageAPI},
@@ -37,7 +37,11 @@ pub const DRIVE_STATE_ROOT_MOUNT: &str = "root-mount";
 pub const DRIVE_STATE_UNKNOWN: &str = "unknown";
 pub const DRIVE_STATE_UNFORMATTED: &str = "unformatted"; // only returned by disk
 
-#[derive(Clone, Copy, Debug, Default)]
+lazy_static! {
+    pub static ref TIME_SENTINEL: OffsetDateTime = OffsetDateTime::from_unix_timestamp(0).unwrap();
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct HealOpts {
     pub recursive: bool,
     pub dry_run: bool,
@@ -50,7 +54,7 @@ pub struct HealOpts {
     pub set: Option<usize>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct HealDriveInfo {
     pub uuid: String,
     pub endpoint: String,
@@ -74,11 +78,21 @@ pub struct HealResultItem {
     pub object_size: usize,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealStartSuccess {
     pub client_token: String,
     pub client_address: String,
-    pub start_time: u64,
+    pub start_time: SystemTime,
+}
+
+impl Default for HealStartSuccess {
+    fn default() -> Self {
+        Self {
+            client_token: Default::default(),
+            client_address: Default::default(),
+            start_time: SystemTime::now(),
+        }
+    }
 }
 
 pub type HealStopSuccess = HealStartSuccess;
@@ -91,8 +105,8 @@ pub struct HealingDisk {
     pub disk_index: Option<usize>,
     pub endpoint: String,
     pub path: String,
-    pub started: u64,
-    pub last_update: u64,
+    pub started: Option<OffsetDateTime>,
+    pub last_update: Option<SystemTime>,
     pub retry_attempts: u64,
     pub objects_total_count: u64,
     pub objects_total_size: u64,
@@ -121,8 +135,8 @@ pub struct HealingTracker {
     pub disk_index: Option<usize>,
     pub path: String,
     pub endpoint: String,
-    pub started: u64,
-    pub last_update: u64,
+    pub started: Option<OffsetDateTime>,
+    pub last_update: Option<SystemTime>,
     pub objects_total_count: u64,
     pub objects_total_size: u64,
     pub items_healed: u64,
@@ -150,9 +164,7 @@ pub struct HealingTracker {
 
 impl HealingTracker {
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        serde_json::to_string(self)
-            .map(|s| s.as_bytes().to_vec())
-            .map_err(|err| Error::from_string(err.to_string()))
+        serde_json::to_vec(self).map_err(|err| Error::from_string(err.to_string()))
     }
 
     pub fn unmarshal_msg(data: &[u8]) -> Result<Self> {
@@ -177,7 +189,7 @@ impl HealingTracker {
         self.object = String::new();
     }
 
-    pub async fn get_last_update(&self) -> u64 {
+    pub async fn get_last_update(&self) -> Option<SystemTime> {
         let _ = self.mu.read().await;
 
         self.last_update
@@ -224,7 +236,7 @@ impl HealingTracker {
 
     pub async fn update(&mut self) -> Result<()> {
         if let Some(disk) = &self.disk {
-            if healing(&disk.path().to_string_lossy().to_string()).await?.is_none() {
+            if healing(disk.path().to_string_lossy().as_ref()).await?.is_none() {
                 return Err(Error::from_string(format!("healingTracker: drive {} is not marked as healing", self.id)));
             }
             let _ = self.mu.write().await;
@@ -252,14 +264,11 @@ impl HealingTracker {
             (self.pool_index, self.set_index, self.disk_index) = store.get_pool_and_set(&self.id).await?;
         }
 
-        self.last_update = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
+        self.last_update = Some(SystemTime::now());
 
         let htracker_bytes = self.marshal_msg()?;
 
-        // TODO: globalBackgroundHealState
+        GLOBAL_BackgroundHealState.write().await.update_heal_status(self).await;
 
         if let Some(disk) = &self.disk {
             let file_path = Path::new(BUCKET_META_PREFIX).join(HEALING_TRACKER_FILENAME);
@@ -270,7 +279,7 @@ impl HealingTracker {
         Ok(())
     }
 
-    async fn delete(&self) -> Result<()> {
+    pub async fn delete(&self) -> Result<()> {
         if let Some(disk) = &self.disk {
             let file_path = Path::new(BUCKET_META_PREFIX).join(HEALING_TRACKER_FILENAME);
             return disk
@@ -289,7 +298,7 @@ impl HealingTracker {
         Ok(())
     }
 
-    async fn is_healed(&self, bucket: &str) -> bool {
+    pub async fn is_healed(&self, bucket: &str) -> bool {
         let _ = self.mu.read().await;
         for v in self.healed_buckets.iter() {
             if v == bucket {
@@ -300,7 +309,7 @@ impl HealingTracker {
         false
     }
 
-    async fn resume(&mut self) {
+    pub async fn resume(&mut self) {
         let _ = self.mu.write().await;
 
         self.items_healed = self.resume_items_healed;
@@ -311,7 +320,7 @@ impl HealingTracker {
         self.bytes_skipped = self.resume_bytes_skipped;
     }
 
-    async fn bucket_done(&mut self, bucket: &str) {
+    pub async fn bucket_done(&mut self, bucket: &str) {
         let _ = self.mu.write().await;
 
         self.resume_items_healed = self.items_healed;
@@ -325,7 +334,7 @@ impl HealingTracker {
         self.queue_buckets.retain(|x| x != bucket);
     }
 
-    async fn set_queue_buckets(&mut self, buckets: &[BucketInfo]) {
+    pub async fn set_queue_buckets(&mut self, buckets: &[BucketInfo]) {
         let _ = self.mu.write().await;
 
         buckets.iter().for_each(|bucket| {
@@ -373,40 +382,40 @@ impl Clone for HealingTracker {
         Self {
             disk: self.disk.clone(),
             id: self.id.clone(),
-            pool_index: self.pool_index.clone(),
-            set_index: self.set_index.clone(),
-            disk_index: self.disk_index.clone(),
+            pool_index: self.pool_index,
+            set_index: self.set_index,
+            disk_index: self.disk_index,
             path: self.path.clone(),
             endpoint: self.endpoint.clone(),
-            started: self.started.clone(),
-            last_update: self.last_update.clone(),
-            objects_total_count: self.objects_total_count.clone(),
-            objects_total_size: self.objects_total_size.clone(),
-            items_healed: self.items_healed.clone(),
-            items_failed: self.items_failed.clone(),
-            item_skipped: self.item_skipped.clone(),
-            bytes_done: self.bytes_done.clone(),
-            bytes_failed: self.bytes_failed.clone(),
-            bytes_skipped: self.bytes_skipped.clone(),
+            started: self.started,
+            last_update: self.last_update,
+            objects_total_count: self.objects_total_count,
+            objects_total_size: self.objects_total_size,
+            items_healed: self.items_healed,
+            items_failed: self.items_failed,
+            item_skipped: self.item_skipped,
+            bytes_done: self.bytes_done,
+            bytes_failed: self.bytes_failed,
+            bytes_skipped: self.bytes_skipped,
             bucket: self.bucket.clone(),
             object: self.object.clone(),
-            resume_items_healed: self.resume_items_healed.clone(),
-            resume_items_failed: self.resume_items_failed.clone(),
-            resume_items_skipped: self.resume_items_skipped.clone(),
-            resume_bytes_done: self.resume_bytes_done.clone(),
-            resume_bytes_failed: self.resume_bytes_failed.clone(),
-            resume_bytes_skipped: self.resume_bytes_skipped.clone(),
+            resume_items_healed: self.resume_items_healed,
+            resume_items_failed: self.resume_items_failed,
+            resume_items_skipped: self.resume_items_skipped,
+            resume_bytes_done: self.resume_bytes_done,
+            resume_bytes_failed: self.resume_bytes_failed,
+            resume_bytes_skipped: self.resume_bytes_skipped,
             queue_buckets: self.queue_buckets.clone(),
             healed_buckets: self.healed_buckets.clone(),
             heal_id: self.heal_id.clone(),
-            retry_attempts: self.retry_attempts.clone(),
-            finished: self.finished.clone(),
+            retry_attempts: self.retry_attempts,
+            finished: self.finished,
             mu: RwLock::new(false),
         }
     }
 }
 
-async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTracker> {
+pub async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTracker> {
     if let Some(disk) = disk {
         let disk_id = disk.get_disk_id().await?;
         if let Some(disk_id) = disk_id {
@@ -430,23 +439,20 @@ async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTracker
     }
 }
 
-async fn init_healing_tracker(disk: DiskStore, heal_id: String) -> Result<HealingTracker> {
-    let mut healing_tracker = HealingTracker::default();
-    healing_tracker.id = disk.get_disk_id().await?.map_or("".to_string(), |id| id.to_string());
-    healing_tracker.heal_id = heal_id;
-    healing_tracker.path = disk.to_string();
-    healing_tracker.endpoint = disk.endpoint().to_string();
-    healing_tracker.started = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs();
+pub async fn init_healing_tracker(disk: DiskStore, heal_id: &str) -> Result<HealingTracker> {
     let disk_location = disk.get_disk_location();
-    healing_tracker.pool_index = disk_location.pool_idx;
-    healing_tracker.set_index = disk_location.set_idx;
-    healing_tracker.disk_index = disk_location.disk_idx;
-    healing_tracker.disk = Some(disk);
-
-    Ok(healing_tracker)
+    Ok(HealingTracker {
+        id: disk.get_disk_id().await?.map_or("".to_string(), |id| id.to_string()),
+        heal_id: heal_id.to_string(),
+        path: disk.to_string(),
+        endpoint: disk.endpoint().to_string(),
+        started: Some(OffsetDateTime::now_utc()),
+        pool_index: disk_location.pool_idx,
+        set_index: disk_location.set_idx,
+        disk_index: disk_location.disk_idx,
+        disk: Some(disk),
+        ..Default::default()
+    })
 }
 
 pub async fn healing(derive_path: &str) -> Result<Option<HealingTracker>> {

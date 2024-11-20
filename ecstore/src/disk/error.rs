@@ -106,6 +106,9 @@ pub enum DiskError {
 
     #[error("part missing or corrupt")]
     PartMissingOrCorrupt,
+
+    #[error("No healing is required")]
+    NoHealRequired,
 }
 
 impl DiskError {
@@ -210,6 +213,7 @@ pub fn clone_disk_err(e: &DiskError) -> Error {
         DiskError::MoreData => Error::new(DiskError::MoreData),
         DiskError::OutdatedXLMeta => Error::new(DiskError::OutdatedXLMeta),
         DiskError::PartMissingOrCorrupt => Error::new(DiskError::PartMissingOrCorrupt),
+        DiskError::NoHealRequired => Error::new(DiskError::NoHealRequired),
     }
 }
 
@@ -261,14 +265,7 @@ pub fn os_err_to_file_err(e: io::Error) -> Error {
 }
 
 pub fn is_err_file_not_found(err: &Error) -> bool {
-    if let Some(e) = err.downcast_ref::<DiskError>() {
-        match e {
-            DiskError::FileNotFound => true,
-            _ => false,
-        }
-    } else {
-        false
-    }
+    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileNotFound))
 }
 
 pub fn is_sys_err_no_space(e: &io::Error) -> bool {
@@ -422,18 +419,32 @@ pub fn convert_access_error(e: io::Error, per_err: DiskError) -> Error {
 }
 
 pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
-    for err in errs.iter() {
-        if let Some(err) = err {
-            if let Some(err) = err.downcast_ref::<DiskError>() {
-                match err {
-                    DiskError::FileNotFound | DiskError::VolumeNotFound | &DiskError::FileVersionNotFound => {
-                        continue;
-                    }
-                    _ => return false,
+    for err in errs.iter().flatten() {
+        if let Some(err) = err.downcast_ref::<DiskError>() {
+            match err {
+                DiskError::FileNotFound | DiskError::VolumeNotFound | &DiskError::FileVersionNotFound => {
+                    continue;
                 }
+                _ => return false,
             }
         }
     }
 
     !errs.is_empty()
+}
+
+pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
+    if errs.is_empty() {
+        return false;
+    }
+    let mut not_found_count = 0;
+    for err in errs.iter().flatten() {
+        match err.downcast_ref() {
+            Some(DiskError::VolumeNotFound) | Some(DiskError::DiskNotFound) => {
+                not_found_count += 1;
+            }
+            _ => {}
+        }
+    }
+    errs.len() == not_found_count
 }

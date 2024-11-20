@@ -427,7 +427,9 @@ checksum = "5b63caa9aa9397e2d9480a9b13673856c78d8ac123288526c37d7839f2a86990"
 name = "common"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "lazy_static",
+ "scopeguard",
  "tokio",
  "tonic",
  "tracing-error",
@@ -655,6 +657,7 @@ dependencies = [
  "url",
  "uuid",
  "winapi",
+ "workers",
  "xxhash-rust",
 ]
 
@@ -3206,6 +3209,14 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "workers"
+version = "0.0.1"
+dependencies = [
+ "common",
+ "tokio",
+]
 
 [[package]]
 name = "write16"

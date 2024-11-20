@@ -33,13 +33,13 @@ async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
     let response = client.lock(request).await?.into_inner();
     println!("request ended");
     if let Some(error_info) = response.error_info {
-        assert!(false, "can not get lock: {}", error_info);
+        panic!("can not get lock: {}", error_info);
     }
 
     let request = Request::new(GenerallyLockRequest { args });
     let response = client.un_lock(request).await?.into_inner();
     if let Some(error_info) = response.error_info {
-        assert!(false, "can not get un_lock: {}", error_info);
+        panic!("can not get un_lock: {}", error_info);
     }
 
     Ok(())
@@ -58,17 +58,16 @@ async fn test_lock_unlock_ns_lock() -> Result<(), Box<dyn Error>> {
         vec![locker],
     )
     .await;
-    assert_eq!(
-        ns.0.write()
-            .await
-            .get_lock(&Options {
-                timeout: Duration::from_secs(5),
-                retry_interval: Duration::from_secs(1),
-            })
-            .await
-            .unwrap(),
-        true
-    );
+    assert!(ns
+        .0
+        .write()
+        .await
+        .get_lock(&Options {
+            timeout: Duration::from_secs(5),
+            retry_interval: Duration::from_secs(1),
+        })
+        .await
+        .unwrap());
 
     ns.0.write().await.un_lock().await.unwrap();
     Ok(())

@@ -1,7 +1,7 @@
 pub mod endpoint;
 pub mod error;
 pub mod format;
-mod local;
+pub mod local;
 pub mod os;
 pub mod remote;
 
@@ -14,9 +14,13 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 const STORAGE_FORMAT_FILE: &str = "xl.meta";
 
 use crate::{
-    erasure::{ReadAt, Writer},
+    erasure::Writer,
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
+    heal::{
+        data_usage_cache::{DataUsageCache, DataUsageEntry},
+        heal_commands::{HealScanMode, HealingTracker},
+    },
     store_api::{FileInfo, RawFileInfo},
 };
 use endpoint::Endpoint;
@@ -35,7 +39,6 @@ use std::{
     io::{Cursor, SeekFrom},
     path::PathBuf,
     sync::Arc,
-    usize,
 };
 use time::OffsetDateTime;
 use tokio::{
@@ -53,8 +56,8 @@ pub type DiskStore = Arc<Disk>;
 
 #[derive(Debug)]
 pub enum Disk {
-    Local(LocalDisk),
-    Remote(RemoteDisk),
+    Local(Box<LocalDisk>),
+    Remote(Box<RemoteDisk>),
 }
 
 #[async_trait::async_trait]
@@ -338,15 +341,34 @@ impl DiskAPI for Disk {
             Disk::Remote(remote_disk) => remote_disk.disk_info(opts).await,
         }
     }
+
+    async fn ns_scanner(
+        &self,
+        cache: &DataUsageCache,
+        updates: Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        match self {
+            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode).await,
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode).await,
+        }
+    }
+
+    async fn healing(&self) -> Option<HealingTracker> {
+        match self {
+            Disk::Local(local_disk) => local_disk.healing().await,
+            Disk::Remote(remote_disk) => remote_disk.healing().await,
+        }
+    }
 }
 
 pub async fn new_disk(ep: &endpoint::Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     if ep.is_local {
         let s = local::LocalDisk::new(ep, opt.cleanup).await?;
-        Ok(Arc::new(Disk::Local(s)))
+        Ok(Arc::new(Disk::Local(Box::new(s))))
     } else {
         let remote_disk = remote::RemoteDisk::new(ep, opt).await?;
-        Ok(Arc::new(Disk::Remote(remote_disk)))
+        Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }
 
@@ -436,6 +458,13 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
+    async fn ns_scanner(
+        &self,
+        cache: &DataUsageCache,
+        updates: Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache>;
+    async fn healing(&self) -> Option<HealingTracker>;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -467,7 +496,7 @@ pub struct DiskInfoOptions {
     pub noop: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskInfo {
     pub total: u64,
     pub free: u64,
@@ -489,7 +518,7 @@ pub struct DiskInfo {
     pub error: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskMetrics {
     api_calls: HashMap<String, u64>,
     total_waiting: u32,
@@ -653,7 +682,7 @@ impl MetaCacheEntry {
         let mut fm = FileMeta::new();
         fm.unmarshal_msg(&self.metadata)?;
 
-        Ok(fm.into_file_info_versions(bucket, self.name.as_str(), false)?)
+        fm.into_file_info_versions(bucket, self.name.as_str(), false)
     }
 
     pub fn matches(&self, other: &MetaCacheEntry, strict: bool) -> Result<(Option<MetaCacheEntry>, bool)> {
@@ -812,7 +841,7 @@ impl MetaCacheEntries {
         selected = Some(MetaCacheEntry {
             name: selected.as_ref().unwrap().name.clone(),
             cached: Some(FileMeta {
-                meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver.clone(),
+                meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver,
                 ..Default::default()
             }),
             _reusable: true,
@@ -835,7 +864,7 @@ impl MetaCacheEntries {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DiskOption {
     pub cleanup: bool,
     pub health_check: bool,
@@ -1281,10 +1310,10 @@ impl Reader for RemoteFileReader {
             Err(Error::from_string(error_info))
         }
     }
-    async fn seek(&mut self, offset: usize) -> Result<()> {
+    async fn seek(&mut self, _offset: usize) -> Result<()> {
         unimplemented!()
     }
-    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize> {
+    async fn read_exact(&mut self, _buf: &mut [u8]) -> Result<usize> {
         unimplemented!()
     }
 }

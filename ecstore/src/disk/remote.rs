@@ -5,11 +5,13 @@ use protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
         CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-        ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequst, StatVolumeRequest,
-        UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
+        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, NsScannerRequest,
+        ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequst,
+        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
+use tokio::sync::mpsc::{self, Sender};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::Request;
 use tracing::info;
 use uuid::Uuid;
@@ -22,6 +24,10 @@ use super::{
 use crate::{
     disk::error::DiskError,
     error::{Error, Result},
+    heal::{
+        data_usage_cache::{DataUsageCache, DataUsageEntry},
+        heal_commands::{HealScanMode, HealingTracker},
+    },
     store_api::{FileInfo, RawFileInfo},
 };
 use protos::proto_gen::node_service::RenamePartRequst;
@@ -746,5 +752,49 @@ impl DiskAPI for RemoteDisk {
         let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
 
         Ok(disk_info)
+    }
+
+    async fn ns_scanner(
+        &self,
+        cache: &DataUsageCache,
+        updates: Sender<DataUsageEntry>,
+        scan_mode: HealScanMode,
+    ) -> Result<DataUsageCache> {
+        info!("ns_scanner");
+        let cache = serde_json::to_string(cache)?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+
+        let (tx, rx) = mpsc::channel(10);
+        let in_stream = ReceiverStream::new(rx);
+        let mut response = client.ns_scanner(in_stream).await?.into_inner();
+        let request = NsScannerRequest {
+            disk: self.root.to_string_lossy().to_string(),
+            cache,
+            scan_mode: scan_mode as u64,
+        };
+        tx.send(request).await?;
+
+        loop {
+            match response.next().await {
+                Some(Ok(resp)) => {
+                    if !resp.update.is_empty() {
+                        let data_usage_cache = serde_json::from_str::<DataUsageEntry>(&resp.update)?;
+                        let _ = updates.send(data_usage_cache).await;
+                    } else if !resp.data_usage_cache.is_empty() {
+                        let data_usage_cache = serde_json::from_str::<DataUsageCache>(&resp.data_usage_cache)?;
+                        return Ok(data_usage_cache);
+                    } else {
+                        return Err(Error::from_string("scan was interrupted"));
+                    }
+                }
+                _ => return Err(Error::from_string("scan was interrupted")),
+            }
+        }
+    }
+
+    async fn healing(&self) -> Option<HealingTracker> {
+        None
     }
 }

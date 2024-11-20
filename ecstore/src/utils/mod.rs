@@ -1,3 +1,4 @@
+pub mod bool_flag;
 pub mod crypto;
 pub mod ellipses;
 pub mod fs;
