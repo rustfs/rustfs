@@ -977,6 +977,7 @@ pub trait StorageAPI: ObjectIO {
     // CheckAbandonedParts
     // Health
     // PutObjectMetadata
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     // DecomTieredObject
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String>;
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
