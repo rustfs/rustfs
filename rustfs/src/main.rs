@@ -7,6 +7,7 @@ use clap::Parser;
 use common::error::{Error, Result};
 use ecstore::{
     endpoints::EndpointServerPools,
+    heal::data_scanner::init_data_scanner,
     set_global_endpoints,
     store::{init_local_disks, ECStore},
     update_erasure_type,
@@ -184,6 +185,8 @@ async fn run(opt: config::Opt) -> Result<()> {
         .map_err(|err| Error::from_string(err.to_string()))?;
 
     store.init().await.map_err(|err| Error::from_string(err.to_string()))?;
+    // init scanner
+    init_data_scanner().await;
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

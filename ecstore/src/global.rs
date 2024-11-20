@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::{
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
+    heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState},
     store::ECStore,
 };
 
@@ -24,6 +25,8 @@ lazy_static! {
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_Endpoints: RwLock<EndpointServerPools> = RwLock::new(EndpointServerPools(Vec::new()));
     pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
+    pub static ref GLOBAL_BackgroundHealRoutine: Arc<RwLock<HealRoutine>> = HealRoutine::new();
+    pub static ref GLOBAL_BackgroundHealState: Arc<RwLock<AllHealState>> = AllHealState::new(false);
     static ref globalDeploymentIDPtr: RwLock<Uuid> = RwLock::new(Uuid::nil());
 }
 
@@ -34,7 +37,7 @@ pub async fn set_global_deployment_id(id: Uuid) {
 pub async fn get_global_deployment_id() -> Uuid {
     let id_ptr = globalDeploymentIDPtr.read().await;
 
-    id_ptr.clone()
+    *id_ptr
 }
 
 pub async fn set_global_endpoints(eps: Vec<PoolEndpoints>) {

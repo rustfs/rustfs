@@ -9,7 +9,7 @@ pub mod erasure;
 pub mod error;
 mod file_meta;
 mod global;
-mod heal;
+pub mod heal;
 pub mod peer;
 mod quorum;
 pub mod set_disk;

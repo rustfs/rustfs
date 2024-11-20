@@ -40,6 +40,16 @@ pub fn object_op_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
     base
 }
 
+// bucket_op_ignored_errs
+pub fn bucket_op_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {
+    let mut base = base_ignored_errs();
+
+    let ext: Vec<Box<dyn CheckErrorFn>> = vec![Box::new(DiskError::DiskAccessDenied), Box::new(DiskError::UnformattedDisk)];
+
+    base.extend(ext);
+    base
+}
+
 // 用于检查错误是否被忽略的函数
 fn is_err_ignored(err: &Error, ignored_errs: &[Box<dyn CheckErrorFn>]) -> bool {
     ignored_errs.iter().any(|ignored_err| ignored_err.is(err))

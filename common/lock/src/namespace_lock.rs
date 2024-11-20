@@ -287,7 +287,7 @@ mod test {
                 })
                 .await?;
 
-        assert_eq!(result, true);
+        assert!(result);
         Ok(())
     }
 }

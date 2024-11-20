@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use tokio::{
     spawn,
@@ -14,6 +14,10 @@ use crate::{
     error::{Error, Result},
 };
 
+type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+type FinishedFn = Box<dyn Fn(&[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+
 #[derive(Default)]
 pub struct ListPathRawOptions {
     pub disks: Vec<Option<DiskStore>>,
@@ -26,9 +30,12 @@ pub struct ListPathRawOptions {
     pub min_disks: usize,
     pub report_not_found: bool,
     pub per_disk_limit: i32,
-    pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
-    pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
-    pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
+    pub agreed: Option<AgreedFn>,
+    pub partial: Option<PartialFn>,
+    pub finished: Option<FinishedFn>,
+    // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
+    // pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
+    // pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
 }
 
 impl Clone for ListPathRawOptions {
@@ -38,12 +45,12 @@ impl Clone for ListPathRawOptions {
             fallback_disks: self.fallback_disks.clone(),
             bucket: self.bucket.clone(),
             path: self.path.clone(),
-            recursice: self.recursice.clone(),
+            recursice: self.recursice,
             filter_prefix: self.filter_prefix.clone(),
             forward_to: self.forward_to.clone(),
-            min_disks: self.min_disks.clone(),
-            report_not_found: self.report_not_found.clone(),
-            per_disk_limit: self.per_disk_limit.clone(),
+            min_disks: self.min_disks,
+            report_not_found: self.report_not_found,
+            per_disk_limit: self.per_disk_limit,
             ..Default::default()
         }
     }
@@ -73,7 +80,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                     .walk_dir(WalkDirOptions {
                         bucket: opts_clone.bucket.clone(),
                         base_dir: opts_clone.path.clone(),
-                        recursive: opts_clone.recursice.clone(),
+                        recursive: opts_clone.recursice,
                         report_notfound: opts_clone.report_not_found,
                         filter_prefix: opts_clone.filter_prefix.clone(),
                         forward_to: opts_clone.forward_to.clone(),
@@ -185,8 +192,8 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         }
 
         if has_err > 0 && has_err > opts.disks.len() - opts.min_disks {
-            if let Some(finished_fn) = opts.finished.clone() {
-                finished_fn(&errs);
+            if let Some(finished_fn) = opts.finished.as_ref() {
+                finished_fn(&errs).await;
             }
             let mut combined_err = Vec::new();
             errs.iter().zip(opts.disks.iter()).for_each(|(err, disk)| match (err, disk) {
@@ -203,24 +210,22 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         }
 
         // Break if all at EOF or error.
-        if at_eof + has_err == readers.len() {
-            if has_err > 0 {
-                if let Some(finished_fn) = opts.finished.clone() {
-                    finished_fn(&errs);
-                }
-                break;
+        if at_eof + has_err == readers.len() && has_err > 0 {
+            if let Some(finished_fn) = opts.finished.as_ref() {
+                finished_fn(&errs).await;
             }
+            break;
         }
 
         if agree == readers.len() {
-            if let Some(agreed_fn) = opts.agreed.clone() {
-                agreed_fn(current);
+            if let Some(agreed_fn) = opts.agreed.as_ref() {
+                agreed_fn(current).await;
             }
             continue;
         }
 
-        if let Some(partial_fn) = opts.partial.clone() {
-            partial_fn(MetaCacheEntries(top_entries), &errs);
+        if let Some(partial_fn) = opts.partial.as_ref() {
+            partial_fn(MetaCacheEntries(top_entries), &errs).await;
         }
     }
 

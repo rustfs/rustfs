@@ -12,6 +12,16 @@ message PingResponse {
   bytes body = 2;
 }
 
+message HealBucketRequest {
+  string bucket = 1;
+  string options = 2;
+}
+
+message HealBucketResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
 message ListBucketRequest {
   string options = 1;
 }
@@ -382,6 +392,19 @@ message DiskInfoResponse {
   optional string error_info = 3;
 }
 
+message NsScannerRequest {
+  string disk = 1;
+  string cache = 2;
+  uint64 scan_mode = 3;
+}
+
+message NsScannerResponse {
+  bool success = 1;
+  string update = 2;
+  string data_usage_cache = 3;
+  optional string error_info = 4;
+}
+
 // lock api have same argument type
 message GenerallyLockRequest {
     string args = 1;
@@ -397,6 +420,7 @@ message GenerallyLockResponse {
 service NodeService {
 /* -------------------------------meta service-------------------------- */
   rpc Ping(PingRequest) returns (PingResponse) {};
+  rpc HealBucket(HealBucketRequest) returns (HealBucketResponse) {};
   rpc ListBucket(ListBucketRequest) returns (ListBucketResponse) {};
   rpc MakeBucket(MakeBucketRequest) returns (MakeBucketResponse) {};
   rpc GetBucketInfo(GetBucketInfoRequest) returns (GetBucketInfoResponse) {};
@@ -432,6 +456,7 @@ service NodeService {
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
   rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {};
+  rpc NsScanner(stream NsScannerRequest) returns (stream NsScannerResponse) {};
 
 /* -------------------------------lock service-------------------------- */
 

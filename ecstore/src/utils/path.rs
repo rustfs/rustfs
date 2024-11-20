@@ -69,6 +69,19 @@ pub fn path_join(elem: &[PathBuf]) -> PathBuf {
     joined_path
 }
 
+pub fn path_to_bucket_object_with_base_path(bash_path: &str, path: &str) -> (String, String) {
+    let path = path.trim_start_matches(bash_path).trim_start_matches(SLASH_SEPARATOR);
+    if let Some(m) = path.find(SLASH_SEPARATOR) {
+        return (path[..m].to_string(), path[m + SLASH_SEPARATOR.len()..].to_string());
+    }
+
+    (path.to_string(), "".to_string())
+}
+
+pub fn path_to_bucket_object(s: &str) -> (String, String) {
+    path_to_bucket_object_with_base_path("", s)
+}
+
 pub fn base_dir_from_prefix(prefix: &str) -> String {
     let mut base_dir = dir(prefix).to_owned();
     if base_dir == "." || base_dir == "./" || base_dir == "/" {

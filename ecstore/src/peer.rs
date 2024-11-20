@@ -1,14 +1,26 @@
 use async_trait::async_trait;
 use futures::future::join_all;
 use protos::node_service_time_out_client;
-use protos::proto_gen::node_service::{DeleteBucketRequest, GetBucketInfoRequest, ListBucketRequest, MakeBucketRequest};
+use protos::proto_gen::node_service::{
+    DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
+};
 use regex::Regex;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use tokio::sync::RwLock;
 use tonic::Request;
 use tracing::warn;
 
-use crate::disk::DiskAPI;
+use crate::disk::error::{is_all_buckets_not_found, is_all_not_found};
+use crate::disk::{DiskAPI, DiskStore};
+use crate::global::GLOBAL_LOCAL_DISK_MAP;
+use crate::heal::heal_commands::{
+    HealDriveInfo, HealOpts, HealResultItem, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK,
+    HEAL_ITEM_BUCKET,
+};
+use crate::heal::heal_ops::RUESTFS_RESERVED_BUCKET;
+use crate::quorum::{bucket_op_ignored_errs, reduce_write_quorum_errs};
 use crate::store::all_local_disk;
+use crate::utils::wildcard::is_rustfs_meta_bucket_name;
 use crate::{
     disk::{self, error::DiskError, VolumeInfo},
     endpoints::{EndpointServerPools, Node},
@@ -20,6 +32,7 @@ type Client = Arc<Box<dyn PeerS3Client>>;
 
 #[async_trait]
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
@@ -61,6 +74,79 @@ impl S3PeerSys {
 }
 
 impl S3PeerSys {
+    pub async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        let mut opts = *opts;
+        let mut futures = Vec::with_capacity(self.clients.len());
+        for client in self.clients.iter() {
+            // client_clon
+            futures.push(async move {
+                match client.get_bucket_info(bucket, &BucketOptions::default()).await {
+                    Ok(_) => None,
+                    Err(err) => Some(err),
+                }
+            });
+        }
+        let errs = join_all(futures).await;
+
+        let mut pool_errs = Vec::new();
+        for pool_idx in 0..self.pools_count {
+            let mut per_pool_errs = Vec::new();
+            for (i, client) in self.clients.iter().enumerate() {
+                if let Some(v) = client.get_pools() {
+                    if v.contains(&pool_idx) {
+                        per_pool_errs.push(errs[i].clone());
+                    }
+                }
+            }
+            let qu = per_pool_errs.len() / 2;
+            pool_errs.push(reduce_write_quorum_errs(&per_pool_errs, &bucket_op_ignored_errs(), qu));
+        }
+
+        if !opts.recreate {
+            opts.remove = is_all_not_found(&pool_errs);
+            opts.recursive = !opts.remove;
+        }
+
+        let mut futures = Vec::new();
+        let heal_bucket_results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.clients.len()]));
+        for (idx, client) in self.clients.iter().enumerate() {
+            let opts_clone = opts;
+            let heal_bucket_results_clone = heal_bucket_results.clone();
+            futures.push(async move {
+                match client.heal_bucket(bucket, &opts_clone).await {
+                    Ok(res) => {
+                        heal_bucket_results_clone.write().await[idx] = res;
+                        None
+                    }
+                    Err(err) => Some(err),
+                }
+            });
+        }
+        let errs = join_all(futures).await;
+
+        for pool_idx in 0..self.pools_count {
+            let mut per_pool_errs = Vec::new();
+            for (i, client) in self.clients.iter().enumerate() {
+                if let Some(v) = client.get_pools() {
+                    if v.contains(&pool_idx) {
+                        per_pool_errs.push(errs[i].clone());
+                    }
+                }
+            }
+            let qu = per_pool_errs.len() / 2;
+            if let Some(pool_err) = reduce_write_quorum_errs(&per_pool_errs, &bucket_op_ignored_errs(), qu) {
+                return Err(pool_err);
+            }
+        }
+
+        for (i, err) in errs.iter().enumerate() {
+            if err.is_none() {
+                return Ok(heal_bucket_results.read().await[i].clone());
+            }
+        }
+        Err(DiskError::VolumeNotFound.into())
+    }
+
     pub async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
@@ -236,6 +322,11 @@ impl PeerS3Client for LocalPeerS3Client {
     fn get_pools(&self) -> Option<Vec<usize>> {
         self.pools.clone()
     }
+
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        heal_bucket_local(bucket, opts).await
+    }
+
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         let local_disks = all_local_disk().await;
 
@@ -420,6 +511,29 @@ impl PeerS3Client for RemotePeerS3Client {
     fn get_pools(&self) -> Option<Vec<usize>> {
         self.pools.clone()
     }
+
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        let options: String = serde_json::to_string(opts)?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(HealBucketRequest {
+            bucket: bucket.to_string(),
+            options,
+        });
+        let response = client.heal_bucket(request).await?.into_inner();
+        if !response.success {
+            return Err(Error::from_string(response.error_info.unwrap_or_default()));
+        }
+
+        Ok(HealResultItem {
+            heal_item_type: HEAL_ITEM_BUCKET.to_string(),
+            bucket: bucket.to_string(),
+            set_count: 0,
+            ..Default::default()
+        })
+    }
+
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         let options = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(&self.addr)
@@ -528,7 +642,7 @@ fn is_reserved_bucket(bucket_name: &str) -> bool {
 }
 
 // 检查桶名是否为保留名或无效名
-fn is_reserved_or_invalid_bucket(bucket_entry: &str, strict: bool) -> bool {
+pub fn is_reserved_or_invalid_bucket(bucket_entry: &str, strict: bool) -> bool {
     if bucket_entry.is_empty() {
         return true;
     }
@@ -537,4 +651,135 @@ fn is_reserved_or_invalid_bucket(bucket_entry: &str, strict: bool) -> bool {
     let result = check_bucket_name(bucket_entry, strict).is_err();
 
     result || is_meta_bucket(bucket_entry) || is_reserved_bucket(bucket_entry)
+}
+
+pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+    let disks = clone_drives().await;
+    let before_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
+    let after_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
+
+    let mut futures = Vec::new();
+    for (index, disk) in disks.iter().enumerate() {
+        let disk = disk.clone();
+        let bucket = bucket.to_string();
+        let bs_clone = before_state.clone();
+        let as_clone = after_state.clone();
+        futures.push(async move {
+            let disk = match disk {
+                Some(disk) => disk,
+                None => {
+                    bs_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
+                    as_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
+                    return Some(Error::new(DiskError::DiskNotFound));
+                }
+            };
+            bs_clone.write().await[index] = DRIVE_STATE_OK.to_string();
+            as_clone.write().await[index] = DRIVE_STATE_OK.to_string();
+
+            if bucket == RUESTFS_RESERVED_BUCKET {
+                return None;
+            }
+
+            match disk.stat_volume(&bucket).await {
+                Ok(_) => None,
+                Err(err) => match err.downcast_ref() {
+                    Some(DiskError::DiskNotFound) => {
+                        bs_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
+                        as_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
+                        Some(err)
+                    }
+                    Some(DiskError::VolumeNotFound) => {
+                        bs_clone.write().await[index] = DRIVE_STATE_MISSING.to_string();
+                        as_clone.write().await[index] = DRIVE_STATE_MISSING.to_string();
+                        Some(err)
+                    }
+                    _ => {
+                        bs_clone.write().await[index] = DRIVE_STATE_CORRUPT.to_string();
+                        as_clone.write().await[index] = DRIVE_STATE_CORRUPT.to_string();
+                        Some(err)
+                    }
+                },
+            }
+        });
+    }
+    let errs = join_all(futures).await;
+    let mut res = HealResultItem {
+        heal_item_type: HEAL_ITEM_BUCKET.to_string(),
+        bucket: bucket.to_string(),
+        disk_count: disks.len(),
+        set_count: 0,
+        ..Default::default()
+    };
+
+    if opts.dry_run {
+        return Ok(res);
+    }
+
+    for (disk, state) in disks.iter().zip(before_state.read().await.iter()) {
+        res.before.push(HealDriveInfo {
+            uuid: "".to_string(),
+            endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
+            state: state.to_string(),
+        });
+    }
+
+    if !is_rustfs_meta_bucket_name(bucket) && !is_all_buckets_not_found(&errs) && opts.remove {
+        let mut futures = Vec::new();
+        for disk in disks.iter() {
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            futures.push(async move {
+                match disk {
+                    Some(disk) => {
+                        let _ = disk.delete_volume(&bucket).await;
+                        None
+                    }
+                    None => Some(Error::new(DiskError::DiskNotFound)),
+                }
+            });
+        }
+
+        let _ = join_all(futures).await;
+    }
+
+    if !opts.remove {
+        let mut futures = Vec::new();
+        for (idx, disk) in disks.iter().enumerate() {
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            let bs_clone = before_state.clone();
+            let as_clone = after_state.clone();
+            let errs_clone = errs.clone();
+            futures.push(async move {
+                if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
+                    match disk.as_ref().unwrap().make_volume(&bucket).await {
+                        Ok(_) => {
+                            as_clone.write().await[idx] = DRIVE_STATE_OK.to_string();
+                            return None;
+                        }
+                        Err(err) => {
+                            return Some(err);
+                        }
+                    }
+                }
+                errs_clone[idx].clone()
+            });
+        }
+
+        let _ = join_all(futures).await;
+    }
+
+    for (disk, state) in disks.iter().zip(after_state.read().await.iter()) {
+        res.before.push(HealDriveInfo {
+            uuid: "".to_string(),
+            endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
+            state: state.to_string(),
+        });
+    }
+
+    Ok(res)
+}
+
+async fn clone_drives() -> Vec<Option<DiskStore>> {
+    GLOBAL_LOCAL_DISK_MAP.read().await.values().cloned().collect::<Vec<_>>()
 }

@@ -10,7 +10,7 @@ use s3s::auth::Credentials;
 use s3s::{dto::*, s3_error, S3Request, S3Result};
 use uuid::Uuid;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 struct ReqInfo {
     pub card: Option<Credentials>,
     pub action: Option<Action>,
@@ -51,7 +51,7 @@ impl S3Access for FS {
 
         let req_info = ReqInfo {
             card: cx.credentials().cloned(),
-            action: action,
+            action,
             ..Default::default()
         };
 

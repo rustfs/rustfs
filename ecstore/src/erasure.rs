@@ -19,6 +19,7 @@ use uuid::Uuid;
 // use crate::chunk_stream::ChunkedStream;
 use crate::disk::error::DiskError;
 
+#[derive(Default)]
 pub struct Erasure {
     data_shards: usize,
     parity_shards: usize,
@@ -416,6 +417,54 @@ impl Erasure {
         }
 
         till_offset
+    }
+
+    pub async fn heal(
+        &self,
+        writers: &mut [Option<BitrotWriter>],
+        readers: Vec<Option<BitrotReader>>,
+        total_length: usize,
+        _prefer: &[bool],
+    ) -> Result<()> {
+        if writers.len() != self.parity_shards + self.data_shards {
+            return Err(Error::from_string("invalid argument"));
+        }
+        let mut reader = ShardReader::new(readers, self, 0, total_length);
+
+        let start_block = 0;
+        let mut end_block = total_length / self.block_size;
+        if total_length % self.block_size != 0 {
+            end_block += 1;
+        }
+
+        let mut errs = Vec::new();
+        for _ in start_block..=end_block {
+            let mut bufs = reader.read().await?;
+
+            if self.parity_shards > 0 {
+                self.encoder.as_ref().unwrap().reconstruct(&mut bufs)?;
+            }
+
+            let shards = bufs.into_iter().flatten().collect::<Vec<_>>();
+            if shards.len() != self.parity_shards + self.data_shards {
+                return Err(Error::from_string("can not reconstruct data"));
+            }
+
+            for (i, w) in writers.iter_mut().enumerate() {
+                if w.is_none() {
+                    continue;
+                }
+                match w.as_mut().unwrap().write(shards[i].as_ref()).await {
+                    Ok(_) => {}
+                    Err(e) => errs.push(e),
+                }
+            }
+        }
+        if !errs.is_empty() {
+            return Err(errs[0].clone());
+        }
+
+        Ok(())
     }
 }
 
