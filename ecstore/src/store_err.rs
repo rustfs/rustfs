@@ -9,6 +9,9 @@ pub enum StorageError {
     #[error("Invalid arguments provided for {0}/{1}-{2}")]
     InvalidArgument(String, String, String),
 
+    #[error("method not allowed")]
+    MethodNotAllowed,
+
     #[error("Bucket not found: {0}")]
     BucketNotFound(String),
 
