@@ -357,9 +357,9 @@ impl HealSequence {
                         );
                     }
                 }
-                return self.push_heal_result_item(&res.result).await;
+                self.push_heal_result_item(&res.result).await
             }
-            None => return Ok(()),
+            None => Ok(()),
         }
     }
 

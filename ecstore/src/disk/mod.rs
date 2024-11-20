@@ -56,8 +56,8 @@ pub type DiskStore = Arc<Disk>;
 
 #[derive(Debug)]
 pub enum Disk {
-    Local(LocalDisk),
-    Remote(RemoteDisk),
+    Local(Box<LocalDisk>),
+    Remote(Box<RemoteDisk>),
 }
 
 #[async_trait::async_trait]
@@ -365,10 +365,10 @@ impl DiskAPI for Disk {
 pub async fn new_disk(ep: &endpoint::Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     if ep.is_local {
         let s = local::LocalDisk::new(ep, opt.cleanup).await?;
-        Ok(Arc::new(Disk::Local(s)))
+        Ok(Arc::new(Disk::Local(Box::new(s))))
     } else {
         let remote_disk = remote::RemoteDisk::new(ep, opt).await?;
-        Ok(Arc::new(Disk::Remote(remote_disk)))
+        Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }
 
