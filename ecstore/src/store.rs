@@ -1381,6 +1381,21 @@ impl StorageAPI for ECStore {
 
         Ok(oi.user_tags)
     }
+
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        let object = encode_dir_object(object);
+        if self.single_pool() {
+            return self.pools[0].put_object_metadata(bucket, object.as_str(), opts).await;
+        }
+
+        let mut opts = opts.clone();
+        opts.metadata_chg = true;
+
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), &opts).await?;
+
+        self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let object = encode_dir_object(object);
