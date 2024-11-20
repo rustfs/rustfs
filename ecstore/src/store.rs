@@ -18,7 +18,8 @@ use crate::new_object_layer_fn;
 use crate::pools::PoolMeta;
 use crate::store_api::{BackendByte, BackendDisks, BackendInfo, ListMultipartsInfo, ObjectIO, StorageInfo};
 use crate::store_err::{
-    is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found, StorageError,
+    is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum, is_err_version_not_found,
+    to_object_err, StorageError,
 };
 use crate::store_init::ec_drives_no_config;
 use crate::utils::crypto::base64_decode;
@@ -57,7 +58,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::interval;
 use tokio::{fs, select};
 use tracing::{debug, info};
@@ -494,8 +495,123 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
-    ) -> Result<(PoolObjInfo, Vec<Error>)> {
-        internal_get_pool_info_existing_with_opts(&self.pools, bucket, object, opts).await
+    ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
+        self.internal_get_pool_info_existing_with_opts(bucket, object, opts).await
+    }
+
+    async fn internal_get_pool_info_existing_with_opts(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
+        let mut futures = Vec::new();
+
+        for pool in self.pools.iter() {
+            futures.push(pool.get_object_info(bucket, object, opts));
+        }
+
+        let results = join_all(futures).await;
+
+        let mut ress = Vec::new();
+
+        // join_all结果跟输入顺序一致
+        for (i, res) in results.into_iter().enumerate() {
+            let index = i;
+
+            match res {
+                Ok(r) => {
+                    ress.push(PoolObjInfo {
+                        index,
+                        object_info: r,
+                        err: None,
+                    });
+                }
+                Err(e) => {
+                    ress.push(PoolObjInfo {
+                        index,
+                        err: Some(e),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        ress.sort_by(|a, b| {
+            let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+
+            at.cmp(&bt)
+        });
+
+        let mut def_pool = PoolObjInfo::default();
+        let mut has_def_pool = false;
+
+        for pinfo in ress.iter() {
+            if opts.skip_decommissioned && self.pool_meta.is_suspended(pinfo.index) {
+                continue;
+            }
+
+            // TODO:SkipRebalancing
+            // if opts.SkipRebalancing && z.IsPoolRebalancing(pinfo.Index) {
+            //     continue
+            // }
+
+            if pinfo.err.is_none() {
+                return Ok((pinfo.clone(), self.pools_with_object(&ress, opts)));
+            }
+
+            let err = pinfo.err.as_ref().unwrap();
+
+            if is_err_read_quorum(err) && !opts.metadata_chg {
+                return Ok((pinfo.clone(), self.pools_with_object(&ress, opts)));
+            }
+
+            def_pool = pinfo.clone();
+            has_def_pool = true;
+
+            if !is_err_object_not_found(err) && !is_err_version_not_found(err) {
+                return Err(err.clone());
+            }
+
+            if pinfo.object_info.delete_marker && !pinfo.object_info.name.is_empty() {
+                return Ok((pinfo.clone(), Vec::new()));
+            }
+        }
+
+        if opts.replication_request && opts.delete_marker && has_def_pool {
+            return Ok((def_pool, Vec::new()));
+        }
+
+        Err(to_object_err(Error::new(DiskError::FileNotFound), vec![bucket, object]))
+    }
+
+    fn pools_with_object(&self, pools: &Vec<PoolObjInfo>, opts: &ObjectOptions) -> Vec<PoolErr> {
+        let mut errs = Vec::new();
+        for pool in pools.iter() {
+            if opts.skip_decommissioned && self.pool_meta.is_suspended(pool.index) {
+                continue;
+            }
+            // TODO:SkipRebalancing
+            // if opts.SkipRebalancing && z.IsPoolRebalancing(pinfo.Index) {
+            //     continue
+            // }
+
+            if let Some(err) = &pool.err {
+                if is_err_read_quorum(err) {
+                    errs.push(PoolErr {
+                        index: Some(pool.index),
+                        err: Some(Error::new(StorageError::InsufficientReadQuorum)),
+                    });
+                }
+            } else {
+                errs.push(PoolErr {
+                    index: Some(pool.index),
+                    err: None,
+                });
+            }
+        }
+        errs
     }
 
     pub async fn ns_scanner(
@@ -685,6 +801,47 @@ impl ECStore {
             )))
         }
     }
+
+    async fn delete_object_from_all_pools(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        errs: Vec<PoolErr>,
+    ) -> Result<ObjectInfo> {
+        let mut objs = Vec::new();
+        let mut derrs = Vec::new();
+
+        for pe in errs.iter() {
+            if let Some(err) = &pe.err {
+                if is_err_read_quorum(err) {
+                    objs.push(None);
+                    derrs.push(Some(Error::new(StorageError::InsufficientWriteQuorum)));
+                    continue;
+                }
+            }
+
+            if let Some(idx) = pe.index {
+                match self.pools[idx].delete_object(bucket, object, opts.clone()).await {
+                    Ok(res) => {
+                        objs.push(Some(res));
+
+                        derrs.push(None);
+                    }
+                    Err(err) => {
+                        objs.push(None);
+                        derrs.push(Some(err));
+                    }
+                }
+            }
+        }
+
+        if derrs[0].is_some() {
+            return Err(derrs[0].as_ref().unwrap().clone());
+        }
+
+        Ok(objs[0].as_ref().unwrap().clone())
+    }
 }
 
 async fn update_scan(
@@ -794,65 +951,13 @@ pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()>
     Ok(())
 }
 
-async fn internal_get_pool_info_existing_with_opts(
-    pools: &[Arc<Sets>],
-    bucket: &str,
-    object: &str,
-    opts: &ObjectOptions,
-) -> Result<(PoolObjInfo, Vec<Error>)> {
-    let mut futures = Vec::new();
-
-    for pool in pools.iter() {
-        futures.push(pool.get_object_info(bucket, object, opts));
-    }
-
-    let results = join_all(futures).await;
-
-    let mut ress = Vec::new();
-
-    // join_all结果跟输入顺序一致
-    for (i, res) in results.into_iter().enumerate() {
-        let index = i;
-
-        match res {
-            Ok(r) => {
-                ress.push(PoolObjInfo {
-                    index,
-                    object_info: r,
-                    err: None,
-                });
-            }
-            Err(e) => {
-                ress.push(PoolObjInfo {
-                    index,
-                    err: Some(e),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
-    ress.sort_by(|a, b| {
-        let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-
-        at.cmp(&bt)
-    });
-
-    for res in ress {
-        // check
-        if res.err.is_none() {
-            // TODO: let errs = self.poolsWithObject()
-            return Ok((res, Vec::new()));
-        }
-    }
-
-    let ret = PoolObjInfo::default();
-
-    Ok((ret, Vec::new()))
+#[derive(Debug, Default)]
+struct PoolErr {
+    index: Option<usize>,
+    err: Option<Error>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PoolObjInfo {
     pub index: usize,
     pub object_info: ObjectInfo,
@@ -897,6 +1002,8 @@ impl ObjectIO for ECStore {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        check_get_obj_args(bucket, object)?;
+
         let object = utils::path::encode_dir_object(object);
 
         if self.single_pool() {
@@ -909,6 +1016,7 @@ impl ObjectIO for ECStore {
 
         opts.no_lock = true;
 
+        // TODO: check if DeleteMarker
         let (_oi, idx) = self.get_latest_object_info_with_idx(bucket, &object, &opts).await?;
 
         self.pools[idx]
@@ -996,6 +1104,7 @@ impl StorageAPI for ECStore {
         }
     }
     async fn storage_info(&self) -> StorageInfo {
+        // FIXME: globalNotificationSys.StorageInfo
         unimplemented!()
     }
     async fn local_storage_info(&self) -> StorageInfo {
@@ -1045,11 +1154,14 @@ impl StorageAPI for ECStore {
 
         let mut opts = opts.clone();
         if !opts.force {
-            // TODO: check bucket exists
+            // FIXME: check bucket exists
             opts.force = true
         }
 
-        self.peer_sys.delete_bucket(bucket, &opts).await?;
+        self.peer_sys
+            .delete_bucket(bucket, &opts)
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket]))?;
 
         // TODO: replication opts.srdelete_op
 
@@ -1097,14 +1209,18 @@ impl StorageAPI for ECStore {
             meta.versioning_config_xml = xml::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
-        meta.save(self).await?;
+        meta.save(self).await.map_err(|e| to_object_err(e, vec![bucket]))?;
 
         set_bucket_metadata(bucket.to_string(), meta).await;
 
         Ok(())
     }
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
+        let mut info = self
+            .peer_sys
+            .get_bucket_info(bucket, opts)
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket]))?;
 
         if let Ok(sys) = metadata_sys::get(bucket).await {
             info.created = Some(sys.created);
@@ -1142,32 +1258,52 @@ impl StorageAPI for ECStore {
 
         // TODO: nslock
 
-        let mut jhs = Vec::new();
-        let semaphore = Arc::new(Semaphore::new(num_cpus::get()));
-        let pools = Arc::new(self.pools.clone());
+        let mut futures = Vec::with_capacity(objects.len());
 
         for obj in objects.iter() {
-            let (semaphore, pools, bucket, object_name, opt) = (
-                semaphore.clone(),
-                pools.clone(),
-                bucket.to_string(),
-                obj.object_name.to_string(),
-                ObjectOptions::default(),
-            );
-
-            let jh = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
-                internal_get_pool_info_existing_with_opts(pools.as_ref(), &bucket, &object_name, &opt).await
+            futures.push(async move {
+                self.internal_get_pool_info_existing_with_opts(
+                    &bucket,
+                    &obj.object_name,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
             });
-            jhs.push(jh);
         }
-        let mut results = Vec::new();
-        for jh in jhs {
-            results.push(jh.await.unwrap());
-        }
+
+        let results = join_all(futures).await;
+
+        // let mut jhs = Vec::new();
+        // let semaphore = Arc::new(Semaphore::new(num_cpus::get()));
+        // let pools = Arc::new(self.pools.clone());
+
+        // for obj in objects.iter() {
+        //     let (semaphore, pools, bucket, object_name, opt) = (
+        //         semaphore.clone(),
+        //         pools.clone(),
+        //         bucket.to_string(),
+        //         obj.object_name.to_string(),
+        //         ObjectOptions::default(),
+        //     );
+
+        //     let jh = tokio::spawn(async move {
+        //         let _permit = semaphore.acquire().await.unwrap();
+        //         self.internal_get_pool_info_existing_with_opts(pools.as_ref(), &bucket, &object_name, &opt)
+        //             .await
+        //     });
+        //     jhs.push(jh);
+        // }
+        // let mut results = Vec::new();
+        // for jh in jhs {
+        //     results.push(jh.await.unwrap());
+        // }
 
         // 记录pool Index 对应的objects pool_idx -> objects idx
-        let mut pool_index_objects = HashMap::new();
+        let mut pool_obj_idx_map = HashMap::new();
+        let mut orig_index_map = HashMap::new();
 
         for (i, res) in results.into_iter().enumerate() {
             match res {
@@ -1182,83 +1318,144 @@ impl StorageAPI for ECStore {
                         };
                     }
 
-                    if !pool_index_objects.contains_key(&pinfo.index) {
-                        pool_index_objects.insert(pinfo.index, vec![i]);
-                    } else {
-                        // let mut vals = pool_index_objects.
-                        if let Some(val) = pool_index_objects.get_mut(&pinfo.index) {
-                            val.push(i);
+                    if let Some(obj) = objects.get(i) {
+                        if !pool_obj_idx_map.contains_key(&pinfo.index) {
+                            pool_obj_idx_map.insert(pinfo.index, vec![obj.clone()]);
+                        } else {
+                            if let Some(val) = pool_obj_idx_map.get_mut(&pinfo.index) {
+                                val.push(obj.clone());
+                            }
+                        }
+
+                        if !orig_index_map.contains_key(&pinfo.index) {
+                            orig_index_map.insert(pinfo.index, vec![i]);
+                        } else {
+                            if let Some(val) = orig_index_map.get_mut(&pinfo.index) {
+                                val.push(i);
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    //TODO: check not found
+                    if !is_err_object_not_found(&e) && is_err_version_not_found(&e) {
+                        del_errs[i] = Some(e)
+                    }
 
-                    del_errs[i] = Some(e)
+                    if let Some(obj) = objects.get(i) {
+                        del_objects[i] = DeletedObject {
+                            object_name: utils::path::decode_dir_object(&obj.object_name),
+                            version_id: obj.version_id.map(|v| v.to_string()),
+                            ..Default::default()
+                        }
+                    }
                 }
             }
         }
 
-        if !pool_index_objects.is_empty() {
-            for sets in self.pools.iter() {
+        if !pool_obj_idx_map.is_empty() {
+            for (i, sets) in self.pools.iter().enumerate() {
                 //  取pool idx 对应的 objects index
-                let vals = pool_index_objects.get(&sets.pool_idx);
-                if vals.is_none() {
-                    continue;
-                }
+                if let Some(objs) = pool_obj_idx_map.get(&i) {
+                    //  取对应obj,理论上不会none
+                    // let objs: Vec<ObjectToDelete> = obj_idxs.iter().filter_map(|&idx| objects.get(idx).cloned()).collect();
 
-                let obj_idxs = vals.unwrap();
-                //  取对应obj,理论上不会none
-                let objs: Vec<ObjectToDelete> = obj_idxs.iter().filter_map(|&idx| objects.get(idx).cloned()).collect();
-
-                if objs.is_empty() {
-                    continue;
-                }
-
-                let (pdel_objs, perrs) = sets.delete_objects(bucket, objs, opts.clone()).await?;
-
-                // perrs的顺序理论上跟obj_idxs顺序一致
-                for (i, err) in perrs.into_iter().enumerate() {
-                    let obj_idx = obj_idxs[i];
-
-                    if err.is_some() {
-                        del_errs[obj_idx] = err;
+                    if objs.is_empty() {
+                        continue;
                     }
 
-                    let mut dobj = pdel_objs.get(i).unwrap().clone();
-                    dobj.object_name = utils::path::decode_dir_object(&dobj.object_name);
+                    let (pdel_objs, perrs) = sets.delete_objects(bucket, objs.clone(), opts.clone()).await?;
 
-                    del_objects[obj_idx] = dobj;
+                    // 同时存入不可能为none
+                    let org_indexes = orig_index_map.get(&i).unwrap();
+
+                    // perrs的顺序理论上跟obj_idxs顺序一致
+                    for (i, err) in perrs.into_iter().enumerate() {
+                        let obj_idx = org_indexes[i];
+
+                        if err.is_some() {
+                            del_errs[obj_idx] = err;
+                        }
+
+                        let mut dobj = pdel_objs.get(i).unwrap().clone();
+                        dobj.object_name = utils::path::decode_dir_object(&dobj.object_name);
+
+                        del_objects[obj_idx] = dobj;
+                    }
                 }
             }
         }
 
         Ok((del_objects, del_errs))
     }
+
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        check_del_obj_args(bucket, object)?;
+
         if opts.delete_prefix {
             self.delete_prefix(bucket, object).await?;
             return Ok(ObjectInfo::default());
         }
 
+        // TODO: nslock
+
         let object = utils::path::encode_dir_object(object);
         let object = object.as_str();
 
         // 查询在哪个pool
-        let (mut pinfo, errs) = self.get_pool_info_existing_with_opts(bucket, object, &opts).await?;
+        let (mut pinfo, errs) = self
+            .get_pool_info_existing_with_opts(bucket, object, &opts)
+            .await
+            .map_err(|e| {
+                if is_err_read_quorum(&e) {
+                    Error::new(StorageError::InsufficientWriteQuorum)
+                } else {
+                    e
+                }
+            })?;
+
         if pinfo.object_info.delete_marker && opts.version_id.is_none() {
             pinfo.object_info.name = utils::path::decode_dir_object(object);
             return Ok(pinfo.object_info);
         }
 
-        if !errs.is_empty() {
-            // TODO: deleteObjectFromAllPools
+        if opts.data_movement && opts.src_pool_idx == pinfo.index {
+            return Err(Error::new(StorageError::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                opts.version_id.unwrap_or_default(),
+            )));
         }
 
-        let mut obj = self.pools[pinfo.index].delete_object(bucket, object, opts.clone()).await?;
-        obj.name = utils::path::decode_dir_object(object);
+        if opts.data_movement {
+            let mut obj = self.pools[pinfo.index].delete_object(bucket, object, opts).await?;
+            obj.name = decode_dir_object(obj.name.as_str());
+            return Ok(obj);
+        }
 
-        Ok(obj)
+        if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
+            return self.delete_object_from_all_pools(bucket, object, &opts, errs).await;
+        }
+
+        for pool in self.pools.iter() {
+            match pool.delete_object(bucket, object, opts.clone()).await {
+                Ok(res) => {
+                    let mut obj = res;
+                    obj.name = utils::path::decode_dir_object(object);
+                    return Ok(obj);
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(ver) = opts.version_id {
+            return Err(Error::new(StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), ver)));
+        }
+
+        Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
     }
 
     // TODO: review
@@ -1320,6 +1517,21 @@ impl StorageAPI for ECStore {
 
         Ok(oi.user_tags)
     }
+
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        let object = encode_dir_object(object);
+        if self.single_pool() {
+            return self.pools[0].put_object_metadata(bucket, object.as_str(), opts).await;
+        }
+
+        let mut opts = opts.clone();
+        opts.metadata_chg = true;
+
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), &opts).await?;
+
+        self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let object = encode_dir_object(object);
@@ -1877,18 +2089,18 @@ fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<
 }
 
 fn _check_copy_obj_args(bucket: &str, object: &str) -> Result<()> {
-    _check_bucket_and_object_names(bucket, object)
+    check_bucket_and_object_names(bucket, object)
 }
 
-fn _check_get_obj_args(bucket: &str, object: &str) -> Result<()> {
-    _check_bucket_and_object_names(bucket, object)
+fn check_get_obj_args(bucket: &str, object: &str) -> Result<()> {
+    check_bucket_and_object_names(bucket, object)
 }
 
-fn _check_del_obj_args(bucket: &str, object: &str) -> Result<()> {
-    _check_bucket_and_object_names(bucket, object)
+fn check_del_obj_args(bucket: &str, object: &str) -> Result<()> {
+    check_bucket_and_object_names(bucket, object)
 }
 
-fn _check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
+fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
         return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
     }

@@ -303,7 +303,7 @@ pub fn ec_drives_no_config(set_drive_count: usize) -> Result<usize> {
     Ok(sc.get_parity_for_sc(storageclass::STANDARD).unwrap_or_default())
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum ErasureError {
     #[error("erasure read quorum")]
     ErasureReadQuorum,
@@ -319,4 +319,14 @@ pub enum ErasureError {
 
     #[error("invalid part id {0}")]
     InvalidPart(usize),
+}
+
+impl ErasureError {
+    pub fn is(&self, err: &Error) -> bool {
+        if let Some(e) = err.downcast_ref::<ErasureError>() {
+            return self == e;
+        }
+
+        false
+    }
 }

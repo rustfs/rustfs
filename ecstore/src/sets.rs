@@ -451,6 +451,10 @@ impl StorageAPI for Sets {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
     }
 
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).put_object_metadata(bucket, object, opts).await
+    }
+
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
         self.get_disks_by_key(object).get_object_tags(bucket, object, opts).await
     }
