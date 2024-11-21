@@ -363,7 +363,6 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        debug!("get_object response {:?}", output);
         Ok(S3Response::new(output))
     }
 
@@ -406,7 +405,6 @@ impl S3 for FS {
             .get_object_info(&bucket, &key, &ObjectOptions::default())
             .await
             .map_err(to_s3_error)?;
-        debug!("info {:?}", info);
 
         let content_type = {
             if let Some(content_type) = info.content_type {
@@ -854,7 +852,6 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
-        log::debug!("bucket: {bucket}, tagging: {tagging:?}");
 
         let layer = new_object_layer_fn();
         let lock = layer.read().await;
