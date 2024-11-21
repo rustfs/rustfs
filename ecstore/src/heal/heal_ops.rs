@@ -7,6 +7,8 @@ use super::{
         HEAL_ITEM_BUCKET_METADATA,
     },
 };
+use crate::heal::heal_commands::{HEAL_DEEP_SCAN, HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT};
+use crate::store_api::StorageAPI;
 use crate::{
     config::common::CONFIG_PREFIX,
     disk::RUSTFS_META_BUCKET,
@@ -24,10 +26,6 @@ use crate::{
     heal::heal_commands::{HealStartSuccess, HEAL_UNKNOWN_SCAN},
     new_object_layer_fn,
     utils::path::has_profix,
-};
-use crate::{
-    heal::heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT},
-    store_api::StorageAPI,
 };
 use lazy_static::lazy_static;
 use std::{
@@ -133,6 +131,32 @@ pub fn new_bg_heal_sequence() -> HealSequence {
             ..Default::default()
         })),
         report_progress: false,
+        scanned_items_map: HashMap::new(),
+        healed_items_map: HashMap::new(),
+        heal_failed_items_map: HashMap::new(),
+        ..Default::default()
+    }
+}
+
+pub fn new_heal_sequence(bucket: &str, obj_prefix: &str, client_addr: &str, hs: HealOpts, force_start: bool) -> HealSequence {
+    let client_token = Uuid::new_v4().to_string();
+    let (tx, rx) = mpsc::channel(10);
+    HealSequence {
+        bucket: bucket.to_string(),
+        object: obj_prefix.to_string(),
+        report_progress: true,
+        start_time: SystemTime::now(),
+        client_token,
+        client_address: client_addr.to_string(),
+        force_started: force_start,
+        setting: hs.clone(),
+        current_status: Arc::new(RwLock::new(HealSequenceStatus {
+            summary: HEAL_NOT_STARTED_STATUS.to_string(),
+            heal_setting: hs,
+            ..Default::default()
+        })),
+        traverse_and_heal_done_tx: Arc::new(RwLock::new(tx)),
+        traverse_and_heal_done_rx: Arc::new(RwLock::new(rx)),
         scanned_items_map: HashMap::new(),
         healed_items_map: HashMap::new(),
         heal_failed_items_map: HashMap::new(),

@@ -37,6 +37,7 @@ pub async fn init_auto_heal() {
     init_background_healing().await;
     if let Ok(v) = env::var("_RUSTFS_AUTO_DRIVE_HEALING") {
         if v == "on" {
+            info!("start monitor local disks and heal");
             GLOBAL_BackgroundHealState
                 .write()
                 .await

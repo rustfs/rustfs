@@ -10,7 +10,7 @@ use clap::Parser;
 use common::error::{Error, Result};
 use ecstore::{
     endpoints::EndpointServerPools,
-    heal::data_scanner::init_data_scanner,
+    heal::{background_heal_ops::init_auto_heal, data_scanner::init_data_scanner},
     set_global_endpoints,
     store::{init_local_disks, ECStore},
     update_erasure_type,
@@ -192,7 +192,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     })?;
     warn!(" init store success!");
     // init scanner
-    init_data_scanner().await;
+    // init_data_scanner().await;
+    // // init auto heal
+    // init_auto_heal().await;
+
+    info!("server was started");
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
