@@ -873,9 +873,17 @@ pub struct BackendInfo {
     pub drives_per_set: Vec<usize>,
 }
 
+pub struct ListObjectVersionsInfo {
+    pub is_truncated: bool,
+    pub next_marker: String,
+    pub next_version_idmarker: String,
+    pub objects: Vec<ObjectInfo>,
+    pub prefixes: Vec<String>,
+}
+
 #[async_trait::async_trait]
 pub trait ObjectIO: Send + Sync + 'static {
-    // GetObjectNInfo
+    // GetObjectNInfo FIXME:
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -890,9 +898,9 @@ pub trait ObjectIO: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 pub trait StorageAPI: ObjectIO {
-    // NewNSLock
-    // Shutdown
-    // NSScanner
+    // NewNSLock TODO:
+    // Shutdown TODO:
+    // NSScanner TODO:
 
     async fn backend_info(&self) -> BackendInfo;
     async fn storage_info(&self) -> StorageInfo;
@@ -902,7 +910,7 @@ pub trait StorageAPI: ObjectIO {
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
-    // ListObjects
+    // ListObjects TODO: FIXME:
     async fn list_objects_v2(
         &self,
         bucket: &str,
@@ -913,8 +921,17 @@ pub trait StorageAPI: ObjectIO {
         fetch_owner: bool,
         start_after: &str,
     ) -> Result<ListObjectsV2Info>;
-    // ListObjectVersions
-    // Walk
+    // ListObjectVersions TODO: FIXME:
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        marker: &str,
+        version_marker: &str,
+        delimiter: &str,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo>;
+    // Walk TODO:
 
     // GetObjectNInfo ObjectIO
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
@@ -928,8 +945,8 @@ pub trait StorageAPI: ObjectIO {
         opts: ObjectOptions,
     ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
     #[warn(clippy::too_many_arguments)]
-    // TransitionObject
-    // RestoreTransitionedObject
+    // TransitionObject TODO:
+    // RestoreTransitionedObject TODO:
 
     // ListMultipartUploads
     async fn list_multipart_uploads(
@@ -967,6 +984,13 @@ pub trait StorageAPI: ObjectIO {
         opts: &ObjectOptions,
     ) -> Result<PartInfo>;
     // GetMultipartInfo
+    async fn get_multipart_info(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<MultipartInfo>;
     // ListObjectParts
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()>;
     async fn complete_multipart_upload(
@@ -981,12 +1005,8 @@ pub trait StorageAPI: ObjectIO {
     async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>>;
     // SetDriveCounts
     fn set_drive_counts(&self) -> Vec<usize>;
-    // HealFormat
-    // HealBucket
-    // HealObject
-    // HealObjects
-    // CheckAbandonedParts
-    // Health
+
+    // Health TODO:
     // PutObjectMetadata
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     // DecomTieredObject

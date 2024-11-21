@@ -16,7 +16,9 @@ use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode, HEAL_IT
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::new_object_layer_fn;
 use crate::pools::PoolMeta;
-use crate::store_api::{BackendByte, BackendDisks, BackendInfo, ListMultipartsInfo, ObjectIO, StorageInfo};
+use crate::store_api::{
+    BackendByte, BackendDisks, BackendInfo, ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO, StorageInfo,
+};
 use crate::store_err::{
     is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum, is_err_version_not_found,
     to_object_err, StorageError,
@@ -454,6 +456,11 @@ impl ECStore {
         }
 
         ServerPoolsAvailableSpace(server_pools)
+    }
+
+    fn is_suspended(&self, idx: usize) -> bool {
+        // TODO: LOCK
+        self.pool_meta.is_suspended(idx)
     }
 
     async fn get_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Result<usize> {
@@ -1490,6 +1497,39 @@ impl StorageAPI for ECStore {
 
         Ok(v2)
     }
+    async fn list_object_versions(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        marker: &str,
+        version_marker: &str,
+        _delimiter: &str,
+        _max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        if marker.is_empty() && !version_marker.is_empty() {
+            return Err(Error::new(StorageError::NotImplemented));
+        }
+
+        // let opts = ListPathOptions {
+        //     bucket: bucket.to_owned(),
+        //     marker: marker.to_owned(),
+        //     prefix: prefix.to_owned(),
+        //     limit: max_keys,
+        //     ..Default::default()
+        // };
+
+        // let list = self
+        //     .list_path(&opts, delimiter)
+        //     .await
+        //     .map_err(|e| to_object_err(e, vec![bucket]))?;
+
+        // for info in list.objects.iter() {
+        //     //
+        // }
+
+        // FIXME:
+        unimplemented!()
+    }
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         check_object_args(bucket, object)?;
 
@@ -1686,6 +1726,41 @@ impl StorageAPI for ECStore {
         }
 
         self.pools[idx].new_multipart_upload(bucket, object, opts).await
+    }
+    async fn get_multipart_info(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<MultipartInfo> {
+        check_list_parts_args(bucket, object, upload_id)?;
+        if self.single_pool() {
+            return self.pools[0].get_multipart_info(bucket, object, upload_id, opts).await;
+        }
+
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if self.is_suspended(idx) {
+                continue;
+            }
+
+            match pool.get_multipart_info(bucket, object, upload_id, opts).await {
+                Ok(res) => return Ok(res),
+                Err(err) => {
+                    if is_err_invalid_upload_id(&err) {
+                        continue;
+                    }
+
+                    return Err(err);
+                }
+            }
+        }
+
+        Err(Error::new(StorageError::InvalidUploadID(
+            bucket.to_owned(),
+            object.to_owned(),
+            upload_id.to_owned(),
+        )))
     }
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
         check_abort_multipart_args(bucket, object, upload_id)?;
@@ -2189,7 +2264,7 @@ fn check_put_object_part_args(bucket: &str, object: &str, upload_id: &str) -> Re
     check_multipart_object_args(bucket, object, upload_id)
 }
 
-fn _check_list_parts_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
+fn check_list_parts_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
     check_multipart_object_args(bucket, object, upload_id)
 }
 

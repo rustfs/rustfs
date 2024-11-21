@@ -10,7 +10,6 @@ use std::fmt::Debug;
 use std::io::ErrorKind;
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
 use tracing::warn;
 // use tracing::debug;
 use uuid::Uuid;
@@ -31,10 +30,10 @@ pub struct Erasure {
 
 impl Erasure {
     pub fn new(data_shards: usize, parity_shards: usize, block_size: usize) -> Self {
-        debug!(
-            "Erasure new data_shards {},parity_shards {} block_size {} ",
-            data_shards, parity_shards, block_size
-        );
+        // debug!(
+        //     "Erasure new data_shards {},parity_shards {} block_size {} ",
+        //     data_shards, parity_shards, block_size
+        // );
         let mut encoder = None;
         if parity_shards > 0 {
             encoder = Some(ReedSolomon::new(data_shards, parity_shards).unwrap());

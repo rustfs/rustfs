@@ -24,8 +24,8 @@ use crate::{
     set_disk::SetDisks,
     store_api::{
         BackendInfo, BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOptions,
-        ObjectToDelete, PartInfo, PutObjReader, StorageAPI, StorageInfo,
+        ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult,
+        ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, StorageInfo,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
     utils::hash,
@@ -446,7 +446,17 @@ impl StorageAPI for Sets {
     ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
-
+    async fn list_object_versions(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _marker: &str,
+        _version_marker: &str,
+        _delimiter: &str,
+        _max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
     }
@@ -512,6 +522,17 @@ impl StorageAPI for Sets {
     }
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
+    }
+    async fn get_multipart_info(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<MultipartInfo> {
+        self.get_disks_by_key(object)
+            .get_multipart_info(bucket, object, upload_id, opts)
+            .await
     }
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
         self.get_disks_by_key(object)
