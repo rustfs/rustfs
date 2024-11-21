@@ -6,6 +6,9 @@ use crate::{
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StorageError {
+    #[error("not implemented")]
+    NotImplemented,
+
     #[error("Invalid arguments provided for {0}/{1}-{2}")]
     InvalidArgument(String, String, String),
 
