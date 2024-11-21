@@ -2173,7 +2173,7 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
     *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
 }
 
-fn is_valid_object_prefix(object: &str) -> bool {
+pub fn is_valid_object_prefix(object: &str) -> bool {
     // Implement object prefix validation
     !object.is_empty() // Placeholder
 }

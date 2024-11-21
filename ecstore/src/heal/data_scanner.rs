@@ -511,9 +511,7 @@ impl FolderScanner {
         let this_hash = hash_path(&folder.name);
         let was_compacted = into.compacted;
 
-        // do not really loop
-        let mut times = 1;
-        while times > 0 {
+        'outer: {
             let mut abandoned_children: DataUsageHashMap = if !into.compacted {
                 self.old_cache.find_children_copy(this_hash.clone())
             } else {
@@ -622,7 +620,7 @@ impl FolderScanner {
             }
             if found_objects && *GLOBAL_IsErasure.read().await {
                 // If we found an object in erasure mode, we skip subdirs (only datadirs)...
-                break;
+                break 'outer;
             }
 
             let should_compact = self.new_cache.info.name != folder.name
@@ -714,11 +712,11 @@ impl FolderScanner {
 
             // Scan for healing
             if abandoned_children.is_empty() || !self.should_heal().await {
-                break;
+                break 'outer;
             }
 
             if self.disks.is_empty() || self.disks_quorum == 0 {
-                break;
+                break 'outer;
             }
 
             let (bg_seq, found) = GLOBAL_BackgroundHealState
@@ -727,7 +725,7 @@ impl FolderScanner {
                 .get_heal_sequence_by_token(BG_HEALING_UUID)
                 .await;
             if !found {
-                break;
+                break 'outer;
             }
             let bg_seq = bg_seq.unwrap();
 
@@ -901,7 +899,6 @@ impl FolderScanner {
                     scan(&this, into, self).await;
                 }
             }
-            times -= 1;
         }
         if !was_compacted {
             self.new_cache.replace_hashed(&this_hash, &Some(folder.parent.clone()), into);
