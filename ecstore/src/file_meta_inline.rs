@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use std::io::{Cursor, Read};
@@ -157,7 +158,63 @@ impl InlineData {
 
         self.serialize(keys, values)
     }
+    pub fn remove(&mut self, remove_keys: Vec<Uuid>) -> Result<bool> {
+        let buf = self.after_version();
+        let mut cur = Cursor::new(buf);
 
+        let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
+        let mut keys = Vec::with_capacity(fields_len + 1);
+        let mut values = Vec::with_capacity(fields_len + 1);
+
+        let remove_key = |found_key: &str| {
+            for key in remove_keys.iter() {
+                if key.to_string().as_str() == found_key {
+                    return true;
+                }
+            }
+            false
+        };
+
+        let mut found = false;
+
+        while fields_len > 0 {
+            fields_len -= 1;
+
+            let str_len = rmp::decode::read_str_len(&mut cur)?;
+
+            let mut field_buff = vec![0u8; str_len as usize];
+
+            cur.read_exact(&mut field_buff)?;
+
+            let find_key = String::from_utf8(field_buff)?;
+
+            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+            let start = cur.position() as usize;
+            let end = start + bin_len;
+            cur.set_position(end as u64);
+
+            let find_value = &buf[start..end];
+
+            if !remove_key(&find_key) {
+                values.push(find_value.to_vec());
+                keys.push(find_key);
+            } else {
+                found = true;
+            }
+        }
+
+        if !found {
+            return Ok(false);
+        }
+
+        if keys.is_empty() {
+            self.0 = Vec::new();
+            return Ok(true);
+        }
+
+        self.serialize(keys, values)?;
+        Ok(true)
+    }
     fn serialize(&mut self, keys: Vec<String>, values: Vec<Vec<u8>>) -> Result<()> {
         assert_eq!(keys.len(), values.len(), "InlineData serialize: keys/values not match");
 

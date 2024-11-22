@@ -11,7 +11,8 @@ pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
-const STORAGE_FORMAT_FILE: &str = "xl.meta";
+pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
+pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::{
     erasure::Writer,
@@ -303,7 +304,7 @@ impl DiskAPI for Disk {
         fi: FileInfo,
         force_del_marker: bool,
         opts: DeleteOptions,
-    ) -> Result<RawFileInfo> {
+    ) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
             Disk::Remote(remote_disk) => remote_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
@@ -409,7 +410,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         fi: FileInfo,
         force_del_marker: bool,
         opts: DeleteOptions,
-    ) -> Result<RawFileInfo>;
+    ) -> Result<()>;
     async fn delete_versions(
         &self,
         volume: &str,

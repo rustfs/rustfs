@@ -616,7 +616,7 @@ impl DiskAPI for RemoteDisk {
         fi: FileInfo,
         force_del_marker: bool,
         opts: DeleteOptions,
-    ) -> Result<RawFileInfo> {
+    ) -> Result<()> {
         info!("delete_version");
         let file_info = serde_json::to_string(&fi)?;
         let opts = serde_json::to_string(&opts)?;
@@ -639,9 +639,9 @@ impl DiskAPI for RemoteDisk {
             return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
         }
 
-        let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
+        // let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
 
-        Ok(raw_file_info)
+        Ok(())
     }
     async fn delete_versions(
         &self,
