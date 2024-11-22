@@ -1,12 +1,12 @@
 use super::error::{
     is_err_file_not_found, is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files, os_is_not_exist, os_is_permission,
 };
-use super::os::is_root_disk;
+use super::os::{is_root_disk, rename_all};
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions,
     FileReader, FileWriter, Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE_BACKUP,
 };
 use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::GLOBAL_BucketMetadataSys;
@@ -1760,16 +1760,88 @@ impl DiskAPI for LocalDisk {
     async fn delete_version(
         &self,
         volume: &str,
-        _path: &str,
-        _fi: FileInfo,
-        _force_del_marker: bool,
-        _opts: DeleteOptions,
-    ) -> Result<RawFileInfo> {
-        let _volume_dir = self.get_bucket_path(volume)?;
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> Result<()> {
+        if path.starts_with(SLASH_SEPARATOR) {
+            return self
+                .delete(
+                    volume,
+                    path,
+                    DeleteOptions {
+                        recursive: false,
+                        immediate: false,
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
 
-        // self.read_all_data(bucket, volume_dir, path);
+        let volume_dir = self.get_bucket_path(volume)?;
 
-        unimplemented!()
+        let file_path = volume_dir.join(Path::new(&path));
+
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+
+        let xl_path = file_path.join(Path::new(STORAGE_FORMAT_FILE));
+        let buf = match self.read_all_data(volume, &volume_dir, &xl_path).await {
+            Ok(res) => res,
+            Err(err) => {
+                //
+                if !is_err_file_not_found(&err) {
+                    return Err(err);
+                }
+
+                if fi.deleted && force_del_marker {
+                    return self.write_metadata("", volume, path, fi).await;
+                }
+
+                if fi.version_id.is_some() {
+                    return Err(Error::new(DiskError::FileVersionNotFound));
+                } else {
+                    return Err(Error::new(DiskError::FileNotFound));
+                }
+            }
+        };
+
+        let mut meta = FileMeta::load(&buf)?;
+        let old_dir = meta.delete_version(&fi)?;
+
+        if let Some(uuid) = old_dir {
+            let vid = fi.version_id.unwrap_or(Uuid::nil());
+            let _ = meta.data.remove(vec![vid, uuid])?;
+
+            let old_path = file_path.join(Path::new(uuid.to_string().as_str()));
+            check_path_length(old_path.to_string_lossy().as_ref())?;
+
+            if let Err(err) = self.move_to_trash(&old_path, true, false).await {
+                if !is_err_file_not_found(&err) {
+                    return Err(err);
+                }
+            }
+        }
+
+        if !meta.versions.is_empty() {
+            let buf = meta.marshal_msg()?;
+            return self
+                .write_all_meta(volume, format!("{}{}{}", path, SLASH_SEPARATOR, STORAGE_FORMAT_FILE).as_str(), &buf, true)
+                .await;
+        }
+
+        // opts.undo_write && opts.old_data_dir.is_some_and(f)
+        if let Some(old_data_dir) = opts.old_data_dir {
+            if opts.undo_write {
+                let src_path = file_path.join(Path::new(
+                    format!("{}{}{}", old_data_dir.to_string(), SLASH_SEPARATOR, STORAGE_FORMAT_FILE_BACKUP).as_str(),
+                ));
+                let dst_path = file_path.join(Path::new(format!("{}{}{}", path, SLASH_SEPARATOR, STORAGE_FORMAT_FILE).as_str()));
+                return rename_all(src_path, dst_path, file_path).await;
+            }
+        }
+
+        self.delete_file(&volume_dir, &xl_path, true, false).await
     }
     async fn delete_versions(
         &self,
