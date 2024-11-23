@@ -49,30 +49,29 @@ Help all of humanity reduce storage costs and achieve data security.
 5. [Advantages and disadvantages of static versus dynamic EC?](/docs/en/core/ec-modes.md)
 6. [Startup modes for RustFS](/docs/en/core/start-modes.md)
 7. [Disks, EC, Stripes, Pools](/docs/en/core/disk-ec-stripes-pools.md)
-8. [Code Layers for RustFS](/docs/en/core/code-layer.md)
-9. [RustFS start-up process](/docs/en/core/start-process.md)
-10. [Our code specification?](/docs/en/core/code-style.md)
-11. [How to develop S3 API?](/docs/en/core/s3-api.md)
-12. [How to develop the management API?](/docs/en/core/management-api.md)
-13. [How to report bugs and submit new feature suggestions to us?](/docs/en/core/report-bug.md)
-14. [Appendix: Which EC does RustFS use? (can be learned without it)](/docs/en/core/rustfs-ec.md)
+8.  [Our code specification?](/docs/en/core/code-style.md)
+9.  [How to report bugs and submit new feature suggestions to us?](/docs/en/core/report-bug.md)
 
+
+# RustFS vs other object storage
+
+| RustFS | Other object storage|
+| - | - |
+| Developed based on Rust language, memory is safer | Developed in Go or C, with potential issues like memory GC/leaks |
+| Does not report logs to third-party countries	 | Reporting logs to other third countries may violate national security laws |
+| Licensed under Apache, more business-friendly	 | AGPL V3 and other protocols, polluted open source and protocol traps, infringement of intellectual property rights |
+| Comprehensive S3 support, works with domestic and international cloud providers	 | Comprehensive S3 support but lacks localization for domestic cloud providers |
+| Rust-based development, strong support for secure and innovative devices	 | Poor support for edge gateways and secure innovative devices|
+| Stable commercial prices, free community support | High pricing, with costs up to $250,000 for 1PiB |
 
 
 # How to install RustFS
 
-1. Linux Install
 
-   Select the version corresponding to the operating CPU and download the installation package.
+The internal test installation package has been released.
+Please contact: hello@rustfs.com
 
-2. Windows Install
 
-   Download the windows installation package and double click to open it.
-   
-
-3. MacOS Install
-
-   Download the corresponding version for MacOS CPU, drag and drop it into the Apple app, and double-click to open it and run it.
 
 # Join us   
 

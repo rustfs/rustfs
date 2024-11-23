@@ -49,28 +49,29 @@ https://RustFS.com/
 5. [静态EC与动态EC的优缺点?](/docs/cn/core/ec-modes.md)
 6. [RustFS的启动模式](/docs/cn/core/start-modes.md)
 7. [磁盘、EC、条带、池](/docs/cn/core/disk-ec-stripes-pools.md)
-8. [RustFS的代码分层](/docs/cn/core/code-layer.md)
-9. [RustFS启动流程](/docs/cn/core/start-process.md)
-10. [我们的代码规范?](/docs/cn/core/code-style.md)
-11. [如何开发S3 API？](/docs/cn/core/s3-api.md)
-12. [如何开发管理端API？](/docs/cn/core/management-api.md)
-13. [如何向我们报告Bug和提交新功能建议?](/docs/cn/core/report-bug.md)
-14. [附录：RustFS使用的EC是哪一种？（可以不用学习）](/docs/cn/core/rustfs-ec.md)
+8.  [我们的代码规范?](/docs/cn/core/code-style.md)
+9.  [如何向我们报告Bug和提交新功能建议?](/docs/cn/core/report-bug.md)
+
+
+# RustFS vs 其他对象存储
+
+| RustFS |  其他对象存储|
+| - | - |
+|基于 Rust 语言开发，内存更安全 |   使用 Go 或者 C 语言开发，内存GC/内存泄漏等 |
+| 不向其他第三国上报日志 | 向其他第三国上报日志，可能违反国家安全法 |
+| Apache协议，商用支持更友好 | AGPL V3 等协议、污染开源和协议陷阱，侵犯知识产权|
+| S3 支持和功能完善，支持国内、国际云厂商 | S3 支持和功能完善，不支持本地化云厂商 |
+| Rust开发，安全信创设备支持良好 | 边缘网关和信创保密设备支持不好 |
+| 商业价格稳定，社区支持免费 |  价格高昂，1PiB高达 170万元人民币 |
+
 
 # 如何安装 RustFS
 
-1. Linux 安装
+内部测试安装包已经布。
+请联系：hello@rustfs.com
 
-   选择与运行 CPU 相对应的版本并下载安装包。
 
-2. Windows 安装
 
-   下载 Windows 安装包并双击打开。
-   
-
-3. MacOS 安装
-
-   下载 MacOS CPU 的相应版本，将其拖放到苹果应用程序中，然后双击打开并运行。
 
 
 # 工作机会
