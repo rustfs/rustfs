@@ -10,7 +10,7 @@ pub fn to_s3_error(err: Error) -> S3Error {
             }
             StorageError::MethodNotAllowed => s3_error!(MethodNotAllowed),
             StorageError::BucketNotFound(bucket) => {
-                s3_error!(InvalidArgument, "bucket not found {}", bucket)
+                s3_error!(NoSuchBucket, "bucket not found {}", bucket)
             }
             StorageError::BucketNotEmpty(bucket) => s3_error!(BucketNotEmpty, "bucket not empty {}", bucket),
             StorageError::BucketNameInvalid(bucket) => s3_error!(InvalidBucketName, "invalid bucket name {}", bucket),
