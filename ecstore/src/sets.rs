@@ -662,7 +662,7 @@ impl StorageAPI for Sets {
         _bucket: &str,
         _prefix: &str,
         _opts: &HealOpts,
-        _hs: Arc<RwLock<HealSequence>>,
+        _hs: Arc<HealSequence>,
         _is_meta: bool,
     ) -> Result<()> {
         unimplemented!()

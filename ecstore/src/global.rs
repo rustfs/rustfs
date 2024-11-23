@@ -28,7 +28,7 @@ lazy_static! {
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
     pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
-    pub static ref GLOBAL_BackgroundHealRoutine: Arc<RwLock<HealRoutine>> = HealRoutine::new();
+    pub static ref GLOBAL_BackgroundHealRoutine: Arc<HealRoutine> = HealRoutine::new();
     pub static ref GLOBAL_BackgroundHealState: Arc<RwLock<AllHealState>> = AllHealState::new(false);
     static ref globalDeploymentIDPtr: RwLock<Uuid> = RwLock::new(Uuid::nil());
 }

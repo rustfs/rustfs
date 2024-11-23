@@ -1953,6 +1953,7 @@ impl StorageAPI for ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        info!("ECStore heal_object");
         let object = utils::path::encode_dir_object(object);
         let errs = Arc::new(RwLock::new(vec![None; self.pools.len()]));
         let results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.pools.len()]));
@@ -2009,9 +2010,10 @@ impl StorageAPI for ECStore {
         bucket: &str,
         prefix: &str,
         opts: &HealOpts,
-        hs: Arc<RwLock<HealSequence>>,
+        hs: Arc<HealSequence>,
         is_meta: bool,
     ) -> Result<()> {
+        info!("heal objects");
         let opts_clone = *opts;
         let heal_entry: HealEntryFn = Arc::new(move |bucket: String, entry: MetaCacheEntry, scan_mode: HealScanMode| {
             let opts_clone = opts_clone;

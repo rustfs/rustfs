@@ -330,6 +330,7 @@ impl DiskAPI for Disk {
     }
 
     async fn delete_volume(&self, volume: &str) -> Result<()> {
+        info!("delete_volume, volume: {}", volume);
         match self {
             Disk::Local(local_disk) => local_disk.delete_volume(volume).await,
             Disk::Remote(remote_disk) => remote_disk.delete_volume(volume).await,
