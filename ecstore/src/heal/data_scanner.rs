@@ -748,8 +748,6 @@ impl FolderScanner {
                 if bucket != resolver.bucket {
                     bg_seq
                         .clone()
-                        .write()
-                        .await
                         .queue_heal_task(
                             HealSource {
                                 bucket: bucket.clone(),
@@ -818,8 +816,6 @@ impl FolderScanner {
                                     Ok(fiv) => fiv,
                                     Err(_) => {
                                         if let Err(err) = bg_seq_partial
-                                            .write()
-                                            .await
                                             .queue_heal_task(
                                                 HealSource {
                                                     bucket: bucket_partial.clone(),
@@ -849,8 +845,6 @@ impl FolderScanner {
                                 let (mut success_versions, mut fail_versions) = (0, 0);
                                 for ver in fiv.versions.iter() {
                                     match bg_seq_partial
-                                        .write()
-                                        .await
                                         .queue_heal_task(
                                             HealSource {
                                                 bucket: bucket_partial.clone(),

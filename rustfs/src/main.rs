@@ -192,9 +192,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     })?;
     warn!(" init store success!");
     // init scanner
-    // init_data_scanner().await;
-    // // init auto heal
-    // init_auto_heal().await;
+    init_data_scanner().await;
+    // init auto heal
+    init_auto_heal().await;
 
     info!("server was started");
 

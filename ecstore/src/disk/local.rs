@@ -1172,6 +1172,7 @@ impl DiskAPI for LocalDisk {
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
         //  TODO: writeAllDirect io.copy
+        info!("file_path: {:?}", file_path);
         if let Some(parent) = file_path.parent() {
             os::make_dir_all(parent, &volume_dir).await?;
         }
@@ -1924,6 +1925,7 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn delete_volume(&self, volume: &str) -> Result<()> {
+        info!("delete_volume, volume: {}", volume);
         let p = self.get_bucket_path(volume)?;
 
         // TODO: 不能用递归删除，如果目录下面有文件，返回errVolumeNotEmpty

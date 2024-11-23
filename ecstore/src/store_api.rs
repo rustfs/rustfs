@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -292,7 +291,7 @@ pub struct ObjectPartInfo {
 //     }
 // }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct RawFileInfo {
     pub buf: Vec<u8>,
 }
@@ -1028,7 +1027,7 @@ pub trait StorageAPI: ObjectIO {
         bucket: &str,
         prefix: &str,
         opts: &HealOpts,
-        hs: Arc<RwLock<HealSequence>>,
+        hs: Arc<HealSequence>,
         is_meta: bool,
     ) -> Result<()>;
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
