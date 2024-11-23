@@ -298,13 +298,10 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&input.bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let output = GetBucketLocationOutput::default();
         Ok(S3Response::new(output))
@@ -377,13 +374,10 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        if let Err(e) = store.get_bucket_info(&input.bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&input.bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
         // mc cp step 2 GetBucketInfo
 
         Ok(S3Response::new(HeadBucketOutput::default()))
@@ -860,13 +854,10 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let data = try_!(xml::serialize(&tagging));
 
@@ -979,13 +970,10 @@ impl S3 for FS {
             None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
         };
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let VersioningConfiguration { status, .. } = BucketVersioningSys::get(&bucket).await.map_err(to_s3_error)?;
 
@@ -1038,13 +1026,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let cfg = match PolicySys::get(&bucket).await {
             Ok(res) => res,
@@ -1070,13 +1055,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         // warn!("input policy {}", &policy);
 
@@ -1110,13 +1092,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         metadata_sys::delete(&bucket, BUCKET_POLICY_CONFIG)
             .await
@@ -1138,13 +1117,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
             Ok((cfg, _)) => Some(cfg.rules),
@@ -1201,13 +1177,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG)
             .await
@@ -1228,13 +1201,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let server_side_encryption_configuration = match metadata_sys::get_sse_config(&bucket).await {
             Ok((cfg, _)) => Some(cfg),
@@ -1270,13 +1240,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         // TODO: check kms
 
@@ -1299,13 +1266,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
         metadata_sys::delete(&bucket, BUCKET_SSECONFIG).await.map_err(to_s3_error)?;
 
         Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
@@ -1352,13 +1316,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let data = try_!(xml::serialize(&input_cfg));
 
@@ -1381,13 +1342,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let replication_configuration = match metadata_sys::get_replication_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
@@ -1418,13 +1376,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         // TODO: check enable, versioning enable
         let data = try_!(xml::serialize(&replication_configuration));
@@ -1448,13 +1403,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
         metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
             .await
             .map_err(to_s3_error)?;
@@ -1476,13 +1428,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let has_notification_config = match metadata_sys::get_notification_config(&bucket).await {
             Ok(cfg) => cfg,
@@ -1528,13 +1477,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let data = try_!(xml::serialize(&notification_configuration));
 
@@ -1556,13 +1502,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         let grants = vec![Grant {
             grantee: Some(Grantee {
@@ -1597,13 +1540,10 @@ impl S3 for FS {
             .as_ref()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
 
-        if let Err(e) = store.get_bucket_info(&bucket, &BucketOptions::default()).await {
-            if DiskError::VolumeNotFound.is(&e) {
-                return Err(s3_error!(NoSuchBucket));
-            } else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
-            }
-        }
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
 
         if let Some(canned_acl) = acl {
             if canned_acl.as_str() != BucketCannedACL::PRIVATE {
