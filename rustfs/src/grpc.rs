@@ -16,6 +16,7 @@ use ecstore::{
 use futures::{Stream, StreamExt};
 use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 
+use madmin::health::get_cpus;
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
@@ -1551,7 +1552,20 @@ impl Node for NodeService {
     }
 
     async fn get_cpus(&self, _request: Request<GetCpusRequest>) -> Result<Response<GetCpusResponse>, Status> {
-        todo!()
+        let info = get_cpus();
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetCpusResponse {
+                success: false,
+                cpus: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetCpusResponse {
+            success: true,
+            cpus: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_net_info(&self, _request: Request<GetNetInfoRequest>) -> Result<Response<GetNetInfoResponse>, Status> {
