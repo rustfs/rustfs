@@ -1,12 +1,16 @@
 #![cfg(test)]
 
-use ecstore::disk::VolumeInfo;
+use ecstore::{disk::VolumeInfo, store_api::StorageInfo};
 use protos::{
     models::{PingBody, PingBodyBuilder},
     node_service_time_out_client,
-    proto_gen::node_service::{ListVolumesRequest, MakeVolumeRequest, PingRequest, PingResponse, ReadAllRequest},
+    proto_gen::node_service::{
+        ListVolumesRequest, LocalStorageInfoRequest, MakeVolumeRequest, PingRequest, PingResponse, ReadAllRequest,
+    },
 };
-use std::error::Error;
+use rmp_serde::Deserializer;
+use serde::Deserialize;
+use std::{error::Error, io::Cursor};
 use tonic::Request;
 
 const CLUSTER_ADDR: &str = "http://localhost:9000";
@@ -98,5 +102,23 @@ async fn read_all() -> Result<(), Box<dyn Error>> {
 
     println!("{}", response.success);
     println!("{:?}", volume_infos);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_info() -> Result<(), Box<dyn Error>> {
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
+    let request = Request::new(LocalStorageInfoRequest { metrics: true });
+
+    let response = client.local_storage_info(request).await?.into_inner();
+    if !response.success {
+        println!("{:?}", response.error_info);
+        return Ok(());
+    }
+    let info = response.storage_info;
+
+    let mut buf = Deserializer::new(Cursor::new(info));
+    let storage_info: StorageInfo = Deserialize::deserialize(&mut buf).unwrap();
+    println!("{:?}", storage_info);
     Ok(())
 }

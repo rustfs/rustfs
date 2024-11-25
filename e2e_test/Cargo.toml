@@ -14,6 +14,8 @@ flatbuffers.workspace = true
 lazy_static.workspace = true
 lock.workspace = true
 protos.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tonic = { version = "0.12.3", features = ["gzip"] }
 tokio = { workspace = true }

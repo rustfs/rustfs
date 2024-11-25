@@ -795,7 +795,7 @@ pub struct DeletedObject {
     // pub replication_state: ReplicationState,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub enum BackendByte {
     #[default]
     Unknown,
@@ -833,13 +833,13 @@ pub struct StorageDisk {
     pub disk_index: i32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StorageInfo {
     pub disks: Vec<StorageDisk>,
     pub backend: BackendInfo,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BackendDisks(HashMap<String, usize>);
 
 impl BackendDisks {
@@ -851,7 +851,7 @@ impl BackendDisks {
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct BackendInfo {
     pub backend_type: BackendByte,
