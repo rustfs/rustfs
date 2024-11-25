@@ -1,0 +1,11 @@
+[package]
+name = "madmin"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+psutil = "3.3.0"
+serde.workspace = true
