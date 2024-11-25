@@ -594,6 +594,8 @@ dependencies = [
  "lazy_static",
  "lock",
  "protos",
+ "rmp-serde",
+ "serde",
  "serde_json",
  "tokio",
  "tonic",
@@ -614,6 +616,7 @@ dependencies = [
  "bytesize",
  "common",
  "crc32fast",
+ "flatbuffers",
  "futures",
  "glob",
  "hex-simd",
@@ -2152,6 +2155,8 @@ dependencies = [
  "prost-types",
  "protobuf",
  "protos",
+ "rmp-serde",
+ "router",
  "s3s",
  "serde",
  "serde_json",
@@ -2169,6 +2174,7 @@ dependencies = [
  "tracing-error",
  "tracing-subscriber",
  "transform-stream",
+ "url",
  "uuid",
 ]
 

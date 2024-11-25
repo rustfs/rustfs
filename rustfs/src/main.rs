@@ -1,6 +1,7 @@
 mod admin;
 mod config;
 mod grpc;
+mod peer_rest_client;
 mod service;
 mod storage;
 

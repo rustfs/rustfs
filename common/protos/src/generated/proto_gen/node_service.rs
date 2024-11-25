@@ -612,6 +612,441 @@ pub struct GenerallyLockResponse {
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Mss {
+    #[prost(map = "string, string", tag = "1")]
+    pub value: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LocalStorageInfoRequest {
+    #[prost(bool, tag = "1")]
+    pub metrics: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LocalStorageInfoResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub storage_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ServerInfoRequest {
+    #[prost(bool, tag = "1")]
+    pub metrics: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServerInfoResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub server_properties: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetCpusRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetCpusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub cpus: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetNetInfoRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetNetInfoResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub net_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetPartitionsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetPartitionsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub partitions: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetOsInfoRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetOsInfoResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub os_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetSeLinuxInfoRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetSeLinuxInfoResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub sys_services: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetSysConfigRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetSysConfigResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub sys_config: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetSysErrorsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetSysErrorsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub sys_errors: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetMemInfoRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetMemInfoResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub mem_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetMetricsRequest {
+    #[prost(uint64, tag = "1")]
+    pub metric_type: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub opts: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetMetricsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub realtime_metrics: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetProcInfoRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetProcInfoResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub proc_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StartProfilingRequest {
+    #[prost(string, tag = "1")]
+    pub profiler: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StartProfilingResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct DownloadProfileDataRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DownloadProfileDataResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(map = "string, bytes", tag = "2")]
+    pub data: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::vec::Vec<u8>>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetBucketStatsDataRequest {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetBucketStatsDataResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub bucket_stats: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetSrMetricsDataRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetSrMetricsDataResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub sr_metrics_summary: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetAllBucketStatsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetAllBucketStatsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub bucket_stats_map: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadBucketMetadataRequest {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadBucketMetadataResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteBucketMetadataRequest {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteBucketMetadataResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeletePolicyRequest {
+    #[prost(string, tag = "1")]
+    pub policy_name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeletePolicyResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadPolicyRequest {
+    #[prost(string, tag = "1")]
+    pub policy_name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadPolicyResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadPolicyMappingRequest {
+    #[prost(string, tag = "1")]
+    pub user_or_group: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub user_type: u64,
+    #[prost(bool, tag = "3")]
+    pub is_group: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadPolicyMappingResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteUserRequest {
+    #[prost(string, tag = "1")]
+    pub access_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteUserResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteServiceAccountRequest {
+    #[prost(string, tag = "1")]
+    pub access_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteServiceAccountResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadUserRequest {
+    #[prost(string, tag = "1")]
+    pub access_key: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub temp: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadUserResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadServiceAccountRequest {
+    #[prost(string, tag = "1")]
+    pub access_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadServiceAccountResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadGroupRequest {
+    #[prost(string, tag = "1")]
+    pub group: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadGroupResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReloadSiteReplicationConfigRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReloadSiteReplicationConfigResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SignalServiceRequest {
+    #[prost(message, optional, tag = "1")]
+    pub vars: ::core::option::Option<Mss>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SignalServiceResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct BackgroundHealStatusRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BackgroundHealStatusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub bg_heal_state: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetMetacacheListingRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub opts: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetMetacacheListingResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub metacache: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateMetacacheListingRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub metacache: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateMetacacheListingResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub metacache: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ReloadPoolMetaRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReloadPoolMetaResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct StopRebalanceRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StopRebalanceResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LoadRebalanceMetaRequest {
+    #[prost(bool, tag = "1")]
+    pub start_rebalance: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadRebalanceMetaResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct LoadTransitionTierConfigRequest {
+    #[prost(bool, tag = "1")]
+    pub start_rebalance: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoadTransitionTierConfigResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
 /// Generated client implementations.
 pub mod node_service_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::wildcard_imports, clippy::let_unit_value)]
@@ -1293,6 +1728,548 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "Refresh"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn local_storage_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LocalStorageInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalStorageInfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LocalStorageInfo");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LocalStorageInfo"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn server_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ServerInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::ServerInfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ServerInfo");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ServerInfo"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_cpus(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetCpusRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetCpusResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetCpus");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetCpus"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_net_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetNetInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetNetInfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetNetInfo");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetNetInfo"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_partitions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetPartitionsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetPartitionsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetPartitions");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetPartitions"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_os_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetOsInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetOsInfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetOsInfo");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetOsInfo"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_se_linux_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSeLinuxInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetSeLinuxInfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetSELinuxInfo");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetSELinuxInfo"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_sys_config(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSysConfigRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetSysConfigResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetSysConfig");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetSysConfig"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_sys_errors(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSysErrorsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetSysErrorsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetSysErrors");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetSysErrors"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_mem_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetMemInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetMemInfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetMemInfo");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetMemInfo"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_metrics(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetMetricsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetMetricsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetMetrics");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetMetrics"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_proc_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetProcInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetProcInfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetProcInfo");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetProcInfo"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn start_profiling(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StartProfilingRequest>,
+        ) -> std::result::Result<tonic::Response<super::StartProfilingResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/StartProfiling");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "StartProfiling"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn download_profile_data(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DownloadProfileDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::DownloadProfileDataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/DownloadProfileData");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "DownloadProfileData"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_bucket_stats(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetBucketStatsDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetBucketStatsDataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetBucketStats");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetBucketStats"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_sr_metrics(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSrMetricsDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetSrMetricsDataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetSRMetrics");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetSRMetrics"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_all_bucket_stats(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetAllBucketStatsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetAllBucketStatsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetAllBucketStats");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetAllBucketStats"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_bucket_metadata(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadBucketMetadataRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadBucketMetadataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LoadBucketMetadata");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LoadBucketMetadata"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_bucket_metadata(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteBucketMetadataRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteBucketMetadataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/DeleteBucketMetadata");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "DeleteBucketMetadata"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_policy(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeletePolicyRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeletePolicyResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/DeletePolicy");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "DeletePolicy"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_policy(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadPolicyRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadPolicyResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LoadPolicy");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LoadPolicy"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_policy_mapping(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadPolicyMappingRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadPolicyMappingResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LoadPolicyMapping");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LoadPolicyMapping"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_user(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteUserRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteUserResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/DeleteUser");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "DeleteUser"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_service_account(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteServiceAccountRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteServiceAccountResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/DeleteServiceAccount");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "DeleteServiceAccount"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_user(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadUserRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadUserResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LoadUser");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LoadUser"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_service_account(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadServiceAccountRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadServiceAccountResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LoadServiceAccount");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LoadServiceAccount"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_group(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadGroupRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadGroupResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LoadGroup");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LoadGroup"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn reload_site_replication_config(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReloadSiteReplicationConfigRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReloadSiteReplicationConfigResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ReloadSiteReplicationConfig");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ReloadSiteReplicationConfig"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// rpc VerifyBinary() returns () {};
+        /// rpc CommitBinary() returns () {};
+        pub async fn signal_service(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SignalServiceRequest>,
+        ) -> std::result::Result<tonic::Response<super::SignalServiceResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/SignalService");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "SignalService"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn background_heal_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BackgroundHealStatusRequest>,
+        ) -> std::result::Result<tonic::Response<super::BackgroundHealStatusResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/BackgroundHealStatus");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "BackgroundHealStatus"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_metacache_listing(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetMetacacheListingRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetMetacacheListingResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GetMetacacheListing");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GetMetacacheListing"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn update_metacache_listing(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateMetacacheListingRequest>,
+        ) -> std::result::Result<tonic::Response<super::UpdateMetacacheListingResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/UpdateMetacacheListing");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "UpdateMetacacheListing"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn reload_pool_meta(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReloadPoolMetaRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReloadPoolMetaResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ReloadPoolMeta");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ReloadPoolMeta"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn stop_rebalance(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StopRebalanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::StopRebalanceResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/StopRebalance");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "StopRebalance"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_rebalance_meta(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadRebalanceMetaRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadRebalanceMetaResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LoadRebalanceMeta");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LoadRebalanceMeta"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn load_transition_tier_config(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LoadTransitionTierConfigRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadTransitionTierConfigResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/LoadTransitionTierConfig");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "LoadTransitionTierConfig"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1476,6 +2453,152 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::GenerallyLockRequest>,
         ) -> std::result::Result<tonic::Response<super::GenerallyLockResponse>, tonic::Status>;
+        async fn local_storage_info(
+            &self,
+            request: tonic::Request<super::LocalStorageInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalStorageInfoResponse>, tonic::Status>;
+        async fn server_info(
+            &self,
+            request: tonic::Request<super::ServerInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::ServerInfoResponse>, tonic::Status>;
+        async fn get_cpus(
+            &self,
+            request: tonic::Request<super::GetCpusRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetCpusResponse>, tonic::Status>;
+        async fn get_net_info(
+            &self,
+            request: tonic::Request<super::GetNetInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetNetInfoResponse>, tonic::Status>;
+        async fn get_partitions(
+            &self,
+            request: tonic::Request<super::GetPartitionsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetPartitionsResponse>, tonic::Status>;
+        async fn get_os_info(
+            &self,
+            request: tonic::Request<super::GetOsInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetOsInfoResponse>, tonic::Status>;
+        async fn get_se_linux_info(
+            &self,
+            request: tonic::Request<super::GetSeLinuxInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetSeLinuxInfoResponse>, tonic::Status>;
+        async fn get_sys_config(
+            &self,
+            request: tonic::Request<super::GetSysConfigRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetSysConfigResponse>, tonic::Status>;
+        async fn get_sys_errors(
+            &self,
+            request: tonic::Request<super::GetSysErrorsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetSysErrorsResponse>, tonic::Status>;
+        async fn get_mem_info(
+            &self,
+            request: tonic::Request<super::GetMemInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetMemInfoResponse>, tonic::Status>;
+        async fn get_metrics(
+            &self,
+            request: tonic::Request<super::GetMetricsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetMetricsResponse>, tonic::Status>;
+        async fn get_proc_info(
+            &self,
+            request: tonic::Request<super::GetProcInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetProcInfoResponse>, tonic::Status>;
+        async fn start_profiling(
+            &self,
+            request: tonic::Request<super::StartProfilingRequest>,
+        ) -> std::result::Result<tonic::Response<super::StartProfilingResponse>, tonic::Status>;
+        async fn download_profile_data(
+            &self,
+            request: tonic::Request<super::DownloadProfileDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::DownloadProfileDataResponse>, tonic::Status>;
+        async fn get_bucket_stats(
+            &self,
+            request: tonic::Request<super::GetBucketStatsDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetBucketStatsDataResponse>, tonic::Status>;
+        async fn get_sr_metrics(
+            &self,
+            request: tonic::Request<super::GetSrMetricsDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetSrMetricsDataResponse>, tonic::Status>;
+        async fn get_all_bucket_stats(
+            &self,
+            request: tonic::Request<super::GetAllBucketStatsRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetAllBucketStatsResponse>, tonic::Status>;
+        async fn load_bucket_metadata(
+            &self,
+            request: tonic::Request<super::LoadBucketMetadataRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadBucketMetadataResponse>, tonic::Status>;
+        async fn delete_bucket_metadata(
+            &self,
+            request: tonic::Request<super::DeleteBucketMetadataRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteBucketMetadataResponse>, tonic::Status>;
+        async fn delete_policy(
+            &self,
+            request: tonic::Request<super::DeletePolicyRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeletePolicyResponse>, tonic::Status>;
+        async fn load_policy(
+            &self,
+            request: tonic::Request<super::LoadPolicyRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadPolicyResponse>, tonic::Status>;
+        async fn load_policy_mapping(
+            &self,
+            request: tonic::Request<super::LoadPolicyMappingRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadPolicyMappingResponse>, tonic::Status>;
+        async fn delete_user(
+            &self,
+            request: tonic::Request<super::DeleteUserRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteUserResponse>, tonic::Status>;
+        async fn delete_service_account(
+            &self,
+            request: tonic::Request<super::DeleteServiceAccountRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteServiceAccountResponse>, tonic::Status>;
+        async fn load_user(
+            &self,
+            request: tonic::Request<super::LoadUserRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadUserResponse>, tonic::Status>;
+        async fn load_service_account(
+            &self,
+            request: tonic::Request<super::LoadServiceAccountRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadServiceAccountResponse>, tonic::Status>;
+        async fn load_group(
+            &self,
+            request: tonic::Request<super::LoadGroupRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadGroupResponse>, tonic::Status>;
+        async fn reload_site_replication_config(
+            &self,
+            request: tonic::Request<super::ReloadSiteReplicationConfigRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReloadSiteReplicationConfigResponse>, tonic::Status>;
+        /// rpc VerifyBinary() returns () {};
+        /// rpc CommitBinary() returns () {};
+        async fn signal_service(
+            &self,
+            request: tonic::Request<super::SignalServiceRequest>,
+        ) -> std::result::Result<tonic::Response<super::SignalServiceResponse>, tonic::Status>;
+        async fn background_heal_status(
+            &self,
+            request: tonic::Request<super::BackgroundHealStatusRequest>,
+        ) -> std::result::Result<tonic::Response<super::BackgroundHealStatusResponse>, tonic::Status>;
+        async fn get_metacache_listing(
+            &self,
+            request: tonic::Request<super::GetMetacacheListingRequest>,
+        ) -> std::result::Result<tonic::Response<super::GetMetacacheListingResponse>, tonic::Status>;
+        async fn update_metacache_listing(
+            &self,
+            request: tonic::Request<super::UpdateMetacacheListingRequest>,
+        ) -> std::result::Result<tonic::Response<super::UpdateMetacacheListingResponse>, tonic::Status>;
+        async fn reload_pool_meta(
+            &self,
+            request: tonic::Request<super::ReloadPoolMetaRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReloadPoolMetaResponse>, tonic::Status>;
+        async fn stop_rebalance(
+            &self,
+            request: tonic::Request<super::StopRebalanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::StopRebalanceResponse>, tonic::Status>;
+        async fn load_rebalance_meta(
+            &self,
+            request: tonic::Request<super::LoadRebalanceMetaRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadRebalanceMetaResponse>, tonic::Status>;
+        async fn load_transition_tier_config(
+            &self,
+            request: tonic::Request<super::LoadTransitionTierConfigRequest>,
+        ) -> std::result::Result<tonic::Response<super::LoadTransitionTierConfigResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct NodeServiceServer<T> {
@@ -2661,6 +3784,1016 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RefreshSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LocalStorageInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct LocalStorageInfoSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LocalStorageInfoRequest> for LocalStorageInfoSvc<T> {
+                        type Response = super::LocalStorageInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LocalStorageInfoRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::local_storage_info(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LocalStorageInfoSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ServerInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct ServerInfoSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ServerInfoRequest> for ServerInfoSvc<T> {
+                        type Response = super::ServerInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ServerInfoRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::server_info(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ServerInfoSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetCpus" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetCpusSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetCpusRequest> for GetCpusSvc<T> {
+                        type Response = super::GetCpusResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetCpusRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_cpus(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetCpusSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetNetInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetNetInfoSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetNetInfoRequest> for GetNetInfoSvc<T> {
+                        type Response = super::GetNetInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetNetInfoRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_net_info(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetNetInfoSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetPartitions" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetPartitionsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetPartitionsRequest> for GetPartitionsSvc<T> {
+                        type Response = super::GetPartitionsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetPartitionsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_partitions(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetPartitionsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetOsInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetOsInfoSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetOsInfoRequest> for GetOsInfoSvc<T> {
+                        type Response = super::GetOsInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetOsInfoRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_os_info(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetOsInfoSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetSELinuxInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSELinuxInfoSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetSeLinuxInfoRequest> for GetSELinuxInfoSvc<T> {
+                        type Response = super::GetSeLinuxInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetSeLinuxInfoRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_se_linux_info(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSELinuxInfoSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetSysConfig" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSysConfigSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetSysConfigRequest> for GetSysConfigSvc<T> {
+                        type Response = super::GetSysConfigResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetSysConfigRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_sys_config(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSysConfigSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetSysErrors" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSysErrorsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetSysErrorsRequest> for GetSysErrorsSvc<T> {
+                        type Response = super::GetSysErrorsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetSysErrorsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_sys_errors(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSysErrorsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetMemInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetMemInfoSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetMemInfoRequest> for GetMemInfoSvc<T> {
+                        type Response = super::GetMemInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetMemInfoRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_mem_info(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetMemInfoSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetMetrics" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetMetricsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetMetricsRequest> for GetMetricsSvc<T> {
+                        type Response = super::GetMetricsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetMetricsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_metrics(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetMetricsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetProcInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetProcInfoSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetProcInfoRequest> for GetProcInfoSvc<T> {
+                        type Response = super::GetProcInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetProcInfoRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_proc_info(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetProcInfoSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/StartProfiling" => {
+                    #[allow(non_camel_case_types)]
+                    struct StartProfilingSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::StartProfilingRequest> for StartProfilingSvc<T> {
+                        type Response = super::StartProfilingResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::StartProfilingRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::start_profiling(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StartProfilingSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/DownloadProfileData" => {
+                    #[allow(non_camel_case_types)]
+                    struct DownloadProfileDataSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::DownloadProfileDataRequest> for DownloadProfileDataSvc<T> {
+                        type Response = super::DownloadProfileDataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::DownloadProfileDataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::download_profile_data(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DownloadProfileDataSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetBucketStats" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetBucketStatsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetBucketStatsDataRequest> for GetBucketStatsSvc<T> {
+                        type Response = super::GetBucketStatsDataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetBucketStatsDataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_bucket_stats(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetBucketStatsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetSRMetrics" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSRMetricsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetSrMetricsDataRequest> for GetSRMetricsSvc<T> {
+                        type Response = super::GetSrMetricsDataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetSrMetricsDataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_sr_metrics(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSRMetricsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetAllBucketStats" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetAllBucketStatsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetAllBucketStatsRequest> for GetAllBucketStatsSvc<T> {
+                        type Response = super::GetAllBucketStatsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetAllBucketStatsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_all_bucket_stats(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetAllBucketStatsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LoadBucketMetadata" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadBucketMetadataSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LoadBucketMetadataRequest> for LoadBucketMetadataSvc<T> {
+                        type Response = super::LoadBucketMetadataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LoadBucketMetadataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::load_bucket_metadata(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadBucketMetadataSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/DeleteBucketMetadata" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteBucketMetadataSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::DeleteBucketMetadataRequest> for DeleteBucketMetadataSvc<T> {
+                        type Response = super::DeleteBucketMetadataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::DeleteBucketMetadataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::delete_bucket_metadata(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteBucketMetadataSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/DeletePolicy" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeletePolicySvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::DeletePolicyRequest> for DeletePolicySvc<T> {
+                        type Response = super::DeletePolicyResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::DeletePolicyRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::delete_policy(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeletePolicySvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LoadPolicy" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadPolicySvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LoadPolicyRequest> for LoadPolicySvc<T> {
+                        type Response = super::LoadPolicyResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LoadPolicyRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::load_policy(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadPolicySvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LoadPolicyMapping" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadPolicyMappingSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LoadPolicyMappingRequest> for LoadPolicyMappingSvc<T> {
+                        type Response = super::LoadPolicyMappingResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LoadPolicyMappingRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::load_policy_mapping(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadPolicyMappingSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/DeleteUser" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteUserSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::DeleteUserRequest> for DeleteUserSvc<T> {
+                        type Response = super::DeleteUserResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::DeleteUserRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::delete_user(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteUserSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/DeleteServiceAccount" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteServiceAccountSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::DeleteServiceAccountRequest> for DeleteServiceAccountSvc<T> {
+                        type Response = super::DeleteServiceAccountResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::DeleteServiceAccountRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::delete_service_account(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteServiceAccountSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LoadUser" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadUserSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LoadUserRequest> for LoadUserSvc<T> {
+                        type Response = super::LoadUserResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LoadUserRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::load_user(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadUserSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LoadServiceAccount" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadServiceAccountSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LoadServiceAccountRequest> for LoadServiceAccountSvc<T> {
+                        type Response = super::LoadServiceAccountResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LoadServiceAccountRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::load_service_account(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadServiceAccountSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LoadGroup" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadGroupSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LoadGroupRequest> for LoadGroupSvc<T> {
+                        type Response = super::LoadGroupResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LoadGroupRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::load_group(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadGroupSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ReloadSiteReplicationConfig" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReloadSiteReplicationConfigSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ReloadSiteReplicationConfigRequest>
+                        for ReloadSiteReplicationConfigSvc<T>
+                    {
+                        type Response = super::ReloadSiteReplicationConfigResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ReloadSiteReplicationConfigRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::reload_site_replication_config(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReloadSiteReplicationConfigSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/SignalService" => {
+                    #[allow(non_camel_case_types)]
+                    struct SignalServiceSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::SignalServiceRequest> for SignalServiceSvc<T> {
+                        type Response = super::SignalServiceResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::SignalServiceRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::signal_service(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SignalServiceSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/BackgroundHealStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct BackgroundHealStatusSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::BackgroundHealStatusRequest> for BackgroundHealStatusSvc<T> {
+                        type Response = super::BackgroundHealStatusResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::BackgroundHealStatusRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::background_heal_status(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BackgroundHealStatusSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GetMetacacheListing" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetMetacacheListingSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GetMetacacheListingRequest> for GetMetacacheListingSvc<T> {
+                        type Response = super::GetMetacacheListingResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GetMetacacheListingRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::get_metacache_listing(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetMetacacheListingSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/UpdateMetacacheListing" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateMetacacheListingSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::UpdateMetacacheListingRequest> for UpdateMetacacheListingSvc<T> {
+                        type Response = super::UpdateMetacacheListingResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::UpdateMetacacheListingRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::update_metacache_listing(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateMetacacheListingSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ReloadPoolMeta" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReloadPoolMetaSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ReloadPoolMetaRequest> for ReloadPoolMetaSvc<T> {
+                        type Response = super::ReloadPoolMetaResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ReloadPoolMetaRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::reload_pool_meta(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReloadPoolMetaSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/StopRebalance" => {
+                    #[allow(non_camel_case_types)]
+                    struct StopRebalanceSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::StopRebalanceRequest> for StopRebalanceSvc<T> {
+                        type Response = super::StopRebalanceResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::StopRebalanceRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::stop_rebalance(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StopRebalanceSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LoadRebalanceMeta" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadRebalanceMetaSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LoadRebalanceMetaRequest> for LoadRebalanceMetaSvc<T> {
+                        type Response = super::LoadRebalanceMetaResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LoadRebalanceMetaRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::load_rebalance_meta(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadRebalanceMetaSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/LoadTransitionTierConfig" => {
+                    #[allow(non_camel_case_types)]
+                    struct LoadTransitionTierConfigSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::LoadTransitionTierConfigRequest> for LoadTransitionTierConfigSvc<T> {
+                        type Response = super::LoadTransitionTierConfigResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::LoadTransitionTierConfigRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::load_transition_tier_config(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LoadTransitionTierConfigSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

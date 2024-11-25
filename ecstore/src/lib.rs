@@ -1,3 +1,4 @@
+pub mod admin_server_info;
 pub mod bitrot;
 pub mod cache_value;
 mod chunk_stream;

@@ -1,36 +1,27 @@
 use std::{error::Error, io::ErrorKind, pin::Pin};
 
 use ecstore::{
+    admin_server_info::get_local_server_property,
     disk::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, Reader,
         UpdateMetadataOpts, WalkDirOptions,
     },
     erasure::Writer,
     heal::{data_usage_cache::DataUsageCache, heal_commands::HealOpts},
+    new_object_layer_fn,
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
-    store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions},
+    store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions, StorageAPI},
 };
 use futures::{Stream, StreamExt};
 use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 
 use protos::{
     models::{PingBody, PingBodyBuilder},
-    proto_gen::node_service::{
-        node_service_server::NodeService as Node, CheckPartsRequest, CheckPartsResponse, DeleteBucketRequest,
-        DeleteBucketResponse, DeletePathsRequest, DeletePathsResponse, DeleteRequest, DeleteResponse, DeleteVersionRequest,
-        DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse,
-        DiskInfoRequest, DiskInfoResponse, GenerallyLockRequest, GenerallyLockResponse, GetBucketInfoRequest,
-        GetBucketInfoResponse, HealBucketRequest, HealBucketResponse, ListBucketRequest, ListBucketResponse, ListDirRequest,
-        ListDirResponse, ListVolumesRequest, ListVolumesResponse, MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest,
-        MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse, NsScannerRequest, NsScannerResponse, PingRequest,
-        PingResponse, ReadAllRequest, ReadAllResponse, ReadAtRequest, ReadAtResponse, ReadMultipleRequest, ReadMultipleResponse,
-        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, RenameDataRequest, RenameDataResponse,
-        RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse, StatVolumeRequest, StatVolumeResponse,
-        UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest, VerifyFileResponse, WalkDirRequest, WalkDirResponse,
-        WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse, WriteRequest, WriteResponse,
-    },
+    proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
+use rmp_serde::{Deserializer, Serializer};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -1505,5 +1496,247 @@ impl Node for NodeService {
                 error_info: Some(format!("can not decode args, err: {}", err)),
             })),
         }
+    }
+
+    async fn local_storage_info(
+        &self,
+        _request: Request<LocalStorageInfoRequest>,
+    ) -> Result<Response<LocalStorageInfoResponse>, Status> {
+        // let request = request.into_inner();
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(LocalStorageInfoResponse {
+                    success: false,
+                    storage_info: vec![],
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
+
+        let info = store.local_storage_info().await;
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(LocalStorageInfoResponse {
+                success: false,
+                storage_info: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+
+        Ok(tonic::Response::new(LocalStorageInfoResponse {
+            success: true,
+            storage_info: buf,
+            error_info: None,
+        }))
+    }
+
+    async fn server_info(&self, _request: Request<ServerInfoRequest>) -> Result<Response<ServerInfoResponse>, Status> {
+        let info = get_local_server_property().await;
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(ServerInfoResponse {
+                success: false,
+                server_properties: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(ServerInfoResponse {
+            success: true,
+            server_properties: buf,
+            error_info: None,
+        }))
+    }
+
+    async fn get_cpus(&self, _request: Request<GetCpusRequest>) -> Result<Response<GetCpusResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_net_info(&self, _request: Request<GetNetInfoRequest>) -> Result<Response<GetNetInfoResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_partitions(&self, _request: Request<GetPartitionsRequest>) -> Result<Response<GetPartitionsResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_os_info(&self, _request: Request<GetOsInfoRequest>) -> Result<Response<GetOsInfoResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_se_linux_info(
+        &self,
+        _request: Request<GetSeLinuxInfoRequest>,
+    ) -> Result<Response<GetSeLinuxInfoResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_sys_config(&self, _request: Request<GetSysConfigRequest>) -> Result<Response<GetSysConfigResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_sys_errors(&self, _request: Request<GetSysErrorsRequest>) -> Result<Response<GetSysErrorsResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_mem_info(&self, _request: Request<GetMemInfoRequest>) -> Result<Response<GetMemInfoResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_metrics(&self, _request: Request<GetMetricsRequest>) -> Result<Response<GetMetricsResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_proc_info(&self, _request: Request<GetProcInfoRequest>) -> Result<Response<GetProcInfoResponse>, Status> {
+        todo!()
+    }
+
+    async fn start_profiling(
+        &self,
+        _request: Request<StartProfilingRequest>,
+    ) -> Result<Response<StartProfilingResponse>, Status> {
+        todo!()
+    }
+
+    async fn download_profile_data(
+        &self,
+        _request: Request<DownloadProfileDataRequest>,
+    ) -> Result<Response<DownloadProfileDataResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_bucket_stats(
+        &self,
+        _request: Request<GetBucketStatsDataRequest>,
+    ) -> Result<Response<GetBucketStatsDataResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_sr_metrics(
+        &self,
+        _request: Request<GetSrMetricsDataRequest>,
+    ) -> Result<Response<GetSrMetricsDataResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_all_bucket_stats(
+        &self,
+        _request: Request<GetAllBucketStatsRequest>,
+    ) -> Result<Response<GetAllBucketStatsResponse>, Status> {
+        todo!()
+    }
+
+    async fn load_bucket_metadata(
+        &self,
+        _request: Request<LoadBucketMetadataRequest>,
+    ) -> Result<Response<LoadBucketMetadataResponse>, Status> {
+        todo!()
+    }
+
+    async fn delete_bucket_metadata(
+        &self,
+        _request: Request<DeleteBucketMetadataRequest>,
+    ) -> Result<Response<DeleteBucketMetadataResponse>, Status> {
+        todo!()
+    }
+
+    async fn delete_policy(&self, _request: Request<DeletePolicyRequest>) -> Result<Response<DeletePolicyResponse>, Status> {
+        todo!()
+    }
+
+    async fn load_policy(&self, _request: Request<LoadPolicyRequest>) -> Result<Response<LoadPolicyResponse>, Status> {
+        todo!()
+    }
+
+    async fn load_policy_mapping(
+        &self,
+        _request: Request<LoadPolicyMappingRequest>,
+    ) -> Result<Response<LoadPolicyMappingResponse>, Status> {
+        todo!()
+    }
+
+    async fn delete_user(&self, _request: Request<DeleteUserRequest>) -> Result<Response<DeleteUserResponse>, Status> {
+        todo!()
+    }
+
+    async fn delete_service_account(
+        &self,
+        _request: Request<DeleteServiceAccountRequest>,
+    ) -> Result<Response<DeleteServiceAccountResponse>, Status> {
+        todo!()
+    }
+
+    async fn load_user(&self, _request: Request<LoadUserRequest>) -> Result<Response<LoadUserResponse>, Status> {
+        todo!()
+    }
+
+    async fn load_service_account(
+        &self,
+        _request: Request<LoadServiceAccountRequest>,
+    ) -> Result<Response<LoadServiceAccountResponse>, Status> {
+        todo!()
+    }
+
+    async fn load_group(&self, _request: Request<LoadGroupRequest>) -> Result<Response<LoadGroupResponse>, Status> {
+        todo!()
+    }
+
+    async fn reload_site_replication_config(
+        &self,
+        _request: Request<ReloadSiteReplicationConfigRequest>,
+    ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
+        todo!()
+    }
+
+    async fn signal_service(&self, _request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
+        todo!()
+    }
+
+    async fn background_heal_status(
+        &self,
+        _request: Request<BackgroundHealStatusRequest>,
+    ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
+        todo!()
+    }
+
+    async fn get_metacache_listing(
+        &self,
+        _request: Request<GetMetacacheListingRequest>,
+    ) -> Result<Response<GetMetacacheListingResponse>, Status> {
+        todo!()
+    }
+
+    async fn update_metacache_listing(
+        &self,
+        _request: Request<UpdateMetacacheListingRequest>,
+    ) -> Result<Response<UpdateMetacacheListingResponse>, Status> {
+        todo!()
+    }
+
+    async fn reload_pool_meta(
+        &self,
+        _request: Request<ReloadPoolMetaRequest>,
+    ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
+        todo!()
+    }
+
+    async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
+        todo!()
+    }
+
+    async fn load_rebalance_meta(
+        &self,
+        _request: Request<LoadRebalanceMetaRequest>,
+    ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
+        todo!()
+    }
+
+    async fn load_transition_tier_config(
+        &self,
+        _request: Request<LoadTransitionTierConfigRequest>,
+    ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
+        todo!()
     }
 }
