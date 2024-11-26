@@ -1,3 +1,4 @@
+mod admin;
 mod config;
 mod grpc;
 mod service;
@@ -84,7 +85,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         );
     }
 
-    set_global_endpoints(endpoint_pools.as_ref().clone()).await;
+    set_global_endpoints(endpoint_pools.as_ref().clone()).map_err(|err| Error::from_string(err.to_string()))?;
     update_erasure_type(setup_type).await;
 
     // 初始化本地磁盘
@@ -114,7 +115,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         b.set_access(store.clone());
 
-        b.set_route(router::make_admin_route()?);
+        b.set_route(admin::make_admin_route()?);
 
         // // Enable parsing virtual-hosted-style requests
         // if let Some(dm) = opt.domain_name {

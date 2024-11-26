@@ -14,7 +14,7 @@ use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
 
-use crate::ADMIN_PREFIX;
+use super::ADMIN_PREFIX;
 
 pub struct S3Router<T> {
     router: Router<T>,

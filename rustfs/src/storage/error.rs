@@ -61,6 +61,7 @@ pub fn to_s3_error(err: Error) -> S3Error {
             StorageError::InsufficientWriteQuorum => {
                 s3_error!(SlowDown, "Storage resources are insufficient for the write operation")
             }
+            StorageError::DecommissionNotStarted => s3_error!(InvalidArgument, "Decommission Not Started"),
         };
     }
 

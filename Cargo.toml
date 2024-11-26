@@ -9,7 +9,7 @@ members = [
     "common/protos",
     "api/admin",
     "reader",
-    "router", "common/workers",
+ "common/workers",
 ]
 
 [workspace.package]

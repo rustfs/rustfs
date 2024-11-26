@@ -26,7 +26,7 @@ pub mod pools;
 pub mod store_err;
 pub mod xhttp;
 
-pub use global::is_legacy;
 pub use global::new_object_layer_fn;
 pub use global::set_global_endpoints;
 pub use global::update_erasure_type;
+pub use global::GLOBAL_Endpoints;

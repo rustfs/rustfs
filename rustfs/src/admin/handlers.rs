@@ -1,12 +1,12 @@
-use std::collections::HashSet;
-
-use crate::router::Operation;
+use super::router::Operation;
+use crate::storage::error::to_s3_error;
 use ecstore::bucket::policy::action::{Action, ActionSet};
 use ecstore::bucket::policy::bucket_policy::{BPStatement, BucketPolicy};
 use ecstore::bucket::policy::effect::Effect;
 use ecstore::bucket::policy::resource::{Resource, ResourceSet};
 use ecstore::store_api::StorageAPI;
 use ecstore::utils::xml;
+use ecstore::GLOBAL_Endpoints;
 use ecstore::{new_object_layer_fn, store_api::BackendInfo};
 use hyper::StatusCode;
 use matchit::Params;
@@ -17,8 +17,10 @@ use s3s::{
 };
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
+use std::collections::HashSet;
 use time::{Duration, OffsetDateTime};
 use tracing::warn;
+
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct AssumeRoleRequest {
@@ -251,21 +253,107 @@ pub struct ListPools {}
 
 #[async_trait::async_trait]
 impl Operation for ListPools {
+    // GET <endpoint>/<admin-API>/pools/list
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListPools");
 
-        return Err(s3_error!(NotImplemented));
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
+        };
+
+        let Some(endpoints) = GLOBAL_Endpoints.get() else {
+            return Err(s3_error!(NotImplemented));
+        };
+
+        if endpoints.legacy() {
+            return Err(s3_error!(NotImplemented));
+        }
+
+        let mut pools_status = Vec::new();
+
+        for (idx, _) in endpoints.as_ref().iter().enumerate() {
+            let state = store.status(idx).await.map_err(to_s3_error)?;
+
+            pools_status.push(state);
+        }
+
+        let output = serde_json::to_string(&pools_status)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
     }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct StatusPoolQuery {
+    pub pool: String,
+    #[serde(rename = "by-id")]
+    pub by_id: String,
 }
 
 pub struct StatusPool {}
 
 #[async_trait::async_trait]
 impl Operation for StatusPool {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    // GET <endpoint>/<admin-API>/pools/status?pool=http://server{1...4}/disk{1...4}
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StatusPool");
 
-        return Err(s3_error!(NotImplemented));
+        let Some(endpoints) = GLOBAL_Endpoints.get() else {
+            return Err(s3_error!(NotImplemented));
+        };
+
+        if endpoints.legacy() {
+            return Err(s3_error!(NotImplemented));
+        }
+
+        let query = {
+            if let Some(query) = req.uri.query() {
+                let input: StatusPoolQuery =
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
+                input
+            } else {
+                StatusPoolQuery::default()
+            }
+        };
+
+        let is_byid = query.by_id.as_str() == "true";
+
+        let has_idx = {
+            if is_byid {
+                let a = query.pool.parse::<usize>().unwrap_or_default();
+                if a < endpoints.as_ref().len() {
+                    Some(a)
+                } else {
+                    None
+                }
+            } else {
+                endpoints.get_pool_idx(&query.pool)
+            }
+        };
+
+        let Some(idx) = has_idx else {
+            warn!("specified pool {} not found, please specify a valid pool", &query.pool);
+            return Err(s3_error!(InvalidArgument));
+        };
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
+        };
+
+        let pools_status = store.status(idx).await.map_err(to_s3_error)?;
+
+        let output = serde_json::to_string(&pools_status)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
     }
 }
 
@@ -273,6 +361,7 @@ pub struct StartDecommission {}
 
 #[async_trait::async_trait]
 impl Operation for StartDecommission {
+    // POST <endpoint>/<admin-API>/pools/decommission?pool=http://server{1...4}/disk{1...4}
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StartDecommission");
 
@@ -284,8 +373,57 @@ pub struct CancelDecommission {}
 
 #[async_trait::async_trait]
 impl Operation for CancelDecommission {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    // POST <endpoint>/<admin-API>/pools/cancel?pool=http://server{1...4}/disk{1...4}
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle CancelDecommission");
+
+        let Some(endpoints) = GLOBAL_Endpoints.get() else {
+            return Err(s3_error!(NotImplemented));
+        };
+
+        if endpoints.legacy() {
+            return Err(s3_error!(NotImplemented));
+        }
+
+        let query = {
+            if let Some(query) = req.uri.query() {
+                let input: StatusPoolQuery =
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
+                input
+            } else {
+                StatusPoolQuery::default()
+            }
+        };
+
+        let is_byid = query.by_id.as_str() == "true";
+
+        let has_idx = {
+            if is_byid {
+                let a = query.pool.parse::<usize>().unwrap_or_default();
+                if a < endpoints.as_ref().len() {
+                    Some(a)
+                } else {
+                    None
+                }
+            } else {
+                endpoints.get_pool_idx(&query.pool)
+            }
+        };
+
+        let Some(_idx) = has_idx else {
+            warn!("specified pool {} not found, please specify a valid pool", &query.pool);
+            return Err(s3_error!(InvalidArgument));
+        };
+
+        let layer = new_object_layer_fn();
+        let lock = layer.write().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
+        };
+
+        // FIXME:
+        // store.decommission_cancel(idx).await;
 
         return Err(s3_error!(NotImplemented));
     }
