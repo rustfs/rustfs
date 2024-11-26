@@ -24,7 +24,7 @@ use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -134,7 +134,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     };
 
     let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
-    info!(" init store success!");
 
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
@@ -184,7 +183,11 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(|err| Error::from_string(err.to_string()))?;
 
-    store.init().await.map_err(|err| Error::from_string(err.to_string()))?;
+    store.init().await.map_err(|err| {
+        error!("init faild {:?}", &err);
+        Error::from_string(err.to_string())
+    })?;
+    warn!(" init store success!");
     // init scanner
     init_data_scanner().await;
 
