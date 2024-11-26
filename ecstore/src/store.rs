@@ -77,6 +77,7 @@ pub struct ECStore {
     pub peer_sys: S3PeerSys,
     // pub local_disks: Vec<DiskStore>,
     pub pool_meta: PoolMeta,
+    pub decommission_cancelers: Vec<Option<usize>>,
 }
 
 impl ECStore {
@@ -197,12 +198,14 @@ impl ECStore {
         let mut pool_meta = PoolMeta::new(pools.clone());
         pool_meta.dont_save = true;
 
+        let decommission_cancelers = vec![None; pools.len()];
         let ec = ECStore {
             id: deployment_id.unwrap(),
             disk_map,
             pools,
             peer_sys,
             pool_meta,
+            decommission_cancelers,
         };
 
         set_object_layer(ec.clone()).await;
@@ -239,7 +242,7 @@ impl ECStore {
     //     self.local_disks.clone()
     // }
 
-    fn single_pool(&self) -> bool {
+    pub fn single_pool(&self) -> bool {
         self.pools.len() == 1
     }
 

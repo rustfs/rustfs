@@ -71,6 +71,9 @@ pub enum StorageError {
 
     #[error("Storage resources are insufficient for the write operation")]
     InsufficientWriteQuorum,
+
+    #[error("Decommission not started")]
+    DecommissionNotStarted,
 }
 
 pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {

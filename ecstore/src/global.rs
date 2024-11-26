@@ -1,11 +1,15 @@
 use lazy_static::lazy_static;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
+    error::{Error, Result},
     heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState},
     store::ECStore,
 };
@@ -23,7 +27,7 @@ lazy_static! {
     pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
-    pub static ref GLOBAL_Endpoints: RwLock<EndpointServerPools> = RwLock::new(EndpointServerPools(Vec::new()));
+    pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
     pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
     pub static ref GLOBAL_BackgroundHealRoutine: Arc<RwLock<HealRoutine>> = HealRoutine::new();
     pub static ref GLOBAL_BackgroundHealState: Arc<RwLock<AllHealState>> = AllHealState::new(false);
@@ -40,9 +44,11 @@ pub async fn get_global_deployment_id() -> Uuid {
     *id_ptr
 }
 
-pub async fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
-    let mut endpoints = GLOBAL_Endpoints.write().await;
-    endpoints.reset(eps);
+pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) -> Result<()> {
+    GLOBAL_Endpoints
+        .set(EndpointServerPools::from(eps))
+        .map_err(|_| Error::msg("GLOBAL_Endpoints set faild"))?;
+    Ok(())
 }
 
 pub fn new_object_layer_fn() -> Arc<RwLock<Option<ECStore>>> {
@@ -84,10 +90,12 @@ pub async fn update_erasure_type(setup_type: SetupType) {
     *is_erasure_sd = setup_type == SetupType::ErasureSD;
 }
 
-pub async fn is_legacy() -> bool {
-    let lock = GLOBAL_Endpoints.read().await;
-    let endpoints = lock.as_ref();
-    endpoints.len() == 1 && endpoints[0].legacy
-}
+// pub fn is_legacy() -> bool {
+//     if let Some(endpoints) = GLOBAL_Endpoints.get() {
+//         endpoints.as_ref().len() == 1 && endpoints.as_ref()[0].legacy
+//     } else {
+//         false
+//     }
+// }
 
 type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;

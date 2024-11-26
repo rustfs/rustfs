@@ -149,8 +149,11 @@ impl BucketMetadataSys {
     }
     async fn init_internal(&self, buckets: Vec<String>) -> Result<()> {
         let count = {
-            let endpoints = GLOBAL_Endpoints.read().await;
-            endpoints.es_count() * 10
+            if let Some(endpoints) = GLOBAL_Endpoints.get() {
+                endpoints.es_count() * 10
+            } else {
+                return Err(Error::msg("GLOBAL_Endpoints not init"));
+            }
         };
 
         let mut failed_buckets: HashSet<String> = HashSet::new();
