@@ -41,7 +41,6 @@ use crate::{
     },
     store_init, utils,
 };
-use backon::{ExponentialBuilder, Retryable};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
 use glob::Pattern;
@@ -51,6 +50,7 @@ use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use s3s::{S3Error, S3ErrorCode};
 use std::cmp::Ordering;
+use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
 use std::{
@@ -61,7 +61,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio::time::interval;
+use tokio::time::{interval, sleep};
 use tokio::{fs, select};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -126,22 +126,39 @@ impl ECStore {
 
             DiskError::check_disk_fatal_errs(&errs)?;
 
-            let fm = (|| async {
-                store_init::connect_load_init_formats(
-                    first_is_local,
-                    &disks,
-                    pool_eps.set_count,
-                    pool_eps.drives_per_set,
-                    deployment_id,
-                )
-                .await
-            })
-            .retry(ExponentialBuilder::default().with_max_times(usize::MAX))
-            .sleep(tokio::time::sleep)
-            .notify(|err, dur: Duration| {
-                info!("retrying get formats {:?} after {:?}", err, dur);
-            })
-            .await?;
+            let fm = {
+                let mut times = 0;
+                let mut interval = 1;
+                loop {
+                    if let Ok(fm) = store_init::connect_load_init_formats(
+                        first_is_local,
+                        &disks,
+                        pool_eps.set_count,
+                        pool_eps.drives_per_set,
+                        deployment_id,
+                    )
+                    .await
+                    {
+                        break fm;
+                    }
+                    times += 1;
+                    if interval < 16 {
+                        interval *= 2;
+                    }
+                    if times > 10 {
+                        return Err(Error::from_string("can not get formats"));
+                    }
+                    info!("retrying get formats after {:?}", interval);
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("got ctrl+c, exits");
+                            exit(0);
+                        }
+                        _ = sleep(Duration::from_secs(interval)) => {
+                        }
+                    }
+                }
+            };
 
             if deployment_id.is_none() {
                 deployment_id = Some(fm.id);

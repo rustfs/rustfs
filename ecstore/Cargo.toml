@@ -47,7 +47,7 @@ sha2 = { version = "0.11.0-pre.4" }
 hex-simd = "0.8.0"
 path-clean = "1.0.1"
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync"] }
+tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
 tokio-stream = "0.1.15"
 tonic.workspace = true
 tower.workspace = true
