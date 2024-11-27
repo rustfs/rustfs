@@ -55,7 +55,7 @@ use std::slice::Iter;
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, RwLock as std_RwLock},
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -68,7 +68,7 @@ use uuid::Uuid;
 
 const MAX_UPLOADS_LIST: usize = 10000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ECStore {
     pub id: uuid::Uuid,
     // pub disks: Vec<DiskStore>,
@@ -76,8 +76,25 @@ pub struct ECStore {
     pub pools: Vec<Arc<Sets>>,
     pub peer_sys: S3PeerSys,
     // pub local_disks: Vec<DiskStore>,
-    pub pool_meta: PoolMeta,
+    pub pool_meta: std_RwLock<PoolMeta>,
     pub decommission_cancelers: Vec<Option<usize>>,
+}
+
+impl Clone for ECStore {
+    fn clone(&self) -> Self {
+        let pool_meta = match self.pool_meta.read() {
+            Ok(pool_meta) => pool_meta.clone(),
+            Err(_) => PoolMeta::default(),
+        };
+        Self {
+            id: self.id.clone(),
+            disk_map: self.disk_map.clone(),
+            pools: self.pools.clone(),
+            peer_sys: self.peer_sys.clone(),
+            pool_meta: std_RwLock::new(pool_meta),
+            decommission_cancelers: self.decommission_cancelers.clone(),
+        }
+    }
 }
 
 impl ECStore {
@@ -189,7 +206,7 @@ impl ECStore {
         if !is_dist_erasure().await {
             let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
             for disk in local_disks {
-                let path = disk.path().to_string_lossy().to_string();
+                let path = disk.endpoint().to_string();
                 global_local_disk_map.insert(path, Some(disk.clone()));
             }
         }
@@ -204,7 +221,7 @@ impl ECStore {
             disk_map,
             pools,
             peer_sys,
-            pool_meta,
+            pool_meta: pool_meta.into(),
             decommission_cancelers,
         };
 
@@ -480,7 +497,10 @@ impl ECStore {
 
     fn is_suspended(&self, idx: usize) -> bool {
         // TODO: LOCK
-        self.pool_meta.is_suspended(idx)
+        match self.pool_meta.read() {
+            Ok(pool_meta) => pool_meta.is_suspended(idx),
+            Err(_) => false,
+        }
     }
 
     async fn get_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Result<usize> {
@@ -575,7 +595,7 @@ impl ECStore {
         let mut has_def_pool = false;
 
         for pinfo in ress.iter() {
-            if opts.skip_decommissioned && self.pool_meta.is_suspended(pinfo.index) {
+            if opts.skip_decommissioned && self.pool_meta.read().unwrap().is_suspended(pinfo.index) {
                 continue;
             }
 
@@ -616,7 +636,7 @@ impl ECStore {
     fn pools_with_object(&self, pools: &Vec<PoolObjInfo>, opts: &ObjectOptions) -> Vec<PoolErr> {
         let mut errs = Vec::new();
         for pool in pools.iter() {
-            if opts.skip_decommissioned && self.pool_meta.is_suspended(pool.index) {
+            if opts.skip_decommissioned && self.pool_meta.read().unwrap().is_suspended(pool.index) {
                 continue;
             }
             // TODO:SkipRebalancing
@@ -869,6 +889,13 @@ impl ECStore {
 
         Ok(objs[0].as_ref().unwrap().clone())
     }
+
+    pub async fn reload_pool_meta(&self) -> Result<()> {
+        let mut meta = PoolMeta::default();
+        meta.load(self).await?;
+        *self.pool_meta.write().unwrap() = meta;
+        Ok(())
+    }
 }
 
 async fn update_scan(
@@ -965,7 +992,7 @@ pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()>
 
             let disk = new_disk(ep, opt).await?;
 
-            let path = disk.path().to_string_lossy().to_string();
+            let path = disk.endpoint().to_string();
 
             global_local_disk_map.insert(path, Some(disk.clone()));
 

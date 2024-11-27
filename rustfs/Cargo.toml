@@ -9,6 +9,7 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+madmin.workspace = true
 log.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
@@ -31,7 +32,9 @@ prost.workspace = true
 prost-types.workspace = true
 protos.workspace = true
 protobuf.workspace = true
+rmp-serde.workspace = true
 s3s.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting"] }
@@ -51,13 +54,13 @@ tracing-error.workspace = true
 tracing-subscriber.workspace = true
 transform-stream.workspace = true
 uuid = "1.11.0"
+url.workspace = true
 admin = { path = "../api/admin" }
 axum.workspace = true
 matchit = "0.8.4"
 shadow-rs = "0.35.2"
 const-str = { version = "0.5.7", features = ["std", "proc"] }
 atoi = "2.0.0"
-serde.workspace = true
 serde_urlencoded = "0.7.1"
 
 [build-dependencies]

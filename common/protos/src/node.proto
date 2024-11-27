@@ -411,8 +411,325 @@ message GenerallyLockRequest {
 }
 
 message GenerallyLockResponse {
-    bool success = 1;
-    optional string error_info = 2;
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message Mss {
+  map<string, string> value = 1;
+}
+
+message LocalStorageInfoRequest {
+  bool metrics = 1;
+}
+
+message LocalStorageInfoResponse {
+  bool success = 1;
+  bytes storage_info = 2;
+  optional string error_info = 3;
+}
+
+message ServerInfoRequest {
+  bool metrics = 1;
+}
+
+message ServerInfoResponse {
+  bool success = 1;
+  bytes server_properties = 2;
+  optional string error_info = 3;
+}
+
+message GetCpusRequest {}
+
+message GetCpusResponse {
+  bool success = 1;
+  bytes cpus = 2;
+  optional string error_info = 3;
+}
+
+message GetNetInfoRequest {}
+
+message GetNetInfoResponse {
+  bool success = 1;
+  bytes net_info = 2;
+  optional string error_info = 3;
+}
+
+message GetPartitionsRequest {}
+
+message GetPartitionsResponse {
+  bool success = 1;
+  bytes partitions = 2;
+  optional string error_info = 3;
+}
+
+message GetOsInfoRequest {}
+
+message GetOsInfoResponse {
+  bool success = 1;
+  bytes os_info = 2;
+  optional string error_info = 3;
+}
+
+message GetSELinuxInfoRequest {}
+
+message GetSELinuxInfoResponse {
+  bool success = 1;
+  bytes sys_services = 2;
+  optional string error_info = 3;
+}
+
+message GetSysConfigRequest {}
+
+message GetSysConfigResponse {
+  bool success = 1;
+  bytes sys_config = 2;
+  optional string error_info = 3;
+}
+
+message GetSysErrorsRequest {}
+
+message GetSysErrorsResponse {
+  bool success = 1;
+  bytes sys_errors = 2;
+  optional string error_info = 3;
+}
+
+message GetMemInfoRequest {}
+
+message GetMemInfoResponse {
+  bool success = 1;
+  bytes mem_info = 2;
+  optional string error_info = 3;
+}
+
+message GetMetricsRequest {
+  uint64 metric_type = 1;
+  bytes opts = 2;
+}
+
+message GetMetricsResponse {
+  bool success = 1;
+  bytes realtime_metrics = 2;
+  optional string error_info = 3;
+}
+
+message GetProcInfoRequest {}
+
+message GetProcInfoResponse {
+  bool success = 1;
+  bytes proc_info = 2;
+  optional string error_info = 3;
+}
+
+message StartProfilingRequest {
+  string profiler = 1;
+}
+
+message StartProfilingResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message DownloadProfileDataRequest {}
+
+message DownloadProfileDataResponse {
+  bool success = 1;
+  map<string, bytes> data = 2;
+  optional string error_info = 3;
+}
+
+message GetBucketStatsDataRequest {
+  string bucket = 1;
+}
+
+message GetBucketStatsDataResponse {
+  bool success = 1;
+  bytes bucket_stats = 2;
+  optional string error_info = 3;
+}
+
+message GetSRMetricsDataRequest {}
+
+message GetSRMetricsDataResponse {
+  bool success = 1;
+  bytes sr_metrics_summary = 2;
+  optional string error_info = 3;
+}
+
+message GetAllBucketStatsRequest {}
+
+message GetAllBucketStatsResponse {
+  bool success = 1;
+  bytes bucket_stats_map = 2;
+  optional string error_info = 3;
+}
+
+message LoadBucketMetadataRequest {
+  string bucket = 1;
+}
+
+message LoadBucketMetadataResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message DeleteBucketMetadataRequest {
+  string bucket = 1;
+}
+
+message DeleteBucketMetadataResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message DeletePolicyRequest {
+  string policy_name = 1;
+}
+
+message DeletePolicyResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message LoadPolicyRequest {
+  string policy_name = 1;
+}
+
+message LoadPolicyResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message LoadPolicyMappingRequest {
+  string user_or_group = 1;
+  uint64 user_type = 2;
+  bool is_group = 3;
+}
+
+message LoadPolicyMappingResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message DeleteUserRequest {
+  string access_key = 1;
+}
+
+message DeleteUserResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message DeleteServiceAccountRequest {
+  string access_key = 1;
+}
+
+message DeleteServiceAccountResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message LoadUserRequest {
+  string access_key = 1;
+  bool temp = 2;
+}
+
+message LoadUserResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message LoadServiceAccountRequest {
+  string access_key = 1;
+}
+
+message LoadServiceAccountResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message LoadGroupRequest {
+  string group = 1;
+}
+
+message LoadGroupResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message ReloadSiteReplicationConfigRequest {}
+
+message ReloadSiteReplicationConfigResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message SignalServiceRequest {
+  Mss vars = 1;
+}
+
+message SignalServiceResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message BackgroundHealStatusRequest {}
+
+message BackgroundHealStatusResponse {
+  bool success = 1;
+  bytes bg_heal_state = 2;
+  optional string error_info = 3;
+}
+
+message GetMetacacheListingRequest {
+  bytes opts = 1;
+}
+
+message GetMetacacheListingResponse {
+  bool success = 1;
+  bytes metacache = 2;
+  optional string error_info = 3;
+}
+
+message UpdateMetacacheListingRequest {
+  bytes metacache = 1;
+}
+
+message UpdateMetacacheListingResponse {
+  bool success = 1;
+  bytes metacache = 2;
+  optional string error_info = 3;
+}
+
+message ReloadPoolMetaRequest {}
+
+message ReloadPoolMetaResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message StopRebalanceRequest {}
+
+message StopRebalanceResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message LoadRebalanceMetaRequest {
+  bool start_rebalance = 1;
+}
+
+message LoadRebalanceMetaResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message LoadTransitionTierConfigRequest {}
+
+message LoadTransitionTierConfigResponse {
+  bool success = 1;
+  optional string error_info = 2;
 }
 
 /* -------------------------------------------------------------------- */
@@ -466,4 +783,45 @@ service NodeService {
   rpc RUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc ForceUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc Refresh(GenerallyLockRequest) returns (GenerallyLockResponse) {};
+
+/* -------------------------------peer rest service-------------------------- */
+
+  rpc LocalStorageInfo(LocalStorageInfoRequest) returns (LocalStorageInfoResponse) {};
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse) {};
+  rpc GetCpus(GetCpusRequest) returns (GetCpusResponse) {};
+  rpc GetNetInfo(GetNetInfoRequest) returns (GetNetInfoResponse) {};
+  rpc GetPartitions(GetPartitionsRequest) returns (GetPartitionsResponse) {};
+  rpc GetOsInfo(GetOsInfoRequest) returns (GetOsInfoResponse) {};
+  rpc GetSELinuxInfo(GetSELinuxInfoRequest) returns (GetSELinuxInfoResponse) {};
+  rpc GetSysConfig(GetSysConfigRequest) returns (GetSysConfigResponse) {};
+  rpc GetSysErrors(GetSysErrorsRequest) returns (GetSysErrorsResponse) {};
+  rpc GetMemInfo(GetMemInfoRequest) returns (GetMemInfoResponse) {};
+  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse) {};
+  rpc GetProcInfo(GetProcInfoRequest) returns (GetProcInfoResponse) {};
+  rpc StartProfiling(StartProfilingRequest) returns (StartProfilingResponse) {};
+  rpc DownloadProfileData(DownloadProfileDataRequest) returns (DownloadProfileDataResponse) {};
+  rpc GetBucketStats(GetBucketStatsDataRequest) returns (GetBucketStatsDataResponse) {};
+  rpc GetSRMetrics(GetSRMetricsDataRequest) returns (GetSRMetricsDataResponse) {};
+  rpc GetAllBucketStats(GetAllBucketStatsRequest) returns (GetAllBucketStatsResponse) {};
+  rpc LoadBucketMetadata(LoadBucketMetadataRequest) returns (LoadBucketMetadataResponse) {};
+  rpc DeleteBucketMetadata(DeleteBucketMetadataRequest) returns (DeleteBucketMetadataResponse) {};
+  rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse) {};
+  rpc LoadPolicy(LoadPolicyRequest) returns (LoadPolicyResponse) {};
+  rpc LoadPolicyMapping(LoadPolicyMappingRequest) returns (LoadPolicyMappingResponse) {};
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse) {};
+  rpc DeleteServiceAccount(DeleteServiceAccountRequest) returns (DeleteServiceAccountResponse) {};
+  rpc LoadUser(LoadUserRequest) returns (LoadUserResponse) {};
+  rpc LoadServiceAccount(LoadServiceAccountRequest) returns (LoadServiceAccountResponse) {};
+  rpc LoadGroup(LoadGroupRequest) returns (LoadGroupResponse) {};
+  rpc ReloadSiteReplicationConfig(ReloadSiteReplicationConfigRequest) returns (ReloadSiteReplicationConfigResponse) {};
+  // rpc VerifyBinary() returns () {};
+  // rpc CommitBinary() returns () {};
+  rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {};
+  rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {};
+  rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {};
+  rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {};
+  rpc ReloadPoolMeta(ReloadPoolMetaRequest) returns (ReloadPoolMetaResponse) {};
+  rpc StopRebalance(StopRebalanceRequest) returns (StopRebalanceResponse) {};
+  rpc LoadRebalanceMeta(LoadRebalanceMetaRequest) returns (LoadRebalanceMetaResponse) {};
+  rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {};
 }
