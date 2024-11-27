@@ -206,7 +206,7 @@ impl ECStore {
         if !is_dist_erasure().await {
             let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
             for disk in local_disks {
-                let path = disk.path().to_string_lossy().to_string();
+                let path = disk.endpoint().to_string();
                 global_local_disk_map.insert(path, Some(disk.clone()));
             }
         }
@@ -992,7 +992,7 @@ pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()>
 
             let disk = new_disk(ep, opt).await?;
 
-            let path = disk.path().to_string_lossy().to_string();
+            let path = disk.endpoint().to_string();
 
             global_local_disk_map.insert(path, Some(disk.clone()));
 
