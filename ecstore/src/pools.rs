@@ -1,12 +1,22 @@
+use crate::config::common::{read_config, save_config};
+use crate::config::error::ConfigError;
 use crate::error::{Error, Result};
+use crate::new_object_layer_fn;
 use crate::store_api::{StorageAPI, StorageDisk, StorageInfo};
 use crate::store_err::StorageError;
 use crate::{sets::Sets, store::ECStore};
-use serde::Serialize;
+use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use rmp_serde::{Deserializer, Serializer};
+use serde::{Deserialize, Serialize};
+use std::io::{Cursor, Write};
 use std::sync::Arc;
 use time::OffsetDateTime;
 
-#[derive(Debug, Clone, Serialize)]
+pub const POOL_META_NAME: &str = "pool.bin";
+pub const POOL_META_FORMAT: u16 = 1;
+pub const POOL_META_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolStatus {
     pub id: usize,
     pub cmd_line: String,
@@ -14,8 +24,9 @@ pub struct PoolStatus {
     pub decommission: Option<PoolDecommissionInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PoolMeta {
+    pub version: u16,
     pub pools: Vec<PoolStatus>,
     pub dont_save: bool,
 }
@@ -33,6 +44,7 @@ impl PoolMeta {
         }
 
         Self {
+            version: POOL_META_VERSION,
             pools: status,
             dont_save: false,
         }
@@ -44,6 +56,62 @@ impl PoolMeta {
         }
 
         self.pools[idx].decommission.is_some()
+    }
+
+    pub async fn load(&mut self, store: &ECStore) -> Result<()> {
+        let data = match read_config(store, POOL_META_NAME).await {
+            Ok(data) => {
+                if data.is_empty() {
+                    return Ok(());
+                } else if data.len() <= 4 {
+                    return Err(Error::from_string("poolMeta: no data"));
+                }
+                data
+            }
+            Err(err) => {
+                if let Some(ConfigError::NotFound) = err.downcast_ref::<ConfigError>() {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
+        let format = LittleEndian::read_u16(&data[0..2]);
+        if format != POOL_META_FORMAT {
+            return Err(Error::msg(format!("PoolMeta: unknown format: {}", format)));
+        }
+        let version = LittleEndian::read_u16(&data[2..4]);
+        if version != POOL_META_VERSION {
+            return Err(Error::msg(format!("PoolMeta: unknown version: {}", version)));
+        }
+
+        let mut buf = Deserializer::new(Cursor::new(&data[4..]));
+        let meta: PoolMeta = Deserialize::deserialize(&mut buf).unwrap();
+        *self = meta;
+
+        if self.version != POOL_META_VERSION {
+            return Err(Error::msg(format!("unexpected PoolMeta version: {}", self.version)));
+        }
+        Ok(())
+    }
+
+    pub async fn save(&self) -> Result<()> {
+        if self.dont_save {
+            return Ok(());
+        }
+        let mut data = Vec::new();
+        data.write_u16::<LittleEndian>(POOL_META_FORMAT).unwrap();
+        data.write_u16::<LittleEndian>(POOL_META_VERSION).unwrap();
+        let mut buf = Vec::new();
+        self.serialize(&mut Serializer::new(&mut buf))?;
+        data.write_all(&buf)?;
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => return Err(Error::from_string("errServerNotInitialized".to_string())),
+        };
+        save_config(store, &POOL_META_NAME, &data).await
     }
 
     pub fn decommission_cancel(&mut self, idx: usize) -> bool {
@@ -72,7 +140,7 @@ impl PoolMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PoolDecommissionInfo {
     pub start_time: Option<OffsetDateTime>,
     pub start_size: usize,
@@ -103,7 +171,7 @@ pub struct PoolSpaceInfo {
 impl ECStore {
     pub async fn status(&self, idx: usize) -> Result<PoolStatus> {
         let space_info = self.get_decommission_pool_space_info(idx).await?;
-        let mut pool_info = self.pool_meta.pools[idx].clone();
+        let mut pool_info = self.pool_meta.read().unwrap().pools[idx].clone();
         if let Some(d) = pool_info.decommission.as_mut() {
             d.total_size = space_info.total;
             d.current_size = space_info.free;
@@ -149,7 +217,7 @@ impl ECStore {
             return Err(Error::new(StorageError::DecommissionNotStarted));
         }
 
-        if self.pool_meta.decommission_cancel(idx) {
+        if self.pool_meta.write().unwrap().decommission_cancel(idx) {
             // FIXME:
         }
 
@@ -181,4 +249,34 @@ fn get_total_usable_capacity_free(disks: &Vec<StorageDisk>, info: &StorageInfo) 
         }
     }
     capacity
+}
+
+#[test]
+fn test_pool_meta() -> Result<()> {
+    let meta = PoolMeta::new(vec![]);
+    let mut data = Vec::new();
+    data.write_u16::<LittleEndian>(POOL_META_FORMAT).unwrap();
+    data.write_u16::<LittleEndian>(POOL_META_VERSION).unwrap();
+    let mut buf = Vec::new();
+    meta.serialize(&mut Serializer::new(&mut buf))?;
+    data.write_all(&buf)?;
+
+    let format = LittleEndian::read_u16(&data[0..2]);
+    if format != POOL_META_FORMAT {
+        return Err(Error::msg(format!("PoolMeta: unknown format: {}", format)));
+    }
+    let version = LittleEndian::read_u16(&data[2..4]);
+    if version != POOL_META_VERSION {
+        return Err(Error::msg(format!("PoolMeta: unknown version: {}", version)));
+    }
+
+    let mut buf = Deserializer::new(Cursor::new(&data[4..]));
+    let de_meta: PoolMeta = Deserialize::deserialize(&mut buf).unwrap();
+
+    if de_meta.version != POOL_META_VERSION {
+        return Err(Error::msg(format!("unexpected PoolMeta version: {}", de_meta.version)));
+    }
+
+    println!("meta: {:?}", de_meta);
+    Ok(())
 }

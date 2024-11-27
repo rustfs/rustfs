@@ -30,13 +30,7 @@ pub struct Endpoint {
 impl Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.url.scheme() == "file" {
-            write!(
-                f,
-                "{}",
-                fs::canonicalize(self.url.path())
-                    .map_err(|_| std::fmt::Error)?
-                    .to_string_lossy()
-            )
+            write!(f, "{}", self.url.path())
         } else {
             write!(f, "{}", self.url)
         }
