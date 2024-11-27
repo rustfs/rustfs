@@ -1,6 +1,7 @@
 mod admin;
 mod config;
 mod grpc;
+#[allow(dead_code)]
 mod peer_rest_client;
 mod service;
 mod storage;

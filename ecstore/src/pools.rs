@@ -171,7 +171,7 @@ pub struct PoolSpaceInfo {
 impl ECStore {
     pub async fn status(&self, idx: usize) -> Result<PoolStatus> {
         let space_info = self.get_decommission_pool_space_info(idx).await?;
-        let mut pool_info = self.pool_meta.pools[idx].clone();
+        let mut pool_info = self.pool_meta.read().unwrap().pools[idx].clone();
         if let Some(d) = pool_info.decommission.as_mut() {
             d.total_size = space_info.total;
             d.current_size = space_info.free;
@@ -217,7 +217,7 @@ impl ECStore {
             return Err(Error::new(StorageError::DecommissionNotStarted));
         }
 
-        if self.pool_meta.decommission_cancel(idx) {
+        if self.pool_meta.write().unwrap().decommission_cancel(idx) {
             // FIXME:
         }
 
@@ -225,11 +225,15 @@ impl ECStore {
     }
 }
 
-fn _get_total_usable_capacity(disks: &Vec<StorageDisk>, _info: &StorageInfo) -> usize {
-    for _disk in disks.iter() {
-        // if disk.pool_index < 0 || info.backend.standard_scdata.len() <= disk.pool_index {
-        //     continue;
-        // }
+fn get_total_usable_capacity(disks: &Vec<StorageDisk>, info: &StorageInfo) -> usize {
+    let mut capacity = 0;
+    for disk in disks.iter() {
+        if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
+            continue;
+        }
+        if (disk.disk_index as usize) < info.backend.standard_sc_data[disk.pool_index as usize] {
+            capacity += disk.total_space as usize;
+        }
     }
     capacity
 }
