@@ -1,7 +1,14 @@
-use std::{error::Error, io::ErrorKind, pin::Pin};
+use std::{
+    collections::HashMap,
+    error::Error,
+    io::{Cursor, ErrorKind},
+    pin::Pin,
+    sync::Arc,
+};
 
 use ecstore::{
     admin_server_info::get_local_server_property,
+    bucket::{metadata::load_bucket_metadata, metadata_sys::GLOBAL_BucketMetadataSys},
     disk::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, Reader,
         UpdateMetadataOpts, WalkDirOptions,
@@ -16,7 +23,15 @@ use ecstore::{
 use futures::{Stream, StreamExt};
 use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 
-use madmin::health::get_cpus;
+use common::globals::GLOBAL_Local_Node_Name;
+use madmin::net::net_linux::get_net_info;
+use madmin::{
+    heal_command::get_local_background_heal_status,
+    health::{
+        get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
+    },
+    metrics::{collect_local_metrics, CollectMetricsOpts},
+};
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
@@ -1569,42 +1584,168 @@ impl Node for NodeService {
     }
 
     async fn get_net_info(&self, _request: Request<GetNetInfoRequest>) -> Result<Response<GetNetInfoResponse>, Status> {
-        todo!()
+        let addr = GLOBAL_Local_Node_Name.read().await.clone();
+        let info = get_net_info(&addr, "");
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetNetInfoResponse {
+                success: false,
+                net_info: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetNetInfoResponse {
+            success: true,
+            net_info: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_partitions(&self, _request: Request<GetPartitionsRequest>) -> Result<Response<GetPartitionsResponse>, Status> {
-        todo!()
+        let partitions = get_partitions();
+        let mut buf = Vec::new();
+        if let Err(err) = partitions.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetPartitionsResponse {
+                success: false,
+                partitions: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetPartitionsResponse {
+            success: true,
+            partitions: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_os_info(&self, _request: Request<GetOsInfoRequest>) -> Result<Response<GetOsInfoResponse>, Status> {
-        todo!()
+        let os_info = get_os_info();
+        let mut buf = Vec::new();
+        if let Err(err) = os_info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetOsInfoResponse {
+                success: false,
+                os_info: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetOsInfoResponse {
+            success: true,
+            os_info: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_se_linux_info(
         &self,
         _request: Request<GetSeLinuxInfoRequest>,
     ) -> Result<Response<GetSeLinuxInfoResponse>, Status> {
-        todo!()
+        let addr = GLOBAL_Local_Node_Name.read().await.clone();
+        let info = get_sys_services(&addr);
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetSeLinuxInfoResponse {
+                success: false,
+                sys_services: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetSeLinuxInfoResponse {
+            success: true,
+            sys_services: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_sys_config(&self, _request: Request<GetSysConfigRequest>) -> Result<Response<GetSysConfigResponse>, Status> {
-        todo!()
+        let addr = GLOBAL_Local_Node_Name.read().await.clone();
+        let info = get_sys_config(&addr);
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetSysConfigResponse {
+                success: false,
+                sys_config: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetSysConfigResponse {
+            success: true,
+            sys_config: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_sys_errors(&self, _request: Request<GetSysErrorsRequest>) -> Result<Response<GetSysErrorsResponse>, Status> {
-        todo!()
+        let addr = GLOBAL_Local_Node_Name.read().await.clone();
+        let info = get_sys_errors(&addr);
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetSysErrorsResponse {
+                success: false,
+                sys_errors: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetSysErrorsResponse {
+            success: true,
+            sys_errors: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_mem_info(&self, _request: Request<GetMemInfoRequest>) -> Result<Response<GetMemInfoResponse>, Status> {
-        todo!()
+        let addr = GLOBAL_Local_Node_Name.read().await.clone();
+        let info = get_mem_info(&addr);
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetMemInfoResponse {
+                success: false,
+                mem_info: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetMemInfoResponse {
+            success: true,
+            mem_info: buf,
+            error_info: None,
+        }))
     }
 
-    async fn get_metrics(&self, _request: Request<GetMetricsRequest>) -> Result<Response<GetMetricsResponse>, Status> {
-        todo!()
+    async fn get_metrics(&self, request: Request<GetMetricsRequest>) -> Result<Response<GetMetricsResponse>, Status> {
+        let request = request.into_inner();
+        let mut buf = Deserializer::new(Cursor::new(request.opts));
+        let opts: CollectMetricsOpts = Deserialize::deserialize(&mut buf).unwrap();
+        let info = collect_local_metrics(request.metric_type, &opts);
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetMetricsResponse {
+                success: false,
+                realtime_metrics: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetMetricsResponse {
+            success: true,
+            realtime_metrics: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_proc_info(&self, _request: Request<GetProcInfoRequest>) -> Result<Response<GetProcInfoResponse>, Status> {
-        todo!()
+        let addr = GLOBAL_Local_Node_Name.read().await.clone();
+        let info = get_proc_info(&addr);
+        let mut buf = Vec::new();
+        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(GetProcInfoResponse {
+                success: false,
+                proc_info: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(GetProcInfoResponse {
+            success: true,
+            proc_info: buf,
+            error_info: None,
+        }))
     }
 
     async fn start_profiling(
@@ -1644,56 +1785,257 @@ impl Node for NodeService {
 
     async fn load_bucket_metadata(
         &self,
-        _request: Request<LoadBucketMetadataRequest>,
+        request: Request<LoadBucketMetadataRequest>,
     ) -> Result<Response<LoadBucketMetadataResponse>, Status> {
-        todo!()
+        let request = request.into_inner();
+        let bucket = request.bucket;
+        if bucket.is_empty() {
+            return Ok(tonic::Response::new(LoadBucketMetadataResponse {
+                success: false,
+                error_info: Some("bucket name is missing".to_string()),
+            }));
+        }
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(LoadBucketMetadataResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
+        match load_bucket_metadata(store, &bucket).await {
+            Ok(meta) => {
+                GLOBAL_BucketMetadataSys.write().await.set(bucket, Arc::new(meta)).await;
+                Ok(tonic::Response::new(LoadBucketMetadataResponse {
+                    success: true,
+                    error_info: None,
+                }))
+            }
+            Err(err) => Ok(tonic::Response::new(LoadBucketMetadataResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
     }
 
     async fn delete_bucket_metadata(
         &self,
-        _request: Request<DeleteBucketMetadataRequest>,
+        request: Request<DeleteBucketMetadataRequest>,
     ) -> Result<Response<DeleteBucketMetadataResponse>, Status> {
+        let request = request.into_inner();
+        let _bucket = request.bucket;
+
+        //todo
+        Ok(tonic::Response::new(DeleteBucketMetadataResponse {
+            success: true,
+            error_info: None,
+        }))
+    }
+
+    async fn delete_policy(&self, request: Request<DeletePolicyRequest>) -> Result<Response<DeletePolicyResponse>, Status> {
+        let request = request.into_inner();
+        let policy = request.policy_name;
+        if policy.is_empty() {
+            return Ok(tonic::Response::new(DeletePolicyResponse {
+                success: false,
+                error_info: Some("policy name is missing".to_string()),
+            }));
+        }
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(DeletePolicyResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
+
         todo!()
     }
 
-    async fn delete_policy(&self, _request: Request<DeletePolicyRequest>) -> Result<Response<DeletePolicyResponse>, Status> {
-        todo!()
-    }
-
-    async fn load_policy(&self, _request: Request<LoadPolicyRequest>) -> Result<Response<LoadPolicyResponse>, Status> {
+    async fn load_policy(&self, request: Request<LoadPolicyRequest>) -> Result<Response<LoadPolicyResponse>, Status> {
+        let request = request.into_inner();
+        let policy = request.policy_name;
+        if policy.is_empty() {
+            return Ok(tonic::Response::new(LoadPolicyResponse {
+                success: false,
+                error_info: Some("policy name is missing".to_string()),
+            }));
+        }
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(LoadPolicyResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
         todo!()
     }
 
     async fn load_policy_mapping(
         &self,
-        _request: Request<LoadPolicyMappingRequest>,
+        request: Request<LoadPolicyMappingRequest>,
     ) -> Result<Response<LoadPolicyMappingResponse>, Status> {
+        let request = request.into_inner();
+        let user_or_group = request.user_or_group;
+        if user_or_group.is_empty() {
+            return Ok(tonic::Response::new(LoadPolicyMappingResponse {
+                success: false,
+                error_info: Some("user_or_group name is missing".to_string()),
+            }));
+        }
+        let _user_type = request.user_type;
+        let _is_group = request.is_group;
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(LoadPolicyMappingResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
         todo!()
     }
 
-    async fn delete_user(&self, _request: Request<DeleteUserRequest>) -> Result<Response<DeleteUserResponse>, Status> {
+    async fn delete_user(&self, request: Request<DeleteUserRequest>) -> Result<Response<DeleteUserResponse>, Status> {
+        let request = request.into_inner();
+        let access_key = request.access_key;
+        if access_key.is_empty() {
+            return Ok(tonic::Response::new(DeleteUserResponse {
+                success: false,
+                error_info: Some("access_key name is missing".to_string()),
+            }));
+        }
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(DeleteUserResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
+
         todo!()
     }
 
     async fn delete_service_account(
         &self,
-        _request: Request<DeleteServiceAccountRequest>,
+        request: Request<DeleteServiceAccountRequest>,
     ) -> Result<Response<DeleteServiceAccountResponse>, Status> {
+        let request = request.into_inner();
+        let access_key = request.access_key;
+        if access_key.is_empty() {
+            return Ok(tonic::Response::new(DeleteServiceAccountResponse {
+                success: false,
+                error_info: Some("access_key name is missing".to_string()),
+            }));
+        }
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(DeleteServiceAccountResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
         todo!()
     }
 
-    async fn load_user(&self, _request: Request<LoadUserRequest>) -> Result<Response<LoadUserResponse>, Status> {
+    async fn load_user(&self, request: Request<LoadUserRequest>) -> Result<Response<LoadUserResponse>, Status> {
+        let request = request.into_inner();
+        let access_key = request.access_key;
+        let _temp = request.temp;
+        if access_key.is_empty() {
+            return Ok(tonic::Response::new(LoadUserResponse {
+                success: false,
+                error_info: Some("access_key name is missing".to_string()),
+            }));
+        }
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(LoadUserResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
+
         todo!()
     }
 
     async fn load_service_account(
         &self,
-        _request: Request<LoadServiceAccountRequest>,
+        request: Request<LoadServiceAccountRequest>,
     ) -> Result<Response<LoadServiceAccountResponse>, Status> {
+        let request = request.into_inner();
+        let access_key = request.access_key;
+        if access_key.is_empty() {
+            return Ok(tonic::Response::new(LoadServiceAccountResponse {
+                success: false,
+                error_info: Some("access_key name is missing".to_string()),
+            }));
+        }
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(LoadServiceAccountResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
         todo!()
     }
 
-    async fn load_group(&self, _request: Request<LoadGroupRequest>) -> Result<Response<LoadGroupResponse>, Status> {
+    async fn load_group(&self, request: Request<LoadGroupRequest>) -> Result<Response<LoadGroupResponse>, Status> {
+        let request = request.into_inner();
+        let group = request.group;
+        if group.is_empty() {
+            return Ok(tonic::Response::new(LoadGroupResponse {
+                success: false,
+                error_info: Some("group name is missing".to_string()),
+            }));
+        }
+
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(LoadGroupResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
         todo!()
     }
 
@@ -1701,10 +2043,26 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadSiteReplicationConfigRequest>,
     ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(ReloadSiteReplicationConfigResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
         todo!()
     }
 
-    async fn signal_service(&self, _request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
+    async fn signal_service(&self, request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
+        let request = request.into_inner();
+        let _vars = match request.vars {
+            Some(vars) => vars.value,
+            None => HashMap::new(),
+        };
         todo!()
     }
 
@@ -1712,7 +2070,28 @@ impl Node for NodeService {
         &self,
         _request: Request<BackgroundHealStatusRequest>,
     ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
-        todo!()
+        let (state, ok) = get_local_background_heal_status().await;
+        if !ok {
+            return Ok(tonic::Response::new(BackgroundHealStatusResponse {
+                success: false,
+                bg_heal_state: vec![],
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        }
+
+        let mut buf = Vec::new();
+        if let Err(err) = state.serialize(&mut Serializer::new(&mut buf)) {
+            return Ok(tonic::Response::new(BackgroundHealStatusResponse {
+                success: false,
+                bg_heal_state: vec![],
+                error_info: Some(err.to_string()),
+            }));
+        }
+        Ok(tonic::Response::new(BackgroundHealStatusResponse {
+            success: true,
+            bg_heal_state: buf,
+            error_info: None,
+        }))
     }
 
     async fn get_metacache_listing(
@@ -1733,10 +2112,44 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadPoolMetaRequest>,
     ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
-        todo!()
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(ReloadPoolMetaResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
+        match store.reload_pool_meta().await {
+            Ok(_) => Ok(tonic::Response::new(ReloadPoolMetaResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(tonic::Response::new(ReloadPoolMetaResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
     }
 
     async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
+        let layer = new_object_layer_fn();
+        let lock = layer.read().await;
+        let _store = match lock.as_ref() {
+            Some(s) => s,
+            None => {
+                return Ok(tonic::Response::new(StopRebalanceResponse {
+                    success: false,
+                    error_info: Some("errServerNotInitialized".to_string()),
+                }))
+            }
+        };
+
+        // todo
+        // store.stop_rebalance().await;
         todo!()
     }
 

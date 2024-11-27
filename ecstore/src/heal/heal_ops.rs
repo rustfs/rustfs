@@ -190,19 +190,19 @@ impl HealSequence {
 }
 
 impl HealSequence {
-    fn _get_scanned_items_count(&self) -> usize {
+    pub fn get_scanned_items_count(&self) -> usize {
         self.scanned_items_map.values().sum()
     }
 
-    fn _get_scanned_items_map(&self) -> ItemsMap {
+    pub fn _get_scanned_items_map(&self) -> ItemsMap {
         self.scanned_items_map.clone()
     }
 
-    fn _get_healed_items_map(&self) -> ItemsMap {
+    pub fn _get_healed_items_map(&self) -> ItemsMap {
         self.healed_items_map.clone()
     }
 
-    fn _get_heal_failed_items_map(&self) -> ItemsMap {
+    pub fn _get_heal_failed_items_map(&self) -> ItemsMap {
         self.heal_failed_items_map.clone()
     }
 

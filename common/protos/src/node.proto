@@ -725,9 +725,7 @@ message LoadRebalanceMetaResponse {
   optional string error_info = 2;
 }
 
-message LoadTransitionTierConfigRequest {
-  bool start_rebalance = 1;
-}
+message LoadTransitionTierConfigRequest {}
 
 message LoadTransitionTierConfigResponse {
   bool success = 1;

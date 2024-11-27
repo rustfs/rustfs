@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::health::NodeCommon;
 
+#[cfg(target_os = "linux")]
 pub mod net_linux;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
