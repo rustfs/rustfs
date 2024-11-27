@@ -104,7 +104,11 @@ pub async fn get_local_server_property() -> ServerProperties {
     let mut pool_numbers = HashSet::new();
     let mut network = HashMap::new();
 
-    for ep in GLOBAL_Endpoints.read().await.as_ref().iter() {
+    let endpoints = match GLOBAL_Endpoints.get() {
+        Some(eps) => eps,
+        None => return ServerProperties::default(),
+    };
+    for ep in endpoints.as_ref().iter() {
         for endpoint in ep.endpoints.as_ref().iter() {
             let node_name = match endpoint.url.host_str() {
                 Some(s) => s.to_string(),

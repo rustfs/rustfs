@@ -2242,7 +2242,6 @@ dependencies = [
  "protobuf",
  "protos",
  "rmp-serde",
- "router",
  "s3s",
  "serde",
  "serde_json",

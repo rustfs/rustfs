@@ -61,7 +61,6 @@ matchit = "0.8.4"
 shadow-rs = "0.35.2"
 const-str = { version = "0.5.7", features = ["std", "proc"] }
 atoi = "2.0.0"
-serde.workspace = true
 serde_urlencoded = "0.7.1"
 
 [build-dependencies]

@@ -117,7 +117,7 @@ pub struct ProcInfo {
     username: String,
 }
 
-pub fn get_proc_info(addr: &str) -> ProcInfo {
+pub fn get_proc_info(_addr: &str) -> ProcInfo {
     ProcInfo::default()
 }
 

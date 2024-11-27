@@ -531,7 +531,7 @@ impl PeerRestClient {
         Ok(())
     }
 
-    pub async fn signal_service(&self, sig: u64, sub_sys: &str, dry_run: bool, exec_at: SystemTime) -> Result<()> {
+    pub async fn signal_service(&self, sig: u64, sub_sys: &str, dry_run: bool, _exec_at: SystemTime) -> Result<()> {
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
@@ -575,14 +575,14 @@ impl PeerRestClient {
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut _client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         todo!()
     }
 
     pub async fn update_metacache_listing(&self) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut _client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         todo!()
@@ -639,7 +639,7 @@ impl PeerRestClient {
         Ok(())
     }
 
-    pub async fn load_transition_tier_config(&self, start_rebalance: bool) -> Result<()> {
+    pub async fn load_transition_tier_config(&self) -> Result<()> {
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
