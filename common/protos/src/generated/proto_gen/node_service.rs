@@ -1036,10 +1036,8 @@ pub struct LoadRebalanceMetaResponse {
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct LoadTransitionTierConfigRequest {
-    #[prost(bool, tag = "1")]
-    pub start_rebalance: bool,
-}
+pub struct LoadTransitionTierConfigRequest {}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LoadTransitionTierConfigResponse {
     #[prost(bool, tag = "1")]

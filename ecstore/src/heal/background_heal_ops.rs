@@ -65,7 +65,7 @@ async fn init_background_healing() {
         .await;
 }
 
-async fn get_local_disks_to_heal() -> Vec<Endpoint> {
+pub async fn get_local_disks_to_heal() -> Vec<Endpoint> {
     let mut disks_to_heal = Vec::new();
     for (_, disk) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
         if let Some(disk) = disk {

@@ -1454,6 +1454,7 @@ dependencies = [
 name = "madmin"
 version = "0.0.1"
 dependencies = [
+ "ecstore",
  "psutil",
  "serde",
 ]
