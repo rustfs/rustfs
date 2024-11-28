@@ -24,7 +24,7 @@ use futures::{Stream, StreamExt};
 use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 
 use common::globals::GLOBAL_Local_Node_Name;
-use madmin::net::net_linux::get_net_info;
+use madmin::net::get_net_info;
 use madmin::{
     heal_command::get_local_background_heal_status,
     health::{
