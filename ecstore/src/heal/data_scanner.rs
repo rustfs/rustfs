@@ -102,17 +102,14 @@ pub async fn init_data_scanner() {
 }
 
 async fn run_data_scanner() {
-    let mut cycle_info = CurrentScannerCycle::default();
-    let layer = new_object_layer_fn();
-    let lock = layer.read().await;
-    let store = match lock.as_ref() {
-        Some(s) => s,
-        None => {
-            info!("errServerNotInitialized");
-            return;
-        }
+    let Some(store) = new_object_layer_fn() else {
+        error!("errServerNotInitialized");
+        return;
     };
-    let mut buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+
+    let mut cycle_info = CurrentScannerCycle::default();
+
+    let mut buf = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
         .map_or(Vec::new(), |buf| buf);
     match buf.len().cmp(&8) {
@@ -146,7 +143,7 @@ async fn run_data_scanner() {
             globalScannerMetrics.write().await.set_cycle(Some(cycle_info.clone())).await;
         }
 
-        let bg_heal_info = read_background_heal_info(store).await;
+        let bg_heal_info = read_background_heal_info(store.clone()).await;
         let scan_mode =
             get_cycle_scan_mode(cycle_info.current, bg_heal_info.bitrot_start_cycle, bg_heal_info.bitrot_start_time).await;
         if bg_heal_info.current_scan_mode != scan_mode {
@@ -156,7 +153,7 @@ async fn run_data_scanner() {
                 new_heal_info.bitrot_start_time = SystemTime::now();
                 new_heal_info.bitrot_start_cycle = cycle_info.current;
             }
-            save_background_heal_info(store, &new_heal_info).await;
+            save_background_heal_info(store.clone(), &new_heal_info).await;
         }
         // Wait before starting next cycle and wait on startup.
         let (tx, rx) = mpsc::channel(100);
@@ -165,7 +162,7 @@ async fn run_data_scanner() {
         });
         let mut res = HashMap::new();
         res.insert("cycle".to_string(), cycle_info.current.to_string());
-        match store.ns_scanner(tx, cycle_info.current as usize, scan_mode).await {
+        match store.clone().ns_scanner(tx, cycle_info.current as usize, scan_mode).await {
             Ok(_) => {
                 cycle_info.next += 1;
                 cycle_info.current = 0;
@@ -178,7 +175,7 @@ async fn run_data_scanner() {
                 globalScannerMetrics.write().await.set_cycle(Some(cycle_info.clone())).await;
                 let mut tmp = Vec::new();
                 tmp.write_u64::<LittleEndian>(cycle_info.next).unwrap();
-                let _ = save_config(store, &DATA_USAGE_BLOOM_NAME_PATH, &tmp).await;
+                let _ = save_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH, &tmp).await;
             }
             Err(err) => {
                 res.insert("error".to_string(), err.to_string());
@@ -206,7 +203,7 @@ impl Default for BackgroundHealInfo {
     }
 }
 
-async fn read_background_heal_info(store: &ECStore) -> BackgroundHealInfo {
+async fn read_background_heal_info(store: Arc<ECStore>) -> BackgroundHealInfo {
     if *GLOBAL_IsErasureSD.read().await {
         return BackgroundHealInfo::default();
     }
@@ -220,7 +217,7 @@ async fn read_background_heal_info(store: &ECStore) -> BackgroundHealInfo {
     serde_json::from_slice::<BackgroundHealInfo>(&buf).map_or(BackgroundHealInfo::default(), |b| b)
 }
 
-async fn save_background_heal_info(store: &ECStore, info: &BackgroundHealInfo) {
+async fn save_background_heal_info(store: Arc<ECStore>, info: &BackgroundHealInfo) {
     if *GLOBAL_IsErasureSD.read().await {
         return;
     }

@@ -1,4 +1,3 @@
-use s3s::{S3Error, S3ErrorCode};
 use std::{cmp::Ordering, env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{
@@ -100,9 +99,8 @@ async fn monitor_local_disks_and_heal() {
             interval.reset();
             continue;
         }
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = lock.as_ref().expect("errServerNotInitialized");
+
+        let store = new_object_layer_fn().expect("errServerNotInitialized");
         if let (_, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
             if let Some(DiskError::NoHealRequired) = err.downcast_ref() {
             } else {
@@ -187,12 +185,8 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
         endpoint.to_string()
     );
 
-    let layer = new_object_layer_fn();
-    let lock = layer.read().await;
-    let store = match lock.as_ref() {
-        Some(s) => s,
-        None => return Err(Error::msg("errServerNotInitialized")),
-    };
+    let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+
     let mut buckets = store.list_bucket(&BucketOptions::default()).await?;
     buckets.push(BucketInfo {
         name: path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(RUSTFS_CONFIG_PREFIX)])
@@ -274,12 +268,7 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
             error!("delete tracker failed: {}", err.to_string());
         }
     }
-    let layer = new_object_layer_fn();
-    let lock = layer.read().await;
-    let store = match lock.as_ref() {
-        Some(s) => s,
-        None => return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))),
-    };
+    let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
     let disks = store.get_disks(pool_idx, set_idx).await?;
     for disk in disks.into_iter() {
         if disk.is_none() {
@@ -377,9 +366,7 @@ impl HealRoutine {
                             Err(err) => d_err = Some(err),
                         }
                     } else {
-                        let layer = new_object_layer_fn();
-                        let lock = layer.read().await;
-                        let store = lock.as_ref().expect("Not init");
+                        let store = new_object_layer_fn().expect("errServerNotInitialized");
                         if task.object.is_empty() {
                             match store.heal_bucket(&task.bucket, &task.opts).await {
                                 Ok(res) => {
@@ -429,9 +416,8 @@ impl HealRoutine {
 // }
 
 async fn heal_disk_format(opts: HealOpts) -> Result<(HealResultItem, Option<Error>)> {
-    let layer = new_object_layer_fn();
-    let lock = layer.read().await;
-    let store = lock.as_ref().expect("Not init");
+    let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+
     let (res, err) = store.heal_format(opts.dry_run).await?;
     // return any error, ignore error returned when disks have
     // already healed.

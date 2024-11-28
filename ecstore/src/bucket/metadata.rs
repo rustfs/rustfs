@@ -12,12 +12,13 @@ use s3s::dto::{
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::{error, warn};
 
-use crate::config;
 use crate::config::common::{read_config, save_config};
 use crate::error::{Error, Result};
+use crate::{config, new_object_layer_fn};
 
 use crate::disk::BUCKET_META_PREFIX;
 use crate::store::ECStore;
@@ -290,8 +291,10 @@ impl BucketMetadata {
         self.created = created
     }
 
-    pub async fn save(&mut self, api: &ECStore) -> Result<()> {
-        self.parse_all_configs(api)?;
+    pub async fn save(&mut self) -> Result<()> {
+        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+
+        self.parse_all_configs(store.clone())?;
 
         let mut buf: Vec<u8> = vec![0; 4];
 
@@ -303,12 +306,12 @@ impl BucketMetadata {
 
         buf.extend_from_slice(&data);
 
-        save_config(api, self.save_file_path().as_str(), &buf).await?;
+        save_config(store, self.save_file_path().as_str(), &buf).await?;
 
         Ok(())
     }
 
-    fn parse_all_configs(&mut self, _api: &ECStore) -> Result<()> {
+    fn parse_all_configs(&mut self, _api: Arc<ECStore>) -> Result<()> {
         if !self.policy_config_json.is_empty() {
             self.policy_config = Some(serde_json::from_slice(&self.policy_config_json)?);
         }
@@ -347,12 +350,12 @@ impl BucketMetadata {
     }
 }
 
-pub async fn load_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketMetadata> {
+pub async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
     load_bucket_metadata_parse(api, bucket, true).await
 }
 
-pub async fn load_bucket_metadata_parse(api: &ECStore, bucket: &str, parse: bool) -> Result<BucketMetadata> {
-    let mut bm = match read_bucket_metadata(api, bucket).await {
+pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: bool) -> Result<BucketMetadata> {
+    let mut bm = match read_bucket_metadata(api.clone(), bucket).await {
         Ok(res) => res,
         Err(err) => {
             warn!("load_bucket_metadata_parse err {:?}", &err);
@@ -375,7 +378,7 @@ pub async fn load_bucket_metadata_parse(api: &ECStore, bucket: &str, parse: bool
     Ok(bm)
 }
 
-async fn read_bucket_metadata(api: &ECStore, bucket: &str) -> Result<BucketMetadata> {
+async fn read_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
     if bucket.is_empty() {
         error!("bucket name empty");
         return Err(Error::msg("invalid argument"));

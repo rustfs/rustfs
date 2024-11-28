@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::SystemTime};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Receiver;
-use tracing::info;
+use tracing::error;
 
 use crate::{
     config::common::save_config,
@@ -107,25 +107,21 @@ pub struct DataUsageInfo {
 }
 
 pub async fn store_data_usage_in_backend(mut rx: Receiver<DataUsageInfo>) {
-    let layer = new_object_layer_fn();
-    let lock = layer.read().await;
-    let store = match lock.as_ref() {
-        Some(s) => s,
-        None => {
-            info!("errServerNotInitialized");
-            return;
-        }
+    let Some(store) = new_object_layer_fn() else {
+        error!("errServerNotInitialized");
+        return;
     };
+
     let mut attempts = 1;
     loop {
         match rx.recv().await {
             Some(data_usage_info) => {
                 if let Ok(data) = serde_json::to_vec(&data_usage_info) {
                     if attempts > 10 {
-                        let _ = save_config(store, &format!("{}{}", *DATA_USAGE_OBJ_NAME_PATH, ".bkp"), &data).await;
+                        let _ = save_config(store.clone(), &format!("{}{}", *DATA_USAGE_OBJ_NAME_PATH, ".bkp"), &data).await;
                         attempts += 1;
                     }
-                    let _ = save_config(store, &DATA_USAGE_OBJ_NAME_PATH, &data).await;
+                    let _ = save_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH, &data).await;
                     attempts += 1;
                 } else {
                     continue;

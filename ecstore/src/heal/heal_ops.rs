@@ -7,8 +7,6 @@ use super::{
         HEAL_ITEM_BUCKET_METADATA,
     },
 };
-use crate::heal::heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT};
-use crate::store_api::StorageAPI;
 use crate::{
     config::common::CONFIG_PREFIX,
     disk::RUSTFS_META_BUCKET,
@@ -27,8 +25,11 @@ use crate::{
     new_object_layer_fn,
     utils::path::has_profix,
 };
+use crate::{
+    heal::heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT},
+    store_api::StorageAPI,
+};
 use lazy_static::lazy_static;
-use s3s::{S3Error, S3ErrorCode};
 use std::{
     collections::HashMap,
     future::Future,
@@ -387,12 +388,7 @@ impl HealSequence {
     }
 
     async fn heal_rustfs_sys_meta(h: Arc<RwLock<HealSequence>>, meta_prefix: &str) -> Result<()> {
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))),
-        };
+        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
         let setting = h.read().await.setting;
         store
             .heal_objects(RUSTFS_META_BUCKET, meta_prefix, &setting, h.clone(), true)
@@ -431,12 +427,7 @@ impl HealSequence {
             }
             (hs_w.object.clone(), hs_w.setting)
         };
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))),
-        };
+        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
         store.heal_objects(bucket, &object, &setting, hs.clone(), false).await
     }
 

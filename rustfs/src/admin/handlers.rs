@@ -116,11 +116,8 @@ impl Operation for AccountInfoHandler {
 
         warn!("AccountInfoHandler cread {:?}", &cred);
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
         // test policy
@@ -257,11 +254,8 @@ impl Operation for ListPools {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListPools");
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
         let Some(endpoints) = GLOBAL_Endpoints.get() else {
@@ -341,11 +335,8 @@ impl Operation for StatusPool {
             return Err(s3_error!(InvalidArgument));
         };
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
         let pools_status = store.status(idx).await.map_err(to_s3_error)?;
@@ -410,22 +401,18 @@ impl Operation for CancelDecommission {
             }
         };
 
-        let Some(_idx) = has_idx else {
+        let Some(idx) = has_idx else {
             warn!("specified pool {} not found, please specify a valid pool", &query.pool);
             return Err(s3_error!(InvalidArgument));
         };
 
-        let layer = new_object_layer_fn();
-        let lock = layer.write().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())),
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // FIXME:
-        // store.decommission_cancel(idx).await;
+        store.decommission_cancel(idx).await.map_err(to_s3_error)?;
 
-        return Err(s3_error!(NotImplemented));
+        Ok(S3Response::new((StatusCode::OK, Body::default())))
     }
 }
 

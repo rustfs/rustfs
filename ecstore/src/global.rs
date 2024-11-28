@@ -9,7 +9,6 @@ use uuid::Uuid;
 use crate::{
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
-    error::{Error, Result},
     heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState},
     store::ECStore,
 };
@@ -20,7 +19,7 @@ pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 
 lazy_static! {
-    pub static ref GLOBAL_OBJECT_API: Arc<RwLock<Option<ECStore>>> = Arc::new(RwLock::new(None));
+    pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
@@ -44,20 +43,22 @@ pub async fn get_global_deployment_id() -> Uuid {
     *id_ptr
 }
 
-pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) -> Result<()> {
+pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
     GLOBAL_Endpoints
         .set(EndpointServerPools::from(eps))
-        .map_err(|_| Error::msg("GLOBAL_Endpoints set faild"))?;
-    Ok(())
+        .expect("GLOBAL_Endpoints set faild")
 }
 
-pub fn new_object_layer_fn() -> Arc<RwLock<Option<ECStore>>> {
-    GLOBAL_OBJECT_API.clone()
+pub fn new_object_layer_fn() -> Option<Arc<ECStore>> {
+    if let Some(ec) = GLOBAL_OBJECT_API.get() {
+        Some(ec.clone())
+    } else {
+        None
+    }
 }
 
-pub async fn set_object_layer(o: ECStore) {
-    let mut global_object_api = GLOBAL_OBJECT_API.write().await;
-    *global_object_api = Some(o);
+pub async fn set_object_layer(o: Arc<ECStore>) {
+    GLOBAL_OBJECT_API.set(o).expect("set_object_layer fail ")
 }
 
 pub async fn is_dist_erasure() -> bool {

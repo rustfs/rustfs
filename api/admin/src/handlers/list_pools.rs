@@ -2,6 +2,7 @@ use crate::error::ErrorCode;
 use crate::Result as LocalResult;
 
 use axum::Json;
+use ecstore::new_object_layer_fn;
 use serde::Serialize;
 use time::OffsetDateTime;
 
@@ -47,14 +48,12 @@ pub async fn handler() -> LocalResult<Json<Vec<PoolStatus>>> {
     //
 
     // todo 实用oncelock作为全局变量
-    let layer = ecstore::new_object_layer_fn();
-    let lock = layer.read().await;
-    let pools = lock.as_ref().ok_or(ErrorCode::ErrNotImplemented)?;
 
+    let Some(store) = new_object_layer_fn() else { return Err(ErrorCode::ErrNotImplemented) };
     // todo, 调用pool.status()接口获取每个池的数据
     //
     let mut result = Vec::new();
-    for (idx, _pool) in pools.pools.iter().enumerate() {
+    for (idx, _pool) in store.pools.iter().enumerate() {
         // 这里mock一下数据
         result.push(PoolStatus {
             id: idx as _,

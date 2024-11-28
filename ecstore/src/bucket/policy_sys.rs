@@ -22,7 +22,7 @@ impl PolicySys {
         args.is_owner
     }
     pub async fn get(bucket: &str) -> Result<BucketPolicy> {
-        let bucket_meta_sys_lock = get_bucket_metadata_sys().await;
+        let bucket_meta_sys_lock = get_bucket_metadata_sys();
         let bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
         let (cfg, _) = bucket_meta_sys.get_bucket_policy(bucket).await?;

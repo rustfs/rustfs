@@ -10,7 +10,7 @@ use common::{lookup_configs, read_config_without_migrate, STORAGE_CLASS_SUB_SYS}
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 lazy_static! {
     pub static ref GLOBAL_StorageClass: OnceLock<storageclass::Config> = OnceLock::new();
@@ -38,8 +38,8 @@ impl ConfigSys {
     pub fn new() -> Self {
         Self {}
     }
-    pub async fn init(&self, api: &ECStore) -> Result<()> {
-        let mut cfg = read_config_without_migrate(api).await?;
+    pub async fn init(&self, api: Arc<ECStore>) -> Result<()> {
+        let mut cfg = read_config_without_migrate(api.clone().clone()).await?;
 
         lookup_configs(&mut cfg, api).await;
 

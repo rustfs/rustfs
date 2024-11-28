@@ -155,19 +155,13 @@ pub async fn get_local_server_property() -> ServerProperties {
     // sensitive.insert(ENV_ROOT_USER.to_string());
     // sensitive.insert(ENV_ROOT_PASSWORD.to_string());
 
-    let layer = new_object_layer_fn();
-    let lock = layer.read().await;
-    match lock.as_ref() {
-        Some(store) => {
-            let storage_info = store.local_storage_info().await;
-            props.state = ITEM_ONLINE.to_string();
-            props.disks = storage_info.disks;
-        }
-        None => {
-            props.state = ITEM_INITIALIZING.to_string();
-            // todo: get_offline_disks
-            // props.disks =
-        }
+    if let Some(store) = new_object_layer_fn() {
+        let storage_info = store.local_storage_info().await;
+        props.state = ITEM_ONLINE.to_string();
+        props.disks = storage_info.disks;
+    } else {
+        props.state = ITEM_INITIALIZING.to_string();
     };
+
     props
 }

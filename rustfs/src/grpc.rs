@@ -3,12 +3,11 @@ use std::{
     error::Error,
     io::{Cursor, ErrorKind},
     pin::Pin,
-    sync::Arc,
 };
 
 use ecstore::{
     admin_server_info::get_local_server_property,
-    bucket::{metadata::load_bucket_metadata, metadata_sys::GLOBAL_BucketMetadataSys},
+    bucket::{metadata::load_bucket_metadata, metadata_sys},
     disk::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, Reader,
         UpdateMetadataOpts, WalkDirOptions,
@@ -1519,17 +1518,13 @@ impl Node for NodeService {
         _request: Request<LocalStorageInfoRequest>,
     ) -> Result<Response<LocalStorageInfoResponse>, Status> {
         // let request = request.into_inner();
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(LocalStorageInfoResponse {
-                    success: false,
-                    storage_info: vec![],
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+
+        let Some(store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(LocalStorageInfoResponse {
+                success: false,
+                storage_info: vec![],
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
 
         let info = store.local_storage_info().await;
@@ -1796,20 +1791,16 @@ impl Node for NodeService {
             }));
         }
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(LoadBucketMetadataResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(LoadBucketMetadataResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
+
         match load_bucket_metadata(store, &bucket).await {
             Ok(meta) => {
-                GLOBAL_BucketMetadataSys.write().await.set(bucket, Arc::new(meta)).await;
+                metadata_sys::set_bucket_metadata(bucket, meta).await;
                 Ok(tonic::Response::new(LoadBucketMetadataResponse {
                     success: true,
                     error_info: None,
@@ -1846,16 +1837,11 @@ impl Node for NodeService {
             }));
         }
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(DeletePolicyResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(DeletePolicyResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
 
         todo!()
@@ -1870,16 +1856,11 @@ impl Node for NodeService {
                 error_info: Some("policy name is missing".to_string()),
             }));
         }
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(LoadPolicyResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(LoadPolicyResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
         todo!()
     }
@@ -1898,16 +1879,11 @@ impl Node for NodeService {
         }
         let _user_type = request.user_type;
         let _is_group = request.is_group;
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(LoadPolicyMappingResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(LoadPolicyMappingResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
         todo!()
     }
@@ -1921,16 +1897,11 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(DeleteUserResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(DeleteUserResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
 
         todo!()
@@ -1948,16 +1919,11 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(DeleteServiceAccountResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(DeleteServiceAccountResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
         todo!()
     }
@@ -1973,16 +1939,11 @@ impl Node for NodeService {
             }));
         }
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(LoadUserResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(LoadUserResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
 
         todo!()
@@ -2001,16 +1962,11 @@ impl Node for NodeService {
             }));
         }
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(LoadServiceAccountResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(LoadServiceAccountResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
         todo!()
     }
@@ -2025,16 +1981,11 @@ impl Node for NodeService {
             }));
         }
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(LoadGroupResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(LoadGroupResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
         todo!()
     }
@@ -2043,16 +1994,11 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadSiteReplicationConfigRequest>,
     ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(ReloadSiteReplicationConfigResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(ReloadSiteReplicationConfigResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
         todo!()
     }
@@ -2112,16 +2058,11 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadPoolMetaRequest>,
     ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(ReloadPoolMetaResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(ReloadPoolMetaResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
         match store.reload_pool_meta().await {
             Ok(_) => Ok(tonic::Response::new(ReloadPoolMetaResponse {
@@ -2136,16 +2077,11 @@ impl Node for NodeService {
     }
 
     async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let _store = match lock.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(tonic::Response::new(StopRebalanceResponse {
-                    success: false,
-                    error_info: Some("errServerNotInitialized".to_string()),
-                }))
-            }
+        let Some(_store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(StopRebalanceResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
         };
 
         // todo
