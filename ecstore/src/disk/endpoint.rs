@@ -2,7 +2,6 @@ use crate::error::{Error, Result};
 use crate::utils::net;
 use path_absolutize::Absolutize;
 use path_clean::PathClean;
-use std::fs;
 use std::{fmt::Display, path::Path};
 use url::{ParseError, Url};
 

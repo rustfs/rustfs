@@ -48,14 +48,13 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
-use s3s::{S3Error, S3ErrorCode};
 use std::cmp::Ordering;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock as std_RwLock},
+    sync::Arc,
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -76,30 +75,30 @@ pub struct ECStore {
     pub pools: Vec<Arc<Sets>>,
     pub peer_sys: S3PeerSys,
     // pub local_disks: Vec<DiskStore>,
-    pub pool_meta: std_RwLock<PoolMeta>,
+    pub pool_meta: RwLock<PoolMeta>,
     pub decommission_cancelers: Vec<Option<usize>>,
 }
 
-impl Clone for ECStore {
-    fn clone(&self) -> Self {
-        let pool_meta = match self.pool_meta.read() {
-            Ok(pool_meta) => pool_meta.clone(),
-            Err(_) => PoolMeta::default(),
-        };
-        Self {
-            id: self.id.clone(),
-            disk_map: self.disk_map.clone(),
-            pools: self.pools.clone(),
-            peer_sys: self.peer_sys.clone(),
-            pool_meta: std_RwLock::new(pool_meta),
-            decommission_cancelers: self.decommission_cancelers.clone(),
-        }
-    }
-}
+// impl Clone for ECStore {
+//     fn clone(&self) -> Self {
+//         let pool_meta = match self.pool_meta.read() {
+//             Ok(pool_meta) => pool_meta.clone(),
+//             Err(_) => PoolMeta::default(),
+//         };
+//         Self {
+//             id: self.id.clone(),
+//             disk_map: self.disk_map.clone(),
+//             pools: self.pools.clone(),
+//             peer_sys: self.peer_sys.clone(),
+//             pool_meta: std_RwLock::new(pool_meta),
+//             decommission_cancelers: self.decommission_cancelers.clone(),
+//         }
+//     }
+// }
 
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
-    pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<Self> {
+    pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<Arc<Self>> {
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
         let mut deployment_id = None;
@@ -216,14 +215,14 @@ impl ECStore {
         pool_meta.dont_save = true;
 
         let decommission_cancelers = vec![None; pools.len()];
-        let ec = ECStore {
+        let ec = Arc::new(ECStore {
             id: deployment_id.unwrap(),
             disk_map,
             pools,
             peer_sys,
             pool_meta: pool_meta.into(),
             decommission_cancelers,
-        };
+        });
 
         set_object_layer(ec.clone()).await;
 
@@ -234,11 +233,11 @@ impl ECStore {
         Ok(ec)
     }
 
-    pub async fn init(&self) -> Result<()> {
+    pub async fn init(api: Arc<ECStore>) -> Result<()> {
         config::init();
-        GLOBAL_ConfigSys.init(self).await?;
+        GLOBAL_ConfigSys.init(api.clone()).await?;
 
-        let buckets_list = self
+        let buckets_list = api
             .list_bucket(&BucketOptions {
                 no_metadata: true,
                 ..Default::default()
@@ -248,7 +247,9 @@ impl ECStore {
 
         let buckets = buckets_list.iter().map(|v| v.name.clone()).collect();
 
-        init_bucket_metadata_sys(self.clone(), buckets).await;
+        // FIXME:
+
+        init_bucket_metadata_sys(api.clone(), buckets).await;
 
         Ok(())
     }
@@ -495,12 +496,12 @@ impl ECStore {
         ServerPoolsAvailableSpace(server_pools)
     }
 
-    fn is_suspended(&self, idx: usize) -> bool {
+    async fn is_suspended(&self, idx: usize) -> bool {
         // TODO: LOCK
-        match self.pool_meta.read() {
-            Ok(pool_meta) => pool_meta.is_suspended(idx),
-            Err(_) => false,
-        }
+
+        let pool_meta = self.pool_meta.read().await;
+
+        pool_meta.is_suspended(idx)
     }
 
     async fn get_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Result<usize> {
@@ -594,8 +595,9 @@ impl ECStore {
         let mut def_pool = PoolObjInfo::default();
         let mut has_def_pool = false;
 
+        let pool_meta = self.pool_meta.read().await;
         for pinfo in ress.iter() {
-            if opts.skip_decommissioned && self.pool_meta.read().unwrap().is_suspended(pinfo.index) {
+            if opts.skip_decommissioned && pool_meta.is_suspended(pinfo.index) {
                 continue;
             }
 
@@ -605,13 +607,13 @@ impl ECStore {
             // }
 
             if pinfo.err.is_none() {
-                return Ok((pinfo.clone(), self.pools_with_object(&ress, opts)));
+                return Ok((pinfo.clone(), self.pools_with_object(&ress, opts).await));
             }
 
             let err = pinfo.err.as_ref().unwrap();
 
             if is_err_read_quorum(err) && !opts.metadata_chg {
-                return Ok((pinfo.clone(), self.pools_with_object(&ress, opts)));
+                return Ok((pinfo.clone(), self.pools_with_object(&ress, opts).await));
             }
 
             def_pool = pinfo.clone();
@@ -633,10 +635,11 @@ impl ECStore {
         Err(to_object_err(Error::new(DiskError::FileNotFound), vec![bucket, object]))
     }
 
-    fn pools_with_object(&self, pools: &Vec<PoolObjInfo>, opts: &ObjectOptions) -> Vec<PoolErr> {
+    async fn pools_with_object(&self, pools: &Vec<PoolObjInfo>, opts: &ObjectOptions) -> Vec<PoolErr> {
         let mut errs = Vec::new();
+        let pool_meta = self.pool_meta.read().await;
         for pool in pools.iter() {
-            if opts.skip_decommissioned && self.pool_meta.read().unwrap().is_suspended(pool.index) {
+            if opts.skip_decommissioned && pool_meta.is_suspended(pool.index) {
                 continue;
             }
             // TODO:SkipRebalancing
@@ -892,8 +895,11 @@ impl ECStore {
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
         let mut meta = PoolMeta::default();
-        meta.load(self).await?;
-        *self.pool_meta.write().unwrap() = meta;
+        meta.load().await?;
+
+        let mut pool_meta = self.pool_meta.write().await;
+        *pool_meta = meta;
+        // *self.pool_meta.write().unwrap() = meta;
         Ok(())
     }
 }
@@ -1263,7 +1269,7 @@ impl StorageAPI for ECStore {
             meta.versioning_config_xml = xml::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
-        meta.save(self).await.map_err(|e| to_object_err(e, vec![bucket]))?;
+        meta.save().await.map_err(|e| to_object_err(e, vec![bucket]))?;
 
         set_bucket_metadata(bucket.to_string(), meta).await;
 
@@ -1787,7 +1793,7 @@ impl StorageAPI for ECStore {
         }
 
         for (idx, pool) in self.pools.iter().enumerate() {
-            if self.is_suspended(idx) {
+            if self.is_suspended(idx).await {
                 continue;
             }
 
@@ -2037,14 +2043,8 @@ impl StorageAPI for ECStore {
                 };
 
                 if opts_clone.remove && !opts_clone.dry_run {
-                    let layer = new_object_layer_fn();
-                    let lock = layer.read().await;
-                    let store = match lock.as_ref() {
-                        Some(s) => s,
-                        None => {
-                            return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string())))
-                        }
-                    };
+                    let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+
                     if let Err(err) = store.check_abandoned_parts(&bucket, &entry.name, &opts_clone).await {
                         info!("unable to check object {}/{} for abandoned data: {}", bucket, entry.name, err.to_string());
                     }

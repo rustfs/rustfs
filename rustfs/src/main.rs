@@ -87,7 +87,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         );
     }
 
-    set_global_endpoints(endpoint_pools.as_ref().clone()).map_err(|err| Error::from_string(err.to_string()))?;
+    set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;
 
     // 初始化本地磁盘
@@ -186,7 +186,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(|err| Error::from_string(err.to_string()))?;
 
-    store.init().await.map_err(|err| {
+    ECStore::init(store.clone()).await.map_err(|err| {
         error!("init faild {:?}", &err);
         Error::from_string(err.to_string())
     })?;

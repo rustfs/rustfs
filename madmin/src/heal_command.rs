@@ -55,17 +55,12 @@ pub async fn get_local_background_heal_status() -> (BgHealState, bool) {
         heal_disks_map.insert(ep.to_string());
     }
 
-    let layer = new_object_layer_fn();
-    let lock = layer.read().await;
-    let store = match lock.as_ref() {
-        Some(s) => s,
-        None => {
-            let healing = GLOBAL_BackgroundHealState.read().await.get_local_healing_disks().await;
-            for disk in healing.values() {
-                status.heal_disks.push(disk.endpoint.clone());
-            }
-            return (status, true);
+    let Some(store) = new_object_layer_fn() else {
+        let healing = GLOBAL_BackgroundHealState.read().await.get_local_healing_disks().await;
+        for disk in healing.values() {
+            status.heal_disks.push(disk.endpoint.clone());
         }
+        return (status, true);
     };
 
     let si = store.local_storage_info().await;

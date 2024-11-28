@@ -256,12 +256,8 @@ impl HealingTracker {
     pub async fn save(&mut self) -> Result<()> {
         let _ = self.mu.write().await;
         if self.pool_index.is_none() || self.set_index.is_none() || self.disk_index.is_none() {
-            let layer = new_object_layer_fn();
-            let lock = layer.read().await;
-            let store = match lock.as_ref() {
-                Some(s) => s,
-                None => return Err(Error::from_string("Not init".to_string())),
-            };
+            let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+
             (self.pool_index, self.set_index, self.disk_index) = store.get_pool_and_set(&self.id).await?;
         }
 

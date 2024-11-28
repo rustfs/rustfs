@@ -58,8 +58,10 @@ impl PoolMeta {
         self.pools[idx].decommission.is_some()
     }
 
-    pub async fn load(&mut self, store: &ECStore) -> Result<()> {
-        let data = match read_config(store, POOL_META_NAME).await {
+    pub async fn load(&mut self) -> Result<()> {
+        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+
+        let data = match read_config(store.clone(), POOL_META_NAME).await {
             Ok(data) => {
                 if data.is_empty() {
                     return Ok(());
@@ -94,7 +96,7 @@ impl PoolMeta {
         Ok(())
     }
 
-    pub async fn save(&self) -> Result<()> {
+    pub async fn save(&self, _pools: Vec<Arc<Sets>>) -> Result<()> {
         if self.dont_save {
             return Ok(());
         }
@@ -105,12 +107,11 @@ impl PoolMeta {
         self.serialize(&mut Serializer::new(&mut buf))?;
         data.write_all(&buf)?;
 
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(Error::from_string("errServerNotInitialized".to_string())),
+        let Some(store) = new_object_layer_fn() else {
+            return Err(Error::from_string("errServerNotInitialized".to_string()));
         };
+
+        // FIXME:
         save_config(store, &POOL_META_NAME, &data).await
     }
 
@@ -171,7 +172,10 @@ pub struct PoolSpaceInfo {
 impl ECStore {
     pub async fn status(&self, idx: usize) -> Result<PoolStatus> {
         let space_info = self.get_decommission_pool_space_info(idx).await?;
-        let mut pool_info = self.pool_meta.read().unwrap().pools[idx].clone();
+
+        let pool_meta = self.pool_meta.read().await;
+
+        let mut pool_info = pool_meta.pools[idx].clone();
         if let Some(d) = pool_info.decommission.as_mut() {
             d.total_size = space_info.total;
             d.current_size = space_info.free;
@@ -204,7 +208,7 @@ impl ECStore {
         }
     }
 
-    pub async fn decommission_cancel(&mut self, idx: usize) -> Result<()> {
+    pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
         if self.single_pool() {
             return Err(Error::msg("InvalidArgument"));
         }
@@ -217,11 +221,12 @@ impl ECStore {
             return Err(Error::new(StorageError::DecommissionNotStarted));
         }
 
-        if self.pool_meta.write().unwrap().decommission_cancel(idx) {
-            // FIXME:
+        let mut lock = self.pool_meta.write().await;
+        if lock.decommission_cancel(idx) {
+            lock.save(self.pools.clone()).await?;
         }
 
-        unimplemented!()
+        Ok(())
     }
 }
 

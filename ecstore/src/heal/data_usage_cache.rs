@@ -11,7 +11,6 @@ use path_clean::PathClean;
 use rand::Rng;
 use rmp_serde::Serializer;
 use s3s::dto::ReplicationConfiguration;
-use s3s::{S3Error, S3ErrorCode};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -442,18 +441,14 @@ impl DataUsageCache {
     }
 
     pub async fn save(&self, name: &str) -> Result<()> {
+        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
         let buf = self.marshal_msg()?;
         let buf_clone = buf.clone();
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))),
-        };
+
         let store_clone = store.clone();
         let name_clone = name.to_string();
         tokio::spawn(async move {
-            let _ = save_config(&store_clone, &format!("{}{}", &name_clone, ".bkp"), &buf_clone).await;
+            let _ = save_config(store_clone, &format!("{}{}", &name_clone, ".bkp"), &buf_clone).await;
         });
         save_config(store, name, &buf).await
     }
