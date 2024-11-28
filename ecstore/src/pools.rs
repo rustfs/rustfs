@@ -1,16 +1,21 @@
-use crate::config::common::{read_config, save_config};
+use crate::config::common::{read_config, save_config, CONFIG_PREFIX};
 use crate::config::error::ConfigError;
+use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
+use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
-use crate::store_api::{StorageAPI, StorageDisk, StorageInfo};
-use crate::store_err::StorageError;
+use crate::store_api::{BucketOptions, MakeBucketOptions, StorageAPI, StorageDisk, StorageInfo};
+use crate::store_err::{is_err_bucket_exists, StorageError};
+use crate::utils::path::path_join;
 use crate::{sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
+use tracing::error;
 
 pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
@@ -96,7 +101,7 @@ impl PoolMeta {
         Ok(())
     }
 
-    pub async fn save(&self, _pools: Vec<Arc<Sets>>) -> Result<()> {
+    pub async fn save(&self, pools: Vec<Arc<Sets>>) -> Result<()> {
         if self.dont_save {
             return Ok(());
         }
@@ -107,12 +112,11 @@ impl PoolMeta {
         self.serialize(&mut Serializer::new(&mut buf))?;
         data.write_all(&buf)?;
 
-        let Some(store) = new_object_layer_fn() else {
-            return Err(Error::from_string("errServerNotInitialized".to_string()));
-        };
+        for pool in pools {
+            save_config(pool, &POOL_META_NAME, &data).await?;
+        }
 
-        // FIXME:
-        save_config(store, &POOL_META_NAME, &data).await
+        Ok(())
     }
 
     pub fn decommission_cancel(&mut self, idx: usize) -> bool {
@@ -139,6 +143,34 @@ impl PoolMeta {
             false
         }
     }
+    pub fn decommission(&mut self, idx: usize, pi: PoolSpaceInfo) -> Result<()> {
+        if let Some(pool) = self.pools.get_mut(idx) {
+            if let Some(ref info) = pool.decommission {
+                if !info.complete && !info.failed && !info.canceled {
+                    return Err(Error::msg("DecommissionAlreadyRunning"));
+                }
+            }
+
+            let now = OffsetDateTime::now_utc();
+            pool.last_update = now.clone();
+            pool.decommission = Some(PoolDecommissionInfo {
+                start_time: Some(now),
+                start_size: pi.free,
+                total_size: pi.total,
+                current_size: pi.free,
+                ..Default::default()
+            });
+        }
+
+        Ok(())
+    }
+    pub fn queue_buckets(&mut self, idx: usize, bks: Vec<DecomBucketInfo>) {
+        for bk in bks.iter() {
+            if let Some(dec) = self.pools[idx].decommission.as_mut() {
+                dec.bucket_push(bk);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -162,11 +194,52 @@ pub struct PoolDecommissionInfo {
     pub bytes_failed: usize,
 }
 
+impl PoolDecommissionInfo {
+    pub fn bucket_push(&mut self, bucket: &DecomBucketInfo) {
+        for b in self.queued_buckets.iter() {
+            if self.is_bucket_decommissioned(b) {
+                return;
+            }
+
+            if b == &bucket.to_string() {
+                return;
+            }
+        }
+
+        self.queued_buckets.push(bucket.to_string());
+
+        self.bucket = bucket.name.clone();
+        self.prefix = bucket.prefix.clone();
+    }
+    pub fn is_bucket_decommissioned(&self, bucket: &String) -> bool {
+        for b in self.decommissioned_buckets.iter() {
+            if b == bucket {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[derive(Debug)]
 pub struct PoolSpaceInfo {
     pub free: usize,
     pub total: usize,
     pub used: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DecomBucketInfo {
+    pub name: String,
+    pub prefix: String,
+}
+
+impl ToString for DecomBucketInfo {
+    fn to_string(&self) -> String {
+        path_join(&[PathBuf::from(self.name.clone()), PathBuf::from(self.prefix.clone())])
+            .to_string_lossy()
+            .to_string()
+    }
 }
 
 impl ECStore {
@@ -227,6 +300,117 @@ impl ECStore {
         }
 
         Ok(())
+    }
+    pub async fn is_decommission_running(&self) -> bool {
+        let pool_meta = self.pool_meta.read().await;
+        for pool in pool_meta.pools.iter() {
+            if let Some(ref info) = pool.decommission {
+                if !info.complete && !info.failed && !info.canceled {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub async fn decommission(&self, indices: Vec<usize>) -> Result<()> {
+        if indices.is_empty() {
+            return Err(Error::msg("errInvalidArgument"));
+        }
+
+        if self.single_pool() {
+            return Err(Error::msg("errInvalidArgument"));
+        }
+
+        self.start_decommission(indices.clone()).await?;
+
+        tokio::spawn(async move {
+            let Some(store) = new_object_layer_fn() else {
+                error!("store not init");
+                return;
+            };
+            for idx in indices.iter() {
+                store.do_decommission_in_routine(idx.clone()).await;
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn do_decommission_in_routine(&self, _idx: usize) {
+        // FIXME:
+        unimplemented!()
+    }
+
+    pub async fn start_decommission(&self, indices: Vec<usize>) -> Result<()> {
+        if indices.is_empty() {
+            return Err(Error::msg("errInvalidArgument"));
+        }
+
+        if self.single_pool() {
+            return Err(Error::msg("errInvalidArgument"));
+        }
+
+        let decom_buckets = self.get_buckets_to_decommission().await?;
+
+        for bk in decom_buckets.iter() {
+            let _ = self.heal_bucket(&bk.name, &HealOpts::default()).await;
+        }
+
+        let meta_buckets = vec![
+            path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(CONFIG_PREFIX)]),
+            path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)]),
+        ];
+
+        for bk in meta_buckets.iter() {
+            if let Err(err) = self
+                .make_bucket(bk.to_string_lossy().to_string().as_str(), &MakeBucketOptions::default())
+                .await
+            {
+                if !is_err_bucket_exists(&err) {
+                    return Err(err);
+                }
+            }
+        }
+
+        let mut pool_meta = self.pool_meta.write().await;
+        for idx in indices.iter() {
+            let pi = self.get_decommission_pool_space_info(idx.clone()).await?;
+
+            pool_meta.decommission(idx.clone(), pi)?;
+
+            pool_meta.queue_buckets(idx.clone(), decom_buckets.clone());
+        }
+
+        pool_meta.save(self.pools.clone()).await?;
+
+        // FIXME: globalNotificationSys.ReloadPoolMeta(ctx)
+
+        Ok(())
+    }
+
+    async fn get_buckets_to_decommission(&self) -> Result<Vec<DecomBucketInfo>> {
+        let buckets = self.list_bucket(&BucketOptions::default()).await?;
+
+        let mut ret: Vec<DecomBucketInfo> = buckets
+            .iter()
+            .map(|v| DecomBucketInfo {
+                name: v.name.clone(),
+                ..Default::default()
+            })
+            .collect();
+
+        ret.push(DecomBucketInfo {
+            name: RUSTFS_META_BUCKET.to_owned(),
+            prefix: CONFIG_PREFIX.to_owned(),
+        });
+        ret.push(DecomBucketInfo {
+            name: RUSTFS_META_BUCKET.to_owned(),
+            prefix: BUCKET_META_PREFIX.to_owned(),
+        });
+
+        Ok(ret)
     }
 }
 

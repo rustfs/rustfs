@@ -6,8 +6,7 @@ use super::{storageclass, Config, GLOBAL_StorageClass, KVS};
 use crate::config::error::is_not_found;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
-use crate::store::ECStore;
-use crate::store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_api::{HTTPRangeSpec, ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use crate::store_err::is_err_object_not_found;
 use crate::utils::path::SLASH_SEPARATOR;
 use http::HeaderMap;
@@ -30,13 +29,17 @@ lazy_static! {
         h
     };
 }
-pub async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
 
     Ok(data)
 }
 
-async fn read_config_with_metadata(api: Arc<ECStore>, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)> {
+async fn read_config_with_metadata<S: StorageAPI>(
+    api: Arc<S>,
+    file: &str,
+    opts: &ObjectOptions,
+) -> Result<(Vec<u8>, ObjectInfo)> {
     let range = HTTPRangeSpec::nil();
     let h = HeaderMap::new();
     let mut rd = api
@@ -59,7 +62,7 @@ async fn read_config_with_metadata(api: Arc<ECStore>, file: &str, opts: &ObjectO
     Ok((data, rd.object_info))
 }
 
-pub async fn save_config(api: Arc<ECStore>, file: &str, data: &[u8]) -> Result<()> {
+pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: &[u8]) -> Result<()> {
     save_config_with_opts(
         api,
         file,
@@ -72,7 +75,7 @@ pub async fn save_config(api: Arc<ECStore>, file: &str, data: &[u8]) -> Result<(
     .await
 }
 
-async fn save_config_with_opts(api: Arc<ECStore>, file: &str, data: &[u8], opts: &ObjectOptions) -> Result<()> {
+async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: &[u8], opts: &ObjectOptions) -> Result<()> {
     let _ = api
         .put_object(
             RUSTFS_META_BUCKET,
@@ -88,7 +91,7 @@ fn new_server_config() -> Config {
     Config::new()
 }
 
-async fn new_and_save_server_config(api: Arc<ECStore>) -> Result<Config> {
+async fn new_and_save_server_config<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
     let mut cfg = new_server_config();
     lookup_configs(&mut cfg, api.clone()).await;
     save_server_config(api, &cfg).await?;
@@ -96,7 +99,7 @@ async fn new_and_save_server_config(api: Arc<ECStore>) -> Result<Config> {
     Ok(cfg)
 }
 
-pub async fn read_config_without_migrate(api: Arc<ECStore>) -> Result<Config> {
+pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
     let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
     let data = match read_config(api.clone(), config_file.as_str()).await {
         Ok(res) => res,
@@ -116,7 +119,7 @@ pub async fn read_config_without_migrate(api: Arc<ECStore>) -> Result<Config> {
     read_server_config(api, data.as_slice()).await
 }
 
-async fn read_server_config(api: Arc<ECStore>, data: &[u8]) -> Result<Config> {
+async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<Config> {
     let cfg = {
         if data.is_empty() {
             let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
@@ -145,7 +148,7 @@ async fn read_server_config(api: Arc<ECStore>, data: &[u8]) -> Result<Config> {
     Ok(cfg.merge())
 }
 
-async fn save_server_config(api: Arc<ECStore>, cfg: &Config) -> Result<()> {
+async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Result<()> {
     let data = cfg.marshal()?;
 
     let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
@@ -153,14 +156,14 @@ async fn save_server_config(api: Arc<ECStore>, cfg: &Config) -> Result<()> {
     save_config(api, &config_file, data.as_slice()).await
 }
 
-pub async fn lookup_configs(cfg: &mut Config, api: Arc<ECStore>) {
+pub async fn lookup_configs<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) {
     // TODO: from etcd
     if let Err(err) = apply_dynamic_config(cfg, api).await {
         error!("apply_dynamic_config err {:?}", &err);
     }
 }
 
-async fn apply_dynamic_config(cfg: &mut Config, api: Arc<ECStore>) -> Result<()> {
+async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> Result<()> {
     for key in SubSystemsDynamic.iter() {
         apply_dynamic_config_for_sub_sys(cfg, api.clone(), key).await?;
     }
@@ -168,7 +171,7 @@ async fn apply_dynamic_config(cfg: &mut Config, api: Arc<ECStore>) -> Result<()>
     Ok(())
 }
 
-async fn apply_dynamic_config_for_sub_sys(cfg: &mut Config, api: Arc<ECStore>, subsys: &str) -> Result<()> {
+async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()> {
     let set_drive_counts = api.set_drive_counts();
     if subsys == STORAGE_CLASS_SUB_SYS {
         let kvs = match cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY) {

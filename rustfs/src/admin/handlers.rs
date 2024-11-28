@@ -308,7 +308,7 @@ impl Operation for StatusPool {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: StatusPoolQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
                 input
             } else {
                 StatusPoolQuery::default()
@@ -353,10 +353,77 @@ pub struct StartDecommission {}
 #[async_trait::async_trait]
 impl Operation for StartDecommission {
     // POST <endpoint>/<admin-API>/pools/decommission?pool=http://server{1...4}/disk{1...4}
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StartDecommission");
 
-        return Err(s3_error!(NotImplemented));
+        let Some(endpoints) = GLOBAL_Endpoints.get() else {
+            return Err(s3_error!(NotImplemented));
+        };
+
+        if endpoints.legacy() {
+            return Err(s3_error!(NotImplemented));
+        }
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        if store.is_decommission_running().await {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "DecommissionAlreadyRunning".to_string(),
+            ));
+        }
+
+        // TODO: check IsRebalanceStarted
+
+        let query = {
+            if let Some(query) = req.uri.query() {
+                let input: StatusPoolQuery =
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                input
+            } else {
+                StatusPoolQuery::default()
+            }
+        };
+        let is_byid = query.by_id.as_str() == "true";
+
+        let pools: Vec<&str> = query.pool.split(",").collect();
+        let mut pools_indices = Vec::with_capacity(pools.len());
+
+        for pool in pools.iter() {
+            let idx = {
+                if is_byid {
+                    pool.parse::<usize>()
+                        .map_err(|_e| s3_error!(InvalidArgument, "pool parse failed"))?
+                } else {
+                    let Some(idx) = endpoints.get_pool_idx(pool) else {
+                        return Err(s3_error!(InvalidArgument, "pool parse failed"));
+                    };
+                    idx
+                }
+            };
+
+            let mut has_found = None;
+            for (i, pool) in store.pools.iter().enumerate() {
+                if i == idx {
+                    has_found = Some(pool.clone());
+                    break;
+                }
+            }
+
+            let Some(_p) = has_found else {
+                return Err(s3_error!(InvalidArgument));
+            };
+
+            pools_indices.push(idx);
+        }
+
+        if !pools_indices.is_empty() {
+            store.decommission(pools_indices).await.map_err(to_s3_error)?;
+        }
+
+        Ok(S3Response::new((StatusCode::OK, Body::default())))
     }
 }
 
@@ -379,7 +446,7 @@ impl Operation for CancelDecommission {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: StatusPoolQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
                 input
             } else {
                 StatusPoolQuery::default()
