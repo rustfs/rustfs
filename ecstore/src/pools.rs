@@ -1,3 +1,4 @@
+use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::config::common::{read_config, save_config, CONFIG_PREFIX};
 use crate::config::error::ConfigError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
@@ -477,7 +478,14 @@ impl ECStore {
         Ok(())
     }
 
-    async fn decommission_pool<S: StorageAPI>(&self, _idx: usize, _pool: Arc<S>, _bucket: DecomBucketInfo) -> Result<()> {
+    async fn decommission_pool<S: StorageAPI>(&self, _idx: usize, _pool: Arc<S>, bi: DecomBucketInfo) -> Result<()> {
+        let mut _vc = None;
+
+        if &bi.name == RUSTFS_META_BUCKET {
+            let versioning = BucketVersioningSys::get(&bi.name).await?;
+            _vc = Some(versioning);
+        }
+
         // FIXME:
         unimplemented!()
     }
