@@ -678,7 +678,7 @@ dependencies = [
  "sha2",
  "siphasher",
  "tempfile",
- "thiserror",
+ "thiserror 1.0.68",
  "time",
  "tokio",
  "tokio-stream",
@@ -1976,7 +1976,7 @@ checksum = "a3a7c64d9bf75b1b8d981124c14c179074e8caa7dfe7b6a12e6222ddcd0c8f72"
 dependencies = [
  "once_cell",
  "protobuf-support",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -1985,7 +1985,7 @@ version = "3.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b088fd20b938a875ea00843b6faf48579462630015c3788d397ad6a786663252"
 dependencies = [
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -2018,7 +2018,7 @@ dependencies = [
  "num_cpus",
  "once_cell",
  "platforms",
- "thiserror",
+ "thiserror 1.0.68",
  "unescape",
 ]
 
@@ -2082,7 +2082,7 @@ dependencies = [
  "pin-project-lite",
  "s3s",
  "sha2",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tracing",
 ]
@@ -2332,7 +2332,7 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 [[package]]
 name = "s3s"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=207170f526c75a8190e8f9afadf961909fd01d34#207170f526c75a8190e8f9afadf961909fd01d34"
+source = "git+https://github.com/Nugine/s3s.git?rev=3291c0ca0284971569499cbe75bd69ef7bde8321#3291c0ca0284971569499cbe75bd69ef7bde8321"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -2364,8 +2364,9 @@ dependencies = [
  "sha1",
  "sha2",
  "smallvec",
+ "std-next",
  "sync_wrapper 1.0.1",
- "thiserror",
+ "thiserror 2.0.3",
  "time",
  "tokio",
  "tower 0.5.1",
@@ -2378,12 +2379,12 @@ dependencies = [
 [[package]]
 name = "s3s-policy"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=207170f526c75a8190e8f9afadf961909fd01d34#207170f526c75a8190e8f9afadf961909fd01d34"
+source = "git+https://github.com/Nugine/s3s.git?rev=3291c0ca0284971569499cbe75bd69ef7bde8321#3291c0ca0284971569499cbe75bd69ef7bde8321"
 dependencies = [
  "indexmap 2.6.0",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -2561,6 +2562,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 
 [[package]]
+name = "std-next"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87854dde78837ff867561b22d873c53c25938d4b152afba2fa6fc48cb406c099"
+dependencies = [
+ "simdutf8",
+ "thiserror 2.0.3",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2625,7 +2636,16 @@ version = "1.0.68"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02dd99dc800bbb97186339685293e1cc5d9df1f8fae2d0aecd9ff1c77efea892"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 1.0.68",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c006c85c7651b3cf2ada4584faa36773bd07bac24acfb39f3c431b36d7e667aa"
+dependencies = [
+ "thiserror-impl 2.0.3",
 ]
 
 [[package]]
@@ -2633,6 +2653,17 @@ name = "thiserror-impl"
 version = "1.0.68"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7c61ec9a6f64d2793d8a45faba21efbe3ced62a886d44c36a009b2b519b4c7e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f077553d607adc1caf65430528a576c757a71ed73944b66ebb58ef2bbd243568"
 dependencies = [
  "proc-macro2",
  "quote",

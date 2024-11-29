@@ -7,6 +7,9 @@ use tracing::warn;
 pub struct BucketVersioningSys {}
 
 impl BucketVersioningSys {
+    pub fn new() -> Self {
+        Self {}
+    }
     pub async fn enabled(bucket: &str) -> bool {
         match Self::get(bucket).await {
             Ok(res) => res.enabled(),
@@ -27,15 +30,15 @@ impl BucketVersioningSys {
         }
     }
 
-    // pub async fn suspended(bucket: &str) -> bool {
-    //     match Self::get(bucket).await {
-    //         Ok(res) => res.suspended(),
-    //         Err(err) => {
-    //             warn!("{:?}", err);
-    //             false
-    //         }
-    //     }
-    // }
+    pub async fn suspended(bucket: &str) -> bool {
+        match Self::get(bucket).await {
+            Ok(res) => res.suspended(),
+            Err(err) => {
+                warn!("{:?}", err);
+                false
+            }
+        }
+    }
 
     pub async fn prefix_suspended(bucket: &str, prefix: &str) -> bool {
         match Self::get(bucket).await {
