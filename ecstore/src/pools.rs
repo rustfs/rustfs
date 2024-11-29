@@ -6,7 +6,7 @@ use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
 use crate::store_api::{BucketOptions, MakeBucketOptions, StorageAPI, StorageDisk, StorageInfo};
 use crate::store_err::{is_err_bucket_exists, StorageError};
-use crate::utils::path::path_join;
+use crate::utils::path::{path_join, SLASH_SEPARATOR};
 use crate::{sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use rmp_serde::{Deserializer, Serializer};
@@ -15,7 +15,7 @@ use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tracing::error;
+use tracing::{error, info, warn};
 
 pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
@@ -143,6 +143,54 @@ impl PoolMeta {
             false
         }
     }
+    pub fn decommission_failed(&mut self, idx: usize) -> bool {
+        if let Some(stats) = self.pools.get_mut(idx) {
+            if let Some(d) = &stats.decommission {
+                if !d.failed {
+                    stats.last_update = OffsetDateTime::now_utc();
+
+                    let mut pd = d.clone();
+                    pd.start_time = None;
+                    pd.canceled = false;
+                    pd.failed = true;
+                    pd.complete = false;
+
+                    stats.decommission = Some(pd);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+    pub fn decommission_complete(&mut self, idx: usize) -> bool {
+        if let Some(stats) = self.pools.get_mut(idx) {
+            if let Some(d) = &stats.decommission {
+                if !d.complete {
+                    stats.last_update = OffsetDateTime::now_utc();
+
+                    let mut pd = d.clone();
+                    pd.start_time = None;
+                    pd.canceled = false;
+                    pd.failed = false;
+                    pd.complete = true;
+
+                    stats.decommission = Some(pd);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
     pub fn decommission(&mut self, idx: usize, pi: PoolSpaceInfo) -> Result<()> {
         if let Some(pool) = self.pools.get_mut(idx) {
             if let Some(ref info) = pool.decommission {
@@ -171,6 +219,74 @@ impl PoolMeta {
             }
         }
     }
+    pub fn pending_buckets(&self, idx: usize) -> Vec<DecomBucketInfo> {
+        let mut list = Vec::new();
+
+        if let Some(pool) = self.pools.get(idx) {
+            if let Some(ref info) = pool.decommission {
+                for bk in info.queued_buckets.iter() {
+                    let (name, prefix) = path2_bucket_object(bk);
+                    list.push(DecomBucketInfo { name, prefix });
+                }
+            }
+        }
+
+        list
+    }
+
+    pub fn is_bucket_decommissioned(&self, idx: usize, bucket: String) -> bool {
+        if let Some(ref info) = self.pools[idx].decommission {
+            info.is_bucket_decommissioned(&bucket)
+        } else {
+            false
+        }
+    }
+
+    pub fn bucket_done(&mut self, idx: usize, bucket: String) -> bool {
+        if let Some(pool) = self.pools.get_mut(idx) {
+            if let Some(info) = pool.decommission.as_mut() {
+                info.bucket_pop(&bucket)
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    pub fn count_item(&mut self, idx: usize, size: usize, failed: bool) {
+        if let Some(pool) = self.pools.get_mut(idx) {
+            if let Some(info) = pool.decommission.as_mut() {
+                if failed {
+                    info.items_decommission_failed += 1;
+                    info.bytes_failed += size;
+                } else {
+                    info.items_decommissioned += 1;
+                    info.bytes_done += size;
+                }
+            }
+        }
+    }
+}
+
+fn path2_bucket_object(name: &String) -> (String, String) {
+    path2_bucket_object_with_base_path("", &name)
+}
+
+fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
+    // Trim the base path and leading slash
+    let trimmed_path = path
+        .strip_prefix(base_path)
+        .unwrap_or(path)
+        .strip_prefix(SLASH_SEPARATOR)
+        .unwrap_or(path);
+    // Find the position of the first '/'
+    let pos = trimmed_path.find(SLASH_SEPARATOR).unwrap_or(trimmed_path.len());
+    // Split into bucket and prefix
+    let bucket = &trimmed_path[0..pos];
+    let prefix = &trimmed_path[pos + 1..]; // +1 to skip the '/' character if it exists
+
+    (bucket.to_string(), prefix.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -216,6 +332,29 @@ impl PoolDecommissionInfo {
             if b == bucket {
                 return true;
             }
+        }
+        false
+    }
+    pub fn bucket_pop(&mut self, bucket: &String) -> bool {
+        self.decommissioned_buckets.push(bucket.clone());
+
+        let mut found = None;
+        for (i, b) in self.queued_buckets.iter().enumerate() {
+            if b == bucket {
+                found = Some(i.clone());
+                break;
+            }
+        }
+
+        if let Some(i) = found {
+            self.queued_buckets.remove(i);
+            if &self.bucket == bucket {
+                self.bucket = "".to_owned();
+                self.prefix = "".to_owned();
+                self.object = "".to_owned();
+            }
+
+            return true;
         }
         false
     }
@@ -338,9 +477,120 @@ impl ECStore {
         Ok(())
     }
 
-    async fn do_decommission_in_routine(&self, _idx: usize) {
+    async fn decommission_pool<S: StorageAPI>(&self, _idx: usize, _pool: Arc<S>, _bucket: DecomBucketInfo) -> Result<()> {
         // FIXME:
         unimplemented!()
+    }
+
+    async fn do_decommission_in_routine(&self, idx: usize) {
+        if let Err(err) = self.decommission_in_background(idx).await {
+            error!("decom err {:?}", &err);
+            if let Err(er) = self.decommission_failed(idx).await {
+                error!("decom failed err {:?}", &er);
+            }
+
+            return;
+        }
+
+        let (failed, cmd_line) = {
+            let pool_meta = self.pool_meta.read().await;
+            let failed = {
+                if let Some(info) = &pool_meta.pools[idx].decommission {
+                    info.items_decommission_failed > 0
+                } else {
+                    false
+                }
+            };
+            let cmd_line = pool_meta.pools[idx].cmd_line.clone();
+            (failed, cmd_line)
+        };
+
+        if !failed {
+            warn!("Decommissioning complete for pool {}, verifying for any pending objects", cmd_line);
+            if let Err(er) = self.decommission_failed(idx).await {
+                error!("decom failed err {:?}", &er);
+            }
+        } else {
+            if let Err(er) = self.complete_decommission(idx).await {
+                error!("decom complete err {:?}", &er);
+            }
+        }
+    }
+
+    pub async fn decommission_failed(&self, idx: usize) -> Result<()> {
+        if self.single_pool() {
+            return Err(Error::msg("errInvalidArgument"));
+        }
+
+        let mut pool_meta = self.pool_meta.write().await;
+        if pool_meta.decommission_failed(idx) {
+            pool_meta.save(self.pools.clone()).await?;
+            // FIXME: globalNotificationSys.ReloadPoolMeta(ctx)
+        }
+
+        Ok(())
+    }
+
+    pub async fn complete_decommission(&self, idx: usize) -> Result<()> {
+        if self.single_pool() {
+            return Err(Error::msg("errInvalidArgument"));
+        }
+
+        let mut pool_meta = self.pool_meta.write().await;
+        if pool_meta.decommission_complete(idx) {
+            pool_meta.save(self.pools.clone()).await?;
+            // FIXME: globalNotificationSys.ReloadPoolMeta(ctx)
+        }
+
+        Ok(())
+    }
+
+    async fn decommission_in_background(&self, idx: usize) -> Result<()> {
+        let pool = self.pools[idx].clone();
+
+        let pending = {
+            let pool_meta = self.pool_meta.read().await;
+            pool_meta.pending_buckets(idx)
+        };
+
+        for bucket in pending.iter() {
+            let is_decommissioned = {
+                let pool_meta = self.pool_meta.read().await;
+                pool_meta.is_bucket_decommissioned(idx, bucket.to_string())
+            };
+
+            if is_decommissioned {
+                info!("decommission: already done, moving on {}", bucket.to_string());
+
+                {
+                    let mut pool_meta = self.pool_meta.write().await;
+                    if pool_meta.bucket_done(idx, bucket.to_string()) {
+                        if let Err(err) = pool_meta.save(self.pools.clone()).await {
+                            error!("decom pool_meta.save err {:?}", err);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            info!("decommission: currently on bucket {}", &bucket.name);
+
+            if let Err(err) = self.decommission_pool(idx, pool.clone(), bucket.clone()).await {
+                error!("decommission: decommission_pool err {:?}", &err);
+                return Err(err);
+            }
+
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                if pool_meta.bucket_done(idx, bucket.to_string()) {
+                    if let Err(err) = pool_meta.save(self.pools.clone()).await {
+                        error!("decom pool_meta.save err {:?}", err);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn start_decommission(&self, indices: Vec<usize>) -> Result<()> {
