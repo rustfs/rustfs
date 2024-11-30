@@ -11,6 +11,7 @@ use std::io::ErrorKind;
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
+use tracing::{debug, info};
 // use tracing::debug;
 use uuid::Uuid;
 
@@ -425,6 +426,12 @@ impl Erasure {
         total_length: usize,
         _prefer: &[bool],
     ) -> Result<()> {
+        info!(
+            "Erasure heal, writers len: {}, readers len: {}, total_length: {}",
+            writers.len(),
+            readers.len(),
+            total_length
+        );
         if writers.len() != self.parity_shards + self.data_shards {
             return Err(Error::from_string("invalid argument"));
         }
@@ -437,14 +444,14 @@ impl Erasure {
         }
 
         let mut errs = Vec::new();
-        for _ in start_block..=end_block {
+        for _ in start_block..end_block {
             let mut bufs = reader.read().await?;
 
             if self.parity_shards > 0 {
                 self.encoder.as_ref().unwrap().reconstruct(&mut bufs)?;
             }
 
-            let shards = bufs.into_iter().flatten().collect::<Vec<_>>();
+            let shards: Vec<Vec<u8>> = bufs.into_iter().flatten().collect::<Vec<_>>();
             if shards.len() != self.parity_shards + self.data_shards {
                 return Err(Error::from_string("can not reconstruct data"));
             }
@@ -455,7 +462,10 @@ impl Erasure {
                 }
                 match w.as_mut().unwrap().write(shards[i].as_ref()).await {
                     Ok(_) => {}
-                    Err(e) => errs.push(e),
+                    Err(e) => {
+                        info!("write failed, err: {:?}", e);
+                        errs.push(e);
+                    }
                 }
             }
         }

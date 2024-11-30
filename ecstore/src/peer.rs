@@ -102,8 +102,6 @@ impl S3PeerSys {
             pool_errs.push(reduce_write_quorum_errs(&per_pool_errs, &bucket_op_ignored_errs(), qu));
         }
 
-        error!("found pool errs: {:?}", pool_errs);
-
         if !opts.recreate {
             opts.remove = is_all_buckets_not_found(&pool_errs);
             opts.recreate = !opts.remove;

@@ -4,6 +4,7 @@ use std::{
 };
 
 use tokio::fs;
+use tracing::info;
 
 use crate::{
     disk::error::{is_sys_err_not_dir, is_sys_err_path_not_found, os_is_not_exist},
@@ -138,7 +139,16 @@ pub async fn reliable_rename(
     if let Some(parent) = dst_file_path.as_ref().parent() {
         reliable_mkdir_all(parent, base_dir.as_ref()).await?;
     }
-
+    // need remove dst path
+    if let Err(err) = utils::fs::remove_all(dst_file_path.as_ref()).await {
+        info!(
+            "reliable_rename rm dst failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
+            src_file_path.as_ref(),
+            dst_file_path.as_ref(),
+            base_dir.as_ref(),
+            err
+        );
+    }
     let mut i = 0;
     loop {
         if let Err(e) = utils::fs::rename(src_file_path.as_ref(), dst_file_path.as_ref()).await {
@@ -146,7 +156,13 @@ pub async fn reliable_rename(
                 i += 1;
                 continue;
             }
-
+            info!(
+                "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
+                src_file_path.as_ref(),
+                dst_file_path.as_ref(),
+                base_dir.as_ref(),
+                e
+            );
             return Err(e);
         }
 

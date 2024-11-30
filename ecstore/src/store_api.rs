@@ -1022,14 +1022,8 @@ pub trait StorageAPI: ObjectIO {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)>;
-    async fn heal_objects(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        opts: &HealOpts,
-        hs: Arc<HealSequence>,
-        is_meta: bool,
-    ) -> Result<()>;
+    async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, hs: Arc<HealSequence>, is_meta: bool)
+        -> Result<()>;
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
 }
