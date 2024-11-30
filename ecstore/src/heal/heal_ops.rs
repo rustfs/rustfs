@@ -217,14 +217,10 @@ impl HealSequence {
 }
 
 impl HealSequence {
-    pub fn get_scanned_items_count(&self) -> usize {
-        self.scanned_items_map.values().sum()
-    async fn _get_scanned_items_count(&self) -> usize {
+    pub async fn get_scanned_items_count(&self) -> usize {
         self.scanned_items_map.read().await.values().sum()
     }
 
-    pub fn _get_scanned_items_map(&self) -> ItemsMap {
-        self.scanned_items_map.clone()
     async fn _get_scanned_items_map(&self) -> ItemsMap {
         self.scanned_items_map.read().await.clone()
     }
@@ -419,12 +415,7 @@ impl HealSequence {
 
     async fn heal_rustfs_sys_meta(h: Arc<HealSequence>, meta_prefix: &str) -> Result<()> {
         info!("heal_rustfs_sys_meta, h: {:?}", h);
-        let layer = new_object_layer_fn();
-        let lock = layer.read().await;
-        let store = match lock.as_ref() {
-            Some(s) => s,
-            None => return Err(Error::from(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))),
-        };
+        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
         let setting = h.setting;
         store
             .heal_objects(RUSTFS_META_BUCKET, meta_prefix, &setting, h.clone(), true)

@@ -9,7 +9,7 @@ use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
 
-pub async fn make_admin_route() -> Result<impl S3Route> {
+pub fn make_admin_route() -> Result<impl S3Route> {
     let mut r = S3Router::new();
 
     r.insert(Method::POST, "/", AdminOperation(&handlers::AssumeRoleHandle {}))?;
