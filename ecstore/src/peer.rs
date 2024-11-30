@@ -8,9 +8,9 @@ use regex::Regex;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::sync::RwLock;
 use tonic::Request;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::disk::error::{is_all_buckets_not_found, is_all_not_found};
+use crate::disk::error::is_all_buckets_not_found;
 use crate::disk::{DiskAPI, DiskStore};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
 use crate::heal::heal_commands::{
@@ -716,7 +716,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
     }
 
     for (disk, state) in disks.iter().zip(before_state.read().await.iter()) {
-        res.before.push(HealDriveInfo {
+        res.before.drives.push(HealDriveInfo {
             uuid: "".to_string(),
             endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
             state: state.to_string(),
@@ -773,7 +773,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
     }
 
     for (disk, state) in disks.iter().zip(after_state.read().await.iter()) {
-        res.before.push(HealDriveInfo {
+        res.before.drives.push(HealDriveInfo {
             uuid: "".to_string(),
             endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
             state: state.to_string(),

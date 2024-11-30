@@ -119,11 +119,11 @@ pub async fn get_local_server_property() -> ServerProperties {
                 network.insert(node_name, ITEM_ONLINE.to_string());
                 continue;
             }
-            if !network.contains_key(&node_name) {
+            if let std::collections::hash_map::Entry::Vacant(e) = network.entry(node_name) {
                 if is_server_resolvable(endpoint).await.is_err() {
-                    network.insert(node_name, ITEM_OFFLINE.to_string());
+                    e.insert(ITEM_OFFLINE.to_string());
                 } else {
-                    network.insert(node_name, ITEM_ONLINE.to_string());
+                    e.insert(ITEM_ONLINE.to_string());
                 }
             }
         }

@@ -39,8 +39,6 @@ pub async fn init_auto_heal() {
         if v == "on" {
             info!("start monitor local disks and heal");
             GLOBAL_BackgroundHealState
-                .write()
-                .await
                 .push_heal_local_disks(&get_local_disks_to_heal().await)
                 .await;
             tokio::spawn(async {
@@ -58,11 +56,7 @@ async fn init_background_healing() {
             GLOBAL_BackgroundHealRoutine.add_worker(bg_seq_clone).await;
         });
     }
-    let _ = GLOBAL_BackgroundHealState
-        .write()
-        .await
-        .launch_new_heal_sequence(bg_seq)
-        .await;
+    let _ = GLOBAL_BackgroundHealState.launch_new_heal_sequence(bg_seq).await;
 }
 
 pub async fn get_local_disks_to_heal() -> Vec<Endpoint> {
@@ -95,7 +89,7 @@ async fn monitor_local_disks_and_heal() {
 
     loop {
         interval.tick().await;
-        let heal_disks = GLOBAL_BackgroundHealState.read().await.get_heal_local_disk_endpoints().await;
+        let heal_disks = GLOBAL_BackgroundHealState.get_heal_local_disk_endpoints().await;
         if heal_disks.is_empty() {
             interval.reset();
             continue;
@@ -115,23 +109,15 @@ async fn monitor_local_disks_and_heal() {
             let disk_clone = disk.clone();
             tokio::spawn(async move {
                 GLOBAL_BackgroundHealState
-                    .write()
-                    .await
                     .set_disk_healing_status(disk_clone.clone(), true)
                     .await;
                 if heal_fresh_disk(&disk_clone).await.is_err() {
                     GLOBAL_BackgroundHealState
-                        .write()
-                        .await
                         .set_disk_healing_status(disk_clone.clone(), false)
                         .await;
                     return;
                 }
-                GLOBAL_BackgroundHealState
-                    .write()
-                    .await
-                    .pop_heal_local_disks(&[disk_clone])
-                    .await;
+                GLOBAL_BackgroundHealState.pop_heal_local_disks(&[disk_clone]).await;
             });
         }
         interval.reset();

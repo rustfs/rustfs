@@ -1,5 +1,6 @@
 use std::{path::Path, time::SystemTime};
 
+use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -44,45 +45,71 @@ lazy_static! {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct HealOpts {
     pub recursive: bool,
+    #[serde(rename = "dryRun")]
     pub dry_run: bool,
     pub remove: bool,
     pub recreate: bool,
+    #[serde(rename = "scanMode")]
     pub scan_mode: HealScanMode,
+    #[serde(rename = "updateParity")]
     pub update_parity: bool,
+    #[serde(rename = "nolock")]
     pub no_lock: bool,
     pub pool: Option<usize>,
     pub set: Option<usize>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealDriveInfo {
     pub uuid: String,
     pub endpoint: String,
     pub state: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Infos {
+    #[serde(rename = "drives")]
+    pub drives: Vec<HealDriveInfo>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealResultItem {
+    #[serde(rename = "resultId")]
     pub result_index: usize,
+    #[serde(rename = "type")]
     pub heal_item_type: HealItemType,
+    #[serde(rename = "bucket")]
     pub bucket: String,
+    #[serde(rename = "object")]
     pub object: String,
+    #[serde(rename = "versionId")]
     pub version_id: String,
+    #[serde(rename = "detail")]
     pub detail: String,
+    #[serde(rename = "parityBlocks")]
     pub parity_blocks: usize,
+    #[serde(rename = "dataBlocks")]
     pub data_blocks: usize,
+    #[serde(rename = "diskCount")]
     pub disk_count: usize,
+    #[serde(rename = "setCount")]
     pub set_count: usize,
-    pub before: Vec<HealDriveInfo>,
-    pub after: Vec<HealDriveInfo>,
+    #[serde(rename = "before")]
+    pub before: Infos,
+    #[serde(rename = "after")]
+    pub after: Infos,
+    #[serde(rename = "objectSize")]
     pub object_size: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealStartSuccess {
+    #[serde(rename = "clientToken")]
     pub client_token: String,
+    #[serde(rename = "clientAddress")]
     pub client_address: String,
-    pub start_time: SystemTime,
+    #[serde(rename = "startTime")]
+    pub start_time: DateTime<Utc>,
 }
 
 impl Default for HealStartSuccess {
@@ -90,7 +117,7 @@ impl Default for HealStartSuccess {
         Self {
             client_token: Default::default(),
             client_address: Default::default(),
-            start_time: SystemTime::now(),
+            start_time: Utc::now(),
         }
     }
 }
@@ -265,7 +292,7 @@ impl HealingTracker {
 
         let htracker_bytes = self.marshal_msg()?;
 
-        GLOBAL_BackgroundHealState.write().await.update_heal_status(self).await;
+        GLOBAL_BackgroundHealState.update_heal_status(self).await;
 
         if let Some(disk) = &self.disk {
             let file_path = Path::new(BUCKET_META_PREFIX).join(HEALING_TRACKER_FILENAME);

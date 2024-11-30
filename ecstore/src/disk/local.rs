@@ -1842,7 +1842,7 @@ impl DiskAPI for LocalDisk {
         if let Some(old_data_dir) = opts.old_data_dir {
             if opts.undo_write {
                 let src_path = file_path.join(Path::new(
-                    format!("{}{}{}", old_data_dir.to_string(), SLASH_SEPARATOR, STORAGE_FORMAT_FILE_BACKUP).as_str(),
+                    format!("{}{}{}", old_data_dir, SLASH_SEPARATOR, STORAGE_FORMAT_FILE_BACKUP).as_str(),
                 ));
                 let dst_path = file_path.join(Path::new(format!("{}{}{}", path, SLASH_SEPARATOR, STORAGE_FORMAT_FILE).as_str()));
                 return rename_all(src_path, dst_path, file_path).await;

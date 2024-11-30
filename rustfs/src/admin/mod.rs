@@ -2,7 +2,7 @@ pub mod handlers;
 pub mod router;
 
 use common::error::Result;
-use ecstore::global::{is_dist_erasure, is_erasure};
+// use ecstore::global::{is_dist_erasure, is_erasure};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;

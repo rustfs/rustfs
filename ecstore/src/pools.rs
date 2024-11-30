@@ -114,7 +114,7 @@ impl PoolMeta {
         data.write_all(&buf)?;
 
         for pool in pools {
-            save_config(pool, &POOL_META_NAME, &data).await?;
+            save_config(pool, POOL_META_NAME, &data).await?;
         }
 
         Ok(())
@@ -201,7 +201,7 @@ impl PoolMeta {
             }
 
             let now = OffsetDateTime::now_utc();
-            pool.last_update = now.clone();
+            pool.last_update = now;
             pool.decommission = Some(PoolDecommissionInfo {
                 start_time: Some(now),
                 start_size: pi.free,
@@ -271,7 +271,7 @@ impl PoolMeta {
 }
 
 fn path2_bucket_object(name: &String) -> (String, String) {
-    path2_bucket_object_with_base_path("", &name)
+    path2_bucket_object_with_base_path("", name)
 }
 
 fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
@@ -342,7 +342,7 @@ impl PoolDecommissionInfo {
         let mut found = None;
         for (i, b) in self.queued_buckets.iter().enumerate() {
             if b == bucket {
-                found = Some(i.clone());
+                found = Some(i);
                 break;
             }
         }
@@ -471,7 +471,7 @@ impl ECStore {
                 return;
             };
             for idx in indices.iter() {
-                store.do_decommission_in_routine(idx.clone()).await;
+                store.do_decommission_in_routine(*idx).await;
             }
         });
 
@@ -481,7 +481,7 @@ impl ECStore {
     async fn decommission_pool<S: StorageAPI>(&self, _idx: usize, _pool: Arc<S>, bi: DecomBucketInfo) -> Result<()> {
         let mut _vc = None;
 
-        if &bi.name == RUSTFS_META_BUCKET {
+        if bi.name == RUSTFS_META_BUCKET {
             let versioning = BucketVersioningSys::get(&bi.name).await?;
             _vc = Some(versioning);
         }
@@ -518,10 +518,8 @@ impl ECStore {
             if let Err(er) = self.decommission_failed(idx).await {
                 error!("decom failed err {:?}", &er);
             }
-        } else {
-            if let Err(er) = self.complete_decommission(idx).await {
-                error!("decom complete err {:?}", &er);
-            }
+        } else if let Err(er) = self.complete_decommission(idx).await {
+            error!("decom complete err {:?}", &er);
         }
     }
 
@@ -616,7 +614,7 @@ impl ECStore {
             let _ = self.heal_bucket(&bk.name, &HealOpts::default()).await;
         }
 
-        let meta_buckets = vec![
+        let meta_buckets = [
             path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(CONFIG_PREFIX)]),
             path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)]),
         ];
@@ -634,11 +632,11 @@ impl ECStore {
 
         let mut pool_meta = self.pool_meta.write().await;
         for idx in indices.iter() {
-            let pi = self.get_decommission_pool_space_info(idx.clone()).await?;
+            let pi = self.get_decommission_pool_space_info(*idx).await?;
 
-            pool_meta.decommission(idx.clone(), pi)?;
+            pool_meta.decommission(*idx, pi)?;
 
-            pool_meta.queue_buckets(idx.clone(), decom_buckets.clone());
+            pool_meta.queue_buckets(*idx, decom_buckets.clone());
         }
 
         pool_meta.save(self.pools.clone()).await?;
@@ -672,7 +670,7 @@ impl ECStore {
     }
 }
 
-fn get_total_usable_capacity(disks: &Vec<StorageDisk>, info: &StorageInfo) -> usize {
+fn get_total_usable_capacity(disks: &[StorageDisk], info: &StorageInfo) -> usize {
     let mut capacity = 0;
     for disk in disks.iter() {
         if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
@@ -685,7 +683,7 @@ fn get_total_usable_capacity(disks: &Vec<StorageDisk>, info: &StorageInfo) -> us
     capacity
 }
 
-fn get_total_usable_capacity_free(disks: &Vec<StorageDisk>, info: &StorageInfo) -> usize {
+fn get_total_usable_capacity_free(disks: &[StorageDisk], info: &StorageInfo) -> usize {
     let mut capacity = 0;
     for disk in disks.iter() {
         if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
