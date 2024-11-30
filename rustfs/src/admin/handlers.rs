@@ -1,13 +1,22 @@
 use super::router::Operation;
 use crate::storage::error::to_s3_error;
+use bytes::Bytes;
 use ecstore::bucket::policy::action::{Action, ActionSet};
 use ecstore::bucket::policy::bucket_policy::{BPStatement, BucketPolicy};
 use ecstore::bucket::policy::effect::Effect;
 use ecstore::bucket::policy::resource::{Resource, ResourceSet};
+use ecstore::error::Error as ec_Error;
+use ecstore::global::GLOBAL_ALlHealState;
+use ecstore::heal::heal_commands::HealOpts;
+use ecstore::heal::heal_ops::new_heal_sequence;
+use ecstore::peer::is_reserved_or_invalid_bucket;
+use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::StorageAPI;
+use ecstore::utils::path::path_join;
 use ecstore::utils::xml;
 use ecstore::GLOBAL_Endpoints;
 use ecstore::{new_object_layer_fn, store_api::BackendInfo};
+use http::Uri;
 use hyper::StatusCode;
 use matchit::Params;
 use s3s::S3ErrorCode;
@@ -18,8 +27,12 @@ use s3s::{
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
-use tracing::warn;
+use tokio::spawn;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "PascalCase", default)]
@@ -224,14 +237,168 @@ impl Operation for MetricsHandler {
     }
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HealInitParams {
+    bucket: String,
+    obj_prefix: String,
+    hs: HealOpts,
+    client_token: String,
+    force_start: bool,
+    force_stop: bool,
+}
+
+fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> S3Result<HealInitParams> {
+    let mut hip = HealInitParams {
+        bucket: params.get("bucket").map(|s| s.to_string()).unwrap_or_default(),
+        obj_prefix: params.get("prefix").map(|s| s.to_string()).unwrap_or_default(),
+        ..Default::default()
+    };
+    if hip.bucket.is_empty() && !hip.obj_prefix.is_empty() {
+        return Err(s3_error!(InvalidRequest, "invalid bucket name"));
+    }
+    if is_reserved_or_invalid_bucket(&hip.bucket, false) {
+        return Err(s3_error!(InvalidRequest, "invalid bucket name"));
+    }
+    if !is_valid_object_prefix(&hip.obj_prefix) {
+        return Err(s3_error!(InvalidRequest, "invalid object name"));
+    }
+
+    if let Some(query) = uri.query() {
+        let params: Vec<&str> = query.split('&').collect();
+        for param in params {
+            let mut parts = param.split('=');
+            if let Some(key) = parts.next() {
+                if key == "clientToken" {
+                    if let Some(value) = parts.next() {
+                        hip.client_token = value.to_string();
+                    }
+                }
+                if key == "forceStart" {
+                    if parts.next().is_some() {
+                        hip.force_start = true;
+                    }
+                }
+                if key == "forceStop" {
+                    if parts.next().is_some() {
+                        hip.force_stop = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (hip.force_start && hip.force_stop) || (!hip.client_token.is_empty() && (hip.force_start || hip.force_stop)) {
+        return Err(s3_error!(InvalidRequest, ""));
+    }
+
+    if hip.client_token.is_empty() {
+        hip.hs = serde_json::from_slice(body).map_err(|e| {
+            info!("err request body parse, err: {:?}", e);
+            s3_error!(InvalidRequest, "err request body parse")
+        })?;
+    }
+
+    Ok(hip)
+}
+
 pub struct HealHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HealHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle HealHandler");
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle HealHandler, req: {:?}, params: {:?}", req, params);
+        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
+        info!("cred: {:?}", cred);
+        let mut input = req.input;
+        let bytes = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("get body failed, e: {:?}", e);
+                return Err(s3_error!(InvalidRequest, "get body failed"));
+            }
+        };
+        info!("bytes: {:?}", bytes);
+        let hip = extract_heal_init_params(&bytes, &req.uri, params)?;
+        info!("body: {:?}", hip);
 
-        return Err(s3_error!(NotImplemented));
+        #[derive(Default)]
+        struct HealResp {
+            resp_bytes: Vec<u8>,
+            _api_err: Option<ec_Error>,
+            _err_body: String,
+        }
+
+        let heap_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
+        if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
+            match GLOBAL_ALlHealState
+                .pop_heal_status_json(heap_path.to_str().unwrap_or_default(), &hip.client_token)
+                .await
+            {
+                Ok(b) => {
+                    info!("pop_heal_status_json success");
+                    return Ok(S3Response::new((StatusCode::OK, Body::from(b))));
+                }
+                Err(_e) => {
+                    info!("pop_heal_status_json failed");
+                    return Ok(S3Response::new((StatusCode::INTERNAL_SERVER_ERROR, Body::from(vec![]))));
+                }
+            }
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        if hip.force_stop {
+            let tx_clone = tx.clone();
+            spawn(async move {
+                match GLOBAL_ALlHealState
+                    .stop_heal_sequence(heap_path.to_str().unwrap_or_default())
+                    .await
+                {
+                    Ok(b) => {
+                        let _ = tx_clone
+                            .send(HealResp {
+                                resp_bytes: b,
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx_clone
+                            .send(HealResp {
+                                _api_err: Some(e),
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                }
+            });
+        } else if hip.client_token.is_empty() {
+            let nh = Arc::new(new_heal_sequence(&hip.bucket, &hip.obj_prefix, "", hip.hs, hip.force_start));
+            let tx_clone = tx.clone();
+            spawn(async move {
+                match GLOBAL_ALlHealState.launch_new_heal_sequence(nh).await {
+                    Ok(b) => {
+                        let _ = tx_clone
+                            .send(HealResp {
+                                resp_bytes: b,
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx_clone
+                            .send(HealResp {
+                                _api_err: Some(e),
+                                ..Default::default()
+                            })
+                            .await;
+                    }
+                }
+            });
+        }
+
+        match rx.recv().await {
+            Some(result) => Ok(S3Response::new((StatusCode::OK, Body::from(result.resp_bytes)))),
+            None => Ok(S3Response::new((StatusCode::INTERNAL_SERVER_ERROR, Body::from(vec![])))),
+        }
     }
 }
 
@@ -514,5 +681,17 @@ impl Operation for RebalanceStop {
         warn!("handle RebalanceStop");
 
         return Err(s3_error!(NotImplemented));
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use ecstore::heal::heal_commands::HealOpts;
+
+    #[test]
+    fn test_decode() {
+        let b = b"{\"recursive\":false,\"dryRun\":false,\"remove\":false,\"recreate\":false,\"scanMode\":1,\"updateParity\":false,\"nolock\":false}";
+        let s: HealOpts = serde_urlencoded::from_bytes(b).unwrap();
+        println!("{:?}", s);
     }
 }

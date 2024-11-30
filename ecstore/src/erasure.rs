@@ -10,8 +10,8 @@ use std::fmt::Debug;
 use std::io::ErrorKind;
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::info;
 use tracing::warn;
-use tracing::{debug, info};
 // use tracing::debug;
 use uuid::Uuid;
 

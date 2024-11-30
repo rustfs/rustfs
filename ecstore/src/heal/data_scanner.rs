@@ -719,11 +719,7 @@ impl FolderScanner {
                 break 'outer;
             }
 
-            let (bg_seq, found) = GLOBAL_BackgroundHealState
-                .read()
-                .await
-                .get_heal_sequence_by_token(BG_HEALING_UUID)
-                .await;
+            let (bg_seq, found) = GLOBAL_BackgroundHealState.get_heal_sequence_by_token(BG_HEALING_UUID).await;
             if !found {
                 break 'outer;
             }
