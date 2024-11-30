@@ -277,6 +277,7 @@ impl DiskAPI for Disk {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn read_version(
         &self,
         _org_volume: &str,

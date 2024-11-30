@@ -399,6 +399,7 @@ impl LocalDisk {
     }
 
     /// read xl.meta raw data
+    #[tracing::instrument(level = "debug", skip(self, volume_dir, path))]
     async fn read_raw(
         &self,
         bucket: &str,
@@ -460,6 +461,7 @@ impl LocalDisk {
         Ok(data)
     }
 
+    #[tracing::instrument(level = "debug", skip(self, volume_dir, file_path))]
     async fn read_all_data_with_dmtime(
         &self,
         volume: &str,

@@ -273,6 +273,7 @@ struct DelObj {
 
 #[async_trait::async_trait]
 impl ObjectIO for Sets {
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -285,6 +286,7 @@ impl ObjectIO for Sets {
             .get_object_reader(bucket, object, range, h, opts)
             .await
     }
+    #[tracing::instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).put_object(bucket, object, data, opts).await
     }
