@@ -47,7 +47,7 @@ pub async fn get_local_background_heal_status() -> (BgHealState, bool) {
     }
     let bg_seq = bg_seq.unwrap();
     let mut status = BgHealState {
-        scanned_items_count: bg_seq.read().await.get_scanned_items_count() as u64,
+        scanned_items_count: bg_seq.get_scanned_items_count().await as u64,
         ..Default::default()
     };
     let mut heal_disks_map = HashSet::new();
