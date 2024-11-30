@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     io::{Cursor, Read},
 };
-use tracing::error;
+use tracing::{error, info};
 
 use tokio::{
     spawn,
@@ -219,7 +219,9 @@ pub fn bitrot_verify(
     if algo != BitrotAlgorithm::HighwayHash256S {
         let mut h = algo.new_hasher();
         h.update(r.get_ref());
-        if h.finalize() != want {
+        let hash = h.finalize();
+        if hash != want {
+            info!("bitrot_verify except: {:?}, got: {:?}", want, hash);
             return Err(Error::new(DiskError::FileCorrupt));
         }
 
@@ -229,7 +231,11 @@ pub fn bitrot_verify(
     let mut hash_buf = vec![0; h.size()];
     let mut left = want_size;
 
-    if left != bitrot_shard_file_size(part_size, shard_size, algo) {
+    if left != bitrot_shard_file_size(part_size, shard_size, algo.clone()) {
+        info!(
+            "bitrot_shard_file_size failed, left: {}, part_size: {}, shard_size: {}, algo: {:?}",
+            left, part_size, shard_size, algo
+        );
         return Err(Error::new(DiskError::FileCorrupt));
     }
 
@@ -246,7 +252,9 @@ pub fn bitrot_verify(
         let read = r.read(&mut buf)?;
         h.update(buf);
         left -= read;
+        let hash = h.clone().finalize();
         if h.clone().finalize() != hash_buf[0..n] {
+            info!("bitrot_verify except: {:?}, got: {:?}", hash_buf[0..n].to_vec(), hash);
             return Err(Error::new(DiskError::FileCorrupt));
         }
     }

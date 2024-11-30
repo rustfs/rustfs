@@ -40,9 +40,9 @@ use std::{
 use tokio::{
     select, spawn,
     sync::{
-        watch::{self, Receiver as W_Receiver, Sender as W_Sender},
-        broadcast::{self, Receiver, Sender},
+        broadcast,
         mpsc::{self, Receiver as M_Receiver, Sender as M_Sender},
+        watch::{self, Receiver as W_Receiver, Sender as W_Sender},
         RwLock,
     },
     time::{interval, sleep},
@@ -401,7 +401,7 @@ impl HealSequence {
         let bucket = h.bucket.clone();
         let task1 = Self::heal_disk_meta(h.clone());
         let task2 = Self::heal_bucket(h.clone(), &bucket, buckets_only);
-        let results =  join!(task1, task2);
+        let results = join!(task1, task2);
         results.0?;
         results.1?;
 
@@ -756,7 +756,7 @@ impl AllHealState {
         let _ = self.mu.write().await;
 
         for (k, v) in self.heal_seq_map.iter() {
-            if !v.has_ended().await && (has_profix(k, path_s) || has_profix(path_s, k)) {
+            if (has_profix(k, path_s) || has_profix(path_s, k)) && !v.has_ended().await {
                 return Err(Error::from_string(format!(
                     "The provided heal sequence path overlaps with an existing heal path: {}",
                     k

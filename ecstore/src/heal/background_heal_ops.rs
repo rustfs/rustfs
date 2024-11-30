@@ -412,7 +412,7 @@ impl HealRoutine {
                 None => {
                     info!("add_worker, tasks_rx was closed, return");
                     return;
-                },
+                }
             }
         }
     }

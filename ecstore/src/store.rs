@@ -1968,10 +1968,10 @@ impl StorageAPI for ECStore {
                     Ok((mut result, err)) => {
                         result.object = utils::path::decode_dir_object(&result.object);
                         results.write().await.insert(idx, result);
-                        errs.write().await.insert(idx, err);
+                        errs.write().await[idx] = err;
                     }
                     Err(err) => {
-                        errs.write().await.insert(idx, Some(err));
+                        errs.write().await[idx] = Some(err);
                     }
                 }
             });

@@ -1375,6 +1375,7 @@ impl DiskAPI for LocalDisk {
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         if !skip_access_checks(src_volume) {
             if let Err(e) = utils::fs::access(&src_volume_dir).await {
+                info!("access checks failed, src_volume_dir: {:?}, err: {}", src_volume_dir, e.to_string());
                 return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
             }
         }
@@ -1382,6 +1383,7 @@ impl DiskAPI for LocalDisk {
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
         if !skip_access_checks(dst_volume) {
             if let Err(e) = utils::fs::access(&dst_volume_dir).await {
+                info!("access checks failed, dst_volume_dir: {:?}, err: {}", dst_volume_dir, e.to_string());
                 return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
             }
         }
@@ -1430,6 +1432,7 @@ impl DiskAPI for LocalDisk {
                     return Err(os_err_to_file_err(e));
                 }
 
+                info!("read xl.meta failed, dst_file_path: {:?}, err: {:?}", dst_file_path, e);
                 None
             }
         };
@@ -1491,13 +1494,15 @@ impl DiskAPI for LocalDisk {
                     err
                 }
             })?;
-
         if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
             let no_inline = fi.data.is_none() && fi.size > 0;
             if no_inline {
                 if let Err(err) = os::rename_all(&src_data_path, &dst_data_path, &skip_parent).await {
                     let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
-
+                    info!(
+                        "rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}",
+                        src_data_path, dst_data_path, err
+                    );
                     return Err({
                         if let Some(e) = err.to_io_err() {
                             os_err_to_file_err(e)
@@ -1522,6 +1527,7 @@ impl DiskAPI for LocalDisk {
                     )
                     .await
                 {
+                    info!("write_all_private failed err: {:?}", err);
                     return Err({
                         if let Some(e) = err.to_io_err() {
                             os_err_to_file_err(e)
@@ -1537,6 +1543,7 @@ impl DiskAPI for LocalDisk {
             if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
             }
+            info!("rename all failed err: {:?}", err);
             return Err({
                 if let Some(e) = err.to_io_err() {
                     os_err_to_file_err(e)
