@@ -303,14 +303,21 @@ impl S3 for FS {
         let range = HTTPRangeSpec::nil();
 
         let h = HeaderMap::new();
-        let opts = &ObjectOptions::default();
+
+        let metadata = extract_metadata(&req.headers);
+
+        let opts: ObjectOptions = put_opts(&bucket, &key, None, &req.headers, Some(metadata))
+            .await
+            .map_err(to_s3_error)?;
+
+        error!("get_object ObjectOptions {:?}", &opts);
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
         let reader = store
-            .get_object_reader(bucket.as_str(), key.as_str(), range, h, opts)
+            .get_object_reader(bucket.as_str(), key.as_str(), range, h, &opts)
             .await
             .map_err(to_s3_error)?;
 
@@ -573,6 +580,8 @@ impl S3 for FS {
         let opts: ObjectOptions = put_opts(&bucket, &key, None, &req.headers, Some(metadata))
             .await
             .map_err(to_s3_error)?;
+
+        error!("ObjectOptions {:?}", opts);
 
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)

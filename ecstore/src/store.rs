@@ -1083,6 +1083,7 @@ impl ObjectIO for ECStore {
             .get_object_reader(bucket, object.as_str(), range, h, &opts)
             .await
     }
+    #[tracing::instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         check_put_object_args(bucket, object)?;
 
