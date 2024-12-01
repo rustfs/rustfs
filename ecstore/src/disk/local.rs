@@ -1845,6 +1845,7 @@ impl DiskAPI for LocalDisk {
 
         self.delete_file(&volume_dir, &xl_path, true, false).await
     }
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn delete_versions(
         &self,
         volume: &str,
