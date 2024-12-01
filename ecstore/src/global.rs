@@ -28,8 +28,9 @@ lazy_static! {
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
     pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
-    pub static ref GLOBAL_BackgroundHealRoutine: Arc<RwLock<HealRoutine>> = HealRoutine::new();
-    pub static ref GLOBAL_BackgroundHealState: Arc<RwLock<AllHealState>> = AllHealState::new(false);
+    pub static ref GLOBAL_BackgroundHealRoutine: Arc<HealRoutine> = HealRoutine::new();
+    pub static ref GLOBAL_BackgroundHealState: Arc<AllHealState> = AllHealState::new(false);
+    pub static ref GLOBAL_ALlHealState: Arc<AllHealState> = AllHealState::new(false);
     static ref globalDeploymentIDPtr: RwLock<Uuid> = RwLock::new(Uuid::nil());
 }
 
@@ -50,11 +51,7 @@ pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
 }
 
 pub fn new_object_layer_fn() -> Option<Arc<ECStore>> {
-    if let Some(ec) = GLOBAL_OBJECT_API.get() {
-        Some(ec.clone())
-    } else {
-        None
-    }
+    GLOBAL_OBJECT_API.get().map(|ec| ec.clone())
 }
 
 pub async fn set_object_layer(o: Arc<ECStore>) {

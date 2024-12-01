@@ -37,17 +37,13 @@ pub struct BgHealState {
 }
 
 pub async fn get_local_background_heal_status() -> (BgHealState, bool) {
-    let (bg_seq, ok) = GLOBAL_BackgroundHealState
-        .read()
-        .await
-        .get_heal_sequence_by_token(BG_HEALING_UUID)
-        .await;
+    let (bg_seq, ok) = GLOBAL_BackgroundHealState.get_heal_sequence_by_token(BG_HEALING_UUID).await;
     if !ok {
         return (BgHealState::default(), false);
     }
     let bg_seq = bg_seq.unwrap();
     let mut status = BgHealState {
-        scanned_items_count: bg_seq.read().await.get_scanned_items_count() as u64,
+        scanned_items_count: bg_seq.get_scanned_items_count().await as u64,
         ..Default::default()
     };
     let mut heal_disks_map = HashSet::new();
@@ -56,7 +52,7 @@ pub async fn get_local_background_heal_status() -> (BgHealState, bool) {
     }
 
     let Some(store) = new_object_layer_fn() else {
-        let healing = GLOBAL_BackgroundHealState.read().await.get_local_healing_disks().await;
+        let healing = GLOBAL_BackgroundHealState.get_local_healing_disks().await;
         for disk in healing.values() {
             status.heal_disks.push(disk.endpoint.clone());
         }

@@ -37,9 +37,8 @@ pub async fn init_auto_heal() {
     init_background_healing().await;
     if let Ok(v) = env::var("_RUSTFS_AUTO_DRIVE_HEALING") {
         if v == "on" {
+            info!("start monitor local disks and heal");
             GLOBAL_BackgroundHealState
-                .write()
-                .await
                 .push_heal_local_disks(&get_local_disks_to_heal().await)
                 .await;
             tokio::spawn(async {
@@ -50,18 +49,14 @@ pub async fn init_auto_heal() {
 }
 
 async fn init_background_healing() {
-    let bg_seq = Arc::new(RwLock::new(new_bg_heal_sequence()));
-    for _ in 0..GLOBAL_BackgroundHealRoutine.read().await.workers {
+    let bg_seq = Arc::new(new_bg_heal_sequence());
+    for _ in 0..GLOBAL_BackgroundHealRoutine.workers {
         let bg_seq_clone = bg_seq.clone();
         tokio::spawn(async {
-            GLOBAL_BackgroundHealRoutine.write().await.add_worker(bg_seq_clone).await;
+            GLOBAL_BackgroundHealRoutine.add_worker(bg_seq_clone).await;
         });
     }
-    let _ = GLOBAL_BackgroundHealState
-        .write()
-        .await
-        .launch_new_heal_sequence(bg_seq)
-        .await;
+    let _ = GLOBAL_BackgroundHealState.launch_new_heal_sequence(bg_seq).await;
 }
 
 pub async fn get_local_disks_to_heal() -> Vec<Endpoint> {
@@ -94,7 +89,7 @@ async fn monitor_local_disks_and_heal() {
 
     loop {
         interval.tick().await;
-        let heal_disks = GLOBAL_BackgroundHealState.read().await.get_heal_local_disk_endpoints().await;
+        let heal_disks = GLOBAL_BackgroundHealState.get_heal_local_disk_endpoints().await;
         if heal_disks.is_empty() {
             interval.reset();
             continue;
@@ -114,23 +109,15 @@ async fn monitor_local_disks_and_heal() {
             let disk_clone = disk.clone();
             tokio::spawn(async move {
                 GLOBAL_BackgroundHealState
-                    .write()
-                    .await
                     .set_disk_healing_status(disk_clone.clone(), true)
                     .await;
                 if heal_fresh_disk(&disk_clone).await.is_err() {
                     GLOBAL_BackgroundHealState
-                        .write()
-                        .await
                         .set_disk_healing_status(disk_clone.clone(), false)
                         .await;
                     return;
                 }
-                GLOBAL_BackgroundHealState
-                    .write()
-                    .await
-                    .pop_heal_local_disks(&[disk_clone])
-                    .await;
+                GLOBAL_BackgroundHealState.pop_heal_local_disks(&[disk_clone]).await;
             });
         }
         interval.reset();
@@ -317,6 +304,7 @@ impl HealTask {
     }
 }
 
+#[derive(Debug)]
 pub struct HealResult {
     pub result: HealResultItem,
     pub err: Option<Error>,
@@ -324,12 +312,12 @@ pub struct HealResult {
 
 pub struct HealRoutine {
     pub tasks_tx: Sender<HealTask>,
-    tasks_rx: Receiver<HealTask>,
+    tasks_rx: RwLock<Receiver<HealTask>>,
     workers: usize,
 }
 
 impl HealRoutine {
-    pub fn new() -> Arc<RwLock<Self>> {
+    pub fn new() -> Arc<Self> {
         let mut workers = num_cpus::get() / 2;
         if let Ok(env_heal_workers) = env::var("_RUSTFS_HEAL_WORKERS") {
             if let Ok(num_healers) = env_heal_workers.parse::<usize>() {
@@ -342,19 +330,20 @@ impl HealRoutine {
         }
 
         let (tx, rx) = mpsc::channel(100);
-        Arc::new(RwLock::new(Self {
+        Arc::new(Self {
             tasks_tx: tx,
-            tasks_rx: rx,
+            tasks_rx: RwLock::new(rx),
             workers,
-        }))
+        })
     }
 
-    pub async fn add_worker(&mut self, bgseq: Arc<RwLock<HealSequence>>) {
+    pub async fn add_worker(&self, bgseq: Arc<HealSequence>) {
         loop {
             let mut d_res = HealResultItem::default();
             let d_err: Option<Error>;
-            match self.tasks_rx.recv().await {
+            match self.tasks_rx.write().await.recv().await {
                 Some(task) => {
+                    info!("got task: {:?}", task);
                     if task.bucket == NOP_HEAL {
                         d_err = Some(Error::from_string("skip file"));
                     } else if task.bucket == SLASH_SEPARATOR {
@@ -388,6 +377,7 @@ impl HealRoutine {
                             }
                         }
                     }
+                    info!("task finished, task: {:?}", task);
                     if let Some(resp_tx) = task.resp_tx {
                         let _ = resp_tx
                             .send(HealResult {
@@ -399,13 +389,16 @@ impl HealRoutine {
                         // when respCh is not set caller is not waiting but we
                         // update the relevant metrics for them
                         if d_err.is_none() {
-                            bgseq.write().await.count_healed(d_res.heal_item_type);
+                            bgseq.count_healed(d_res.heal_item_type).await;
                         } else {
-                            bgseq.write().await.count_failed(d_res.heal_item_type);
+                            bgseq.count_failed(d_res.heal_item_type).await;
                         }
                     }
                 }
-                None => return,
+                None => {
+                    info!("add_worker, tasks_rx was closed, return");
+                    return;
+                }
             }
         }
     }

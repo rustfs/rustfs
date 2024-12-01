@@ -8,9 +8,9 @@ use regex::Regex;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::sync::RwLock;
 use tonic::Request;
-use tracing::warn;
+use tracing::{info, warn};
 
-use crate::disk::error::{is_all_buckets_not_found, is_all_not_found};
+use crate::disk::error::is_all_buckets_not_found;
 use crate::disk::{DiskAPI, DiskStore};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
 use crate::heal::heal_commands::{
@@ -103,14 +103,14 @@ impl S3PeerSys {
         }
 
         if !opts.recreate {
-            opts.remove = is_all_not_found(&pool_errs);
-            opts.recursive = !opts.remove;
+            opts.remove = is_all_buckets_not_found(&pool_errs);
+            opts.recreate = !opts.remove;
         }
 
         let mut futures = Vec::new();
         let heal_bucket_results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.clients.len()]));
         for (idx, client) in self.clients.iter().enumerate() {
-            let opts_clone = opts;
+            let opts_clone = opts.clone();
             let heal_bucket_results_clone = heal_bucket_results.clone();
             futures.push(async move {
                 match client.heal_bucket(bucket, &opts_clone).await {
@@ -716,21 +716,23 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
     }
 
     for (disk, state) in disks.iter().zip(before_state.read().await.iter()) {
-        res.before.push(HealDriveInfo {
+        res.before.drives.push(HealDriveInfo {
             uuid: "".to_string(),
             endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
             state: state.to_string(),
         });
     }
 
-    if !is_rustfs_meta_bucket_name(bucket) && !is_all_buckets_not_found(&errs) && opts.remove {
+    if opts.remove && !is_rustfs_meta_bucket_name(bucket) && !is_all_buckets_not_found(&errs) {
         let mut futures = Vec::new();
         for disk in disks.iter() {
             let disk = disk.clone();
             let bucket = bucket.to_string();
+            info!("heal_bucket_local, errs: {:?}, opts: {:?}", errs, opts);
             futures.push(async move {
                 match disk {
                     Some(disk) => {
+                        info!("will call delete_volume, volume: {}", bucket);
                         let _ = disk.delete_volume(&bucket).await;
                         None
                     }
@@ -752,6 +754,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let errs_clone = errs.clone();
             futures.push(async move {
                 if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
+                    info!("bucket not find, will recreate");
                     match disk.as_ref().unwrap().make_volume(&bucket).await {
                         Ok(_) => {
                             as_clone.write().await[idx] = DRIVE_STATE_OK.to_string();
@@ -770,7 +773,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
     }
 
     for (disk, state) in disks.iter().zip(after_state.read().await.iter()) {
-        res.before.push(HealDriveInfo {
+        res.before.drives.push(HealDriveInfo {
             uuid: "".to_string(),
             endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
             state: state.to_string(),

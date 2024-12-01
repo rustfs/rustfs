@@ -6,6 +6,12 @@ use tracing::warn;
 
 pub struct BucketVersioningSys {}
 
+impl Default for BucketVersioningSys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BucketVersioningSys {
     pub fn new() -> Self {
         Self {}

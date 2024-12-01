@@ -139,7 +139,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         });
     }
 
-    let errs: Vec<Option<Error>> = Vec::with_capacity(readers.len());
+    let errs: Vec<Option<Error>> = vec![None; readers.len()];
     loop {
         let mut current = MetaCacheEntry::default();
         let (mut at_eof, mut has_err, mut agree) = (0, 0, 0);
