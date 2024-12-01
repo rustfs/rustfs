@@ -16,7 +16,9 @@ pub async fn del_opts(
     metadata: Option<HashMap<String, String>>,
 ) -> Result<ObjectOptions> {
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
-    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+    let version_suspended = BucketVersioningSys::suspended(bucket).await;
+
+    // TODO: delete_prefix
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
