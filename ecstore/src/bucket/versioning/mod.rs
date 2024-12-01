@@ -19,7 +19,7 @@ impl VersioningApi for VersioningConfiguration {
     }
 
     fn prefix_enabled(&self, prefix: &str) -> bool {
-        if self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)) {
+        if self.status != Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)) {
             return false;
         }
 

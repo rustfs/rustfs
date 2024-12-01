@@ -16,6 +16,7 @@ use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::new_object_layer_fn;
+use ecstore::options::del_opts;
 use ecstore::options::extract_metadata;
 use ecstore::options::put_opts;
 use ecstore::store_api::BucketOptions;
@@ -155,7 +156,14 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input;
 
-        let version_id = version_id
+        let metadata = extract_metadata(&req.headers);
+
+        let opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
+            .await
+            .map_err(to_s3_error)?;
+
+        let version_id = opts
+            .version_id
             .as_ref()
             .map(|v| match Uuid::parse_str(v) {
                 Ok(id) => Some(id),
@@ -172,10 +180,7 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-        let (dobjs, _errs) = store
-            .delete_objects(&bucket, objects, ObjectOptions::default())
-            .await
-            .map_err(to_s3_error)?;
+        let (dobjs, _errs) = store.delete_objects(&bucket, objects, opts).await.map_err(to_s3_error)?;
 
         // TODO: let errors;
 
@@ -240,11 +245,13 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let (dobjs, _errs) = store
-            .delete_objects(&bucket, objects, ObjectOptions::default())
+        let metadata = extract_metadata(&req.headers);
+
+        let opts: ObjectOptions = del_opts(&bucket, "", None, &req.headers, Some(metadata))
             .await
             .map_err(to_s3_error)?;
-        // info!("delete_objects res {:?} {:?}", &dobjs, errs);
+
+        let (dobjs, errs) = store.delete_objects(&bucket, objects, opts).await.map_err(to_s3_error)?;
 
         let deleted = dobjs
             .iter()
@@ -263,6 +270,9 @@ impl S3 for FS {
             .collect();
 
         // TODO: let errors;
+        for err in errs.iter().flatten() {
+            warn!("delete_objects err  {:?}", err);
+        }
 
         let output = DeleteObjectsOutput {
             deleted: Some(deleted),
@@ -298,19 +308,28 @@ impl S3 for FS {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         // mc get 3
 
-        let GetObjectInput { bucket, key, .. } = req.input;
+        let GetObjectInput {
+            bucket, key, version_id, ..
+        } = req.input;
 
         let range = HTTPRangeSpec::nil();
 
         let h = HeaderMap::new();
-        let opts = &ObjectOptions::default();
+
+        let metadata = extract_metadata(&req.headers);
+
+        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
+            .await
+            .map_err(to_s3_error)?;
+
+        error!("get_object ObjectOptions {:?}", &opts);
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
         let reader = store
-            .get_object_reader(bucket.as_str(), key.as_str(), range, h, opts)
+            .get_object_reader(bucket.as_str(), key.as_str(), range, h, &opts)
             .await
             .map_err(to_s3_error)?;
 
@@ -573,6 +592,8 @@ impl S3 for FS {
         let opts: ObjectOptions = put_opts(&bucket, &key, None, &req.headers, Some(metadata))
             .await
             .map_err(to_s3_error)?;
+
+        error!("ObjectOptions {:?}", opts);
 
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)
