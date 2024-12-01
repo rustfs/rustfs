@@ -322,8 +322,6 @@ impl S3 for FS {
             .await
             .map_err(to_s3_error)?;
 
-        error!("get_object ObjectOptions {:?}", &opts);
-
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
