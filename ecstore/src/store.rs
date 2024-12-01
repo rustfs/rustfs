@@ -635,7 +635,7 @@ impl ECStore {
         Err(to_object_err(Error::new(DiskError::FileNotFound), vec![bucket, object]))
     }
 
-    async fn pools_with_object(&self, pools: &Vec<PoolObjInfo>, opts: &ObjectOptions) -> Vec<PoolErr> {
+    async fn pools_with_object(&self, pools: &[PoolObjInfo], opts: &ObjectOptions) -> Vec<PoolErr> {
         let mut errs = Vec::new();
         let pool_meta = self.pool_meta.read().await;
         for pool in pools.iter() {
@@ -1183,7 +1183,7 @@ impl StorageAPI for ECStore {
         }
 
         let backend = self.backend_info().await;
-        StorageInfo { backend: backend, disks }
+        StorageInfo { backend, disks }
     }
 
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
@@ -1323,7 +1323,7 @@ impl StorageAPI for ECStore {
         for obj in objects.iter() {
             futures.push(async move {
                 self.internal_get_pool_info_existing_with_opts(
-                    &bucket,
+                    bucket,
                     &obj.object_name,
                     &ObjectOptions {
                         no_lock: true,
@@ -1381,18 +1381,14 @@ impl StorageAPI for ECStore {
                     if let Some(obj) = objects.get(i) {
                         if !pool_obj_idx_map.contains_key(&pinfo.index) {
                             pool_obj_idx_map.insert(pinfo.index, vec![obj.clone()]);
-                        } else {
-                            if let Some(val) = pool_obj_idx_map.get_mut(&pinfo.index) {
-                                val.push(obj.clone());
-                            }
+                        } else if let Some(val) = pool_obj_idx_map.get_mut(&pinfo.index) {
+                            val.push(obj.clone());
                         }
 
                         if !orig_index_map.contains_key(&pinfo.index) {
                             orig_index_map.insert(pinfo.index, vec![i]);
-                        } else {
-                            if let Some(val) = orig_index_map.get_mut(&pinfo.index) {
-                                val.push(i);
-                            }
+                        } else if let Some(val) = orig_index_map.get_mut(&pinfo.index) {
+                            val.push(i);
                         }
                     }
                 }
@@ -1934,8 +1930,8 @@ impl StorageAPI for ECStore {
             }
             r.disk_count += result.disk_count;
             r.set_count += result.set_count;
-            r.before.append(&mut result.before);
-            r.after.append(&mut result.after);
+            r.before.drives.append(&mut result.before.drives);
+            r.after.drives.append(&mut result.after.drives);
         }
         if count_no_heal == self.pools.len() {
             return Ok((r, Some(Error::new(DiskError::NoHealRequired))));
@@ -1953,6 +1949,7 @@ impl StorageAPI for ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        info!("ECStore heal_object");
         let object = utils::path::encode_dir_object(object);
         let errs = Arc::new(RwLock::new(vec![None; self.pools.len()]));
         let results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.pools.len()]));
@@ -1967,10 +1964,10 @@ impl StorageAPI for ECStore {
                     Ok((mut result, err)) => {
                         result.object = utils::path::decode_dir_object(&result.object);
                         results.write().await.insert(idx, result);
-                        errs.write().await.insert(idx, err);
+                        errs.write().await[idx] = err;
                     }
                     Err(err) => {
-                        errs.write().await.insert(idx, Some(err));
+                        errs.write().await[idx] = Some(err);
                     }
                 }
             });
@@ -2009,9 +2006,10 @@ impl StorageAPI for ECStore {
         bucket: &str,
         prefix: &str,
         opts: &HealOpts,
-        hs: Arc<RwLock<HealSequence>>,
+        hs: Arc<HealSequence>,
         is_meta: bool,
     ) -> Result<()> {
+        info!("heal objects");
         let opts_clone = *opts;
         let heal_entry: HealEntryFn = Arc::new(move |bucket: String, entry: MetaCacheEntry, scan_mode: HealScanMode| {
             let opts_clone = opts_clone;
@@ -2173,7 +2171,7 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
     *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
 }
 
-fn is_valid_object_prefix(object: &str) -> bool {
+pub fn is_valid_object_prefix(object: &str) -> bool {
     // Implement object prefix validation
     !object.is_empty() // Placeholder
 }

@@ -84,14 +84,14 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
             }
 
             DiskError::FileNotFound => {
-                let bucket = params.get(0).cloned().unwrap_or_default().to_owned();
-                let object = params.get(1).cloned().map(|v| decode_dir_object(v)).unwrap_or_default();
+                let bucket = params.first().cloned().unwrap_or_default().to_owned();
+                let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
 
                 return Error::new(StorageError::ObjectNotFound(bucket, object));
             }
             DiskError::FileVersionNotFound => {
-                let bucket = params.get(0).cloned().unwrap_or_default().to_owned();
-                let object = params.get(1).cloned().map(|v| decode_dir_object(v)).unwrap_or_default();
+                let bucket = params.first().cloned().unwrap_or_default().to_owned();
+                let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
                 let version = params.get(2).cloned().unwrap_or_default().to_owned();
 
                 return Error::new(StorageError::VersionNotFound(bucket, object, version));
@@ -100,34 +100,34 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
                 return Error::new(StorageError::SlowDown);
             }
             DiskError::FileNameTooLong => {
-                let bucket = params.get(0).cloned().unwrap_or_default().to_owned();
-                let object = params.get(1).cloned().map(|v| decode_dir_object(v)).unwrap_or_default();
+                let bucket = params.first().cloned().unwrap_or_default().to_owned();
+                let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
 
                 return Error::new(StorageError::ObjectNameInvalid(bucket, object));
             }
             DiskError::VolumeExists => {
-                let bucket = params.get(0).cloned().unwrap_or_default().to_owned();
+                let bucket = params.first().cloned().unwrap_or_default().to_owned();
                 return Error::new(StorageError::BucketExists(bucket));
             }
             DiskError::IsNotRegular => {
-                let bucket = params.get(0).cloned().unwrap_or_default().to_owned();
-                let object = params.get(1).cloned().map(|v| decode_dir_object(v)).unwrap_or_default();
+                let bucket = params.first().cloned().unwrap_or_default().to_owned();
+                let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
 
                 return Error::new(StorageError::ObjectExistsAsDirectory(bucket, object));
             }
 
             DiskError::VolumeNotFound => {
-                let bucket = params.get(0).cloned().unwrap_or_default().to_owned();
+                let bucket = params.first().cloned().unwrap_or_default().to_owned();
                 return Error::new(StorageError::BucketNotFound(bucket));
             }
             DiskError::VolumeNotEmpty => {
-                let bucket = params.get(0).cloned().unwrap_or_default().to_owned();
+                let bucket = params.first().cloned().unwrap_or_default().to_owned();
                 return Error::new(StorageError::BucketNotEmpty(bucket));
             }
 
             DiskError::FileAccessDenied => {
-                let bucket = params.get(0).cloned().unwrap_or_default().to_owned();
-                let object = params.get(1).cloned().map(|v| decode_dir_object(v)).unwrap_or_default();
+                let bucket = params.first().cloned().unwrap_or_default().to_owned();
+                let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
 
                 return Error::new(StorageError::PrefixAccessDenied(bucket, object));
             }

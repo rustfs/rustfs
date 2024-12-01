@@ -587,12 +587,12 @@ impl StorageAPI for Sets {
             ..Default::default()
         };
         let before_derives = formats_to_drives_info(&self.endpoints.endpoints, &formats, &errs);
-        res.before = vec![HealDriveInfo::default(); before_derives.len()];
-        res.after = vec![HealDriveInfo::default(); before_derives.len()];
+        res.before.drives = vec![HealDriveInfo::default(); before_derives.len()];
+        res.after.drives = vec![HealDriveInfo::default(); before_derives.len()];
 
         for v in before_derives.iter() {
-            res.before.push(v.clone());
-            res.after.push(v.clone());
+            res.before.drives.push(v.clone());
+            res.after.drives.push(v.clone());
         }
         if DiskError::UnformattedDisk.count_errs(&errs) == 0 {
             return Ok((res, Some(Error::new(DiskError::NoHealRequired))));
@@ -609,8 +609,8 @@ impl StorageAPI for Sets {
             for (i, set) in new_format_sets.iter().enumerate() {
                 for (j, fm) in set.iter().enumerate() {
                     if let Some(fm) = fm {
-                        res.after[i * self.set_drive_count + j].uuid = fm.erasure.this.to_string();
-                        res.after[i * self.set_drive_count + j].state = DRIVE_STATE_OK.to_string();
+                        res.after.drives[i * self.set_drive_count + j].uuid = fm.erasure.this.to_string();
+                        res.after.drives[i * self.set_drive_count + j].state = DRIVE_STATE_OK.to_string();
                         tmp_new_formats[i * self.set_drive_count + j] = Some(fm.clone());
                     }
                 }
@@ -662,7 +662,7 @@ impl StorageAPI for Sets {
         _bucket: &str,
         _prefix: &str,
         _opts: &HealOpts,
-        _hs: Arc<RwLock<HealSequence>>,
+        _hs: Arc<HealSequence>,
         _is_meta: bool,
     ) -> Result<()> {
         unimplemented!()

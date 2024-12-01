@@ -7,6 +7,7 @@ use super::{
         HEAL_ITEM_BUCKET_METADATA,
     },
 };
+use crate::store_api::StorageAPI;
 use crate::{
     config::common::CONFIG_PREFIX,
     disk::RUSTFS_META_BUCKET,
@@ -27,13 +28,16 @@ use crate::{
 };
 use crate::{
     heal::heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT},
-    store_api::StorageAPI,
+    utils::path::path_join,
 };
+use chrono::Utc;
+use futures::join;
 use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     future::Future,
-    path::Path,
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -41,13 +45,14 @@ use std::{
 use tokio::{
     select, spawn,
     sync::{
-        broadcast::{self, Receiver, Sender},
+        broadcast,
         mpsc::{self, Receiver as M_Receiver, Sender as M_Sender},
+        watch::{self, Receiver as W_Receiver, Sender as W_Sender},
         RwLock,
     },
     time::{interval, sleep},
 };
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 type HealStatusSummary = String;
@@ -73,7 +78,7 @@ pub const NOP_HEAL: &str = "";
 
 lazy_static! {}
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealSequenceStatus {
     pub summary: HealStatusSummary,
     pub failure_detail: String,
@@ -91,7 +96,7 @@ pub struct HealSource {
     pub opts: Option<HealOpts>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct HealSequence {
     pub bucket: String,
     pub object: String,
@@ -103,17 +108,17 @@ pub struct HealSequence {
     pub force_started: bool,
     pub setting: HealOpts,
     pub current_status: Arc<RwLock<HealSequenceStatus>>,
-    pub last_sent_result_index: usize,
-    pub scanned_items_map: ItemsMap,
-    pub healed_items_map: ItemsMap,
-    pub heal_failed_items_map: ItemsMap,
-    pub last_heal_activity: u64,
+    pub last_sent_result_index: RwLock<usize>,
+    pub scanned_items_map: RwLock<ItemsMap>,
+    pub healed_items_map: RwLock<ItemsMap>,
+    pub heal_failed_items_map: RwLock<ItemsMap>,
+    pub last_heal_activity: RwLock<SystemTime>,
 
     traverse_and_heal_done_tx: Arc<RwLock<M_Sender<Option<Error>>>>,
     traverse_and_heal_done_rx: Arc<RwLock<M_Receiver<Option<Error>>>>,
 
-    tx: Arc<RwLock<Sender<bool>>>,
-    rx: Arc<RwLock<Receiver<bool>>>,
+    tx: W_Sender<bool>,
+    rx: W_Receiver<bool>,
 }
 
 pub fn new_bg_heal_sequence() -> HealSequence {
@@ -133,9 +138,35 @@ pub fn new_bg_heal_sequence() -> HealSequence {
             ..Default::default()
         })),
         report_progress: false,
-        scanned_items_map: HashMap::new(),
-        healed_items_map: HashMap::new(),
-        heal_failed_items_map: HashMap::new(),
+        scanned_items_map: HashMap::new().into(),
+        healed_items_map: HashMap::new().into(),
+        heal_failed_items_map: HashMap::new().into(),
+        ..Default::default()
+    }
+}
+
+pub fn new_heal_sequence(bucket: &str, obj_prefix: &str, client_addr: &str, hs: HealOpts, force_start: bool) -> HealSequence {
+    let client_token = Uuid::new_v4().to_string();
+    let (tx, rx) = mpsc::channel(10);
+    HealSequence {
+        bucket: bucket.to_string(),
+        object: obj_prefix.to_string(),
+        report_progress: true,
+        start_time: SystemTime::now(),
+        client_token,
+        client_address: client_addr.to_string(),
+        force_started: force_start,
+        setting: hs,
+        current_status: Arc::new(RwLock::new(HealSequenceStatus {
+            summary: HEAL_NOT_STARTED_STATUS.to_string(),
+            heal_setting: hs,
+            ..Default::default()
+        })),
+        traverse_and_heal_done_tx: Arc::new(RwLock::new(tx)),
+        traverse_and_heal_done_rx: Arc::new(RwLock::new(rx)),
+        scanned_items_map: HashMap::new().into(),
+        healed_items_map: HashMap::new().into(),
+        heal_failed_items_map: HashMap::new().into(),
         ..Default::default()
     }
 }
@@ -143,7 +174,7 @@ pub fn new_bg_heal_sequence() -> HealSequence {
 impl Default for HealSequence {
     fn default() -> Self {
         let (h_tx, h_rx) = mpsc::channel(1);
-        let (tx, rx) = broadcast::channel(1);
+        let (tx, rx) = watch::channel(false);
         Self {
             bucket: Default::default(),
             object: Default::default(),
@@ -159,11 +190,11 @@ impl Default for HealSequence {
             scanned_items_map: Default::default(),
             healed_items_map: Default::default(),
             heal_failed_items_map: Default::default(),
-            last_heal_activity: Default::default(),
+            last_heal_activity: RwLock::new(SystemTime::now()),
             traverse_and_heal_done_tx: Arc::new(RwLock::new(h_tx)),
             traverse_and_heal_done_rx: Arc::new(RwLock::new(h_rx)),
-            tx: Arc::new(RwLock::new(tx)),
-            rx: Arc::new(RwLock::new(rx)),
+            tx,
+            rx,
         }
     }
 }
@@ -191,49 +222,40 @@ impl HealSequence {
 }
 
 impl HealSequence {
-    pub fn get_scanned_items_count(&self) -> usize {
-        self.scanned_items_map.values().sum()
+    pub async fn get_scanned_items_count(&self) -> usize {
+        self.scanned_items_map.read().await.values().sum()
     }
 
-    pub fn _get_scanned_items_map(&self) -> ItemsMap {
-        self.scanned_items_map.clone()
+    async fn _get_scanned_items_map(&self) -> ItemsMap {
+        self.scanned_items_map.read().await.clone()
     }
 
-    pub fn _get_healed_items_map(&self) -> ItemsMap {
-        self.healed_items_map.clone()
+    async fn _get_healed_items_map(&self) -> ItemsMap {
+        self.healed_items_map.read().await.clone()
     }
 
-    pub fn _get_heal_failed_items_map(&self) -> ItemsMap {
-        self.heal_failed_items_map.clone()
+    async fn _get_heal_failed_items_map(&self) -> ItemsMap {
+        self.heal_failed_items_map.read().await.clone()
     }
 
-    pub fn count_failed(&mut self, heal_type: HealItemType) {
-        *self.heal_failed_items_map.entry(heal_type).or_insert(0) += 1;
-        self.last_heal_activity = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
+    pub async fn count_failed(&self, heal_type: HealItemType) {
+        *self.heal_failed_items_map.write().await.entry(heal_type).or_insert(0) += 1;
+        *self.last_heal_activity.write().await = SystemTime::now();
     }
 
-    pub fn count_scanned(&mut self, heal_type: HealItemType) {
-        *self.scanned_items_map.entry(heal_type).or_insert(0) += 1;
-        self.last_heal_activity = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
+    pub async fn count_scanned(&self, heal_type: HealItemType) {
+        *self.scanned_items_map.write().await.entry(heal_type).or_insert(0) += 1;
+        *self.last_heal_activity.write().await = SystemTime::now();
     }
 
-    pub fn count_healed(&mut self, heal_type: HealItemType) {
-        *self.healed_items_map.entry(heal_type).or_insert(0) += 1;
-        self.last_heal_activity = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
+    pub async fn count_healed(&self, heal_type: HealItemType) {
+        *self.healed_items_map.write().await.entry(heal_type).or_insert(0) += 1;
+        *self.last_heal_activity.write().await = SystemTime::now();
     }
 
     async fn is_quitting(&self) -> bool {
-        let mut w = self.rx.write().await;
-        if w.try_recv().is_ok() {
+        if let Ok(true) = self.rx.has_changed() {
+            info!("quited");
             return true;
         }
         false
@@ -248,8 +270,7 @@ impl HealSequence {
     }
 
     async fn stop(&self) {
-        let w = self.tx.write().await;
-        let _ = w.send(true);
+        let _ = self.tx.send(true);
     }
 
     async fn push_heal_result_item(&self, r: &HealResultItem) -> Result<()> {
@@ -284,7 +305,7 @@ impl HealSequence {
         if items_len > 0 {
             r.result_index = 1 + current_status_w.items[items_len - 1].result_index;
         } else {
-            r.result_index = 1 + self.last_sent_result_index;
+            r.result_index = 1 + *self.last_sent_result_index.read().await;
         }
 
         current_status_w.items.push(r);
@@ -292,19 +313,20 @@ impl HealSequence {
         Ok(())
     }
 
-    pub async fn queue_heal_task(&mut self, source: HealSource, heal_type: HealItemType) -> Result<()> {
+    pub async fn queue_heal_task(&self, source: HealSource, heal_type: HealItemType) -> Result<()> {
         let mut task = HealTask::new(&source.bucket, &source.object, &source.version_id, &self.setting);
+        info!("queue_heal_task, {:?}", task);
         if let Some(opts) = source.opts {
             task.opts = opts;
         } else {
             task.opts.scan_mode = HEAL_UNKNOWN_SCAN;
         }
 
-        self.count_scanned(heal_type.clone());
+        self.count_scanned(heal_type.clone()).await;
 
         if source.no_wait {
             let task_str = format!("{:?}", task);
-            if GLOBAL_BackgroundHealRoutine.read().await.tasks_tx.try_send(task).is_ok() {
+            if GLOBAL_BackgroundHealRoutine.tasks_tx.try_send(task).is_ok() {
                 info!("Task in the queue: {:?}", task_str);
             }
             return Ok(());
@@ -314,8 +336,10 @@ impl HealSequence {
         task.resp_tx = Some(resp_tx);
 
         let task_str = format!("{:?}", task);
-        if GLOBAL_BackgroundHealRoutine.read().await.tasks_tx.try_send(task).is_ok() {
+        if GLOBAL_BackgroundHealRoutine.tasks_tx.try_send(task).is_ok() {
             info!("Task in the queue: {:?}", task_str);
+        } else {
+            error!("push task to queue failed");
         }
         let count_ok_drives = |drivers: &[HealDriveInfo]| {
             let mut count = 0;
@@ -330,9 +354,9 @@ impl HealSequence {
         match resp_rx.recv().await {
             Some(mut res) => {
                 if res.err.is_none() {
-                    self.count_healed(heal_type.clone());
+                    self.count_healed(heal_type.clone()).await;
                 } else {
-                    self.count_failed(heal_type.clone());
+                    self.count_failed(heal_type.clone()).await;
                 }
                 if !self.report_progress {
                     if let Some(err) = res.err {
@@ -350,7 +374,7 @@ impl HealSequence {
                 }
                 if res.result.parity_blocks > 0 && res.result.data_blocks > 0 && res.result.data_blocks > res.result.parity_blocks
                 {
-                    let got = count_ok_drives(&res.result.after);
+                    let got = count_ok_drives(&res.result.after.drives);
                     if got < res.result.parity_blocks {
                         res.result.detail = format!(
                             "quorum loss - expected {} minimum, got drive states in OK {}",
@@ -358,55 +382,62 @@ impl HealSequence {
                         );
                     }
                 }
+
+                info!("queue_heal_task, HealResult: {:?}", res);
                 self.push_heal_result_item(&res.result).await
             }
             None => Ok(()),
         }
     }
 
-    async fn heal_disk_meta(h: Arc<RwLock<HealSequence>>) -> Result<()> {
+    async fn heal_disk_meta(h: Arc<HealSequence>) -> Result<()> {
         HealSequence::heal_rustfs_sys_meta(h, CONFIG_PREFIX).await
     }
 
-    async fn heal_items(h: Arc<RwLock<HealSequence>>, buckets_only: bool) -> Result<()> {
-        if h.read().await.client_token == *BG_HEALING_UUID {
+    async fn heal_items(h: Arc<HealSequence>, buckets_only: bool) -> Result<()> {
+        if h.client_token == *BG_HEALING_UUID {
             return Ok(());
         }
 
-        Self::heal_disk_meta(h.clone()).await?;
-        let bucket = h.read().await.bucket.clone();
-        Self::heal_bucket(h.clone(), &bucket, buckets_only).await
+        let bucket = h.bucket.clone();
+        let task1 = Self::heal_disk_meta(h.clone());
+        let task2 = Self::heal_bucket(h.clone(), &bucket, buckets_only);
+        let results = join!(task1, task2);
+        results.0?;
+        results.1?;
+
+        Ok(())
     }
 
-    async fn traverse_and_heal(h: Arc<RwLock<HealSequence>>) {
+    async fn traverse_and_heal(h: Arc<HealSequence>) {
         let buckets_only = false;
         let result = match Self::heal_items(h.clone(), buckets_only).await {
             Ok(_) => None,
             Err(err) => Some(err),
         };
-        let _ = h.read().await.traverse_and_heal_done_tx.read().await.send(result).await;
+        let _ = h.traverse_and_heal_done_tx.read().await.send(result).await;
     }
 
-    async fn heal_rustfs_sys_meta(h: Arc<RwLock<HealSequence>>, meta_prefix: &str) -> Result<()> {
+    async fn heal_rustfs_sys_meta(h: Arc<HealSequence>, meta_prefix: &str) -> Result<()> {
+        info!("heal_rustfs_sys_meta, h: {:?}", h);
         let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
-        let setting = h.read().await.setting;
+        let setting = h.setting;
         store
             .heal_objects(RUSTFS_META_BUCKET, meta_prefix, &setting, h.clone(), true)
             .await
     }
 
     async fn is_done(&self) -> bool {
-        let mut rx_w = self.rx.write().await;
-        if let Ok(true) = rx_w.recv().await {
+        if let Ok(true) = self.rx.has_changed() {
             return true;
         }
         false
     }
 
-    pub async fn heal_bucket(hs: Arc<RwLock<HealSequence>>, bucket: &str, bucket_only: bool) -> Result<()> {
+    pub async fn heal_bucket(hs: Arc<HealSequence>, bucket: &str, bucket_only: bool) -> Result<()> {
+        info!("heal_bucket, hs: {:?}", hs);
         let (object, setting) = {
-            let mut hs_w = hs.write().await;
-            hs_w.queue_heal_task(
+            hs.queue_heal_task(
                 HealSource {
                     bucket: bucket.to_string(),
                     ..Default::default()
@@ -419,37 +450,38 @@ impl HealSequence {
                 return Ok(());
             }
 
-            if !hs_w.setting.recursive {
-                if !hs_w.object.is_empty() {
-                    HealSequence::heal_object(hs.clone(), bucket, &hs_w.object, "", hs_w.setting.scan_mode).await?;
+            if !hs.setting.recursive {
+                if !hs.object.is_empty() {
+                    HealSequence::heal_object(hs.clone(), bucket, &hs.object, "", hs.setting.scan_mode).await?;
                 }
                 return Ok(());
             }
-            (hs_w.object.clone(), hs_w.setting)
+            (hs.object.clone(), hs.setting)
         };
         let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
         store.heal_objects(bucket, &object, &setting, hs.clone(), false).await
     }
 
     pub async fn heal_object(
-        hs: Arc<RwLock<HealSequence>>,
+        hs: Arc<HealSequence>,
         bucket: &str,
         object: &str,
         version_id: &str,
         _scan_mode: HealScanMode,
     ) -> Result<()> {
-        let mut hs_w = hs.write().await;
-        if hs_w.is_quitting().await {
+        info!("heal_object");
+        if hs.is_quitting().await {
+            info!("heal_object hs is quitting");
             return Err(Error::from_string(ERR_HEAL_STOP_SIGNALLED));
         }
 
-        let setting = hs_w.setting;
-        hs_w.queue_heal_task(
+        info!("will queue task");
+        hs.queue_heal_task(
             HealSource {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
                 version_id: version_id.to_string(),
-                opts: Some(setting),
+                opts: Some(hs.setting),
                 ..Default::default()
             },
             HEAL_ITEM_OBJECT.to_string(),
@@ -460,18 +492,17 @@ impl HealSequence {
     }
 
     pub async fn heal_meta_object(
-        hs: Arc<RwLock<HealSequence>>,
+        hs: Arc<HealSequence>,
         bucket: &str,
         object: &str,
         version_id: &str,
         _scan_mode: HealScanMode,
     ) -> Result<()> {
-        let mut hs_w = hs.write().await;
-        if hs_w.is_quitting().await {
+        if hs.is_quitting().await {
             return Err(Error::from_string(ERR_HEAL_STOP_SIGNALLED));
         }
 
-        hs_w.queue_heal_task(
+        hs.queue_heal_task(
             HealSource {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
@@ -486,10 +517,9 @@ impl HealSequence {
     }
 }
 
-pub async fn heal_sequence_start(h: Arc<RwLock<HealSequence>>) {
-    let r = h.read().await;
+pub async fn heal_sequence_start(h: Arc<HealSequence>) {
     {
-        let mut current_status_w = r.current_status.write().await;
+        let mut current_status_w = h.current_status.write().await;
         current_status_w.summary = HEAL_RUNNING_STATUS.to_string();
         current_status_w.start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -503,16 +533,15 @@ pub async fn heal_sequence_start(h: Arc<RwLock<HealSequence>>) {
     });
 
     let h_clone_1 = h.clone();
-    let mut x = r.traverse_and_heal_done_rx.write().await;
+    let mut x = h.traverse_and_heal_done_rx.write().await;
     select! {
-        _ = r.is_done() => {
-            *(r.end_time.write().await) = SystemTime::now();
-            let mut current_status_w = r.current_status.write().await;
+        _ = h.is_done() => {
+            *(h.end_time.write().await) = SystemTime::now();
+            let mut current_status_w = h.current_status.write().await;
             current_status_w.summary = HEAL_FINISHED_STATUS.to_string();
 
             spawn(async move {
-                let binding = h_clone_1.read().await;
-                let mut rx_w = binding.traverse_and_heal_done_rx.write().await;
+                let mut rx_w = h_clone_1.traverse_and_heal_done_rx.write().await;
                 rx_w.recv().await;
             });
         }
@@ -520,12 +549,12 @@ pub async fn heal_sequence_start(h: Arc<RwLock<HealSequence>>) {
             if let Some(err) = result {
                 match err {
                     Some(err) => {
-                        let mut current_status_w = r.current_status.write().await;
+                        let mut current_status_w = h.current_status.write().await;
                         (current_status_w).summary = HEAL_STOPPED_STATUS.to_string();
                         (current_status_w).failure_detail = err.to_string();
                     },
                     None => {
-                        let mut current_status_w = r.current_status.write().await;
+                        let mut current_status_w = h.current_status.write().await;
                         (current_status_w).summary = HEAL_FINISHED_STATUS.to_string();
                     }
                 }
@@ -539,14 +568,14 @@ pub async fn heal_sequence_start(h: Arc<RwLock<HealSequence>>) {
 pub struct AllHealState {
     mu: RwLock<bool>,
 
-    heal_seq_map: HashMap<String, Arc<RwLock<HealSequence>>>,
-    heal_local_disks: HashMap<Endpoint, bool>,
-    heal_status: HashMap<String, HealingTracker>,
+    heal_seq_map: RwLock<HashMap<String, Arc<HealSequence>>>,
+    heal_local_disks: RwLock<HashMap<Endpoint, bool>>,
+    heal_status: RwLock<HashMap<String, HealingTracker>>,
 }
 
 impl AllHealState {
-    pub fn new(cleanup: bool) -> Arc<RwLock<Self>> {
-        let hstate = Arc::new(RwLock::new(AllHealState::default()));
+    pub fn new(cleanup: bool) -> Arc<Self> {
+        let hstate = Arc::new(AllHealState::default());
         let (_, mut rx) = broadcast::channel(1);
         if cleanup {
             let hstate_clone = hstate.clone();
@@ -559,7 +588,7 @@ impl AllHealState {
                             }
                         }
                         _ = sleep(Duration::from_secs(5 * 60)) => {
-                            hstate_clone.write().await.periodic_heal_seqs_clean().await;
+                            hstate_clone.periodic_heal_seqs_clean().await;
                         }
                     }
                 }
@@ -569,10 +598,10 @@ impl AllHealState {
         hstate
     }
 
-    pub async fn pop_heal_local_disks(&mut self, heal_local_disks: &[Endpoint]) {
+    pub async fn pop_heal_local_disks(&self, heal_local_disks: &[Endpoint]) {
         let _ = self.mu.write().await;
 
-        self.heal_local_disks.retain(|k, _| {
+        self.heal_local_disks.write().await.retain(|k, _| {
             if heal_local_disks.contains(k) {
                 return false;
             }
@@ -580,7 +609,7 @@ impl AllHealState {
         });
 
         let heal_local_disks = heal_local_disks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        self.heal_status.retain(|_, v| {
+        self.heal_status.write().await.retain(|_, v| {
             if heal_local_disks.contains(&v.endpoint) {
                 return false;
             }
@@ -589,18 +618,57 @@ impl AllHealState {
         });
     }
 
-    pub async fn update_heal_status(&mut self, tracker: &HealingTracker) {
+    pub async fn pop_heal_status_json(&self, heal_path: &str, client_token: &str) -> Result<Vec<u8>> {
+        match self.get_heal_sequence(heal_path).await {
+            Some(h) => {
+                if client_token != h.client_token {
+                    info!("err heal invalid client token");
+                    return Err(Error::from_string("err heal invalid client token"));
+                }
+                let num_items = h.current_status.read().await.items.len();
+                let mut last_result_index = *h.last_sent_result_index.read().await;
+                if num_items > 0 {
+                    if let Some(item) = h.current_status.read().await.items.last() {
+                        last_result_index = item.result_index;
+                    }
+                }
+                *h.last_sent_result_index.write().await = last_result_index;
+                let data = h.current_status.read().await.clone();
+                match serde_json::to_vec(&data) {
+                    Ok(b) => {
+                        h.current_status.write().await.items.clear();
+                        Ok(b)
+                    }
+                    Err(e) => {
+                        h.current_status.write().await.items.clear();
+                        info!("json encode err, e: {}", e);
+                        Err(Error::msg(e.to_string()))
+                    }
+                }
+            }
+            None => serde_json::to_vec(&HealSequenceStatus {
+                summary: HEAL_FINISHED_STATUS.to_string(),
+                ..Default::default()
+            })
+            .map_err(|e| {
+                info!("json encode err, e: {}", e);
+                Error::msg(e.to_string())
+            }),
+        }
+    }
+
+    pub async fn update_heal_status(&self, tracker: &HealingTracker) {
         let _ = self.mu.write().await;
         let _ = tracker.mu.read().await;
 
-        self.heal_status.insert(tracker.id.clone(), tracker.clone());
+        self.heal_status.write().await.insert(tracker.id.clone(), tracker.clone());
     }
 
     pub async fn get_local_healing_disks(&self) -> HashMap<String, HealingDisk> {
         let _ = self.mu.read().await;
 
         let mut dst = HashMap::new();
-        for v in self.heal_status.values() {
+        for v in self.heal_status.read().await.values() {
             dst.insert(v.endpoint.clone(), v.to_healing_disk().await);
         }
 
@@ -611,7 +679,7 @@ impl AllHealState {
         let _ = self.mu.read().await;
 
         let mut endpoints = Vec::new();
-        self.heal_local_disks.iter().for_each(|(k, v)| {
+        self.heal_local_disks.read().await.iter().for_each(|(k, v)| {
             if !v {
                 endpoints.push(k.clone());
             }
@@ -620,42 +688,40 @@ impl AllHealState {
         Endpoints::from(endpoints)
     }
 
-    pub async fn set_disk_healing_status(&mut self, ep: Endpoint, healing: bool) {
+    pub async fn set_disk_healing_status(&self, ep: Endpoint, healing: bool) {
         let _ = self.mu.write().await;
 
-        self.heal_local_disks.insert(ep, healing);
+        self.heal_local_disks.write().await.insert(ep, healing);
     }
 
-    pub async fn push_heal_local_disks(&mut self, heal_local_disks: &[Endpoint]) {
+    pub async fn push_heal_local_disks(&self, heal_local_disks: &[Endpoint]) {
         let _ = self.mu.write().await;
 
-        heal_local_disks.iter().for_each(|heal_local_disk| {
-            self.heal_local_disks.insert(heal_local_disk.clone(), false);
-        });
+        for heal_local_disk in heal_local_disks.iter() {
+            self.heal_local_disks.write().await.insert(heal_local_disk.clone(), false);
+        }
     }
 
-    pub async fn periodic_heal_seqs_clean(&mut self) {
+    pub async fn periodic_heal_seqs_clean(&self) {
         let _ = self.mu.write().await;
         let now = SystemTime::now();
 
         let mut keys_to_reomve = Vec::new();
-        for (k, v) in self.heal_seq_map.iter() {
-            let r = v.read().await;
-            if r.has_ended().await && now.duration_since(*(r.end_time.read().await)).unwrap() > KEEP_HEAL_SEQ_STATE_DURATION {
+        for (k, v) in self.heal_seq_map.read().await.iter() {
+            if v.has_ended().await && now.duration_since(*(v.end_time.read().await)).unwrap() > KEEP_HEAL_SEQ_STATE_DURATION {
                 keys_to_reomve.push(k.clone())
             }
         }
         for key in keys_to_reomve.iter() {
-            self.heal_seq_map.remove(key);
+            self.heal_seq_map.write().await.remove(key);
         }
     }
 
-    pub async fn get_heal_sequence_by_token(&self, token: &str) -> (Option<Arc<RwLock<HealSequence>>>, bool) {
+    pub async fn get_heal_sequence_by_token(&self, token: &str) -> (Option<Arc<HealSequence>>, bool) {
         let _ = self.mu.read().await;
 
-        for v in self.heal_seq_map.values() {
-            let r = v.read().await;
-            if r.client_token == token {
+        for v in self.heal_seq_map.read().await.values() {
+            if v.client_token == token {
                 return (Some(v.clone()), true);
             }
         }
@@ -663,16 +729,15 @@ impl AllHealState {
         (None, false)
     }
 
-    pub async fn get_heal_sequence(&self, path: &str) -> Option<Arc<RwLock<HealSequence>>> {
+    pub async fn get_heal_sequence(&self, path: &str) -> Option<Arc<HealSequence>> {
         let _ = self.mu.read().await;
 
-        self.heal_seq_map.get(path).cloned()
+        self.heal_seq_map.read().await.get(path).cloned()
     }
 
-    pub async fn stop_heal_sequence(&mut self, path: &str) -> Result<Vec<u8>> {
+    pub async fn stop_heal_sequence(&self, path: &str) -> Result<Vec<u8>> {
         let mut hsp = HealStopSuccess::default();
         if let Some(he) = self.get_heal_sequence(path).await {
-            let he = he.read().await;
             let client_token = he.client_token.clone();
             if *GLOBAL_IsDistErasure.read().await {
                 // TODO: proxy
@@ -680,7 +745,7 @@ impl AllHealState {
 
             hsp.client_token = client_token;
             hsp.client_address = he.client_address.clone();
-            hsp.start_time = he.start_time;
+            hsp.start_time = Utc::now();
 
             he.stop().await;
 
@@ -693,7 +758,7 @@ impl AllHealState {
             }
 
             let _ = self.mu.write().await;
-            self.heal_seq_map.remove(path);
+            self.heal_seq_map.write().await.remove(path);
         } else {
             hsp.client_token = "unknown".to_string();
         }
@@ -712,22 +777,24 @@ impl AllHealState {
     // `keepHealSeqStateDuration`. This function also launches a
     // background routine to clean up heal results after the
     // aforementioned duration.
-    pub async fn launch_new_heal_sequence(&mut self, heal_sequence: Arc<RwLock<HealSequence>>) -> Result<Vec<u8>> {
-        let r = heal_sequence.read().await;
-        let path = Path::new(&r.bucket).join(r.object.clone());
+    pub async fn launch_new_heal_sequence(&self, heal_sequence: Arc<HealSequence>) -> Result<Vec<u8>> {
+        let path = path_join(&[
+            PathBuf::from(heal_sequence.bucket.clone()),
+            PathBuf::from(heal_sequence.object.clone()),
+        ]);
         let path_s = path.to_str().unwrap();
-        if r.force_started {
+        if heal_sequence.force_started {
             self.stop_heal_sequence(path_s).await?;
         } else if let Some(hs) = self.get_heal_sequence(path_s).await {
-            if !hs.read().await.has_ended().await {
-                return Err(Error::from_string(format!("Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {:?}, token is {}", r.client_address, r.start_time, r.client_token)));
+            if !hs.has_ended().await {
+                return Err(Error::from_string(format!("Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {:?}, token is {}", heal_sequence.client_address, heal_sequence.start_time, heal_sequence.client_token)));
             }
         }
 
         let _ = self.mu.write().await;
 
-        for (k, v) in self.heal_seq_map.iter() {
-            if !v.read().await.has_ended().await && (has_profix(k, path_s) || has_profix(path_s, k)) {
+        for (k, v) in self.heal_seq_map.read().await.iter() {
+            if (has_profix(k, path_s) || has_profix(path_s, k)) && !v.has_ended().await {
                 return Err(Error::from_string(format!(
                     "The provided heal sequence path overlaps with an existing heal path: {}",
                     k
@@ -735,14 +802,17 @@ impl AllHealState {
             }
         }
 
-        self.heal_seq_map.insert(path_s.to_string(), heal_sequence.clone());
+        self.heal_seq_map
+            .write()
+            .await
+            .insert(path_s.to_string(), heal_sequence.clone());
 
-        let client_token = r.client_token.clone();
+        let client_token = heal_sequence.client_token.clone();
         if *GLOBAL_IsDistErasure.read().await {
             // TODO: proxy
         }
 
-        if r.client_token == BG_HEALING_UUID {
+        if heal_sequence.client_token == BG_HEALING_UUID {
             // For background heal do nothing, do not spawn an unnecessary goroutine.
         } else {
             let heal_sequence_clone = heal_sequence.clone();
@@ -753,8 +823,9 @@ impl AllHealState {
 
         let b = serde_json::to_vec(&HealStartSuccess {
             client_token,
-            client_address: r.client_address.clone(),
-            start_time: r.start_time,
+            client_address: heal_sequence.client_address.clone(),
+            // start_time: Utc::now(),
+            start_time: heal_sequence.start_time.into(),
         })?;
         Ok(b)
     }

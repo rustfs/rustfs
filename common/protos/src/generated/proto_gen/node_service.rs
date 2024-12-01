@@ -1037,7 +1037,6 @@ pub struct LoadRebalanceMetaResponse {
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct LoadTransitionTierConfigRequest {}
-
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LoadTransitionTierConfigResponse {
     #[prost(bool, tag = "1")]

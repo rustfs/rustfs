@@ -2,6 +2,7 @@ pub mod handlers;
 pub mod router;
 
 use common::error::Result;
+// use ecstore::global::{is_dist_erasure, is_erasure};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
@@ -54,17 +55,6 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     )?;
 
     r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),
-        AdminOperation(&handlers::HealHandler {}),
-    )?;
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
-        AdminOperation(&handlers::BackgroundHealStatusHandler {}),
-    )?;
-
-    r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/list").as_str(),
         AdminOperation(&handlers::ListPools {}),
@@ -100,6 +90,20 @@ pub fn make_admin_route() -> Result<impl S3Route> {
         format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/stop").as_str(),
         AdminOperation(&handlers::RebalanceStop {}),
     )?;
+
+    // Some APIs are only available in EC mode
+    // if is_dist_erasure().await || is_erasure().await {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),
+        AdminOperation(&handlers::HealHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
+        AdminOperation(&handlers::BackgroundHealStatusHandler {}),
+    )?;
+    // }
 
     Ok(r)
 }
