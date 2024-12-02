@@ -2,6 +2,7 @@ use crate::{
     disk::endpoint::{Endpoint, EndpointType},
     disks_layout::DisksLayout,
     error::{Error, Result},
+    global::global_rustfs_port,
     utils::net,
 };
 use std::{
@@ -528,6 +529,46 @@ impl EndpointServerPools {
         nodes.sort_by(|a, b| a.grid_host.cmp(&b.grid_host));
 
         nodes
+    }
+    pub fn hosts_sorted(&self) -> Vec<()> {
+        let (mut peers, local) = self.peers();
+
+        peers.sort();
+
+        for peer in peers.iter() {
+            if &local == peer {
+                continue;
+            }
+
+            // FIXME:TODO
+        }
+
+        unimplemented!()
+    }
+    pub fn peers(&self) -> (Vec<String>, String) {
+        let mut local = None;
+        let mut set = HashSet::new();
+        for ep in self.0.iter() {
+            for endpoint in ep.endpoints.0.iter() {
+                if endpoint.get_type() != EndpointType::Url {
+                    continue;
+                }
+                let host = endpoint.host_port();
+                if endpoint.is_local {
+                    if endpoint.url.port() == Some(global_rustfs_port()) {
+                        if local.is_none() {
+                            local = Some(host.clone());
+                        }
+                    }
+                }
+
+                set.insert(host);
+            }
+        }
+
+        let hosts: Vec<String> = set.iter().cloned().collect();
+
+        (hosts, local.unwrap_or_default())
     }
 }
 

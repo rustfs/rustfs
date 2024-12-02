@@ -1,12 +1,13 @@
 use clap::Parser;
 use const_str::concat;
+use ecstore::global::DEFAULT_PORT;
 
 shadow_rs::shadow!(build);
 
 /// Default port that a rustfs server listens on.
 ///
 /// Used if no port is specified.
-pub const DEFAULT_PORT: u16 = 9000;
+
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 

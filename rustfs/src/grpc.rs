@@ -13,7 +13,10 @@ use ecstore::{
         UpdateMetadataOpts, WalkDirOptions,
     },
     erasure::Writer,
-    heal::{data_usage_cache::DataUsageCache, heal_commands::HealOpts},
+    heal::{
+        data_usage_cache::DataUsageCache,
+        heal_commands::{get_local_background_heal_status, HealOpts},
+    },
     new_object_layer_fn,
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
@@ -25,7 +28,6 @@ use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 use common::globals::GLOBAL_Local_Node_Name;
 use madmin::net::get_net_info;
 use madmin::{
-    heal_command::get_local_background_heal_status,
     health::{
         get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
     },

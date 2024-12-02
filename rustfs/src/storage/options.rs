@@ -1,8 +1,8 @@
-use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::error::{Error, Result};
-use crate::store_api::ObjectOptions;
-use crate::store_err::StorageError;
-use crate::utils::path::is_dir_object;
+use ecstore::bucket::versioning_sys::BucketVersioningSys;
+use ecstore::error::{Error, Result};
+use ecstore::store_api::ObjectOptions;
+use ecstore::store_err::StorageError;
+use ecstore::utils::path::is_dir_object;
 use http::{HeaderMap, HeaderValue};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
