@@ -1,4 +1,8 @@
-#!/bin/bash
+#!/bin/bash -e
+
+if [ -z "$SKIP_BUILD" ]; then
+    cargo build -p rustfs --bins
+fi
 
 current_dir=$(pwd)
 
@@ -29,5 +33,5 @@ fi
     # --domain-name   127.0.0.1:9010  \
     # "$DATA_DIR_ARG"
 
-cargo run "$DATA_DIR_ARG"
+./target/debug/rustfs "$DATA_DIR_ARG"
 # cargo run ./target/volume/test
