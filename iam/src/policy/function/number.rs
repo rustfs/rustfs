@@ -1,0 +1,113 @@
+use std::collections::HashMap;
+
+use super::func::InnerFunc;
+use serde::{
+    de::{Error, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+
+pub type NumberFunc = InnerFunc<NumberFuncValue>;
+
+#[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+pub struct NumberFuncValue(i64);
+
+impl NumberFunc {
+    pub fn evaluate(&self, op: impl FnOnce(&i64, &i64) -> bool, if_exists: bool, values: &HashMap<String, Vec<String>>) -> bool {
+        let v = match values.get(self.key.name().as_str()).and_then(|x| x.get(0)) {
+            Some(x) => x,
+            None => return if_exists,
+        };
+
+        let Ok(rv) = v.parse::<i64>() else {
+            return false;
+        };
+
+        op(&rv, &self.values.0)
+    }
+}
+
+impl Serialize for NumberFuncValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.0.to_string().as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for NumberFuncValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NumberVisitor;
+
+        impl<'de> Visitor<'de> for NumberVisitor {
+            type Value = NumberFuncValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a number or a string that can be represented as a number.")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                Ok(NumberFuncValue(value.parse().map_err(|e| E::custom(format!("{e:?}")))?))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                Ok(NumberFuncValue(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                Ok(NumberFuncValue(value as i64))
+            }
+        }
+
+        deserializer.deserialize_any(NumberVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NumberFunc, NumberFuncValue};
+    use crate::policy::function::{
+        key::Key,
+        key_name::KeyName::{self, *},
+        key_name::S3KeyName::*,
+    };
+    use test_case::test_case;
+
+    fn new_func(name: KeyName, variable: Option<String>, value: i64) -> NumberFunc {
+        NumberFunc {
+            key: Key { name, variable },
+            values: NumberFuncValue(value),
+        }
+    }
+
+    #[test_case(r#"{"s3:max-keys": 1}"#, new_func(S3(S3MaxKeys), None, 1); "1")]
+    #[test_case(r#"{"s3:max-keys/a": 1}"#, new_func(S3(S3MaxKeys), Some("a".into()), 1); "2")]
+    #[test_case(r#"{"s3:max-keys": "1"}"#, new_func(S3(S3MaxKeys), None, 1); "3")]
+    #[test_case(r#"{"s3:max-keys/a": "1"}"#, new_func(S3(S3MaxKeys), Some("a".into()), 1); "4")]
+    fn test_deser(input: &str, expect: NumberFunc) -> Result<(), serde_json::Error> {
+        let v: NumberFunc = serde_json::from_str(input)?;
+        assert_eq!(v, expect);
+        Ok(())
+    }
+
+    #[test_case(r#"{"s3:max-keys":"1"}"#, new_func(S3(S3MaxKeys), None, 1); "1")]
+    #[test_case(r#"{"s3:max-keys/a":"1"}"#, new_func(S3(S3MaxKeys), Some("a".into()), 1); "2")]
+    fn test_ser(expect: &str, input: NumberFunc) -> Result<(), serde_json::Error> {
+        let v = serde_json::to_string(&input)?;
+        assert_eq!(v, expect);
+        Ok(())
+    }
+}
