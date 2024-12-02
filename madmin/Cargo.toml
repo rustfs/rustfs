@@ -7,6 +7,5 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ecstore.workspace = true
 psutil = "3.3.0"
 serde.workspace = true
