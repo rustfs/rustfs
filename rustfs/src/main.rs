@@ -25,7 +25,7 @@ use iam::init_iam_sys;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
 use service::hybrid;
-use std::{io::IsTerminal, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tracing::{debug, error, info, warn};
