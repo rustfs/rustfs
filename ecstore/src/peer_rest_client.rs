@@ -1,9 +1,11 @@
 use std::{collections::HashMap, io::Cursor, time::SystemTime};
 
+use crate::{
+    admin_server_info::ServerProperties, endpoints::EndpointServerPools, global::is_dist_erasure,
+    heal::heal_commands::BgHealState, store_api::StorageInfo,
+};
 use common::error::{Error, Result};
-use ecstore::{admin_server_info::ServerProperties, store_api::StorageInfo};
 use madmin::{
-    heal_command::BgHealState,
     health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysService},
     metrics::{CollectMetricsOpts, MetricType, RealtimeMetrics},
     net::NetInfo,
@@ -21,14 +23,14 @@ use protos::{
     },
 };
 use rmp_serde::{Deserializer, Serializer};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize as _};
 use tonic::Request;
 
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
 
-struct PeerRestClient {
+pub struct PeerRestClient {
     addr: String,
 }
 
@@ -37,6 +39,15 @@ impl PeerRestClient {
         Self {
             addr: format!("{}://{}:{}", url.scheme(), url.host_str().unwrap(), url.port().unwrap()),
         }
+    }
+    pub async fn new_clients(_eps: EndpointServerPools) -> (Vec<Self>, Vec<Self>) {
+        if !is_dist_erasure().await {
+            return (Vec::new(), Vec::new());
+        }
+
+        // FIXME:TODO
+
+        todo!()
     }
 }
 

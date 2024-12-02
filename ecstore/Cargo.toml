@@ -62,6 +62,7 @@ rand.workspace = true
 pin-project-lite.workspace = true
 md-5.workspace = true
 workers.workspace = true
+madmin.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 

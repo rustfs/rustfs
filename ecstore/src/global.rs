@@ -18,7 +18,10 @@ pub const DISK_MIN_INODES: u64 = 1000;
 pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 
+pub const DEFAULT_PORT: u16 = 9000;
+
 lazy_static! {
+    static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
@@ -31,6 +34,18 @@ lazy_static! {
     pub static ref GLOBAL_BackgroundHealRoutine: Arc<RwLock<HealRoutine>> = HealRoutine::new();
     pub static ref GLOBAL_BackgroundHealState: Arc<RwLock<AllHealState>> = AllHealState::new(false);
     static ref globalDeploymentIDPtr: RwLock<Uuid> = RwLock::new(Uuid::nil());
+}
+
+pub fn global_rustfs_port() -> u16 {
+    if let Some(p) = GLOBAL_RUSTFS_PORT.get() {
+        p.clone()
+    } else {
+        DEFAULT_PORT
+    }
+}
+
+pub fn set_global_rustfs_port(value: u16) {
+    GLOBAL_RUSTFS_PORT.set(value).expect("set_global_rustfs_port fail");
 }
 
 pub async fn set_global_deployment_id(id: Uuid) {

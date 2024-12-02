@@ -1,3 +1,6 @@
+use super::options::del_opts;
+use super::options::extract_metadata;
+use super::options::put_opts;
 use bytes::Bytes;
 use common::error::Result;
 use ecstore::bucket::error::BucketMetadataError;
@@ -16,9 +19,6 @@ use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::new_object_layer_fn;
-use ecstore::options::del_opts;
-use ecstore::options::extract_metadata;
-use ecstore::options::put_opts;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
 use ecstore::store_api::DeleteBucketOptions;

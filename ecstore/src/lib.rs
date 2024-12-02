@@ -11,7 +11,9 @@ pub mod error;
 mod file_meta;
 pub mod global;
 pub mod heal;
+pub mod notification_sys;
 pub mod peer;
+mod peer_rest_client;
 mod quorum;
 pub mod set_disk;
 mod sets;
@@ -22,7 +24,7 @@ pub mod utils;
 
 pub mod bucket;
 pub mod file_meta_inline;
-pub mod options;
+
 pub mod pools;
 pub mod store_err;
 pub mod xhttp;
