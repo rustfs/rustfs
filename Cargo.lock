@@ -796,6 +796,7 @@ dependencies = [
  "http",
  "lazy_static",
  "lock",
+ "madmin",
  "md-5",
  "netif",
  "nix 0.29.0",
@@ -1672,7 +1673,6 @@ dependencies = [
 name = "madmin"
 version = "0.0.1"
 dependencies = [
- "ecstore",
  "psutil",
  "serde",
 ]

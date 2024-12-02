@@ -1,16 +1,17 @@
 mod admin;
 mod config;
 mod grpc;
-#[allow(dead_code)]
-mod peer_rest_client;
 mod service;
 mod storage;
-
 use clap::Parser;
 use common::error::{Error, Result};
+use ecstore::global::set_global_rustfs_port;
+use ecstore::heal::background_heal_ops::init_auto_heal;
+use ecstore::utils::net::{self, get_available_port};
 use ecstore::{
     endpoints::EndpointServerPools,
-    heal::{background_heal_ops::init_auto_heal, data_scanner::init_data_scanner},
+    heal::data_scanner::init_data_scanner,
+    notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::{init_local_disks, ECStore},
     update_erasure_type,
@@ -72,13 +73,27 @@ fn main() -> Result<()> {
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
+    let mut server_addr = net::check_local_server_addr(opt.address.as_str()).unwrap();
+
+    if server_addr.port() == 0 {
+        server_addr.set_port(get_available_port());
+    }
+
+    let server_port = server_addr.port();
+
+    let server_address = server_addr.to_string();
+
+    debug!("server_address {}", &server_address);
+
+    set_global_rustfs_port(server_port);
+
     //监听地址,端口从参数中获取
-    let listener = TcpListener::bind(opt.address.clone()).await?;
+    let listener = TcpListener::bind(server_address.clone()).await?;
     //获取监听地址
     let local_addr: SocketAddr = listener.local_addr()?;
 
     // 用于rpc
-    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(opt.address.clone().as_str(), opt.volumes.clone())
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
@@ -100,7 +115,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // 本项目使用s3s库来实现s3服务
     let service = {
         let store = storage::ecfs::FS::new();
-        // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(opt.address.clone(), endpoint_pools).await?);
+        // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(server_address.clone(), endpoint_pools).await?);
         let mut b = S3ServiceBuilder::new(store.clone());
         //设置AK和SK
         //其中部份内容从config配置文件中读取
@@ -183,7 +198,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     });
 
     // init store
-    let store = ECStore::new(opt.address.clone(), endpoint_pools.clone())
+    let store = ECStore::new(server_address.clone(), endpoint_pools.clone())
         .await
         .map_err(|err| Error::from_string(err.to_string()))?;
 
@@ -192,6 +207,12 @@ async fn run(opt: config::Opt) -> Result<()> {
         Error::from_string(err.to_string())
     })?;
     warn!(" init store success!");
+
+    new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
+        error!("new_global_notification_sys faild {:?}", &err);
+        Error::from_string(err.to_string())
+    })?;
+
     // init scanner
     init_data_scanner().await;
     // init auto heal

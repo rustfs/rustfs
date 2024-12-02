@@ -2,8 +2,9 @@ use crate::error::{Error, Result};
 use lazy_static::lazy_static;
 use std::{
     collections::HashSet,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
 };
+
 use url::Host;
 
 lazy_static! {
@@ -90,6 +91,10 @@ pub fn get_host_ip(host: Host<&str>) -> Result<HashSet<IpAddr>> {
             Ok(set)
         }
     }
+}
+
+pub fn get_available_port() -> u16 {
+    TcpListener::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port()
 }
 
 /// returns IPs of local interface
