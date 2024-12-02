@@ -1,6 +1,7 @@
 #[cfg(any(test, feature = "crypto"))]
 pub fn decrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
     use crate::encdec::id::ID;
+    use crate::error::Error;
     use aes_gcm::{Aes256Gcm, KeyInit as _};
     use chacha20poly1305::ChaCha20Poly1305;
 
@@ -30,6 +31,7 @@ pub fn decrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
 #[cfg(any(test, feature = "crypto"))]
 #[inline]
 fn decryp<T: aes_gcm::aead::Aead>(stream: T, nonce: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    use crate::error::Error;
     stream
         .decrypt(aes_gcm::Nonce::from_slice(nonce), data)
         .map_err(Error::ErrDecryptFailed)
