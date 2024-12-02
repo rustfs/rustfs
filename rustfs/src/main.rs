@@ -4,7 +4,10 @@ mod grpc;
 mod service;
 mod storage;
 use clap::Parser;
-use common::error::{Error, Result};
+use common::{
+    error::{Error, Result},
+    globals::set_global_addr,
+};
 use ecstore::global::set_global_rustfs_port;
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::utils::net::{self, get_available_port};
@@ -102,6 +105,8 @@ async fn run(opt: config::Opt) -> Result<()> {
             i, eps.set_count, eps.drives_per_set, eps.cmd_line
         );
     }
+
+    set_global_addr(&opt.address).await;
 
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;

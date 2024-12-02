@@ -14,9 +14,12 @@ use ecstore::{
     },
     erasure::Writer,
     heal::{
+        
         data_usage_cache::DataUsageCache,
-        heal_commands::{get_local_background_heal_status, HealOpts},
+       
+        heal_commands::{get_local_background_heal_status, {get_local_background_heal_status, HealOpts},
     },
+    metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType},
     new_object_layer_fn,
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
@@ -33,6 +36,7 @@ use madmin::{
     },
     metrics::{collect_local_metrics, CollectMetricsOpts},
 };
+use madmin::net::get_net_info;
 use protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
@@ -1709,9 +1713,14 @@ impl Node for NodeService {
 
     async fn get_metrics(&self, request: Request<GetMetricsRequest>) -> Result<Response<GetMetricsResponse>, Status> {
         let request = request.into_inner();
-        let mut buf = Deserializer::new(Cursor::new(request.opts));
-        let opts: CollectMetricsOpts = Deserialize::deserialize(&mut buf).unwrap();
-        let info = collect_local_metrics(request.metric_type, &opts);
+        let mut buf_t = Deserializer::new(Cursor::new(request.metric_type));
+        let t: MetricType = Deserialize::deserialize(&mut buf_t).unwrap();
+
+        let mut buf_o = Deserializer::new(Cursor::new(request.opts));
+        let opts: CollectMetricsOpts = Deserialize::deserialize(&mut buf_o).unwrap();
+
+        let info = collect_local_metrics(t, &opts).await;
+
         let mut buf = Vec::new();
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetMetricsResponse {

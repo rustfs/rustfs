@@ -13,6 +13,7 @@ use std::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use chrono::{DateTime, TimeZone, Utc};
 use lazy_static::lazy_static;
 use rand::Rng;
 use rmp_serde::{Deserializer, Serializer};
@@ -138,7 +139,7 @@ async fn run_data_scanner() {
     loop {
         let stop_fn = ScannerMetrics::log(ScannerMetric::ScanCycle);
         cycle_info.current = cycle_info.next;
-        cycle_info.started = SystemTime::now();
+        cycle_info.started = Utc::now();
         {
             globalScannerMetrics.write().await.set_cycle(Some(cycle_info.clone())).await;
         }
@@ -166,7 +167,7 @@ async fn run_data_scanner() {
             Ok(_) => {
                 cycle_info.next += 1;
                 cycle_info.current = 0;
-                cycle_info.cycle_completed.push(SystemTime::now());
+                cycle_info.cycle_completed.push(Utc::now());
                 if cycle_info.cycle_completed.len() > DATA_USAGE_UPDATE_DIR_CYCLES as usize {
                     cycle_info.cycle_completed = cycle_info.cycle_completed
                         [cycle_info.cycle_completed.len() - DATA_USAGE_UPDATE_DIR_CYCLES as usize..]
@@ -252,8 +253,8 @@ async fn get_cycle_scan_mode(current_cycle: u64, bitrot_start_cycle: u64, bitrot
 pub struct CurrentScannerCycle {
     pub current: u64,
     pub next: u64,
-    pub started: SystemTime,
-    pub cycle_completed: Vec<SystemTime>,
+    pub started: DateTime<Utc>,
+    pub cycle_completed: Vec<DateTime<Utc>>,
 }
 
 impl Default for CurrentScannerCycle {
@@ -261,7 +262,7 @@ impl Default for CurrentScannerCycle {
         Self {
             current: Default::default(),
             next: Default::default(),
-            started: SystemTime::now(),
+            started: Utc::now(),
             cycle_completed: Default::default(),
         }
     }
@@ -285,7 +286,7 @@ impl CurrentScannerCycle {
 
         // write "started"
         rmp::encode::write_str(&mut wr, "started")?;
-        rmp::encode::write_uint(&mut wr, system_time_to_timestamp(&self.started))?;
+        rmp::encode::write_sint(&mut wr, system_time_to_timestamp(&self.started))?;
 
         // write "cycle_completed"
         rmp::encode::write_str(&mut wr, "cycle_completed")?;
@@ -328,14 +329,14 @@ impl CurrentScannerCycle {
                 //     self.next = u;
                 // }
                 "started" => {
-                    let u: u64 = rmp::decode::read_int(&mut cur)?;
+                    let u: i64 = rmp::decode::read_int(&mut cur)?;
                     let started = timestamp_to_system_time(u);
                     self.started = started;
                 }
                 "cycleCompleted" => {
                     let mut buf = Vec::new();
                     let _ = cur.read_to_end(&mut buf)?;
-                    let u: Vec<SystemTime> =
+                    let u: Vec<DateTime<Utc>> =
                         Deserialize::deserialize(&mut Deserializer::new(&buf[..])).expect("Deserialization failed");
                     self.cycle_completed = u;
                 }
@@ -348,13 +349,13 @@ impl CurrentScannerCycle {
 }
 
 // 将 SystemTime 转换为时间戳
-fn system_time_to_timestamp(time: &SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs()
+fn system_time_to_timestamp(time: &DateTime<Utc>) -> i64 {
+    time.timestamp_micros()
 }
 
 // 将时间戳转换为 SystemTime
-fn timestamp_to_system_time(timestamp: u64) -> SystemTime {
-    UNIX_EPOCH + std::time::Duration::new(timestamp, 0)
+fn timestamp_to_system_time(timestamp: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(timestamp).unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Default)]

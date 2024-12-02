@@ -11,6 +11,7 @@ pub mod error;
 mod file_meta;
 pub mod global;
 pub mod heal;
+pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod peer;
 mod peer_rest_client;

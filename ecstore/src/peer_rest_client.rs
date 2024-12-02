@@ -7,7 +7,7 @@ use crate::{
 use common::error::{Error, Result};
 use madmin::{
     health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysService},
-    metrics::{CollectMetricsOpts, MetricType, RealtimeMetrics},
+    metrics::RealtimeMetrics,
     net::NetInfo,
 };
 use protos::{
@@ -266,11 +266,13 @@ impl PeerRestClient {
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
-        let mut buf = Vec::new();
-        opts.serialize(&mut Serializer::new(&mut buf))?;
+        let mut buf_t = Vec::new();
+        t.serialize(&mut Serializer::new(&mut buf_t))?;
+        let mut buf_o = Vec::new();
+        opts.serialize(&mut Serializer::new(&mut buf_o))?;
         let request = Request::new(GetMetricsRequest {
-            metric_type: t,
-            opts: buf,
+            metric_type: buf_t,
+            opts: buf_o,
         });
 
         let response = client.get_metrics(request).await?.into_inner();

@@ -27,6 +27,7 @@ use crate::{
 use endpoint::Endpoint;
 use futures::StreamExt;
 use local::LocalDisk;
+use madmin::info_commands::DiskMetrics;
 use protos::proto_gen::node_service::{
     node_service_client::NodeServiceClient, ReadAtRequest, ReadAtResponse, WriteRequest, WriteResponse,
 };
@@ -35,7 +36,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::HashMap,
     fmt::Debug,
     io::{Cursor, SeekFrom},
     path::PathBuf,
@@ -519,16 +519,6 @@ pub struct DiskInfo {
     pub rotational: bool,
     pub metrics: DiskMetrics,
     pub error: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DiskMetrics {
-    api_calls: HashMap<String, u64>,
-    total_waiting: u32,
-    total_errors_availability: u64,
-    total_errors_timeout: u64,
-    total_writes: u64,
-    total_deletes: u64,
 }
 
 #[derive(Clone, Debug, Default)]
