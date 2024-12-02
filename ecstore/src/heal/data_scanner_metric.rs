@@ -1,5 +1,8 @@
+use chrono::{DateTime, Utc};
+use common::globals::GLOBAL_Local_Node_Name;
 use common::last_minute::{AccElem, LastMinuteLatency};
 use lazy_static::lazy_static;
+use madmin::metrics::ScannerMetrics as M_ScannerMetrics;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
@@ -125,7 +128,7 @@ pub type TimeSizeFn = Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = ()> + Send>
 pub type TimeFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 
 pub struct ScannerMetrics {
-    operations: Vec<AtomicU32>,
+    operations: Vec<AtomicU64>,
     latency: Vec<LockedLastMinuteLatency>,
     cycle_info: RwLock<Option<CurrentScannerCycle>>,
     current_paths: HashMap<String, String>,
@@ -140,7 +143,7 @@ impl Default for ScannerMetrics {
 impl ScannerMetrics {
     pub fn new() -> Self {
         Self {
-            operations: (0..ScannerMetric::Last as usize).map(|_| AtomicU32::new(0)).collect(),
+            operations: (0..ScannerMetric::Last as usize).map(|_| AtomicU64::new(0)).collect(),
             latency: vec![LockedLastMinuteLatency::default(); ScannerMetric::LastRealtime as usize],
             cycle_info: RwLock::new(None),
             current_paths: HashMap::new(),
@@ -194,6 +197,39 @@ impl ScannerMetrics {
                 }
             })
         })
+    }
+
+    pub async fn get_cycle(&self) -> Option<CurrentScannerCycle> {
+        let r = self.cycle_info.read().await;
+        if let Some(c) = r.as_ref() {
+            return Some(c.clone());
+        }
+        None
+    }
+
+    pub async fn get_current_paths(&self) -> Vec<String> {
+        let mut res = Vec::new();
+        let prefix = format!("{}/", GLOBAL_Local_Node_Name.read().await);
+        self.current_paths.iter().for_each(|(k, v)| {
+            res.push(format!("{}/{}/{}", prefix, k, v));
+        });
+        res
+    }
+
+    pub async fn report(&self) -> M_ScannerMetrics {
+        let mut m = M_ScannerMetrics::default();
+        if let Some(cycle) = self.get_cycle().await {
+            m.current_cycle = cycle.current;
+            m.cycles_completed_at = cycle.cycle_completed;
+            m.current_started = cycle.started;
+        }
+        m.collected_at = Utc::now();
+        m.active_paths = self.get_current_paths().await;
+        for (i, v) in self.operations.iter().enumerate() {
+            m.life_time_ops.insert(i.to_string(), v.load(Ordering::SeqCst));
+        }
+
+        m
     }
 }
 

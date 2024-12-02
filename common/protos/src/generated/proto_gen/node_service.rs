@@ -735,8 +735,8 @@ pub struct GetMemInfoResponse {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetMetricsRequest {
-    #[prost(uint64, tag = "1")]
-    pub metric_type: u64,
+    #[prost(bytes = "vec", tag = "1")]
+    pub metric_type: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub opts: ::prost::alloc::vec::Vec<u8>,
 }

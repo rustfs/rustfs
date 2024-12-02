@@ -131,7 +131,7 @@ impl Default for HealStartSuccess {
 
 pub type HealStopSuccess = HealStartSuccess;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealingDisk {
     pub id: String,
     pub heal_id: String,
