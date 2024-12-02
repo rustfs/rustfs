@@ -1,8 +1,12 @@
 pub mod handlers;
+pub mod models;
 pub mod router;
 
 use common::error::Result;
 // use ecstore::global::{is_dist_erasure, is_erasure};
+use handlers::service_account::{
+    AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount,
+};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
@@ -104,6 +108,36 @@ pub fn make_admin_route() -> Result<impl S3Route> {
         AdminOperation(&handlers::BackgroundHealStatusHandler {}),
     )?;
     // }
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/update-service-account").as_str(),
+        AdminOperation(&UpdateServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/info-service-account").as_str(),
+        AdminOperation(&InfoServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-service-accounts").as_str(),
+        AdminOperation(&ListServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/delete-service-accounts").as_str(),
+        AdminOperation(&DeleteServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/add-service-accounts").as_str(),
+        AdminOperation(&AddServiceAccount {}),
+    )?;
 
     Ok(r)
 }

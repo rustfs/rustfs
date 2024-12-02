@@ -34,6 +34,8 @@ use tokio::spawn;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+pub mod service_account;
+
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct AssumeRoleRequest {

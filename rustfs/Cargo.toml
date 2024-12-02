@@ -37,7 +37,7 @@ s3s.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-time = { workspace = true, features = ["parsing", "formatting"] }
+time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 tokio-util = { version = "0.7.12", features = ["io", "compat"] }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
@@ -62,6 +62,8 @@ shadow-rs = "0.36.0"
 const-str = { version = "0.5.7", features = ["std", "proc"] }
 atoi = "2.0.0"
 serde_urlencoded = "0.7.1"
+crypto = { path = "../crypto" }
+iam = { path = "../iam" }
 
 [build-dependencies]
 prost-build.workspace = true

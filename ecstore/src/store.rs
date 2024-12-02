@@ -264,7 +264,7 @@ impl ECStore {
         self.pools.len() == 1
     }
 
-    async fn list_path(&self, opts: &ListPathOptions, delimiter: &str) -> Result<ListObjectsInfo> {
+    pub async fn list_path(&self, opts: &ListPathOptions, delimiter: &str) -> Result<ListObjectsInfo> {
         // if opts.prefix.ends_with(SLASH_SEPARATOR) {
         //     return Err(Error::msg("eof"));
         // }

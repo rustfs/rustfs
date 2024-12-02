@@ -9,7 +9,7 @@ use crate::{
 use futures::StreamExt;
 use http::HeaderMap;
 use rmp_serde::Serializer;
-use s3s::dto::StreamingBlob;
+use s3s::{dto::StreamingBlob, Body};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -411,6 +411,14 @@ pub struct PutObjReader {
 impl PutObjReader {
     pub fn new(stream: StreamingBlob, content_length: usize) -> Self {
         PutObjReader { stream, content_length }
+    }
+
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        let content_length = data.len();
+        PutObjReader {
+            stream: Body::from(data).into(),
+            content_length,
+        }
     }
 }
 
