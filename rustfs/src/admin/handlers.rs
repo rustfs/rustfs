@@ -431,7 +431,7 @@ impl Operation for MetricsHandler {
                 // todo write resp
                 match serde_json::to_vec(&m) {
                     Ok(re) => {
-                        info!("got metrics, send it to client, m: {m:?}, re: {re:?}");
+                        info!("got metrics, send it to client, m: {m:?}");
                         let _ = tx.send(Ok(Bytes::from(re))).await;
                     }
                     Err(e) => {

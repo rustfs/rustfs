@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use tokio::{sync::RwLock, time::sleep};
+use tracing::info;
 
 #[derive(Debug, Default)]
 pub struct LRWMutex {
@@ -87,14 +88,14 @@ impl LRWMutex {
     pub async fn un_lock(&self) {
         let is_write = true;
         if !self.unlock(is_write).await {
-            panic!("Trying to un_lock() while no Lock() is active")
+            info!("Trying to un_lock() while no Lock() is active")
         }
     }
 
     pub async fn un_r_lock(&self) {
         let is_write = false;
         if !self.unlock(is_write).await {
-            panic!("Trying to un_r_lock() while no Lock() is active")
+            info!("Trying to un_r_lock() while no Lock() is active")
         }
     }
 
