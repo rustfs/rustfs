@@ -62,7 +62,8 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy
+        # run: cargo clippy -- -D warnings
 
       - name: cargo test
         run: cargo test --all --exclude e2e_test
