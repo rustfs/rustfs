@@ -1,3 +1,4 @@
+use crate::heal::heal_commands::HealingDisk;
 use crate::heal::heal_ops::HealSequence;
 use crate::{
     disk::DiskStore,
@@ -8,6 +9,7 @@ use crate::{
 };
 use futures::StreamExt;
 use http::HeaderMap;
+use madmin::info_commands::DiskMetrics;
 use rmp_serde::Serializer;
 use s3s::{dto::StreamingBlob, Body};
 use serde::{Deserialize, Serialize};
@@ -830,8 +832,8 @@ pub struct StorageDisk {
     pub read_latency: f64,
     pub write_latency: f64,
     pub utilization: f64,
-    // pub metrics: Option<DiskMetrics>,
-    // pub heal_info: Option<HealingDisk>,
+    pub metrics: Option<DiskMetrics>,
+    pub heal_info: Option<HealingDisk>,
     pub used_inodes: u64,
     pub free_inodes: u64,
     pub local: bool,

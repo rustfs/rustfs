@@ -1,9 +1,15 @@
 use nix::sys::stat::{self, stat};
 use nix::sys::statfs::{self, statfs, FsType};
-use std::io::{Error, ErrorKind};
+use std::fs::File;
+use std::io::{self, BufRead, Error, ErrorKind};
 use std::path::Path;
 
-use crate::{disk::Info, error::Result};
+use crate::{
+    disk::Info,
+    error::{Error as e_Error, Result},
+};
+
+use super::IOStats;
 
 /// returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
@@ -109,4 +115,73 @@ pub fn same_disk(disk1: &str, disk2: &str) -> Result<bool> {
     let stat2 = stat(disk2)?;
 
     Ok(stat1.st_dev == stat2.st_dev)
+}
+
+pub fn get_drive_stats(major: u32, minor: u32) -> Result<IOStats> {
+    read_drive_stats(&format!("/sys/dev/block/{}:{}/stat", major, minor))
+}
+
+fn read_drive_stats(stats_file: &str) -> Result<IOStats> {
+    let stats = read_stat(stats_file)?;
+    if stats.len() < 11 {
+        return Err(e_Error::from_string(format!("found invalid format while reading {}", stats_file)));
+    }
+    let mut io_stats = IOStats {
+        read_ios: stats[0],
+        read_merges: stats[1],
+        read_sectors: stats[2],
+        read_ticks: stats[3],
+        write_ios: stats[4],
+        write_merges: stats[5],
+        write_sectors: stats[6],
+        write_ticks: stats[7],
+        current_ios: stats[8],
+        total_ticks: stats[9],
+        req_ticks: stats[10],
+        ..Default::default()
+    };
+
+    if stats.len() > 14 {
+        io_stats.discard_ios = stats[11];
+        io_stats.discard_merges = stats[12];
+        io_stats.discard_sectors = stats[13];
+        io_stats.discard_ticks = stats[14];
+    }
+    Ok(io_stats)
+}
+
+fn read_stat(file_name: &str) -> Result<Vec<u64>> {
+    // 打开文件
+    let path = Path::new(file_name);
+    let file = File::open(&path)?;
+
+    // 创建一个 BufReader
+    let reader = io::BufReader::new(file);
+
+    // 读取第一行
+    let mut stats = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        // 分割行并解析为 u64
+        for token in line.trim().split_whitespace() {
+            let ui64: u64 = token.parse()?;
+            stats.push(ui64);
+        }
+        break; // 只读取第一行
+    }
+
+    Ok(stats)
+}
+
+#[cfg(test)]
+mod test {
+    use super::get_drive_stats;
+
+    #[test]
+    fn test_stats() {
+        let major = 7;
+        let minor = 11;
+        let s = get_drive_stats(major, minor).unwrap();
+        println!("{:?}", s);
+    }
 }

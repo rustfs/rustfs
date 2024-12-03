@@ -9,30 +9,41 @@ use ecstore::error::Error as ec_Error;
 use ecstore::global::GLOBAL_ALlHealState;
 use ecstore::heal::heal_commands::HealOpts;
 use ecstore::heal::heal_ops::new_heal_sequence;
+use ecstore::metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType};
 use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::StorageAPI;
 use ecstore::utils::path::path_join;
+use ecstore::utils::time::parse_duration;
 use ecstore::utils::xml;
 use ecstore::GLOBAL_Endpoints;
 use ecstore::{new_object_layer_fn, store_api::BackendInfo};
+use futures::{Stream, StreamExt};
 use http::Uri;
 use hyper::StatusCode;
+use madmin::metrics::RealtimeMetrics;
 use matchit::Params;
-use s3s::S3ErrorCode;
+use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{
     dto::{AssumeRoleOutput, Credentials, Timestamp},
     s3_error, Body, S3Error, S3Request, S3Response, S3Result,
 };
+use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration as std_Duration;
+use std::u64;
 use time::{Duration, OffsetDateTime};
-use tokio::spawn;
-use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tokio::sync::mpsc::{self};
+use tokio::time::interval;
+use tokio::{select, spawn};
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::{error, info, warn};
 
 pub mod service_account;
 
@@ -228,14 +239,220 @@ impl Operation for DataUsageInfoHandler {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct MetricsParams {
+    disks: String,
+    hosts: String,
+    #[serde(rename = "interval")]
+    tick: String,
+    n: u64,
+    types: u32,
+    #[serde(rename = "by-disk")]
+    by_disk: String,
+    #[serde(rename = "by-host")]
+    by_host: String,
+    #[serde(rename = "by-jobID")]
+    by_job_id: String,
+    #[serde(rename = "by-depID")]
+    by_dep_id: String,
+}
+
+impl Default for MetricsParams {
+    fn default() -> Self {
+        Self {
+            disks: Default::default(),
+            hosts: Default::default(),
+            tick: Default::default(),
+            n: u64::MAX,
+            types: Default::default(),
+            by_disk: Default::default(),
+            by_host: Default::default(),
+            by_job_id: Default::default(),
+            by_dep_id: Default::default(),
+        }
+    }
+}
+
+fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
+    let mut mp = MetricsParams::default();
+    if let Some(query) = uri.query() {
+        let params: Vec<&str> = query.split('&').collect();
+        for param in params {
+            let mut parts = param.split('=');
+            if let Some(key) = parts.next() {
+                if key == "disks" {
+                    if let Some(value) = parts.next() {
+                        mp.disks = value.to_string();
+                    }
+                }
+                if key == "hosts" {
+                    if let Some(value) = parts.next() {
+                        mp.hosts = value.to_string();
+                    }
+                }
+                if key == "interval" {
+                    if let Some(value) = parts.next() {
+                        mp.tick = value.to_string();
+                    }
+                }
+                if key == "n" {
+                    if let Some(value) = parts.next() {
+                        mp.n = value.parse::<u64>().unwrap_or(u64::MAX);
+                    }
+                }
+                if key == "types" {
+                    if let Some(value) = parts.next() {
+                        mp.types = value.parse::<u32>().unwrap_or_default();
+                    }
+                }
+                if key == "by-disk" {
+                    if let Some(value) = parts.next() {
+                        mp.by_disk = value.to_string();
+                    }
+                }
+                if key == "by-host" {
+                    if let Some(value) = parts.next() {
+                        mp.by_host = value.to_string();
+                    }
+                }
+                if key == "by-jobID" {
+                    if let Some(value) = parts.next() {
+                        mp.by_job_id = value.to_string();
+                    }
+                }
+                if key == "by-depID" {
+                    if let Some(value) = parts.next() {
+                        mp.by_dep_id = value.to_string();
+                    }
+                }
+            }
+        }
+    }
+    mp
+}
+
+struct MetricsStream {
+    inner: ReceiverStream<Result<Bytes, StdError>>,
+}
+
+impl Stream for MetricsStream {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        info!("MetricsStream poll_next");
+        let this = Pin::into_inner(self);
+        this.inner.poll_next_unpin(cx)
+    }
+}
+
+impl ByteStream for MetricsStream {}
+
 pub struct MetricsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for MetricsHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle MetricsHandler");
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        info!("handle MetricsHandler, req: {:?}, params: {:?}", req, params);
+        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
+        info!("cred: {:?}", cred);
 
-        return Err(s3_error!(NotImplemented));
+        let mp = extract_metrics_init_params(&req.uri);
+        info!("mp: {:?}", mp);
+
+        let tick = match parse_duration(&mp.tick) {
+            Some(i) => i,
+            None => std_Duration::from_secs(1),
+        };
+
+        let mut n = mp.n;
+        if n == 0 {
+            n = u64::MAX;
+        }
+
+        let types = if mp.types != 0 {
+            MetricType::new(mp.types)
+        } else {
+            MetricType::ALL
+        };
+
+        let disks = mp.disks.split(",").map(String::from).collect::<Vec<String>>();
+        let by_disk = mp.by_disk == "true";
+        let mut disk_map = HashSet::new();
+        if !disks.is_empty() && !disks[0].is_empty() {
+            for d in disks.iter() {
+                if !d.is_empty() {
+                    disk_map.insert(d.to_string());
+                }
+            }
+        }
+
+        let job_id = mp.by_job_id;
+        let hosts = mp.hosts.split(",").map(String::from).collect::<Vec<String>>();
+        let by_host = mp.by_host == "true";
+        let mut host_map = HashSet::new();
+        if !hosts.is_empty() && !hosts[0].is_empty() {
+            for d in hosts.iter() {
+                if !d.is_empty() {
+                    host_map.insert(d.to_string());
+                }
+            }
+        }
+
+        let d_id = mp.by_dep_id;
+        let mut interval = interval(tick);
+
+        let opts = CollectMetricsOpts {
+            hosts: host_map,
+            disks: disk_map,
+            job_id,
+            dep_id: d_id,
+        };
+        let (tx, rx) = mpsc::channel(10);
+        let in_stream: DynByteStream = Box::pin(MetricsStream {
+            inner: ReceiverStream::new(rx),
+        });
+        let body = Body::from(in_stream);
+        tokio::spawn(async move {
+            while n > 0 {
+                info!("loop, n: {n}");
+                let mut m = RealtimeMetrics::default();
+                let m_local = collect_local_metrics(types, &opts).await;
+                m.merge(m_local);
+
+                if !by_host {
+                    m.by_host = HashMap::new();
+                }
+                if !by_disk {
+                    m.by_disk = HashMap::new();
+                }
+
+                m.finally = n <= 1;
+
+                // todo write resp
+                match serde_json::to_vec(&m) {
+                    Ok(re) => {
+                        info!("got metrics, send it to client, m: {m:?}, re: {re:?}");
+                        let _ = tx.send(Ok(Bytes::from(re))).await;
+                    }
+                    Err(e) => {
+                        error!("MetricsHandler: json encode failed, err: {:?}", e);
+                        return;
+                    }
+                }
+
+                n -= 1;
+                if n == 0 {
+                    break;
+                }
+
+                select! {
+                    _ = tx.closed() => { return; }
+                    _ = interval.tick() => {}
+                }
+            }
+        });
+
+        Ok(S3Response::new((StatusCode::OK, body)))
     }
 }
 
@@ -330,10 +547,10 @@ impl Operation for HealHandler {
             _err_body: String,
         }
 
-        let heap_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
+        let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
         if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
             match GLOBAL_ALlHealState
-                .pop_heal_status_json(heap_path.to_str().unwrap_or_default(), &hip.client_token)
+                .pop_heal_status_json(heal_path.to_str().unwrap_or_default(), &hip.client_token)
                 .await
             {
                 Ok(b) => {
@@ -351,7 +568,7 @@ impl Operation for HealHandler {
             let tx_clone = tx.clone();
             spawn(async move {
                 match GLOBAL_ALlHealState
-                    .stop_heal_sequence(heap_path.to_str().unwrap_or_default())
+                    .stop_heal_sequence(heal_path.to_str().unwrap_or_default())
                     .await
                 {
                     Ok(b) => {

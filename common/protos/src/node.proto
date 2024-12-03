@@ -504,7 +504,7 @@ message GetMemInfoResponse {
 }
 
 message GetMetricsRequest {
-  uint64 metric_type = 1;
+  bytes metric_type = 1;
   bytes opts = 2;
 }
 
