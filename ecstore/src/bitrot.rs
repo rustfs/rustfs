@@ -169,6 +169,7 @@ pub async fn new_bitrot_writer(
 
 pub type BitrotReader = Box<dyn ReadAt + Send>;
 
+#[allow(clippy::too_many_arguments)]
 pub fn new_bitrot_reader(
     disk: DiskStore,
     data: &[u8],
@@ -691,16 +692,16 @@ mod test {
         let ep = Endpoint::try_from(temp_dir.as_str())?;
         let opt = DiskOption::default();
         let disk = new_disk(&ep, &opt).await?;
-        let _ = disk.make_volume(volume).await?;
+        disk.make_volume(volume).await?;
         let mut writer = new_bitrot_writer(disk.clone(), "", volume, file_path, 35, algo.clone(), 10).await?;
 
-        let _ = writer.write(b"aaaaaaaaaa").await?;
-        let _ = writer.write(b"aaaaaaaaaa").await?;
-        let _ = writer.write(b"aaaaaaaaaa").await?;
-        let _ = writer.write(b"aaaaa").await?;
+        writer.write(b"aaaaaaaaaa").await?;
+        writer.write(b"aaaaaaaaaa").await?;
+        writer.write(b"aaaaaaaaaa").await?;
+        writer.write(b"aaaaa").await?;
 
         let sum = bitrot_writer_sum(&writer);
-        let _ = writer.close().await?;
+        writer.close().await?;
 
         let mut reader = new_bitrot_reader(disk, b"", volume, file_path, 35, algo, &sum, 10);
         let read_len = 10;

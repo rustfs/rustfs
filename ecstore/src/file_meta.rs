@@ -824,7 +824,7 @@ impl TryFrom<FileMetaShallowVersion> for FileMetaVersion {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone, Eq, Ord, Hash)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone, Eq, Hash)]
 pub struct FileMetaVersionHeader {
     pub version_id: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
@@ -974,26 +974,33 @@ impl FileMetaVersionHeader {
 
 impl PartialOrd for FileMetaVersionHeader {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match self.mod_time.partial_cmp(&other.mod_time) {
-            Some(core::cmp::Ordering::Equal) => {}
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FileMetaVersionHeader {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.mod_time.cmp(&other.mod_time) {
+            core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
 
-        match self.version_type.partial_cmp(&other.version_type) {
-            Some(core::cmp::Ordering::Equal) => {}
+        match self.version_type.cmp(&other.version_type) {
+            core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
-        match self.signature.partial_cmp(&other.signature) {
-            Some(core::cmp::Ordering::Equal) => {}
+        match self.signature.cmp(&other.signature) {
+            core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
-        match self.version_id.partial_cmp(&other.version_id) {
-            Some(core::cmp::Ordering::Equal) => {}
+        match self.version_id.cmp(&other.version_id) {
+            core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
-        self.flags.partial_cmp(&other.flags)
+        self.flags.cmp(&other.flags)
     }
 }
+
 impl From<FileMetaVersion> for FileMetaVersionHeader {
     fn from(value: FileMetaVersion) -> Self {
         let flags = {
