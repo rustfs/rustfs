@@ -10,6 +10,7 @@ use s3s::auth::Credentials;
 use s3s::{dto::*, s3_error, S3Request, S3Result};
 use uuid::Uuid;
 
+#[allow(dead_code)]
 #[derive(Default, Clone)]
 struct ReqInfo {
     pub card: Option<Credentials>,

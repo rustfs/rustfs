@@ -22,7 +22,7 @@ impl Operation for AddServiceAccount {
         warn!("handle AddServiceAccount, req: {req:?}");
 
         let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
-        let is_owner = true; // 先按true处理，后期根据请求决定。
+        let _is_owner = true; // 先按true处理，后期根据请求决定。
         let body = req.input.store_all_unlimited().await.unwrap();
         let body = crypto::decrypt_data(cred.secret_key.expose().as_bytes(), &body[..])
             .map_err(|_| s3_error!(InternalError, "encrypt data failed"))?;
@@ -39,8 +39,8 @@ impl Operation for AddServiceAccount {
         }
 
         // 校验合法性, Name, Expiration, Description
-        let target_user = create_req.target_user.as_ref().unwrap_or(&cred.access_key);
-        let deny_only = true;
+        let _target_user = create_req.target_user.as_ref().unwrap_or(&cred.access_key);
+        let _deny_only = true;
 
         // todo 校验权限
 
@@ -109,7 +109,7 @@ impl Operation for UpdateServiceAccount {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle UpdateServiceAccount");
 
-        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
+        let Some(_cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
 
         // return Err(s3_error!(NotImplemented));
         //
@@ -121,7 +121,7 @@ impl Operation for UpdateServiceAccount {
 pub struct InfoServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for InfoServiceAccount {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle InfoServiceAccount");
 
         let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
@@ -149,7 +149,7 @@ impl Operation for InfoServiceAccount {
             return Err(s3_error!(InvalidRequest, "access key is not exist"));
         };
 
-        let (sa, sp) = iam::get_service_account(ak).await.map_err(|e| {
+        let (sa, _sp) = iam::get_service_account(ak).await.map_err(|e| {
             debug!("get service account failed, err: {e:?}");
             s3_error!(InternalError)
         })?;
@@ -206,7 +206,7 @@ impl Operation for InfoServiceAccount {
 pub struct ListServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for ListServiceAccount {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListServiceAccount");
         todo!()
     }
@@ -218,9 +218,9 @@ impl Operation for DeleteServiceAccount {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle DeleteServiceAccount");
 
-        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
+        let Some(_cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
 
-        let Some(service_account) = params.get("accessKey") else {
+        let Some(_service_account) = params.get("accessKey") else {
             return Err(s3_error!(InvalidRequest, "Invalid arguments specified."));
         };
 
