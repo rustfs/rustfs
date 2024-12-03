@@ -3,4 +3,5 @@
 .idea
 .vscode
 /test
+/logs
 .devcontainer
