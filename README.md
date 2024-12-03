@@ -59,11 +59,11 @@ Help all of humanity reduce storage costs and achieve data security.
 | - | - |
 | Developed based on Rust language, memory is safer | Developed in Go or C, with potential issues like memory GC/leaks |
 | Does not report logs to third-party countries	 | Reporting logs to other third countries may violate national security laws |
-| Licensed under Apache, more business-friendly	 | AGPL V3 and other protocols, polluted open source and protocol traps, infringement of intellectual property rights |
-| Comprehensive S3 support, works with domestic and international cloud providers	 | Comprehensive S3 support but lacks localization for domestic cloud providers |
+| Licensed under Apache, more business-friendly	 | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
+| Comprehensive S3 support, works with domestic and international cloud providers	 | Full support for S3, but no local cloud vendor support |
 | Rust-based development, strong support for secure and innovative devices	 | Poor support for edge gateways and secure innovative devices|
 | Stable commercial prices, free community support | High pricing, with costs up to $250,000 for 1PiB |
-| Unlimited risk | There are limited legal risks |
+| No risk | There is a legal risk of long-arm jurisdiction |
 
 
 # How to install RustFS
