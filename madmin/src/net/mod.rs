@@ -16,7 +16,7 @@ pub fn get_net_info(addr: &str, iface: &str) -> NetInfo {
     NetInfo {
         node_common: NodeCommon {
             addr: addr.to_owned(),
-            error: "Not implemented for non-linux platforms".to_owned(),
+            error: Some("Not implemented for non-linux platforms".to_string()),
         },
         interface: iface.to_owned(),
         ..Default::default()
