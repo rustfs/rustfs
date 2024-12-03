@@ -218,6 +218,7 @@ impl ScannerMetrics {
     pub async fn report(&self) -> M_ScannerMetrics {
         let mut m = M_ScannerMetrics::default();
         if let Some(cycle) = self.get_cycle().await {
+            info!("cycle: {cycle:?}");
             m.current_cycle = cycle.current;
             m.cycles_completed_at = cycle.cycle_completed;
             m.current_started = cycle.started;
