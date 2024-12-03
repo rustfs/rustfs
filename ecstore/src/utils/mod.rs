@@ -6,5 +6,6 @@ pub mod hash;
 pub mod net;
 pub mod os;
 pub mod path;
+pub mod time;
 pub mod wildcard;
 pub mod xml;

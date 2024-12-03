@@ -2,25 +2,26 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NodeCommon {
     pub addr: String,
-    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Cpu {
-    vendor_id: String,
-    family: String,
-    model: String,
-    stepping: i32,
-    physical_id: String,
-    model_name: String,
-    mhz: f64,
-    cache_size: i32,
-    flags: Vec<String>,
-    microcode: String,
-    cores: u64,
+    pub vendor_id: String,
+    pub family: String,
+    pub model: String,
+    pub stepping: i32,
+    pub physical_id: String,
+    pub model_name: String,
+    pub mhz: f64,
+    pub cache_size: i32,
+    pub flags: Vec<String>,
+    pub microcode: String,
+    pub cores: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -157,19 +158,29 @@ pub fn get_sys_errors(_add: &str) -> SysErrors {
     SysErrors::default()
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MemInfo {
     node_common: NodeCommon,
-    total: u64,
-    used: u64,
-    free: u64,
-    available: u64,
-    shared: u64,
-    cache: u64,
-    buffers: u64,
-    swap_space_total: u64,
-    swap_space_free: u64,
-    limit: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    free: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buffers: Option<u64>,
+    #[serde(rename = "swap_space_total", skip_serializing_if = "Option::is_none")]
+    swap_space_total: Option<u64>,
+    #[serde(rename = "swap_space_free", skip_serializing_if = "Option::is_none")]
+    swap_space_free: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u64>,
 }
 
 pub fn get_mem_info(_addr: &str) -> MemInfo {

@@ -37,21 +37,21 @@ pub struct MemStats {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ServerProperties {
-    state: String,
-    endpoint: String,
-    scheme: String,
-    uptime: u64,
-    version: String,
-    commit_id: String,
-    network: HashMap<String, String>,
-    disks: Vec<StorageDisk>,
-    pool_number: i32,
-    pool_numbers: Vec<i32>,
-    mem_stats: MemStats,
-    max_procs: u64,
-    num_cpu: u64,
-    runtime_version: String,
-    rustfs_env_vars: HashMap<String, String>,
+    pub state: String,
+    pub endpoint: String,
+    pub scheme: String,
+    pub uptime: u64,
+    pub version: String,
+    pub commit_id: String,
+    pub network: HashMap<String, String>,
+    pub disks: Vec<StorageDisk>,
+    pub pool_number: i32,
+    pub pool_numbers: Vec<i32>,
+    pub mem_stats: MemStats,
+    pub max_procs: u64,
+    pub num_cpu: u64,
+    pub runtime_version: String,
+    pub rustfs_env_vars: HashMap<String, String>,
 }
 
 async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
