@@ -351,6 +351,7 @@ impl DiskAPI for Disk {
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
+        info!("ns_scanner");
         match self {
             Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode).await,
             Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode).await,

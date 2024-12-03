@@ -2668,6 +2668,7 @@ impl SetDisks {
         updates: Sender<DataUsageCache>,
         heal_scan_mode: HealScanMode,
     ) -> Result<()> {
+        info!("ns_scanner");
         if buckets.is_empty() {
             return Ok(());
         }
@@ -2768,9 +2769,9 @@ impl SetDisks {
             let buckets_results_tx_clone = buckets_results_tx.clone();
             futures.push(async move {
                 loop {
-                    match bucket_rx_clone.write().await.recv().await {
-                        None => return,
-                        Some(bucket_info) => {
+                    match bucket_rx_clone.write().await.try_recv() {
+                        Err(_) => return,
+                        Ok(bucket_info) => {
                             let cache_name = Path::new(&bucket_info.name).join(DATA_USAGE_CACHE_NAME);
                             let mut cache = match DataUsageCache::load(self, &cache_name.to_string_lossy()).await {
                                 Ok(cache) => cache,
@@ -2841,11 +2842,16 @@ impl SetDisks {
                             let _ = cache.save(&cache_name.to_string_lossy()).await;
                         }
                     }
+                    info!("continue scanner");
                 }
             });
         }
+        info!("ns_scanner start");
         let _ = join_all(futures).await;
+        drop(buckets_results_tx);
+        info!("1");
         let _ = task.await;
+        info!("ns_scanner completed");
         Ok(())
     }
 

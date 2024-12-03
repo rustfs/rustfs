@@ -2092,6 +2092,7 @@ impl DiskAPI for LocalDisk {
         )
         .await?;
         data_usage_info.info.last_update = Some(SystemTime::now());
+        info!("ns_scanner completed: {data_usage_info:?}");
         Ok(data_usage_info)
     }
 

@@ -14,6 +14,7 @@ use std::{
     time::SystemTime,
 };
 use tokio::sync::RwLock;
+use tracing::info;
 
 use super::data_scanner::{CurrentScannerCycle, UpdateCurrentPathFn};
 
@@ -148,6 +149,7 @@ impl ScannerMetrics {
     }
 
     pub async fn set_cycle(&mut self, c: Option<CurrentScannerCycle>) {
+        info!("ScannerMetrics set_cycle {c:?}");
         *self.cycle_info.write().await = c;
     }
 
@@ -216,6 +218,7 @@ impl ScannerMetrics {
     pub async fn report(&self) -> M_ScannerMetrics {
         let mut m = M_ScannerMetrics::default();
         if let Some(cycle) = self.get_cycle().await {
+            info!("cycle: {cycle:?}");
             m.current_cycle = cycle.current;
             m.cycles_completed_at = cycle.cycle_completed;
             m.current_started = cycle.started;

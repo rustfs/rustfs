@@ -4,6 +4,7 @@ use chrono::Utc;
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr};
 use madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::{
     admin_server_info::get_local_server_property,
@@ -55,8 +56,10 @@ impl MetricType {
 }
 
 pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts) -> RealtimeMetrics {
+    info!("collect_local_metrics");
     let mut real_time_metrics = RealtimeMetrics::default();
     if types.0 == MetricType::NONE.0 {
+        info!("types is None, return");
         return real_time_metrics;
     }
 
@@ -75,11 +78,13 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     }
 
     if types.contains(&MetricType::DISK) {
+        info!("start get disk metrics");
         let mut aggr = DiskMetric {
             collected_at: Utc::now(),
             ..Default::default()
         };
         for (name, disk) in collect_local_disks_metrics(&opts.disks).await.into_iter() {
+            info!("got disk metric, name: {name}, metric: {disk:?}");
             real_time_metrics.by_disk.insert(name, disk.clone());
             aggr.merge(&disk);
         }
@@ -87,10 +92,31 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     }
 
     if types.contains(&MetricType::SCANNER) {
+        info!("start get scanner metrics");
         let metrics = globalScannerMetrics.read().await.report().await;
         real_time_metrics.aggregated.scanner = Some(metrics);
     }
-    RealtimeMetrics::default()
+
+    if types.contains(&MetricType::OS) {}
+
+    if types.contains(&MetricType::BATCH_JOBS) {}
+
+    if types.contains(&MetricType::SITE_RESYNC) {}
+
+    if types.contains(&MetricType::NET) {}
+
+    if types.contains(&MetricType::MEM) {}
+
+    if types.contains(&MetricType::CPU) {}
+
+    if types.contains(&MetricType::RPC) {}
+
+    real_time_metrics
+        .by_host
+        .insert(by_host_name.clone(), real_time_metrics.aggregated.clone());
+    real_time_metrics.hosts.push(by_host_name);
+
+    real_time_metrics
 }
 
 async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String, DiskMetric> {
@@ -166,4 +192,26 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
     }
 
     metrics
+}
+
+#[cfg(test)]
+mod test {
+    use super::MetricType;
+
+    #[test]
+    fn tes_types() {
+        let t = MetricType::ALL;
+        assert!(t.contains(&MetricType::NONE));
+        assert!(t.contains(&MetricType::DISK));
+        assert!(t.contains(&MetricType::OS));
+        assert!(t.contains(&MetricType::BATCH_JOBS));
+        assert!(t.contains(&MetricType::SITE_RESYNC));
+        assert!(t.contains(&MetricType::NET));
+        assert!(t.contains(&MetricType::MEM));
+        assert!(t.contains(&MetricType::CPU));
+        assert!(t.contains(&MetricType::RPC));
+
+        let disk = MetricType::new(1 << 1);
+        assert!(disk.contains(&MetricType::DISK));
+    }
 }
