@@ -105,6 +105,30 @@ pub(crate) fn must_get_local_ips() -> Result<Vec<IpAddr>> {
     }
 }
 
+pub struct XHost {
+    pub name: String,
+    pub port: u16,
+    pub is_port_set: bool,
+}
+
+impl ToString for XHost {
+    fn to_string(&self) -> String {
+        if !self.is_port_set {
+            self.name.clone()
+        } else {
+            join_host_port(&self.name, self.port)
+        }
+    }
+}
+
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::net::Ipv4Addr;
