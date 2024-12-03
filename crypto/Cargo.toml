@@ -13,7 +13,7 @@ cfg-if = "1.0.0"
 chacha20poly1305 = { version = "0.10.1", optional = true }
 jsonwebtoken = "9.3.0"
 pbkdf2 = { version = "0.12.2", optional = true }
-rand.workspace = true
+rand = { workspace = true, optional = true }
 sha2 = "0.10.8"
 thiserror.workspace = true
 serde_json.workspace = true
@@ -25,8 +25,14 @@ time.workspace = true
 
 [features]
 fips = []
-crypto = ["dep:aes-gcm", "dep:argon2", "dep:chacha20poly1305", "dep:pbkdf2"]
-# default = ["crypto", "fips"]
+crypto = [
+    "dep:aes-gcm",
+    "dep:argon2",
+    "dep:chacha20poly1305",
+    "dep:pbkdf2",
+    "dep:rand",
+]
+default = ["crypto", "fips"]
 
 [lints.clippy]
 unwrap_used = "deny"
