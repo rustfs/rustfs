@@ -8,7 +8,6 @@ use common::{
     error::{Error, Result},
     globals::set_global_addr,
 };
-use ecstore::global::set_global_rustfs_port;
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::utils::net::{self, get_available_port};
 use ecstore::{
@@ -18,6 +17,7 @@ use ecstore::{
     store::{init_local_disks, ECStore},
     update_erasure_type,
 };
+use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
 use grpc::make_server;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -212,10 +212,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     })?;
     warn!(" init store success!");
 
-    // new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
-    //     error!("new_global_notification_sys faild {:?}", &err);
-    //     Error::from_string(err.to_string())
-    // })?;
+    new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
+        error!("new_global_notification_sys faild {:?}", &err);
+        Error::from_string(err.to_string())
+    })?;
 
     // init scanner
     init_data_scanner().await;

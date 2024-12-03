@@ -23,9 +23,9 @@ use crate::{
     },
     set_disk::SetDisks,
     store_api::{
-        BackendInfo, BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
+        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
         ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult,
-        ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, StorageInfo,
+        ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
     utils::hash,
@@ -294,10 +294,10 @@ impl ObjectIO for Sets {
 
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
-    async fn backend_info(&self) -> BackendInfo {
+    async fn backend_info(&self) -> madmin::BackendInfo {
         unimplemented!()
     }
-    async fn storage_info(&self) -> StorageInfo {
+    async fn storage_info(&self) -> madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.disk_set.len());
 
         for set in self.disk_set.iter() {
@@ -312,12 +312,12 @@ impl StorageAPI for Sets {
             disks.extend_from_slice(&res.disks);
         }
 
-        StorageInfo {
+        madmin::StorageInfo {
             disks,
             ..Default::default()
         }
     }
-    async fn local_storage_info(&self) -> StorageInfo {
+    async fn local_storage_info(&self) -> madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.disk_set.len());
 
         for set in self.disk_set.iter() {
@@ -331,7 +331,7 @@ impl StorageAPI for Sets {
         for res in results.into_iter() {
             disks.extend_from_slice(&res.disks);
         }
-        StorageInfo {
+        madmin::StorageInfo {
             disks,
             ..Default::default()
         }

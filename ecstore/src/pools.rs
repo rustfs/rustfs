@@ -5,7 +5,7 @@ use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
-use crate::store_api::{BucketOptions, MakeBucketOptions, StorageAPI, StorageDisk, StorageInfo};
+use crate::store_api::{BucketOptions, MakeBucketOptions, StorageAPI};
 use crate::store_err::{is_err_bucket_exists, StorageError};
 use crate::utils::path::{path_join, SLASH_SEPARATOR};
 use crate::{sets::Sets, store::ECStore};
@@ -670,7 +670,7 @@ impl ECStore {
     }
 }
 
-fn get_total_usable_capacity(disks: &[StorageDisk], info: &StorageInfo) -> usize {
+fn get_total_usable_capacity(disks: &[madmin::Disk], info: &madmin::StorageInfo) -> usize {
     let mut capacity = 0;
     for disk in disks.iter() {
         if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
@@ -683,7 +683,7 @@ fn get_total_usable_capacity(disks: &[StorageDisk], info: &StorageInfo) -> usize
     capacity
 }
 
-fn get_total_usable_capacity_free(disks: &[StorageDisk], info: &StorageInfo) -> usize {
+fn get_total_usable_capacity_free(disks: &[madmin::Disk], info: &madmin::StorageInfo) -> usize {
     let mut capacity = 0;
     for disk in disks.iter() {
         if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {

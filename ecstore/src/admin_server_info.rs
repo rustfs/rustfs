@@ -15,12 +15,7 @@ use protos::{
 use serde::{Deserialize, Serialize};
 use tonic::Request;
 
-use crate::{
-    disk::endpoint::Endpoint,
-    global::GLOBAL_Endpoints,
-    new_object_layer_fn,
-    store_api::{StorageAPI, StorageDisk},
-};
+use crate::{disk::endpoint::Endpoint, global::GLOBAL_Endpoints, new_object_layer_fn, store_api::StorageAPI};
 
 pub const ITEM_OFFLINE: &str = "offline";
 pub const ITEM_INITIALIZING: &str = "initializing";
@@ -44,7 +39,7 @@ pub struct ServerProperties {
     pub version: String,
     pub commit_id: String,
     pub network: HashMap<String, String>,
-    pub disks: Vec<StorageDisk>,
+    pub disks: Vec<madmin::Disk>,
     pub pool_number: i32,
     pub pool_numbers: Vec<i32>,
     pub mem_stats: MemStats,

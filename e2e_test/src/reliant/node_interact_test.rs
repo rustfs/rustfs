@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use ecstore::{disk::VolumeInfo, store_api::StorageInfo};
+use ecstore::disk::VolumeInfo;
 use protos::{
     models::{PingBody, PingBodyBuilder},
     node_service_time_out_client,
@@ -118,7 +118,7 @@ async fn storage_info() -> Result<(), Box<dyn Error>> {
     let info = response.storage_info;
 
     let mut buf = Deserializer::new(Cursor::new(info));
-    let storage_info: StorageInfo = Deserialize::deserialize(&mut buf).unwrap();
+    let storage_info: madmin::StorageInfo = Deserialize::deserialize(&mut buf).unwrap();
     println!("{:?}", storage_info);
     Ok(())
 }

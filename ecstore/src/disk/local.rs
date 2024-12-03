@@ -1291,7 +1291,7 @@ impl DiskAPI for LocalDisk {
             Ok(res) => res,
             Err(e) => {
                 if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
-                    error!("list_dir err {:?}", &e);
+                    info!("list_dir err {:?}", &e);
                 }
 
                 if opts.report_notfound && is_err_file_not_found(&e) {
