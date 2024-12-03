@@ -9,11 +9,11 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use rand::Rng;
 use rmp_serde::{Deserializer, Serializer};

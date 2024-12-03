@@ -39,10 +39,9 @@ use std::task::{Context, Poll};
 use std::time::Duration as std_Duration;
 use std::u64;
 use time::{Duration, OffsetDateTime};
-use tokio::spawn;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::mpsc::{self};
 use tokio::time::interval;
+use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
@@ -446,7 +445,10 @@ impl Operation for MetricsHandler {
                     break;
                 }
 
-                interval.tick().await;
+                select! {
+                    _ = tx.closed() => { return; }
+                    _ = interval.tick() => {}
+                }
             }
         });
 
