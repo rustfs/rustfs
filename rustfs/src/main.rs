@@ -14,7 +14,6 @@ use ecstore::utils::net::{self, get_available_port};
 use ecstore::{
     endpoints::EndpointServerPools,
     heal::data_scanner::init_data_scanner,
-    notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::{init_local_disks, ECStore},
     update_erasure_type,
