@@ -18,7 +18,7 @@ use ecstore::utils::time::parse_duration;
 use ecstore::utils::xml;
 use ecstore::GLOBAL_Endpoints;
 use ecstore::{new_object_layer_fn, store_api::BackendInfo};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use http::Uri;
 use hyper::StatusCode;
 use madmin::metrics::RealtimeMetrics;
@@ -43,6 +43,7 @@ use tokio::spawn;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::interval;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 pub mod service_account;
@@ -332,23 +333,16 @@ fn extract_metrics_init_params(uri: &Uri) -> MetricsParams {
 }
 
 struct MetricsStream {
-    inner: Receiver<Result<Bytes, StdError>>,
+    inner: ReceiverStream<Result<Bytes, StdError>>,
 }
 
 impl Stream for MetricsStream {
     type Item = Result<Bytes, StdError>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        info!("MetricsStream poll_next");
         let this = Pin::into_inner(self);
-        match this.inner.try_recv() {
-            Ok(re) => Poll::Ready(Some(re)),
-            Err(err) => {
-                if err == TryRecvError::Empty {
-                    return Poll::Pending;
-                }
-                Poll::Ready(None)
-            }
-        }
+        this.inner.poll_next_unpin(cx)
     }
 }
 
@@ -415,10 +409,13 @@ impl Operation for MetricsHandler {
             dep_id: d_id,
         };
         let (tx, rx) = mpsc::channel(10);
-        let in_stream: DynByteStream = Box::pin(MetricsStream { inner: rx });
+        let in_stream: DynByteStream = Box::pin(MetricsStream {
+            inner: ReceiverStream::new(rx),
+        });
         let body = Body::from(in_stream);
         tokio::spawn(async move {
             while n > 0 {
+                info!("loop, n: {n}");
                 let mut m = RealtimeMetrics::default();
                 let m_local = collect_local_metrics(types, &opts).await;
                 m.merge(m_local);
@@ -435,6 +432,7 @@ impl Operation for MetricsHandler {
                 // todo write resp
                 match serde_json::to_vec(&m) {
                     Ok(re) => {
+                        info!("got metrics, send it to client, m: {m:?}, re: {re:?}");
                         let _ = tx.send(Ok(Bytes::from(re))).await;
                     }
                     Err(e) => {
