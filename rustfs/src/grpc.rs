@@ -14,10 +14,8 @@ use ecstore::{
     },
     erasure::Writer,
     heal::{
-        
         data_usage_cache::DataUsageCache,
-       
-        heal_commands::{get_local_background_heal_status, {get_local_background_heal_status, HealOpts},
+        heal_commands::{get_local_background_heal_status, HealOpts},
     },
     metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType},
     new_object_layer_fn,
@@ -29,12 +27,8 @@ use futures::{Stream, StreamExt};
 use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 
 use common::globals::GLOBAL_Local_Node_Name;
-use madmin::net::get_net_info;
-use madmin::{
-    health::{
-        get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
-    },
-    metrics::{collect_local_metrics, CollectMetricsOpts},
+use madmin::health::{
+    get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
 };
 use madmin::net::get_net_info;
 use protos::{
