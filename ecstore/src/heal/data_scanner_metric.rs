@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use common::globals::GLOBAL_Local_Node_Name;
 use common::last_minute::{AccElem, LastMinuteLatency};
 use lazy_static::lazy_static;
@@ -10,10 +10,7 @@ use std::sync::Once;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    sync::{atomic::Ordering, Arc},
     time::SystemTime,
 };
 use tokio::sync::RwLock;
