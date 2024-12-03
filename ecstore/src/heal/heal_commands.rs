@@ -17,7 +17,7 @@ use crate::{
     global::GLOBAL_BackgroundHealState,
     heal::heal_ops::HEALING_TRACKER_FILENAME,
     new_object_layer_fn,
-    store_api::{BucketInfo, StorageAPI, StorageDisk},
+    store_api::{BucketInfo, StorageAPI},
     utils::fs::read_file,
 };
 
@@ -130,35 +130,6 @@ impl Default for HealStartSuccess {
 }
 
 pub type HealStopSuccess = HealStartSuccess;
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct HealingDisk {
-    pub id: String,
-    pub heal_id: String,
-    pub pool_index: Option<usize>,
-    pub set_index: Option<usize>,
-    pub disk_index: Option<usize>,
-    pub endpoint: String,
-    pub path: String,
-    pub started: Option<OffsetDateTime>,
-    pub last_update: Option<SystemTime>,
-    pub retry_attempts: u64,
-    pub objects_total_count: u64,
-    pub objects_total_size: u64,
-    pub items_healed: u64,
-    pub items_failed: u64,
-    pub item_skipped: u64,
-    pub bytes_done: u64,
-    pub bytes_failed: u64,
-    pub bytes_skipped: u64,
-    pub objects_healed: u64,
-    pub objects_failed: u64,
-    pub bucket: String,
-    pub object: String,
-    pub queue_buckets: Vec<String>,
-    pub healed_buckets: Vec<String>,
-    pub finished: bool,
-}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct HealingTracker {
@@ -375,10 +346,10 @@ impl HealingTracker {
         });
     }
 
-    pub async fn to_healing_disk(&self) -> HealingDisk {
+    pub async fn to_healing_disk(&self) -> madmin::HealingDisk {
         let _ = self.mu.read().await;
 
-        HealingDisk {
+        madmin::HealingDisk {
             id: self.id.clone(),
             heal_id: self.heal_id.clone(),
             pool_index: self.pool_index,
@@ -516,7 +487,7 @@ pub struct SetStatus {
     pub heal_status: String,
     pub heal_priority: String,
     pub total_objects: usize,
-    pub disks: Vec<StorageDisk>,
+    pub disks: Vec<madmin::Disk>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

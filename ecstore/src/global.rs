@@ -65,6 +65,14 @@ pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
         .expect("GLOBAL_Endpoints set faild")
 }
 
+pub fn get_global_endpoints() -> EndpointServerPools {
+    if let Some(eps) = GLOBAL_Endpoints.get() {
+        eps.clone()
+    } else {
+        EndpointServerPools::default()
+    }
+}
+
 pub fn new_object_layer_fn() -> Option<Arc<ECStore>> {
     GLOBAL_OBJECT_API.get().map(|ec| ec.clone())
 }

@@ -1,9 +1,11 @@
+use tracing::warn;
+
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
     disks_layout::DisksLayout,
     error::{Error, Result},
     global::global_rustfs_port,
-    utils::net,
+    utils::net::{self, XHost},
 };
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -530,20 +532,30 @@ impl EndpointServerPools {
 
         nodes
     }
-    pub fn hosts_sorted(&self) -> Vec<()> {
+    pub fn hosts_sorted(&self) -> Vec<Option<XHost>> {
         let (mut peers, local) = self.peers();
+
+        let mut ret = vec![None; peers.len()];
 
         peers.sort();
 
-        for peer in peers.iter() {
+        for (i, peer) in peers.iter().enumerate() {
             if &local == peer {
                 continue;
             }
 
-            // FIXME:TODO
+            let host = match XHost::try_from(peer.clone()) {
+                Ok(res) => res,
+                Err(err) => {
+                    warn!("Xhost parse failed {:?}", err);
+                    continue;
+                }
+            };
+
+            ret[i] = Some(host);
         }
 
-        unimplemented!()
+        ret
     }
     pub fn peers(&self) -> (Vec<String>, String) {
         let mut local = None;
@@ -554,12 +566,8 @@ impl EndpointServerPools {
                     continue;
                 }
                 let host = endpoint.host_port();
-                if endpoint.is_local {
-                    if endpoint.url.port() == Some(global_rustfs_port()) {
-                        if local.is_none() {
-                            local = Some(host.clone());
-                        }
-                    }
+                if endpoint.is_local && endpoint.url.port() == Some(global_rustfs_port()) && local.is_none() {
+                    local = Some(host.clone());
                 }
 
                 set.insert(host);
@@ -569,6 +577,28 @@ impl EndpointServerPools {
         let hosts: Vec<String> = set.iter().cloned().collect();
 
         (hosts, local.unwrap_or_default())
+    }
+
+    pub fn find_grid_hosts_from_peer(&self, host: &XHost) -> Option<String> {
+        for ep in self.0.iter() {
+            for endpoint in ep.endpoints.0.iter() {
+                if endpoint.is_local {
+                    continue;
+                }
+                let xhost = match XHost::try_from(endpoint.host_port()) {
+                    Ok(res) => res,
+                    Err(_) => {
+                        continue;
+                    }
+                };
+
+                if xhost.to_string() == host.to_string() {
+                    return Some(endpoint.grid_host());
+                }
+            }
+        }
+
+        None
     }
 }
 

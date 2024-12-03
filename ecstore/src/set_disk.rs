@@ -38,10 +38,9 @@ use crate::{
     },
     quorum::{object_op_ignored_errs, reduce_read_quorum_errs, reduce_write_quorum_errs, QuorumError},
     store_api::{
-        BackendByte, BackendInfo, BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, FileInfo,
-        GetObjectReader, HTTPRangeSpec, ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo,
-        MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOptions, ObjectPartInfo, ObjectToDelete, PartInfo, PutObjReader,
-        RawFileInfo, StorageAPI, StorageDisk, StorageInfo, DEFAULT_BITROT_ALGO,
+        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, FileInfo, GetObjectReader, HTTPRangeSpec,
+        ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectIO, ObjectInfo,
+        ObjectOptions, ObjectPartInfo, ObjectToDelete, PartInfo, PutObjReader, RawFileInfo, StorageAPI, DEFAULT_BITROT_ALGO,
     },
     store_err::{to_object_err, StorageError},
     store_init::{load_format_erasure, ErasureError},
@@ -3590,15 +3589,15 @@ impl ObjectIO for SetDisks {
 
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
-    async fn backend_info(&self) -> BackendInfo {
+    async fn backend_info(&self) -> madmin::BackendInfo {
         unimplemented!()
     }
-    async fn storage_info(&self) -> StorageInfo {
+    async fn storage_info(&self) -> madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
         get_storage_info(&disks, &self.set_endpoints).await
     }
-    async fn local_storage_info(&self) -> StorageInfo {
+    async fn local_storage_info(&self) -> madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
         let mut local_disks: Vec<Option<Arc<crate::disk::Disk>>> = Vec::new();
@@ -4941,13 +4940,13 @@ pub fn should_heal_object_on_disk(
     (false, err.clone())
 }
 
-async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<StorageDisk> {
+async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<madmin::Disk> {
     let mut ret = Vec::new();
 
     for (i, pool) in disks.iter().enumerate() {
         if let Some(disk) = pool {
             match disk.disk_info(&DiskInfoOptions::default()).await {
-                Ok(res) => ret.push(StorageDisk {
+                Ok(res) => ret.push(madmin::Disk {
                     endpoint: eps[i].to_string(),
                     local: eps[i].is_local,
                     pool_index: eps[i].pool_idx,
@@ -4978,7 +4977,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<St
                     free_inodes: res.free_inodes,
                     ..Default::default()
                 }),
-                Err(err) => ret.push(StorageDisk {
+                Err(err) => ret.push(madmin::Disk {
                     state: err.to_string(),
                     endpoint: eps[i].to_string(),
                     local: eps[i].is_local,
@@ -4989,7 +4988,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<St
                 }),
             }
         } else {
-            ret.push(StorageDisk {
+            ret.push(madmin::Disk {
                 endpoint: eps[i].to_string(),
                 local: eps[i].is_local,
                 pool_index: eps[i].pool_idx,
@@ -5003,14 +5002,14 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<St
 
     ret
 }
-async fn get_storage_info(disks: &Vec<Option<DiskStore>>, eps: &Vec<Endpoint>) -> StorageInfo {
+async fn get_storage_info(disks: &Vec<Option<DiskStore>>, eps: &Vec<Endpoint>) -> madmin::StorageInfo {
     let mut disks = get_disks_info(disks, eps).await;
     disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
 
-    StorageInfo {
+    madmin::StorageInfo {
         disks,
-        backend: BackendInfo {
-            backend_type: BackendByte::Erasure,
+        backend: madmin::BackendInfo {
+            backend_type: madmin::BackendByte::Erasure,
             ..Default::default()
         },
     }

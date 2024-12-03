@@ -3,8 +3,7 @@ use super::{
     data_scanner::HEAL_DELETE_DANGLING,
     error::ERR_SKIP_FILE,
     heal_commands::{
-        HealItemType, HealOpts, HealResultItem, HealScanMode, HealStopSuccess, HealingDisk, HealingTracker,
-        HEAL_ITEM_BUCKET_METADATA,
+        HealItemType, HealOpts, HealResultItem, HealScanMode, HealStopSuccess, HealingTracker, HEAL_ITEM_BUCKET_METADATA,
     },
 };
 use crate::store_api::StorageAPI;
@@ -664,7 +663,7 @@ impl AllHealState {
         self.heal_status.write().await.insert(tracker.id.clone(), tracker.clone());
     }
 
-    pub async fn get_local_healing_disks(&self) -> HashMap<String, HealingDisk> {
+    pub async fn get_local_healing_disks(&self) -> HashMap<String, madmin::HealingDisk> {
         let _ = self.mu.read().await;
 
         let mut dst = HashMap::new();
