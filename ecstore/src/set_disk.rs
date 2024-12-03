@@ -2667,6 +2667,7 @@ impl SetDisks {
         updates: Sender<DataUsageCache>,
         heal_scan_mode: HealScanMode,
     ) -> Result<()> {
+        info!("ns_scanner");
         if buckets.is_empty() {
             return Ok(());
         }
@@ -2845,6 +2846,7 @@ impl SetDisks {
         }
         let _ = join_all(futures).await;
         let _ = task.await;
+        info!("ns_scanner completed");
         Ok(())
     }
 

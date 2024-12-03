@@ -131,7 +131,7 @@ const OBJECTS_VERSION_COUNT_INTERVALS: [ObjectHistogramInterval; DATA_USAGE_VERS
 ];
 
 // sizeHistogram is a size histogram.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SizeHistogram(Vec<u64>);
 
 impl Default for SizeHistogram {
@@ -168,7 +168,7 @@ impl SizeHistogram {
 }
 
 // versionsHistogram is a histogram of number of versions in an object.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VersionsHistogram(Vec<u64>);
 
 impl Default for VersionsHistogram {
@@ -238,7 +238,7 @@ impl ReplicationAllStats {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageEntry {
     pub children: DataUsageHashMap,
     // These fields do no include any children.
@@ -340,7 +340,7 @@ pub struct DataUsageEntryInfo {
     pub entry: DataUsageEntry,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageCacheInfo {
     pub name: String,
     pub next_cycle: u32,
@@ -367,7 +367,7 @@ pub struct DataUsageCacheInfo {
 //     }
 // }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageCache {
     pub info: DataUsageCacheInfo,
     pub cache: HashMap<String, DataUsageEntry>,
