@@ -3,6 +3,7 @@ pub fn encrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
     use crate::encdec::id::ID;
     use aes_gcm::Aes256Gcm;
     use aes_gcm::KeyInit as _;
+    use rand::random;
 
     let salt: [u8; 32] = random();
 
@@ -34,7 +35,14 @@ pub fn encrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
 }
 
 #[cfg(any(test, feature = "crypto"))]
-fn encrypt<T: aes_gcm::aead::Aead>(stream: T, salt: &[u8], id: ID, data: &[u8]) -> Result<Vec<u8>, crate::Error> {
+fn encrypt<T: aes_gcm::aead::Aead>(
+    stream: T,
+    salt: &[u8],
+    id: crate::encdec::id::ID,
+    data: &[u8],
+) -> Result<Vec<u8>, crate::Error> {
+    use crate::error::Error;
+
     let nonce = T::generate_nonce(rand::thread_rng());
     let encryptor = stream.encrypt(&nonce, data).map_err(Error::ErrEncryptFailed)?;
 
