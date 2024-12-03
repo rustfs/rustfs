@@ -1,3 +1,4 @@
+use super::IOStats;
 use crate::{disk::Info, error::Result};
 use std::io::{Error, ErrorKind, Result};
 use std::mem;

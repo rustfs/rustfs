@@ -1,3 +1,4 @@
+use super::IOStats;
 use crate::{disk::Info, error::Result};
 use nix::sys::{stat::stat, statfs::statfs};
 use std::io::{Error, ErrorKind};
