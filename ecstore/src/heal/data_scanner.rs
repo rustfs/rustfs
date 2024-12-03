@@ -86,23 +86,28 @@ lazy_static! {
 }
 
 pub async fn init_data_scanner() {
-    let mut r = rand::thread_rng();
-    let random = r.gen_range(0.0..1.0);
     tokio::spawn(async move {
         loop {
             run_data_scanner().await;
+            let random = {
+                let mut r = rand::thread_rng();
+                r.gen_range(0.0..1.0)
+            };
             let duration = Duration::from_secs_f64(random * (SCANNER_CYCLE.load(std::sync::atomic::Ordering::SeqCst) as f64));
             let sleep_duration = if duration < Duration::new(1, 0) {
                 Duration::new(1, 0)
             } else {
                 duration
             };
+
+            info!("data scanner will sleeping {sleep_duration:?}");
             sleep(sleep_duration).await;
         }
     });
 }
 
 async fn run_data_scanner() {
+    info!("run_data_scanner");
     let Some(store) = new_object_layer_fn() else {
         error!("errServerNotInitialized");
         return;
@@ -163,8 +168,10 @@ async fn run_data_scanner() {
         });
         let mut res = HashMap::new();
         res.insert("cycle".to_string(), cycle_info.current.to_string());
+        info!("start ns_scanner");
         match store.clone().ns_scanner(tx, cycle_info.current as usize, scan_mode).await {
             Ok(_) => {
+                info!("ns_scanner completed");
                 cycle_info.next += 1;
                 cycle_info.current = 0;
                 cycle_info.cycle_completed.push(Utc::now());
@@ -176,9 +183,14 @@ async fn run_data_scanner() {
                 globalScannerMetrics.write().await.set_cycle(Some(cycle_info.clone())).await;
                 let mut tmp = Vec::new();
                 tmp.write_u64::<LittleEndian>(cycle_info.next).unwrap();
-                let _ = save_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH, &tmp).await;
+                if let Ok(data) = cycle_info.marshal_msg(&tmp) {
+                    let _ = save_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH, &data).await;
+                } else {
+                    let _ = save_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH, &tmp).await;
+                }
             }
             Err(err) => {
+                info!("ns_scanner failed: {:?}", err);
                 res.insert("error".to_string(), err.to_string());
             }
         }
