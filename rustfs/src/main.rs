@@ -208,10 +208,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     })?;
     warn!(" init store success!");
 
-    new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
-        error!("new_global_notification_sys faild {:?}", &err);
-        Error::from_string(err.to_string())
-    })?;
+    // new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
+    //     error!("new_global_notification_sys faild {:?}", &err);
+    //     Error::from_string(err.to_string())
+    // })?;
 
     // init scanner
     init_data_scanner().await;
