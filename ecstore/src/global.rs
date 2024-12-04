@@ -39,7 +39,7 @@ lazy_static! {
 
 pub fn global_rustfs_port() -> u16 {
     if let Some(p) = GLOBAL_RUSTFS_PORT.get() {
-        p.clone()
+        *p
     } else {
         DEFAULT_PORT
     }
@@ -74,7 +74,7 @@ pub fn get_global_endpoints() -> EndpointServerPools {
 }
 
 pub fn new_object_layer_fn() -> Option<Arc<ECStore>> {
-    GLOBAL_OBJECT_API.get().map(|ec| ec.clone())
+    GLOBAL_OBJECT_API.get().cloned()
 }
 
 pub async fn set_object_layer(o: Arc<ECStore>) {

@@ -168,7 +168,7 @@ impl ScannerMetrics {
             self.last_minute.ilm.entry(k.clone()).or_default().merge(v);
         }
 
-        self.active_paths.extend(other.active_paths.clone().into_iter());
+        self.active_paths.extend(other.active_paths.clone());
 
         self.active_paths.sort();
     }
@@ -606,14 +606,14 @@ pub struct RealtimeMetrics {
 impl RealtimeMetrics {
     pub fn merge(&mut self, other: Self) {
         if !other.errors.is_empty() {
-            self.errors.extend(other.errors.into_iter());
+            self.errors.extend(other.errors);
         }
 
         for (k, v) in other.by_host.into_iter() {
             *self.by_host.entry(k).or_default() = v;
         }
 
-        self.hosts.extend(other.hosts.into_iter());
+        self.hosts.extend(other.hosts);
         self.aggregated.merge(&other.aggregated);
         self.hosts.sort();
 

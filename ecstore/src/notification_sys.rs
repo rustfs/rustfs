@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
@@ -7,6 +7,7 @@ use crate::peer_rest_client::PeerRestClient;
 use crate::StorageAPI;
 use futures::future::join_all;
 use lazy_static::lazy_static;
+use tracing::error;
 
 lazy_static! {
     pub static ref GLOBAL_NotificationSys: OnceLock<NotificationSys> = OnceLock::new();
@@ -88,6 +89,20 @@ impl NotificationSys {
 
         let backend = api.backend_info().await;
         madmin::StorageInfo { disks, backend }
+    }
+
+    pub async fn reload_pool_meta(&self) {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().flatten() {
+            futures.push(client.reload_pool_meta());
+        }
+
+        let results = join_all(futures).await;
+        for result in results {
+            if let Err(err) = result {
+                error!("notification reload_pool_meta err {:?}", err);
+            }
+        }
     }
 }
 

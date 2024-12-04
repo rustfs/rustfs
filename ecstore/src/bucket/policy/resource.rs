@@ -169,6 +169,7 @@ impl<'de> Deserialize<'de> for Resource {
     {
         struct Visitor;
 
+        #[allow(clippy::needless_lifetimes)]
         impl<'de> serde::de::Visitor<'de> for Visitor {
             type Value = Resource;
 

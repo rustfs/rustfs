@@ -250,7 +250,7 @@ impl FileMeta {
         // TODO: use old buf
         let meta_buf = ver.marshal_msg()?;
 
-        let pre_mod_time = self.versions[idx].header.mod_time.clone();
+        let pre_mod_time = self.versions[idx].header.mod_time;
 
         self.versions[idx].header = ver.header();
         self.versions[idx].meta = meta_buf;

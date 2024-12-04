@@ -110,7 +110,7 @@ impl S3PeerSys {
         let mut futures = Vec::new();
         let heal_bucket_results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.clients.len()]));
         for (idx, client) in self.clients.iter().enumerate() {
-            let opts_clone = opts.clone();
+            let opts_clone = opts;
             let heal_bucket_results_clone = heal_bucket_results.clone();
             futures.push(async move {
                 match client.heal_bucket(bucket, &opts_clone).await {
