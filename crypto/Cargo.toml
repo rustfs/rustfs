@@ -14,7 +14,7 @@ chacha20poly1305 = { version = "0.10.1", optional = true }
 jsonwebtoken = "9.3.0"
 pbkdf2 = { version = "0.12.2", optional = true }
 rand = { workspace = true, optional = true }
-sha2 = "0.10.8"
+sha2 = { version = "0.10.8", optional = true }
 thiserror.workspace = true
 serde_json.workspace = true
 
@@ -24,6 +24,7 @@ test-case.workspace = true
 time.workspace = true
 
 [features]
+default = ["crypto", "fips"]
 fips = []
 crypto = [
     "dep:aes-gcm",
@@ -31,8 +32,8 @@ crypto = [
     "dep:chacha20poly1305",
     "dep:pbkdf2",
     "dep:rand",
+    "dep:sha2",
 ]
-default = ["crypto", "fips"]
 
 [lints.clippy]
 unwrap_used = "deny"
