@@ -331,7 +331,7 @@ impl ErasureInfo {
 
     // 算出每个分片大小
     pub fn shard_size(&self, data_size: usize) -> usize {
-        (data_size + self.data_blocks - 1) / self.data_blocks
+        data_size.div_ceil(self.data_blocks)
     }
 
     // returns final erasure size from original size.
@@ -342,7 +342,7 @@ impl ErasureInfo {
 
         let num_shards = total_size / self.block_size;
         let last_block_size = total_size % self.block_size;
-        let last_shard_size = (last_block_size + self.data_blocks - 1) / self.data_blocks;
+        let last_shard_size = last_block_size.div_ceil(self.data_blocks);
         num_shards * self.shard_size(self.block_size) + last_shard_size
 
         // // 因为写入的时候ec需要补全，所以最后一个长度应该也是一样的
@@ -826,6 +826,7 @@ pub trait ObjectIO: Send + Sync + 'static {
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait StorageAPI: ObjectIO {
     // NewNSLock TODO:
     // Shutdown TODO:
@@ -873,7 +874,7 @@ pub trait StorageAPI: ObjectIO {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> Result<(Vec<DeletedObject>, Vec<Option<Error>>)>;
-    #[warn(clippy::too_many_arguments)]
+
     // TransitionObject TODO:
     // RestoreTransitionedObject TODO:
 

@@ -77,6 +77,6 @@ pub fn same_disk(disk1: &str, disk2: &str) -> Result<bool> {
     Ok(stat1.st_dev == stat2.st_dev)
 }
 
-pub fn get_drive_stats(major: u32, minor: u32) -> Result<IOStats> {
+pub fn get_drive_stats(_major: u32, _minor: u32) -> Result<IOStats> {
     Ok(IOStats::default())
 }

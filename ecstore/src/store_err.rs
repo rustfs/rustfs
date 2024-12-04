@@ -208,7 +208,7 @@ pub fn is_err_object_not_found(err: &Error) -> bool {
 fn test_storage_error() {
     let e1 = Error::new(StorageError::BucketExists("ss".into()));
     let e2 = Error::new(StorageError::ObjectNotFound("ss".into(), "sdf".to_owned()));
-    assert_eq!(is_err_bucket_exists(&e1), true);
-    assert_eq!(is_err_object_not_found(&e1), false);
-    assert_eq!(is_err_object_not_found(&e2), true);
+    assert!(is_err_bucket_exists(&e1));
+    assert!(!is_err_object_not_found(&e1));
+    assert!(is_err_object_not_found(&e2));
 }

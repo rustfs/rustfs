@@ -4,10 +4,6 @@ use ecstore::global::DEFAULT_PORT;
 
 shadow_rs::shadow!(build);
 
-/// Default port that a rustfs server listens on.
-///
-/// Used if no port is specified.
-
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 

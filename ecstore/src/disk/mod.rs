@@ -994,6 +994,7 @@ impl BufferWriter {
     pub fn new(inner: Vec<u8>) -> Self {
         Self { inner }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &[u8] {
         self.inner.as_ref()
     }
@@ -1038,6 +1039,10 @@ impl Writer for LocalFileWriter {
     }
 }
 
+type NodeClient = NodeServiceClient<
+    InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+>;
+
 #[derive(Debug)]
 pub struct RemoteFileWriter {
     pub root: PathBuf,
@@ -1049,15 +1054,7 @@ pub struct RemoteFileWriter {
 }
 
 impl RemoteFileWriter {
-    pub async fn new(
-        root: PathBuf,
-        volume: String,
-        path: String,
-        is_append: bool,
-        mut client: NodeServiceClient<
-            InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
-        >,
-    ) -> Result<Self> {
+    pub async fn new(root: PathBuf, volume: String, path: String, is_append: bool, mut client: NodeClient) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 
@@ -1247,14 +1244,7 @@ pub struct RemoteFileReader {
 }
 
 impl RemoteFileReader {
-    pub async fn new(
-        root: PathBuf,
-        volume: String,
-        path: String,
-        mut client: NodeServiceClient<
-            InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
-        >,
-    ) -> Result<Self> {
+    pub async fn new(root: PathBuf, volume: String, path: String, mut client: NodeClient) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 

@@ -591,8 +591,6 @@ impl S3 for FS {
             .await
             .map_err(to_s3_error)?;
 
-        error!("ObjectOptions {:?}", opts);
-
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
