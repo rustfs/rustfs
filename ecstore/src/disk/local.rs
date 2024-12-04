@@ -18,6 +18,7 @@ use crate::disk::error::{
 use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
+use crate::file_meta::read_xl_meta_no_data;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, ShouldSleepFn, SizeSummary};
 use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
@@ -452,7 +453,6 @@ impl LocalDisk {
         Ok(data)
     }
 
-    // FIXME: read_metadata only suport
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
 
@@ -471,18 +471,15 @@ impl LocalDisk {
         }
 
         let size = meta.len() as usize;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size)?;
 
-        // FIXME: real xl no data
-        f.read_to_end(&mut bytes).await.map_err(os_err_to_file_err)?;
+        let data = read_xl_meta_no_data(&mut f, size).await?;
 
         let modtime = match meta.modified() {
             Ok(md) => Some(OffsetDateTime::from(md)),
             Err(_) => None,
         };
 
-        Ok((bytes, modtime))
+        Ok((data, modtime))
     }
 
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -1475,7 +1472,7 @@ impl DiskAPI for LocalDisk {
         let mut xlmeta = FileMeta::new();
 
         if let Some(dst_buf) = has_dst_buf.as_ref() {
-            if FileMeta::is_xl_format(dst_buf) {
+            if FileMeta::is_xl2_v1_format(dst_buf) {
                 if let Ok(nmeta) = FileMeta::load(dst_buf) {
                     xlmeta = nmeta
                 }
@@ -1723,7 +1720,7 @@ impl DiskAPI for LocalDisk {
                     }
                 })?;
 
-            if !FileMeta::is_xl_format(buf.as_slice()) {
+            if !FileMeta::is_xl2_v1_format(buf.as_slice()) {
                 return Err(Error::new(DiskError::FileVersionNotFound));
             }
 
