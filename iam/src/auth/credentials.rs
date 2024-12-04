@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::LazyCell;
 use std::collections::HashMap;
-use std::env::var;
 use time::format_description::BorrowedFormatItem;
 use time::{Date, OffsetDateTime};
 
@@ -103,7 +102,7 @@ impl Credentials {
         Self::check_key_value(header)
     }
 
-    pub fn check_key_value(header: CredentialHeader) -> crate::Result<Self> {
+    pub fn check_key_value(_header: CredentialHeader) -> crate::Result<Self> {
         todo!()
     }
 

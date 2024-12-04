@@ -1,5 +1,3 @@
-use std::{fmt::Write, usize};
-
 struct LazyBuf<'a> {
     s: &'a str,
     buf: Option<Vec<u8>>,

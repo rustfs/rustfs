@@ -1,13 +1,12 @@
-use std::{borrow::Cow, collections::HashMap, f32::NAN};
+use std::{borrow::Cow, collections::HashMap};
 
 use log::{info, warn};
-use time::OffsetDateTime;
 
 use crate::{
     arn::ARN,
-    auth::{Credentials, UserIdentity},
-    cache::{Cache, CacheInner},
-    policy::{utils::get_values_from_claims, Args, MappedPolicy, Policy, UserType},
+    auth::UserIdentity,
+    cache::CacheInner,
+    policy::{utils::get_values_from_claims, Args, Policy},
     store::Store,
     Error,
 };
@@ -36,7 +35,7 @@ where
             .or_else(|| self.cache.sts_accounts.get(user_name))
     }
 
-    async fn get_policy(&self, name: &str, groups: &[String]) -> crate::Result<Vec<String>> {
+    async fn get_policy(&self, name: &str, _groups: &[String]) -> crate::Result<Vec<String>> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -122,7 +121,7 @@ where
         false
     }
 
-    pub async fn get_combined_policy(&self, policyes: &[String]) -> Policy {
+    pub async fn get_combined_policy(&self, _policies: &[String]) -> Policy {
         todo!()
     }
 

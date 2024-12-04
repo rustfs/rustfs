@@ -1,5 +1,3 @@
-use sha2::digest::InvalidLength;
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("unexpected header")]
@@ -8,8 +6,9 @@ pub enum Error {
     #[error("invalid encryption algorithm ID: {0}")]
     ErrInvalidAlgID(u8),
 
+    #[cfg(any(test, feature = "crypto"))]
     #[error("{0}")]
-    ErrInvalidLength(#[from] InvalidLength),
+    ErrInvalidLength(#[from] sha2::digest::InvalidLength),
 
     #[cfg(any(test, feature = "crypto"))]
     #[error("encrypt failed")]
