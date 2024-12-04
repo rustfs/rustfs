@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
 use super::{action::Action, ActionSet, Args, Effect, Error, Functions, ResourceSet, Validator, ID};

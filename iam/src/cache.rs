@@ -93,7 +93,7 @@ impl CacheInner {
         self.users.get(user_name).or_else(|| self.sts_accounts.get(user_name))
     }
 
-    fn get_policy(&self, name: &str, groups: &[String]) -> crate::Result<Vec<Policy>> {
+    fn get_policy(&self, _name: &str, _groups: &[String]) -> crate::Result<Vec<Policy>> {
         todo!()
     }
 
@@ -126,13 +126,13 @@ impl CacheInner {
     }
 
     // todo
-    pub fn is_allowed_sts(&self, args: &Args, parent: &str) -> bool {
+    pub fn is_allowed_sts(&self, _args: &Args, _parent: &str) -> bool {
         warn!("unimplement is_allowed_sts");
         false
     }
 
     // todo
-    pub fn is_allowed_service_account(&self, args: &Args, parent: &str) -> bool {
+    pub fn is_allowed_service_account(&self, _args: &Args, _parent: &str) -> bool {
         warn!("unimplement is_allowed_sts");
         false
     }
@@ -141,7 +141,7 @@ impl CacheInner {
         todo!()
     }
 
-    pub fn policy_db_get(&self, name: &str, groups: &[String]) -> Vec<String> {
+    pub fn policy_db_get(&self, _name: &str, _groups: &[String]) -> Vec<String> {
         todo!()
     }
 }

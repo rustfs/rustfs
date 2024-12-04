@@ -37,7 +37,7 @@ fn decryp<T: aes_gcm::aead::Aead>(stream: T, nonce: &[u8], data: &[u8]) -> Resul
         .map_err(Error::ErrDecryptFailed)
 }
 
-#[cfg(all(not(test), not(feature = "crypto")))]
+#[cfg(not(any(test, feature = "crypto")))]
 pub fn decrypt_data(_password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
     Ok(data.to_vec())
 }

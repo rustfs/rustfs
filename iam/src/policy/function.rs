@@ -1,7 +1,6 @@
 use std::{collections::HashMap, ops::Deref};
 
 use func::Func;
-use key::Key;
 use serde::{de, Deserialize, Serialize};
 
 pub mod addr;
@@ -56,7 +55,7 @@ impl<'de> Deserialize<'de> for Functions {
                         return Err(A::Error::custom("invalid codition"));
                     }
 
-                    let Some(name) = name else { return Err(A::Error::custom("invalid codition")) };
+                    let Some(_name) = name else { return Err(A::Error::custom("invalid codition")) };
 
                     let f = match qualifier {
                         Some("ForAnyValues") => Func::ForAnyValues,
