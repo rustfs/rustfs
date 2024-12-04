@@ -6,7 +6,7 @@ use crate::{
     global::is_dist_erasure,
     heal::heal_commands::BgHealState,
     metrics_realtime::{CollectMetricsOpts, MetricType},
-    store_api::StorageInfo,
+    utils::net::XHost,
 };
 use common::error::{Error, Result};
 use madmin::{
@@ -29,35 +29,53 @@ use protos::{
 use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize as _};
 use tonic::Request;
+use tracing::warn;
 
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
 
+#[derive(Debug, Clone)]
 pub struct PeerRestClient {
-    addr: String,
+    pub host: XHost,
+    pub grid_host: String,
 }
 
 impl PeerRestClient {
-    pub fn new(url: url::Url) -> Self {
-        Self {
-            addr: format!("{}://{}:{}", url.scheme(), url.host_str().unwrap(), url.port().unwrap()),
-        }
+    pub fn new(host: XHost, grid_host: String) -> Self {
+        Self { host, grid_host }
     }
-    pub async fn new_clients(_eps: EndpointServerPools) -> (Vec<Self>, Vec<Self>) {
+    pub async fn new_clients(eps: EndpointServerPools) -> (Vec<Option<Self>>, Vec<Option<Self>>) {
         if !is_dist_erasure().await {
             return (Vec::new(), Vec::new());
         }
 
-        // FIXME:TODO
+        let eps = eps.clone();
+        let hosts = eps.hosts_sorted();
+        let mut remote = vec![None; hosts.len()];
+        let mut all = Vec::with_capacity(hosts.len());
+        for (i, hs_host) in hosts.iter().enumerate() {
+            if let Some(host) = hs_host {
+                if let Some(grid_host) = eps.find_grid_hosts_from_peer(host) {
+                    let client = PeerRestClient::new(host.clone(), grid_host);
 
-        todo!()
+                    all[i] = Some(client.clone());
+                    remote.push(Some(client));
+                }
+            }
+        }
+
+        if all.len() != remote.len() + 1 {
+            warn!("Expected number of all hosts ({}) to be remote +1 ({})", all.len(), remote.len());
+        }
+
+        (remote, all)
     }
 }
 
 impl PeerRestClient {
-    pub async fn local_storage_info(&self) -> Result<StorageInfo> {
-        let mut client = node_service_time_out_client(&self.addr)
+    pub async fn local_storage_info(&self) -> Result<madmin::StorageInfo> {
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LocalStorageInfoRequest { metrics: true });
@@ -72,13 +90,13 @@ impl PeerRestClient {
         let data = response.storage_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let storage_info: StorageInfo = Deserialize::deserialize(&mut buf).unwrap();
+        let storage_info: madmin::StorageInfo = Deserialize::deserialize(&mut buf).unwrap();
 
         Ok(storage_info)
     }
 
     pub async fn server_info(&self) -> Result<ServerProperties> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(ServerInfoRequest { metrics: true });
@@ -99,7 +117,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_cpus(&self) -> Result<Cpus> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetCpusRequest {});
@@ -120,7 +138,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_net_info(&self) -> Result<NetInfo> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetNetInfoRequest {});
@@ -141,7 +159,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_partitions(&self) -> Result<Partitions> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetPartitionsRequest {});
@@ -162,7 +180,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_os_info(&self) -> Result<OsInfo> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetOsInfoRequest {});
@@ -183,7 +201,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_se_linux_info(&self) -> Result<SysService> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetSeLinuxInfoRequest {});
@@ -204,7 +222,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_sys_config(&self) -> Result<SysConfig> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetSysConfigRequest {});
@@ -225,7 +243,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_sys_errors(&self) -> Result<SysErrors> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetSysErrorsRequest {});
@@ -246,7 +264,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_mem_info(&self) -> Result<MemInfo> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetMemInfoRequest {});
@@ -267,7 +285,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_metrics(&self, t: MetricType, opts: &CollectMetricsOpts) -> Result<RealtimeMetrics> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let mut buf_t = Vec::new();
@@ -295,7 +313,7 @@ impl PeerRestClient {
     }
 
     pub async fn get_proc_info(&self) -> Result<ProcInfo> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(GetProcInfoRequest {});
@@ -316,7 +334,7 @@ impl PeerRestClient {
     }
 
     pub async fn start_profiling(&self, profiler: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(StartProfilingRequest {
@@ -350,7 +368,7 @@ impl PeerRestClient {
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LoadBucketMetadataRequest {
@@ -368,7 +386,7 @@ impl PeerRestClient {
     }
 
     pub async fn delete_bucket_metadata(&self, bucket: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(DeleteBucketMetadataRequest {
@@ -386,7 +404,7 @@ impl PeerRestClient {
     }
 
     pub async fn delete_policy(&self, policy: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(DeletePolicyRequest {
@@ -404,7 +422,7 @@ impl PeerRestClient {
     }
 
     pub async fn load_policy(&self, policy: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LoadPolicyRequest {
@@ -422,7 +440,7 @@ impl PeerRestClient {
     }
 
     pub async fn load_policy_mapping(&self, user_or_group: &str, user_type: u64, is_group: bool) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LoadPolicyMappingRequest {
@@ -442,7 +460,7 @@ impl PeerRestClient {
     }
 
     pub async fn delete_user(&self, access_key: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(DeleteUserRequest {
@@ -460,7 +478,7 @@ impl PeerRestClient {
     }
 
     pub async fn delete_service_account(&self, access_key: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(DeleteServiceAccountRequest {
@@ -478,7 +496,7 @@ impl PeerRestClient {
     }
 
     pub async fn load_user(&self, access_key: &str, temp: bool) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LoadUserRequest {
@@ -497,7 +515,7 @@ impl PeerRestClient {
     }
 
     pub async fn load_service_account(&self, access_key: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LoadServiceAccountRequest {
@@ -515,7 +533,7 @@ impl PeerRestClient {
     }
 
     pub async fn load_group(&self, group: &str) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LoadGroupRequest {
@@ -533,7 +551,7 @@ impl PeerRestClient {
     }
 
     pub async fn reload_site_replication_config(&self) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(ReloadSiteReplicationConfigRequest {});
@@ -549,7 +567,7 @@ impl PeerRestClient {
     }
 
     pub async fn signal_service(&self, sig: u64, sub_sys: &str, dry_run: bool, _exec_at: SystemTime) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let mut vars = HashMap::new();
@@ -571,7 +589,7 @@ impl PeerRestClient {
     }
 
     pub async fn background_heal_status(&self) -> Result<BgHealState> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(BackgroundHealStatusRequest {});
@@ -592,21 +610,21 @@ impl PeerRestClient {
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
-        let mut _client = node_service_time_out_client(&self.addr)
+        let mut _client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         todo!()
     }
 
     pub async fn update_metacache_listing(&self) -> Result<()> {
-        let mut _client = node_service_time_out_client(&self.addr)
+        let mut _client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         todo!()
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(ReloadPoolMetaRequest {});
@@ -623,7 +641,7 @@ impl PeerRestClient {
     }
 
     pub async fn stop_rebalance(&self) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(StopRebalanceRequest {});
@@ -640,7 +658,7 @@ impl PeerRestClient {
     }
 
     pub async fn load_rebalance_meta(&self, start_rebalance: bool) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
@@ -657,7 +675,7 @@ impl PeerRestClient {
     }
 
     pub async fn load_transition_tier_config(&self) -> Result<()> {
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         let request = Request::new(LoadTransitionTierConfigRequest {});

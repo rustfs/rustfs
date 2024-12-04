@@ -387,7 +387,7 @@ impl Erasure {
 
     // 算出每个分片大小
     pub fn shard_size(&self, data_size: usize) -> usize {
-        (data_size + self.data_shards - 1) / self.data_shards
+        data_size.div_ceil(self.data_shards)
     }
     // returns final erasure size from original size.
     pub fn shard_file_size(&self, total_size: usize) -> usize {
@@ -397,7 +397,7 @@ impl Erasure {
 
         let num_shards = total_size / self.block_size;
         let last_block_size = total_size % self.block_size;
-        let last_shard_size = (last_block_size + self.data_shards - 1) / self.data_shards;
+        let last_shard_size = last_block_size.div_ceil(self.data_shards);
         num_shards * self.shard_size(self.block_size) + last_shard_size
 
         // // 因为写入的时候ec需要补全，所以最后一个长度应该也是一样的

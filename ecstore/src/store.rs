@@ -15,10 +15,9 @@ use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
 use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode, HEAL_ITEM_METADATA};
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::new_object_layer_fn;
+use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
-use crate::store_api::{
-    BackendByte, BackendDisks, BackendInfo, ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO, StorageInfo,
-};
+use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
 use crate::store_err::{
     is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum, is_err_version_not_found,
     to_object_err, StorageError,
@@ -1120,7 +1119,7 @@ lazy_static! {
 
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
-    async fn backend_info(&self) -> BackendInfo {
+    async fn backend_info(&self) -> madmin::BackendInfo {
         let (standard_sc_parity, rr_sc_parity) = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
                 let sc_parity = sc
@@ -1151,10 +1150,10 @@ impl StorageAPI for ECStore {
             drives_per_set.push(*set_count);
         }
 
-        BackendInfo {
-            backend_type: BackendByte::Erasure,
-            online_disks: BackendDisks::new(),
-            offline_disks: BackendDisks::new(),
+        madmin::BackendInfo {
+            backend_type: madmin::BackendByte::Erasure,
+            online_disks: madmin::BackendDisks::new(),
+            offline_disks: madmin::BackendDisks::new(),
             standard_sc_data,
             standard_sc_parity,
             rr_sc_data,
@@ -1164,11 +1163,14 @@ impl StorageAPI for ECStore {
             ..Default::default()
         }
     }
-    async fn storage_info(&self) -> StorageInfo {
-        // FIXME: globalNotificationSys.StorageInfo
-        unimplemented!()
+    async fn storage_info(&self) -> madmin::StorageInfo {
+        let Some(notification_sy) = get_global_notification_sys() else {
+            return madmin::StorageInfo::default();
+        };
+
+        notification_sy.storage_info(self).await
     }
-    async fn local_storage_info(&self) -> StorageInfo {
+    async fn local_storage_info(&self) -> madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.pools.len());
 
         for pool in self.pools.iter() {
@@ -1184,7 +1186,7 @@ impl StorageAPI for ECStore {
         }
 
         let backend = self.backend_info().await;
-        StorageInfo { backend, disks }
+        madmin::StorageInfo { backend, disks }
     }
 
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {

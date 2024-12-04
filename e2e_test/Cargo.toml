@@ -21,3 +21,4 @@ tonic = { version = "0.12.3", features = ["gzip"] }
 tokio = { workspace = true }
 tower.workspace = true
 url.workspace = true
+madmin.workspace =true

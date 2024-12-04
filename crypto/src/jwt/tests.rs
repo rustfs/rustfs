@@ -10,7 +10,10 @@ fn test() {
         "bbb": "bbb"
     });
 
-    let jwt_token = encode(b"aaaa", &claims).unwrap();
-    let new_claims = decode(&jwt_token, b"aaaa").unwrap();
-    assert_eq!(new_claims.claims, claims);
+    let jwt_token = encode(b"aaaa", &claims).unwrap_or_default();
+    let new_claims = match decode(&jwt_token, b"aaaa") {
+        Ok(res) => Some(res.claims),
+        Err(_errr) => None,
+    };
+    assert_eq!(new_claims, Some(claims));
 }

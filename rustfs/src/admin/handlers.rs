@@ -10,6 +10,7 @@ use ecstore::global::GLOBAL_ALlHealState;
 use ecstore::heal::heal_commands::HealOpts;
 use ecstore::heal::heal_ops::new_heal_sequence;
 use ecstore::metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType};
+use ecstore::new_object_layer_fn;
 use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::StorageAPI;
@@ -17,7 +18,6 @@ use ecstore::utils::path::path_join;
 use ecstore::utils::time::parse_duration;
 use ecstore::utils::xml;
 use ecstore::GLOBAL_Endpoints;
-use ecstore::{new_object_layer_fn, store_api::BackendInfo};
 use futures::{Stream, StreamExt};
 use http::Uri;
 use hyper::StatusCode;
@@ -37,7 +37,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration as std_Duration;
-use std::u64;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc::{self};
 use tokio::time::interval;
@@ -128,7 +127,7 @@ impl Operation for AssumeRoleHandle {
 #[serde(rename_all = "PascalCase", default)]
 pub struct AccountInfo {
     pub account_name: String,
-    pub server: BackendInfo,
+    pub server: madmin::BackendInfo,
     pub policy: BucketPolicy,
 }
 
@@ -224,7 +223,18 @@ impl Operation for StorageInfoHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StorageInfoHandler");
 
-        return Err(s3_error!(NotImplemented));
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        // TODO:getAggregatedBackgroundHealState
+
+        let info = store.storage_info().await;
+
+        let output = serde_json::to_string(&info)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
     }
 }
 
@@ -492,15 +502,11 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
                         hip.client_token = value.to_string();
                     }
                 }
-                if key == "forceStart" {
-                    if parts.next().is_some() {
-                        hip.force_start = true;
-                    }
+                if key == "forceStart" && parts.next().is_some() {
+                    hip.force_start = true;
                 }
-                if key == "forceStop" {
-                    if parts.next().is_some() {
-                        hip.force_stop = true;
-                    }
+                if key == "forceStop" && parts.next().is_some() {
+                    hip.force_stop = true;
                 }
             }
         }
