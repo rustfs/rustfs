@@ -117,6 +117,7 @@ async fn run_data_scanner() {
         .map_or(Vec::new(), |buf| buf);
 
     let mut buf_t = Deserializer::new(Cursor::new(buf));
+
     let mut cycle_info: CurrentScannerCycle = Deserialize::deserialize(&mut buf_t).unwrap_or_default();
 
     loop {
