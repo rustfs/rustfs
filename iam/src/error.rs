@@ -1,5 +1,3 @@
-use core::error;
-
 use crate::policy;
 
 #[derive(thiserror::Error, Debug)]

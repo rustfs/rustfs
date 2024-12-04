@@ -6,14 +6,14 @@ use ecstore::{
     store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader},
     utils::path::dir,
 };
-use futures::{future::try_join_all, SinkExt};
+use futures::future::try_join_all;
 use log::debug;
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::Store;
 use crate::{
     auth::UserIdentity,
-    cache::{Cache, CacheEntity, CacheInner},
+    cache::{Cache, CacheEntity},
     policy::{utils::split_path, MappedPolicy, PolicyDoc, UserType},
     Error,
 };
@@ -102,7 +102,7 @@ impl ObjectStore {
         Ok(Some(user))
     }
 
-    async fn load_mapped_policy(&self, user_type: UserType, name: &str, is_group: bool) -> crate::Result<MappedPolicy> {
+    async fn load_mapped_policy(&self, user_type: UserType, name: &str, _is_group: bool) -> crate::Result<MappedPolicy> {
         let (p, _) = self
             .load_iam_config::<MappedPolicy>(&format!("{base}{name}.json", base = user_type.prefix(), name = name))
             .await?;
