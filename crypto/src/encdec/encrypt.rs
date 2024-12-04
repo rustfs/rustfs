@@ -55,7 +55,7 @@ fn encrypt<T: aes_gcm::aead::Aead>(
     Ok(ciphertext)
 }
 
-#[cfg(all(not(test), not(feature = "crypto")))]
+#[cfg(not(any(test, feature = "crypto")))]
 pub fn encrypt_data(_password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
     Ok(data.to_vec())
 }
