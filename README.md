@@ -63,7 +63,7 @@ Help all of humanity reduce storage costs and achieve data security.
 | Comprehensive S3 support, works with domestic and international cloud providers	 | Full support for S3, but no local cloud vendor support |
 | Rust-based development, strong support for secure and innovative devices	 | Poor support for edge gateways and secure innovative devices|
 | Stable commercial prices, free community support | High pricing, with costs up to $250,000 for 1PiB |
-| No risk | There is a legal risk of long-arm jurisdiction |
+| No risk | Intellectual property risks and risks of prohibited uses |
 
 
 # How to install RustFS
