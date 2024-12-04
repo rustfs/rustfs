@@ -101,6 +101,7 @@ impl ListPathOptions {
 }
 
 impl ECStore {
+    #[allow(clippy::too_many_arguments)]
     pub async fn inner_list_objects_v2(
         &self,
         bucket: &str,
@@ -120,7 +121,7 @@ impl ECStore {
         };
 
         self.list_objects_generic(bucket, prefix, marker, delimiter, max_keys).await?;
-
+        // FIXME:TODO:
         unimplemented!()
     }
 
@@ -145,6 +146,8 @@ impl ECStore {
 
         let merged = self.list_path(&opts).await?;
 
+        // FIXME:TODO:
+
         todo!()
     }
 
@@ -159,10 +162,8 @@ impl ECStore {
             o.marker = "".to_owned();
         }
 
-        if !o.marker.is_empty() && !o.prefix.is_empty() {
-            if !o.marker.starts_with(&o.prefix) {
-                return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
-            }
+        if !o.marker.is_empty() && !o.prefix.is_empty() && !o.marker.starts_with(&o.prefix) {
+            return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
         }
 
         if o.limit == 0 {
@@ -194,6 +195,7 @@ impl ECStore {
             o.create = false;
         }
 
+        // FIXME:TODO:
         todo!()
 
         // let mut opts = opts.clone();
