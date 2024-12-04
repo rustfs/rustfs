@@ -764,6 +764,7 @@ dependencies = [
  "flatbuffers",
  "lazy_static",
  "lock",
+ "madmin",
  "protos",
  "rmp-serde",
  "serde",
@@ -1677,6 +1678,7 @@ dependencies = [
  "common",
  "psutil",
  "serde",
+ "time",
 ]
 
 [[package]]

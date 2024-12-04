@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use lazy_static::lazy_static;
 use std::{
     collections::HashSet,
+    fmt::Display,
     net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
 };
 
@@ -105,27 +106,38 @@ pub(crate) fn must_get_local_ips() -> Result<Vec<IpAddr>> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct XHost {
     pub name: String,
     pub port: u16,
     pub is_port_set: bool,
 }
 
-impl ToString for XHost {
-    fn to_string(&self) -> String {
+impl Display for XHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if !self.is_port_set {
-            self.name.clone()
+            write!(f, "{}", self.name)
+        } else if self.name.contains(':') {
+            write!(f, "[{}]:{}", self.name, self.port)
         } else {
-            join_host_port(&self.name, self.port)
+            write!(f, "{}:{}", self.name, self.port)
         }
     }
 }
 
-fn join_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{}]:{}", host, port)
-    } else {
-        format!("{}:{}", host, port)
+impl TryFrom<String> for XHost {
+    type Error = std::io::Error;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        if let Some(addr) = value.to_socket_addrs()?.next() {
+            Ok(Self {
+                name: addr.ip().to_string(),
+                port: addr.port(),
+                is_port_set: addr.port() > 0,
+            })
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "value invalid"))
+        }
     }
 }
 

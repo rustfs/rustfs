@@ -139,13 +139,12 @@ impl DiskError {
     }
 
     pub fn count_errs(&self, errs: &[Option<Error>]) -> usize {
-        return errs
-            .iter()
+        errs.iter()
             .filter(|&err| match err {
                 None => false,
                 Some(e) => self.is(e),
             })
-            .count();
+            .count()
     }
 
     pub fn quorum_unformatted_disks(errs: &[Option<Error>]) -> bool {

@@ -5,13 +5,15 @@ use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
-use crate::store_api::{BucketOptions, MakeBucketOptions, StorageAPI, StorageDisk, StorageInfo};
+use crate::notification_sys::get_global_notification_sys;
+use crate::store_api::{BucketOptions, MakeBucketOptions, StorageAPI};
 use crate::store_err::{is_err_bucket_exists, StorageError};
 use crate::utils::path::{path_join, SLASH_SEPARATOR};
 use crate::{sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -270,7 +272,7 @@ impl PoolMeta {
     }
 }
 
-fn path2_bucket_object(name: &String) -> (String, String) {
+fn path2_bucket_object(name: &str) -> (String, String) {
     path2_bucket_object_with_base_path("", name)
 }
 
@@ -374,11 +376,13 @@ pub struct DecomBucketInfo {
     pub prefix: String,
 }
 
-impl ToString for DecomBucketInfo {
-    fn to_string(&self) -> String {
-        path_join(&[PathBuf::from(self.name.clone()), PathBuf::from(self.prefix.clone())])
-            .to_string_lossy()
-            .to_string()
+impl Display for DecomBucketInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            path_join(&[PathBuf::from(self.name.clone()), PathBuf::from(self.prefix.clone())]).to_string_lossy()
+        )
     }
 }
 
@@ -531,7 +535,9 @@ impl ECStore {
         let mut pool_meta = self.pool_meta.write().await;
         if pool_meta.decommission_failed(idx) {
             pool_meta.save(self.pools.clone()).await?;
-            // FIXME: globalNotificationSys.ReloadPoolMeta(ctx)
+            if let Some(notification_sys) = get_global_notification_sys() {
+                notification_sys.reload_pool_meta().await;
+            }
         }
 
         Ok(())
@@ -545,7 +551,9 @@ impl ECStore {
         let mut pool_meta = self.pool_meta.write().await;
         if pool_meta.decommission_complete(idx) {
             pool_meta.save(self.pools.clone()).await?;
-            // FIXME: globalNotificationSys.ReloadPoolMeta(ctx)
+            if let Some(notification_sys) = get_global_notification_sys() {
+                notification_sys.reload_pool_meta().await;
+            }
         }
 
         Ok(())
@@ -641,7 +649,9 @@ impl ECStore {
 
         pool_meta.save(self.pools.clone()).await?;
 
-        // FIXME: globalNotificationSys.ReloadPoolMeta(ctx)
+        if let Some(notification_sys) = get_global_notification_sys() {
+            notification_sys.reload_pool_meta().await;
+        }
 
         Ok(())
     }
@@ -670,7 +680,7 @@ impl ECStore {
     }
 }
 
-fn get_total_usable_capacity(disks: &[StorageDisk], info: &StorageInfo) -> usize {
+fn get_total_usable_capacity(disks: &[madmin::Disk], info: &madmin::StorageInfo) -> usize {
     let mut capacity = 0;
     for disk in disks.iter() {
         if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
@@ -683,7 +693,7 @@ fn get_total_usable_capacity(disks: &[StorageDisk], info: &StorageInfo) -> usize
     capacity
 }
 
-fn get_total_usable_capacity_free(disks: &[StorageDisk], info: &StorageInfo) -> usize {
+fn get_total_usable_capacity_free(disks: &[madmin::Disk], info: &madmin::StorageInfo) -> usize {
     let mut capacity = 0;
     for disk in disks.iter() {
         if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {

@@ -105,9 +105,9 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
         Ok(res) => res,
         Err(err) => {
             if is_not_found(&err) {
-                warn!("config not found init start");
+                warn!("config not found, start to init");
                 let cfg = new_and_save_server_config(api).await?;
-                warn!("config not found init done");
+                warn!("config init done");
                 return Ok(cfg);
             } else {
                 error!("read config err {:?}", &err);

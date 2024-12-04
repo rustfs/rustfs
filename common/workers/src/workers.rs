@@ -81,7 +81,7 @@ mod tests {
         sleep(Duration::from_secs(1)).await;
         workers.wait().await;
         if workers.available().await != workers.limit {
-            assert!(false);
+            unreachable!();
         }
     }
 }
