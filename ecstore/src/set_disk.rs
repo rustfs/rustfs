@@ -177,6 +177,7 @@ impl SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
+    #[allow(clippy::type_complexity)]
     async fn rename_data(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -1107,9 +1108,9 @@ impl SetDisks {
         let finfo = match meta.into_fileinfo(bucket, object, "", true, true) {
             Ok(res) => res,
             Err(err) => {
-                for i in 0..errs.len() {
-                    if errs[i].is_none() {
-                        errs[i] = Some(err.clone())
+                for item in errs.iter_mut() {
+                    if item.is_none() {
+                        *item = Some(err.clone())
                     }
                 }
 
@@ -1118,9 +1119,9 @@ impl SetDisks {
         };
 
         if !finfo.is_valid() {
-            for i in 0..errs.len() {
-                if errs[i].is_none() {
-                    errs[i] = Some(Error::new(DiskError::FileCorrupt));
+            for item in errs.iter_mut() {
+                if item.is_none() {
+                    *item = Some(Error::new(DiskError::FileCorrupt));
                 }
             }
 
@@ -1629,6 +1630,7 @@ impl SetDisks {
         Ok((fi, parts_metadata, online_disks))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn get_object_with_fileinfo(
         // &self,
         bucket: &str,
@@ -5008,7 +5010,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ma
 
     ret
 }
-async fn get_storage_info(disks: &Vec<Option<DiskStore>>, eps: &Vec<Endpoint>) -> madmin::StorageInfo {
+async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> madmin::StorageInfo {
     let mut disks = get_disks_info(disks, eps).await;
     disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
 
