@@ -86,7 +86,7 @@ impl Sets {
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        for i in 0..set_count {
+        for (i, locker) in lockers.iter().enumerate().take(set_count) {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
@@ -131,7 +131,7 @@ impl Sets {
             // warn!("sets new set_drive {:?}", &set_drive);
 
             let set_disks = SetDisks {
-                lockers: lockers[i].clone(),
+                lockers: locker.clone(),
                 locker_owner: GLOBAL_Local_Node_Name.read().await.to_string(),
                 ns_mutex: Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
                 disks: RwLock::new(set_drive),

@@ -12,8 +12,8 @@ use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::{self};
 use crate::cache_value::cache::{Cache, Opts, UpdateFn};
 use crate::disk::error::{
-    convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
-    map_err_not_exists, os_err_to_file_err,
+    convert_access_error, is_err_os_not_exist, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir,
+    is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err,
 };
 use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
@@ -40,6 +40,7 @@ use crate::{
     utils,
 };
 use common::defer;
+use nix::NixPath;
 use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -57,7 +58,7 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -399,22 +400,49 @@ impl LocalDisk {
     }
 
     /// read xl.meta raw data
-    #[tracing::instrument(level = "debug", skip(self, volume_dir, path))]
+    #[tracing::instrument(level = "debug", skip(self, volume_dir, file_path))]
     async fn read_raw(
         &self,
         bucket: &str,
         volume_dir: impl AsRef<Path>,
-        path: impl AsRef<Path>,
+        file_path: impl AsRef<Path>,
         read_data: bool,
     ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-        let meta_path = path.as_ref().join(Path::new(super::STORAGE_FORMAT_FILE));
-        if read_data {
-            self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
-        } else {
-            self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
-            // FIXME: read_metadata only suport
-            // self.read_metadata_with_dmtime(meta_path).await
+        if file_path.as_ref().is_empty() {
+            return Err(Error::new(DiskError::FileNotFound));
         }
+
+        let meta_path = file_path.as_ref().join(Path::new(super::STORAGE_FORMAT_FILE));
+
+        let res = {
+            if read_data {
+                self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
+            } else {
+                match self.read_metadata_with_dmtime(meta_path).await {
+                    Ok(res) => Ok(res),
+                    Err(err) => {
+                        if is_err_os_not_exist(&err)
+                            && !skip_access_checks(volume_dir.as_ref().to_string_lossy().to_string().as_str())
+                        {
+                            if let Err(aerr) = access(volume_dir.as_ref()).await {
+                                if os_is_not_exist(&aerr) {
+                                    return Err(Error::new(DiskError::VolumeNotFound));
+                                }
+                            }
+                        }
+
+                        Err(err)
+                    }
+                }
+            }
+        };
+
+        let (buf, mtime) = res?;
+        if buf.is_empty() {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        Ok((buf, mtime))
     }
 
     async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -445,6 +473,7 @@ impl LocalDisk {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(size)?;
 
+        // FIXME: real xl no data
         f.read_to_end(&mut bytes).await.map_err(os_err_to_file_err)?;
 
         let modtime = match meta.modified() {

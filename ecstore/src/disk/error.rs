@@ -450,3 +450,11 @@ pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
     }
     errs.len() == not_found_count
 }
+
+pub fn is_err_os_not_exist(err: &Error) -> bool {
+    if let Some(os_err) = err.downcast_ref::<io::Error>() {
+        os_is_not_exist(os_err)
+    } else {
+        false
+    }
+}

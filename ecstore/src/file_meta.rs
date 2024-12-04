@@ -484,7 +484,7 @@ impl FileMeta {
                 }
             }
 
-            let mut fi = ver.into_fileinfo(volume, path, has_vid, all_parts)?;
+            let mut fi = ver.to_fileinfo(volume, path, has_vid, all_parts)?;
             fi.is_latest = is_latest;
             if let Some(_d) = succ_mod_time {
                 fi.successor_mod_time = succ_mod_time;
@@ -511,7 +511,7 @@ impl FileMeta {
         for version in self.versions.iter() {
             let mut file_version = FileMetaVersion::default();
             file_version.unmarshal_msg(&version.meta)?;
-            let fi = file_version.into_fileinfo(volume, path, None, all_parts);
+            let fi = file_version.to_fileinfo(volume, path, None, all_parts);
             versions.push(fi);
         }
 
@@ -553,10 +553,10 @@ pub struct FileMetaShallowVersion {
 }
 
 impl FileMetaShallowVersion {
-    pub fn into_fileinfo(&self, volume: &str, path: &str, version_id: Option<Uuid>, all_parts: bool) -> Result<FileInfo> {
+    pub fn to_fileinfo(&self, volume: &str, path: &str, version_id: Option<Uuid>, all_parts: bool) -> Result<FileInfo> {
         let file_version = FileMetaVersion::try_from(self.meta.as_slice())?;
 
-        Ok(file_version.into_fileinfo(volume, path, version_id, all_parts))
+        Ok(file_version.to_fileinfo(volume, path, version_id, all_parts))
     }
 }
 
@@ -760,7 +760,7 @@ impl FileMetaVersion {
         FileMetaVersionHeader::from(self.clone())
     }
 
-    pub fn into_fileinfo(self, volume: &str, path: &str, version_id: Option<Uuid>, all_parts: bool) -> FileInfo {
+    pub fn to_fileinfo(&self, volume: &str, path: &str, version_id: Option<Uuid>, all_parts: bool) -> FileInfo {
         match self.version_type {
             VersionType::Invalid => FileInfo {
                 name: path.to_string(),
