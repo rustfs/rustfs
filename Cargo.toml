@@ -22,6 +22,12 @@ repository = "https://github.com/rustfs/rustfs"
 rust-version = "1.75"
 version = "0.0.1"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
 [workspace.dependencies]
 madmin = { path = "./madmin" }
 async-trait = "0.1.83"

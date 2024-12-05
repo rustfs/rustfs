@@ -3,6 +3,9 @@ name = "protos"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 #async-backtrace = { workspace = true, optional = true }
 common.workspace = true
