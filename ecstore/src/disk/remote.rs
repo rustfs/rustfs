@@ -347,7 +347,7 @@ impl DiskAPI for RemoteDisk {
         Ok(response.volumes)
     }
 
-    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>> {
         info!("walk_dir");
         let walk_dir_options = serde_json::to_string(&opts)?;
         let mut client = node_service_time_out_client(&self.addr)
