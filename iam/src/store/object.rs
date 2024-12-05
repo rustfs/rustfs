@@ -2,8 +2,9 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use ecstore::{
     config::error::is_not_found,
-    store::{ECStore, ListPathOptions},
+    store::ECStore,
     store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader},
+    store_list_objects::ListPathOptions,
     utils::path::dir,
 };
 use futures::future::try_join_all;
@@ -41,14 +42,11 @@ impl ObjectStore {
             futures.push(async move {
                 let items = self
                     .object_api
-                    .list_path(
-                        &ListPathOptions {
-                            bucket: Self::BUCKET_NAME.into(),
-                            prefix: prefix.clone(),
-                            ..Default::default()
-                        },
-                        "",
-                    )
+                    .list_path(&ListPathOptions {
+                        bucket: Self::BUCKET_NAME.into(),
+                        prefix: prefix.clone(),
+                        ..Default::default()
+                    })
                     .await;
 
                 match items {

@@ -25,7 +25,7 @@ pub mod store;
 pub mod store_api;
 pub mod store_err;
 mod store_init;
-mod store_list_objects;
+pub mod store_list_objects;
 pub mod utils;
 pub mod xhttp;
 
