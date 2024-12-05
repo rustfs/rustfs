@@ -151,7 +151,7 @@ impl ECStore {
         todo!()
     }
 
-    async fn list_path(&self, o: &ListPathOptions) -> Result<ListObjectsInfo> {
+    pub async fn list_path(&self, o: &ListPathOptions) -> Result<ListObjectsInfo> {
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
         // if opts.prefix.ends_with(SLASH_SEPARATOR) {
         //     return Err(Error::msg("eof"));

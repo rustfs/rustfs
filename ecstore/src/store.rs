@@ -1016,32 +1016,32 @@ pub struct PoolObjInfo {
     pub err: Option<Error>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ListPathOptions {
-    pub id: String,
+// #[derive(Debug, Default, Clone)]
+// pub struct ListPathOptions {
+//     pub id: String,
 
-    // Bucket of the listing.
-    pub bucket: String,
+//     // Bucket of the listing.
+//     pub bucket: String,
 
-    // Directory inside the bucket.
-    // When unset listPath will set this based on Prefix
-    pub base_dir: String,
+//     // Directory inside the bucket.
+//     // When unset listPath will set this based on Prefix
+//     pub base_dir: String,
 
-    // Scan/return only content with prefix.
-    pub prefix: String,
+//     // Scan/return only content with prefix.
+//     pub prefix: String,
 
-    // FilterPrefix will return only results with this prefix when scanning.
-    // Should never contain a slash.
-    // Prefix should still be set.
-    pub filter_prefix: String,
+//     // FilterPrefix will return only results with this prefix when scanning.
+//     // Should never contain a slash.
+//     // Prefix should still be set.
+//     pub filter_prefix: String,
 
-    // Marker to resume listing.
-    // The response will be the first entry >= this object name.
-    pub marker: String,
+//     // Marker to resume listing.
+//     // The response will be the first entry >= this object name.
+//     pub marker: String,
 
-    // Limit the number of results.
-    pub limit: i32,
-}
+//     // Limit the number of results.
+//     pub limit: i32,
+// }
 
 #[async_trait::async_trait]
 impl ObjectIO for ECStore {
@@ -1521,7 +1521,7 @@ impl StorageAPI for ECStore {
         fetch_owner: bool,
         start_after: &str,
     ) -> Result<ListObjectsV2Info> {
-        self.inner_list_objects_v2(&bucket, &prefix, &continuation_token, &delimiter, max_keys, fetch_owner, start_after)
+        self.inner_list_objects_v2(bucket, prefix, continuation_token, delimiter, max_keys, fetch_owner, start_after)
             .await
 
         // let opts = ListPathOptions {
