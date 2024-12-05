@@ -23,6 +23,7 @@ use crate::{
         data_usage_cache::{DataUsageCache, DataUsageEntry},
         heal_commands::{HealScanMode, HealingTracker},
     },
+    io,
     store_api::{FileInfo, RawFileInfo},
 };
 use endpoint::Endpoint;
@@ -209,10 +210,10 @@ impl DiskAPI for Disk {
         }
     }
 
-    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>> {
         match self {
-            Disk::Local(local_disk) => local_disk.walk_dir(opts).await,
-            Disk::Remote(remote_disk) => remote_disk.walk_dir(opts).await,
+            Disk::Local(local_disk) => local_disk.walk_dir(opts, wr).await,
+            Disk::Remote(remote_disk) => remote_disk.walk_dir(opts, wr).await,
         }
     }
 
@@ -405,7 +406,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn delete_volume(&self, volume: &str) -> Result<()>;
 
     // 并发边读边写 TODO: wr io.Writer
-    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>>;
+    async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>>;
 
     // Metadata operations
     async fn delete_version(
@@ -602,10 +603,10 @@ pub struct MetaCacheEntry {
     pub metadata: Vec<u8>,
 
     // cached contains the metadata if decoded.
-    cached: Option<FileMeta>,
+    pub cached: Option<FileMeta>,
 
     // Indicates the entry can be reused and only one reference to metadata is expected.
-    _reusable: bool,
+    pub reusable: bool,
 }
 
 impl MetaCacheEntry {
@@ -619,6 +620,7 @@ impl MetaCacheEntry {
 
         Ok(wr)
     }
+
     pub fn is_dir(&self) -> bool {
         self.metadata.is_empty() && self.name.ends_with('/')
     }
@@ -841,7 +843,7 @@ impl MetaCacheEntries {
                 meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver,
                 ..Default::default()
             }),
-            _reusable: true,
+            reusable: true,
             ..Default::default()
         });
 

@@ -13,6 +13,8 @@ mod file_meta;
 pub mod file_meta_inline;
 pub mod global;
 pub mod heal;
+pub mod io;
+pub mod metacache;
 pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod peer;
