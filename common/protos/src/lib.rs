@@ -1,4 +1,6 @@
+#[allow(unsafe_code)]
 mod generated;
+
 use std::{error::Error, time::Duration};
 
 use common::globals::GLOBAL_Conn_Map;

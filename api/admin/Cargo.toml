@@ -6,6 +6,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 axum.workspace = true
 mime.workspace = true

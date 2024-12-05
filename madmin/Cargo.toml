@@ -6,6 +6,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 chrono.workspace = true
 common.workspace = true

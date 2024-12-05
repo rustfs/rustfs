@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used)]
+
 mod encdec;
 mod error;
 mod jwt;
