@@ -12,6 +12,7 @@ use tokio::{
 use crate::{
     disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions},
     error::{Error, Result},
+    io::Writer,
 };
 
 type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
@@ -77,16 +78,19 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 match disk
                     .as_ref()
                     .unwrap()
-                    .walk_dir(WalkDirOptions {
-                        bucket: opts_clone.bucket.clone(),
-                        base_dir: opts_clone.path.clone(),
-                        recursive: opts_clone.recursice,
-                        report_notfound: opts_clone.report_not_found,
-                        filter_prefix: opts_clone.filter_prefix.clone(),
-                        forward_to: opts_clone.forward_to.clone(),
-                        limit: opts_clone.per_disk_limit,
-                        ..Default::default()
-                    })
+                    .walk_dir(
+                        WalkDirOptions {
+                            bucket: opts_clone.bucket.clone(),
+                            base_dir: opts_clone.path.clone(),
+                            recursive: opts_clone.recursice,
+                            report_notfound: opts_clone.report_not_found,
+                            filter_prefix: opts_clone.filter_prefix.clone(),
+                            forward_to: opts_clone.forward_to.clone(),
+                            limit: opts_clone.per_disk_limit,
+                            ..Default::default()
+                        },
+                        Writer::NotUse,
+                    )
                     .await
                 {
                     Ok(r) => {
@@ -115,16 +119,19 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 match disk
                     .as_ref()
                     .unwrap()
-                    .walk_dir(WalkDirOptions {
-                        bucket: opts_clone.bucket.clone(),
-                        base_dir: opts_clone.path.clone(),
-                        recursive: opts_clone.recursice,
-                        report_notfound: opts_clone.report_not_found,
-                        filter_prefix: opts_clone.filter_prefix.clone(),
-                        forward_to: opts_clone.forward_to.clone(),
-                        limit: opts_clone.per_disk_limit,
-                        ..Default::default()
-                    })
+                    .walk_dir(
+                        WalkDirOptions {
+                            bucket: opts_clone.bucket.clone(),
+                            base_dir: opts_clone.path.clone(),
+                            recursive: opts_clone.recursice,
+                            report_notfound: opts_clone.report_not_found,
+                            filter_prefix: opts_clone.filter_prefix.clone(),
+                            forward_to: opts_clone.forward_to.clone(),
+                            limit: opts_clone.per_disk_limit,
+                            ..Default::default()
+                        },
+                        Writer::NotUse,
+                    )
                     .await
                 {
                     Ok(r) => {

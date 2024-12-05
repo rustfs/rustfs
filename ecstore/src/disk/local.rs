@@ -1291,9 +1291,17 @@ impl DiskAPI for LocalDisk {
         Ok(entries)
     }
 
-    // TODO: io.writer
-    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
+    // FIXME: TODO: io.writer
+    async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>> {
         // warn!("walk_dir opts {:?}", &opts);
+
+        let volume_dir = self.get_bucket_path(&opts.bucket)?;
+
+        if !skip_access_checks(&opts.bucket) {
+            if let Err(e) = access(&volume_dir).await {
+                return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
+            }
+        }
 
         let mut metas = Vec::new();
 
