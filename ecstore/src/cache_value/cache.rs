@@ -1,3 +1,5 @@
+#![allow(unsafe_code)] // TODO: audit unsafe code
+
 use std::{
     fmt::Debug,
     future::Future,

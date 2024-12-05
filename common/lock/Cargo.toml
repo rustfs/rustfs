@@ -3,6 +3,9 @@ name = "lock"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait.workspace = true
 backon.workspace = true
