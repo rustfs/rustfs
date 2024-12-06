@@ -591,7 +591,7 @@ pub struct MetadataResolutionParams {
     pub candidates: Vec<Vec<FileMetaShallowVersion>>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct MetaCacheEntry {
     // name is the full name of the object including prefixes
     pub name: String,

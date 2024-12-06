@@ -1,30 +1,23 @@
-use std::io::ErrorKind;
-use std::io::Read;
-use std::io::Write;
-use std::str::from_utf8;
-
 use crate::disk::MetaCacheEntry;
 use crate::error::Error;
 use crate::error::Result;
+use std::io::Read;
+use std::io::Write;
+use std::str::from_utf8;
 
 const METACACHE_STREAM_VERSION: u8 = 2;
 
 pub struct MetacacheWriter<W> {
     wr: W,
-    buf: Vec<u8>,
     created: bool,
 }
 
-impl<W: Write + Unpin> MetacacheWriter<W> {
-    pub fn new(wr: W, block_size: usize) -> Self {
-        Self {
-            wr,
-            buf: Vec::with_capacity(block_size),
-            created: false,
-        }
+impl<W: Write> MetacacheWriter<W> {
+    pub fn new(wr: W) -> Self {
+        Self { wr, created: false }
     }
 
-    async fn write(&mut self, objs: &[MetaCacheEntry]) -> Result<()> {
+    pub fn write(&mut self, objs: &[MetaCacheEntry]) -> Result<()> {
         if objs.is_empty() {
             return Ok(());
         }
@@ -49,9 +42,8 @@ impl<W: Write + Unpin> MetacacheWriter<W> {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    pub fn close(&mut self) -> Result<()> {
         rmp::encode::write_bool(&mut self.wr, false)?;
-
         self.wr.flush()?;
         Ok(())
     }
@@ -74,8 +66,15 @@ impl<R: Read> MetacacheReader<R> {
         }
     }
 
-    pub fn check_init(&mut self) {
+    fn check_init(&mut self) {
         if !self.init {
+            // let mut buf = match self.read_buf(1).await {
+            //     Ok(res) => res,
+            //     Err(err) => {
+            //         self.err = Some(Error::msg(err.to_string()));
+            //         return;
+            //     }
+            // };
             let ver = match rmp::decode::read_u8(&mut self.rd) {
                 Ok(res) => res,
                 Err(err) => {
@@ -94,7 +93,7 @@ impl<R: Read> MetacacheReader<R> {
         }
     }
 
-    pub fn peek(&mut self) -> Result<MetaCacheEntry> {
+    pub fn peek(&mut self) -> Result<Option<MetaCacheEntry>> {
         self.check_init();
 
         if let Some(err) = &self.err {
@@ -104,8 +103,7 @@ impl<R: Read> MetacacheReader<R> {
         match rmp::decode::read_bool(&mut self.rd) {
             Ok(res) => {
                 if !res {
-                    self.err = Some(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
-                    return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
+                    return Ok(None);
                 }
             }
             Err(err) => {
@@ -158,49 +156,64 @@ impl<R: Read> MetacacheReader<R> {
 
         let metadata = self.buf.clone();
 
-        Ok(MetaCacheEntry {
+        Ok(Some(MetaCacheEntry {
             name,
             metadata,
             cached: None,
             reusable: false,
-        })
+        }))
+    }
+
+    pub fn read_all(&mut self) -> Result<Vec<MetaCacheEntry>> {
+        let mut ret = Vec::new();
+
+        loop {
+            if let Some(entry) = self.peek()? {
+                ret.push(entry);
+                continue;
+            }
+
+            break;
+        }
+
+        Ok(ret)
     }
 }
 
 #[tokio::test]
 async fn test_writer() {
-    use std::fs::File;
-    use std::fs::OpenOptions;
+    use crate::io::AsyncToSync;
+    use crate::io::VecAsyncReader;
+    use crate::io::VecAsyncWriter;
 
-    let file_path = "./test_writer.txt";
-    let f = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(file_path)
-        .unwrap();
+    let mut f = VecAsyncWriter::new(Vec::new());
 
-    // let wr = Writer::File(f);
-
-    let mut w = MetacacheWriter::new(f, 1024);
+    let mut w = MetacacheWriter::new(AsyncToSync::new_writer(&mut f));
 
     let mut objs = Vec::new();
     for i in 0..10 {
-        objs.push(MetaCacheEntry {
+        let info = MetaCacheEntry {
             name: format!("item{}", i),
             metadata: vec![0u8, 10],
             cached: None,
             reusable: false,
-        });
+        };
+        println!("old {:?}", &info);
+        objs.push(info);
     }
 
-    w.write(&objs).await.unwrap();
-    w.close().await.unwrap();
+    w.write(&objs).unwrap();
 
-    let nf = File::open(file_path).unwrap();
+    w.close().unwrap();
 
-    let meta = nf.metadata().unwrap();
+    let nf = VecAsyncReader::new(f.get_buffer().to_vec());
 
-    println!("{}", meta.len());
+    let mut r = MetacacheReader::new(AsyncToSync::new_reader(nf));
+    let nobjs = r.read_all().unwrap();
+
+    for info in nobjs.iter() {
+        println!("new {:?}", &info);
+    }
+
+    assert_eq!(objs, nobjs)
 }
