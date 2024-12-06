@@ -19,6 +19,7 @@ use crate::{
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
     heal::{
+        data_scanner::ShouldSleepFn,
         data_usage_cache::{DataUsageCache, DataUsageEntry},
         heal_commands::{HealScanMode, HealingTracker},
     },
@@ -350,11 +351,12 @@ impl DiskAPI for Disk {
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
+        we_sleep: ShouldSleepFn,
     ) -> Result<DataUsageCache> {
         info!("ns_scanner");
         match self {
-            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode).await,
-            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode).await,
+            Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
         }
     }
 
@@ -467,6 +469,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
+        we_sleep: ShouldSleepFn,
     ) -> Result<DataUsageCache>;
     async fn healing(&self) -> Option<HealingTracker>;
 }

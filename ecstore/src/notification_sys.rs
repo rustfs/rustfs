@@ -25,13 +25,13 @@ pub fn get_global_notification_sys() -> Option<&'static NotificationSys> {
 }
 
 pub struct NotificationSys {
-    peer_clients: Vec<Option<PeerRestClient>>,
-    all_peer_clients: Vec<Option<PeerRestClient>>,
+    pub peer_clients: Vec<Option<PeerRestClient>>,
+    pub all_peer_clients: Vec<Option<PeerRestClient>>,
 }
 
 impl NotificationSys {
     pub async fn new(eps: EndpointServerPools) -> Self {
-        let (peer_clients, all_peer_clients) = PeerRestClient::new_clients(eps).await;
+        let (peer_clients, all_peer_clients) = PeerRestClient::new_clients(&eps).await;
         Self {
             peer_clients,
             all_peer_clients,
