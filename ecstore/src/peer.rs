@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use futures::future::join_all;
+use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use protos::node_service_time_out_client;
 use protos::proto_gen::node_service::{
     DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
@@ -14,8 +15,7 @@ use crate::disk::error::is_all_buckets_not_found;
 use crate::disk::{DiskAPI, DiskStore};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
 use crate::heal::heal_commands::{
-    HealDriveInfo, HealOpts, HealResultItem, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK,
-    HEAL_ITEM_BUCKET,
+    HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET,
 };
 use crate::heal::heal_ops::RUESTFS_RESERVED_BUCKET;
 use crate::quorum::{bucket_op_ignored_errs, reduce_write_quorum_errs};

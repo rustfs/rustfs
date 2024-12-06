@@ -35,7 +35,7 @@ pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct PeerRestClient {
     pub host: XHost,
     pub grid_host: String,
