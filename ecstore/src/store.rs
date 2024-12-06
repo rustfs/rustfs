@@ -12,7 +12,7 @@ use crate::global::{
 };
 use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
-use crate::heal::heal_commands::{HealOpts, HealResultItem, HealScanMode, HEAL_ITEM_METADATA};
+use crate::heal::heal_commands::{HealOpts, HealScanMode, HEAL_ITEM_METADATA};
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
@@ -45,6 +45,7 @@ use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
 use lazy_static::lazy_static;
+use madmin::heal_commands::HealResultItem;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;

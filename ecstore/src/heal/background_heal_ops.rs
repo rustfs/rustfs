@@ -1,3 +1,4 @@
+use madmin::heal_commands::HealResultItem;
 use std::{cmp::Ordering, env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{
@@ -10,7 +11,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use super::{
-    heal_commands::{HealOpts, HealResultItem},
+    heal_commands::HealOpts,
     heal_ops::{new_bg_heal_sequence, HealSequence},
 };
 use crate::heal::error::ERR_RETRY_HEALING;

@@ -50,6 +50,7 @@ hyper-util = { version = "0.1.10", features = [
 ] }
 http = "1.1.0"
 http-body = "1.0.1"
+humantime = "2.1.0"
 lock = { path = "./common/lock" }
 lazy_static = "1.5.0"
 mime = "0.3.17"

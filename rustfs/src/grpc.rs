@@ -1349,7 +1349,7 @@ impl Node for NodeService {
                                 }
                             }
                         });
-                        let data_usage_cache = disk.ns_scanner(&cache, updates_tx, request.scan_mode as usize).await;
+                        let data_usage_cache = disk.ns_scanner(&cache, updates_tx, request.scan_mode as usize, None).await;
                         let _ = task.await;
                         match data_usage_cache {
                             Ok(data_usage_cache) => {
