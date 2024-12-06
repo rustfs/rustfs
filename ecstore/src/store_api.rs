@@ -9,6 +9,7 @@ use crate::{
 use futures::StreamExt;
 use http::HeaderMap;
 use madmin::heal_commands::HealResultItem;
+use madmin::info_commands::DiskMetrics;
 use rmp_serde::Serializer;
 use s3s::{dto::StreamingBlob, Body};
 use serde::{Deserialize, Serialize};

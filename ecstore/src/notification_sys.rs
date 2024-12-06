@@ -32,7 +32,7 @@ pub struct NotificationSys {
 
 impl NotificationSys {
     pub async fn new(eps: EndpointServerPools) -> Self {
-        let (peer_clients, all_peer_clients) = PeerRestClient::new_clients(eps).await;
+        let (peer_clients, all_peer_clients) = PeerRestClient::new_clients(&eps).await;
         Self {
             peer_clients,
             all_peer_clients,
@@ -46,9 +46,7 @@ pub struct NotificationPeerErr {
 }
 
 impl NotificationSys {
-    pub fn rest_client_from_hash(&self, s:&str) ->Option<PeerRestClient>{
-        
-
+    pub fn rest_client_from_hash(&self, s: &str) -> Option<PeerRestClient> {
         None
     }
     pub async fn delete_policy(&self) -> Vec<NotificationPeerErr> {

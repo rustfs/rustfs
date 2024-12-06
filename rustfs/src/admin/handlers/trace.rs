@@ -4,6 +4,7 @@ use hyper::Uri;
 use madmin::service_commands::ServiceTraceOpts;
 use matchit::Params;
 use s3s::{s3_error, Body, S3Request, S3Response, S3Result};
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::admin::router::Operation;
@@ -24,11 +25,11 @@ impl Operation for Trace {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle Trace");
 
-        let _trace_opts = extract_trace_options(&req.uri)?;
+        let trace_opts = extract_trace_options(&req.uri)?;
 
         // let (tx, rx) = mpsc::channel(10000);
-        let _perrs = match GLOBAL_Endpoints.get() {
-            Some(ep) => PeerRestClient::new_clients(ep.clone()).await,
+        let perrs = match GLOBAL_Endpoints.get() {
+            Some(ep) => PeerRestClient::new_clients(ep).await,
             None => (Vec::new(), Vec::new()),
         };
         return Err(s3_error!(NotImplemented));
