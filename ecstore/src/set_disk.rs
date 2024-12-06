@@ -30,8 +30,8 @@ use crate::{
         data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT},
         data_usage_cache::{DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo},
         heal_commands::{
-            HealDriveInfo, HealOpts, HealResultItem, HealScanMode, HealingTracker, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING,
-            DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_DEEP_SCAN, HEAL_ITEM_OBJECT, HEAL_NORMAL_SCAN,
+            HealOpts, HealScanMode, HealingTracker, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE,
+            DRIVE_STATE_OK, HEAL_DEEP_SCAN, HEAL_ITEM_OBJECT, HEAL_NORMAL_SCAN,
         },
         heal_ops::BG_HEALING_UUID,
     },
@@ -67,6 +67,7 @@ use lock::{
     namespace_lock::{new_nslock, NsLockMap},
     LockApi,
 };
+use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rand::{
     thread_rng,
     {seq::SliceRandom, Rng},
@@ -2816,7 +2817,7 @@ impl SetDisks {
                             });
                             // Calc usage
                             let before = cache.info.last_update;
-                            let cache = match disk.clone().ns_scanner(&cache, tx, heal_scan_mode).await {
+                            let cache = match disk.clone().ns_scanner(&cache, tx, heal_scan_mode, None).await {
                                 Ok(cache) => cache,
                                 Err(_) => {
                                     if cache.info.last_update > before {

@@ -25,6 +25,7 @@ use crate::{
     disk::error::DiskError,
     error::{Error, Result},
     heal::{
+        data_scanner::ShouldSleepFn,
         data_usage_cache::{DataUsageCache, DataUsageEntry},
         heal_commands::{HealScanMode, HealingTracker},
     },
@@ -759,6 +760,7 @@ impl DiskAPI for RemoteDisk {
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
+        _we_sleep: ShouldSleepFn,
     ) -> Result<DataUsageCache> {
         info!("ns_scanner");
         let cache = serde_json::to_string(cache)?;

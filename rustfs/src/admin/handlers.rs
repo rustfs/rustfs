@@ -15,13 +15,13 @@ use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::StorageAPI;
 use ecstore::utils::path::path_join;
-use ecstore::utils::time::parse_duration;
 use ecstore::utils::xml;
 use ecstore::GLOBAL_Endpoints;
 use futures::{Stream, StreamExt};
 use http::Uri;
 use hyper::StatusCode;
 use madmin::metrics::RealtimeMetrics;
+use madmin::utils::parse_duration;
 use matchit::Params;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{
@@ -45,6 +45,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 pub mod service_account;
+pub mod trace;
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "PascalCase", default)]
@@ -370,8 +371,8 @@ impl Operation for MetricsHandler {
         info!("mp: {:?}", mp);
 
         let tick = match parse_duration(&mp.tick) {
-            Some(i) => i,
-            None => std_Duration::from_secs(1),
+            Ok(i) => i,
+            Err(_) => std_Duration::from_secs(1),
         };
 
         let mut n = mp.n;

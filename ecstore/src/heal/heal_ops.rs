@@ -2,19 +2,14 @@ use super::{
     background_heal_ops::HealTask,
     data_scanner::HEAL_DELETE_DANGLING,
     error::ERR_SKIP_FILE,
-    heal_commands::{
-        HealItemType, HealOpts, HealResultItem, HealScanMode, HealStopSuccess, HealingTracker, HEAL_ITEM_BUCKET_METADATA,
-    },
+    heal_commands::{HealOpts, HealScanMode, HealStopSuccess, HealingDisk, HealingTracker, HEAL_ITEM_BUCKET_METADATA},
 };
 use crate::store_api::StorageAPI;
 use crate::{
     config::common::CONFIG_PREFIX,
     disk::RUSTFS_META_BUCKET,
     global::GLOBAL_BackgroundHealRoutine,
-    heal::{
-        error::ERR_HEAL_STOP_SIGNALLED,
-        heal_commands::{HealDriveInfo, DRIVE_STATE_OK},
-    },
+    heal::{error::ERR_HEAL_STOP_SIGNALLED, heal_commands::DRIVE_STATE_OK},
 };
 use crate::{
     disk::{endpoint::Endpoint, MetaCacheEntry},
@@ -32,6 +27,7 @@ use crate::{
 use chrono::Utc;
 use futures::join;
 use lazy_static::lazy_static;
+use madmin::heal_commands::{HealDriveInfo, HealItemType, HealResultItem};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,

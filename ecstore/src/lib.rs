@@ -18,7 +18,7 @@ pub mod metacache;
 pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod peer;
-mod peer_rest_client;
+pub mod peer_rest_client;
 pub mod pools;
 mod quorum;
 pub mod set_disk;
