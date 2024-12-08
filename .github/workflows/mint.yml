@@ -38,6 +38,9 @@ jobs:
         uses: actions-rs/toolchain@v1.0.6
         with:
           toolchain: stable
+
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
   
       - name: cargo build & release
         run: cargo build --release
