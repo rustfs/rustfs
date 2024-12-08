@@ -54,12 +54,10 @@ jobs:
 
       - name: run mint test task
         run: |
-          docker run -itd -e SERVER_ENDPOINT=localhost:9000 \
+          ps aux | grep rustfs
+          docker run -e SERVER_ENDPOINT=localhost:9000 \
             -e ACCESS_KEY=rustfsadmin \
             -e SECRET_KEY=rustfsadmin \
             -e ENABLE_HTTPS=1 \
-            -v /tmp/logs:/mint/log \
             minio/mint
-          ls -l /tmp/logs
-          
-        
+  
