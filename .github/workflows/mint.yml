@@ -42,6 +42,6 @@ jobs:
       - name: cargo build & release
         run: cargo build --release
 
-    - name: run this rustfs server
-      run: ./target/release/rustfs --help
+      - name: run this rustfs server
+        run: ./target/release/rustfs --help
         
