@@ -44,13 +44,13 @@ jobs:
 
       - name: run this rustfs server
         run: |
-          mkdir -p /data/rustfs
+          mkdir -p data/rustfs
           nohub ./target/release/rustfs \
             --address 0.0.0.0:9000 \
             --access-key rustfsadmin \
             --secret-key rustfsadmin \
             --domain-name localhost:9000 \
-            /data/rustfs &
+            data/rustfs &
 
       - name: run mint test task
         run: |
