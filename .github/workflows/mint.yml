@@ -44,14 +44,22 @@ jobs:
 
       - name: run this rustfs server
         run: |
-          # RUSTFS_ROOT_USER=rustfsadmin
-          # RUSTFS_ROOT_PASSWORD=rustfsadmin
-          RUSTFS_VOLUMES="/data/rustfs"
-          RUSTFS_OPTS="--address 0.0.0.0:9001"
-          mkdir ${RUSTFS_VOLUMES}
-          nohub ./target/release/rustfs ${RUSTFS_OPTS} ${RUSTFS_VOLUMES} &
+          mkdir -p /data/rustfs
+          nohub ./target/release/rustfs \
+            --address 0.0.0.0:9000 \
+            --access-key rustfsadmin \
+            --secret-key rustfsadmin \
+            --domain-name localhost:9000 \
+            /data/rustfs &
 
       - name: run mint test task
         run: |
-          docker run -e SERVER_ENDPOINT=localhost:9001 minio/mint
+          docker run -itd -e SERVER_ENDPOINT=localhost:9000 \
+            -e ACCESS_KEY=rustfsadmin \
+            -e SECRET_KEY=rustfsadmin \
+            -e ENABLE_HTTPS=1 \
+            -v /tmp/logs:/mint/log \
+            minio/mint
+          ls -l /tmp/logs
+          
         
