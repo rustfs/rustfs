@@ -15,9 +15,44 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - name: craete dir
-        run: mkdir -p data/rustfs
-      - name: test docker mint
+      - name: install protoc
+        run: |
+          wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip
+          unzip protoc-27.0-linux-x86_64.zip -d protoc3
+          mv protoc3/bin/* /usr/local/bin/
+          chmod +x /usr/local/bin/protoc
+          rm -rf protoc-27.0-linux-x86_64.zip protoc3
+  
+      - name: install flatc
+        run: |
+          wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
+          unzip Linux.flatc.binary.g++-13.zip
+          mv flatc /usr/local/bin/ 
+          chmod +x /usr/local/bin/flatc 
+          rm -rf Linux.flatc.binary.g++-13.zip
+  
+      - name: checkout source code
+        uses: actions/checkout@v4
+  
+      - name: rust-toolchain
+        uses: actions-rs/toolchain@v1.0.6
+        with:
+          toolchain: stable
+  
+      - name: cargo build & release
+        run: cargo build --release
+
+      - name: run this rustfs server
+        run: |
+          mkdir -p data/rustfs
+          nohup ./target/release/rustfs \
+            --address 0.0.0.0:9000 \
+            --access-key rustfsadmin \
+            --secret-key rustfsadmin \
+            --domain-name localhost:9000 \
+            data/rustfs &
+
+      - name: run mint test task
         run: |
           docker run -itd -e SERVER_ENDPOINT=localhost:9000 \
             -e ACCESS_KEY=rustfsadmin \
@@ -26,52 +61,5 @@ jobs:
             -v /tmp/logs:/mint/log \
             minio/mint
           ls -l /tmp/logs
-          
-      # - name: install protoc
-      #   run: |
-      #     wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip
-      #     unzip protoc-27.0-linux-x86_64.zip -d protoc3
-      #     mv protoc3/bin/* /usr/local/bin/
-      #     chmod +x /usr/local/bin/protoc
-      #     rm -rf protoc-27.0-linux-x86_64.zip protoc3
-  
-      # - name: install flatc
-      #   run: |
-      #     wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
-      #     unzip Linux.flatc.binary.g++-13.zip
-      #     mv flatc /usr/local/bin/ 
-      #     chmod +x /usr/local/bin/flatc 
-      #     rm -rf Linux.flatc.binary.g++-13.zip
-  
-      # - name: checkout source code
-      #   uses: actions/checkout@v4
-  
-      # - name: rust-toolchain
-      #   uses: actions-rs/toolchain@v1.0.6
-      #   with:
-      #     toolchain: stable
-  
-      # - name: cargo build & release
-      #   run: cargo build --release
-
-      # - name: run this rustfs server
-      #   run: |
-      #     mkdir -p data/rustfs
-      #     nohub ./target/release/rustfs \
-      #       --address 0.0.0.0:9000 \
-      #       --access-key rustfsadmin \
-      #       --secret-key rustfsadmin \
-      #       --domain-name localhost:9000 \
-      #       data/rustfs &
-
-      # - name: run mint test task
-      #   run: |
-      #     docker run -itd -e SERVER_ENDPOINT=localhost:9000 \
-      #       -e ACCESS_KEY=rustfsadmin \
-      #       -e SECRET_KEY=rustfsadmin \
-      #       -e ENABLE_HTTPS=1 \
-      #       -v /tmp/logs:/mint/log \
-      #       minio/mint
-      #     ls -l /tmp/logs
           
         
