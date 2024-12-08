@@ -43,5 +43,15 @@ jobs:
         run: cargo build --release
 
       - name: run this rustfs server
-        run: ./target/release/rustfs --help
+        run: |
+          # RUSTFS_ROOT_USER=rustfsadmin
+          # RUSTFS_ROOT_PASSWORD=rustfsadmin
+          RUSTFS_VOLUMES="/data/rustfs"
+          RUSTFS_OPTS="--address 0.0.0.0:9001"
+          mkdir ${RUSTFS_VOLUMES}
+          nohub ./target/release/rustfs ${RUSTFS_OPTS} ${RUSTFS_VOLUMES} &
+
+      - name: run mint test task
+        run: |
+          docker run -e SERVER_ENDPOINT=localhost:9001 minio/mint
         
