@@ -130,7 +130,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ReadAllRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
         });
@@ -152,7 +152,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(WriteAllRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             data,
@@ -174,7 +174,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(DeleteRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             options,
@@ -196,7 +196,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(VerifyFileRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             file_info,
@@ -220,7 +220,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(CheckPartsRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             file_info,
@@ -243,7 +243,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(RenamePartRequst {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             src_volume: src_volume.to_string(),
             src_path: src_path.to_string(),
             dst_volume: dst_volume.to_string(),
@@ -265,7 +265,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(RenameFileRequst {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             src_volume: src_volume.to_string(),
             src_path: src_path.to_string(),
             dst_volume: dst_volume.to_string(),
@@ -285,7 +285,7 @@ impl DiskAPI for RemoteDisk {
         info!("create_file");
         Ok(FileWriter::Remote(
             RemoteFileWriter::new(
-                self.root.clone(),
+                self.endpoint.clone(),
                 volume.to_string(),
                 path.to_string(),
                 false,
@@ -301,7 +301,7 @@ impl DiskAPI for RemoteDisk {
         info!("append_file");
         Ok(FileWriter::Remote(
             RemoteFileWriter::new(
-                self.root.clone(),
+                self.endpoint.clone(),
                 volume.to_string(),
                 path.to_string(),
                 true,
@@ -317,7 +317,7 @@ impl DiskAPI for RemoteDisk {
         info!("read_file");
         Ok(FileReader::Remote(
             RemoteFileReader::new(
-                self.root.clone(),
+                self.endpoint.clone(),
                 volume.to_string(),
                 path.to_string(),
                 node_service_time_out_client(&self.addr)
@@ -334,7 +334,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ListDirRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
         });
 
@@ -354,7 +354,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(WalkDirRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             walk_dir_options,
         });
 
@@ -387,7 +387,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(RenameDataRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             src_volume: src_volume.to_string(),
             src_path: src_path.to_string(),
             file_info,
@@ -412,7 +412,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(MakeVolumesRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
         });
 
@@ -431,7 +431,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(MakeVolumeRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
         });
 
@@ -450,7 +450,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ListVolumesRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
         });
 
         let response = client.list_volumes(request).await?.into_inner();
@@ -474,7 +474,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(StatVolumeRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
         });
 
@@ -496,7 +496,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(DeletePathsRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             paths,
         });
@@ -518,7 +518,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(UpdateMetadataRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             file_info,
@@ -541,7 +541,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(WriteMetadataRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             file_info,
@@ -570,7 +570,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ReadVersionRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             version_id: version_id.to_string(),
@@ -594,7 +594,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ReadXlRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             read_data,
@@ -626,7 +626,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(DeleteVersionRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
             file_info,
@@ -660,7 +660,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(DeleteVersionsRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             versions: versions_str,
             opts,
@@ -695,7 +695,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ReadMultipleRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             read_multiple_req,
         });
 
@@ -720,7 +720,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(DeleteVolumeRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: volume.to_string(),
         });
 
@@ -740,7 +740,7 @@ impl DiskAPI for RemoteDisk {
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(DiskInfoRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             opts,
         });
 
@@ -772,7 +772,7 @@ impl DiskAPI for RemoteDisk {
         let in_stream = ReceiverStream::new(rx);
         let mut response = client.ns_scanner(in_stream).await?.into_inner();
         let request = NsScannerRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             cache,
             scan_mode: scan_mode as u64,
         };
