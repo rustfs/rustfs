@@ -4,17 +4,35 @@ use crate::error::Result;
 use std::io::Read;
 use std::io::Write;
 use std::str::from_utf8;
+// use std::sync::Arc;
+// use tokio::sync::mpsc;
+// use tokio::sync::mpsc::Sender;
+// use tokio::task;
 
 const METACACHE_STREAM_VERSION: u8 = 2;
 
+#[derive(Debug)]
 pub struct MetacacheWriter<W> {
     wr: W,
     created: bool,
+    // err: Option<Error>,
 }
 
 impl<W: Write> MetacacheWriter<W> {
     pub fn new(wr: W) -> Self {
-        Self { wr, created: false }
+        Self {
+            wr,
+            created: false,
+            // err: None,
+        }
+    }
+
+    pub fn init(&mut self) -> Result<()> {
+        if !self.created {
+            rmp::encode::write_u8(&mut self.wr, METACACHE_STREAM_VERSION)?;
+            self.created = true;
+        }
+        Ok(())
     }
 
     pub fn write(&mut self, objs: &[MetaCacheEntry]) -> Result<()> {
@@ -22,25 +40,61 @@ impl<W: Write> MetacacheWriter<W> {
             return Ok(());
         }
 
-        if !self.created {
-            rmp::encode::write_u8(&mut self.wr, METACACHE_STREAM_VERSION)?;
-            self.created = false;
-        }
+        self.init()?;
 
         for obj in objs.iter() {
             if obj.name.is_empty() {
                 return Err(Error::msg("metacacheWriter: no name"));
             }
 
-            rmp::encode::write_bool(&mut self.wr, true)?;
-
-            rmp::encode::write_str(&mut self.wr, &obj.name)?;
-
-            rmp::encode::write_bin(&mut self.wr, &obj.metadata)?;
+            self.write_obj(obj)?;
         }
 
         Ok(())
     }
+
+    pub fn write_obj(&mut self, obj: &MetaCacheEntry) -> Result<()> {
+        self.init()?;
+        rmp::encode::write_bool(&mut self.wr, true)?;
+
+        rmp::encode::write_str(&mut self.wr, &obj.name)?;
+
+        rmp::encode::write_bin(&mut self.wr, &obj.metadata)?;
+        Ok(())
+    }
+
+    // pub async fn stream(&mut self) -> Result<Sender<MetaCacheEntry>> {
+    //     let (sender, mut receiver) = mpsc::channel::<MetaCacheEntry>(100);
+
+    //     let wr = Arc::new(self);
+
+    //     task::spawn(async move {
+    //         while let Some(obj) = receiver.recv().await {
+    //             // if obj.name.is_empty() || self.err.is_some() {
+    //             //     continue;
+    //             // }
+
+    //             let _ = wr.write_obj(&obj);
+
+    //             // if let Err(err) = rmp::encode::write_bool(&mut self.wr, true) {
+    //             //     self.err = Some(Error::new(err));
+    //             //     continue;
+    //             // }
+
+    //             // if let Err(err) = rmp::encode::write_str(&mut self.wr, &obj.name) {
+    //             //     self.err = Some(Error::new(err));
+    //             //     continue;
+    //             // }
+
+    //             // if let Err(err) = rmp::encode::write_bin(&mut self.wr, &obj.metadata) {
+    //             //     self.err = Some(Error::new(err));
+    //             //     continue;
+    //             // }
+    //         }
+    //     });
+
+    //     Ok(sender)
+    // }
 
     pub fn close(&mut self) -> Result<()> {
         rmp::encode::write_bool(&mut self.wr, false)?;
