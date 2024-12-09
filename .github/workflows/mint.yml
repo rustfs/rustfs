@@ -61,6 +61,6 @@ jobs:
           docker run -e SERVER_ENDPOINT=localhost:9000 \
             -e ACCESS_KEY=rustfsadmin \
             -e SECRET_KEY=rustfsadmin \
-            -e ENABLE_HTTPS=1 \
+            -e ENABLE_HTTPS=0 \
             minio/mint
   
