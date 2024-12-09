@@ -2,7 +2,7 @@ use super::{
     background_heal_ops::HealTask,
     data_scanner::HEAL_DELETE_DANGLING,
     error::ERR_SKIP_FILE,
-    heal_commands::{HealOpts, HealScanMode, HealStopSuccess, HealingDisk, HealingTracker, HEAL_ITEM_BUCKET_METADATA},
+    heal_commands::{HealOpts, HealScanMode, HealStopSuccess, HealingTracker, HEAL_ITEM_BUCKET_METADATA},
 };
 use crate::store_api::StorageAPI;
 use crate::{
