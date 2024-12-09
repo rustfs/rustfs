@@ -19,7 +19,7 @@ use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
-use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, SizeSummary};
+use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, ShouldSleepFn, SizeSummary};
 use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
@@ -1974,6 +1974,7 @@ impl DiskAPI for LocalDisk {
         cache: &DataUsageCache,
         updates: Sender<DataUsageEntry>,
         scan_mode: HealScanMode,
+        we_sleep: ShouldSleepFn,
     ) -> Result<DataUsageCache> {
         self.scanning.fetch_add(1, Ordering::SeqCst);
         defer!(|| { self.scanning.fetch_sub(1, Ordering::SeqCst) });
@@ -2089,6 +2090,7 @@ impl DiskAPI for LocalDisk {
                 })
             }),
             scan_mode,
+            we_sleep,
         )
         .await?;
         data_usage_info.info.last_update = Some(SystemTime::now());

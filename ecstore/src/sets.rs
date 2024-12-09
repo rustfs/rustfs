@@ -5,6 +5,7 @@ use common::globals::GLOBAL_Local_Node_Name;
 use futures::future::join_all;
 use http::HeaderMap;
 use lock::{namespace_lock::NsLockMap, new_lock_api, LockApi};
+use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -18,8 +19,7 @@ use crate::{
     error::{Error, Result},
     global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     heal::heal_commands::{
-        HealDriveInfo, HealOpts, HealResultItem, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK,
-        HEAL_ITEM_METADATA,
+        HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_METADATA,
     },
     set_disk::SetDisks,
     store_api::{

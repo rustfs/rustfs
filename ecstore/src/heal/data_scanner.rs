@@ -62,7 +62,7 @@ use crate::{
     store_api::{FileInfo, ObjectInfo},
 };
 
-const _DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1); // Time to wait between folders.
+const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1); // Time to wait between folders.
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16; // Visit all folders every n cycles.
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: u64 = 500; // Compact when there are less than this many objects in a branch.
 const DATA_SCANNER_COMPACT_AT_CHILDREN: u64 = 10000; // Compact when there are this many children in a branch.
@@ -73,7 +73,6 @@ const DATA_SCANNER_START_DELAY: Duration = Duration::from_secs(60); // Time to w
 pub const HEAL_DELETE_DANGLING: bool = true;
 const HEAL_OBJECT_SELECT_PROB: u64 = 1024; // Overall probability of a file being scanned; one in n.
 
-// static SCANNER_SLEEPER: () = new_dynamic_sleeper(2, Duration::from_secs(1), true); // Keep defaults same as config defaults
 static SCANNER_CYCLE: AtomicU64 = AtomicU64::new(DATA_SCANNER_START_DELAY.as_secs());
 static _SCANNER_IDLE_MODE: AtomicU32 = AtomicU32::new(0); // default is throttled when idle
 static SCANNER_EXCESS_OBJECT_VERSIONS: AtomicU64 = AtomicU64::new(100);
@@ -81,7 +80,65 @@ static SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE: AtomicU64 = AtomicU64::new(102
 static SCANNER_EXCESS_FOLDERS: AtomicU64 = AtomicU64::new(50_000);
 
 lazy_static! {
+    static ref SCANNER_SLEEPER: RwLock<DynamicSleeper> = RwLock::new(new_dynamic_sleeper(2.0, Duration::from_secs(1), true));
     pub static ref globalHealConfig: Arc<RwLock<Config>> = Arc::new(RwLock::new(Config::default()));
+}
+
+struct DynamicSleeper {
+    factor: f64,
+    max_sleep: Duration,
+    min_sleep: Duration,
+    _is_scanner: bool,
+}
+
+type TimerFn = Pin<Box<dyn Future<Output = ()> + Send>>;
+impl DynamicSleeper {
+    fn timer() -> TimerFn {
+        let t = SystemTime::now();
+        Box::pin(async move {
+            let done_at = SystemTime::now().duration_since(t).unwrap_or_default();
+            SCANNER_SLEEPER.read().await.sleep(done_at).await;
+        })
+    }
+
+    async fn sleep(&self, base: Duration) {
+        let (min_wait, max_wait) = (self.min_sleep, self.max_sleep);
+        let factor = self.factor;
+
+        let want_sleep = {
+            let tmp = base.mul_f64(factor);
+            if tmp < min_wait {
+                return;
+            }
+
+            if max_wait > Duration::from_secs(0) && tmp > max_wait {
+                max_wait
+            } else {
+                tmp
+            }
+        };
+        sleep(want_sleep).await;
+    }
+
+    fn _update(&mut self, factor: f64, max_wait: Duration) -> Result<()> {
+        if (self.factor - factor).abs() < 1e-10 && self.max_sleep == max_wait {
+            return Ok(());
+        }
+
+        self.factor = factor;
+        self.max_sleep = max_wait;
+
+        Ok(())
+    }
+}
+
+fn new_dynamic_sleeper(factor: f64, max_wait: Duration, is_scanner: bool) -> DynamicSleeper {
+    DynamicSleeper {
+        factor,
+        max_sleep: max_wait,
+        min_sleep: Duration::from_micros(100),
+        _is_scanner: is_scanner,
+    }
 }
 
 pub async fn init_data_scanner() {
@@ -457,6 +514,7 @@ struct CachedFolder {
 pub type GetSizeFn =
     Box<dyn Fn(&ScannerItem) -> Pin<Box<dyn Future<Output = Result<SizeSummary>> + Send>> + Send + Sync + 'static>;
 pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+pub type ShouldSleepFn = Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>;
 
 struct FolderScanner {
     root: String,
@@ -474,6 +532,7 @@ struct FolderScanner {
     update_current_path: UpdateCurrentPathFn,
     skip_heal: AtomicBool,
     drive: LocalDrive,
+    we_sleep: ShouldSleepFn,
 }
 
 impl FolderScanner {
@@ -514,6 +573,12 @@ impl FolderScanner {
                 None
             };
 
+            if let Some(should_sleep) = &self.we_sleep {
+                if should_sleep() {
+                    SCANNER_SLEEPER.read().await.sleep(DATA_SCANNER_SLEEP_PER_FOLDER).await;
+                }
+            }
+
             let mut existing_folders = Vec::new();
             let mut new_folders = Vec::new();
             let mut found_objects: bool = false;
@@ -552,6 +617,16 @@ impl FolderScanner {
                         }
                         continue;
                     }
+
+                    let _wait = if let Some(should_sleep) = &self.we_sleep {
+                        if should_sleep() {
+                            DynamicSleeper::timer()
+                        } else {
+                            Box::pin(async {})
+                        }
+                    } else {
+                        Box::pin(async {})
+                    };
 
                     let mut item = ScannerItem {
                         path: Path::new(&self.root).join(&ent_name).to_string_lossy().to_string(),
@@ -1001,6 +1076,7 @@ pub async fn scan_data_folder(
     cache: &DataUsageCache,
     get_size_fn: GetSizeFn,
     heal_scan_mode: HealScanMode,
+    should_sleep: ShouldSleepFn,
 ) -> Result<DataUsageCache> {
     if cache.info.name.is_empty() || cache.info.name == DATA_USAGE_ROOT {
         return Err(Error::from_string("internal error: root scan attempted"));
@@ -1029,6 +1105,7 @@ pub async fn scan_data_folder(
         disks_quorum: disks.len() / 2,
         skip_heal,
         drive: drive.clone(),
+        we_sleep: should_sleep,
     };
 
     if *GLOBAL_IsErasure.read().await || !cache.info.skip_healing {

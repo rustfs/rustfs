@@ -2,12 +2,14 @@ use crate::heal::heal_ops::HealSequence;
 use crate::{
     disk::DiskStore,
     error::{Error, Result},
-    heal::heal_commands::{HealOpts, HealResultItem},
+    heal::heal_commands::HealOpts,
     utils::path::decode_dir_object,
     xhttp,
 };
 use futures::StreamExt;
 use http::HeaderMap;
+use madmin::heal_commands::HealResultItem;
+use madmin::info_commands::DiskMetrics;
 use rmp_serde::Serializer;
 use s3s::{dto::StreamingBlob, Body};
 use serde::{Deserialize, Serialize};
