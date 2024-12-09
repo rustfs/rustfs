@@ -1048,7 +1048,7 @@ type NodeClient = NodeServiceClient<
 
 #[derive(Debug)]
 pub struct RemoteFileWriter {
-    pub root: PathBuf,
+    pub endpoint: Endpoint,
     pub volume: String,
     pub path: String,
     pub is_append: bool,
@@ -1057,7 +1057,13 @@ pub struct RemoteFileWriter {
 }
 
 impl RemoteFileWriter {
-    pub async fn new(root: PathBuf, volume: String, path: String, is_append: bool, mut client: NodeClient) -> Result<Self> {
+    pub async fn new(
+        endpoint: Endpoint,
+        volume: String,
+        path: String,
+        is_append: bool,
+        mut client: NodeClient,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 
@@ -1066,7 +1072,7 @@ impl RemoteFileWriter {
         let resp_stream = response.into_inner();
 
         Ok(Self {
-            root,
+            endpoint,
             volume,
             path,
             is_append,
@@ -1084,7 +1090,7 @@ impl Writer for RemoteFileWriter {
 
     async fn write(&mut self, buf: &[u8]) -> Result<()> {
         let request = WriteRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: self.volume.to_string(),
             path: self.path.to_string(),
             is_append: self.is_append,
@@ -1239,7 +1245,7 @@ impl Reader for LocalFileReader {
 
 #[derive(Debug)]
 pub struct RemoteFileReader {
-    pub root: PathBuf,
+    pub endpoint: Endpoint,
     pub volume: String,
     pub path: String,
     tx: Sender<ReadAtRequest>,
@@ -1247,7 +1253,12 @@ pub struct RemoteFileReader {
 }
 
 impl RemoteFileReader {
-    pub async fn new(root: PathBuf, volume: String, path: String, mut client: NodeClient) -> Result<Self> {
+    pub async fn new(
+        endpoint: Endpoint,
+        volume: String,
+        path: String,
+        mut client: NodeClient,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 
@@ -1256,7 +1267,7 @@ impl RemoteFileReader {
         let resp_stream = response.into_inner();
 
         Ok(Self {
-            root,
+            endpoint,
             volume,
             path,
             tx,
@@ -1269,7 +1280,7 @@ impl RemoteFileReader {
 impl Reader for RemoteFileReader {
     async fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize> {
         let request = ReadAtRequest {
-            disk: self.root.to_string_lossy().to_string(),
+            disk: self.endpoint.to_string(),
             volume: self.volume.to_string(),
             path: self.path.to_string(),
             offset: offset.try_into().unwrap(),
