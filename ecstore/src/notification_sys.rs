@@ -25,8 +25,8 @@ pub fn get_global_notification_sys() -> Option<&'static NotificationSys> {
 }
 
 pub struct NotificationSys {
-    peer_clients: Vec<Option<PeerRestClient>>,
-    all_peer_clients: Vec<Option<PeerRestClient>>,
+    pub peer_clients: Vec<Option<PeerRestClient>>,
+    pub all_peer_clients: Vec<Option<PeerRestClient>>,
 }
 
 impl NotificationSys {

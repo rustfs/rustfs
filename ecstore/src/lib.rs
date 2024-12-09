@@ -14,7 +14,7 @@ pub mod heal;
 pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod peer;
-mod peer_rest_client;
+pub mod peer_rest_client;
 mod quorum;
 pub mod set_disk;
 mod sets;
