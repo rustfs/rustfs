@@ -1059,13 +1059,7 @@ pub struct RemoteFileWriter {
 }
 
 impl RemoteFileWriter {
-    pub async fn new(
-        endpoint: Endpoint,
-        volume: String,
-        path: String,
-        is_append: bool,
-        mut client: NodeClient,
-    ) -> Result<Self> {
+    pub async fn new(endpoint: Endpoint, volume: String, path: String, is_append: bool, mut client: NodeClient) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 
@@ -1255,12 +1249,7 @@ pub struct RemoteFileReader {
 }
 
 impl RemoteFileReader {
-    pub async fn new(
-        endpoint: Endpoint,
-        volume: String,
-        path: String,
-        mut client: NodeClient,
-    ) -> Result<Self> {
+    pub async fn new(endpoint: Endpoint, volume: String, path: String, mut client: NodeClient) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
         let in_stream = ReceiverStream::new(rx);
 
