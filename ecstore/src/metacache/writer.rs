@@ -54,6 +54,8 @@ impl<W: Write> MetacacheWriter<W> {
     }
 
     pub fn write_obj(&mut self, obj: &MetaCacheEntry) -> Result<()> {
+        println!("write_obj {:?}", &obj);
+
         self.init()?;
         rmp::encode::write_bool(&mut self.wr, true)?;
 
