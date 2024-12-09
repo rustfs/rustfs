@@ -6,7 +6,8 @@ use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions,
     FileReader, FileWriter, Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE_BACKUP,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
+    STORAGE_FORMAT_FILE_BACKUP,
 };
 use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::{self};
@@ -739,9 +740,12 @@ impl LocalDisk {
             return Ok(());
         }
 
+        println!("list_dir opts {} {}", &opts.bucket, &opts.base_dir);
+
         let mut entries = match self.list_dir("", &opts.bucket, &opts.base_dir, -1).await {
             Ok(res) => res,
             Err(e) => {
+                println!("list_dir err {:?}", &e);
                 if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
                     info!("list_dir err {:?}", &e);
                 }
@@ -749,9 +753,12 @@ impl LocalDisk {
                 if opts.report_notfound && is_err_file_not_found(&e) {
                     return Err(e);
                 }
+
                 return Ok(());
             }
         };
+
+        println!("list_dir entries {:?}", &entries);
 
         if entries.is_empty() {
             return Ok(());
@@ -861,12 +868,71 @@ impl LocalDisk {
                 }
             }
 
-            if let Some(dir) = dir_objes.get(entry) {
-                //
+            let mut meta = MetaCacheEntry {
+                name,
+                ..Default::default()
+            };
+
+            let mut is_dir_obj = false;
+
+            if let Some(_dir) = dir_objes.get(entry) {
+                is_dir_obj = true;
+                meta.name
+                    .truncate(meta.name.len() - meta.name.chars().last().unwrap().len_utf8());
+                meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
             }
+
+            match self
+                .read_metadata(self.get_object_path(&opts.bucket, format!("{}/{}", &meta.name, FORMAT_CONFIG_FILE).as_str())?)
+                .await
+            {
+                Ok(res) => {
+                    if is_dir_obj {
+                        meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
+                        meta.name.push_str(SLASH_SEPARATOR);
+                    }
+
+                    meta.metadata = res;
+
+                    out.write_obj(&meta)?;
+                    *objs_returned += 1;
+                }
+                Err(err) => {
+                    warn!("scan dir read_metadata err {:?}", err);
+                    if let Some(e) = err.downcast_ref::<std::io::Error>() {
+                        if os_is_not_exist(e) || is_sys_err_is_dir(e) {
+                            // NOT an object, append to stack (with slash)
+                            // If dirObject, but no metadata (which is unexpected) we skip it.
+                            if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
+                                meta.name.push_str(SLASH_SEPARATOR);
+                                dir_stack.push(meta.name);
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+            };
         }
 
-        // FIXME:TODO:
+        while let Some(dir) = dir_stack.pop() {
+            if opts.limit > 0 && *objs_returned >= opts.limit {
+                return Ok(());
+            }
+
+            out.write_obj(&MetaCacheEntry {
+                name: dir.clone(),
+                ..Default::default()
+            })?;
+            *objs_returned += 1;
+
+            if opts.recursive {
+                let mut dir = dir;
+                if let Err(er) = Box::pin(self.scan_dir(&mut dir, opts, out, objs_returned)).await {
+                    warn!("scan_dir err {:?}", &er);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1452,6 +1518,7 @@ impl DiskAPI for LocalDisk {
     }
 
     // FIXME: TODO: io.writer TODO cancel
+    #[tracing::instrument(level = "debug", skip(self, wr))]
     async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>> {
         // warn!("walk_dir opts {:?}", &opts);
 
@@ -2266,6 +2333,9 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
 #[cfg(test)]
 mod test {
 
+    use utils::fs::open_file;
+    use utils::fs::O_RDWR;
+
     use super::*;
 
     #[tokio::test]
@@ -2344,5 +2414,35 @@ mod test {
         disk.delete_volume("a").await.unwrap();
 
         let _ = fs::remove_dir_all(&p).await;
+    }
+
+    #[tokio::test]
+    async fn test_walk_dir() {
+        let ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+        let disk = match LocalDisk::new(&ep, false).await {
+            Ok(res) => res,
+            Err(err) => {
+                println!("LocalDisk::new err {:?}", err);
+                return;
+            }
+        };
+
+        let mut f = match open_file("./testfile.txt", O_CREATE | O_RDWR).await {
+            Ok(res) => res,
+            Err(err) => {
+                println!("openfile err {:?}", err);
+                return;
+            }
+        };
+
+        let opts = WalkDirOptions {
+            bucket: "dada".to_owned(),
+            // base_dir: "dada".to_owned(),
+            recursive: true,
+            ..Default::default()
+        };
+        if let Err(err) = disk.walk_dir(opts, crate::io::Writer::File(f)).await {
+            println!("walk_dir err {:?}", err);
+        }
     }
 }
