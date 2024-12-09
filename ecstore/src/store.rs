@@ -932,20 +932,13 @@ async fn update_scan(
 }
 
 pub async fn find_local_disk(disk_path: &String) -> Option<DiskStore> {
-    let disk_path = match fs::canonicalize(disk_path).await {
-        Ok(disk_path) => disk_path,
-        Err(_) => return None,
-    };
-
     let disk_map = GLOBAL_LOCAL_DISK_MAP.read().await;
 
-    let path = disk_path.to_string_lossy().to_string();
-    if disk_map.contains_key(&path) {
-        let a = disk_map[&path].as_ref().cloned();
-
-        return a;
+    if let Some(disk) = disk_map.get(disk_path) {
+        disk.as_ref().cloned()
+    } else {
+        None
     }
-    None
 }
 
 pub async fn get_disk_via_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
