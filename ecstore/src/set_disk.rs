@@ -178,6 +178,7 @@ impl SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
+    #[allow(clippy::type_complexity)]
     async fn rename_data(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -1630,6 +1631,7 @@ impl SetDisks {
         Ok((fi, parts_metadata, online_disks))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn get_object_with_fileinfo(
         // &self,
         bucket: &str,

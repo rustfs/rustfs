@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use time::OffsetDateTime;
 
-mod cache;
+pub mod cache;
 mod format;
 mod handler;
 
@@ -24,6 +24,38 @@ pub use error::{Error, Result};
 
 static IAM_SYS: OnceLock<Arc<IamCache<ObjectStore>>> = OnceLock::new();
 
+static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
+
+pub fn init_global_action_cred(ak: Option<String>, sk: Option<String>) -> Result<()> {
+    let ak = {
+        if let Some(k) = ak {
+            k
+        } else {
+            utils::gen_access_key(20).unwrap_or_default()
+        }
+    };
+
+    let sk = {
+        if let Some(k) = sk {
+            k
+        } else {
+            utils::gen_secret_key(32).unwrap_or_default()
+        }
+    };
+
+    GLOBAL_ACTIVE_CRED
+        .set(Credentials {
+            access_key: ak,
+            secret_key: sk,
+            ..Default::default()
+        })
+        .map_err(|_e| Error::CredNotInitialized)
+}
+
+pub fn get_global_action_cred() -> Option<Credentials> {
+    GLOBAL_ACTIVE_CRED.get().cloned()
+}
+
 pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> crate::Result<()> {
     debug!("init iam system");
     let s = IamCache::new(ObjectStore::new(ecstore)).await;
@@ -33,7 +65,7 @@ pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> crate::Result<()> {
 
 #[inline]
 pub fn get() -> crate::Result<Arc<IamCache<ObjectStore>>> {
-    IAM_SYS.get().map(|x| Arc::clone(x)).ok_or(Error::IamSysNotInitialized)
+    IAM_SYS.get().map(Arc::clone).ok_or(Error::IamSysNotInitialized)
 }
 
 pub async fn is_allowed<'a>(args: Args<'a>) -> crate::Result<bool> {

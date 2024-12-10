@@ -222,9 +222,9 @@ pub fn split(path: &str) -> (&str, &str) {
     (path, "")
 }
 
-pub fn dir(path: &str) -> &str {
+pub fn dir(path: &str) -> String {
     let (a, _) = split(path);
-    a
+    clean(a)
 }
 #[cfg(test)]
 mod tests {
