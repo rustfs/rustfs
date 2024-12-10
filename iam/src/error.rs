@@ -28,6 +28,15 @@ pub enum Error {
 
     #[error("malformed credential")]
     ErrCredMalformed,
+
+    #[error("CredNotInitialized")]
+    CredNotInitialized,
+
+    #[error("invalid key length")]
+    InvalidAccessKeyLength,
+
+    #[error("jwt err {0}")]
+    JWTError(jsonwebtoken::errors::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

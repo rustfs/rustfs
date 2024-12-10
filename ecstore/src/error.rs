@@ -1,5 +1,6 @@
 use std::io;
 
+use tracing::warn;
 use tracing_error::{SpanTrace, SpanTraceStatus};
 
 use crate::disk::error::{clone_disk_err, DiskError};

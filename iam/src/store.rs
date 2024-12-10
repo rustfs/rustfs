@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{
     auth::UserIdentity,
     cache::Cache,
-    policy::{PolicyDoc, UserType, DEFAULT_POLICIES},
+    policy::{MappedPolicy, PolicyDoc, UserType, DEFAULT_POLICIES},
 };
 
 #[async_trait::async_trait]
@@ -40,4 +40,5 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn load_users(&self, user_type: UserType) -> crate::Result<HashMap<String, UserIdentity>>;
 
     async fn load_policy_docs(&self) -> crate::Result<HashMap<String, PolicyDoc>>;
+    async fn load_mapped_policy(&self, user_type: UserType, name: &str, is_group: bool) -> crate::Result<MappedPolicy>;
 }
