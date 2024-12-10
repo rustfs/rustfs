@@ -1,13 +1,21 @@
+use crate::policy::{Policy, Validator};
+use crate::service_type::ServiceType;
+use crate::{utils, Error};
+use jsonwebtoken::{encode, Algorithm, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::LazyCell;
 use std::collections::HashMap;
 use time::format_description::BorrowedFormatItem;
-use time::{Date, OffsetDateTime};
+use time::{Date, Duration, OffsetDateTime};
 
-use crate::policy::{Policy, Validator};
-use crate::service_type::ServiceType;
-use crate::{utils, Error};
+const ACCESS_KEY_MIN_LEN: usize = 3;
+const ACCESS_KEY_MAX_LEN: usize = 20;
+const SECRET_KEY_MIN_LEN: usize = 8;
+const SECRET_KEY_MAX_LEN: usize = 40;
+
+const ACCOUNT_ON: &str = "on";
+const ACCOUNT_OFF: &str = "off";
 
 #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
 struct CredentialHeader {
@@ -100,6 +108,44 @@ impl Credentials {
     pub fn new(elem: &str) -> crate::Result<Self> {
         let header: CredentialHeader = elem.try_into()?;
         Self::check_key_value(header)
+    }
+
+    pub fn get_new_credentials_with_metadata<T: Serialize>(
+        claims: &T,
+        token_secret: &str,
+        exp: Option<usize>,
+    ) -> crate::Result<Self> {
+        let ak = utils::gen_access_key(20).unwrap_or_default();
+        let sk = utils::gen_secret_key(32).unwrap_or_default();
+
+        Self::create_new_credentials_with_metadata(&ak, &sk, claims, token_secret, exp)
+    }
+
+    pub fn create_new_credentials_with_metadata<T: Serialize>(
+        ak: &str,
+        sk: &str,
+        claims: &T,
+        token_secret: &str,
+        exp: Option<usize>,
+    ) -> crate::Result<Self> {
+        if ak.len() < ACCESS_KEY_MIN_LEN || ak.len() > ACCESS_KEY_MAX_LEN {
+            return Err(Error::InvalidAccessKeyLength);
+        }
+
+        if sk.len() < SECRET_KEY_MIN_LEN || sk.len() > SECRET_KEY_MAX_LEN {
+            return Err(Error::InvalidAccessKeyLength);
+        }
+
+        let token = utils::generate_jwt(claims, token_secret).map_err(Error::JWTError)?;
+
+        Ok(Self {
+            access_key: ak.to_owned(),
+            secret_key: sk.to_owned(),
+            session_token: token,
+            status: ACCOUNT_ON.to_owned(),
+            expiration: exp.map(|v| OffsetDateTime::now_utc().saturating_add(Duration::seconds(v as i64))),
+            ..Default::default()
+        })
     }
 
     pub fn check_key_value(_header: CredentialHeader) -> crate::Result<Self> {

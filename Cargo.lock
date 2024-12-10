@@ -1287,6 +1287,7 @@ dependencies = [
  "futures",
  "ipnetwork",
  "itertools",
+ "jsonwebtoken",
  "log",
  "rand",
  "serde",
@@ -1296,6 +1297,7 @@ dependencies = [
  "thiserror 2.0.3",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2521,6 +2523,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iam",
+ "jsonwebtoken",
  "lazy_static",
  "lock",
  "log",
