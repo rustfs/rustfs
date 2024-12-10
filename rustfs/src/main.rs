@@ -89,7 +89,18 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     debug!("server_address {}", &server_address);
 
-    iam::init_global_action_cred(None, None).unwrap();
+    //设置AK和SK
+    //其中部份内容从config配置文件中读取
+    let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
+    let mut secret_key = String::from_str(config::DEFAULT_SECRET_KEY).unwrap();
+
+    // Enable authentication
+    if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {
+        access_key = ak;
+        secret_key = sk;
+    }
+
+    iam::init_global_action_cred(Some(access_key.clone()), Some(secret_key.clone())).unwrap();
     set_global_rustfs_port(server_port);
 
     //监听地址,端口从参数中获取
@@ -124,16 +135,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         let store = storage::ecfs::FS::new();
         // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(server_address.clone(), endpoint_pools).await?);
         let mut b = S3ServiceBuilder::new(store.clone());
-        //设置AK和SK
-        //其中部份内容从config配置文件中读取
-        let mut access_key = String::from_str(config::DEFAULT_ACCESS_KEY).unwrap();
-        let mut secret_key = String::from_str(config::DEFAULT_SECRET_KEY).unwrap();
 
-        // Enable authentication
-        if let (Some(ak), Some(sk)) = (opt.access_key, opt.secret_key) {
-            access_key = ak;
-            secret_key = sk;
-        }
         //显示info信息
         info!("authentication is enabled {}, {}", &access_key, &secret_key);
         b.set_auth(IAMAuth::new(access_key, secret_key));
