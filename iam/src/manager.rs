@@ -109,11 +109,12 @@ where
     }
 
     // todo, 判断是否存在，是否可以重试
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn save_iam_formatter(self: Arc<Self>) -> crate::Result<()> {
         match self.api.load_iam_config::<Format>(Format::PATH).await {
             Ok((format, _)) if format.version >= 1 => return Ok(()),
             Err(Error::EcstoreError(e)) if !ecstore::disk::error::is_err_file_not_found(&e) => {
-                return Err(Error::EcstoreError(e))
+                return Err(Error::EcstoreError(e));
             }
             _ => {}
         }
@@ -127,13 +128,14 @@ where
         Ok(users
             .values()
             .filter_map(|x| {
-                if !access_key.is_empty() && x.credentials.parent_user.as_str() == access_key {
-                    if x.credentials.is_service_account() {
-                        let mut c = x.credentials.clone();
-                        c.secret_key = String::new();
-                        c.session_token = String::new();
-                        return Some(c);
-                    }
+                if !access_key.is_empty()
+                    && x.credentials.parent_user.as_str() == access_key
+                    && x.credentials.is_service_account()
+                {
+                    let mut c = x.credentials.clone();
+                    c.secret_key = String::new();
+                    c.session_token = String::new();
+                    return Some(c);
                 }
 
                 None
@@ -219,5 +221,45 @@ where
             Some(u) if u.credentials.is_valid() => Ok(Some(u)),
             _ => Ok(None),
         }
+    }
+    pub async fn policy_db_get(&self, name: &str, _groups: Option<Vec<String>>) -> crate::Result<Vec<String>> {
+        // let user = self.cache.users.load();
+        // let Some(u) = user.get(name) else {
+        //     return Err(Error::StringError("no service account".into()));
+        // };
+
+        let policies = self.cache.user_policies.load();
+
+        let user_policies = {
+            if let Some(p) = policies.get(name) {
+                p.to_slice()
+            } else {
+                Vec::new()
+            }
+        };
+
+        // TODO: groups
+
+        Ok(user_policies)
+    }
+
+    pub async fn set_temp_user(&self, _access_key: &str, cred: &Credentials, _policy_name: &str) -> crate::Result<()> {
+        let user_entiry = UserIdentity::from(cred.clone());
+        let path = format!(
+            "config/iam/{}{}/identity.json",
+            UserType::Sts.prefix(),
+            user_entiry.credentials.access_key
+        );
+        debug!("save object: {path:?}");
+        self.api.save_iam_config(&user_entiry, path).await?;
+
+        Cache::add_or_update(
+            &self.cache.users,
+            &user_entiry.credentials.access_key,
+            &user_entiry,
+            OffsetDateTime::now_utc(),
+        );
+
+        Ok(())
     }
 }

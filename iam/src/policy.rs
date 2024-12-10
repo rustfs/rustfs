@@ -17,7 +17,7 @@ pub use id::ID;
 pub use policy::{default::DEFAULT_POLICIES, Policy};
 pub use resource::ResourceSet;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{to_string, Value};
 pub use statement::Statement;
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -36,6 +36,14 @@ impl MappedPolicy {
             policies: policy.to_owned(),
             update_at: OffsetDateTime::now_utc(),
         }
+    }
+
+    pub fn to_slice(&self) -> Vec<String> {
+        self.policies
+            .split(",")
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.to_string())
+            .collect()
     }
 }
 

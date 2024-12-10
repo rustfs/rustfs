@@ -89,7 +89,7 @@ impl Cache {
 
 impl CacheInner {
     #[inline]
-    fn get_user<'a>(&self, user_name: &'a str) -> Option<&UserIdentity> {
+    pub fn get_user<'a>(&self, user_name: &'a str) -> Option<&UserIdentity> {
         self.users.get(user_name).or_else(|| self.sts_accounts.get(user_name))
     }
 
