@@ -67,6 +67,7 @@ atoi = "2.0.0"
 serde_urlencoded = "0.7.1"
 crypto = { path = "../crypto" }
 iam = { path = "../iam" }
+jsonwebtoken = "9.3.0"
 
 [build-dependencies]
 prost-build.workspace = true

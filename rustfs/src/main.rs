@@ -1,8 +1,10 @@
 mod admin;
+mod auth;
 mod config;
 mod grpc;
 mod service;
 mod storage;
+use crate::auth::IAMAuth;
 use clap::Parser;
 use common::{
     error::{Error, Result},
@@ -26,7 +28,7 @@ use hyper_util::{
 };
 use iam::init_iam_sys;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
-use s3s::{auth::SimpleAuth, service::S3ServiceBuilder};
+use s3s::service::S3ServiceBuilder;
 use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
@@ -87,6 +89,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     debug!("server_address {}", &server_address);
 
+    iam::init_global_action_cred(None, None).unwrap();
     set_global_rustfs_port(server_port);
 
     //监听地址,端口从参数中获取
@@ -133,7 +136,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         }
         //显示info信息
         info!("authentication is enabled {}, {}", &access_key, &secret_key);
-        b.set_auth(SimpleAuth::from_single(access_key, secret_key));
+        b.set_auth(IAMAuth::new(access_key, secret_key));
 
         b.set_access(store.clone());
 
@@ -212,6 +215,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     })?;
     warn!(" init store success!");
 
+    init_iam_sys(store.clone()).await.unwrap();
+
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
         error!("new_global_notification_sys faild {:?}", &err);
         Error::from_string(err.to_string())
@@ -221,7 +226,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_data_scanner().await;
     // init auto heal
     init_auto_heal().await;
-    init_iam_sys(store.clone()).await.unwrap();
 
     info!("server was started");
 

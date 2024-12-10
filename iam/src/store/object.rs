@@ -8,8 +8,9 @@ use ecstore::{
     utils::path::dir,
 };
 use futures::future::try_join_all;
-use log::debug;
+use log::{debug, warn};
 use serde::{de::DeserializeOwned, Serialize};
+use tracing::error;
 
 use super::Store;
 use crate::{
@@ -99,14 +100,6 @@ impl ObjectStore {
 
         Ok(Some(user))
     }
-
-    async fn load_mapped_policy(&self, user_type: UserType, name: &str, _is_group: bool) -> crate::Result<MappedPolicy> {
-        let (p, _) = self
-            .load_iam_config::<MappedPolicy>(&format!("{base}{name}.json", base = user_type.prefix(), name = name))
-            .await?;
-
-        Ok(p)
-    }
 }
 
 #[async_trait::async_trait]
@@ -137,6 +130,7 @@ impl Store for ObjectStore {
         ))
     }
 
+    #[tracing::instrument(level = "debug", skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> crate::Result<()> {
         let data = serde_json::to_vec(&item).map_err(|e| crate::Error::StringError(e.to_string()))?;
         // let data = crypto::encrypt_data(&[], &data)?;
@@ -169,8 +163,8 @@ impl Store for ObjectStore {
                 .await?;
 
             if policy_doc.version == 0 {
-                policy_doc.create_date = object_info.mod_time.clone();
-                policy_doc.update_date = object_info.mod_time.clone();
+                policy_doc.create_date = object_info.mod_time;
+                policy_doc.update_date = object_info.mod_time;
             }
 
             result.insert(name.to_str().unwrap().to_owned(), policy_doc);
@@ -219,7 +213,7 @@ impl Store for ObjectStore {
                     "policydb/groups/",
                     "service-accounts/",
                     "policydb/sts-users/",
-                    "sts",
+                    "sts/",
                 ],
             )
             .await?;
@@ -234,12 +228,13 @@ impl Store for ObjectStore {
         );
 
         // 一次读取32个元素
-        let mut iter = items
+        let iter = items
             .iter()
             .map(|item| item.trim_start_matches("config/iam/"))
             .map(|item| split_path(item, item.starts_with("policydb/")))
             .filter_map(|(list_key, trimmed_item)| {
                 debug!("list_key: {list_key}, trimmed_item: {trimmed_item}");
+
                 if list_key == "format.json" {
                     return None;
                 }
@@ -255,13 +250,14 @@ impl Store for ObjectStore {
                 Some(async move {
                     match list_key {
                         "policies/" => {
-                            let name = dir(trimmed_item).trim_end_matches('/');
+                            let trimmed_item = dir(trimmed_item);
+                            let name = trimmed_item.trim_end_matches('/');
                             let policy_doc = self.load_policy(name).await?;
                             policy_docs.lock().await.insert(name.to_owned(), policy_doc);
                         }
                         "users/" => {
                             let name = dir(trimmed_item);
-                            if let Some(user) = self.load_user_identity(UserType::Reg, name).await? {
+                            if let Some(user) = self.load_user_identity(UserType::Reg, &name).await? {
                                 users.lock().await.insert(name.to_owned(), user);
                             };
                         }
@@ -276,7 +272,8 @@ impl Store for ObjectStore {
                             }
                         }
                         "service-accounts/" => {
-                            let name = dir(trimmed_item).trim_end_matches('/');
+                            let trimmed_item = dir(trimmed_item);
+                            let name = trimmed_item.trim_end_matches('/');
                             let Some(user) = self.load_user_identity(UserType::Svc, name).await? else {
                                 return Ok(());
                             };
@@ -299,7 +296,8 @@ impl Store for ObjectStore {
                         }
                         "sts/" => {
                             let name = dir(trimmed_item);
-                            if let Some(user) = self.load_user_identity(UserType::Sts, name).await? {
+                            if let Some(user) = self.load_user_identity(UserType::Sts, &name).await? {
+                                warn!("sts_accounts insert {}, user {:?}", name, &user.credentials.access_key);
                                 sts_accounts.lock().await.insert(name.to_owned(), user);
                             };
                         }
@@ -319,7 +317,7 @@ impl Store for ObjectStore {
 
         let mut all_futures = Vec::with_capacity(32);
 
-        while let Some(f) = iter.next() {
+        for f in iter {
             all_futures.push(f);
 
             if all_futures.len() == 32 {
@@ -332,12 +330,30 @@ impl Store for ObjectStore {
             try_join_all(all_futures).await?;
         }
 
-        Arc::into_inner(users).map(|x| cache.users.store(Arc::new(x.into_inner().update_load_time())));
-        Arc::into_inner(policy_docs).map(|x| cache.policy_docs.store(Arc::new(x.into_inner().update_load_time())));
-        Arc::into_inner(user_policies).map(|x| cache.user_policies.store(Arc::new(x.into_inner().update_load_time())));
-        Arc::into_inner(sts_policies).map(|x| cache.sts_policies.store(Arc::new(x.into_inner().update_load_time())));
-        Arc::into_inner(sts_accounts).map(|x| cache.sts_accounts.store(Arc::new(x.into_inner().update_load_time())));
+        if let Some(x) = Arc::into_inner(users) {
+            cache.users.store(Arc::new(x.into_inner().update_load_time()))
+        }
+
+        if let Some(x) = Arc::into_inner(policy_docs) {
+            cache.policy_docs.store(Arc::new(x.into_inner().update_load_time()))
+        }
+        if let Some(x) = Arc::into_inner(user_policies) {
+            cache.user_policies.store(Arc::new(x.into_inner().update_load_time()))
+        }
+        if let Some(x) = Arc::into_inner(sts_policies) {
+            cache.sts_policies.store(Arc::new(x.into_inner().update_load_time()))
+        }
+        if let Some(x) = Arc::into_inner(sts_accounts) {
+            cache.sts_accounts.store(Arc::new(x.into_inner().update_load_time()))
+        }
 
         Ok(())
+    }
+    async fn load_mapped_policy(&self, user_type: UserType, name: &str, _is_group: bool) -> crate::Result<MappedPolicy> {
+        let (p, _) = self
+            .load_iam_config::<MappedPolicy>(&format!("{base}{name}.json", base = user_type.prefix(), name = name))
+            .await?;
+
+        Ok(p)
     }
 }
