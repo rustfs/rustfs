@@ -1,5 +1,7 @@
 use std::io::{self, ErrorKind};
 
+use tracing::error;
+
 use crate::{
     error::{Error, Result},
     quorum::CheckErrorFn,
