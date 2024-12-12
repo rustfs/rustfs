@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     disk::{
-        error::DiskError,
+        error::{is_unformatted_disk, DiskError},
         format::{DistributionAlgoVersion, FormatV3},
         new_disk, DiskAPI, DiskInfo, DiskOption, DiskStore,
     },
@@ -34,8 +34,8 @@ use crate::{
 use crate::heal::heal_ops::HealSequence;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
 use tracing::warn;
+use tracing::{error, info};
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -56,6 +56,7 @@ pub struct Sets {
 }
 
 impl Sets {
+    #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, partiy_count))]
     pub async fn new(
         disks: Vec<Option<DiskStore>>,
         endpoints: &PoolEndpoints,
@@ -120,7 +121,20 @@ impl Sets {
                     disk = local_disk;
                 }
 
-                if let Some(_disk_id) = disk.as_ref().unwrap().get_disk_id().await? {
+                let has_disk_id = match disk.as_ref().unwrap().get_disk_id().await {
+                    Ok(res) => res,
+                    Err(err) => {
+                        if is_unformatted_disk(&err) {
+                            error!("get_disk_id err {:?}", err);
+                        } else {
+                            warn!("get_disk_id err {:?}", err);
+                        }
+
+                        None
+                    }
+                };
+
+                if let Some(_disk_id) = has_disk_id {
                     set_drive.push(disk);
                 } else {
                     warn!("sets new set_drive {}-{} get_disk_id is none", i, j);
