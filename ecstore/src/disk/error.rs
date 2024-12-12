@@ -265,6 +265,10 @@ pub fn os_err_to_file_err(e: io::Error) -> Error {
     }
 }
 
+pub fn is_unformatted_disk(err: &Error) -> bool {
+    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::UnformattedDisk))
+}
+
 pub fn is_err_file_not_found(err: &Error) -> bool {
     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileNotFound))
 }

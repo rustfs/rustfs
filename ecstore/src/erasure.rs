@@ -533,14 +533,21 @@ impl ShardReader {
         let mut ress = Vec::with_capacity(reader_length);
 
         for disk in self.readers.iter_mut() {
-            if disk.is_none() {
-                ress.push(None);
-                errors.push(Some(Error::new(DiskError::DiskNotFound)));
-                continue;
-            }
+            // if disk.is_none() {
+            //     ress.push(None);
+            //     errors.push(Some(Error::new(DiskError::DiskNotFound)));
+            //     continue;
+            // }
 
-            let disk: &mut BitrotReader = disk.as_mut().unwrap();
-            futures.push(disk.read_at(self.offset, read_length));
+            // let disk: &mut BitrotReader = disk.as_mut().unwrap();
+            let offset = self.offset;
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.read_at(offset, read_length).await
+                } else {
+                    Err(Error::new(DiskError::DiskNotFound))
+                }
+            });
         }
 
         let results = join_all(futures).await;

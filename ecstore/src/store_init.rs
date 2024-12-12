@@ -191,13 +191,13 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
     let mut errors = Vec::with_capacity(disks.len());
 
     for disk in disks.iter() {
-        if disk.is_none() {
-            datas.push(None);
-            errors.push(Some(Error::new(DiskError::DiskNotFound)));
-        }
-
-        let disk = disk.as_ref().unwrap();
-        futures.push(load_format_erasure(disk, heal));
+        futures.push(async move {
+            if let Some(disk) = disk {
+                load_format_erasure(disk, heal).await
+            } else {
+                Err(Error::new(DiskError::DiskNotFound))
+            }
+        });
     }
 
     let results = join_all(futures).await;
