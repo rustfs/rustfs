@@ -209,10 +209,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     // init store
     let store = ECStore::new(server_address.clone(), endpoint_pools.clone())
         .await
-        .map_err(|err| Error::from_string(err.to_string()))?;
+        .map_err(|err| {
+            error!("ECStore::new {:?}", &err);
+            panic!("{}", err);
+            Error::from_string(err.to_string())
+        })?;
 
     ECStore::init(store.clone()).await.map_err(|err| {
-        error!("init faild {:?}", &err);
+        error!("ECStore init faild {:?}", &err);
         Error::from_string(err.to_string())
     })?;
     warn!(" init store success!");
