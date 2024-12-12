@@ -252,6 +252,7 @@ impl LocalDisk {
         true
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn check_format_json(&self) -> Result<Metadata> {
         let md = fs::metadata(&self.format_path).await.map_err(|e| match e.kind() {
             ErrorKind::NotFound => DiskError::DiskNotFound,
@@ -1051,6 +1052,7 @@ impl DiskAPI for LocalDisk {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         let mut format_info = self.format_info.write().await;
 
