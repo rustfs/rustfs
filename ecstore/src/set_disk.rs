@@ -1602,7 +1602,7 @@ impl SetDisks {
         // TODO: 优化并发 可用数量中断
         let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
-        warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
+        // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
