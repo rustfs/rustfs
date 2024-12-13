@@ -2418,7 +2418,11 @@ mod test {
 
     #[tokio::test]
     async fn test_walk_dir() {
-        let ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+        let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+        ep.pool_idx = 0;
+        ep.set_idx = 0;
+        ep.disk_idx = 0;
+
         let disk = match LocalDisk::new(&ep, false).await {
             Ok(res) => res,
             Err(err) => {
