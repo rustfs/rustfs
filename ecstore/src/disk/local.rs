@@ -37,7 +37,7 @@ use crate::set_disk::{
 use crate::store_api::{BitrotAlgorithm, StorageAPI};
 use crate::utils::fs::{access, lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::os::get_info;
-use crate::utils::path::{clean, decode_dir_object, has_suffix, path_join, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
+use crate::utils::path::{self, clean, decode_dir_object, has_suffix, path_join, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
@@ -740,25 +740,18 @@ impl LocalDisk {
             return Ok(());
         }
 
-        println!("list_dir opts {} {}", &opts.bucket, &opts.base_dir);
-
-        let mut entries = match self.list_dir("", &opts.bucket, &opts.base_dir, -1).await {
+        let mut entries = match self.list_dir("", &opts.bucket, current, -1).await {
             Ok(res) => res,
             Err(e) => {
-                println!("list_dir err {:?}", &e);
-                if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
-                    info!("list_dir err {:?}", &e);
-                }
+                if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {}
 
-                if opts.report_notfound && is_err_file_not_found(&e) {
-                    return Err(e);
+                if opts.report_notfound && is_err_file_not_found(&e) && current == &opts.base_dir {
+                    return Err(Error::new(DiskError::FileNotFound));
                 }
 
                 return Ok(());
             }
         };
-
-        println!("list_dir entries {:?}", &entries);
 
         if entries.is_empty() {
             return Ok(());
@@ -848,7 +841,7 @@ impl LocalDisk {
                 continue;
             }
 
-            let name = format!("{}{}", current, entry);
+            let name = path::path_join_buf(&[current, &entry]);
 
             if !dir_stack.is_empty() {
                 if let Some(pop) = dir_stack.pop() {
@@ -882,10 +875,9 @@ impl LocalDisk {
                 meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
             }
 
-            match self
-                .read_metadata(self.get_object_path(&opts.bucket, format!("{}/{}", &meta.name, FORMAT_CONFIG_FILE).as_str())?)
-                .await
-            {
+            let fname = format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE);
+
+            match self.read_metadata(self.get_object_path(&opts.bucket, fname.as_str())?).await {
                 Ok(res) => {
                     if is_dir_obj {
                         meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
@@ -898,7 +890,6 @@ impl LocalDisk {
                     *objs_returned += 1;
                 }
                 Err(err) => {
-                    warn!("scan dir read_metadata err {:?}", err);
                     if let Some(e) = err.downcast_ref::<std::io::Error>() {
                         if os_is_not_exist(e) || is_sys_err_is_dir(e) {
                             // NOT an object, append to stack (with slash)
@@ -928,6 +919,7 @@ impl LocalDisk {
 
             if opts.recursive {
                 let mut dir = dir;
+
                 if let Err(er) = Box::pin(self.scan_dir(&mut dir, opts, out, objs_returned)).await {
                     warn!("scan_dir err {:?}", &er);
                 }
@@ -2441,7 +2433,6 @@ mod test {
 
         let opts = WalkDirOptions {
             bucket: "dada".to_owned(),
-            // base_dir: "dada".to_owned(),
             recursive: true,
             ..Default::default()
         };
