@@ -1,11 +1,7 @@
 use crate::disk::MetaCacheEntry;
 use crate::error::Error;
 use crate::error::Result;
-use rmp::decode::RmpRead;
-use rmp::encode::RmpWrite;
 use rmp::Marker;
-use std::io::Read;
-use std::io::Write;
 use std::str::from_utf8;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
