@@ -70,6 +70,8 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
         self.init().await?;
 
         rmp::encode::write_bool(&mut self.buf, true).map_err(|e| Error::msg(format!("{:?}", e)))?;
+        rmp::encode::write_str(&mut self.buf, &obj.name).map_err(|e| Error::msg(format!("{:?}", e)))?;
+        rmp::encode::write_bin(&mut self.buf, &obj.metadata).map_err(|e| Error::msg(format!("{:?}", e)))?;
         self.flush().await?;
 
         Ok(())
@@ -197,7 +199,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             Marker::Str8 => Ok(u32::from(self.read_u8().await?)),
             Marker::Str16 => Ok(u32::from(self.read_u16().await?)),
             Marker::Str32 => Ok(self.read_u32().await?),
-            _ => Err(Error::msg("str marker err")),
+            marker => Err(Error::msg("str marker err")),
         }
     }
 
