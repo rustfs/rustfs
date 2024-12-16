@@ -818,6 +818,7 @@ impl LocalDisk {
                 })
                 .await?;
                 *objs_returned += 1;
+
                 return Ok(());
             }
         }
@@ -927,7 +928,6 @@ impl LocalDisk {
 
             if opts.recursive {
                 let mut dir = dir;
-
                 if let Err(er) = Box::pin(self.scan_dir(&mut dir, opts, out, objs_returned)).await {
                     warn!("scan_dir err {:?}", &er);
                 }
@@ -1501,10 +1501,6 @@ impl DiskAPI for LocalDisk {
 
         let volume_dir = self.get_bucket_path(volume)?;
         let dir_path_abs = volume_dir.join(Path::new(&dir_path.trim_start_matches(SLASH_SEPARATOR)));
-        println!(
-            "list dir  volume_dir: {:?} join dir_path {} = abs {:?}",
-            &volume_dir, &dir_path, dir_path_abs
-        );
 
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
@@ -1524,8 +1520,6 @@ impl DiskAPI for LocalDisk {
     // FIXME: TODO: io.writer TODO cancel
     #[tracing::instrument(level = "debug", skip(self, wr))]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
-        // warn!("walk_dir opts {:?}", &opts);
-
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket) {
@@ -1550,7 +1544,6 @@ impl DiskAPI for LocalDisk {
                 .as_str(),
             )?;
 
-            println!("fpath {:?}", &fpath);
             if let Ok(data) = self.read_metadata(fpath).await {
                 let meta = MetaCacheEntry {
                     name: opts.base_dir.clone(),
@@ -1564,6 +1557,7 @@ impl DiskAPI for LocalDisk {
 
         let mut current = opts.base_dir.clone();
         self.scan_dir(&mut current, &opts, &mut out, &mut objs_returned).await?;
+
         Ok(Vec::new())
     }
 
@@ -2343,6 +2337,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
 #[cfg(test)]
 mod test {
 
+    use futures::future::join_all;
     use tokio::io::BufWriter;
     use utils::fs::open_file;
     use utils::fs::O_RDWR;
@@ -2447,11 +2442,12 @@ mod test {
             }
         };
 
-        let (rd, mut wr) = tokio::io::duplex(64);
+        let (rd, mut wr) = tokio::io::duplex(1024);
 
         let job = tokio::spawn(async move {
             let opts = WalkDirOptions {
                 bucket: "dada".to_owned(),
+                base_dir: "".to_owned(),
                 recursive: true,
                 ..Default::default()
             };
@@ -2460,15 +2456,21 @@ mod test {
             }
         });
 
-        let rd_job = tokio::spawn(async move {
+        let job2 = tokio::spawn(async move {
             let mut mrd = MetacacheReader::new(rd);
 
             while let Some(info) = mrd.peek().await.unwrap_or_default() {
-                println!("{:?}", info)
+                println!("info {:?}", info.name)
             }
         });
+        job.await;
+        job2.await;
 
-        job.await.unwrap();
-        rd_job.await.unwrap();
+        // let mut jobs = Vec::new();
+
+        // jobs.push(job);
+        // jobs.push(job2);
+
+        // join_all(jobs).await;
     }
 }
