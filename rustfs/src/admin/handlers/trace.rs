@@ -29,7 +29,7 @@ impl Operation for Trace {
 
         // let (tx, rx) = mpsc::channel(10000);
         let perrs = match GLOBAL_Endpoints.get() {
-            Some(ep) => PeerRestClient::new_clients(ep).await,
+            Some(ep) => PeerRestClient::new_clients(ep.clone()).await,
             None => (Vec::new(), Vec::new()),
         };
         return Err(s3_error!(NotImplemented));
