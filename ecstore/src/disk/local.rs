@@ -59,10 +59,10 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -716,7 +716,7 @@ impl LocalDisk {
         bitrot_verify(&mut Cursor::new(data), n, part_size, algo, sum.to_vec(), shard_size)
     }
 
-    async fn scan_dir<W: Write>(
+    async fn scan_dir<W: AsyncWrite + Unpin>(
         &self,
         current: &mut String,
         opts: &WalkDirOptions,
@@ -810,7 +810,8 @@ impl LocalDisk {
                     name,
                     metadata,
                     ..Default::default()
-                })?;
+                })
+                .await?;
                 *objs_returned += 1;
                 return Ok(());
             }
@@ -850,7 +851,8 @@ impl LocalDisk {
                         out.write_obj(&MetaCacheEntry {
                             name: pop,
                             ..Default::default()
-                        })?;
+                        })
+                        .await?;
 
                         if opts.recursive {
                             if let Err(er) = Box::pin(self.scan_dir(current, opts, out, objs_returned)).await {
@@ -886,7 +888,7 @@ impl LocalDisk {
 
                     meta.metadata = res;
 
-                    out.write_obj(&meta)?;
+                    out.write_obj(&meta).await?;
                     *objs_returned += 1;
                 }
                 Err(err) => {
@@ -914,7 +916,8 @@ impl LocalDisk {
             out.write_obj(&MetaCacheEntry {
                 name: dir.clone(),
                 ..Default::default()
-            })?;
+            })
+            .await?;
             *objs_returned += 1;
 
             if opts.recursive {
@@ -1511,7 +1514,7 @@ impl DiskAPI for LocalDisk {
 
     // FIXME: TODO: io.writer TODO cancel
     #[tracing::instrument(level = "debug", skip(self, wr))]
-    async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
         // warn!("walk_dir opts {:?}", &opts);
 
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
@@ -1524,7 +1527,7 @@ impl DiskAPI for LocalDisk {
 
         let mut wr = wr;
 
-        let mut out = MetacacheWriter::new(AsyncToSync::new_writer(&mut wr));
+        let mut out = MetacacheWriter::new(&mut wr);
 
         let mut objs_returned = 0;
 
@@ -1539,7 +1542,7 @@ impl DiskAPI for LocalDisk {
                     metadata: data,
                     ..Default::default()
                 };
-                out.write_obj(&meta)?;
+                out.write_obj(&meta).await?;
                 objs_returned += 1;
             }
         }
@@ -2330,6 +2333,10 @@ mod test {
     use utils::fs::O_RDWR;
     use utils::fs::O_TRUNC;
 
+    use crate::io::VecAsyncReader;
+    use crate::io::VecAsyncWriter;
+    use crate::metacache::writer::MetacacheReader;
+
     use super::*;
 
     #[tokio::test]
@@ -2425,25 +2432,32 @@ mod test {
             }
         };
 
-        let f = match open_file("./testfile.txt", O_CREATE | O_RDWR | O_TRUNC).await {
-            Ok(res) => res,
-            Err(err) => {
-                println!("openfile err {:?}", err);
-                return;
+        let (rd, mut wr) = tokio::io::duplex(64);
+
+        // let mut wr = VecAsyncWriter::new(Vec::new());
+
+        let job = tokio::spawn(async move {
+            let opts = WalkDirOptions {
+                bucket: "dada".to_owned(),
+                recursive: true,
+                ..Default::default()
+            };
+            if let Err(err) = disk.walk_dir(opts, &mut wr).await {
+                println!("walk_dir err {:?}", err);
             }
-        };
+        });
 
-        let buf = BufWriter::new(Vec::new());
+        // let rd = VecAsyncReader::new(wr.get_buffer().to_vec());
 
-        let opts = WalkDirOptions {
-            bucket: "dada".to_owned(),
-            recursive: true,
-            ..Default::default()
-        };
-        if let Err(err) = disk.walk_dir(opts, crate::io::Writer::File(f)).await {
-            println!("walk_dir err {:?}", err);
-        }
+        let rd_job = tokio::spawn(async move {
+            let mut mrd = MetacacheReader::new(rd);
 
-        MetacacheReader::new()
+            while let Some(info) = mrd.peek().await.unwrap_or_default() {
+                println!("{:?}", info)
+            }
+        });
+
+        job.await.unwrap();
+        rd_job.await.unwrap();
     }
 }

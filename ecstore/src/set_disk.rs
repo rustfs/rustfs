@@ -1330,7 +1330,7 @@ impl SetDisks {
             let opts = opts.clone();
             futures.push(async move {
                 if let Some(disk) = disk {
-                    disk.walk_dir(opts, Writer::NotUse).await
+                    disk.walk_dir(opts, &mut Writer::NotUse).await
                 } else {
                     Err(Error::new(DiskError::DiskNotFound))
                 }
