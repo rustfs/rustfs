@@ -743,7 +743,7 @@ impl Node for NodeService {
                     }));
                 }
             };
-            match disk.walk_dir(opts, ecstore::io::Writer::NotUse).await {
+            match disk.walk_dir(opts, &mut ecstore::io::Writer::NotUse).await {
                 Ok(entries) => {
                     let entries = entries
                         .into_iter()
