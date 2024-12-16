@@ -46,7 +46,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc::{self, Sender},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -210,7 +210,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
         match self {
             Disk::Local(local_disk) => local_disk.walk_dir(opts, wr).await,
             Disk::Remote(remote_disk) => remote_disk.walk_dir(opts, wr).await,
@@ -406,7 +406,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn delete_volume(&self, volume: &str) -> Result<()>;
 
     // 并发边读边写 TODO: wr io.Writer
-    async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>>;
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>>;
 
     // Metadata operations
     async fn delete_version(

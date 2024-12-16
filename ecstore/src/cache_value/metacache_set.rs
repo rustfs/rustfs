@@ -89,7 +89,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                             limit: opts_clone.per_disk_limit,
                             ..Default::default()
                         },
-                        Writer::NotUse,
+                        &mut Writer::NotUse,
                     )
                     .await
                 {
@@ -130,7 +130,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                             limit: opts_clone.per_disk_limit,
                             ..Default::default()
                         },
-                        Writer::NotUse,
+                        &mut Writer::NotUse,
                     )
                     .await
                 {
