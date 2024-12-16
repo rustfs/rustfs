@@ -70,11 +70,6 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
         self.init().await?;
 
         rmp::encode::write_bool(&mut self.buf, true).map_err(|e| Error::msg(format!("{:?}", e)))?;
-
-        rmp::encode::write_str(&mut self.buf, &obj.name).map_err(|e| Error::msg(format!("{:?}", e)))?;
-
-        rmp::encode::write_bin(&mut self.buf, &obj.metadata).map_err(|e| Error::msg(format!("{:?}", e)))?;
-
         self.flush().await?;
 
         Ok(())
