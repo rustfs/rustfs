@@ -71,6 +71,8 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
     }
 
     pub async fn write_obj(&mut self, obj: &MetaCacheEntry) -> Result<()> {
+        println!("write_obj {:?}", &obj);
+
         self.init().await?;
 
         rmp::encode::write_bool(&mut self.buf, true).map_err(|e| Error::msg(format!("{:?}", e)))?;
@@ -162,8 +164,6 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
 
         let data = &self.buf[pref..ext_size];
 
-        println!("pref {} offset {},ext_size {}, data {:?}", pref, self.offset, ext_size, &data);
-
         Ok(data)
     }
 
@@ -181,8 +181,6 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
                     0
                 }
             };
-
-            println!("ver {}", ver);
             match ver {
                 1 | 2 => (),
                 _ => {
@@ -233,21 +231,25 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
     }
 
     async fn read_u8(&mut self) -> Result<u8> {
-        let a = self.read_more(1).await?;
+        let buf = self.read_more(1).await?;
 
-        Ok(a[0])
+        Ok(u8::from_be_bytes(buf.try_into().expect("Slice with incorrect length")))
     }
 
     async fn read_u16(&mut self) -> Result<u16> {
-        rmp::decode::read_u16(&mut self.read_more(2).await?).map_err(|e| Error::msg(format!("{:?}", e)))
+        let buf = self.read_more(2).await?;
+
+        Ok(u16::from_be_bytes(buf.try_into().expect("Slice with incorrect length")))
     }
 
     async fn read_u32(&mut self) -> Result<u32> {
-        rmp::decode::read_u32(&mut self.read_more(4).await?).map_err(|e| Error::msg(format!("{:?}", e)))
+        let buf = self.read_more(4).await?;
+
+        Ok(u32::from_be_bytes(buf.try_into().expect("Slice with incorrect length")))
     }
 
     pub async fn peek(&mut self) -> Result<Option<MetaCacheEntry>> {
-        self.check_init().await;
+        self.check_init().await?;
 
         if let Some(err) = &self.err {
             return Err(err.clone());
@@ -336,8 +338,6 @@ async fn test_writer() {
     w.close().await.unwrap();
 
     let data = f.get_buffer().to_vec();
-
-    println!("data len {}", data.len());
 
     let nf = VecAsyncReader::new(data);
 
