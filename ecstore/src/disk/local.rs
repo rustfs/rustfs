@@ -2325,8 +2325,10 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
 #[cfg(test)]
 mod test {
 
+    use tokio::io::BufWriter;
     use utils::fs::open_file;
     use utils::fs::O_RDWR;
+    use utils::fs::O_TRUNC;
 
     use super::*;
 
@@ -2423,13 +2425,15 @@ mod test {
             }
         };
 
-        let mut f = match open_file("./testfile.txt", O_CREATE | O_RDWR).await {
+        let f = match open_file("./testfile.txt", O_CREATE | O_RDWR | O_TRUNC).await {
             Ok(res) => res,
             Err(err) => {
                 println!("openfile err {:?}", err);
                 return;
             }
         };
+
+        let buf = BufWriter::new(Vec::new());
 
         let opts = WalkDirOptions {
             bucket: "dada".to_owned(),
@@ -2439,5 +2443,7 @@ mod test {
         if let Err(err) = disk.walk_dir(opts, crate::io::Writer::File(f)).await {
             println!("walk_dir err {:?}", err);
         }
+
+        MetacacheReader::new()
     }
 }
