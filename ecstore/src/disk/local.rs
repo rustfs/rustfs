@@ -37,7 +37,10 @@ use crate::set_disk::{
 use crate::store_api::{BitrotAlgorithm, StorageAPI};
 use crate::utils::fs::{access, lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::os::get_info;
-use crate::utils::path::{self, clean, decode_dir_object, has_suffix, path_join, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
+use crate::utils::path::{
+    self, clean, decode_dir_object, has_suffix, path_join, path_join_buf, GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH,
+    SLASH_SEPARATOR,
+};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
@@ -743,7 +746,9 @@ impl LocalDisk {
         let mut entries = match self.list_dir("", &opts.bucket, current, -1).await {
             Ok(res) => res,
             Err(e) => {
-                if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {}
+                if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
+                    error!("scan list_dir {}, err {:?}", &current, &e);
+                }
 
                 if opts.report_notfound && is_err_file_not_found(&e) && current == &opts.base_dir {
                     return Err(Error::new(DiskError::FileNotFound));
@@ -849,13 +854,13 @@ impl LocalDisk {
                     if pop < name {
                         //
                         out.write_obj(&MetaCacheEntry {
-                            name: pop,
+                            name: pop.clone(),
                             ..Default::default()
                         })
                         .await?;
 
                         if opts.recursive {
-                            if let Err(er) = Box::pin(self.scan_dir(current, opts, out, objs_returned)).await {
+                            if let Err(er) = Box::pin(self.scan_dir(&mut pop.clone(), opts, out, objs_returned)).await {
                                 error!("scan_dir err {:?}", er);
                             }
                         }
@@ -1495,7 +1500,11 @@ impl DiskAPI for LocalDisk {
         }
 
         let volume_dir = self.get_bucket_path(volume)?;
-        let dir_path_abs = volume_dir.join(Path::new(&dir_path));
+        let dir_path_abs = volume_dir.join(Path::new(&dir_path.trim_start_matches(SLASH_SEPARATOR)));
+        println!(
+            "list dir  volume_dir: {:?} join dir_path {} = abs {:?}",
+            &volume_dir, &dir_path, dir_path_abs
+        );
 
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
@@ -1534,8 +1543,14 @@ impl DiskAPI for LocalDisk {
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             let fpath = self.get_object_path(
                 &opts.bucket,
-                format!("{}/{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), STORAGE_FORMAT_FILE).as_str(),
+                path_join_buf(&[
+                    format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX).as_str(),
+                    STORAGE_FORMAT_FILE,
+                ])
+                .as_str(),
             )?;
+
+            println!("fpath {:?}", &fpath);
             if let Ok(data) = self.read_metadata(fpath).await {
                 let meta = MetaCacheEntry {
                     name: opts.base_dir.clone(),
@@ -2434,8 +2449,6 @@ mod test {
 
         let (rd, mut wr) = tokio::io::duplex(64);
 
-        // let mut wr = VecAsyncWriter::new(Vec::new());
-
         let job = tokio::spawn(async move {
             let opts = WalkDirOptions {
                 bucket: "dada".to_owned(),
@@ -2446,8 +2459,6 @@ mod test {
                 println!("walk_dir err {:?}", err);
             }
         });
-
-        // let rd = VecAsyncReader::new(wr.get_buffer().to_vec());
 
         let rd_job = tokio::spawn(async move {
             let mut mrd = MetacacheReader::new(rd);

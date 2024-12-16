@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
+pub const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
 pub const SLASH_SEPARATOR: &str = "/";
 

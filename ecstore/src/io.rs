@@ -163,7 +163,7 @@ impl VecAsyncWriter {
 
 // Implementing AsyncWrite trait for VecAsyncWriter
 impl AsyncWrite for VecAsyncWriter {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let len = buf.len();
 
         // Assume synchronous writing for simplicity
@@ -178,7 +178,7 @@ impl AsyncWrite for VecAsyncWriter {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Similar to flush, shutdown has no effect here
         Poll::Ready(Ok(()))
     }
