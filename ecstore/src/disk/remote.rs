@@ -10,7 +10,10 @@ use protos::{
         StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
-use tokio::sync::mpsc::{self, Sender};
+use tokio::{
+    io::AsyncWrite,
+    sync::mpsc::{self, Sender},
+};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::Request;
 use tracing::info;
@@ -347,7 +350,7 @@ impl DiskAPI for RemoteDisk {
         Ok(response.volumes)
     }
 
-    async fn walk_dir(&self, opts: WalkDirOptions, wr: crate::io::Writer) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
         info!("walk_dir");
         let walk_dir_options = serde_json::to_string(&opts)?;
         let mut client = node_service_time_out_client(&self.addr)

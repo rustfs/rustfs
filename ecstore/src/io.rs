@@ -3,8 +3,6 @@ use std::io::Write;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::fs::File;
-use tokio::io::BufReader;
-use tokio::io::BufWriter;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 
 #[derive(Default)]
@@ -12,19 +10,14 @@ pub enum Reader {
     #[default]
     NotUse,
     File(File),
-    Buffer(BufReader<Vec<u8>>),
+    Buffer(VecAsyncReader),
 }
 
 impl AsyncRead for Reader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Reader::File(file) => {
-                let file = Pin::new(file);
-                file.poll_read(cx, buf)
-            }
-            Reader::Buffer(buffer) => {
-                todo!()
-            }
+            Reader::File(file) => Pin::new(file).poll_read(cx, buf),
+            Reader::Buffer(buffer) => Pin::new(buffer).poll_read(cx, buf),
             Reader::NotUse => Poll::Ready(Ok(())),
         }
     }
@@ -35,7 +28,7 @@ pub enum Writer {
     #[default]
     NotUse,
     File(File),
-    Buffer(BufWriter<Vec<u8>>),
+    Buffer(VecAsyncWriter),
 }
 
 impl AsyncWrite for Writer {
