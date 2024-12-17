@@ -671,8 +671,10 @@ impl ECStore {
         want_cycle: usize,
         heal_scan_mode: HealScanMode,
     ) -> Result<()> {
+        info!("ns_scanner updates - {}", want_cycle);
         let all_buckets = self.list_bucket(&BucketOptions::default()).await?;
         if all_buckets.is_empty() {
+            info!("No buckets found");
             let _ = updates.send(DataUsageInfo::default()).await;
             return Ok(());
         }

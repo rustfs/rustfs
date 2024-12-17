@@ -212,9 +212,9 @@ impl Erasure {
         offset: usize,
         length: usize,
         total_length: usize,
-    ) -> Result<usize> {
+    ) -> (usize, Option<Error>) {
         if length == 0 {
-            return Ok(0);
+            return (0, None);
         }
 
         let mut reader = ShardReader::new(readers, self, offset, total_length);
@@ -247,15 +247,24 @@ impl Erasure {
 
             // debug!("decode {} block_offset {},block_length {} ", block_idx, block_offset, block_length);
 
-            let mut bufs = reader.read().await?;
+            let mut bufs = match reader.read().await {
+                Ok(bufs) => bufs,
+                Err(err) => return (bytes_writed, Some(err)),
+            };
 
             if self.parity_shards > 0 {
-                self.decode_data(&mut bufs)?;
+                if let Err(err) = self.decode_data(&mut bufs) {
+                    return (bytes_writed, Some(err));
+                }
             }
 
-            let writed_n = self
+            let writed_n = match self
                 .write_data_blocks(writer, bufs, self.data_shards, block_offset, block_length)
-                .await?;
+                .await
+            {
+                Ok(n) => n,
+                Err(err) => return (bytes_writed, Some(err)),
+            };
 
             bytes_writed += writed_n;
 
@@ -264,10 +273,10 @@ impl Erasure {
 
         if bytes_writed != length {
             // debug!("bytes_writed != length: {} != {} ", bytes_writed, length);
-            return Err(Error::msg("erasure decode less data"));
+            return (bytes_writed, Some(Error::msg("erasure decode less data")));
         }
 
-        Ok(bytes_writed)
+        (bytes_writed, None)
     }
 
     async fn write_data_blocks(
