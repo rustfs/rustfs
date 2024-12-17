@@ -273,6 +273,17 @@ pub fn is_err_file_not_found(err: &Error) -> bool {
     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileNotFound))
 }
 
+pub fn is_err_volume_not_found(err: &Error) -> bool {
+    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::VolumeNotFound))
+}
+
+pub fn is_err_eof(err: &Error) -> bool {
+    if let Some(ioerr) = err.downcast_ref::<io::Error>() {
+        return ioerr.kind() == ErrorKind::UnexpectedEof;
+    }
+    false
+}
+
 pub fn is_sys_err_no_space(e: &io::Error) -> bool {
     if let Some(no) = e.raw_os_error() {
         return no == 28;

@@ -123,6 +123,8 @@ pub struct MetacacheReader<R> {
     err: Option<Error>,
     buf: Vec<u8>,
     offset: usize,
+
+    current: Option<MetaCacheEntry>,
 }
 
 impl<R: AsyncRead + Unpin> MetacacheReader<R> {
@@ -133,6 +135,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             err: None,
             buf: Vec::new(),
             offset: 0,
+            current: None,
         }
     }
 
@@ -199,7 +202,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             Marker::Str8 => Ok(u32::from(self.read_u8().await?)),
             Marker::Str16 => Ok(u32::from(self.read_u16().await?)),
             Marker::Str32 => Ok(self.read_u32().await?),
-            marker => Err(Error::msg("str marker err")),
+            _marker => Err(Error::msg("str marker err")),
         }
     }
 
@@ -237,6 +240,45 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         let buf = self.read_more(4).await?;
 
         Ok(u32::from_be_bytes(buf.try_into().expect("Slice with incorrect length")))
+    }
+
+    pub async fn skip(&mut self, size: usize) -> Result<()> {
+        self.check_init().await?;
+
+        if let Some(err) = &self.err {
+            return Err(err.clone());
+        }
+
+        let mut n = size;
+
+        if self.current.is_some() {
+            n -= 1;
+            self.current = None;
+        }
+
+        while n > 0 {
+            match rmp::decode::read_bool(&mut self.read_more(1).await?) {
+                Ok(res) => {
+                    if !res {
+                        return Ok(());
+                    }
+                }
+                Err(err) => {
+                    let serr = format!("{:?}", err);
+                    self.err = Some(Error::msg(&serr));
+                    return Err(Error::msg(&serr));
+                }
+            };
+
+            let l = self.read_str_len().await?;
+            let _ = self.read_more(l as usize).await?;
+            let l = self.read_bin_len().await?;
+            let _ = self.read_more(l as usize).await?;
+
+            n -= 1;
+        }
+
+        Ok(())
     }
 
     pub async fn peek(&mut self) -> Result<Option<MetaCacheEntry>> {
@@ -279,12 +321,15 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
 
         self.reset();
 
-        Ok(Some(MetaCacheEntry {
+        let entry = Some(MetaCacheEntry {
             name,
             metadata,
             cached: None,
             reusable: false,
-        }))
+        });
+        self.current = entry.clone();
+
+        Ok(entry)
     }
 
     pub async fn read_all(&mut self) -> Result<Vec<MetaCacheEntry>> {
