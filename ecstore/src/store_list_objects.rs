@@ -290,3 +290,132 @@ impl ECStore {
         Ok(ress)
     }
 }
+
+// list_path_raw
+
+#[cfg(test)]
+mod test {
+    use crate::cache_value::metacache_set::list_path_raw;
+    use crate::cache_value::metacache_set::ListPathRawOptions;
+    use crate::disk::endpoint::Endpoint;
+    use crate::disk::error::is_err_eof;
+    use crate::disk::new_disk;
+    use crate::disk::DiskAPI;
+    use crate::disk::DiskOption;
+    use crate::disk::MetaCacheEntries;
+    use crate::disk::MetaCacheEntry;
+    use crate::disk::WalkDirOptions;
+    use crate::error::Error;
+    use crate::metacache::writer::MetacacheReader;
+    use futures::future::join_all;
+    use tokio::sync::broadcast;
+
+    #[tokio::test]
+    async fn test_walk_dir() {
+        let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+        ep.pool_idx = 0;
+        ep.set_idx = 0;
+        ep.disk_idx = 0;
+        ep.is_local = true;
+
+        let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
+
+        // let disk = match LocalDisk::new(&ep, false).await {
+        //     Ok(res) => res,
+        //     Err(err) => {
+        //         println!("LocalDisk::new err {:?}", err);
+        //         return;
+        //     }
+        // };
+
+        let (rd, mut wr) = tokio::io::duplex(64);
+
+        let job = tokio::spawn(async move {
+            let opts = WalkDirOptions {
+                bucket: "dada".to_owned(),
+                base_dir: "".to_owned(),
+                recursive: true,
+                ..Default::default()
+            };
+
+            println!("walk opts {:?}", opts);
+            if let Err(err) = disk.walk_dir(opts, &mut wr).await {
+                println!("walk_dir err {:?}", err);
+            }
+        });
+
+        let job2 = tokio::spawn(async move {
+            let mut mrd = MetacacheReader::new(rd);
+
+            loop {
+                match mrd.peek().await {
+                    Ok(res) => {
+                        if let Some(info) = res {
+                            println!("info {:?}", info.name)
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        if is_err_eof(&err) {
+                            break;
+                        }
+
+                        println!("get err {:?}", err);
+                        break;
+                    }
+                }
+            }
+        });
+        join_all(vec![job, job2]).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_path_raw() {
+        let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+        ep.pool_idx = 0;
+        ep.set_idx = 0;
+        ep.disk_idx = 0;
+        ep.is_local = true;
+
+        let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
+
+        // let disk = match LocalDisk::new(&ep, false).await {
+        //     Ok(res) => res,
+        //     Err(err) => {
+        //         println!("LocalDisk::new err {:?}", err);
+        //         return;
+        //     }
+        // };
+
+        let (_, rx) = broadcast::channel(1);
+        let bucket = "dada".to_owned();
+        let forward_to = "".to_owned();
+        let disks = vec![Some(disk)];
+        let fallback_disks = Vec::new();
+
+        list_path_raw(
+            rx,
+            ListPathRawOptions {
+                disks,
+                fallback_disks,
+                bucket,
+                path: "".to_owned(),
+                recursice: true,
+                forward_to,
+                min_disks: 1,
+                report_not_found: false,
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    Box::pin(async move { println!("get entry: {}", entry.name) })
+                })),
+                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                    Box::pin(async move { println!("get entries: {:?}", entries) })
+                })),
+                finished: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+}

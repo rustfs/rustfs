@@ -2096,10 +2096,6 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
 #[cfg(test)]
 mod test {
 
-    use std::fs;
-    use std::fs::File;
-    use std::os::unix::fs::MetadataExt;
-
     use super::*;
 
     #[test]

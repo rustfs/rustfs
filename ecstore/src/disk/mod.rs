@@ -770,7 +770,8 @@ impl MetaCacheEntry {
     }
 }
 
-pub struct MetaCacheEntries(pub Vec<MetaCacheEntry>);
+#[derive(Debug)]
+pub struct MetaCacheEntries(pub Vec<Option<MetaCacheEntry>>);
 
 impl MetaCacheEntries {
     pub fn resolve(&self, mut params: MetadataResolutionParams) -> Result<Option<MetaCacheEntry>> {
@@ -785,7 +786,7 @@ impl MetaCacheEntries {
         let mut objs_agree = 0;
         let mut objs_valid = 0;
 
-        for entry in self.0.iter() {
+        for entry in self.0.iter().flatten() {
             if entry.name.is_empty() {
                 continue;
             }
@@ -859,7 +860,7 @@ impl MetaCacheEntries {
     }
 
     pub fn first_found(&self) -> (Option<MetaCacheEntry>, usize) {
-        (self.0.iter().find(|x| !x.name.is_empty()).cloned(), self.0.len())
+        (self.0.iter().find(|x| x.is_some()).cloned().unwrap_or_default(), self.0.len())
     }
 }
 
