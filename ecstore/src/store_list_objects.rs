@@ -1,13 +1,20 @@
-use crate::disk::WalkDirOptions;
+use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
+use crate::disk::{DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, WalkDirOptions};
 use crate::error::{Error, Result};
 use crate::peer::is_reserved_or_invalid_bucket;
+use crate::set_disk::SetDisks;
 use crate::store::check_list_objs_args;
 use crate::store_api::{ListObjectsInfo, ObjectInfo};
 use crate::utils::path::{base_dir_from_prefix, SLASH_SEPARATOR};
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
-use std::collections::HashSet;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
+use tokio::sync::broadcast::Receiver;
+use tokio::sync::mpsc::Sender;
+use tracing::error;
 
 const MAX_OBJECT_LIST: i32 = 1000;
 const MAX_DELETE_LIST: i32 = 1000;
@@ -80,6 +87,8 @@ pub struct ListPathOptions {
 
     // Versioned is this a ListObjectVersions call.
     pub versioned: bool,
+
+    pub stop_disk_at_limit: bool,
 }
 
 impl ListPathOptions {
@@ -291,14 +300,169 @@ impl ECStore {
     }
 }
 
+impl SetDisks {
+    pub async fn list_path(&self, rx: Receiver<bool>, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
+        let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
+
+        let mut ask_disks = get_list_quorum(&opts.ask_disks, self.set_drive_count as i32);
+        if ask_disks == -1 {
+            let new_disks = get_quorum_disks(&disks, &infos, (disks.len() + 1) / 2);
+            if !new_disks.is_empty() {
+                disks = new_disks;
+                ask_disks = 1;
+            } else {
+                ask_disks = get_list_quorum("strict", self.set_drive_count as i32);
+            }
+        }
+
+        if self.set_drive_count == 4 || ask_disks > disks.len() as i32 {
+            ask_disks = disks.len() as i32;
+        }
+
+        let listing_quorum = ((ask_disks + 1) / 2) as usize;
+
+        let mut fallback_disks = Vec::new();
+
+        if ask_disks > 0 && disks.len() > ask_disks as usize {
+            let mut rand = thread_rng();
+            disks.shuffle(&mut rand);
+
+            fallback_disks = disks.split_off(ask_disks as usize);
+        }
+
+        let mut resolver = MetadataResolutionParams {
+            dir_quorum: listing_quorum,
+            obj_quorum: listing_quorum,
+            bucket: opts.bucket.clone(),
+            ..Default::default()
+        };
+
+        if opts.versioned {
+            resolver.requested_versions = 1;
+        }
+
+        let limit = {
+            if opts.limit > 0 && opts.stop_disk_at_limit {
+                opts.limit + 4 + (opts.limit / 16)
+            } else {
+                0
+            }
+        };
+
+        let tx1 = sender.clone();
+        let tx2 = sender.clone();
+
+        list_path_raw(
+            rx,
+            ListPathRawOptions {
+                disks: disks.iter().cloned().map(Some).collect(),
+                fallback_disks: fallback_disks.iter().cloned().map(Some).collect(),
+                bucket: opts.bucket,
+                path: opts.base_dir,
+                recursice: opts.recursive,
+                filter_prefix: opts.filter_prefix,
+                forward_to: opts.marker,
+                min_disks: listing_quorum,
+                per_disk_limit: limit,
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    Box::pin({
+                        let value = tx1.clone();
+                        async move {
+                            if let Err(err) = value.send(entry).await {
+                                error!("list_path send fail {:?}", err);
+                            }
+                        }
+                    })
+                })),
+                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                    Box::pin({
+                        let value = tx2.clone();
+                        let resolver = resolver.clone();
+                        async move {
+                            if let Ok(Some(entry)) = entries.resolve(resolver) {
+                                if let Err(err) = value.send(entry).await {
+                                    error!("list_path send fail {:?}", err);
+                                }
+                            }
+                        }
+                    })
+                })),
+                finished: None,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+}
+
+fn get_list_quorum(quorum: &str, drive_count: i32) -> i32 {
+    match quorum {
+        "disk" => 1,
+        "reduced" => 2,
+        "optimal" => (drive_count + 1) / 2,
+        "auto" => -1,
+        _ => drive_count, // defaults to 'strict'
+    }
+}
+
+fn get_quorum_disk_infos(disks: &[DiskStore], infos: &[DiskInfo], read_quorum: usize) -> (Vec<DiskStore>, Vec<DiskInfo>) {
+    let common_mutations = calc_common_counter(infos, read_quorum);
+    let mut new_disks = Vec::new();
+    let mut new_infos = Vec::new();
+
+    for (i, info) in infos.iter().enumerate() {
+        let mutations = info.metrics.total_deletes + info.metrics.total_writes;
+        if mutations >= common_mutations {
+            new_disks.push(disks[i].clone()); // Assuming StorageAPI derives Clone
+            new_infos.push(infos[i].clone()); // Assuming DiskInfo derives Clone
+        }
+    }
+
+    (new_disks, new_infos)
+}
+
+fn get_quorum_disks(disks: &[DiskStore], infos: &[DiskInfo], read_quorum: usize) -> Vec<DiskStore> {
+    let (new_disks, _) = get_quorum_disk_infos(disks, infos, read_quorum);
+    new_disks
+}
+
+fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
+    let mut max = 0;
+    let mut common_count = 0;
+    let mut signature_map: HashMap<u64, usize> = HashMap::new();
+
+    for info in infos {
+        if !info.error.is_empty() {
+            continue;
+        }
+        let mutations = info.metrics.total_deletes + info.metrics.total_writes;
+        *signature_map.entry(mutations).or_insert(0) += 1;
+    }
+
+    for (&ops, &count) in &signature_map {
+        if max < count && common_count < ops {
+            max = count;
+            common_count = ops;
+        }
+    }
+
+    if max < read_quorum {
+        return 0;
+    }
+    common_count
+}
+
 // list_path_raw
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use crate::cache_value::metacache_set::list_path_raw;
     use crate::cache_value::metacache_set::ListPathRawOptions;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::is_err_eof;
+    use crate::disk::format::FormatV3;
     use crate::disk::new_disk;
     use crate::disk::DiskAPI;
     use crate::disk::DiskOption;
@@ -307,8 +471,14 @@ mod test {
     use crate::disk::WalkDirOptions;
     use crate::error::Error;
     use crate::metacache::writer::MetacacheReader;
+    use crate::set_disk::SetDisks;
+    use crate::store_list_objects::ListPathOptions;
     use futures::future::join_all;
+    use lock::namespace_lock::NsLockMap;
     use tokio::sync::broadcast;
+    use tokio::sync::mpsc;
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_walk_dir() {
@@ -417,5 +587,47 @@ mod test {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_path() {
+        let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+        ep.pool_idx = 0;
+        ep.set_idx = 0;
+        ep.disk_idx = 0;
+        ep.is_local = true;
+
+        let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
+        let _ = disk.set_disk_id(Some(Uuid::new_v4())).await;
+
+        let set = SetDisks {
+            lockers: Vec::new(),
+            locker_owner: String::new(),
+            ns_mutex: Arc::new(RwLock::new(NsLockMap::new(false))),
+            disks: RwLock::new(vec![Some(disk)]),
+            set_endpoints: Vec::new(),
+            set_drive_count: 1,
+            default_parity_count: 0,
+            set_index: 0,
+            pool_index: 0,
+            format: FormatV3::new(1, 1),
+        };
+
+        let (_, rx) = broadcast::channel(1);
+        let bucket = "dada".to_owned();
+
+        let opts = ListPathOptions {
+            bucket,
+            recursive: true,
+            ..Default::default()
+        };
+
+        let (sender, mut recv) = mpsc::channel(10);
+
+        set.list_path(rx, opts, sender).await.unwrap();
+
+        while let Some(entry) = recv.recv().await {
+            println!("get entry {:?}", entry.name)
+        }
     }
 }

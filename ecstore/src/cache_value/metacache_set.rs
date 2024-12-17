@@ -1,13 +1,9 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use futures::{future::join_all, join};
+use futures::future::join_all;
 use tokio::{
     spawn,
-    sync::{
-        broadcast::Receiver as B_Receiver,
-        mpsc::{self},
-        RwLock,
-    },
+    sync::{broadcast::Receiver as B_Receiver, RwLock},
 };
 use tracing::error;
 
@@ -17,7 +13,6 @@ use crate::{
         DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions,
     },
     error::{Error, Result},
-    io::Writer,
     metacache::writer::MetacacheReader,
 };
 
@@ -306,7 +301,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
 
     jobs.push(revjob);
 
-    let a = join_all(jobs).await;
+    let _ = join_all(jobs).await;
 
     Ok(())
 }

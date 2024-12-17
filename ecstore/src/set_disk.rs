@@ -157,6 +157,88 @@ impl SetDisks {
 
         disks
     }
+
+    pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
+        let mut disks = self.get_disks_internal().await;
+
+        let mut infos = Vec::with_capacity(disks.len());
+
+        let mut futures = Vec::with_capacity(disks.len());
+
+        let mut rng = thread_rng();
+        disks.shuffle(&mut rng);
+
+        let mut numbers: Vec<usize> = (0..disks.len()).collect();
+        numbers.shuffle(&mut rand::thread_rng());
+
+        for &i in numbers.iter() {
+            let disk = disks[i].clone();
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.disk_info(&DiskInfoOptions::default()).await
+                } else {
+                    Err(Error::new(DiskError::DiskNotFound))
+                }
+            });
+        }
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(res) => {
+                    infos.push(res);
+                }
+                Err(err) => {
+                    infos.push(DiskInfo {
+                        error: err.to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        let mut healing: usize = 0;
+
+        let mut scanning_disks = Vec::new();
+        let mut healing_disks = Vec::new();
+        let mut scanning_infos = Vec::new();
+        let mut healing_infos = Vec::new();
+
+        let mut new_disks = Vec::new();
+        let mut new_infos = Vec::new();
+
+        for &i in numbers.iter() {
+            let (info, disk) = (infos[i].clone(), disks[i].clone());
+            if !info.error.is_empty() || disk.is_none() {
+                continue;
+            }
+
+            if info.healing {
+                healing += 1;
+                if incl_healing {
+                    healing_disks.push(disk.unwrap());
+                    healing_infos.push(info);
+                }
+
+                continue;
+            }
+
+            if !info.healing {
+                new_disks.push(disk.unwrap());
+                new_infos.push(info);
+            } else {
+                scanning_disks.push(disk.unwrap());
+                scanning_infos.push(info);
+            }
+        }
+
+        new_disks.extend(scanning_disks);
+        new_infos.extend(scanning_infos);
+        new_disks.extend(healing_disks);
+        new_infos.extend(healing_infos);
+
+        (new_disks, new_infos, healing)
+    }
     async fn _get_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_disks_internal().await;
 
