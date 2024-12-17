@@ -8,12 +8,13 @@ use crate::store_api::{ListObjectsInfo, ObjectInfo};
 use crate::utils::path::{base_dir_from_prefix, SLASH_SEPARATOR};
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
+use futures::select;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::broadcast::Receiver as B_Receiver;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::error;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -223,85 +224,128 @@ impl ECStore {
     }
 
     // 读所有
-    async fn list_merged(&self, opts: &ListPathOptions) -> Result<Vec<ObjectInfo>> {
-        let walk_opts = WalkDirOptions {
-            bucket: opts.bucket.clone(),
-            base_dir: opts.base_dir.clone(),
-            ..Default::default()
-        };
-
-        // let (mut wr, mut rd) = tokio::io::duplex(1024);
-
+    async fn list_merged(
+        &self,
+        rx: B_Receiver<bool>,
+        opts: ListPathOptions,
+        sender: Sender<MetaCacheEntry>,
+    ) -> Result<Vec<ObjectInfo>> {
         let mut futures = Vec::new();
+
+        let mut inputs = Vec::new();
 
         for sets in self.pools.iter() {
             for set in sets.disk_set.iter() {
-                futures.push(set.walk_dir(&walk_opts));
+                let (send, recv) = mpsc::channel(100);
+
+                inputs.push(recv);
+                let opts = opts.clone();
+
+                let rx = rx.resubscribe();
+                futures.push(set.list_path(rx, opts, send));
             }
         }
+
+        let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
 
         let results = join_all(futures).await;
 
-        // let mut errs = Vec::new();
-        let mut ress = Vec::new();
-        let mut uniq = HashSet::new();
-
-        for (disks_ress, _disks_errs) in results {
-            for disks_res in disks_ress.iter() {
-                if disks_res.is_none() {
-                    // TODO handle errs
-                    continue;
-                }
-                let entrys = disks_res.as_ref().unwrap();
-
-                for entry in entrys {
-                    // warn!("lst_merged entry---- {}", &entry.name);
-
-                    if !opts.prefix.is_empty() && !entry.name.starts_with(&opts.prefix) {
-                        continue;
-                    }
-
-                    if !uniq.contains(&entry.name) {
-                        uniq.insert(entry.name.clone());
-                        // TODO: 过滤
-
-                        if opts.limit > 0 && ress.len() as i32 >= opts.limit {
-                            return Ok(ress);
-                        }
-
-                        if entry.is_object() {
-                            // if !opts.delimiter.is_empty() {
-                            //     // entry.name.trim_start_matches(pat)
-                            // }
-
-                            let fi = entry.to_fileinfo(&opts.bucket)?;
-                            if let Some(f) = fi {
-                                ress.push(f.to_object_info(&opts.bucket, &entry.name, false));
-                            }
-                            continue;
-                        }
-
-                        if entry.is_dir() {
-                            ress.push(ObjectInfo {
-                                is_dir: true,
-                                bucket: opts.bucket.clone(),
-                                name: entry.name.clone(),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
+        let mut errs = Vec::new();
+        for result in results {
+            if let Err(err) = result {
+                errs.push(Some(err));
+            } else {
+                errs.push(None);
             }
         }
 
-        // warn!("list_merged errs {:?}", errs);
+        unimplemented!()
 
-        Ok(ress)
+        // // let mut errs = Vec::new();
+        // let mut ress = Vec::new();
+        // let mut uniq = HashSet::new();
+
+        // for (disks_ress, _disks_errs) in results {
+        //     for disks_res in disks_ress.iter() {
+        //         if disks_res.is_none() {
+        //             // TODO handle errs
+        //             continue;
+        //         }
+        //         let entrys = disks_res.as_ref().unwrap();
+
+        //         for entry in entrys {
+        //             // warn!("lst_merged entry---- {}", &entry.name);
+
+        //             if !opts.prefix.is_empty() && !entry.name.starts_with(&opts.prefix) {
+        //                 continue;
+        //             }
+
+        //             if !uniq.contains(&entry.name) {
+        //                 uniq.insert(entry.name.clone());
+        //                 // TODO: 过滤
+
+        //                 if opts.limit > 0 && ress.len() as i32 >= opts.limit {
+        //                     return Ok(ress);
+        //                 }
+
+        //                 if entry.is_object() {
+        //                     // if !opts.delimiter.is_empty() {
+        //                     //     // entry.name.trim_start_matches(pat)
+        //                     // }
+
+        //                     let fi = entry.to_fileinfo(&opts.bucket)?;
+        //                     if let Some(f) = fi {
+        //                         ress.push(f.to_object_info(&opts.bucket, &entry.name, false));
+        //                     }
+        //                     continue;
+        //                 }
+
+        //                 if entry.is_dir() {
+        //                     ress.push(ObjectInfo {
+        //                         is_dir: true,
+        //                         bucket: opts.bucket.clone(),
+        //                         name: entry.name.clone(),
+        //                         ..Default::default()
+        //                     });
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
+
+        // // warn!("list_merged errs {:?}", errs);
+
+        // Ok(ress)
     }
 }
 
+async fn merge_entry_channels(
+    rx: B_Receiver<bool>,
+    ins: Vec<Receiver<MetaCacheEntry>>,
+    out: Sender<MetaCacheEntry>,
+    read_quorum: usize,
+) -> Result<()> {
+    // let mut rx = rx;
+    // let mut ins = ins;
+    // if ins.len() == 1 {
+    //     let rev = ins[0].recv();
+    //     loop {
+    //         tokio::select! {
+    //             _=rx.recv()=>break,
+    //             Some(entry) = rev =>{
+
+    //                 println!("recv entry {}", &entry.name);
+    //             }
+
+    //         }
+    //     }
+    // }
+
+    unimplemented!()
+}
+
 impl SetDisks {
-    pub async fn list_path(&self, rx: Receiver<bool>, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
+    pub async fn list_path(&self, rx: B_Receiver<bool>, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
         let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
 
         let mut ask_disks = get_list_quorum(&opts.ask_disks, self.set_drive_count as i32);
@@ -613,7 +657,8 @@ mod test {
             format: FormatV3::new(1, 1),
         };
 
-        let (_, rx) = broadcast::channel(1);
+        let (_tx, rx) = broadcast::channel(1);
+
         let bucket = "dada".to_owned();
 
         let opts = ListPathOptions {
