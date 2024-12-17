@@ -589,6 +589,7 @@ impl StorageAPI for Sets {
         .await;
         let (formats, errs) = load_format_erasure_all(&disks, true).await;
         if let Err(err) = check_format_erasure_values(&formats, self.set_drive_count) {
+            info!("failed to check formats erasure values: {}", err);
             return Ok((HealResultItem::default(), Some(err)));
         }
         let ref_format = match get_format_erasure_in_quorum(&formats) {
@@ -614,9 +615,10 @@ impl StorageAPI for Sets {
             return Ok((res, Some(Error::new(DiskError::NoHealRequired))));
         }
 
-        if !self.format.eq(&ref_format) {
-            return Ok((res, Some(Error::new(DiskError::CorruptedFormat))));
-        }
+        // if !self.format.eq(&ref_format) {
+        //     info!("format ({:?}) not eq ref_format ({:?})", self.format, ref_format);
+        //     return Ok((res, Some(Error::new(DiskError::CorruptedFormat))));
+        // }
 
         let format_op_id = Uuid::new_v4().to_string();
         let (new_format_sets, _) = new_heal_format_sets(&ref_format, self.set_count, self.set_drive_count, &formats, &errs);

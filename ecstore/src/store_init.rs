@@ -16,8 +16,7 @@ use std::{
     fmt::Debug,
 };
 
-use crate::config::error::ConfigError;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<Error>>) {
