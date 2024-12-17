@@ -1909,6 +1909,7 @@ impl StorageAPI for ECStore {
         counts
     }
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        info!("heal_format");
         let mut r = HealResultItem {
             heal_item_type: HEAL_ITEM_METADATA.to_string(),
             detail: "disk-format".to_string(),
@@ -1936,6 +1937,7 @@ impl StorageAPI for ECStore {
         if count_no_heal == self.pools.len() {
             return Ok((r, Some(Error::new(DiskError::NoHealRequired))));
         }
+        info!("heal format success result: {:?}", r);
         Ok((r, None))
     }
 

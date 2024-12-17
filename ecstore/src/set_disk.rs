@@ -1258,11 +1258,19 @@ impl SetDisks {
             Err(e) => {
                 warn!("connect_endpoint err {:?}", &e);
                 if ep.is_local && DiskError::UnformattedDisk.is(&e) {
-                    // TODO: pushHealLocalDisks
+                    GLOBAL_BackgroundHealState.push_heal_local_disks(&[ep.clone()]).await;
                 }
                 return;
             }
         };
+
+        if new_disk.is_local() {
+            if let Some(h) = new_disk.healing().await {
+                if !h.finished {
+                    GLOBAL_BackgroundHealState.push_heal_local_disks(&[new_disk.endpoint()]).await;
+                }
+            }
+        }
 
         let (set_idx, disk_idx) = match self.find_disk_index(&fm) {
             Ok(res) => res,
@@ -3022,6 +3030,7 @@ impl SetDisks {
         let mut ret_err = None;
         for bucket in buckets.iter() {
             if tracker.read().await.is_healed(bucket).await {
+                info!("bucket{} was healed", bucket);
                 continue;
             }
 
@@ -3142,6 +3151,7 @@ impl SetDisks {
             let bg_seq_clone = bg_seq.clone();
             let send_clone = send.clone();
             let heal_entry = Arc::new(move |bucket: String, entry: MetaCacheEntry| {
+                info!("heal entry, bucket: {}, entry: {:?}", bucket, entry);
                 let jt_clone = jt_clone.clone();
                 let self_clone = self_clone.clone();
                 let started = started_clone;
