@@ -167,6 +167,47 @@ impl DiskError {
     }
 }
 
+impl DiskError {
+    pub fn to_u8(&self) -> u32 {
+        match self {
+            DiskError::MaxVersionsExceeded => 0x01,
+            DiskError::Unexpected => 0x02,
+            DiskError::CorruptedFormat => 0x03,
+            DiskError::CorruptedBackend => 0x04,
+            DiskError::UnformattedDisk => 0x05,
+            DiskError::InconsistentDisk => 0x06,
+            DiskError::UnsupportedDisk => 0x07,
+            DiskError::DiskFull => 0x08,
+            DiskError::DiskNotDir => 0x09,
+            DiskError::DiskNotFound => 0x0A,
+            DiskError::DiskOngoingReq => 0x0B,
+            DiskError::DriveIsRoot => 0x0C,
+            DiskError::FaultyRemoteDisk => 0x0D,
+            DiskError::FaultyDisk => 0x0E,
+            DiskError::DiskAccessDenied => 0x0F,
+            DiskError::FileNotFound => 0x10,
+            DiskError::FileVersionNotFound => 0x11,
+            DiskError::TooManyOpenFiles => 0x12,
+            DiskError::FileNameTooLong => 0x13,
+            DiskError::VolumeExists => 0x14,
+            DiskError::IsNotRegular => 0x15,
+            DiskError::PathNotFound => 0x16,
+            DiskError::VolumeNotFound => 0x17,
+            DiskError::VolumeNotEmpty => 0x18,
+            DiskError::VolumeAccessDenied => 0x19,
+            DiskError::FileAccessDenied => 0x1A,
+            DiskError::FileCorrupt => 0x1B,
+            DiskError::BitrotHashAlgoInvalid => 0x1C,
+            DiskError::CrossDeviceLink => 0x1D,
+            DiskError::LessData => 0x1E,
+            DiskError::MoreData => 0x1F,
+            DiskError::OutdatedXLMeta => 0x20,
+            DiskError::PartMissingOrCorrupt => 0x21,
+            DiskError::NoHealRequired => 0x22,
+        }
+    }
+}
+
 impl PartialEq for DiskError {
     fn eq(&self, other: &Self) -> bool {
         core::mem::discriminant(self) == core::mem::discriminant(other)
