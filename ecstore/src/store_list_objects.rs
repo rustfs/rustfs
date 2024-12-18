@@ -1,13 +1,14 @@
 use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
 use crate::disk::{DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, WalkDirOptions};
 use crate::error::{Error, Result};
+use crate::file_meta::merge_file_meta_versions;
 use crate::peer::is_reserved_or_invalid_bucket;
 use crate::set_disk::SetDisks;
 use crate::store::check_list_objs_args;
 use crate::store_api::{ListObjectsInfo, ObjectInfo};
-use crate::utils::path::{base_dir_from_prefix, SLASH_SEPARATOR};
+use crate::utils::path::{self, base_dir_from_prefix, SLASH_SEPARATOR};
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
-use futures::future::join_all;
+use futures::future::{join_all, ok};
 use futures::select;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -319,29 +320,182 @@ impl ECStore {
     }
 }
 
+async fn select_from(
+    in_channels: &mut [Receiver<MetaCacheEntry>],
+    idx: usize,
+    top: &mut [Option<MetaCacheEntry>],
+    n_done: &mut usize,
+) -> Result<()> {
+    match in_channels[idx].recv().await {
+        Some(entry) => {
+            top[idx] = Some(entry);
+        }
+        None => {
+            top[idx] = None;
+            *n_done += 1;
+        }
+    }
+    Ok(())
+}
+
+// TODO: exit when cancel
 async fn merge_entry_channels(
     rx: B_Receiver<bool>,
-    ins: Vec<Receiver<MetaCacheEntry>>,
-    out: Sender<MetaCacheEntry>,
+    in_channels: Vec<Receiver<MetaCacheEntry>>,
+    out_channel: Sender<MetaCacheEntry>,
     read_quorum: usize,
 ) -> Result<()> {
-    // let mut rx = rx;
-    // let mut ins = ins;
-    // if ins.len() == 1 {
-    //     let rev = ins[0].recv();
-    //     loop {
-    //         tokio::select! {
-    //             _=rx.recv()=>break,
-    //             Some(entry) = rev =>{
+    let mut rx = rx;
+    let mut in_channels = in_channels;
+    if in_channels.len() == 1 {
+        loop {
+            tokio::select! {
+                has_entry = in_channels[0].recv()=>{
+                    if let Some(entry) = has_entry{
+                        out_channel.send(entry).await?;
+                    } else {
+                        return Ok(())
+                    }
+                },
+                _ = rx.recv()=>return Err(Error::msg("cancel")),
+            }
+        }
+    }
 
-    //                 println!("recv entry {}", &entry.name);
-    //             }
+    let mut top: Vec<Option<MetaCacheEntry>> = vec![None; in_channels.len()];
+    let mut n_done = 0;
 
-    //         }
-    //     }
-    // }
+    let in_channels_len = in_channels.len();
 
-    unimplemented!()
+    for idx in 0..in_channels_len {
+        select_from(&mut in_channels, idx, &mut top, &mut n_done).await?;
+    }
+
+    let mut last = String::new();
+    let mut to_merge: Vec<usize> = Vec::new();
+    loop {
+        if n_done == in_channels.len() {
+            return Ok(());
+        }
+
+        let mut best: Option<MetaCacheEntry> = None;
+        let mut best_idx = 0;
+        to_merge.clear();
+
+        // FIXME: top move when select_from call
+        let vtop = top.clone();
+
+        for (i, other) in vtop.iter().enumerate() {
+            if let Some(other_entry) = other {
+                if let Some(best_entry) = &best {
+                    let other_idx = i;
+
+                    if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
+                        let dir_matches = best_entry.is_dir() && other_entry.is_dir();
+                        let suffix_matche =
+                            best_entry.name.ends_with(SLASH_SEPARATOR) == other_entry.name.ends_with(SLASH_SEPARATOR);
+
+                        if dir_matches && suffix_matche {
+                            to_merge.push(other_idx);
+                            continue;
+                        }
+
+                        if !dir_matches {
+                            // dir and object has the save name
+                            if other_entry.is_dir() {
+                                // TODO: read next entry to top
+                                select_from(&mut in_channels, other_idx, &mut top, &mut n_done).await?;
+                                continue;
+                            }
+
+                            to_merge.clear();
+
+                            best = Some(other_entry.clone());
+                            best_idx = other_idx;
+                            continue;
+                        }
+                    } else if best_entry.name > other_entry.name {
+                        to_merge.clear();
+                        best = Some(other_entry.clone());
+                        best_idx = i;
+                    }
+                } else {
+                    best = Some(other_entry.clone());
+                    best_idx = i;
+                }
+            }
+        }
+
+        // TODO:
+        if !to_merge.is_empty() {
+            if let Some(entry) = &best {
+                let mut versions = Vec::with_capacity(to_merge.len() + 1);
+
+                let mut has_xl = {
+                    if let Ok(meta) = entry.clone().xl_meta() {
+                        Some(meta)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(x) = &has_xl {
+                    versions.push(x.versions.clone());
+                }
+
+                for &idx in to_merge.iter() {
+                    let has_entry = { top.get(idx).cloned() };
+
+                    if let Some(Some(entry)) = has_entry {
+                        let xl2 = match entry.clone().xl_meta() {
+                            Ok(res) => res,
+                            Err(_) => {
+                                select_from(&mut in_channels, idx, &mut top, &mut n_done).await?;
+
+                                continue;
+                            }
+                        };
+
+                        versions.push(xl2.versions.clone());
+
+                        if has_xl.is_none() {
+                            select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
+
+                            best_idx = idx;
+                            best = Some(entry.clone());
+                            has_xl = Some(xl2);
+                        } else {
+                            select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
+                        }
+                    }
+                }
+
+                if let Some(xl) = has_xl.as_mut() {
+                    if !versions.is_empty() {
+                        xl.versions = merge_file_meta_versions(read_quorum, true, 0, &versions);
+
+                        if let Ok(meta) = xl.marshal_msg() {
+                            if let Some(b) = best.as_mut() {
+                                b.metadata = meta;
+                                b.cached = Some(xl.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            to_merge.clear();
+        }
+
+        if let Some(best_entry) = &best {
+            if best_entry.name > last {
+                out_channel.send(best_entry.clone()).await?;
+                last = best_entry.name.clone();
+            }
+            top[best_idx] = None; // Replace entry we just sent
+            select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
+        }
+    }
 }
 
 impl SetDisks {

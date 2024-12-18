@@ -27,6 +27,7 @@ use crate::{
     store_api::{FileInfo, RawFileInfo},
 };
 use endpoint::Endpoint;
+use error::DiskError;
 use futures::StreamExt;
 use local::LocalDisk;
 use madmin::info_commands::DiskMetrics;
@@ -767,6 +768,26 @@ impl MetaCacheEntry {
         }
 
         Ok((prefer, true))
+    }
+
+    pub fn xl_meta(&mut self) -> Result<FileMeta> {
+        if self.is_dir() {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        if let Some(meta) = &self.cached {
+            Ok(meta.clone())
+        } else {
+            if self.metadata.is_empty() {
+                return Err(Error::new(DiskError::FileNotFound));
+            }
+
+            let meta = FileMeta::load(&self.metadata)?;
+
+            self.cached = Some(meta.clone());
+
+            Ok(meta)
+        }
     }
 }
 
