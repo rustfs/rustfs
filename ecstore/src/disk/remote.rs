@@ -21,6 +21,7 @@ use super::{
     FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader,
     RemoteFileWriter, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
+use crate::utils::proto_err_to_err;
 use crate::{
     disk::error::DiskError,
     error::{Error, Result},
@@ -161,7 +162,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.write_all(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -183,7 +188,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.delete(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -205,7 +214,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.verify_file(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
@@ -229,7 +242,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.check_parts(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
@@ -254,7 +271,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.rename_part(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -275,7 +296,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.rename_file(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -341,7 +366,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.list_dir(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(response.volumes)
@@ -361,7 +390,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.walk_dir(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let entries = response
@@ -398,7 +431,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.rename_data(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let rename_data_resp = serde_json::from_str::<RenameDataResp>(&response.rename_data_resp)?;
@@ -419,7 +456,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.make_volumes(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -438,7 +479,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.make_volume(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -456,7 +501,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.list_volumes(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let infos = response
@@ -481,7 +530,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.stat_volume(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let volume_info = serde_json::from_str::<VolumeInfo>(&response.volume_info)?;
@@ -504,7 +557,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.delete_paths(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -528,7 +585,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.update_metadata(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -550,7 +611,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.write_metadata(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -580,7 +645,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.read_version(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let file_info = serde_json::from_str::<FileInfo>(&response.file_info)?;
@@ -603,7 +672,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.read_xl(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
@@ -637,7 +710,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.delete_version(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         // let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
@@ -668,10 +745,11 @@ impl DiskAPI for RemoteDisk {
 
         let response = client.delete_versions(request).await?.into_inner();
         if !response.success {
-            return Err(Error::from_string(format!(
-                "delete versions remote err: {}",
-                response.error_info.unwrap_or("None".to_string())
-            )));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
         let errors = response
             .errors
@@ -702,7 +780,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.read_multiple(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let read_multiple_resps = response
@@ -727,7 +809,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.delete_volume(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -747,7 +833,11 @@ impl DiskAPI for RemoteDisk {
         let response = client.disk_info(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         let disk_info = serde_json::from_str::<DiskInfo>(&response.disk_info)?;
