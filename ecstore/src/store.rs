@@ -1935,6 +1935,7 @@ impl StorageAPI for ECStore {
             r.after.drives.append(&mut result.after.drives);
         }
         if count_no_heal == self.pools.len() {
+            info!("heal format success, NoHealRequired");
             return Ok((r, Some(Error::new(DiskError::NoHealRequired))));
         }
         info!("heal format success result: {:?}", r);

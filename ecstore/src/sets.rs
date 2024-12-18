@@ -612,6 +612,7 @@ impl StorageAPI for Sets {
             res.after.drives.push(v.clone());
         }
         if DiskError::UnformattedDisk.count_errs(&errs) == 0 {
+            info!("disk formats success, NoHealRequired, errs: {:?}", errs);
             return Ok((res, Some(Error::new(DiskError::NoHealRequired))));
         }
 

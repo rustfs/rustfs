@@ -762,7 +762,7 @@ impl DiskAPI for LocalDisk {
         self.endpoint.host_port()
     }
     async fn is_online(&self) -> bool {
-        true
+        self.check_format_json().await.is_ok()
     }
 
     fn endpoint(&self) -> Endpoint {

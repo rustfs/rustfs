@@ -1238,6 +1238,7 @@ impl SetDisks {
         for (i, opdisk) in disks.iter().enumerate() {
             if let Some(disk) = opdisk {
                 if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
+                    info!("Disk {:?} is online", disk);
                     continue;
                 }
 
@@ -1245,6 +1246,7 @@ impl SetDisks {
             }
 
             if let Some(endpoint) = self.set_endpoints.get(i) {
+                info!("will renew disk, opdisk: {:?}", opdisk);
                 self.renew_disk(endpoint).await;
             }
         }
@@ -2901,7 +2903,6 @@ impl SetDisks {
         info!("ns_scanner start");
         let _ = join_all(futures).await;
         drop(buckets_results_tx);
-        info!("1");
         let _ = task.await;
         info!("ns_scanner completed");
         Ok(())
