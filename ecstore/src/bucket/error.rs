@@ -29,3 +29,32 @@ impl BucketMetadataError {
         }
     }
 }
+
+impl BucketMetadataError {
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            BucketMetadataError::TaggingNotFound => 0x01,
+            BucketMetadataError::BucketPolicyNotFound => 0x02,
+            BucketMetadataError::BucketObjectLockConfigNotFound => 0x03,
+            BucketMetadataError::BucketLifecycleNotFound => 0x04,
+            BucketMetadataError::BucketSSEConfigNotFound => 0x05,
+            BucketMetadataError::BucketQuotaConfigNotFound => 0x06,
+            BucketMetadataError::BucketReplicationConfigNotFound => 0x07,
+            BucketMetadataError::BucketRemoteTargetNotFound => 0x08,
+        }
+    }
+
+    pub fn from_u32(error: u32) -> Option<Self> {
+        match error {
+            0x01 => Some(BucketMetadataError::TaggingNotFound),
+            0x02 => Some(BucketMetadataError::BucketPolicyNotFound),
+            0x03 => Some(BucketMetadataError::BucketObjectLockConfigNotFound),
+            0x04 => Some(BucketMetadataError::BucketLifecycleNotFound),
+            0x05 => Some(BucketMetadataError::BucketSSEConfigNotFound),
+            0x06 => Some(BucketMetadataError::BucketQuotaConfigNotFound),
+            0x07 => Some(BucketMetadataError::BucketReplicationConfigNotFound),
+            0x08 => Some(BucketMetadataError::BucketRemoteTargetNotFound),
+            _ => None,
+        }
+    }
+}

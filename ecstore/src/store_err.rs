@@ -76,6 +76,71 @@ pub enum StorageError {
     DecommissionNotStarted,
 }
 
+impl StorageError {
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            StorageError::NotImplemented => 0x01,
+            StorageError::InvalidArgument(_, _, _) => 0x02,
+            StorageError::MethodNotAllowed => 0x03,
+            StorageError::BucketNotFound(_) => 0x04,
+            StorageError::BucketNotEmpty(_) => 0x05,
+            StorageError::BucketNameInvalid(_) => 0x06,
+            StorageError::ObjectNameInvalid(_, _) => 0x07,
+            StorageError::BucketExists(_) => 0x08,
+            StorageError::StorageFull => 0x09,
+            StorageError::SlowDown => 0x0A,
+            StorageError::PrefixAccessDenied(_, _) => 0x0B,
+            StorageError::InvalidUploadIDKeyCombination(_, _) => 0x0C,
+            StorageError::MalformedUploadID(_) => 0x0D,
+            StorageError::ObjectNameTooLong(_, _) => 0x0E,
+            StorageError::ObjectNamePrefixAsSlash(_, _) => 0x0F,
+            StorageError::ObjectNotFound(_, _) => 0x10,
+            StorageError::VersionNotFound(_, _, _) => 0x11,
+            StorageError::InvalidUploadID(_, _, _) => 0x12,
+            StorageError::InvalidVersionID(_, _, _) => 0x13,
+            StorageError::DataMovementOverwriteErr(_, _, _) => 0x14,
+            StorageError::ObjectExistsAsDirectory(_, _) => 0x15,
+            StorageError::InsufficientReadQuorum => 0x16,
+            StorageError::InsufficientWriteQuorum => 0x17,
+            StorageError::DecommissionNotStarted => 0x18,
+        }
+    }
+
+    pub fn from_u32(error: u32) -> Option<Self> {
+        match error {
+            0x01 => Some(StorageError::NotImplemented),
+            0x02 => Some(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
+            0x03 => Some(StorageError::MethodNotAllowed),
+            0x04 => Some(StorageError::BucketNotFound(Default::default())),
+            0x05 => Some(StorageError::BucketNotEmpty(Default::default())),
+            0x06 => Some(StorageError::BucketNameInvalid(Default::default())),
+            0x07 => Some(StorageError::ObjectNameInvalid(Default::default(), Default::default())),
+            0x08 => Some(StorageError::BucketExists(Default::default())),
+            0x09 => Some(StorageError::StorageFull),
+            0x0A => Some(StorageError::SlowDown),
+            0x0B => Some(StorageError::PrefixAccessDenied(Default::default(), Default::default())),
+            0x0C => Some(StorageError::InvalidUploadIDKeyCombination(Default::default(), Default::default())),
+            0x0D => Some(StorageError::MalformedUploadID(Default::default())),
+            0x0E => Some(StorageError::ObjectNameTooLong(Default::default(), Default::default())),
+            0x0F => Some(StorageError::ObjectNamePrefixAsSlash(Default::default(), Default::default())),
+            0x10 => Some(StorageError::ObjectNotFound(Default::default(), Default::default())),
+            0x11 => Some(StorageError::VersionNotFound(Default::default(), Default::default(), Default::default())),
+            0x12 => Some(StorageError::InvalidUploadID(Default::default(), Default::default(), Default::default())),
+            0x13 => Some(StorageError::InvalidVersionID(Default::default(), Default::default(), Default::default())),
+            0x14 => Some(StorageError::DataMovementOverwriteErr(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )),
+            0x15 => Some(StorageError::ObjectExistsAsDirectory(Default::default(), Default::default())),
+            0x16 => Some(StorageError::InsufficientReadQuorum),
+            0x17 => Some(StorageError::InsufficientWriteQuorum),
+            0x18 => Some(StorageError::DecommissionNotStarted),
+            _ => None,
+        }
+    }
+}
+
 pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
     if let Some(e) = err.downcast_ref::<DiskError>() {
         match e {

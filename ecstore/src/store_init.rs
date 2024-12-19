@@ -16,6 +16,7 @@ use std::{
     fmt::Debug,
 };
 
+use crate::config::error::ConfigError;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -328,5 +329,28 @@ impl ErasureError {
         }
 
         false
+    }
+}
+
+impl ErasureError {
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            ErasureError::ErasureReadQuorum => 0x01,
+            ErasureError::_ErasureWriteQuorum => 0x02,
+            ErasureError::NotFirstDisk => 0x03,
+            ErasureError::FirstDiskWait => 0x04,
+            ErasureError::InvalidPart(_) => 0x05,
+        }
+    }
+
+    pub fn from_u32(error: u32) -> Option<Self> {
+        match error {
+            0x01 => Some(ErasureError::ErasureReadQuorum),
+            0x02 => Some(ErasureError::_ErasureWriteQuorum),
+            0x03 => Some(ErasureError::NotFirstDisk),
+            0x04 => Some(ErasureError::FirstDiskWait),
+            0x05 => Some(ErasureError::InvalidPart(Default::default())),
+            _ => None,
+        }
     }
 }
