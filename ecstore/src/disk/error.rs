@@ -2,6 +2,7 @@ use std::io::{self, ErrorKind};
 
 use tracing::error;
 
+use crate::utils::ERROR_TYPE_MASK;
 use crate::{
     error::{Error, Result},
     quorum::CheckErrorFn,
@@ -163,6 +164,87 @@ impl DiskError {
             e == self
         } else {
             false
+        }
+    }
+}
+
+impl DiskError {
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            DiskError::MaxVersionsExceeded => 0x01,
+            DiskError::Unexpected => 0x02,
+            DiskError::CorruptedFormat => 0x03,
+            DiskError::CorruptedBackend => 0x04,
+            DiskError::UnformattedDisk => 0x05,
+            DiskError::InconsistentDisk => 0x06,
+            DiskError::UnsupportedDisk => 0x07,
+            DiskError::DiskFull => 0x08,
+            DiskError::DiskNotDir => 0x09,
+            DiskError::DiskNotFound => 0x0A,
+            DiskError::DiskOngoingReq => 0x0B,
+            DiskError::DriveIsRoot => 0x0C,
+            DiskError::FaultyRemoteDisk => 0x0D,
+            DiskError::FaultyDisk => 0x0E,
+            DiskError::DiskAccessDenied => 0x0F,
+            DiskError::FileNotFound => 0x10,
+            DiskError::FileVersionNotFound => 0x11,
+            DiskError::TooManyOpenFiles => 0x12,
+            DiskError::FileNameTooLong => 0x13,
+            DiskError::VolumeExists => 0x14,
+            DiskError::IsNotRegular => 0x15,
+            DiskError::PathNotFound => 0x16,
+            DiskError::VolumeNotFound => 0x17,
+            DiskError::VolumeNotEmpty => 0x18,
+            DiskError::VolumeAccessDenied => 0x19,
+            DiskError::FileAccessDenied => 0x1A,
+            DiskError::FileCorrupt => 0x1B,
+            DiskError::BitrotHashAlgoInvalid => 0x1C,
+            DiskError::CrossDeviceLink => 0x1D,
+            DiskError::LessData => 0x1E,
+            DiskError::MoreData => 0x1F,
+            DiskError::OutdatedXLMeta => 0x20,
+            DiskError::PartMissingOrCorrupt => 0x21,
+            DiskError::NoHealRequired => 0x22,
+        }
+    }
+
+    pub fn from_u32(error: u32) -> Option<Self> {
+        match error & ERROR_TYPE_MASK {
+            0x01 => Some(DiskError::MaxVersionsExceeded),
+            0x02 => Some(DiskError::Unexpected),
+            0x03 => Some(DiskError::CorruptedFormat),
+            0x04 => Some(DiskError::CorruptedBackend),
+            0x05 => Some(DiskError::UnformattedDisk),
+            0x06 => Some(DiskError::InconsistentDisk),
+            0x07 => Some(DiskError::UnsupportedDisk),
+            0x08 => Some(DiskError::DiskFull),
+            0x09 => Some(DiskError::DiskNotDir),
+            0x0A => Some(DiskError::DiskNotFound),
+            0x0B => Some(DiskError::DiskOngoingReq),
+            0x0C => Some(DiskError::DriveIsRoot),
+            0x0D => Some(DiskError::FaultyRemoteDisk),
+            0x0E => Some(DiskError::FaultyDisk),
+            0x0F => Some(DiskError::DiskAccessDenied),
+            0x10 => Some(DiskError::FileNotFound),
+            0x11 => Some(DiskError::FileVersionNotFound),
+            0x12 => Some(DiskError::TooManyOpenFiles),
+            0x13 => Some(DiskError::FileNameTooLong),
+            0x14 => Some(DiskError::VolumeExists),
+            0x15 => Some(DiskError::IsNotRegular),
+            0x16 => Some(DiskError::PathNotFound),
+            0x17 => Some(DiskError::VolumeNotFound),
+            0x18 => Some(DiskError::VolumeNotEmpty),
+            0x19 => Some(DiskError::VolumeAccessDenied),
+            0x1A => Some(DiskError::FileAccessDenied),
+            0x1B => Some(DiskError::FileCorrupt),
+            0x1C => Some(DiskError::BitrotHashAlgoInvalid),
+            0x1D => Some(DiskError::CrossDeviceLink),
+            0x1E => Some(DiskError::LessData),
+            0x1F => Some(DiskError::MoreData),
+            0x20 => Some(DiskError::OutdatedXLMeta),
+            0x21 => Some(DiskError::PartMissingOrCorrupt),
+            0x22 => Some(DiskError::NoHealRequired),
+            _ => None,
         }
     }
 }

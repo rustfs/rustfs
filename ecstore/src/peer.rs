@@ -20,6 +20,7 @@ use crate::heal::heal_commands::{
 use crate::heal::heal_ops::RUESTFS_RESERVED_BUCKET;
 use crate::quorum::{bucket_op_ignored_errs, reduce_write_quorum_errs};
 use crate::store::all_local_disk;
+use crate::utils::proto_err_to_err;
 use crate::utils::wildcard::is_rustfs_meta_bucket_name;
 use crate::{
     disk::{self, error::DiskError, VolumeInfo},
@@ -523,7 +524,11 @@ impl PeerS3Client for RemotePeerS3Client {
         });
         let response = client.heal_bucket(request).await?.into_inner();
         if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or_default()));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(HealResultItem {
@@ -541,6 +546,13 @@ impl PeerS3Client for RemotePeerS3Client {
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ListBucketRequest { options });
         let response = client.list_bucket(request).await?.into_inner();
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
         let bucket_infos = response
             .bucket_infos
             .into_iter()
@@ -562,7 +574,11 @@ impl PeerS3Client for RemotePeerS3Client {
 
         // TODO: deal with error
         if !response.success {
-            warn!("make bucket error: {:?}", response.error_info);
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
         Ok(())
@@ -577,6 +593,13 @@ impl PeerS3Client for RemotePeerS3Client {
             options,
         });
         let response = client.get_bucket_info(request).await?.into_inner();
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
         let bucket_info = serde_json::from_str::<BucketInfo>(&response.bucket_info)?;
 
         Ok(bucket_info)
@@ -590,7 +613,14 @@ impl PeerS3Client for RemotePeerS3Client {
         let request = Request::new(DeleteBucketRequest {
             bucket: bucket.to_string(),
         });
-        let _response = client.delete_bucket(request).await?.into_inner();
+        let response = client.delete_bucket(request).await?.into_inner();
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
 
         Ok(())
     }

@@ -1,18 +1,35 @@
+use crate::config::error::ConfigError;
 use crate::{disk::error::DiskError, error::Error};
 use std::{collections::HashMap, fmt::Debug};
-
 // pub type CheckErrorFn = fn(e: &Error) -> bool;
 
 pub trait CheckErrorFn: Debug + Send + Sync + 'static {
     fn is(&self, e: &Error) -> bool;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum QuorumError {
     #[error("Read quorum not met")]
     Read,
     #[error("disk not found")]
     Write,
+}
+
+impl QuorumError {
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            QuorumError::Read => 0x01,
+            QuorumError::Write => 0x02,
+        }
+    }
+
+    pub fn from_u32(error: u32) -> Option<Self> {
+        match error {
+            0x01 => Some(QuorumError::Read),
+            0x02 => Some(QuorumError::Write),
+            _ => None,
+        }
+    }
 }
 
 pub fn base_ignored_errs() -> Vec<Box<dyn CheckErrorFn>> {

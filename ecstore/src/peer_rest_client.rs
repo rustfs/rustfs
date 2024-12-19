@@ -53,7 +53,7 @@ impl PeerRestClient {
         let eps = eps.clone();
         let hosts = eps.hosts_sorted();
         let mut remote = vec![None; hosts.len()];
-        let mut all = Vec::with_capacity(hosts.len());
+        let mut all = vec![None; hosts.len()];
         for (i, hs_host) in hosts.iter().enumerate() {
             if let Some(host) = hs_host {
                 if let Some(grid_host) = eps.find_grid_hosts_from_peer(host) {
