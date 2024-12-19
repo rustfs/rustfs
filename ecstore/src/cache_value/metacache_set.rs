@@ -1,5 +1,9 @@
+use crate::{
+    disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions},
+    error::{Error, Result},
+};
+use futures::future::join_all;
 use std::{future::Future, pin::Pin, sync::Arc};
-
 use tokio::{
     spawn,
     sync::{
@@ -8,11 +12,7 @@ use tokio::{
         RwLock,
     },
 };
-
-use crate::{
-    disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions},
-    error::{Error, Result},
-};
+use tracing::info;
 
 type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
@@ -58,18 +58,20 @@ impl Clone for ListPathRawOptions {
 
 pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> Result<()> {
     if opts.disks.is_empty() {
+        info!("list_path_raw 0 drives provided");
         return Err(Error::from_string("list_path_raw: 0 drives provided"));
     }
 
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = Arc::new(RwLock::new(opts.fallback_disks.clone()));
+    let mut futures = Vec::with_capacity(opts.disks.len());
     for disk in opts.disks.iter() {
         let disk = disk.clone();
         let opts_clone = opts.clone();
         let fds_clone = fds.clone();
         let (m_tx, m_rx) = mpsc::channel::<MetaCacheEntry>(100);
         readers.push(m_rx);
-        spawn(async move {
+        futures.push(async move {
             let mut need_fallback = false;
             if disk.is_none() {
                 need_fallback = true;
@@ -136,21 +138,25 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                     Err(_) => break,
                 }
             }
+            drop(m_tx);
         });
     }
+
+    let _ = join_all(futures).await;
 
     let errs: Vec<Option<Error>> = vec![None; readers.len()];
     loop {
         let mut current = MetaCacheEntry::default();
         let (mut at_eof, mut has_err, mut agree) = (0, 0, 0);
         if rx.try_recv().is_ok() {
+            info!("list_path_raw canceled");
             return Err(Error::from_string("canceled"));
         }
-        let mut top_entries: Vec<MetaCacheEntry> = Vec::with_capacity(readers.len());
+        let mut top_entries: Vec<MetaCacheEntry> = vec![MetaCacheEntry::default(); readers.len()];
         // top_entries.clear();
 
         for (i, r) in readers.iter_mut().enumerate() {
-            if errs[i].is_none() {
+            if errs[i].is_some() {
                 has_err += 1;
                 continue;
             }
@@ -163,20 +169,20 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
             };
             // If no current, add it.
             if current.name.is_empty() {
-                top_entries.insert(i, entry.clone());
+                top_entries[i] = entry.clone();
                 current = entry;
                 agree += 1;
                 continue;
             }
             // If exact match, we agree.
             if let Ok((_, true)) = current.matches(&entry, true) {
-                top_entries.insert(i, entry);
+                top_entries[i] = entry;
                 agree += 1;
                 continue;
             }
             // If only the name matches we didn't agree, but add it for resolution.
             if entry.name == current.name {
-                top_entries.insert(i, entry);
+                top_entries[i] = entry;
                 continue;
             }
             // We got different entries
@@ -185,9 +191,11 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
             }
             // We got a new, better current.
             // Clear existing entries.
-            top_entries.clear();
+            for i in 0..top_entries.len() {
+                top_entries[i] = MetaCacheEntry::default();
+            }
             agree += 1;
-            top_entries.insert(i, entry.clone());
+            top_entries[i] = entry.clone();
             current = entry;
         }
 
@@ -205,14 +213,16 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
                 _ => {}
             });
-
+            info!("list_path_raw failed, err: {:?}", combined_err);
             return Err(Error::from_string(combined_err.join(", ")));
         }
 
         // Break if all at EOF or error.
-        if at_eof + has_err == readers.len() && has_err > 0 {
+        if at_eof + has_err == readers.len() {
             if let Some(finished_fn) = opts.finished.as_ref() {
-                finished_fn(&errs).await;
+                if has_err > 0 {
+                    finished_fn(&errs).await;
+                }
             }
             break;
         }

@@ -388,6 +388,7 @@ pub async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTra
                 )));
             }
             healing_tracker.id = disk_id;
+            healing_tracker.disk = Some(disk.clone());
             Ok(healing_tracker)
         } else {
             Err(Error::from_string("loadHealingTracker: disk not have id"))
@@ -400,7 +401,10 @@ pub async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTra
 pub async fn init_healing_tracker(disk: DiskStore, heal_id: &str) -> Result<HealingTracker> {
     let disk_location = disk.get_disk_location();
     Ok(HealingTracker {
-        id: disk.get_disk_id().await?.map_or("".to_string(), |id| id.to_string()),
+        id: disk
+            .get_disk_id()
+            .await
+            .map_or("".to_string(), |id| id.map_or("".to_string(), |id| id.to_string())),
         heal_id: heal_id.to_string(),
         path: disk.to_string(),
         endpoint: disk.endpoint().to_string(),

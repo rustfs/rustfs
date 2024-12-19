@@ -671,8 +671,10 @@ impl ECStore {
         want_cycle: usize,
         heal_scan_mode: HealScanMode,
     ) -> Result<()> {
+        info!("ns_scanner updates - {}", want_cycle);
         let all_buckets = self.list_bucket(&BucketOptions::default()).await?;
         if all_buckets.is_empty() {
+            info!("No buckets found");
             let _ = updates.send(DataUsageInfo::default()).await;
             return Ok(());
         }
@@ -1907,6 +1909,7 @@ impl StorageAPI for ECStore {
         counts
     }
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        info!("heal_format");
         let mut r = HealResultItem {
             heal_item_type: HEAL_ITEM_METADATA.to_string(),
             detail: "disk-format".to_string(),
@@ -1932,8 +1935,10 @@ impl StorageAPI for ECStore {
             r.after.drives.append(&mut result.after.drives);
         }
         if count_no_heal == self.pools.len() {
+            info!("heal format success, NoHealRequired");
             return Ok((r, Some(Error::new(DiskError::NoHealRequired))));
         }
+        info!("heal format success result: {:?}", r);
         Ok((r, None))
     }
 
