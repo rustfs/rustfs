@@ -6,8 +6,7 @@ use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
     os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions,
     FileReader, FileWriter, Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
-    STORAGE_FORMAT_FILE_BACKUP,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE_BACKUP,
 };
 use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::{self};
@@ -27,7 +26,6 @@ use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
 use crate::heal::heal_commands::{HealScanMode, HealingTracker};
 use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
-use crate::io::AsyncToSync;
 use crate::metacache::writer::MetacacheWriter;
 use crate::new_object_layer_fn;
 use crate::set_disk::{
@@ -51,7 +49,7 @@ use nix::NixPath;
 use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -839,7 +837,6 @@ impl LocalDisk {
             }
         }
 
-        let prefix = "";
         let mut dir_stack: Vec<String> = Vec::with_capacity(5);
 
         for entry in entries.iter() {
@@ -2341,16 +2338,6 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
 
 #[cfg(test)]
 mod test {
-
-    use futures::future::join_all;
-    use tokio::io::BufWriter;
-    use utils::fs::open_file;
-    use utils::fs::O_RDWR;
-    use utils::fs::O_TRUNC;
-
-    use crate::io::VecAsyncReader;
-    use crate::io::VecAsyncWriter;
-    use crate::metacache::writer::MetacacheReader;
 
     use super::*;
 

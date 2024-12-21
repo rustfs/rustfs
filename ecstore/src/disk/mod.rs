@@ -15,10 +15,7 @@ pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::{
-    bucket::{
-        metadata_sys::get_versioning_config,
-        versioning::{self, VersioningApi},
-    },
+    bucket::{metadata_sys::get_versioning_config, versioning::VersioningApi},
     erasure::Writer,
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
@@ -27,7 +24,6 @@ use crate::{
         data_usage_cache::{DataUsageCache, DataUsageEntry},
         heal_commands::{HealScanMode, HealingTracker},
     },
-    io,
     store_api::{FileInfo, ObjectInfo, RawFileInfo},
 };
 use endpoint::Endpoint;
@@ -45,7 +41,6 @@ use std::{
     cmp::Ordering,
     fmt::Debug,
     io::{Cursor, SeekFrom},
-    ops::Index,
     path::PathBuf,
     sync::Arc,
 };
@@ -921,7 +916,7 @@ impl MetaCacheEntriesSorted {
                                 continue;
                             }
 
-                            prev_prefix = curr_prefix.clone();
+                            prev_prefix = curr_prefix;
 
                             objects.push(ObjectInfo {
                                 is_dir: true,
@@ -954,7 +949,7 @@ impl MetaCacheEntriesSorted {
                             continue;
                         }
 
-                        prev_prefix = curr_prefix.clone();
+                        prev_prefix = curr_prefix;
 
                         objects.push(ObjectInfo {
                             is_dir: true,
