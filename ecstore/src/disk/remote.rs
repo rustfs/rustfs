@@ -350,7 +350,8 @@ impl DiskAPI for RemoteDisk {
         Ok(response.volumes)
     }
 
-    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
+    // FIXME: TODO: use writer
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, _wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
         info!("walk_dir");
         let walk_dir_options = serde_json::to_string(&opts)?;
         let mut client = node_service_time_out_client(&self.addr)

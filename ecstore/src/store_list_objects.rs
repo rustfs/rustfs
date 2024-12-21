@@ -1,8 +1,6 @@
 use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
 use crate::disk::error::{is_all_not_found, is_all_volume_not_found, is_err_eof, DiskError};
-use crate::disk::{
-    DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetadataResolutionParams, WalkDirOptions,
-};
+use crate::disk::{DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetadataResolutionParams};
 use crate::error::{Error, Result};
 use crate::file_meta::merge_file_meta_versions;
 use crate::peer::is_reserved_or_invalid_bucket;
@@ -11,21 +9,20 @@ use crate::store::check_list_objs_args;
 use crate::store_api::{ListObjectsInfo, ObjectInfo};
 use crate::utils::path::{self, base_dir_from_prefix, SLASH_SEPARATOR};
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
-use futures::future::{join_all, ok};
-use futures::select;
+use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{error, warn};
+use tracing::error;
 
 const MAX_OBJECT_LIST: i32 = 1000;
-const MAX_DELETE_LIST: i32 = 1000;
-const MAX_UPLOADS_LIST: i32 = 10000;
-const MAX_PARTS_LIST: i32 = 10000;
+// const MAX_DELETE_LIST: i32 = 1000;
+// const MAX_UPLOADS_LIST: i32 = 10000;
+// const MAX_PARTS_LIST: i32 = 10000;
 
 const METACACHE_SHARE_PREFIX: bool = false;
 
@@ -188,7 +185,7 @@ impl ECStore {
                 get_objects.truncate(max_keys as usize);
                 true
             } else {
-                !err_eof && get_objects.len() > 0
+                !err_eof && !get_objects.is_empty()
             }
         };
 
@@ -388,62 +385,6 @@ impl ECStore {
         _ = all_at_eof;
 
         Ok(Vec::new())
-
-        // // let mut errs = Vec::new();
-        // let mut ress = Vec::new();
-        // let mut uniq = HashSet::new();
-
-        // for (disks_ress, _disks_errs) in results {
-        //     for disks_res in disks_ress.iter() {
-        //         if disks_res.is_none() {
-        //             // TODO handle errs
-        //             continue;
-        //         }
-        //         let entrys = disks_res.as_ref().unwrap();
-
-        //         for entry in entrys {
-        //             // warn!("lst_merged entry---- {}", &entry.name);
-
-        //             if !opts.prefix.is_empty() && !entry.name.starts_with(&opts.prefix) {
-        //                 continue;
-        //             }
-
-        //             if !uniq.contains(&entry.name) {
-        //                 uniq.insert(entry.name.clone());
-        //                 // TODO: 过滤
-
-        //                 if opts.limit > 0 && ress.len() as i32 >= opts.limit {
-        //                     return Ok(ress);
-        //                 }
-
-        //                 if entry.is_object() {
-        //                     // if !opts.delimiter.is_empty() {
-        //                     //     // entry.name.trim_start_matches(pat)
-        //                     // }
-
-        //                     let fi = entry.to_fileinfo(&opts.bucket)?;
-        //                     if let Some(f) = fi {
-        //                         ress.push(f.to_object_info(&opts.bucket, &entry.name, false));
-        //                     }
-        //                     continue;
-        //                 }
-
-        //                 if entry.is_dir() {
-        //                     ress.push(ObjectInfo {
-        //                         is_dir: true,
-        //                         bucket: opts.bucket.clone(),
-        //                         name: entry.name.clone(),
-        //                         ..Default::default()
-        //                     });
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
-
-        // // warn!("list_merged errs {:?}", errs);
-
-        // Ok(ress)
     }
 }
 
@@ -840,7 +781,6 @@ mod test {
     use crate::set_disk::SetDisks;
     use crate::store::ECStore;
     use crate::store_list_objects::ListPathOptions;
-    use crate::StorageAPI;
     use futures::future::join_all;
     use lock::namespace_lock::NsLockMap;
     use tokio::sync::broadcast;
