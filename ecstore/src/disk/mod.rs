@@ -18,7 +18,7 @@ use crate::{
     bucket::{metadata_sys::get_versioning_config, versioning::VersioningApi},
     erasure::Writer,
     error::{Error, Result},
-    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
+    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion, VersionType},
     heal::{
         data_scanner::ShouldSleepFn,
         data_usage_cache::{DataUsageCache, DataUsageEntry},
@@ -627,6 +627,39 @@ impl MetaCacheEntry {
     }
     pub fn is_object(&self) -> bool {
         !self.metadata.is_empty()
+    }
+
+    pub fn is_latest_deletemarker(&mut self) -> bool {
+        if let Some(cached) = &self.cached {
+            if cached.versions.is_empty() {
+                return true;
+            }
+
+            return cached.versions[0].header.version_type == VersionType::Delete;
+        }
+
+        if !FileMeta::is_xl2_v1_format(&self.metadata) {
+            return false;
+        }
+
+        match FileMeta::check_xl2_v1(&self.metadata) {
+            Ok((meta, _, _)) => {
+                if !meta.is_empty() {
+                    // TODO: IsLatestDeleteMarker
+                }
+            }
+            Err(_) => return true,
+        }
+
+        match self.xl_meta() {
+            Ok(res) => {
+                if res.versions.is_empty() {
+                    return true;
+                }
+                res.versions[0].header.version_type == VersionType::Delete
+            }
+            Err(_) => true,
+        }
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
