@@ -1512,7 +1512,7 @@ impl StorageAPI for ECStore {
 
     // TODO: review
     async fn list_objects_v2(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         prefix: &str,
         continuation_token: &str,
@@ -2170,9 +2170,11 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
     *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
 }
 
-pub fn is_valid_object_prefix(object: &str) -> bool {
+pub fn is_valid_object_prefix(_object: &str) -> bool {
     // Implement object prefix validation
-    !object.is_empty() // Placeholder
+    // !object.is_empty() // Placeholder
+    // FIXME: TODO:
+    true
 }
 
 fn is_valid_object_name(object: &str) -> bool {

@@ -1,5 +1,8 @@
 use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
-use crate::disk::{DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, WalkDirOptions};
+use crate::disk::error::{is_all_not_found, is_all_volume_not_found, is_err_eof, DiskError};
+use crate::disk::{
+    DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetadataResolutionParams, WalkDirOptions,
+};
 use crate::error::{Error, Result};
 use crate::file_meta::merge_file_meta_versions;
 use crate::peer::is_reserved_or_invalid_bucket;
@@ -14,9 +17,10 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
-use tokio::sync::broadcast::Receiver as B_Receiver;
+use std::sync::Arc;
+use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::error;
+use tracing::{error, warn};
 
 const MAX_OBJECT_LIST: i32 = 1000;
 const MAX_DELETE_LIST: i32 = 1000;
@@ -114,7 +118,7 @@ impl ListPathOptions {
 impl ECStore {
     #[allow(clippy::too_many_arguments)]
     pub async fn inner_list_objects_v2(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         prefix: &str,
         continuation_token: &str,
@@ -131,13 +135,18 @@ impl ECStore {
             }
         };
 
-        self.list_objects_generic(bucket, prefix, marker, delimiter, max_keys).await?;
-        // FIXME:TODO:
-        unimplemented!()
+        let loi = self.list_objects_generic(bucket, prefix, marker, delimiter, max_keys).await?;
+        Ok(ListObjectsV2Info {
+            is_truncated: loi.is_truncated,
+            continuation_token: continuation_token.to_owned(),
+            next_continuation_token: loi.next_marker,
+            objects: loi.objects,
+            prefixes: loi.prefixes,
+        })
     }
 
     pub async fn list_objects_generic(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         prefix: &str,
         marker: &str,
@@ -155,14 +164,73 @@ impl ECStore {
             ..Default::default()
         };
 
-        let merged = self.list_path(&opts).await?;
+        let mut err_eof = false;
+        let has_merged = match self.list_path(&opts).await {
+            Ok(res) => Some(res),
+            Err(err) => {
+                if !is_err_eof(&err) {
+                    return Err(err);
+                }
 
-        // FIXME:TODO:
+                err_eof = true;
+                None
+            }
+        };
 
-        todo!()
+        let mut get_objects = if let Some(merged) = has_merged {
+            merged.file_infos(bucket, prefix, delimiter).await
+        } else {
+            Vec::new()
+        };
+
+        let is_truncated = {
+            if max_keys > 0 && get_objects.len() > max_keys as usize {
+                get_objects.truncate(max_keys as usize);
+                true
+            } else {
+                !err_eof && get_objects.len() > 0
+            }
+        };
+
+        let mut prefixes: Vec<String> = Vec::new();
+
+        let mut objects = Vec::with_capacity(get_objects.len());
+        for obj in get_objects.into_iter() {
+            if obj.is_dir && obj.mod_time.is_none() && !delimiter.is_empty() {
+                let mut found = false;
+                if delimiter != SLASH_SEPARATOR {
+                    for p in prefixes.iter() {
+                        if found {
+                            break;
+                        }
+                        found = p == &obj.name;
+                    }
+                }
+                if !found {
+                    prefixes.push(obj.name.clone());
+                }
+            } else {
+                objects.push(obj);
+            }
+        }
+
+        let next_marker = {
+            if is_truncated {
+                objects.last().map(|last| last.name.clone())
+            } else {
+                None
+            }
+        };
+
+        Ok(ListObjectsInfo {
+            is_truncated,
+            next_marker: next_marker.unwrap_or_default(),
+            objects,
+            prefixes,
+        })
     }
 
-    pub async fn list_path(&self, o: &ListPathOptions) -> Result<ListObjectsInfo> {
+    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSorted> {
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
         // if opts.prefix.ends_with(SLASH_SEPARATOR) {
         //     return Err(Error::msg("eof"));
@@ -181,7 +249,7 @@ impl ECStore {
             return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
         }
 
-        if o.prefix.ends_with(SLASH_SEPARATOR) {
+        if o.prefix.starts_with(SLASH_SEPARATOR) {
             return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
         }
 
@@ -207,7 +275,29 @@ impl ECStore {
         }
 
         // FIXME:TODO:
-        todo!()
+        let (tx, rx) = broadcast::channel(1);
+
+        let (sender, mut recv) = mpsc::channel(o.limit as usize);
+
+        let store = self.clone();
+        let opts = o.clone();
+        let rx1 = rx.resubscribe();
+        tokio::spawn(async move {
+            if let Err(err) = store.list_merged(rx1, opts, sender).await {
+                error!("list_merged err {:?}", err);
+            }
+        });
+
+        let rx2 = rx.resubscribe();
+        let res = gather_results(rx2, &o, &mut recv).await?;
+
+        tx.send(true)?;
+
+        // TODO: recv list_merged err
+
+        Ok(MetaCacheEntriesSorted {
+            o: MetaCacheEntries(res.into_iter().map(Some).collect()),
+        })
 
         // let mut opts = opts.clone();
 
@@ -247,20 +337,57 @@ impl ECStore {
             }
         }
 
-        let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
+        tokio::spawn(async move {
+            if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
+                println!("merge_entry_channels err {:?}", err)
+            }
+        });
+
+        // let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
 
         let results = join_all(futures).await;
+
+        let mut all_at_eof = true;
 
         let mut errs = Vec::new();
         for result in results {
             if let Err(err) = result {
+                all_at_eof = false;
                 errs.push(Some(err));
             } else {
                 errs.push(None);
             }
         }
 
-        unimplemented!()
+        if is_all_not_found(&errs) {
+            if is_all_volume_not_found(&errs) {
+                return Err(Error::new(DiskError::VolumeNotFound));
+            }
+
+            return Ok(Vec::new());
+        }
+
+        // merge_res?;
+
+        // TODO check cancel
+
+        for err in errs.iter() {
+            if let Some(err) = err {
+                if is_err_eof(err) {
+                    continue;
+                }
+
+                return Err(err.clone());
+            } else {
+                all_at_eof = false;
+                continue;
+            }
+        }
+
+        // check all_at_eof
+        _ = all_at_eof;
+
+        Ok(Vec::new())
 
         // // let mut errs = Vec::new();
         // let mut ress = Vec::new();
@@ -318,6 +445,42 @@ impl ECStore {
 
         // Ok(ress)
     }
+}
+
+// TODO: FIXME: 异步
+async fn gather_results(
+    _rx: B_Receiver<bool>,
+    opts: &ListPathOptions,
+    recv: &mut Receiver<MetaCacheEntry>,
+) -> Result<Vec<MetaCacheEntry>> {
+    let mut returned = false;
+    let mut results = Vec::new();
+    while let Some(entry) = recv.recv().await {
+        if returned {
+            continue;
+        }
+
+        // TODO: rx.recv()
+
+        // TODO: isLatestDeletemarker
+        if !opts.include_directories && (entry.is_dir() || (!opts.versioned && entry.is_object())) {
+            continue;
+        }
+
+        if !opts.marker.is_empty() && entry.name < opts.marker {
+            continue;
+        }
+
+        // TODO: other
+        if opts.limit > 0 && results.len() >= opts.limit as usize {
+            returned = true;
+            continue;
+        }
+
+        results.push(entry);
+    }
+
+    Ok(results)
 }
 
 async fn select_from(
@@ -390,6 +553,8 @@ async fn merge_entry_channels(
                 if let Some(best_entry) = &best {
                     let other_idx = i;
 
+                    // println!("get other_entry {:?}", other_entry.name);
+
                     if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
                         let dir_matches = best_entry.is_dir() && other_entry.is_dir();
                         let suffix_matche =
@@ -425,6 +590,8 @@ async fn merge_entry_channels(
                 }
             }
         }
+
+        // println!("get best_entry {} {:?}", &best_idx, &best.clone().unwrap_or_default().name);
 
         // TODO:
         if !to_merge.is_empty() {
@@ -667,10 +834,13 @@ mod test {
     use crate::disk::MetaCacheEntries;
     use crate::disk::MetaCacheEntry;
     use crate::disk::WalkDirOptions;
+    use crate::endpoints::EndpointServerPools;
     use crate::error::Error;
     use crate::metacache::writer::MetacacheReader;
     use crate::set_disk::SetDisks;
+    use crate::store::ECStore;
     use crate::store_list_objects::ListPathOptions;
+    use crate::StorageAPI;
     use futures::future::join_all;
     use lock::namespace_lock::NsLockMap;
     use tokio::sync::broadcast;
@@ -788,7 +958,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_path() {
+    async fn test_set_list_path() {
         let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
         ep.pool_idx = 0;
         ep.set_idx = 0;
@@ -829,4 +999,81 @@ mod test {
             println!("get entry {:?}", entry.name)
         }
     }
+
+    #[tokio::test]
+    async fn test_list_merged() {
+        let server_address = "localhost:9000";
+
+        let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
+            server_address,
+            vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
+        )
+        .unwrap();
+
+        let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
+            .await
+            .unwrap();
+
+        let (_tx, rx) = broadcast::channel(1);
+
+        let bucket = "dada".to_owned();
+        let opts = ListPathOptions {
+            bucket,
+            recursive: true,
+            ..Default::default()
+        };
+
+        let (sender, mut recv) = mpsc::channel(10);
+
+        store.list_merged(rx, opts, sender).await.unwrap();
+
+        while let Some(entry) = recv.recv().await {
+            println!("get entry {:?}", entry.name)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_path() {
+        let server_address = "localhost:9000";
+
+        let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
+            server_address,
+            vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
+        )
+        .unwrap();
+
+        let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
+            .await
+            .unwrap();
+
+        let bucket = "dada".to_owned();
+        let opts = ListPathOptions {
+            bucket,
+            recursive: true,
+            limit: 100,
+
+            ..Default::default()
+        };
+
+        let ret = store.list_path(&opts).await.unwrap();
+        println!("ret {:?}", ret);
+    }
+
+    // #[tokio::test]
+    // async fn test_list_objects_v2() {
+    //     let server_address = "localhost:9000";
+
+    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
+    //         server_address,
+    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
+    //     )
+    //     .unwrap();
+
+    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
+    //         .await
+    //         .unwrap();
+
+    //     let ret = store.list_objects_v2("data", "", "", "", 100, false, "").await.unwrap();
+    //     println!("ret {:?}", ret);
+    // }
 }

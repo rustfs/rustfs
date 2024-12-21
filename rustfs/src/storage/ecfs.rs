@@ -460,8 +460,6 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        // warn!("list_objects_v2 input {:?}", &req.input);
-
         let ListObjectsV2Input {
             bucket,
             continuation_token,
@@ -475,6 +473,7 @@ impl S3 for FS {
 
         let prefix = prefix.unwrap_or_default();
         let delimiter = delimiter.unwrap_or_default();
+        let max_keys = max_keys.unwrap_or(1000);
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -486,7 +485,7 @@ impl S3 for FS {
                 &prefix,
                 &continuation_token.unwrap_or_default(),
                 &delimiter,
-                max_keys.unwrap_or_default(),
+                max_keys,
                 fetch_owner.unwrap_or_default(),
                 &start_after.unwrap_or_default(),
             )
@@ -519,6 +518,12 @@ impl S3 for FS {
 
         let key_count = objects.len() as i32;
 
+        let common_prefixes = object_infos
+            .prefixes
+            .into_iter()
+            .map(|v| CommonPrefix { prefix: Some(v) })
+            .collect();
+
         let output = ListObjectsV2Output {
             key_count: Some(key_count),
             max_keys: Some(key_count),
@@ -526,6 +531,7 @@ impl S3 for FS {
             delimiter: Some(delimiter),
             name: Some(bucket),
             prefix: Some(prefix),
+            common_prefixes: Some(common_prefixes),
             ..Default::default()
         };
 

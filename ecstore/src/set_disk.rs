@@ -164,12 +164,13 @@ impl SetDisks {
         let mut infos = Vec::with_capacity(disks.len());
 
         let mut futures = Vec::with_capacity(disks.len());
-
-        let mut rng = thread_rng();
-        disks.shuffle(&mut rng);
-
         let mut numbers: Vec<usize> = (0..disks.len()).collect();
-        numbers.shuffle(&mut rand::thread_rng());
+        {
+            let mut rng = thread_rng();
+            disks.shuffle(&mut rng);
+
+            numbers.shuffle(&mut rand::thread_rng());
+        }
 
         for &i in numbers.iter() {
             let disk = disks[i].clone();
@@ -818,6 +819,7 @@ impl SetDisks {
         };
 
         if let Some(err) = reduce_read_quorum_errs(errs, object_op_ignored_errs().as_ref(), expected_rquorum) {
+            // warn!("object_quorum_from_meta err {:?}", &err);
             return Err(err);
         }
 
@@ -1687,11 +1689,12 @@ impl SetDisks {
         // TODO: 优化并发 可用数量中断
         let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
-        warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
+        // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
-        let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
+        let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
+            .map_err(|err| to_object_err(err, vec![bucket, object]))?;
 
         if let Some(err) = reduce_read_quorum_errs(&errs, object_op_ignored_errs().as_ref(), read_quorum as usize) {
             error!(
@@ -1700,7 +1703,7 @@ impl SetDisks {
                 read_quorum,
                 &errs
             );
-            return Err(err);
+            return Err(to_object_err(err, vec![bucket, object]));
         }
 
         let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum as usize);
@@ -3832,7 +3835,7 @@ impl StorageAPI for SetDisks {
     }
 
     async fn list_objects_v2(
-        &self,
+        self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
         _continuation_token: &str,
