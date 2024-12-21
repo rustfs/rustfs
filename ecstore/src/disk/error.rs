@@ -452,6 +452,10 @@ pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
     !errs.is_empty()
 }
 
+pub fn is_all_volume_not_found(errs: &[Option<Error>]) -> bool {
+    DiskError::VolumeNotFound.count_errs(errs) == errs.len()
+}
+
 pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
     if errs.is_empty() {
         return false;

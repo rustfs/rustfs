@@ -15,6 +15,10 @@ pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::{
+    bucket::{
+        metadata_sys::get_versioning_config,
+        versioning::{self, VersioningApi},
+    },
     erasure::Writer,
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
@@ -24,7 +28,7 @@ use crate::{
         heal_commands::{HealScanMode, HealingTracker},
     },
     io,
-    store_api::{FileInfo, RawFileInfo},
+    store_api::{FileInfo, ObjectInfo, RawFileInfo},
 };
 use endpoint::Endpoint;
 use error::DiskError;
@@ -41,6 +45,7 @@ use std::{
     cmp::Ordering,
     fmt::Debug,
     io::{Cursor, SeekFrom},
+    ops::Index,
     path::PathBuf,
     sync::Arc,
 };
@@ -795,6 +800,10 @@ impl MetaCacheEntry {
 pub struct MetaCacheEntries(pub Vec<Option<MetaCacheEntry>>);
 
 impl MetaCacheEntries {
+    #[allow(clippy::should_implement_trait)]
+    pub fn as_ref(&self) -> &[Option<MetaCacheEntry>] {
+        &self.0
+    }
     pub fn resolve(&self, mut params: MetadataResolutionParams) -> Result<Option<MetaCacheEntry>> {
         if self.0.is_empty() {
             return Ok(None);
@@ -882,6 +891,83 @@ impl MetaCacheEntries {
 
     pub fn first_found(&self) -> (Option<MetaCacheEntry>, usize) {
         (self.0.iter().find(|x| x.is_some()).cloned().unwrap_or_default(), self.0.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct MetaCacheEntriesSorted {
+    pub o: MetaCacheEntries,
+    // pub list_id: String,
+    // pub reuse: bool,
+    // pub lastSkippedEntry: String,
+}
+
+impl MetaCacheEntriesSorted {
+    pub fn entries(&self) -> Vec<MetaCacheEntry> {
+        let entries: Vec<MetaCacheEntry> = self.o.0.iter().flatten().cloned().collect();
+        entries
+    }
+    pub async fn file_infos(&self, bucket: &str, prefix: &str, delimiter: &str) -> Vec<ObjectInfo> {
+        let vcfg = get_versioning_config(bucket).await.ok();
+        let mut objects = Vec::with_capacity(self.o.as_ref().len());
+        let mut prev_prefix = "";
+        for entry in self.o.as_ref().iter().flatten() {
+            if entry.is_object() {
+                if !delimiter.is_empty() {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
+
+                            prev_prefix = curr_prefix.clone();
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
+                        }
+                        continue;
+                    }
+                }
+
+                if let Ok(Some(fi)) = entry.to_fileinfo(bucket) {
+                    // TODO:VersionPurgeStatus
+                    let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
+                    objects.push(fi.to_object_info(bucket, &entry.name, versioned));
+                }
+                continue;
+            }
+
+            if entry.is_dir() {
+                if delimiter.is_empty() {
+                    continue;
+                }
+
+                if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let idx = prefix.len() + idx + delimiter.len();
+                    if let Some(curr_prefix) = entry.name.get(0..idx) {
+                        if curr_prefix == prev_prefix {
+                            continue;
+                        }
+
+                        prev_prefix = curr_prefix.clone();
+
+                        objects.push(ObjectInfo {
+                            is_dir: true,
+                            bucket: bucket.to_owned(),
+                            name: curr_prefix.to_owned(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+
+        objects
     }
 }
 

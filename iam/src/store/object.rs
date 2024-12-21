@@ -6,6 +6,7 @@ use ecstore::{
     store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader},
     store_list_objects::ListPathOptions,
     utils::path::dir,
+    StorageAPI,
 };
 use futures::future::try_join_all;
 use log::{debug, warn};
@@ -41,29 +42,31 @@ impl ObjectStore {
         for item in items {
             let prefix = format!("{}{}", prefix, item);
             futures.push(async move {
+                // let items = self
+                //     .object_api
+                //     .clone()
+                //     .list_path(&ListPathOptions {
+                //         bucket: Self::BUCKET_NAME.into(),
+                //         prefix: prefix.clone(),
+                //         ..Default::default()
+                //     })
+                //     .await;
+
                 let items = self
                     .object_api
-                    .list_path(&ListPathOptions {
-                        bucket: Self::BUCKET_NAME.into(),
-                        prefix: prefix.clone(),
-                        ..Default::default()
-                    })
+                    .clone()
+                    .list_objects_v2(Self::BUCKET_NAME.into(), &prefix.clone(), "", "", 0, false, "")
                     .await;
 
                 match items {
-                    Ok(items) => Result::<_, crate::Error>::Ok(items.objects),
+                    Ok(items) => Result::<_, crate::Error>::Ok(items.prefixes),
                     Err(e) if is_not_found(&e) => Result::<_, crate::Error>::Ok(vec![]),
                     Err(e) => Err(Error::StringError(format!("list {prefix} failed, err: {e:?}"))),
                 }
             });
         }
-
-        Ok(try_join_all(futures)
-            .await?
-            .into_iter()
-            .flat_map(|x| x.into_iter())
-            .map(|x| x.name)
-            .collect())
+        // TODO: FIXME:
+        Ok(try_join_all(futures).await?.into_iter().flat_map(|x| x.into_iter()).collect())
     }
 
     async fn load_policy(&self, name: &str) -> crate::Result<PolicyDoc> {

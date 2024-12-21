@@ -451,7 +451,7 @@ impl StorageAPI for Sets {
         self.get_disks_by_key(object).delete_object(bucket, object, opts).await
     }
     async fn list_objects_v2(
-        &self,
+        self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
         _continuation_token: &str,

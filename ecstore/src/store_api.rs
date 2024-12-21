@@ -843,7 +843,7 @@ pub trait StorageAPI: ObjectIO {
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
     // ListObjects TODO: FIXME:
     async fn list_objects_v2(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         prefix: &str,
         continuation_token: &str,

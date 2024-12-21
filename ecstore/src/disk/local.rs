@@ -439,7 +439,11 @@ impl LocalDisk {
                             }
                         }
 
-                        Err(err)
+                        if let Some(os_err) = err.downcast_ref::<std::io::Error>() {
+                            Err(os_err_to_file_err(std::io::Error::new(os_err.kind(), os_err.to_string())))
+                        } else {
+                            Err(err)
+                        }
                     }
                 }
             }
@@ -531,7 +535,7 @@ impl LocalDisk {
                     return Err(Error::new(DiskError::UnsupportedDisk));
                 }
 
-                return Err(Error::new(e));
+                return Err(os_err_to_file_err(e));
             }
         };
 
@@ -848,7 +852,7 @@ impl LocalDisk {
                 continue;
             }
 
-            let name = path::path_join_buf(&[current, &entry]);
+            let name = path::path_join_buf(&[current, entry]);
 
             if !dir_stack.is_empty() {
                 if let Some(pop) = dir_stack.pop() {
@@ -1514,6 +1518,7 @@ impl DiskAPI for LocalDisk {
                 return Err(e);
             }
         };
+
         Ok(entries)
     }
 
