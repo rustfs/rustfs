@@ -17,7 +17,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::error;
+use tracing::{error, warn};
 
 const MAX_OBJECT_LIST: i32 = 1000;
 // const MAX_DELETE_LIST: i32 = 1000;
@@ -318,6 +318,8 @@ impl ECStore {
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
     ) -> Result<Vec<ObjectInfo>> {
+        // warn!("list_merged ops {:?}", &opts);
+
         let mut futures = Vec::new();
 
         let mut inputs = Vec::new();
@@ -396,7 +398,8 @@ async fn gather_results(
 ) -> Result<Vec<MetaCacheEntry>> {
     let mut returned = false;
     let mut results = Vec::new();
-    while let Some(entry) = recv.recv().await {
+    while let Some(mut entry) = recv.recv().await {
+        // warn!("gather_results entry {}", &entry.name);
         if returned {
             continue;
         }
@@ -404,7 +407,9 @@ async fn gather_results(
         // TODO: rx.recv()
 
         // TODO: isLatestDeletemarker
-        if !opts.include_directories && (entry.is_dir() || (!opts.versioned && entry.is_object())) {
+        if !opts.include_directories
+            && (entry.is_dir() || (!opts.versioned && entry.is_object() && entry.is_latest_deletemarker()))
+        {
             continue;
         }
 
@@ -421,6 +426,7 @@ async fn gather_results(
         results.push(entry);
     }
 
+    // warn!("gather_results results {:?}", &results);
     Ok(results)
 }
 
@@ -456,6 +462,7 @@ async fn merge_entry_channels(
             tokio::select! {
                 has_entry = in_channels[0].recv()=>{
                     if let Some(entry) = has_entry{
+                        // warn!("merge_entry_channels entry {}", &entry.name);
                         out_channel.send(entry).await?;
                     } else {
                         return Ok(())
