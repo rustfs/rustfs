@@ -211,7 +211,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.walk_dir(opts, wr).await,
             Disk::Remote(remote_disk) => remote_disk.walk_dir(opts, wr).await,
@@ -406,8 +406,8 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
     async fn delete_volume(&self, volume: &str) -> Result<()>;
 
-    // 并发边读边写 TODO: wr io.Writer
-    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>>;
+    // 并发边读边写 w <- MetaCacheEntry
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()>;
 
     // Metadata operations
     async fn delete_version(
