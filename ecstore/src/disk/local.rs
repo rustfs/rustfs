@@ -1521,7 +1521,7 @@ impl DiskAPI for LocalDisk {
 
     // FIXME: TODO: io.writer TODO cancel
     #[tracing::instrument(level = "debug", skip(self, wr))]
-    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket) {
@@ -1560,7 +1560,7 @@ impl DiskAPI for LocalDisk {
         let mut current = opts.base_dir.clone();
         self.scan_dir(&mut current, &opts, &mut out, &mut objs_returned).await?;
 
-        Ok(Vec::new())
+        Ok(())
     }
 
     // #[tracing::instrument(skip(self))]

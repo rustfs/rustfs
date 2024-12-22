@@ -1402,42 +1402,42 @@ impl SetDisks {
         Ok((disk, fm))
     }
 
-    pub async fn walk_dir(&self, opts: &WalkDirOptions) -> (Vec<Option<Vec<MetaCacheEntry>>>, Vec<Option<Error>>) {
-        let disks = self.disks.read().await;
+    // pub async fn walk_dir(&self, opts: &WalkDirOptions) -> (Vec<Option<Vec<MetaCacheEntry>>>, Vec<Option<Error>>) {
+    //     let disks = self.disks.read().await;
 
-        let disks = disks.clone();
-        let mut futures = Vec::new();
-        let mut errs = Vec::new();
-        let mut ress = Vec::new();
+    //     let disks = disks.clone();
+    //     let mut futures = Vec::new();
+    //     let mut errs = Vec::new();
+    //     let mut ress = Vec::new();
 
-        for disk in disks.iter() {
-            let opts = opts.clone();
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.walk_dir(opts, &mut Writer::NotUse).await
-                } else {
-                    Err(Error::new(DiskError::DiskNotFound))
-                }
-            });
-        }
+    //     for disk in disks.iter() {
+    //         let opts = opts.clone();
+    //         futures.push(async move {
+    //             if let Some(disk) = disk {
+    //                 disk.walk_dir(opts, &mut Writer::NotUse).await
+    //             } else {
+    //                 Err(Error::new(DiskError::DiskNotFound))
+    //             }
+    //         });
+    //     }
 
-        let results = join_all(futures).await;
+    //     let results = join_all(futures).await;
 
-        for res in results {
-            match res {
-                Ok(entrys) => {
-                    ress.push(Some(entrys));
-                    errs.push(None);
-                }
-                Err(e) => {
-                    ress.push(None);
-                    errs.push(Some(e));
-                }
-            }
-        }
+    //     for res in results {
+    //         match res {
+    //             Ok(entrys) => {
+    //                 ress.push(Some(entrys));
+    //                 errs.push(None);
+    //             }
+    //             Err(e) => {
+    //                 ress.push(None);
+    //                 errs.push(Some(e));
+    //             }
+    //         }
+    //     }
 
-        (ress, errs)
-    }
+    //     (ress, errs)
+    // }
 
     async fn remove_object_part(
         &self,

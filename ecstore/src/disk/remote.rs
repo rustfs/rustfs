@@ -351,7 +351,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     // FIXME: TODO: use writer
-    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, _wr: &mut W) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, _wr: &mut W) -> Result<()> {
         info!("walk_dir");
         let walk_dir_options = serde_json::to_string(&opts)?;
         let mut client = node_service_time_out_client(&self.addr)
@@ -362,19 +362,22 @@ impl DiskAPI for RemoteDisk {
             walk_dir_options,
         });
 
-        let response = client.walk_dir(request).await?.into_inner();
+        // TODO: use writer
+        unimplemented!()
 
-        if !response.success {
-            return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
-        }
+        // let response = client.walk_dir(request).await?.into_inner();
 
-        let entries = response
-            .meta_cache_entry
-            .into_iter()
-            .filter_map(|json_str| serde_json::from_str::<MetaCacheEntry>(&json_str).ok())
-            .collect();
+        // if !response.success {
+        //     return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
+        // }
 
-        Ok(entries)
+        // let entries = response
+        //     .meta_cache_entry
+        //     .into_iter()
+        //     .filter_map(|json_str| serde_json::from_str::<MetaCacheEntry>(&json_str).ok())
+        //     .collect();
+
+        // Ok(entries)
     }
 
     async fn rename_data(

@@ -731,43 +731,45 @@ impl Node for NodeService {
     }
 
     async fn walk_dir(&self, request: Request<WalkDirRequest>) -> Result<Response<WalkDirResponse>, Status> {
-        let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
-            let opts = match serde_json::from_str::<WalkDirOptions>(&request.walk_dir_options) {
-                Ok(options) => options,
-                Err(_) => {
-                    return Ok(tonic::Response::new(WalkDirResponse {
-                        success: false,
-                        meta_cache_entry: Vec::new(),
-                        error_info: Some("can not decode DeleteOptions".to_string()),
-                    }));
-                }
-            };
-            match disk.walk_dir(opts, &mut ecstore::io::Writer::NotUse).await {
-                Ok(entries) => {
-                    let entries = entries
-                        .into_iter()
-                        .filter_map(|entry| serde_json::to_string(&entry).ok())
-                        .collect();
-                    Ok(tonic::Response::new(WalkDirResponse {
-                        success: true,
-                        meta_cache_entry: entries,
-                        error_info: None,
-                    }))
-                }
-                Err(err) => Ok(tonic::Response::new(WalkDirResponse {
-                    success: false,
-                    meta_cache_entry: Vec::new(),
-                    error_info: Some(err.to_string()),
-                })),
-            }
-        } else {
-            Ok(tonic::Response::new(WalkDirResponse {
-                success: false,
-                meta_cache_entry: Vec::new(),
-                error_info: Some("can not find disk".to_string()),
-            }))
-        }
+        // TODO: use writer
+        unimplemented!()
+        // let request = request.into_inner();
+        // if let Some(disk) = self.find_disk(&request.disk).await {
+        //     let opts = match serde_json::from_str::<WalkDirOptions>(&request.walk_dir_options) {
+        //         Ok(options) => options,
+        //         Err(_) => {
+        //             return Ok(tonic::Response::new(WalkDirResponse {
+        //                 success: false,
+        //                 meta_cache_entry: Vec::new(),
+        //                 error_info: Some("can not decode DeleteOptions".to_string()),
+        //             }));
+        //         }
+        //     };
+        //     match disk.walk_dir(opts, &mut ecstore::io::Writer::NotUse).await {
+        //         Ok(entries) => {
+        //             let entries = entries
+        //                 .into_iter()
+        //                 .filter_map(|entry| serde_json::to_string(&entry).ok())
+        //                 .collect();
+        //             Ok(tonic::Response::new(WalkDirResponse {
+        //                 success: true,
+        //                 meta_cache_entry: entries,
+        //                 error_info: None,
+        //             }))
+        //         }
+        //         Err(err) => Ok(tonic::Response::new(WalkDirResponse {
+        //             success: false,
+        //             meta_cache_entry: Vec::new(),
+        //             error_info: Some(err.to_string()),
+        //         })),
+        //     }
+        // } else {
+        //     Ok(tonic::Response::new(WalkDirResponse {
+        //         success: false,
+        //         meta_cache_entry: Vec::new(),
+        //         error_info: Some("can not find disk".to_string()),
+        //     }))
+        // }
     }
 
     async fn rename_data(&self, request: Request<RenameDataRequest>) -> Result<Response<RenameDataResponse>, Status> {
