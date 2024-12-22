@@ -46,7 +46,7 @@ pub struct NotificationPeerErr {
 }
 
 impl NotificationSys {
-    pub fn rest_client_from_hash(&self, s: &str) -> Option<PeerRestClient> {
+    pub fn rest_client_from_hash(&self, _s: &str) -> Option<PeerRestClient> {
         None
     }
     pub async fn delete_policy(&self) -> Vec<NotificationPeerErr> {
