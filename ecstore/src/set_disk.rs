@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::{
     bitrot::{bitrot_verify, close_bitrot_writers, new_bitrot_filereader, new_bitrot_filewriter, BitrotFileWriter},
     cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
@@ -16,8 +17,8 @@ use crate::{
         format::FormatV3,
         new_disk, BufferReader, BufferWriter, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption,
         DiskStore, FileInfoVersions, FileReader, FileWriter, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, UpdateMetadataOpts, WalkDirOptions, RUSTFS_META_BUCKET,
-        RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET,
+        RUSTFS_META_TMP_BUCKET,
     },
     erasure::Erasure,
     error::{Error, Result},
@@ -54,10 +55,6 @@ use crate::{file_meta::file_info_from_raw, heal::data_usage_cache::DataUsageCach
 use crate::{
     heal::data_scanner::{globalHealConfig, HEAL_DELETE_DANGLING},
     store_api::ListObjectVersionsInfo,
-};
-use crate::{
-    heal::heal_ops::{HealEntryFn, HealSequence},
-    io::Writer,
 };
 use futures::future::join_all;
 use glob::Pattern;

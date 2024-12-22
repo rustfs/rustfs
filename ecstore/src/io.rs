@@ -5,10 +5,7 @@ use std::task::{Context, Poll};
 use tokio::fs::File;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 
-#[derive(Default)]
 pub enum Reader {
-    #[default]
-    NotUse,
     File(File),
     Buffer(VecAsyncReader),
 }
@@ -18,7 +15,6 @@ impl AsyncRead for Reader {
         match self.get_mut() {
             Reader::File(file) => Pin::new(file).poll_read(cx, buf),
             Reader::Buffer(buffer) => Pin::new(buffer).poll_read(cx, buf),
-            Reader::NotUse => Poll::Ready(Ok(())),
         }
     }
 }
@@ -203,7 +199,7 @@ impl VecAsyncReader {
 
 // Implementing AsyncRead trait for VecAsyncReader
 impl AsyncRead for VecAsyncReader {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf) -> Poll<io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
         // Check how many bytes are available to read
