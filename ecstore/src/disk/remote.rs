@@ -10,6 +10,8 @@ use protos::{
         StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
+use rmp_serde::Serializer;
+use serde::Serialize;
 use tokio::{
     io::AsyncWrite,
     sync::mpsc::{self, Sender},
@@ -356,13 +358,14 @@ impl DiskAPI for RemoteDisk {
         info!("walk_dir");
         let mut wr = wr;
         let mut out = MetacacheWriter::new(&mut wr);
-        let walk_dir_options = serde_json::to_string(&opts)?;
+        let mut buf = Vec::new();
+        opts.serialize(&mut Serializer::new(&mut buf))?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(WalkDirRequest {
             disk: self.endpoint.to_string(),
-            walk_dir_options,
+            walk_dir_options: buf,
         });
         let mut response = client.walk_dir(request).await?.into_inner();
 

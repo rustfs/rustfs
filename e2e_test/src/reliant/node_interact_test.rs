@@ -11,8 +11,8 @@ use protos::{
         ListVolumesRequest, LocalStorageInfoRequest, MakeVolumeRequest, PingRequest, PingResponse, ReadAllRequest,
     },
 };
-use rmp_serde::Deserializer;
-use serde::Deserialize;
+use rmp_serde::{Deserializer, Serializer};
+use serde::{Deserialize, Serialize};
 use std::{error::Error, io::Cursor};
 use tokio::io::AsyncWrite;
 use tokio::spawn;
@@ -107,11 +107,12 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
     let (rd, mut wr) = tokio::io::duplex(1024);
-    let walk_dir_options = serde_json::to_string(&opts)?;
+    let mut buf = Vec::new();
+    opts.serialize(&mut Serializer::new(&mut buf))?;
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(WalkDirRequest {
         disk: "/home/dandan/code/rust/s3-rustfs/target/debug/data".to_string(),
-        walk_dir_options,
+        walk_dir_options: buf,
     });
     let mut response = client.walk_dir(request).await?.into_inner();
 

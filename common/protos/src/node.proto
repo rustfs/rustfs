@@ -204,7 +204,7 @@ message ListDirResponse {
 
 message WalkDirRequest {
   string disk = 1;  // indicate which one in the disks
-  string walk_dir_options = 2;
+  bytes walk_dir_options = 2;
 }
 
 message WalkDirResponse {
