@@ -373,7 +373,7 @@ impl DiskAPI for RemoteDisk {
                         return Err(Error::from_string(resp.error_info.unwrap_or("".to_string())));
                     }
                     let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-                        .map_err(|e| Error::from_string(format!("Unexpected response: {:?}", response)))?;
+                        .map_err(|_| Error::from_string(format!("Unexpected response: {:?}", response)))?;
                     out.write_obj(&entry).await?;
                 }
                 None => break,
