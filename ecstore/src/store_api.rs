@@ -805,8 +805,8 @@ pub struct DeletedObject {
 
 pub struct ListObjectVersionsInfo {
     pub is_truncated: bool,
-    pub next_marker: String,
-    pub next_version_idmarker: String,
+    pub next_marker: Option<String>,
+    pub next_version_idmarker: Option<String>,
     pub objects: Vec<ObjectInfo>,
     pub prefixes: Vec<String>,
 }
@@ -854,7 +854,7 @@ pub trait StorageAPI: ObjectIO {
     ) -> Result<ListObjectsV2Info>;
     // ListObjectVersions TODO: FIXME:
     async fn list_object_versions(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         prefix: &str,
         marker: &str,

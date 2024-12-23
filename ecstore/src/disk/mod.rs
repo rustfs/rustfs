@@ -558,6 +558,20 @@ pub struct FileInfoVersions {
     pub free_versions: Vec<FileInfo>,
 }
 
+impl FileInfoVersions {
+    pub fn find_version_index(&self, v: &str) -> Option<usize> {
+        if v.is_empty() {
+            return None;
+        }
+
+        let vid = Uuid::parse_str(v).unwrap_or(Uuid::nil());
+
+        for ver in self.versions.iter() {}
+
+        self.versions.iter().position(|v| v.version_id == Some(vid))
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WalkDirOptions {
     // Bucket to scanner
@@ -663,31 +677,31 @@ impl MetaCacheEntry {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    pub fn to_fileinfo(&self, bucket: &str) -> Result<Option<FileInfo>> {
+    pub fn to_fileinfo(&self, bucket: &str) -> Result<FileInfo> {
         if self.is_dir() {
-            return Ok(Some(FileInfo {
+            return Ok(FileInfo {
                 volume: bucket.to_owned(),
                 name: self.name.clone(),
                 ..Default::default()
-            }));
+            });
         }
 
         if self.cached.is_some() {
             let fm = self.cached.as_ref().unwrap();
             if fm.versions.is_empty() {
-                return Ok(Some(FileInfo {
+                return Ok(FileInfo {
                     volume: bucket.to_owned(),
                     name: self.name.clone(),
                     deleted: true,
                     is_latest: true,
                     mod_time: Some(OffsetDateTime::UNIX_EPOCH),
                     ..Default::default()
-                }));
+                });
             }
 
             let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
 
-            return Ok(Some(fi));
+            return Ok(fi);
         }
 
         let mut fm = FileMeta::new();
@@ -695,7 +709,7 @@ impl MetaCacheEntry {
 
         let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
 
-        return Ok(Some(fi));
+        return Ok(fi);
     }
 
     pub fn file_info_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
@@ -962,11 +976,99 @@ impl MetaCacheEntriesSorted {
                     }
                 }
 
-                if let Ok(Some(fi)) = entry.to_fileinfo(bucket) {
+                if let Ok(fi) = entry.to_fileinfo(bucket) {
                     // TODO:VersionPurgeStatus
                     let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
                     objects.push(fi.to_object_info(bucket, &entry.name, versioned));
                 }
+                continue;
+            }
+
+            if entry.is_dir() {
+                if delimiter.is_empty() {
+                    continue;
+                }
+
+                if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                    let idx = prefix.len() + idx + delimiter.len();
+                    if let Some(curr_prefix) = entry.name.get(0..idx) {
+                        if curr_prefix == prev_prefix {
+                            continue;
+                        }
+
+                        prev_prefix = curr_prefix;
+
+                        objects.push(ObjectInfo {
+                            is_dir: true,
+                            bucket: bucket.to_owned(),
+                            name: curr_prefix.to_owned(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+
+        objects
+    }
+
+    pub async fn file_info_versions(&self, bucket: &str, prefix: &str, delimiter: &str, after_v: &str) -> Vec<ObjectInfo> {
+        let vcfg = get_versioning_config(bucket).await.ok();
+        let mut objects = Vec::with_capacity(self.o.as_ref().len());
+        let mut prev_prefix = "";
+        let mut after_v = after_v;
+        for entry in self.o.as_ref().iter().flatten() {
+            if entry.is_object() {
+                if !delimiter.is_empty() {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
+
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
+                        }
+                        continue;
+                    }
+                }
+
+                let mut fiv = match entry.file_info_versions(bucket) {
+                    Ok(res) => res,
+                    Err(_err) => {
+                        //
+                        continue;
+                    }
+                };
+
+                let fi_versions = 'c: {
+                    if !after_v.is_empty() {
+                        if let Some(idx) = fiv.find_version_index(after_v) {
+                            after_v = "";
+                            break 'c fiv.versions.split_off(idx + 1);
+                        }
+
+                        after_v = "";
+                        break 'c fiv.versions;
+                    } else {
+                        break 'c fiv.versions;
+                    }
+                };
+
+                for fi in fi_versions.into_iter() {
+                    // VersionPurgeStatus
+
+                    let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
+                    objects.push(fi.to_object_info(bucket, &entry.name, versioned));
+                }
+
                 continue;
             }
 
