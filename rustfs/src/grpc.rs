@@ -740,7 +740,8 @@ impl Node for NodeService {
         let request = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let opts = match serde_json::from_str::<WalkDirOptions>(&request.walk_dir_options) {
+            let mut buf = Deserializer::new(Cursor::new(request.walk_dir_options));
+            let opts = match Deserialize::deserialize(&mut buf) {
                 Ok(options) => options,
                 Err(_) => {
                     return Err(Status::invalid_argument("invalid WalkDirOptions"));

@@ -293,8 +293,8 @@ pub struct WalkDirRequest {
     /// indicate which one in the disks
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub walk_dir_options: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub walk_dir_options: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WalkDirResponse {
