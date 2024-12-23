@@ -1,6 +1,8 @@
 #![cfg(test)]
 
-use ecstore::disk::VolumeInfo;
+use ecstore::disk::{MetaCacheEntry, VolumeInfo, WalkDirOptions};
+use ecstore::metacache::writer::MetacacheWriter;
+use protos::proto_gen::node_service::WalkDirRequest;
 use protos::{
     models::{PingBody, PingBodyBuilder},
     node_service_time_out_client,
@@ -11,6 +13,10 @@ use protos::{
 use rmp_serde::Deserializer;
 use serde::Deserialize;
 use std::{error::Error, io::Cursor};
+use tokio::io::AsyncWrite;
+use tokio::sync::mpsc;
+use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+use tonic::codegen::tokio_stream::StreamExt;
 use tonic::Request;
 
 const CLUSTER_ADDR: &str = "http://localhost:9000";
@@ -85,6 +91,44 @@ async fn list_volumes() -> Result<(), Box<dyn Error>> {
         .collect();
 
     println!("{:?}", volume_infos);
+    Ok(())
+}
+
+#[tokio::test]
+async fn walk_dir<W: AsyncWrite + Unpin + Send>() -> Result<(), Box<dyn Error>> {
+    println!("walk_dir");
+    // TODO: use writer
+    let opts = WalkDirOptions {
+        bucket: "dandan".to_owned(),
+        base_dir: "".to_owned(),
+        recursive: true,
+        ..Default::default()
+    };
+    let (rd, mut wr) = tokio::io::duplex(1024);
+    let mut out = MetacacheWriter::new(&mut wr);
+    let walk_dir_options = serde_json::to_string(&opts)?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
+    let request = Request::new(WalkDirRequest {
+        disk: "data".to_string(),
+        walk_dir_options,
+    });
+    let mut response = client.walk_dir(request).await?.into_inner();
+
+    loop {
+        match response.next().await {
+            Some(Ok(resp)) => {
+                if !resp.success {
+                    println!("{}", resp.error_info.unwrap_or("".to_string()));
+                }
+                let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
+                    .map_err(|e| Err(ecstore::error::Error::from_string(format!("Unexpected response: {:?}", response))))?;
+                out.write_obj(&entry)?;
+            }
+            None => break,
+            _ => println!("Unexpected response: {:?}", response),
+        }
+    }
+
     Ok(())
 }
 
