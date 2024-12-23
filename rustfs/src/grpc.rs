@@ -796,7 +796,7 @@ impl Node for NodeService {
                 join_all(vec![job1, job2]).await;
             });
         } else {
-            return Err(Status::invalid_argument("invalid disk"));
+            return Err(Status::invalid_argument(format!("invalid disk, all disk: {:?}", self.all_disk().await)));
         }
 
         let out_stream = ReceiverStream::new(rx);
