@@ -1,7 +1,6 @@
-use serde::{Deserialize, Serialize};
-
 use super::key_name::KeyName;
 use crate::policy::{Error, Validator};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
@@ -19,8 +18,8 @@ impl Key {
         self.name.eq(other)
     }
 
-    pub fn val_name(&self) -> String {
-        self.name.val_name()
+    pub fn var_name(&self) -> String {
+        self.name.var_name()
     }
 
     pub fn name(&self) -> String {
@@ -34,7 +33,12 @@ impl Key {
 
 impl From<Key> for String {
     fn from(value: Key) -> Self {
-        value.name()
+        let mut data = String::from(Into::<&str>::into(&value.name));
+        if let Some(x) = value.variable.as_ref() {
+            data.push('/');
+            data.push_str(&x);
+        }
+        data
     }
 }
 

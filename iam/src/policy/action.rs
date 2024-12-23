@@ -40,7 +40,7 @@ impl Validator for ActionSet {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
 #[serde(try_from = "&str", untagged)]
 pub enum Action {
     S3Action(S3Action),
@@ -55,11 +55,22 @@ impl Action {
     }
 }
 
+impl From<&Action> for &str {
+    fn from(value: &Action) -> &'static str {
+        match value {
+            Action::S3Action(s) => s.into(),
+            Action::AdminAction(s) => s.into(),
+            Action::StsAction(s) => s.into(),
+            Action::KmsAction(s) => s.into(),
+        }
+    }
+}
+
 impl Action {
     const S3_PREFIX: &'static str = "s3:";
-    const ADMIN_PREFIX: &str = "admin:";
-    const STS_PREFIX: &str = "sts:";
-    const KMS_PREFIX: &str = "kms:";
+    const ADMIN_PREFIX: &'static str = "admin:";
+    const STS_PREFIX: &'static str = "sts:";
+    const KMS_PREFIX: &'static str = "kms:";
 }
 
 impl TryFrom<&str> for Action {
@@ -86,8 +97,10 @@ impl TryFrom<&str> for Action {
 }
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr)]
+#[cfg_attr(test, derive(Default))]
 #[serde(try_from = "&str", into = "&str")]
 pub enum S3Action {
+    #[cfg_attr(test, default)]
     #[strum(serialize = "s3:*")]
     AllActions,
     #[strum(serialize = "s3:GetBucketLocation")]

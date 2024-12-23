@@ -13,17 +13,23 @@ pub type NumberFunc = InnerFunc<NumberFuncValue>;
 pub struct NumberFuncValue(i64);
 
 impl NumberFunc {
-    pub fn evaluate(&self, op: impl FnOnce(&i64, &i64) -> bool, if_exists: bool, values: &HashMap<String, Vec<String>>) -> bool {
-        let v = match values.get(self.key.name().as_str()).and_then(|x| x.get(0)) {
-            Some(x) => x,
-            None => return if_exists,
-        };
+    pub fn evaluate(&self, op: impl Fn(&i64, &i64) -> bool, if_exists: bool, values: &HashMap<String, Vec<String>>) -> bool {
+        for inner in self.0.iter() {
+            let v = match values.get(inner.key.name().as_str()).and_then(|x| x.get(0)) {
+                Some(x) => x,
+                None => return if_exists,
+            };
 
-        let Ok(rv) = v.parse::<i64>() else {
-            return false;
-        };
+            let Ok(rv) = v.parse::<i64>() else {
+                return false;
+            };
 
-        op(&rv, &self.values.0)
+            if !op(&rv, &inner.values.0) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -50,13 +56,6 @@ impl<'de> Deserialize<'de> for NumberFuncValue {
                 formatter.write_str("a number or a string that can be represented as a number.")
             }
 
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: Error,
-            {
-                Ok(NumberFuncValue(value.parse().map_err(|e| E::custom(format!("{e:?}")))?))
-            }
-
             fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
             where
                 E: Error,
@@ -70,6 +69,13 @@ impl<'de> Deserialize<'de> for NumberFuncValue {
             {
                 Ok(NumberFuncValue(value as i64))
             }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                Ok(NumberFuncValue(value.parse().map_err(|e| E::custom(format!("{e:?}")))?))
+            }
         }
 
         deserializer.deserialize_any(NumberVisitor)
@@ -79,6 +85,7 @@ impl<'de> Deserialize<'de> for NumberFuncValue {
 #[cfg(test)]
 mod tests {
     use super::{NumberFunc, NumberFuncValue};
+    use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::{
         key::Key,
         key_name::KeyName::{self, *},
@@ -88,8 +95,10 @@ mod tests {
 
     fn new_func(name: KeyName, variable: Option<String>, value: i64) -> NumberFunc {
         NumberFunc {
-            key: Key { name, variable },
-            values: NumberFuncValue(value),
+            0: vec![FuncKeyValue {
+                key: Key { name, variable },
+                values: NumberFuncValue(value),
+            }],
         }
     }
 

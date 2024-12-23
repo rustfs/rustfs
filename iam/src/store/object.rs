@@ -9,7 +9,6 @@ use ecstore::{
 use futures::future::try_join_all;
 use log::{debug, warn};
 use serde::{de::DeserializeOwned, Serialize};
-use tracing::error;
 
 use super::Store;
 use crate::{

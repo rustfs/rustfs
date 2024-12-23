@@ -1,41 +1,33 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::marker::PhantomData;
 
 use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
 };
 
-use super::{condition::Condition, key::Key};
-
-#[derive(Clone, Serialize, Deserialize)]
-pub enum Func {
-    ForAnyValues(Vec<Condition>),
-    ForAllValues(Vec<Condition>),
-    ForNormal(Vec<Condition>),
-}
-
-impl Func {
-    pub fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
-        match self {
-            Self::ForAnyValues(conditions) => conditions.iter().all(|x| x.evaluate(true, values)),
-            Self::ForAllValues(conditions) => conditions.iter().all(|x| x.evaluate(false, values)),
-            Self::ForNormal(conditions) => conditions.iter().all(|x| x.evaluate(false, values)),
-        }
-    }
-}
+use super::key::Key;
 
 #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
-pub struct InnerFunc<T> {
+pub struct InnerFunc<T>(pub(crate) Vec<FuncKeyValue<T>>);
+
+#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+pub struct FuncKeyValue<T> {
     pub key: Key,
     pub values: T,
 }
 
-impl<T: Clone> Clone for InnerFunc<T> {
+impl<T: Clone> Clone for FuncKeyValue<T> {
     fn clone(&self) -> Self {
         Self {
             key: self.key.clone(),
             values: self.values.clone(),
         }
+    }
+}
+
+impl<T: Clone> Clone for InnerFunc<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -46,9 +38,13 @@ impl<T: Serialize> Serialize for InnerFunc<T> {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_key(&self.key)?;
-        map.serialize_value(&self.values)?;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+
+        for kv in self.0.iter() {
+            map.serialize_key(&kv.key)?;
+            map.serialize_value(&kv.values)?;
+        }
+
         map.end()
     }
 }
@@ -78,11 +74,16 @@ where
             {
                 use serde::de::Error;
 
-                let Some((key, values)) = map.next_entry::<Key, T>()? else {
-                    return Err(A::Error::custom("no k-v pair"));
-                };
+                let mut inner = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((key, values)) = map.next_entry::<Key, T>()? {
+                    inner.push(FuncKeyValue { key, values });
+                }
 
-                Ok(InnerFunc { key, values })
+                if inner.is_empty() {
+                    return Err(Error::custom("has no condition key"));
+                }
+
+                Ok(InnerFunc(inner))
             }
         }
 
