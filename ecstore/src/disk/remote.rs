@@ -7,7 +7,7 @@ use protos::{
         CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
         DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, NsScannerRequest,
         ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequst,
-        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
 use tokio::{
@@ -24,7 +24,6 @@ use super::{
     FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter,
     RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
-use crate::metacache::writer::MetacacheWriter;
 use crate::{
     disk::error::DiskError,
     error::{Error, Result},
@@ -35,6 +34,7 @@ use crate::{
     },
     store_api::{FileInfo, RawFileInfo},
 };
+use crate::{disk::MetaCacheEntry, metacache::writer::MetacacheWriter};
 use protos::proto_gen::node_service::RenamePartRequst;
 
 #[derive(Debug)]
