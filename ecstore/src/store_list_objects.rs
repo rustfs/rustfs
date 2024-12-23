@@ -6,7 +6,8 @@ use crate::file_meta::merge_file_meta_versions;
 use crate::peer::is_reserved_or_invalid_bucket;
 use crate::set_disk::SetDisks;
 use crate::store::check_list_objs_args;
-use crate::store_api::{ListObjectsInfo, ObjectInfo};
+use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo};
+use crate::store_err::StorageError;
 use crate::utils::path::{self, base_dir_from_prefix, SLASH_SEPARATOR};
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
@@ -26,7 +27,7 @@ const MAX_OBJECT_LIST: i32 = 1000;
 
 const METACACHE_SHARE_PREFIX: bool = false;
 
-fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
+pub fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
     let mut max_keys = max_keys;
     if max_keys > MAX_OBJECT_LIST {
         max_keys = MAX_OBJECT_LIST;
@@ -222,6 +223,101 @@ impl ECStore {
         Ok(ListObjectsInfo {
             is_truncated,
             next_marker: next_marker.unwrap_or_default(),
+            objects,
+            prefixes,
+        })
+    }
+
+    pub async fn inner_list_object_versions(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: &str,
+        version_marker: &str,
+        delimiter: &str,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        if marker.is_empty() && !version_marker.is_empty() {
+            return Err(Error::new(StorageError::NotImplemented));
+        }
+
+        let opts = ListPathOptions {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+            separator: delimiter.to_owned(),
+            limit: max_keys_plus_one(max_keys, !marker.is_empty()),
+            marker: marker.to_owned(),
+            incl_deleted: true,
+            ask_disks: "strict".to_owned(),
+            versioned: true,
+            ..Default::default()
+        };
+
+        let mut err_eof = false;
+        let has_merged = match self.list_path(&opts).await {
+            Ok(res) => Some(res),
+            Err(err) => {
+                if !is_err_eof(&err) {
+                    return Err(err);
+                }
+
+                err_eof = true;
+                None
+            }
+        };
+
+        let mut get_objects = if let Some(merged) = has_merged {
+            merged.file_info_versions(bucket, prefix, delimiter, version_marker).await
+        } else {
+            Vec::new()
+        };
+
+        let is_truncated = {
+            if max_keys > 0 && get_objects.len() > max_keys as usize {
+                get_objects.truncate(max_keys as usize);
+                true
+            } else {
+                !err_eof && !get_objects.is_empty()
+            }
+        };
+
+        let mut prefixes: Vec<String> = Vec::new();
+
+        let mut objects = Vec::with_capacity(get_objects.len());
+        for obj in get_objects.into_iter() {
+            if obj.is_dir && obj.mod_time.is_none() && !delimiter.is_empty() {
+                let mut found = false;
+                if delimiter != SLASH_SEPARATOR {
+                    for p in prefixes.iter() {
+                        if found {
+                            break;
+                        }
+                        found = p == &obj.name;
+                    }
+                }
+                if !found {
+                    prefixes.push(obj.name.clone());
+                }
+            } else {
+                objects.push(obj);
+            }
+        }
+
+        let (next_marker, next_version_idmarker) = {
+            if is_truncated {
+                objects
+                    .last()
+                    .map(|last| (Some(last.name.clone()), last.version_id.map(|v| v.to_string())))
+                    .unwrap_or_default()
+            } else {
+                (None, None)
+            }
+        };
+
+        Ok(ListObjectVersionsInfo {
+            is_truncated,
+            next_marker,
+            next_version_idmarker,
             objects,
             prefixes,
         })

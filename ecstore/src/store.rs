@@ -23,6 +23,7 @@ use crate::store_err::{
     to_object_err, StorageError,
 };
 use crate::store_init::ec_drives_no_config;
+use crate::store_list_objects::{max_keys_plus_one, ListPathOptions};
 use crate::utils::crypto::base64_decode;
 use crate::utils::path::{decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
 use crate::utils::xml;
@@ -1546,37 +1547,16 @@ impl StorageAPI for ECStore {
         // Ok(v2)
     }
     async fn list_object_versions(
-        &self,
-        _bucket: &str,
-        _prefix: &str,
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
         marker: &str,
         version_marker: &str,
-        _delimiter: &str,
-        _max_keys: i32,
+        delimiter: &str,
+        max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        if marker.is_empty() && !version_marker.is_empty() {
-            return Err(Error::new(StorageError::NotImplemented));
-        }
-
-        // let opts = ListPathOptions {
-        //     bucket: bucket.to_owned(),
-        //     marker: marker.to_owned(),
-        //     prefix: prefix.to_owned(),
-        //     limit: max_keys,
-        //     ..Default::default()
-        // };
-
-        // let list = self
-        //     .list_path(&opts, delimiter)
-        //     .await
-        //     .map_err(|e| to_object_err(e, vec![bucket]))?;
-
-        // for info in list.objects.iter() {
-        //     //
-        // }
-
-        // FIXME:
-        unimplemented!()
+        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+            .await
     }
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         check_object_args(bucket, object)?;

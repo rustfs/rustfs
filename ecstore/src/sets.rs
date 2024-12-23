@@ -463,7 +463,7 @@ impl StorageAPI for Sets {
         unimplemented!()
     }
     async fn list_object_versions(
-        &self,
+        self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
         _marker: &str,
