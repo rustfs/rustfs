@@ -49,7 +49,7 @@ use crate::{
     store_init::{load_format_erasure, ErasureError},
     utils::{
         self,
-        crypto::{base64_decode, base64_encode, hex, sha256},
+        crypto::{base64_decode, base64_encode, hex},
         path::{encode_dir_object, has_suffix, SLASH_SEPARATOR},
     },
     xhttp,
@@ -540,7 +540,9 @@ impl SetDisks {
 
     fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
         let path = format!("{}/{}", bucket, object);
-        hex(sha256(path.as_bytes()).as_ref())
+        let mut hasher = Sha256::new();
+        hasher.update(path);
+        hex(hasher.finalize())
     }
 
     fn common_parity(parities: &[i32], default_parity_count: i32) -> i32 {
