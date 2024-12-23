@@ -1,4 +1,4 @@
-use crate::{disk, error::Error};
+use crate::{disk, error::Error, store_err::is_err_object_not_found};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -20,6 +20,8 @@ pub fn is_not_found(err: &Error) -> bool {
         ConfigError::is_not_found(e)
     } else if let Some(e) = err.downcast_ref::<disk::error::DiskError>() {
         matches!(e, disk::error::DiskError::FileNotFound)
+    } else if is_err_object_not_found(err) {
+        return true;
     } else {
         false
     }

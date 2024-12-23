@@ -60,8 +60,13 @@ impl ObjectStore {
 
                 match items {
                     Ok(items) => Result::<_, crate::Error>::Ok(items.prefixes),
-                    Err(e) if is_not_found(&e) => Result::<_, crate::Error>::Ok(vec![]),
-                    Err(e) => Err(Error::StringError(format!("list {prefix} failed, err: {e:?}"))),
+                    Err(e) => {
+                        if is_not_found(&e) {
+                            Result::<_, crate::Error>::Ok(vec![])
+                        } else {
+                            Err(Error::StringError(format!("list {prefix} failed, err: {e:?}")))
+                        }
+                    }
                 }
             });
         }
