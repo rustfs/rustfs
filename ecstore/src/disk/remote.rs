@@ -24,6 +24,7 @@ use super::{
     FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter,
     RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
+use crate::metacache::writer::MetacacheWriter;
 use crate::{
     disk::error::DiskError,
     error::{Error, Result},
@@ -351,32 +352,36 @@ impl DiskAPI for RemoteDisk {
     }
 
     // FIXME: TODO: use writer
-    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, _opts: WalkDirOptions, _wr: &mut W) -> Result<()> {
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         info!("walk_dir");
-        // TODO: use writer
-        unimplemented!()
-        // let walk_dir_options = serde_json::to_string(&opts)?;
-        // let mut client = node_service_time_out_client(&self.addr)
-        //     .await
-        //     .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        // let request = Request::new(WalkDirRequest {
-        //     disk: self.endpoint.to_string(),
-        //     walk_dir_options,
-        // });
+        let mut wr = wr;
+        let mut out = MetacacheWriter::new(&mut wr);
+        let walk_dir_options = serde_json::to_string(&opts)?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(WalkDirRequest {
+            disk: self.endpoint.to_string(),
+            walk_dir_options,
+        });
+        let mut response = client.walk_dir(request).await?.into_inner();
 
-        // let response = client.walk_dir(request).await?.into_inner();
+        loop {
+            match response.next().await {
+                Some(Ok(resp)) => {
+                    if !resp.success {
+                        return Err(Error::from_string(resp.error_info.unwrap_or("".to_string())));
+                    }
+                    let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
+                        .map_err(|e| Error::from_string(format!("Unexpected response: {:?}", response)))?;
+                    out.write_obj(&entry).await?;
+                }
+                None => break,
+                _ => return Err(Error::from_string(format!("Unexpected response: {:?}", response))),
+            }
+        }
 
-        // if !response.success {
-        //     return Err(Error::from_string(response.error_info.unwrap_or("".to_string())));
-        // }
-
-        // let entries = response
-        //     .meta_cache_entry
-        //     .into_iter()
-        //     .filter_map(|json_str| serde_json::from_str::<MetaCacheEntry>(&json_str).ok())
-        //     .collect();
-
-        // Ok(entries)
+        Ok(())
     }
 
     async fn rename_data(

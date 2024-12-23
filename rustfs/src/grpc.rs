@@ -24,9 +24,12 @@ use ecstore::{
     store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions, StorageAPI},
 };
 use futures::{Stream, StreamExt};
+use futures_util::future::join_all;
 use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 
 use common::globals::GLOBAL_Local_Node_Name;
+use ecstore::disk::error::is_err_eof;
+use ecstore::metacache::writer::MetacacheReader;
 use madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
 };
@@ -37,6 +40,7 @@ use protos::{
 };
 use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
+use tokio::spawn;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -730,46 +734,73 @@ impl Node for NodeService {
         }
     }
 
-    async fn walk_dir(&self, request: Request<WalkDirRequest>) -> Result<Response<WalkDirResponse>, Status> {
-        // TODO: use writer
-        unimplemented!()
-        // let request = request.into_inner();
-        // if let Some(disk) = self.find_disk(&request.disk).await {
-        //     let opts = match serde_json::from_str::<WalkDirOptions>(&request.walk_dir_options) {
-        //         Ok(options) => options,
-        //         Err(_) => {
-        //             return Ok(tonic::Response::new(WalkDirResponse {
-        //                 success: false,
-        //                 meta_cache_entry: Vec::new(),
-        //                 error_info: Some("can not decode DeleteOptions".to_string()),
-        //             }));
-        //         }
-        //     };
-        //     match disk.walk_dir(opts, &mut ecstore::io::Writer::NotUse).await {
-        //         Ok(entries) => {
-        //             let entries = entries
-        //                 .into_iter()
-        //                 .filter_map(|entry| serde_json::to_string(&entry).ok())
-        //                 .collect();
-        //             Ok(tonic::Response::new(WalkDirResponse {
-        //                 success: true,
-        //                 meta_cache_entry: entries,
-        //                 error_info: None,
-        //             }))
-        //         }
-        //         Err(err) => Ok(tonic::Response::new(WalkDirResponse {
-        //             success: false,
-        //             meta_cache_entry: Vec::new(),
-        //             error_info: Some(err.to_string()),
-        //         })),
-        //     }
-        // } else {
-        //     Ok(tonic::Response::new(WalkDirResponse {
-        //         success: false,
-        //         meta_cache_entry: Vec::new(),
-        //         error_info: Some("can not find disk".to_string()),
-        //     }))
-        // }
+    type WalkDirStream = ResponseStream<WalkDirResponse>;
+    async fn walk_dir(&self, request: Request<WalkDirRequest>) -> Result<Response<Self::WalkDirStream>, Status> {
+        info!("walk_dir");
+        let request = request.into_inner();
+        let (tx, rx) = mpsc::channel(128);
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let opts = match serde_json::from_str::<WalkDirOptions>(&request.walk_dir_options) {
+                Ok(options) => options,
+                Err(_) => {
+                    return Err(Status::invalid_argument("invalid WalkDirOptions"));
+                }
+            };
+            spawn(async {
+                let (rd, mut wr) = tokio::io::duplex(64);
+                let job1 = spawn(async move {
+                    if let Err(err) = disk.walk_dir(opts, &mut wr).await {
+                        println!("walk_dir err {:?}", err);
+                    }
+                });
+                let job2 = spawn(async move {
+                    let mut reader = MetacacheReader::new(rd);
+
+                    loop {
+                        match reader.peek().await {
+                            Ok(res) => {
+                                if let Some(info) = res {
+                                    match serde_json::to_string(&info) {
+                                        Ok(meta_cache_entry) => tx
+                                            .send(Ok(WalkDirResponse {
+                                                success: true,
+                                                meta_cache_entry,
+                                                error_info: None,
+                                            }))
+                                            .await
+                                            .expect("working rx"),
+                                        Err(e) => tx
+                                            .send(Ok(WalkDirResponse {
+                                                success: false,
+                                                meta_cache_entry: "".to_string(),
+                                                error_info: Some(e.to_string()),
+                                            }))
+                                            .await
+                                            .expect("working rx"),
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if is_err_eof(&err) {
+                                    break;
+                                }
+
+                                println!("get err {:?}", err);
+                                break;
+                            }
+                        }
+                    }
+                });
+                join_all(vec![job1, job2]).await;
+            });
+        } else {
+            return Err(Status::invalid_argument("invalid disk"));
+        }
+
+        let out_stream = ReceiverStream::new(rx);
+        Ok(tonic::Response::new(Box::pin(out_stream)))
     }
 
     async fn rename_data(&self, request: Request<RenameDataRequest>) -> Result<Response<RenameDataResponse>, Status> {
