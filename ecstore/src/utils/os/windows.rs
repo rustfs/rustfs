@@ -1,6 +1,8 @@
+#![allow(unsafe_code)] // TODO: audit unsafe code
+
 use super::IOStats;
 use crate::{disk::Info, error::Result};
-use std::io::{Error, ErrorKind, Result};
+use std::io::{Error, ErrorKind, Result as IoResult};
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -32,7 +34,7 @@ pub fn get_info(p: impl AsRef<Path>) -> Result<Info> {
         )
     };
     if success == 0 {
-        return Err(Error::last_os_error());
+        return Err(Error::last_os_error().into());
     }
 
     let total = unsafe { *lp_total_number_of_bytes.QuadPart() };
@@ -47,7 +49,8 @@ pub fn get_info(p: impl AsRef<Path>) -> Result<Info> {
                 total,
                 p.as_ref().display()
             ),
-        ));
+        )
+        .into());
     }
 
     let mut lp_sectors_per_cluster: DWORD = 0;
@@ -65,7 +68,7 @@ pub fn get_info(p: impl AsRef<Path>) -> Result<Info> {
         )
     };
     if success == 0 {
-        return Err(Error::last_os_error());
+        return Err(Error::last_os_error().into());
     }
 
     Ok(Info {
@@ -87,7 +90,7 @@ fn get_volume_name(v: &[WCHAR]) -> Result<LPCWSTR> {
     let success = unsafe { GetVolumePathNameW(v.as_ptr(), lp_volume_name_buffer.as_mut_ptr(), volume_name_size) };
 
     if success == 0 {
-        return Err(Error::last_os_error());
+        return Err(Error::last_os_error().into());
     }
 
     Ok(lp_volume_name_buffer.as_ptr())
@@ -126,7 +129,7 @@ fn get_fs_type(p: &[WCHAR]) -> Result<String> {
     };
 
     if success == 0 {
-        return Err(Error::last_os_error());
+        return Err(Error::last_os_error().into());
     }
 
     Ok(utf16_to_string(&lp_file_system_name_buffer))
@@ -137,5 +140,5 @@ pub fn same_disk(disk1: &str, disk2: &str) -> Result<bool> {
 }
 
 pub fn get_drive_stats(major: u32, minor: u32) -> Result<IOStats> {
-    IOStats::default()
+    Ok(IOStats::default())
 }
