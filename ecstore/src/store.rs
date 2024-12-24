@@ -1511,7 +1511,10 @@ impl StorageAPI for ECStore {
         Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
     }
 
-    // TODO: review
+    // @continuation_token marker
+    // @start_after as marker when continuation_token empty
+    // @delimiter default="/", empty when recursive
+    // @max_keys limit
     async fn list_objects_v2(
         self: Arc<Self>,
         bucket: &str,
@@ -1524,27 +1527,6 @@ impl StorageAPI for ECStore {
     ) -> Result<ListObjectsV2Info> {
         self.inner_list_objects_v2(bucket, prefix, continuation_token, delimiter, max_keys, fetch_owner, start_after)
             .await
-
-        // let opts = ListPathOptions {
-        //     bucket: bucket.to_string(),
-        //     limit: max_keys,
-        //     prefix: prefix.to_owned(),
-        //     ..Default::default()
-        // };
-
-        // let info = self.list_path(&opts, delimiter).await?;
-
-        // // warn!("list_objects_v2 info {:?}", info);
-
-        // let v2 = ListObjectsV2Info {
-        //     is_truncated: info.is_truncated,
-        //     continuation_token: continuation_token.to_owned(),
-        //     next_continuation_token: info.next_marker,
-        //     objects: info.objects,
-        //     prefixes: info.prefixes,
-        // };
-
-        // Ok(v2)
     }
     async fn list_object_versions(
         self: Arc<Self>,

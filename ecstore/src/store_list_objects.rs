@@ -6,9 +6,10 @@ use crate::file_meta::merge_file_meta_versions;
 use crate::peer::is_reserved_or_invalid_bucket;
 use crate::set_disk::SetDisks;
 use crate::store::check_list_objs_args;
-use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo};
-use crate::store_err::StorageError;
+use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectOptions};
+use crate::store_err::{is_err_bucket_exists, is_err_bucket_not_found, StorageError};
 use crate::utils::path::{self, base_dir_from_prefix, SLASH_SEPARATOR};
+use crate::StorageAPI;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
@@ -29,7 +30,7 @@ const METACACHE_SHARE_PREFIX: bool = false;
 
 pub fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
     let mut max_keys = max_keys;
-    if max_keys > MAX_OBJECT_LIST {
+    if !(0..=MAX_OBJECT_LIST).contains(&max_keys) {
         max_keys = MAX_OBJECT_LIST;
     }
     if add_one {
@@ -115,6 +116,10 @@ impl ListPathOptions {
 
 impl ECStore {
     #[allow(clippy::too_many_arguments)]
+    // @continuation_token marker
+    // @start_after as marker when continuation_token empty
+    // @delimiter default="/", empty when recursive
+    // @max_keys limit
     pub async fn inner_list_objects_v2(
         self: Arc<Self>,
         bucket: &str,
@@ -160,6 +165,33 @@ impl ECStore {
             incl_deleted: false,
             ask_disks: "strict".to_owned(), //TODO: from config
             ..Default::default()
+        };
+
+        // use get
+        if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_empty() {
+            match self
+                .get_object_info(
+                    &opts.bucket,
+                    &opts.prefix,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(res) => {
+                    return Ok(ListObjectsInfo {
+                        objects: vec![res],
+                        ..Default::default()
+                    });
+                }
+                Err(err) => {
+                    if is_err_bucket_not_found(&err) {
+                        return Err(err);
+                    }
+                }
+            };
         };
 
         let mut err_eof = false;
@@ -367,44 +399,60 @@ impl ECStore {
             o.create = false;
         }
 
-        // FIXME:TODO:
-        let (tx, rx) = broadcast::channel(1);
+        // cancel channel
+        let (cancel_tx, cancel_rx) = broadcast::channel(1);
+        let (err_tx, mut err_rx) = broadcast::channel::<Error>(1);
 
-        let (sender, mut recv) = mpsc::channel(o.limit as usize);
+        let (sender, recv) = mpsc::channel(o.limit as usize);
 
         let store = self.clone();
         let opts = o.clone();
-        let rx1 = rx.resubscribe();
-        tokio::spawn(async move {
-            if let Err(err) = store.list_merged(rx1, opts, sender).await {
+        let cancel_rx1 = cancel_rx.resubscribe();
+        let err_tx1 = err_tx.clone();
+        let job1 = tokio::spawn(async move {
+            let mut opts = opts;
+            opts.stop_disk_at_limit = true;
+            if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await {
                 error!("list_merged err {:?}", err);
+                let _ = err_tx1.send(err);
             }
         });
 
-        let rx2 = rx.resubscribe();
-        let res = gather_results(rx2, &o, &mut recv).await?;
+        let cancel_rx2 = cancel_rx.resubscribe();
 
-        tx.send(true)?;
+        let (result_tx, mut result_rx) = mpsc::channel(1);
 
-        // TODO: recv list_merged err
+        let job2 = tokio::spawn(gather_results(cancel_rx2, o, recv, result_tx));
 
-        Ok(MetaCacheEntriesSorted {
-            o: MetaCacheEntries(res.into_iter().map(Some).collect()),
-        })
+        let result = {
+            // receiver result
+            tokio::select! {
+               res = err_rx.recv() =>{
 
-        // let mut opts = opts.clone();
+                match res{
+                    Ok(o) => {
+                        error!("list_path err_rx.recv() ok {:?}", &o);
+                        Err(o)
+                    },
+                    Err(err) => {
+                        error!("list_path err_rx.recv() err {:?}", &err);
+                        Err(Error::new(err))
+                    },
+                }
+               },
+               Some(result) = result_rx.recv()=>{
+                result
+               }
+            }
+        };
 
-        // if opts.base_dir.is_empty() {
-        //     opts.base_dir = base_dir_from_prefix(&opts.prefix);
-        // }
+        // cancel call exit spawns
+        cancel_tx.send(true)?;
 
-        // let objects = self.list_merged(&opts).await?;
+        // wait spawns exit
+        join_all(vec![job1, job2]).await;
 
-        // let info = ListObjectsInfo {
-        //     objects,
-        //     ..Default::default()
-        // };
-        // Ok(info)
+        result
     }
 
     // 读所有
@@ -486,16 +534,21 @@ impl ECStore {
     }
 }
 
-// TODO: FIXME: 异步
 async fn gather_results(
     _rx: B_Receiver<bool>,
-    opts: &ListPathOptions,
-    recv: &mut Receiver<MetaCacheEntry>,
-) -> Result<Vec<MetaCacheEntry>> {
+    opts: ListPathOptions,
+    recv: Receiver<MetaCacheEntry>,
+    results_tx: Sender<Result<MetaCacheEntriesSorted>>,
+) {
     let mut returned = false;
-    let mut results = Vec::new();
+    let mut results = MetaCacheEntriesSorted {
+        o: MetaCacheEntries(Vec::new()),
+    };
+
+    let mut recv = recv;
+    // let mut entrys = Vec::new();
     while let Some(mut entry) = recv.recv().await {
-        // warn!("gather_results entry {}", &entry.name);
+        // warn!("gather_entrys entry {}", &entry.name);
         if returned {
             continue;
         }
@@ -514,16 +567,16 @@ async fn gather_results(
         }
 
         // TODO: other
-        if opts.limit > 0 && results.len() >= opts.limit as usize {
+        if opts.limit > 0 && results.o.0.len() >= opts.limit as usize {
             returned = true;
             continue;
         }
 
-        results.push(entry);
+        results.o.0.push(Some(entry));
+        // entrys.push(entry);
     }
 
-    // warn!("gather_results results {:?}", &results);
-    Ok(results)
+    results_tx.send(Ok(results)).await;
 }
 
 async fn select_from(
