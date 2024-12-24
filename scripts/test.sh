@@ -48,7 +48,7 @@ mc rm rustfs/dada/test2.txt
 
 mc ls rustfs/dada
 
-dd if=/dev/urandom of=50M.file bs=1M count=50
+dd if=/dev/urandom of=50M.file bs=1m count=50
 
 mc cp 50M.file rustfs/dada
 
