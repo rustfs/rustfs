@@ -688,7 +688,7 @@ pub struct ListObjectsInfo {
     // When response is truncated (the IsTruncated element value in the response
     // is true), you can use the key name in this field as marker in the subsequent
     // request to get next set of objects.
-    pub next_marker: String,
+    pub next_marker: Option<String>,
 
     // List of objects info for this request.
     pub objects: Vec<ObjectInfo>,
@@ -711,8 +711,8 @@ pub struct ListObjectsV2Info {
     //
     // NOTE: This element is returned only if you have delimiter request parameter
     // specified.
-    pub continuation_token: String,
-    pub next_continuation_token: String,
+    pub continuation_token: Option<String>,
+    pub next_continuation_token: Option<String>,
 
     // List of objects info for this request.
     pub objects: Vec<ObjectInfo>,
@@ -744,20 +744,20 @@ pub struct MultipartInfo {
 pub struct ListMultipartsInfo {
     // Together with upload-id-marker, this parameter specifies the multipart upload
     // after which listing should begin.
-    pub key_marker: String,
+    pub key_marker: Option<String>,
 
     // Together with key-marker, specifies the multipart upload after which listing
     // should begin. If key-marker is not specified, the upload-id-marker parameter
     // is ignored.
-    pub upload_id_marker: String,
+    pub upload_id_marker: Option<String>,
 
     // When a list is truncated, this element specifies the value that should be
     // used for the key-marker request parameter in a subsequent request.
-    pub next_key_marker: String,
+    pub next_key_marker: Option<String>,
 
     // When a list is truncated, this element specifies the value that should be
     // used for the upload-id-marker request parameter in a subsequent request.
-    pub next_upload_id_marker: String,
+    pub next_upload_id_marker: Option<String>,
 
     // Maximum number of multipart uploads that could have been included in the
     // response.
@@ -778,7 +778,7 @@ pub struct ListMultipartsInfo {
 
     // A character used to truncate the object prefixes.
     // NOTE: only supported delimiter is '/'.
-    pub delimiter: String,
+    pub delimiter: Option<String>,
 
     // CommonPrefixes contains all (if there are any) keys between Prefix and the
     // next occurrence of the string specified by delimiter.
@@ -846,20 +846,20 @@ pub trait StorageAPI: ObjectIO {
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
-        continuation_token: &str,
-        delimiter: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
         max_keys: i32,
         fetch_owner: bool,
-        start_after: &str,
+        start_after: Option<String>,
     ) -> Result<ListObjectsV2Info>;
     // ListObjectVersions TODO: FIXME:
     async fn list_object_versions(
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
-        marker: &str,
-        version_marker: &str,
-        delimiter: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo>;
     // Walk TODO:
@@ -884,9 +884,9 @@ pub trait StorageAPI: ObjectIO {
         &self,
         bucket: &str,
         prefix: &str,
-        key_marker: &str,
-        upload_id_marker: &str,
-        delimiter: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo>;
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult>;

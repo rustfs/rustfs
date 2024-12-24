@@ -454,11 +454,11 @@ impl StorageAPI for Sets {
         self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
-        _continuation_token: &str,
-        _delimiter: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
         _max_keys: i32,
         _fetch_owner: bool,
-        _start_after: &str,
+        _start_after: Option<String>,
     ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
@@ -466,9 +466,9 @@ impl StorageAPI for Sets {
         self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
-        _marker: &str,
-        _version_marker: &str,
-        _delimiter: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
         unimplemented!()
@@ -527,9 +527,9 @@ impl StorageAPI for Sets {
         &self,
         bucket: &str,
         prefix: &str,
-        key_marker: &str,
-        upload_id_marker: &str,
-        delimiter: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
         self.get_disks_by_key(prefix)

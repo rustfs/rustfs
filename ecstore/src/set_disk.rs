@@ -1907,9 +1907,15 @@ impl SetDisks {
             fallback_disks: fallback_disks.to_vec(),
             bucket: bucket.to_string(),
             path: path.to_string(),
-            filter_prefix: filter_prefix.to_string(),
+            filter_prefix: {
+                if filter_prefix.is_empty() {
+                    None
+                } else {
+                    Some(filter_prefix.to_string())
+                }
+            },
             recursice: true,
-            forward_to: "".to_string(),
+            forward_to: None,
             min_disks: 1,
             report_not_found: false,
             per_disk_limit: 0,
@@ -3067,10 +3073,10 @@ impl SetDisks {
                 continue;
             }
 
-            let mut forward_to = "".to_string();
+            let mut forward_to = None;
             let b = tracker.read().await.get_bucket().await;
             if b == *bucket {
-                forward_to = tracker.read().await.get_object().await;
+                forward_to = Some(tracker.read().await.get_object().await);
             }
 
             if !b.is_empty() {
@@ -3835,11 +3841,11 @@ impl StorageAPI for SetDisks {
         self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
-        _continuation_token: &str,
-        _delimiter: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
         _max_keys: i32,
         _fetch_owner: bool,
-        _start_after: &str,
+        _start_after: Option<String>,
     ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
@@ -3847,9 +3853,9 @@ impl StorageAPI for SetDisks {
         self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
-        _marker: &str,
-        _version_marker: &str,
-        _delimiter: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
         unimplemented!()
@@ -4113,9 +4119,9 @@ impl StorageAPI for SetDisks {
         &self,
         bucket: &str,
         object: &str,
-        key_marker: &str,
-        upload_id_marker: &str,
-        delimiter: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
         let disks = {
@@ -4209,14 +4215,14 @@ impl StorageAPI for SetDisks {
         uploads.sort_by(|a, b| a.initiated.cmp(&b.initiated));
 
         let mut upload_idx = 0;
-        if !upload_id_marker.is_empty() {
+        if let Some(upload_id_marker) = &upload_id_marker {
             while upload_idx < uploads.len() {
-                if uploads[upload_idx].upload_id != upload_id_marker {
+                if &uploads[upload_idx].upload_id != upload_id_marker {
                     upload_idx += 1;
                     continue;
                 }
 
-                if uploads[upload_idx].upload_id == upload_id_marker {
+                if &uploads[upload_idx].upload_id == upload_id_marker {
                     upload_idx += 1;
                     break;
                 }
@@ -4226,10 +4232,10 @@ impl StorageAPI for SetDisks {
         }
 
         let mut ret_uploads = Vec::new();
-        let mut next_upload_id_marker = String::new();
+        let mut next_upload_id_marker = None;
         while upload_idx < uploads.len() {
             ret_uploads.push(uploads[upload_idx].clone());
-            next_upload_id_marker = uploads[upload_idx].upload_id.clone();
+            next_upload_id_marker = Some(uploads[upload_idx].upload_id.clone());
             upload_idx += 1;
 
             if ret_uploads.len() > max_uploads {
@@ -4240,7 +4246,7 @@ impl StorageAPI for SetDisks {
         let is_truncated = ret_uploads.len() < uploads.len();
 
         if !is_truncated {
-            next_upload_id_marker = "".to_owned();
+            next_upload_id_marker = None;
         }
 
         Ok(ListMultipartsInfo {

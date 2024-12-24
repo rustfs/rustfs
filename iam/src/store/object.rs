@@ -55,7 +55,7 @@ impl ObjectStore {
                 let items = self
                     .object_api
                     .clone()
-                    .list_objects_v2(Self::BUCKET_NAME.into(), &prefix.clone(), "", "", 0, false, "")
+                    .list_objects_v2(Self::BUCKET_NAME, &prefix.clone(), None, None, 0, false, None)
                     .await;
 
                 match items {
