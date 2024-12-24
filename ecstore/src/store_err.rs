@@ -52,6 +52,9 @@ pub enum StorageError {
     #[error("Object not found: {0}/{1}")]
     ObjectNotFound(String, String),
 
+    #[error("volume not found: {0}")]
+    VolumeNotFound(String),
+
     #[error("Version not found: {0}/{1}-{2}")]
     VersionNotFound(String, String, String),
 
@@ -188,6 +191,14 @@ pub fn is_err_version_not_found(err: &Error) -> bool {
 pub fn is_err_bucket_exists(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<StorageError>() {
         matches!(e, StorageError::BucketExists(_))
+    } else {
+        false
+    }
+}
+
+pub fn is_err_bucket_not_found(err: &Error) -> bool {
+    if let Some(e) = err.downcast_ref::<StorageError>() {
+        matches!(e, StorageError::VolumeNotFound(_)) || matches!(e, StorageError::BucketNotFound(_))
     } else {
         false
     }
