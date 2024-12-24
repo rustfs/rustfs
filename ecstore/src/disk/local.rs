@@ -44,6 +44,7 @@ use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::io::Cursor;
+#[cfg(target_family = "unix")]
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -963,7 +964,7 @@ impl DiskAPI for LocalDisk {
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                         continue;
                     }
-                    if (st.size() as usize) < fi.erasure.shard_file_size(part.size) {
+                    if (st.len() as usize) < fi.erasure.shard_file_size(part.size) {
                         resp.results[i] = CHECK_PART_FILE_CORRUPT;
                         continue;
                     }
