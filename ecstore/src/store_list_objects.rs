@@ -1,13 +1,16 @@
 use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
 use crate::disk::error::{is_all_not_found, is_all_volume_not_found, is_err_eof, DiskError};
-use crate::disk::{DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetadataResolutionParams};
+use crate::disk::{
+    DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
+    MetadataResolutionParams,
+};
 use crate::error::{Error, Result};
 use crate::file_meta::merge_file_meta_versions;
 use crate::peer::is_reserved_or_invalid_bucket;
 use crate::set_disk::SetDisks;
 use crate::store::check_list_objs_args;
 use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectOptions};
-use crate::store_err::{is_err_bucket_exists, is_err_bucket_not_found, StorageError};
+use crate::store_err::{is_err_bucket_not_found, to_object_err, StorageError};
 use crate::utils::path::{self, base_dir_from_prefix, SLASH_SEPARATOR};
 use crate::StorageAPI;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
@@ -20,6 +23,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::error;
+use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
 // const MAX_DELETE_LIST: i32 = 1000;
@@ -41,7 +45,7 @@ pub fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
 
 #[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
-    pub id: String,
+    pub id: Option<String>,
 
     // Bucket of the listing.
     pub bucket: String,
@@ -56,11 +60,11 @@ pub struct ListPathOptions {
     // FilterPrefix will return only results with this prefix when scanning.
     // Should never contain a slash.
     // Prefix should still be set.
-    pub filter_prefix: String,
+    pub filter_prefix: Option<String>,
 
     // Marker to resume listing.
     // The response will be the first entry >= this object name.
-    pub marker: String,
+    pub marker: Option<String>,
 
     // Limit the number of results.
     pub limit: i32,
@@ -77,7 +81,7 @@ pub struct ListPathOptions {
     pub recursive: bool,
 
     // Separator to use.
-    pub separator: String,
+    pub separator: Option<String>,
 
     // Create indicates that the lister should not attempt to load an existing cache.
     pub create: bool,
@@ -94,7 +98,12 @@ pub struct ListPathOptions {
     pub versioned: bool,
 
     pub stop_disk_at_limit: bool,
+
+    pub pool_idx: Option<usize>,
+    pub set_idx: Option<usize>,
 }
+
+const MARKER_TAG_VERSION: &str = "v1";
 
 impl ListPathOptions {
     pub fn set_filter(&mut self) {
@@ -106,10 +115,79 @@ impl ListPathOptions {
         }
 
         let s = SLASH_SEPARATOR.chars().next().unwrap_or_default();
-        self.filter_prefix = self.prefix.trim_start_matches(&self.base_dir).trim_matches(s).to_owned();
+        self.filter_prefix = {
+            let fp = self.prefix.trim_start_matches(&self.base_dir).trim_matches(s);
 
-        if self.filter_prefix.contains(s) {
-            self.filter_prefix = "".to_owned();
+            if fp.contains(s) || fp.is_empty() {
+                None
+            } else {
+                Some(fp.to_owned())
+            }
+        }
+    }
+
+    pub fn parse_marker(&mut self) {
+        if let Some(marker) = &self.marker {
+            let s = marker.clone();
+            if !s.contains(format!("[rustfs_cache:{}", MARKER_TAG_VERSION).as_str()) {
+                return;
+            }
+
+            if let (Some(start_idx), Some(end_idx)) = (s.find("["), s.find("]")) {
+                self.marker = Some(s[0..start_idx].to_owned());
+                let tags: Vec<_> = s[start_idx..end_idx].trim_matches(['[', ']']).split(",").collect();
+
+                for &tag in tags.iter() {
+                    let kv: Vec<_> = tag.split(":").collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+
+                    match kv[0] {
+                        "rustfs_cache" => {
+                            if kv[1] != MARKER_TAG_VERSION {
+                                continue;
+                            }
+                        }
+                        "id" => self.id = Some(kv[1].to_owned()),
+                        "return" => {
+                            self.id = Some(Uuid::new_v4().to_string());
+                            self.create = true;
+                        }
+                        "p" => match kv[1].parse::<usize>() {
+                            Ok(res) => self.pool_idx = Some(res),
+                            Err(_) => {
+                                self.id = Some(Uuid::new_v4().to_string());
+                                self.create = true;
+                                continue;
+                            }
+                        },
+                        "s" => match kv[1].parse::<usize>() {
+                            Ok(res) => self.set_idx = Some(res),
+                            Err(_) => {
+                                self.id = Some(Uuid::new_v4().to_string());
+                                self.create = true;
+                                continue;
+                            }
+                        },
+                        _ => (),
+                    }
+                }
+            }
+        }
+    }
+    pub fn encode_marker(&mut self, marker: &str) -> String {
+        if let Some(id) = &self.id {
+            format!(
+                "{}[rustfs_cache:{},id:{},p:{},s:{}]",
+                marker,
+                MARKER_TAG_VERSION,
+                id.to_owned(),
+                self.pool_idx.unwrap_or_default(),
+                self.pool_idx.unwrap_or_default(),
+            )
+        } else {
+            format!("{}[rustfs_cache:{},return:]", marker, MARKER_TAG_VERSION)
         }
     }
 }
@@ -124,24 +202,24 @@ impl ECStore {
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
-        continuation_token: &str,
-        delimiter: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
         max_keys: i32,
         _fetch_owner: bool,
-        start_after: &str,
+        start_after: Option<String>,
     ) -> Result<ListObjectsV2Info> {
         let marker = {
-            if continuation_token.is_empty() {
+            if continuation_token.is_none() {
                 start_after
             } else {
-                continuation_token
+                continuation_token.clone()
             }
         };
 
         let loi = self.list_objects_generic(bucket, prefix, marker, delimiter, max_keys).await?;
         Ok(ListObjectsV2Info {
             is_truncated: loi.is_truncated,
-            continuation_token: continuation_token.to_owned(),
+            continuation_token,
             next_continuation_token: loi.next_marker,
             objects: loi.objects,
             prefixes: loi.prefixes,
@@ -152,23 +230,23 @@ impl ECStore {
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
-        marker: &str,
-        delimiter: &str,
+        marker: Option<String>,
+        delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectsInfo> {
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
-            separator: delimiter.to_owned(),
-            limit: max_keys_plus_one(max_keys, !marker.is_empty()),
-            marker: marker.to_owned(),
+            separator: delimiter.clone(),
+            limit: max_keys_plus_one(max_keys, marker.is_some()),
+            marker,
             incl_deleted: false,
             ask_disks: "strict".to_owned(), //TODO: from config
             ..Default::default()
         };
 
         // use get
-        if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_empty() {
+        if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_none() {
             match self
                 .get_object_info(
                     &opts.bucket,
@@ -194,31 +272,46 @@ impl ECStore {
             };
         };
 
-        let mut err_eof = false;
-        let has_merged = match self.list_path(&opts).await {
-            Ok(res) => Some(res),
-            Err(err) => {
-                if !is_err_eof(&err) {
-                    return Err(err);
-                }
+        let mut list_result = match self.list_path(&opts).await {
+            Ok(res) => res,
+            Err(err) => MetaCacheEntriesSortedResult {
+                err: Some(err),
+                ..Default::default()
+            },
+        };
 
-                err_eof = true;
-                None
+        if let Some(err) = &list_result.err {
+            if !is_err_eof(err) {
+                return Err(to_object_err(list_result.err.unwrap(), vec![bucket, prefix]));
             }
-        };
+        }
 
-        let mut get_objects = if let Some(merged) = has_merged {
-            merged.file_infos(bucket, prefix, delimiter).await
-        } else {
-            Vec::new()
-        };
+        if let Some(result) = list_result.entries.as_mut() {
+            result.forward_past(opts.marker);
+        }
+
+        // contextCanceled
+
+        let mut get_objects = list_result
+            .entries
+            .unwrap_or_default()
+            .file_infos(bucket, prefix, delimiter.clone())
+            .await;
 
         let is_truncated = {
             if max_keys > 0 && get_objects.len() > max_keys as usize {
                 get_objects.truncate(max_keys as usize);
                 true
             } else {
-                !err_eof && !get_objects.is_empty()
+                list_result.err.is_none() && !get_objects.is_empty()
+            }
+        };
+
+        let next_marker = {
+            if is_truncated {
+                get_objects.last().map(|last| last.name.clone())
+            } else {
+                None
             }
         };
 
@@ -226,35 +319,31 @@ impl ECStore {
 
         let mut objects = Vec::with_capacity(get_objects.len());
         for obj in get_objects.into_iter() {
-            if obj.is_dir && obj.mod_time.is_none() && !delimiter.is_empty() {
-                let mut found = false;
-                if delimiter != SLASH_SEPARATOR {
-                    for p in prefixes.iter() {
-                        if found {
-                            break;
+            if let Some(delimiter) = &delimiter {
+                if obj.is_dir && obj.mod_time.is_none() {
+                    let mut found = false;
+                    if delimiter != SLASH_SEPARATOR {
+                        for p in prefixes.iter() {
+                            if found {
+                                break;
+                            }
+                            found = p == &obj.name;
                         }
-                        found = p == &obj.name;
                     }
-                }
-                if !found {
-                    prefixes.push(obj.name.clone());
+                    if !found {
+                        prefixes.push(obj.name.clone());
+                    }
+                } else {
+                    objects.push(obj);
                 }
             } else {
                 objects.push(obj);
             }
         }
 
-        let next_marker = {
-            if is_truncated {
-                objects.last().map(|last| last.name.clone())
-            } else {
-                None
-            }
-        };
-
         Ok(ListObjectsInfo {
             is_truncated,
-            next_marker: next_marker.unwrap_or_default(),
+            next_marker,
             objects,
             prefixes,
         })
@@ -264,80 +353,64 @@ impl ECStore {
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
-        marker: &str,
-        version_marker: &str,
-        delimiter: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        if marker.is_empty() && !version_marker.is_empty() {
+        if marker.is_none() && version_marker.is_some() {
             return Err(Error::new(StorageError::NotImplemented));
         }
 
+        // if marker set, limit +1
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
-            separator: delimiter.to_owned(),
-            limit: max_keys_plus_one(max_keys, !marker.is_empty()),
-            marker: marker.to_owned(),
+            separator: delimiter.clone(),
+            limit: max_keys_plus_one(max_keys, marker.is_some()),
+            marker,
             incl_deleted: true,
             ask_disks: "strict".to_owned(),
             versioned: true,
             ..Default::default()
         };
 
-        let mut err_eof = false;
-        let has_merged = match self.list_path(&opts).await {
-            Ok(res) => Some(res),
-            Err(err) => {
-                if !is_err_eof(&err) {
-                    return Err(err);
-                }
+        let mut list_result = match self.list_path(&opts).await {
+            Ok(res) => res,
+            Err(err) => MetaCacheEntriesSortedResult {
+                err: Some(err),
+                ..Default::default()
+            },
+        };
 
-                err_eof = true;
-                None
+        if let Some(err) = &list_result.err {
+            if !is_err_eof(err) {
+                return Err(to_object_err(list_result.err.unwrap(), vec![bucket, prefix]));
             }
-        };
+        }
 
-        let mut get_objects = if let Some(merged) = has_merged {
-            merged.file_info_versions(bucket, prefix, delimiter, version_marker).await
-        } else {
-            Vec::new()
-        };
+        if let Some(result) = list_result.entries.as_mut() {
+            result.forward_past(opts.marker);
+        }
+
+        let mut get_objects = list_result
+            .entries
+            .unwrap_or_default()
+            .file_info_versions(bucket, prefix, delimiter.clone(), version_marker)
+            .await;
 
         let is_truncated = {
             if max_keys > 0 && get_objects.len() > max_keys as usize {
                 get_objects.truncate(max_keys as usize);
                 true
             } else {
-                !err_eof && !get_objects.is_empty()
+                list_result.err.is_none() && !get_objects.is_empty()
             }
         };
 
-        let mut prefixes: Vec<String> = Vec::new();
-
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects.into_iter() {
-            if obj.is_dir && obj.mod_time.is_none() && !delimiter.is_empty() {
-                let mut found = false;
-                if delimiter != SLASH_SEPARATOR {
-                    for p in prefixes.iter() {
-                        if found {
-                            break;
-                        }
-                        found = p == &obj.name;
-                    }
-                }
-                if !found {
-                    prefixes.push(obj.name.clone());
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
         let (next_marker, next_version_idmarker) = {
             if is_truncated {
-                objects
+                get_objects
                     .last()
                     .map(|last| (Some(last.name.clone()), last.version_id.map(|v| v.to_string())))
                     .unwrap_or_default()
@@ -345,6 +418,32 @@ impl ECStore {
                 (None, None)
             }
         };
+
+        let mut prefixes: Vec<String> = Vec::new();
+
+        let mut objects = Vec::with_capacity(get_objects.len());
+        for obj in get_objects.into_iter() {
+            if let Some(delimiter) = &delimiter {
+                if obj.is_dir && obj.mod_time.is_none() {
+                    let mut found = false;
+                    if delimiter != SLASH_SEPARATOR {
+                        for p in prefixes.iter() {
+                            if found {
+                                break;
+                            }
+                            found = p == &obj.name;
+                        }
+                    }
+                    if !found {
+                        prefixes.push(obj.name.clone());
+                    }
+                } else {
+                    objects.push(obj);
+                }
+            } else {
+                objects.push(obj);
+            }
+        }
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -355,19 +454,21 @@ impl ECStore {
         })
     }
 
-    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSorted> {
+    pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
+        // warn!("list_path opt {:?}", &o);
+
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
         // if opts.prefix.ends_with(SLASH_SEPARATOR) {
         //     return Err(Error::msg("eof"));
         // }
 
         let mut o = o.clone();
-        if o.marker < o.prefix {
-            o.marker = "".to_owned();
-        }
+        o.marker = o.marker.filter(|v| v >= &o.prefix);
 
-        if !o.marker.is_empty() && !o.prefix.is_empty() && !o.marker.starts_with(&o.prefix) {
-            return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
+        if let Some(marker) = &o.marker {
+            if !o.prefix.is_empty() && !marker.starts_with(&o.prefix) {
+                return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
+            }
         }
 
         if o.limit == 0 {
@@ -378,16 +479,18 @@ impl ECStore {
             return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
         }
 
-        o.include_directories = o.separator == SLASH_SEPARATOR;
+        let slash_separator = Some(SLASH_SEPARATOR.to_owned());
 
-        if (o.separator == SLASH_SEPARATOR || o.separator.is_empty()) && !o.recursive {
-            o.recursive = o.separator != SLASH_SEPARATOR;
-            o.separator = SLASH_SEPARATOR.to_owned();
+        o.include_directories = o.separator == slash_separator;
+
+        if (o.separator == slash_separator || o.separator.is_none()) && !o.recursive {
+            o.recursive = o.separator != slash_separator;
+            o.separator = slash_separator;
         } else {
             o.recursive = true
         }
 
-        // TODO: parseMarker
+        o.parse_marker();
 
         if o.base_dir.is_empty() {
             o.base_dir = base_dir_from_prefix(&o.prefix);
@@ -421,10 +524,16 @@ impl ECStore {
         let cancel_rx2 = cancel_rx.resubscribe();
 
         let (result_tx, mut result_rx) = mpsc::channel(1);
+        let err_tx2 = err_tx.clone();
+        let opts = o.clone();
+        let job2 = tokio::spawn(async move {
+            if let Err(err) = gather_results(cancel_rx2, opts, recv, result_tx).await {
+                error!("gather_results err {:?}", err);
+                let _ = err_tx2.send(err);
+            }
+        });
 
-        let job2 = tokio::spawn(gather_results(cancel_rx2, o, recv, result_tx));
-
-        let result = {
+        let mut result = {
             // receiver result
             tokio::select! {
                res = err_rx.recv() =>{
@@ -432,11 +541,12 @@ impl ECStore {
                 match res{
                     Ok(o) => {
                         error!("list_path err_rx.recv() ok {:?}", &o);
-                        Err(o)
+                        MetaCacheEntriesSortedResult{ entries: None, err: Some(o) }
                     },
                     Err(err) => {
                         error!("list_path err_rx.recv() err {:?}", &err);
-                        Err(Error::new(err))
+
+                        MetaCacheEntriesSortedResult{ entries: None, err: Some(Error::new(err)) }
                     },
                 }
                },
@@ -452,7 +562,28 @@ impl ECStore {
         // wait spawns exit
         join_all(vec![job1, job2]).await;
 
-        result
+        if result.err.is_some() {
+            return Ok(result);
+        }
+
+        if let Some(entries) = result.entries.as_mut() {
+            entries.reuse = true;
+            let truncated = !entries.entries().is_empty() || result.err.is_none();
+            entries.o.0.truncate(o.limit as usize);
+            if !o.transient && truncated {
+                entries.list_id = if let Some(id) = o.id {
+                    Some(id)
+                } else {
+                    Some(Uuid::new_v4().to_string())
+                }
+            }
+
+            if !truncated {
+                result.err = Some(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
+            }
+        }
+
+        Ok(result)
     }
 
     // 读所有
@@ -485,6 +616,10 @@ impl ECStore {
                 println!("merge_entry_channels err {:?}", err)
             }
         });
+
+        // let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
+
+        // TODO: cancelList
 
         // let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
 
@@ -538,17 +673,15 @@ async fn gather_results(
     _rx: B_Receiver<bool>,
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
-    results_tx: Sender<Result<MetaCacheEntriesSorted>>,
-) {
+    results_tx: Sender<MetaCacheEntriesSortedResult>,
+) -> Result<()> {
     let mut returned = false;
-    let mut results = MetaCacheEntriesSorted {
-        o: MetaCacheEntries(Vec::new()),
-    };
+
+    let mut sender = Some(results_tx);
 
     let mut recv = recv;
-    // let mut entrys = Vec::new();
+    let mut entrys = Vec::new();
     while let Some(mut entry) = recv.recv().await {
-        // warn!("gather_entrys entry {}", &entry.name);
         if returned {
             continue;
         }
@@ -562,21 +695,62 @@ async fn gather_results(
             continue;
         }
 
-        if !opts.marker.is_empty() && entry.name < opts.marker {
+        if let Some(marker) = &opts.marker {
+            if &entry.name < marker {
+                continue;
+            }
+        }
+
+        if !entry.name.starts_with(&opts.prefix) {
             continue;
         }
 
-        // TODO: other
-        if opts.limit > 0 && results.o.0.len() >= opts.limit as usize {
-            returned = true;
+        if let Some(separator) = &opts.separator {
+            if !opts.recursive && !entry.is_in_dir(&opts.prefix, separator) {
+                continue;
+            }
+        }
+
+        if !opts.incl_deleted && entry.is_object() && entry.is_latest_deletemarker() && entry.is_object_dir() {
             continue;
         }
 
-        results.o.0.push(Some(entry));
+        // TODO: Lifecycle
+
+        if opts.limit > 0 && entrys.len() >= opts.limit as usize {
+            if let Some(tx) = sender {
+                tx.send(MetaCacheEntriesSortedResult {
+                    entries: Some(MetaCacheEntriesSorted {
+                        o: MetaCacheEntries(entrys.clone()),
+                        ..Default::default()
+                    }),
+                    err: None,
+                })
+                .await?;
+
+                returned = true;
+                sender = None;
+            }
+            continue;
+        }
+
+        entrys.push(Some(entry));
         // entrys.push(entry);
     }
 
-    results_tx.send(Ok(results)).await;
+    // finish not full, return eof
+    if let Some(tx) = sender {
+        tx.send(MetaCacheEntriesSortedResult {
+            entries: Some(MetaCacheEntriesSorted {
+                o: MetaCacheEntries(entrys.clone()),
+                ..Default::default()
+            }),
+            err: Some(Error::new(std::io::Error::new(ErrorKind::UnexpectedEof, "Unexpected EOF"))),
+        })
+        .await?;
+    }
+
+    Ok(())
 }
 
 async fn select_from(
@@ -1024,7 +1198,7 @@ mod test {
 
         let (_, rx) = broadcast::channel(1);
         let bucket = "dada".to_owned();
-        let forward_to = "".to_owned();
+        let forward_to = None;
         let disks = vec![Some(disk)];
         let fallback_disks = Vec::new();
 

@@ -23,7 +23,6 @@ use crate::store_err::{
     to_object_err, StorageError,
 };
 use crate::store_init::ec_drives_no_config;
-use crate::store_list_objects::{max_keys_plus_one, ListPathOptions};
 use crate::utils::crypto::base64_decode;
 use crate::utils::path::{decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
 use crate::utils::xml;
@@ -1519,11 +1518,11 @@ impl StorageAPI for ECStore {
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
-        continuation_token: &str,
-        delimiter: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
         max_keys: i32,
         fetch_owner: bool,
-        start_after: &str,
+        start_after: Option<String>,
     ) -> Result<ListObjectsV2Info> {
         self.inner_list_objects_v2(bucket, prefix, continuation_token, delimiter, max_keys, fetch_owner, start_after)
             .await
@@ -1532,9 +1531,9 @@ impl StorageAPI for ECStore {
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
-        marker: &str,
-        version_marker: &str,
-        delimiter: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
         self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
@@ -1672,12 +1671,12 @@ impl StorageAPI for ECStore {
         &self,
         bucket: &str,
         prefix: &str,
-        key_marker: &str,
-        upload_id_marker: &str,
-        delimiter: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
-        check_list_multipart_args(bucket, prefix, key_marker, upload_id_marker, delimiter)?;
+        check_list_multipart_args(bucket, prefix, &key_marker, &upload_id_marker, &delimiter)?;
 
         if prefix.is_empty() {
             // TODO: return from cache
@@ -1693,14 +1692,21 @@ impl StorageAPI for ECStore {
 
         for pool in self.pools.iter() {
             let res = pool
-                .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
+                .list_multipart_uploads(
+                    bucket,
+                    prefix,
+                    key_marker.clone(),
+                    upload_id_marker.clone(),
+                    delimiter.clone(),
+                    max_uploads,
+                )
                 .await?;
             uploads.extend(res.uploads);
         }
 
         Ok(ListMultipartsInfo {
-            key_marker: key_marker.to_owned(),
-            upload_id_marker: upload_id_marker.to_owned(),
+            key_marker,
+            upload_id_marker,
             max_uploads,
             uploads,
             prefix: prefix.to_owned(),
@@ -1718,7 +1724,7 @@ impl StorageAPI for ECStore {
         for (idx, pool) in self.pools.iter().enumerate() {
             // // TODO: IsSuspended
             let res = pool
-                .list_multipart_uploads(bucket, object, "", "", "", MAX_UPLOADS_LIST)
+                .list_multipart_uploads(bucket, object, None, None, None, MAX_UPLOADS_LIST)
                 .await?;
 
             if !res.uploads.is_empty() {
@@ -2203,7 +2209,7 @@ fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &str) -> Result<()> {
+pub fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &Option<String>) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
         return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
     }
@@ -2218,18 +2224,20 @@ pub fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &str) -> Result
 fn check_list_multipart_args(
     bucket: &str,
     prefix: &str,
-    key_marker: &str,
-    upload_id_marker: &str,
-    _delimiter: &str,
+    key_marker: &Option<String>,
+    upload_id_marker: &Option<String>,
+    _delimiter: &Option<String>,
 ) -> Result<()> {
     check_list_objs_args(bucket, prefix, key_marker)?;
 
-    if !upload_id_marker.is_empty() {
-        if key_marker.ends_with('/') {
-            return Err(Error::new(StorageError::InvalidUploadIDKeyCombination(
-                upload_id_marker.to_string(),
-                key_marker.to_string(),
-            )));
+    if let Some(upload_id_marker) = upload_id_marker {
+        if let Some(key_marker) = key_marker {
+            if key_marker.ends_with('/') {
+                return Err(Error::new(StorageError::InvalidUploadIDKeyCombination(
+                    upload_id_marker.to_string(),
+                    key_marker.to_string(),
+                )));
+            }
         }
 
         if let Err(_e) = base64_decode(upload_id_marker.as_bytes()) {

@@ -729,16 +729,29 @@ impl LocalDisk {
         objs_returned: &mut i32,
     ) -> Result<()> {
         let forward = {
-            if !opts.forward_to.is_empty() && opts.forward_to.starts_with(&*current) {
-                let forward = opts.forward_to.trim_start_matches(&*current);
+            opts.forward_to.as_ref().filter(|v| v.starts_with(&*current)).map(|v| {
+                let forward = v.trim_start_matches(&*current);
                 if let Some(idx) = forward.find('/') {
-                    &forward[..idx]
+                    forward[..idx].to_owned()
                 } else {
-                    forward
+                    forward.to_owned()
                 }
-            } else {
-                ""
-            }
+            })
+            // if let Some(forward_to) = &opts.forward_to {
+
+            // } else {
+            //     None
+            // }
+            // if !opts.forward_to.is_empty() && opts.forward_to.starts_with(&*current) {
+            //     let forward = opts.forward_to.trim_start_matches(&*current);
+            //     if let Some(idx) = forward.find('/') {
+            //         &forward[..idx]
+            //     } else {
+            //         forward
+            //     }
+            // } else {
+            //     ""
+            // }
         };
 
         if opts.limit > 0 && *objs_returned >= opts.limit {
@@ -781,14 +794,18 @@ impl LocalDisk {
                 return Ok(());
             }
             // check prefix
-            if !opts.filter_prefix.is_empty() && !entry.starts_with(&opts.filter_prefix) {
-                *item = "".to_owned();
-                continue;
+            if let Some(filter_prefix) = &opts.filter_prefix {
+                if !entry.starts_with(filter_prefix) {
+                    *item = "".to_owned();
+                    continue;
+                }
             }
 
-            if !forward.is_empty() && entry.as_str() < forward {
-                *item = "".to_owned();
-                continue;
+            if let Some(forward) = &forward {
+                if &entry < forward {
+                    *item = "".to_owned();
+                    continue;
+                }
             }
 
             if entry.ends_with(SLASH_SEPARATOR) {
@@ -828,9 +845,9 @@ impl LocalDisk {
         entries.sort();
 
         let mut entries = entries.as_slice();
-        if !forward.is_empty() {
+        if let Some(forward) = &forward {
             for (i, entry) in entries.iter().enumerate() {
-                if entry.as_str() >= forward || forward.starts_with(entry.as_str()) {
+                if entry >= forward || forward.starts_with(entry.as_str()) {
                     entries = &entries[i..];
                     break;
                 }

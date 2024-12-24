@@ -10,7 +10,7 @@ use ecstore::{
     bucket::{metadata::load_bucket_metadata, metadata_sys},
     disk::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, Reader,
-        UpdateMetadataOpts, WalkDirOptions,
+        UpdateMetadataOpts,
     },
     erasure::Writer,
     heal::{

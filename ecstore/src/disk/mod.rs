@@ -25,6 +25,7 @@ use crate::{
         heal_commands::{HealScanMode, HealingTracker},
     },
     store_api::{FileInfo, ObjectInfo, RawFileInfo},
+    utils::path::SLASH_SEPARATOR,
 };
 use endpoint::Endpoint;
 use error::DiskError;
@@ -566,8 +567,6 @@ impl FileInfoVersions {
 
         let vid = Uuid::parse_str(v).unwrap_or(Uuid::nil());
 
-        for ver in self.versions.iter() {}
-
         self.versions.iter().position(|v| v.version_id == Some(vid))
     }
 }
@@ -586,10 +585,10 @@ pub struct WalkDirOptions {
 
     // FilterPrefix will only return results with given prefix within folder.
     // Should never contain a slash.
-    pub filter_prefix: String,
+    pub filter_prefix: Option<String>,
 
     // ForwardTo will forward to the given object path.
-    pub forward_to: String,
+    pub forward_to: Option<String>,
 
     // Limit the number of returned objects if > 0.
     pub limit: i32,
@@ -639,8 +638,27 @@ impl MetaCacheEntry {
     pub fn is_dir(&self) -> bool {
         self.metadata.is_empty() && self.name.ends_with('/')
     }
+    pub fn is_in_dir(&self, dir: &str, separator: &str) -> bool {
+        if dir.is_empty() {
+            let idx = self.name.find(separator);
+            return idx.is_none() || idx.unwrap() == self.name.len() - separator.len();
+        }
+
+        let ext = self.name.trim_start_matches(dir);
+
+        if ext.len() != self.name.len() {
+            let idx = ext.find(separator);
+            return idx.is_none() || idx.unwrap() == ext.len() - separator.len();
+        }
+
+        false
+    }
     pub fn is_object(&self) -> bool {
         !self.metadata.is_empty()
+    }
+
+    pub fn is_object_dir(&self) -> bool {
+        !self.metadata.is_empty() && self.name.ends_with(SLASH_SEPARATOR)
     }
 
     pub fn is_latest_deletemarker(&mut self) -> bool {
@@ -838,7 +856,7 @@ impl MetaCacheEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MetaCacheEntries(pub Vec<Option<MetaCacheEntry>>);
 
 impl MetaCacheEntries {
@@ -936,26 +954,50 @@ impl MetaCacheEntries {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+pub struct MetaCacheEntriesSortedResult {
+    pub entries: Option<MetaCacheEntriesSorted>,
+    pub err: Option<Error>,
+}
+
+// impl MetaCacheEntriesSortedResult {
+//     pub fn entriy_list(&self) -> Vec<&MetaCacheEntry> {
+//         if let Some(entries) = &self.entries {
+//             entries.entries()
+//         } else {
+//             Vec::new()
+//         }
+//     }
+// }
+
+#[derive(Debug, Default)]
 pub struct MetaCacheEntriesSorted {
     pub o: MetaCacheEntries,
-    // pub list_id: String,
-    // pub reuse: bool,
-    // pub lastSkippedEntry: String,
+    pub list_id: Option<String>,
+    pub reuse: bool,
+    pub last_skipped_entry: Option<String>,
 }
 
 impl MetaCacheEntriesSorted {
-    pub fn entries(&self) -> Vec<MetaCacheEntry> {
-        let entries: Vec<MetaCacheEntry> = self.o.0.iter().flatten().cloned().collect();
+    pub fn entries(&self) -> Vec<&MetaCacheEntry> {
+        let entries: Vec<&MetaCacheEntry> = self.o.0.iter().flatten().collect();
         entries
     }
-    pub async fn file_infos(&self, bucket: &str, prefix: &str, delimiter: &str) -> Vec<ObjectInfo> {
+    pub fn forward_past(&mut self, marker: Option<String>) {
+        if let Some(val) = marker {
+            // TODO: reuse
+            if let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val) {
+                self.o.0 = self.o.0.split_off(idx);
+            }
+        }
+    }
+    pub async fn file_infos(&self, bucket: &str, prefix: &str, delimiter: Option<String>) -> Vec<ObjectInfo> {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(self.o.as_ref().len());
         let mut prev_prefix = "";
         for entry in self.o.as_ref().iter().flatten() {
             if entry.is_object() {
-                if !delimiter.is_empty() {
+                if let Some(delimiter) = &delimiter {
                     if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
@@ -985,25 +1027,23 @@ impl MetaCacheEntriesSorted {
             }
 
             if entry.is_dir() {
-                if delimiter.is_empty() {
-                    continue;
-                }
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
 
-                if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
-                    let idx = prefix.len() + idx + delimiter.len();
-                    if let Some(curr_prefix) = entry.name.get(0..idx) {
-                        if curr_prefix == prev_prefix {
-                            continue;
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
                         }
-
-                        prev_prefix = curr_prefix;
-
-                        objects.push(ObjectInfo {
-                            is_dir: true,
-                            bucket: bucket.to_owned(),
-                            name: curr_prefix.to_owned(),
-                            ..Default::default()
-                        });
                     }
                 }
             }
@@ -1012,14 +1052,20 @@ impl MetaCacheEntriesSorted {
         objects
     }
 
-    pub async fn file_info_versions(&self, bucket: &str, prefix: &str, delimiter: &str, after_v: &str) -> Vec<ObjectInfo> {
+    pub async fn file_info_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_v: Option<String>,
+    ) -> Vec<ObjectInfo> {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(self.o.as_ref().len());
         let mut prev_prefix = "";
         let mut after_v = after_v;
         for entry in self.o.as_ref().iter().flatten() {
             if entry.is_object() {
-                if !delimiter.is_empty() {
+                if let Some(delimiter) = &delimiter {
                     if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
                         let idx = prefix.len() + idx + delimiter.len();
                         if let Some(curr_prefix) = entry.name.get(0..idx) {
@@ -1049,13 +1095,13 @@ impl MetaCacheEntriesSorted {
                 };
 
                 let fi_versions = 'c: {
-                    if !after_v.is_empty() {
-                        if let Some(idx) = fiv.find_version_index(after_v) {
-                            after_v = "";
+                    if let Some(after_val) = &after_v {
+                        if let Some(idx) = fiv.find_version_index(after_val) {
+                            after_v = None;
                             break 'c fiv.versions.split_off(idx + 1);
                         }
 
-                        after_v = "";
+                        after_v = None;
                         break 'c fiv.versions;
                     } else {
                         break 'c fiv.versions;
@@ -1073,25 +1119,23 @@ impl MetaCacheEntriesSorted {
             }
 
             if entry.is_dir() {
-                if delimiter.is_empty() {
-                    continue;
-                }
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
 
-                if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
-                    let idx = prefix.len() + idx + delimiter.len();
-                    if let Some(curr_prefix) = entry.name.get(0..idx) {
-                        if curr_prefix == prev_prefix {
-                            continue;
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
                         }
-
-                        prev_prefix = curr_prefix;
-
-                        objects.push(ObjectInfo {
-                            is_dir: true,
-                            bucket: bucket.to_owned(),
-                            name: curr_prefix.to_owned(),
-                            ..Default::default()
-                        });
                     }
                 }
             }
