@@ -1,6 +1,9 @@
 #![cfg(test)]
 
-use ecstore::disk::VolumeInfo;
+use ecstore::disk::{MetaCacheEntry, VolumeInfo, WalkDirOptions};
+use ecstore::metacache::writer::{MetacacheReader, MetacacheWriter};
+use futures::future::join_all;
+use protos::proto_gen::node_service::WalkDirRequest;
 use protos::{
     models::{PingBody, PingBodyBuilder},
     node_service_time_out_client,
@@ -8,9 +11,14 @@ use protos::{
         ListVolumesRequest, LocalStorageInfoRequest, MakeVolumeRequest, PingRequest, PingResponse, ReadAllRequest,
     },
 };
-use rmp_serde::Deserializer;
-use serde::Deserialize;
+use rmp_serde::{Deserializer, Serializer};
+use serde::{Deserialize, Serialize};
 use std::{error::Error, io::Cursor};
+use tokio::io::AsyncWrite;
+use tokio::spawn;
+use tokio::sync::mpsc;
+use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+use tonic::codegen::tokio_stream::StreamExt;
 use tonic::Request;
 
 const CLUSTER_ADDR: &str = "http://localhost:9000";
@@ -85,6 +93,62 @@ async fn list_volumes() -> Result<(), Box<dyn Error>> {
         .collect();
 
     println!("{:?}", volume_infos);
+    Ok(())
+}
+
+#[tokio::test]
+async fn walk_dir() -> Result<(), Box<dyn Error>> {
+    println!("walk_dir");
+    // TODO: use writer
+    let opts = WalkDirOptions {
+        bucket: "dandan".to_owned(),
+        base_dir: "".to_owned(),
+        recursive: true,
+        ..Default::default()
+    };
+    let (rd, mut wr) = tokio::io::duplex(1024);
+    let mut buf = Vec::new();
+    opts.serialize(&mut Serializer::new(&mut buf))?;
+    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
+    let request = Request::new(WalkDirRequest {
+        disk: "/home/dandan/code/rust/s3-rustfs/target/debug/data".to_string(),
+        walk_dir_options: buf,
+    });
+    let mut response = client.walk_dir(request).await?.into_inner();
+
+    let job1 = spawn(async move {
+        let mut out = MetacacheWriter::new(&mut wr);
+        loop {
+            match response.next().await {
+                Some(Ok(resp)) => {
+                    if !resp.success {
+                        println!("{}", resp.error_info.unwrap_or("".to_string()));
+                    }
+                    let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
+                        .map_err(|e| ecstore::error::Error::from_string(format!("Unexpected response: {:?}", response)))
+                        .unwrap();
+                    out.write_obj(&entry).await.unwrap();
+                }
+                None => {
+                    let _ = out.close().await;
+                    break;
+                }
+                _ => {
+                    println!("Unexpected response: {:?}", response);
+                    let _ = out.close().await;
+                    break;
+                }
+            }
+        }
+    });
+    let job2 = spawn(async move {
+        let mut reader = MetacacheReader::new(rd);
+        while let Ok(Some(entry)) = reader.peek().await {
+            println!("{:?}", entry);
+        }
+    });
+
+    join_all(vec![job1, job2]).await;
     Ok(())
 }
 
