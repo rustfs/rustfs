@@ -210,7 +210,7 @@ impl DRWMutex {
 
     pub async fn un_lock(&mut self) {
         if self.write_locks.is_empty() || !self.is_locked() {
-            panic!("Trying to un_lock() while no lock() is active, write_locks: {:?}", self.write_locks)
+            warn!("Trying to un_lock() while no lock() is active, write_locks: {:?}", self.write_locks)
         }
 
         let tolerance = self.lockers.len() / 2;
@@ -231,7 +231,7 @@ impl DRWMutex {
 
     pub async fn un_r_lock(&mut self) {
         if self.read_locks.is_empty() || !self.is_r_locked() {
-            panic!("Trying to un_r_lock() while no r_lock() is active, read_locks: {:?}", self.read_locks)
+            warn!("Trying to un_r_lock() while no r_lock() is active, read_locks: {:?}", self.read_locks)
         }
 
         let tolerance = self.lockers.len() / 2;
