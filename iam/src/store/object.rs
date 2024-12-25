@@ -4,14 +4,12 @@ use ecstore::{
     config::error::is_not_found,
     store::ECStore,
     store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader},
-    store_list_objects::ListPathOptions,
     utils::path::dir,
     StorageAPI,
 };
 use futures::future::try_join_all;
 use log::{debug, warn};
 use serde::{de::DeserializeOwned, Serialize};
-use tracing::error;
 
 use super::Store;
 use crate::{

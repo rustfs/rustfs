@@ -1,20 +1,18 @@
-use std::{future::Future, pin::Pin, sync::Arc};
-
+use crate::{
+    disk::error::{is_err_eof, is_err_file_not_found, is_err_volume_not_found, DiskError},
+    metacache::writer::MetacacheReader,
+};
+use crate::{
+    disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions},
+    error::{Error, Result},
+};
 use futures::future::join_all;
+use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::{
     spawn,
     sync::{broadcast::Receiver as B_Receiver, RwLock},
 };
-use tracing::error;
-
-use crate::{
-    disk::{
-        error::{is_err_eof, is_err_file_not_found, is_err_volume_not_found, DiskError},
-        DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions,
-    },
-    error::{Error, Result},
-    metacache::writer::MetacacheReader,
-};
+use tracing::{error, info};
 
 type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
@@ -60,12 +58,14 @@ impl Clone for ListPathRawOptions {
 
 pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> Result<()> {
     if opts.disks.is_empty() {
+        info!("list_path_raw 0 drives provided");
         return Err(Error::from_string("list_path_raw: 0 drives provided"));
     }
 
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), Error>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = Arc::new(RwLock::new(opts.fallback_disks.clone()));
+
     for disk in opts.disks.iter() {
         let opdisk = disk.clone();
         let opts_clone = opts.clone();

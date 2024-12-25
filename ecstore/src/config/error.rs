@@ -1,6 +1,6 @@
 use crate::{disk, error::Error, store_err::is_err_object_not_found};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum ConfigError {
     #[error("config not found")]
     NotFound,
@@ -15,6 +15,22 @@ impl ConfigError {
         matches!(self, Self::NotFound)
     }
 }
+
+impl ConfigError {
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            ConfigError::NotFound => 0x01,
+        }
+    }
+
+    pub fn from_u32(error: u32) -> Option<Self> {
+        match error {
+            0x01 => Some(Self::NotFound),
+            _ => None,
+        }
+    }
+}
+
 pub fn is_not_found(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<ConfigError>() {
         ConfigError::is_not_found(e)

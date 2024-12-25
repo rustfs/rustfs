@@ -73,7 +73,7 @@ async fn make_volume() -> Result<(), Box<dyn Error>> {
     if response.success {
         println!("success");
     } else {
-        println!("failed: {:?}", response.error_info);
+        println!("failed: {:?}", response.error);
     }
     Ok(())
 }
