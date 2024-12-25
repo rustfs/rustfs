@@ -2,6 +2,11 @@ syntax = "proto3";
 package node_service;
 
 /* -------------------------------------------------------------------- */
+message Error {
+  uint32 code = 1;
+  string error_info = 2;
+}
+
 message PingRequest {
   uint64 version = 1;
   bytes body = 2;
@@ -19,7 +24,7 @@ message HealBucketRequest {
 
 message HealBucketResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message ListBucketRequest {
@@ -29,7 +34,7 @@ message ListBucketRequest {
 message ListBucketResponse {
   bool success = 1;
   repeated string bucket_infos = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message MakeBucketRequest {
@@ -39,7 +44,7 @@ message MakeBucketRequest {
 
 message MakeBucketResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message GetBucketInfoRequest {
@@ -50,7 +55,7 @@ message GetBucketInfoRequest {
 message GetBucketInfoResponse {
   bool success = 1;
   string bucket_info = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message DeleteBucketRequest {
@@ -59,7 +64,7 @@ message DeleteBucketRequest {
 
 message DeleteBucketResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message ReadAllRequest {
@@ -71,7 +76,7 @@ message ReadAllRequest {
 message ReadAllResponse {
   bool success = 1;
   bytes data = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message WriteAllRequest {
@@ -83,7 +88,7 @@ message WriteAllRequest {
 
 message WriteAllResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message DeleteRequest {
@@ -95,7 +100,7 @@ message DeleteRequest {
 
 message DeleteResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message VerifyFileRequest {
@@ -108,7 +113,7 @@ message VerifyFileRequest {
 message VerifyFileResponse {
   bool success = 1;
   string check_parts_resp = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message CheckPartsRequest {
@@ -121,7 +126,7 @@ message CheckPartsRequest {
 message CheckPartsResponse {
   bool success = 1;
   string check_parts_resp = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message RenamePartRequst {
@@ -135,7 +140,7 @@ message RenamePartRequst {
 
 message RenamePartResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message RenameFileRequst {
@@ -148,7 +153,7 @@ message RenameFileRequst {
 
 message RenameFileResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message WriteRequest {
@@ -161,7 +166,7 @@ message WriteRequest {
 
 message WriteResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 // message AppendRequest {
@@ -173,7 +178,7 @@ message WriteResponse {
 // 
 // message AppendResponse {
 //   bool success = 1;
-//   optional string error_info = 2;
+//   optional Error error = 2;
 // }
 
 message ReadAtRequest {
@@ -188,7 +193,7 @@ message ReadAtResponse {
   bool success = 1;
   bytes data = 2;
   int64 read_size = 3;
-  optional string error_info = 4;
+  optional Error error = 4;
 }
 
 message ListDirRequest {
@@ -199,7 +204,7 @@ message ListDirRequest {
 message ListDirResponse {
   bool success = 1;
   repeated string volumes = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message WalkDirRequest {
@@ -225,7 +230,7 @@ message RenameDataRequest {
 message RenameDataResponse {
   bool success = 1;
   string rename_data_resp = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message MakeVolumesRequest {
@@ -235,7 +240,7 @@ message MakeVolumesRequest {
 
 message MakeVolumesResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message MakeVolumeRequest {
@@ -245,7 +250,7 @@ message MakeVolumeRequest {
 
 message MakeVolumeResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message ListVolumesRequest {
@@ -255,7 +260,7 @@ message ListVolumesRequest {
 message ListVolumesResponse {
   bool success = 1;
   repeated string volume_infos = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message StatVolumeRequest {
@@ -266,7 +271,7 @@ message StatVolumeRequest {
 message StatVolumeResponse {
   bool success = 1;
   string volume_info = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message DeletePathsRequest {
@@ -277,7 +282,7 @@ message DeletePathsRequest {
 
 message DeletePathsResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message UpdateMetadataRequest {
@@ -290,7 +295,7 @@ message UpdateMetadataRequest {
 
 message UpdateMetadataResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message WriteMetadataRequest {
@@ -302,7 +307,7 @@ message WriteMetadataRequest {
 
 message WriteMetadataResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message ReadVersionRequest {
@@ -316,7 +321,7 @@ message ReadVersionRequest {
 message ReadVersionResponse {
   bool success = 1;
   string file_info = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message ReadXLRequest {
@@ -329,7 +334,7 @@ message ReadXLRequest {
 message ReadXLResponse {
   bool success = 1;
   string raw_file_info = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message DeleteVersionRequest {
@@ -344,7 +349,7 @@ message DeleteVersionRequest {
 message DeleteVersionResponse {
   bool success = 1;
   string raw_file_info = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message DeleteVersionsRequest {
@@ -357,7 +362,7 @@ message DeleteVersionsRequest {
 message DeleteVersionsResponse {
   bool success = 1;
   repeated string errors = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message ReadMultipleRequest {
@@ -368,7 +373,7 @@ message ReadMultipleRequest {
 message ReadMultipleResponse {
   bool success = 1;
   repeated string read_multiple_resps = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message DeleteVolumeRequest {
@@ -378,7 +383,7 @@ message DeleteVolumeRequest {
 
 message DeleteVolumeResponse {
   bool success = 1;
-  optional string error_info = 2;
+  optional Error error = 2;
 }
 
 message DiskInfoRequest {
@@ -389,7 +394,7 @@ message DiskInfoRequest {
 message DiskInfoResponse {
   bool success = 1;
   string disk_info = 2;
-  optional string error_info = 3;
+  optional Error error = 3;
 }
 
 message NsScannerRequest {
@@ -402,7 +407,7 @@ message NsScannerResponse {
   bool success = 1;
   string update = 2;
   string data_usage_cache = 3;
-  optional string error_info = 4;
+  optional Error error = 4;
 }
 
 // lock api have same argument type

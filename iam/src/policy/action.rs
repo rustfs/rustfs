@@ -56,7 +56,7 @@ impl Action {
 }
 
 impl Action {
-    const S3_PREFIX: &str = "s3:";
+    const S3_PREFIX: &'static str = "s3:";
     const ADMIN_PREFIX: &str = "admin:";
     const STS_PREFIX: &str = "sts:";
     const KMS_PREFIX: &str = "kms:";

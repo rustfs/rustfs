@@ -14,6 +14,7 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
+use crate::utils::proto_err_to_err;
 use crate::{
     bucket::{metadata_sys::get_versioning_config, versioning::VersioningApi},
     erasure::Writer,
@@ -1393,9 +1394,11 @@ impl Writer for RemoteFileWriter {
             if resp.success {
                 info!("write stream success");
             } else {
-                let error_info = resp.error_info.unwrap_or("".to_string());
-                info!("write stream failed: {}", error_info);
-                return Err(Error::from_string(error_info));
+                return if let Some(err) = &resp.error {
+                    Err(proto_err_to_err(err))
+                } else {
+                    Err(Error::from_string(""))
+                };
             }
         } else {
             let error_info = "can not get response";
@@ -1571,9 +1574,11 @@ impl Reader for RemoteFileReader {
 
                 Ok(resp.read_size.try_into().unwrap())
             } else {
-                let error_info = resp.error_info.unwrap_or("".to_string());
-                info!("read at stream failed: {}", error_info);
-                Err(Error::from_string(error_info))
+                return if let Some(err) = &resp.error {
+                    Err(proto_err_to_err(err))
+                } else {
+                    Err(Error::from_string(""))
+                };
             }
         } else {
             let error_info = "can not get response";

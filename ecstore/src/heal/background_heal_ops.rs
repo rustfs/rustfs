@@ -1,6 +1,7 @@
 use madmin::heal_commands::HealResultItem;
 use std::{cmp::Ordering, env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
+    spawn,
     sync::{
         mpsc::{self, Receiver, Sender},
         RwLock,
@@ -14,7 +15,10 @@ use super::{
     heal_commands::HealOpts,
     heal_ops::{new_bg_heal_sequence, HealSequence},
 };
+use crate::global::GLOBAL_MRFState;
 use crate::heal::error::ERR_RETRY_HEALING;
+use crate::heal::heal_commands::{HealScanMode, HEAL_ITEM_BUCKET};
+use crate::heal::heal_ops::{HealSource, BG_HEALING_UUID};
 use crate::{
     config::RUSTFS_CONFIG_PREFIX,
     disk::{endpoint::Endpoint, error::DiskError, DiskAPI, DiskInfoOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
@@ -36,24 +40,26 @@ pub static DEFAULT_MONITOR_NEW_DISK_INTERVAL: Duration = Duration::from_secs(10)
 
 pub async fn init_auto_heal() {
     init_background_healing().await;
-    if let Ok(v) = env::var("_RUSTFS_AUTO_DRIVE_HEALING") {
-        if v == "on" {
-            info!("start monitor local disks and heal");
-            GLOBAL_BackgroundHealState
-                .push_heal_local_disks(&get_local_disks_to_heal().await)
-                .await;
-            tokio::spawn(async {
-                monitor_local_disks_and_heal().await;
-            });
-        }
+    let v = env::var("_RUSTFS_AUTO_DRIVE_HEALING").unwrap_or("on".to_string());
+    if v == "on" {
+        info!("start monitor local disks and heal");
+        GLOBAL_BackgroundHealState
+            .push_heal_local_disks(&get_local_disks_to_heal().await)
+            .await;
+        spawn(async {
+            monitor_local_disks_and_heal().await;
+        });
     }
+    spawn(async {
+        GLOBAL_MRFState.heal_routine().await;
+    });
 }
 
 async fn init_background_healing() {
     let bg_seq = Arc::new(new_bg_heal_sequence());
     for _ in 0..GLOBAL_BackgroundHealRoutine.workers {
         let bg_seq_clone = bg_seq.clone();
-        tokio::spawn(async {
+        spawn(async {
             GLOBAL_BackgroundHealRoutine.add_worker(bg_seq_clone).await;
         });
     }
@@ -66,12 +72,14 @@ pub async fn get_local_disks_to_heal() -> Vec<Endpoint> {
         if let Some(disk) = disk {
             if let Err(err) = disk.disk_info(&DiskInfoOptions::default()).await {
                 if let Some(DiskError::UnformattedDisk) = err.downcast_ref() {
+                    info!("get_local_disks_to_heal, disk is unformatted: {}", err);
                     disks_to_heal.push(disk.endpoint());
                 }
             }
             let h = disk.healing().await;
             if let Some(h) = h {
                 if !h.finished {
+                    info!("get_local_disks_to_heal, disk healing not finished");
                     disks_to_heal.push(disk.endpoint());
                 }
             }
@@ -92,13 +100,17 @@ async fn monitor_local_disks_and_heal() {
         interval.tick().await;
         let heal_disks = GLOBAL_BackgroundHealState.get_heal_local_disk_endpoints().await;
         if heal_disks.is_empty() {
+            info!("heal local disks is empty");
             interval.reset();
             continue;
         }
 
+        info!("heal local disks: {:?}", heal_disks);
+
         let store = new_object_layer_fn().expect("errServerNotInitialized");
-        if let (_, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
-            if let Some(DiskError::NoHealRequired) = err.downcast_ref() {
+        if let (result, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
+            error!("heal local disk format error: {}", err);
+            if let Some(DiskError::NoHealRequired) = err.downcast_ref::<DiskError>() {
             } else {
                 info!("heal format err: {}", err.to_string());
                 interval.reset();
@@ -108,7 +120,7 @@ async fn monitor_local_disks_and_heal() {
 
         for disk in heal_disks.into_ref().iter() {
             let disk_clone = disk.clone();
-            tokio::spawn(async move {
+            spawn(async move {
                 GLOBAL_BackgroundHealState
                     .set_disk_healing_status(disk_clone.clone(), true)
                     .await;
@@ -419,4 +431,31 @@ async fn heal_disk_format(opts: HealOpts) -> Result<(HealResultItem, Option<Erro
         return Ok((HealResultItem::default(), err));
     }
     Ok((res, err))
+}
+
+pub(crate) async fn heal_bucket(bucket: &str) -> Result<()> {
+    let (bg_seq, ok) = GLOBAL_BackgroundHealState.get_heal_sequence_by_token(BG_HEALING_UUID).await;
+    if ok {
+        // bg_seq must be Some when ok is true
+        return bg_seq
+            .unwrap()
+            .queue_heal_task(
+                HealSource {
+                    bucket: bucket.to_string(),
+                    ..Default::default()
+                },
+                HEAL_ITEM_BUCKET.to_string(),
+            )
+            .await;
+    }
+    Ok(())
+}
+
+pub(crate) async fn heal_object(bucket: &str, object: &str, version_id: &str, scan_mode: HealScanMode) -> Result<()> {
+    let (bg_seq, ok) = GLOBAL_BackgroundHealState.get_heal_sequence_by_token(BG_HEALING_UUID).await;
+    if ok {
+        // bg_seq must be Some when ok is true
+        return HealSequence::heal_object(bg_seq.unwrap(), bucket, object, version_id, scan_mode).await;
+    }
+    Ok(())
 }

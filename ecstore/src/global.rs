@@ -6,6 +6,7 @@ use std::{
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::heal::mrf::MRFState;
 use crate::{
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
@@ -34,6 +35,7 @@ lazy_static! {
     pub static ref GLOBAL_BackgroundHealRoutine: Arc<HealRoutine> = HealRoutine::new();
     pub static ref GLOBAL_BackgroundHealState: Arc<AllHealState> = AllHealState::new(false);
     pub static ref GLOBAL_ALlHealState: Arc<AllHealState> = AllHealState::new(false);
+    pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
     static ref globalDeploymentIDPtr: RwLock<Uuid> = RwLock::new(Uuid::nil());
 }
 
