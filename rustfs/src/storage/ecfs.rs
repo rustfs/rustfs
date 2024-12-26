@@ -407,10 +407,15 @@ impl S3 for FS {
         };
         let last_modified = info.mod_time.map(Timestamp::from);
 
+        let metadata = Some(info.user_defined);
+
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(info.size))),
             content_type,
             last_modified,
+            e_tag: info.etag,
+            metadata,
+            version_id: info.version_id.map(|v| v.to_string()),
             // metadata: object_metadata,
             ..Default::default()
         };
