@@ -57,6 +57,7 @@ impl Clone for ListPathRawOptions {
 }
 
 pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> Result<()> {
+    info!("list_path_raw");
     if opts.disks.is_empty() {
         info!("list_path_raw 0 drives provided");
         return Err(Error::from_string("list_path_raw: 0 drives provided"));
