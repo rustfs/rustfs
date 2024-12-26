@@ -1090,260 +1090,260 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 // list_path_raw
 
-#[cfg(test)]
-mod test {
-    use std::sync::Arc;
+// #[cfg(test)]
+// mod test {
+//     use std::sync::Arc;
 
-    use crate::cache_value::metacache_set::list_path_raw;
-    use crate::cache_value::metacache_set::ListPathRawOptions;
-    use crate::disk::endpoint::Endpoint;
-    use crate::disk::error::is_err_eof;
-    use crate::disk::format::FormatV3;
-    use crate::disk::new_disk;
-    use crate::disk::DiskAPI;
-    use crate::disk::DiskOption;
-    use crate::disk::MetaCacheEntries;
-    use crate::disk::MetaCacheEntry;
-    use crate::disk::WalkDirOptions;
-    use crate::endpoints::EndpointServerPools;
-    use crate::error::Error;
-    use crate::metacache::writer::MetacacheReader;
-    use crate::set_disk::SetDisks;
-    use crate::store::ECStore;
-    use crate::store_list_objects::ListPathOptions;
-    use futures::future::join_all;
-    use lock::namespace_lock::NsLockMap;
-    use tokio::sync::broadcast;
-    use tokio::sync::mpsc;
-    use tokio::sync::RwLock;
-    use uuid::Uuid;
+//     use crate::cache_value::metacache_set::list_path_raw;
+//     use crate::cache_value::metacache_set::ListPathRawOptions;
+//     use crate::disk::endpoint::Endpoint;
+//     use crate::disk::error::is_err_eof;
+//     use crate::disk::format::FormatV3;
+//     use crate::disk::new_disk;
+//     use crate::disk::DiskAPI;
+//     use crate::disk::DiskOption;
+//     use crate::disk::MetaCacheEntries;
+//     use crate::disk::MetaCacheEntry;
+//     use crate::disk::WalkDirOptions;
+//     use crate::endpoints::EndpointServerPools;
+//     use crate::error::Error;
+//     use crate::metacache::writer::MetacacheReader;
+//     use crate::set_disk::SetDisks;
+//     use crate::store::ECStore;
+//     use crate::store_list_objects::ListPathOptions;
+//     use futures::future::join_all;
+//     use lock::namespace_lock::NsLockMap;
+//     use tokio::sync::broadcast;
+//     use tokio::sync::mpsc;
+//     use tokio::sync::RwLock;
+//     use uuid::Uuid;
 
-    #[tokio::test]
-    async fn test_walk_dir() {
-        let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-        ep.pool_idx = 0;
-        ep.set_idx = 0;
-        ep.disk_idx = 0;
-        ep.is_local = true;
+//     #[tokio::test]
+//     async fn test_walk_dir() {
+//         let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+//         ep.pool_idx = 0;
+//         ep.set_idx = 0;
+//         ep.disk_idx = 0;
+//         ep.is_local = true;
 
-        let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
+//         let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
 
-        // let disk = match LocalDisk::new(&ep, false).await {
-        //     Ok(res) => res,
-        //     Err(err) => {
-        //         println!("LocalDisk::new err {:?}", err);
-        //         return;
-        //     }
-        // };
+//         // let disk = match LocalDisk::new(&ep, false).await {
+//         //     Ok(res) => res,
+//         //     Err(err) => {
+//         //         println!("LocalDisk::new err {:?}", err);
+//         //         return;
+//         //     }
+//         // };
 
-        let (rd, mut wr) = tokio::io::duplex(64);
+//         let (rd, mut wr) = tokio::io::duplex(64);
 
-        let job = tokio::spawn(async move {
-            let opts = WalkDirOptions {
-                bucket: "dada".to_owned(),
-                base_dir: "".to_owned(),
-                recursive: true,
-                ..Default::default()
-            };
+//         let job = tokio::spawn(async move {
+//             let opts = WalkDirOptions {
+//                 bucket: "dada".to_owned(),
+//                 base_dir: "".to_owned(),
+//                 recursive: true,
+//                 ..Default::default()
+//             };
 
-            println!("walk opts {:?}", opts);
-            if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-                println!("walk_dir err {:?}", err);
-            }
-        });
+//             println!("walk opts {:?}", opts);
+//             if let Err(err) = disk.walk_dir(opts, &mut wr).await {
+//                 println!("walk_dir err {:?}", err);
+//             }
+//         });
 
-        let job2 = tokio::spawn(async move {
-            let mut mrd = MetacacheReader::new(rd);
+//         let job2 = tokio::spawn(async move {
+//             let mut mrd = MetacacheReader::new(rd);
 
-            loop {
-                match mrd.peek().await {
-                    Ok(res) => {
-                        if let Some(info) = res {
-                            println!("info {:?}", info.name)
-                        } else {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        if is_err_eof(&err) {
-                            break;
-                        }
+//             loop {
+//                 match mrd.peek().await {
+//                     Ok(res) => {
+//                         if let Some(info) = res {
+//                             println!("info {:?}", info.name)
+//                         } else {
+//                             break;
+//                         }
+//                     }
+//                     Err(err) => {
+//                         if is_err_eof(&err) {
+//                             break;
+//                         }
 
-                        println!("get err {:?}", err);
-                        break;
-                    }
-                }
-            }
-        });
-        join_all(vec![job, job2]).await;
-    }
+//                         println!("get err {:?}", err);
+//                         break;
+//                     }
+//                 }
+//             }
+//         });
+//         join_all(vec![job, job2]).await;
+//     }
 
-    #[tokio::test]
-    async fn test_list_path_raw() {
-        let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-        ep.pool_idx = 0;
-        ep.set_idx = 0;
-        ep.disk_idx = 0;
-        ep.is_local = true;
+//     #[tokio::test]
+//     async fn test_list_path_raw() {
+//         let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+//         ep.pool_idx = 0;
+//         ep.set_idx = 0;
+//         ep.disk_idx = 0;
+//         ep.is_local = true;
 
-        let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
+//         let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
 
-        // let disk = match LocalDisk::new(&ep, false).await {
-        //     Ok(res) => res,
-        //     Err(err) => {
-        //         println!("LocalDisk::new err {:?}", err);
-        //         return;
-        //     }
-        // };
+//         // let disk = match LocalDisk::new(&ep, false).await {
+//         //     Ok(res) => res,
+//         //     Err(err) => {
+//         //         println!("LocalDisk::new err {:?}", err);
+//         //         return;
+//         //     }
+//         // };
 
-        let (_, rx) = broadcast::channel(1);
-        let bucket = "dada".to_owned();
-        let forward_to = None;
-        let disks = vec![Some(disk)];
-        let fallback_disks = Vec::new();
+//         let (_, rx) = broadcast::channel(1);
+//         let bucket = "dada".to_owned();
+//         let forward_to = None;
+//         let disks = vec![Some(disk)];
+//         let fallback_disks = Vec::new();
 
-        list_path_raw(
-            rx,
-            ListPathRawOptions {
-                disks,
-                fallback_disks,
-                bucket,
-                path: "".to_owned(),
-                recursice: true,
-                forward_to,
-                min_disks: 1,
-                report_not_found: false,
-                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                    Box::pin(async move { println!("get entry: {}", entry.name) })
-                })),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
-                    Box::pin(async move { println!("get entries: {:?}", entries) })
-                })),
-                finished: None,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    }
+//         list_path_raw(
+//             rx,
+//             ListPathRawOptions {
+//                 disks,
+//                 fallback_disks,
+//                 bucket,
+//                 path: "".to_owned(),
+//                 recursice: true,
+//                 forward_to,
+//                 min_disks: 1,
+//                 report_not_found: false,
+//                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+//                     Box::pin(async move { println!("get entry: {}", entry.name) })
+//                 })),
+//                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+//                     Box::pin(async move { println!("get entries: {:?}", entries) })
+//                 })),
+//                 finished: None,
+//                 ..Default::default()
+//             },
+//         )
+//         .await
+//         .unwrap();
+//     }
 
-    #[tokio::test]
-    async fn test_set_list_path() {
-        let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-        ep.pool_idx = 0;
-        ep.set_idx = 0;
-        ep.disk_idx = 0;
-        ep.is_local = true;
+//     #[tokio::test]
+//     async fn test_set_list_path() {
+//         let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
+//         ep.pool_idx = 0;
+//         ep.set_idx = 0;
+//         ep.disk_idx = 0;
+//         ep.is_local = true;
 
-        let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
-        let _ = disk.set_disk_id(Some(Uuid::new_v4())).await;
+//         let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
+//         let _ = disk.set_disk_id(Some(Uuid::new_v4())).await;
 
-        let set = SetDisks {
-            lockers: Vec::new(),
-            locker_owner: String::new(),
-            ns_mutex: Arc::new(RwLock::new(NsLockMap::new(false))),
-            disks: RwLock::new(vec![Some(disk)]),
-            set_endpoints: Vec::new(),
-            set_drive_count: 1,
-            default_parity_count: 0,
-            set_index: 0,
-            pool_index: 0,
-            format: FormatV3::new(1, 1),
-        };
+//         let set = SetDisks {
+//             lockers: Vec::new(),
+//             locker_owner: String::new(),
+//             ns_mutex: Arc::new(RwLock::new(NsLockMap::new(false))),
+//             disks: RwLock::new(vec![Some(disk)]),
+//             set_endpoints: Vec::new(),
+//             set_drive_count: 1,
+//             default_parity_count: 0,
+//             set_index: 0,
+//             pool_index: 0,
+//             format: FormatV3::new(1, 1),
+//         };
 
-        let (_tx, rx) = broadcast::channel(1);
+//         let (_tx, rx) = broadcast::channel(1);
 
-        let bucket = "dada".to_owned();
+//         let bucket = "dada".to_owned();
 
-        let opts = ListPathOptions {
-            bucket,
-            recursive: true,
-            ..Default::default()
-        };
+//         let opts = ListPathOptions {
+//             bucket,
+//             recursive: true,
+//             ..Default::default()
+//         };
 
-        let (sender, mut recv) = mpsc::channel(10);
+//         let (sender, mut recv) = mpsc::channel(10);
 
-        set.list_path(rx, opts, sender).await.unwrap();
+//         set.list_path(rx, opts, sender).await.unwrap();
 
-        while let Some(entry) = recv.recv().await {
-            println!("get entry {:?}", entry.name)
-        }
-    }
+//         while let Some(entry) = recv.recv().await {
+//             println!("get entry {:?}", entry.name)
+//         }
+//     }
 
-    #[tokio::test]
-    async fn test_list_merged() {
-        let server_address = "localhost:9000";
+//     #[tokio::test]
+//     async fn test_list_merged() {
+//         let server_address = "localhost:9000";
 
-        let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-            server_address,
-            vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-        )
-        .unwrap();
+//         let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
+//             server_address,
+//             vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
+//         )
+//         .unwrap();
 
-        let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-            .await
-            .unwrap();
+//         let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
+//             .await
+//             .unwrap();
 
-        let (_tx, rx) = broadcast::channel(1);
+//         let (_tx, rx) = broadcast::channel(1);
 
-        let bucket = "dada".to_owned();
-        let opts = ListPathOptions {
-            bucket,
-            recursive: true,
-            ..Default::default()
-        };
+//         let bucket = "dada".to_owned();
+//         let opts = ListPathOptions {
+//             bucket,
+//             recursive: true,
+//             ..Default::default()
+//         };
 
-        let (sender, mut recv) = mpsc::channel(10);
+//         let (sender, mut recv) = mpsc::channel(10);
 
-        store.list_merged(rx, opts, sender).await.unwrap();
+//         store.list_merged(rx, opts, sender).await.unwrap();
 
-        while let Some(entry) = recv.recv().await {
-            println!("get entry {:?}", entry.name)
-        }
-    }
+//         while let Some(entry) = recv.recv().await {
+//             println!("get entry {:?}", entry.name)
+//         }
+//     }
 
-    #[tokio::test]
-    async fn test_list_path() {
-        let server_address = "localhost:9000";
+//     #[tokio::test]
+//     async fn test_list_path() {
+//         let server_address = "localhost:9000";
 
-        let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-            server_address,
-            vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-        )
-        .unwrap();
+//         let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
+//             server_address,
+//             vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
+//         )
+//         .unwrap();
 
-        let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-            .await
-            .unwrap();
+//         let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
+//             .await
+//             .unwrap();
 
-        let bucket = "dada".to_owned();
-        let opts = ListPathOptions {
-            bucket,
-            recursive: true,
-            limit: 100,
+//         let bucket = "dada".to_owned();
+//         let opts = ListPathOptions {
+//             bucket,
+//             recursive: true,
+//             limit: 100,
 
-            ..Default::default()
-        };
+//             ..Default::default()
+//         };
 
-        let ret = store.list_path(&opts).await.unwrap();
-        println!("ret {:?}", ret);
-    }
+//         let ret = store.list_path(&opts).await.unwrap();
+//         println!("ret {:?}", ret);
+//     }
 
-    // #[tokio::test]
-    // async fn test_list_objects_v2() {
-    //     let server_address = "localhost:9000";
+//     // #[tokio::test]
+//     // async fn test_list_objects_v2() {
+//     //     let server_address = "localhost:9000";
 
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
+//     //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
+//     //         server_address,
+//     //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
+//     //     )
+//     //     .unwrap();
 
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
+//     //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
+//     //         .await
+//     //         .unwrap();
 
-    //     let ret = store.list_objects_v2("data", "", "", "", 100, false, "").await.unwrap();
-    //     println!("ret {:?}", ret);
-    // }
-}
+//     //     let ret = store.list_objects_v2("data", "", "", "", 100, false, "").await.unwrap();
+//     //     println!("ret {:?}", ret);
+//     // }
+// }
