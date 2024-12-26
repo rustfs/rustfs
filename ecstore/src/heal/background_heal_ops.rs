@@ -123,19 +123,26 @@ async fn monitor_local_disks_and_heal() {
         for disk in heal_disks.into_ref().iter() {
             let disk_clone = disk.clone();
             futures.push(async move {
+                info!("1");
                 GLOBAL_BackgroundHealState
                     .set_disk_healing_status(disk_clone.clone(), true)
                     .await;
+                info!("2");
                 if heal_fresh_disk(&disk_clone).await.is_err() {
+                    info!("heal_fresh_disk is err");
                     GLOBAL_BackgroundHealState
                         .set_disk_healing_status(disk_clone.clone(), false)
                         .await;
                     return;
                 }
+                info!("3");
                 GLOBAL_BackgroundHealState.pop_heal_local_disks(&[disk_clone]).await;
+                info!("4");
             });
         }
+        info!("monitor_local_disks_and_heal wait");
         let _ = join_all(futures).await;
+        info!("monitor_local_disks_and_heal end");
         interval.reset();
     }
 }
@@ -226,11 +233,14 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
 
     let tracker = Arc::new(RwLock::new(tracker));
     let qb = tracker.read().await.queue_buckets.clone();
+    info!("0.4");
     store.pools[pool_idx].disk_set[set_idx]
         .clone()
         .heal_erasure_set(&qb, tracker.clone())
         .await?;
+    info!("4");
     let mut tracker_w = tracker.write().await;
+    info!("5");
     if tracker_w.items_failed > 0 && tracker_w.retry_attempts < 4 {
         tracker_w.retry_attempts += 1;
         tracker_w.reset_healing().await;
