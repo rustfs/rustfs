@@ -61,6 +61,9 @@ pub enum StorageError {
     #[error("Invalid upload id: {0}/{1}-{2}")]
     InvalidUploadID(String, String, String),
 
+    #[error("Specified part could not be found. PartNumber {0}, Expected {1}, got {2}")]
+    InvalidPart(usize, String, String),
+
     #[error("Invalid version id: {0}/{1}-{2}")]
     InvalidVersionID(String, String, String),
     #[error("invalid data movement operation, source and destination pool are the same for : {0}/{1}-{2}")]
@@ -106,7 +109,8 @@ impl StorageError {
             StorageError::InsufficientReadQuorum => 0x16,
             StorageError::InsufficientWriteQuorum => 0x17,
             StorageError::DecommissionNotStarted => 0x18,
-            StorageError::VolumeNotFound(_) => 0x19,
+            StorageError::InvalidPart(_, _, _) => 0x19,
+            StorageError::VolumeNotFound(_) => 0x20,
         }
     }
 
@@ -140,7 +144,8 @@ impl StorageError {
             0x16 => Some(StorageError::InsufficientReadQuorum),
             0x17 => Some(StorageError::InsufficientWriteQuorum),
             0x18 => Some(StorageError::DecommissionNotStarted),
-            0x19 => Some(StorageError::VolumeNotFound(Default::default())),
+            0x19 => Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default())),
+            0x20 => Some(StorageError::VolumeNotFound(Default::default())),
             _ => None,
         }
     }

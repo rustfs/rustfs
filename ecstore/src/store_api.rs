@@ -137,13 +137,13 @@ impl FileInfo {
     pub fn add_object_part(
         &mut self,
         num: usize,
-        etag: Option<String>,
+        e_tag: Option<String>,
         part_size: usize,
         mod_time: Option<OffsetDateTime>,
         actual_size: usize,
     ) {
         let part = ObjectPartInfo {
-            etag,
+            e_tag,
             number: num,
             size: part_size,
             mod_time,
@@ -272,7 +272,7 @@ impl FileInfo {
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
-    pub etag: Option<String>,
+    pub e_tag: Option<String>,
     pub number: usize,
     pub size: usize,
     pub actual_size: usize, // 源数据大小
@@ -606,12 +606,14 @@ pub struct PartInfo {
 #[derive(Debug, Clone)]
 pub struct CompletePart {
     pub part_num: usize,
+    pub e_tag: Option<String>,
 }
 
 impl From<s3s::dto::CompletedPart> for CompletePart {
     fn from(value: s3s::dto::CompletedPart) -> Self {
         Self {
             part_num: value.part_number.unwrap_or_default() as usize,
+            e_tag: value.e_tag,
         }
     }
 }

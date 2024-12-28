@@ -62,8 +62,18 @@ pub fn to_s3_error(err: Error) -> S3Error {
                 s3_error!(SlowDown, "Storage resources are insufficient for the write operation")
             }
             StorageError::DecommissionNotStarted => s3_error!(InvalidArgument, "Decommission Not Started"),
+
             StorageError::VolumeNotFound(bucket) => {
                 s3_error!(NoSuchBucket, "bucket not found {}", bucket)
+            }
+            StorageError::InvalidPart(bucket, object, version_id) => {
+                s3_error!(
+                    InvalidPart,
+                    "Specified part could not be found. PartNumber {}, Expected {}, got {}",
+                    bucket,
+                    object,
+                    version_id
+                )
             }
         };
     }
