@@ -211,7 +211,6 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(|err| {
             error!("ECStore::new {:?}", &err);
-            panic!("{}", err);
             Error::from_string(err.to_string())
         })?;
 

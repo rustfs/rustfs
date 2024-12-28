@@ -59,6 +59,7 @@ use crate::{
     heal::data_scanner::{globalHealConfig, HEAL_DELETE_DANGLING},
     store_api::ListObjectVersionsInfo,
 };
+use bytesize::ByteSize;
 use chrono::Utc;
 use futures::future::join_all;
 use glob::Pattern;
@@ -69,6 +70,7 @@ use lock::{
     LockApi,
 };
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use md5::{Digest as Md5Digest, Md5};
 use rand::{
     thread_rng,
     {seq::SliceRandom, Rng},
@@ -2352,7 +2354,7 @@ impl SetDisks {
                                     parts_metadata[index].data_dir = Some(dst_data_dir);
                                     parts_metadata[index].add_object_part(
                                         part.number,
-                                        part.etag.clone(),
+                                        part.e_tag.clone(),
                                         part.size,
                                         part.mod_time,
                                         part.actual_size,
@@ -4050,7 +4052,7 @@ impl StorageAPI for SetDisks {
         }
 
         let part_info = ObjectPartInfo {
-            etag: Some(etag.clone()),
+            e_tag: Some(etag.clone()),
             number: part_id,
             size: w_size,
             mod_time: Some(OffsetDateTime::now_utc()),
@@ -4431,7 +4433,7 @@ impl StorageAPI for SetDisks {
                 return Err(Error::new(ErasureError::InvalidPart(part_id)));
             }
 
-            fi.add_object_part(part.number, part.etag.clone(), part.size, part.mod_time, part.actual_size);
+            fi.add_object_part(part.number, part.e_tag.clone(), part.size, part.mod_time, part.actual_size);
         }
 
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files_metas, &fi);
@@ -4440,23 +4442,45 @@ impl StorageAPI for SetDisks {
 
         fi.parts = Vec::with_capacity(uploaded_parts.len());
 
-        let mut total_size: usize = 0;
+        let mut object_size: usize = 0;
+        let mut object_actual_size: usize = 0;
 
         for (i, p) in uploaded_parts.iter().enumerate() {
             let has_part = curr_fi.parts.iter().find(|v| v.number == p.part_num);
             if has_part.is_none() {
                 // error!("complete_multipart_upload has_part.is_none() {:?}", has_part);
-                return Err(Error::new(ErasureError::InvalidPart(p.part_num)));
+                return Err(Error::new(StorageError::InvalidPart(
+                    p.part_num,
+                    "".to_owned(),
+                    p.e_tag.clone().unwrap_or_default(),
+                )));
             }
 
             let ext_part = &curr_fi.parts[i];
 
+            if p.e_tag != ext_part.e_tag {
+                return Err(Error::new(StorageError::InvalidPart(
+                    p.part_num,
+                    ext_part.e_tag.clone().unwrap_or_default(),
+                    p.e_tag.clone().unwrap_or_default(),
+                )));
+            }
+
             // TODO: crypto
 
-            total_size += ext_part.size;
+            if (i < uploaded_parts.len() - 1) && !is_min_allowed_part_size(ext_part.size) {
+                return Err(Error::new(StorageError::InvalidPart(
+                    p.part_num,
+                    ext_part.e_tag.clone().unwrap_or_default(),
+                    p.e_tag.clone().unwrap_or_default(),
+                )));
+            }
+
+            object_size += ext_part.size;
+            object_actual_size += ext_part.actual_size;
 
             fi.parts.push(ObjectPartInfo {
-                etag: ext_part.etag.clone(),
+                e_tag: ext_part.e_tag.clone(),
                 number: p.part_num,
                 size: ext_part.size,
                 mod_time: ext_part.mod_time,
@@ -4464,17 +4488,34 @@ impl StorageAPI for SetDisks {
             });
         }
 
-        fi.size = total_size;
+        fi.size = object_size;
         fi.mod_time = opts.mod_time;
         if fi.mod_time.is_none() {
             fi.mod_time = Some(OffsetDateTime::now_utc());
         }
+
+        // etag
+
+        if let Some(metadata) = fi.metadata.as_mut() {
+            if let Some(etag) = opts.user_defined.get("etag") {
+                metadata.insert("etag".to_owned(), etag.clone());
+            } else {
+                metadata.insert("etag".to_owned(), get_complete_multipart_md5(&uploaded_parts));
+            }
+        }
+
+        // TODO: object_actual_size
+        let _ = object_actual_size;
 
         for meta in parts_metadatas.iter_mut() {
             if meta.is_valid() {
                 meta.size = fi.size;
                 meta.mod_time = fi.mod_time;
                 meta.parts.clone_from(&fi.parts);
+                meta.metadata = fi.metadata.clone();
+                meta.versioned = opts.versioned || opts.version_suspended;
+
+                // TODO: Checksum
             }
         }
 
@@ -5122,4 +5163,24 @@ pub async fn stat_all_dirs(disks: &[Option<DiskStore>], bucket: &str, prefix: &s
         errs.push(err);
     }
     errs
+}
+
+const GLOBAL_MIN_PART_SIZE: ByteSize = ByteSize::mib(5);
+fn is_min_allowed_part_size(size: usize) -> bool {
+    size as u64 >= GLOBAL_MIN_PART_SIZE.as_u64()
+}
+
+fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
+    let mut buf = Vec::new();
+
+    for part in parts.iter() {
+        if let Some(etag) = &part.e_tag {
+            buf.extend(etag.bytes());
+        }
+    }
+
+    let mut hasher = Md5::new();
+    hasher.write(&buf);
+
+    format!("{:x}-{}", hasher.finalize(), parts.len())
 }
