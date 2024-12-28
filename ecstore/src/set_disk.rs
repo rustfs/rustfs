@@ -3527,8 +3527,8 @@ impl ObjectIO for SetDisks {
         // let disks = disks.clone();
         let bucket = String::from(bucket);
         let object = String::from(object);
-        let set_index = self.set_index.clone();
-        let pool_index = self.pool_index.clone();
+        let set_index = self.set_index;
+        let pool_index = self.pool_index;
         tokio::spawn(async move {
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket, &object, offset, length, &mut wd, fi, files, &disks, set_index, pool_index,
@@ -5271,7 +5271,7 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     }
 
     let mut hasher = Md5::new();
-    hasher.write(&buf);
+    let _ = hasher.write(&buf);
 
     format!("{:x}-{}", hasher.finalize(), parts.len())
 }
