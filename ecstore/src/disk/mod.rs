@@ -16,17 +16,20 @@ pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::utils::proto_err_to_err;
 use crate::{
+    bucket::{metadata_sys::get_versioning_config, versioning::VersioningApi},
     erasure::Writer,
     error::{Error, Result},
-    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
+    file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion, VersionType},
     heal::{
         data_scanner::ShouldSleepFn,
         data_usage_cache::{DataUsageCache, DataUsageEntry},
         heal_commands::{HealScanMode, HealingTracker},
     },
-    store_api::{FileInfo, RawFileInfo},
+    store_api::{FileInfo, ObjectInfo, RawFileInfo},
+    utils::path::SLASH_SEPARATOR,
 };
 use endpoint::Endpoint;
+use error::DiskError;
 use futures::StreamExt;
 use local::LocalDisk;
 use madmin::info_commands::DiskMetrics;
@@ -46,7 +49,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc::{self, Sender},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -210,10 +213,10 @@ impl DiskAPI for Disk {
         }
     }
 
-    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         match self {
-            Disk::Local(local_disk) => local_disk.walk_dir(opts).await,
-            Disk::Remote(remote_disk) => remote_disk.walk_dir(opts).await,
+            Disk::Local(local_disk) => local_disk.walk_dir(opts, wr).await,
+            Disk::Remote(remote_disk) => remote_disk.walk_dir(opts, wr).await,
         }
     }
 
@@ -405,8 +408,8 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
     async fn delete_volume(&self, volume: &str) -> Result<()>;
 
-    // 并发边读边写 TODO: wr io.Writer
-    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>>;
+    // 并发边读边写 w <- MetaCacheEntry
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()>;
 
     // Metadata operations
     async fn delete_version(
@@ -557,6 +560,18 @@ pub struct FileInfoVersions {
     pub free_versions: Vec<FileInfo>,
 }
 
+impl FileInfoVersions {
+    pub fn find_version_index(&self, v: &str) -> Option<usize> {
+        if v.is_empty() {
+            return None;
+        }
+
+        let vid = Uuid::parse_str(v).unwrap_or(Uuid::nil());
+
+        self.versions.iter().position(|v| v.version_id == Some(vid))
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WalkDirOptions {
     // Bucket to scanner
@@ -571,10 +586,10 @@ pub struct WalkDirOptions {
 
     // FilterPrefix will only return results with given prefix within folder.
     // Should never contain a slash.
-    pub filter_prefix: String,
+    pub filter_prefix: Option<String>,
 
     // ForwardTo will forward to the given object path.
-    pub forward_to: String,
+    pub forward_to: Option<String>,
 
     // Limit the number of returned objects if > 0.
     pub limit: i32,
@@ -594,7 +609,7 @@ pub struct MetadataResolutionParams {
     pub candidates: Vec<Vec<FileMetaShallowVersion>>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct MetaCacheEntry {
     // name is the full name of the object including prefixes
     pub name: String,
@@ -603,10 +618,10 @@ pub struct MetaCacheEntry {
     pub metadata: Vec<u8>,
 
     // cached contains the metadata if decoded.
-    cached: Option<FileMeta>,
+    pub cached: Option<FileMeta>,
 
     // Indicates the entry can be reused and only one reference to metadata is expected.
-    _reusable: bool,
+    pub reusable: bool,
 }
 
 impl MetaCacheEntry {
@@ -620,39 +635,92 @@ impl MetaCacheEntry {
 
         Ok(wr)
     }
+
     pub fn is_dir(&self) -> bool {
         self.metadata.is_empty() && self.name.ends_with('/')
+    }
+    pub fn is_in_dir(&self, dir: &str, separator: &str) -> bool {
+        if dir.is_empty() {
+            let idx = self.name.find(separator);
+            return idx.is_none() || idx.unwrap() == self.name.len() - separator.len();
+        }
+
+        let ext = self.name.trim_start_matches(dir);
+
+        if ext.len() != self.name.len() {
+            let idx = ext.find(separator);
+            return idx.is_none() || idx.unwrap() == ext.len() - separator.len();
+        }
+
+        false
     }
     pub fn is_object(&self) -> bool {
         !self.metadata.is_empty()
     }
 
+    pub fn is_object_dir(&self) -> bool {
+        !self.metadata.is_empty() && self.name.ends_with(SLASH_SEPARATOR)
+    }
+
+    pub fn is_latest_deletemarker(&mut self) -> bool {
+        if let Some(cached) = &self.cached {
+            if cached.versions.is_empty() {
+                return true;
+            }
+
+            return cached.versions[0].header.version_type == VersionType::Delete;
+        }
+
+        if !FileMeta::is_xl2_v1_format(&self.metadata) {
+            return false;
+        }
+
+        match FileMeta::check_xl2_v1(&self.metadata) {
+            Ok((meta, _, _)) => {
+                if !meta.is_empty() {
+                    // TODO: IsLatestDeleteMarker
+                }
+            }
+            Err(_) => return true,
+        }
+
+        match self.xl_meta() {
+            Ok(res) => {
+                if res.versions.is_empty() {
+                    return true;
+                }
+                res.versions[0].header.version_type == VersionType::Delete
+            }
+            Err(_) => true,
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
-    pub fn to_fileinfo(&self, bucket: &str) -> Result<Option<FileInfo>> {
+    pub fn to_fileinfo(&self, bucket: &str) -> Result<FileInfo> {
         if self.is_dir() {
-            return Ok(Some(FileInfo {
+            return Ok(FileInfo {
                 volume: bucket.to_owned(),
                 name: self.name.clone(),
                 ..Default::default()
-            }));
+            });
         }
 
         if self.cached.is_some() {
             let fm = self.cached.as_ref().unwrap();
             if fm.versions.is_empty() {
-                return Ok(Some(FileInfo {
+                return Ok(FileInfo {
                     volume: bucket.to_owned(),
                     name: self.name.clone(),
                     deleted: true,
                     is_latest: true,
                     mod_time: Some(OffsetDateTime::UNIX_EPOCH),
                     ..Default::default()
-                }));
+                });
             }
 
             let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
 
-            return Ok(Some(fi));
+            return Ok(fi);
         }
 
         let mut fm = FileMeta::new();
@@ -660,7 +728,7 @@ impl MetaCacheEntry {
 
         let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
 
-        return Ok(Some(fi));
+        return Ok(fi);
     }
 
     pub fn file_info_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
@@ -767,11 +835,36 @@ impl MetaCacheEntry {
 
         Ok((prefer, true))
     }
+
+    pub fn xl_meta(&mut self) -> Result<FileMeta> {
+        if self.is_dir() {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        if let Some(meta) = &self.cached {
+            Ok(meta.clone())
+        } else {
+            if self.metadata.is_empty() {
+                return Err(Error::new(DiskError::FileNotFound));
+            }
+
+            let meta = FileMeta::load(&self.metadata)?;
+
+            self.cached = Some(meta.clone());
+
+            Ok(meta)
+        }
+    }
 }
 
-pub struct MetaCacheEntries(pub Vec<MetaCacheEntry>);
+#[derive(Debug, Default)]
+pub struct MetaCacheEntries(pub Vec<Option<MetaCacheEntry>>);
 
 impl MetaCacheEntries {
+    #[allow(clippy::should_implement_trait)]
+    pub fn as_ref(&self) -> &[Option<MetaCacheEntry>] {
+        &self.0
+    }
     pub fn resolve(&self, mut params: MetadataResolutionParams) -> Result<Option<MetaCacheEntry>> {
         if self.0.is_empty() {
             return Ok(None);
@@ -784,7 +877,7 @@ impl MetaCacheEntries {
         let mut objs_agree = 0;
         let mut objs_valid = 0;
 
-        for entry in self.0.iter() {
+        for entry in self.0.iter().flatten() {
             if entry.name.is_empty() {
                 continue;
             }
@@ -842,7 +935,7 @@ impl MetaCacheEntries {
                 meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver,
                 ..Default::default()
             }),
-            _reusable: true,
+            reusable: true,
             ..Default::default()
         });
 
@@ -858,7 +951,198 @@ impl MetaCacheEntries {
     }
 
     pub fn first_found(&self) -> (Option<MetaCacheEntry>, usize) {
-        (self.0.iter().find(|x| !x.name.is_empty()).cloned(), self.0.len())
+        (self.0.iter().find(|x| x.is_some()).cloned().unwrap_or_default(), self.0.len())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MetaCacheEntriesSortedResult {
+    pub entries: Option<MetaCacheEntriesSorted>,
+    pub err: Option<Error>,
+}
+
+// impl MetaCacheEntriesSortedResult {
+//     pub fn entriy_list(&self) -> Vec<&MetaCacheEntry> {
+//         if let Some(entries) = &self.entries {
+//             entries.entries()
+//         } else {
+//             Vec::new()
+//         }
+//     }
+// }
+
+#[derive(Debug, Default)]
+pub struct MetaCacheEntriesSorted {
+    pub o: MetaCacheEntries,
+    pub list_id: Option<String>,
+    pub reuse: bool,
+    pub last_skipped_entry: Option<String>,
+}
+
+impl MetaCacheEntriesSorted {
+    pub fn entries(&self) -> Vec<&MetaCacheEntry> {
+        let entries: Vec<&MetaCacheEntry> = self.o.0.iter().flatten().collect();
+        entries
+    }
+    pub fn forward_past(&mut self, marker: Option<String>) {
+        if let Some(val) = marker {
+            // TODO: reuse
+            if let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val) {
+                self.o.0 = self.o.0.split_off(idx);
+            }
+        }
+    }
+    pub async fn file_infos(&self, bucket: &str, prefix: &str, delimiter: Option<String>) -> Vec<ObjectInfo> {
+        let vcfg = get_versioning_config(bucket).await.ok();
+        let mut objects = Vec::with_capacity(self.o.as_ref().len());
+        let mut prev_prefix = "";
+        for entry in self.o.as_ref().iter().flatten() {
+            if entry.is_object() {
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
+
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
+                        }
+                        continue;
+                    }
+                }
+
+                if let Ok(fi) = entry.to_fileinfo(bucket) {
+                    // TODO:VersionPurgeStatus
+                    let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
+                    objects.push(fi.to_object_info(bucket, &entry.name, versioned));
+                }
+                continue;
+            }
+
+            if entry.is_dir() {
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
+
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        objects
+    }
+
+    pub async fn file_info_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_v: Option<String>,
+    ) -> Vec<ObjectInfo> {
+        let vcfg = get_versioning_config(bucket).await.ok();
+        let mut objects = Vec::with_capacity(self.o.as_ref().len());
+        let mut prev_prefix = "";
+        let mut after_v = after_v;
+        for entry in self.o.as_ref().iter().flatten() {
+            if entry.is_object() {
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
+
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
+                        }
+                        continue;
+                    }
+                }
+
+                let mut fiv = match entry.file_info_versions(bucket) {
+                    Ok(res) => res,
+                    Err(_err) => {
+                        //
+                        continue;
+                    }
+                };
+
+                let fi_versions = 'c: {
+                    if let Some(after_val) = &after_v {
+                        if let Some(idx) = fiv.find_version_index(after_val) {
+                            after_v = None;
+                            break 'c fiv.versions.split_off(idx + 1);
+                        }
+
+                        after_v = None;
+                        break 'c fiv.versions;
+                    } else {
+                        break 'c fiv.versions;
+                    }
+                };
+
+                for fi in fi_versions.into_iter() {
+                    // VersionPurgeStatus
+
+                    let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
+                    objects.push(fi.to_object_info(bucket, &entry.name, versioned));
+                }
+
+                continue;
+            }
+
+            if entry.is_dir() {
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
+
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        objects
     }
 }
 

@@ -24,19 +24,19 @@ use crate::store_err::{
 };
 use crate::store_init::ec_drives_no_config;
 use crate::utils::crypto::base64_decode;
-use crate::utils::path::{base_dir_from_prefix, decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
+use crate::utils::path::{decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
 use crate::utils::xml;
 use crate::{
     bucket::metadata::BucketMetadata,
-    disk::{error::DiskError, new_disk, DiskOption, DiskStore, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    disk::{error::DiskError, new_disk, DiskOption, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     endpoints::EndpointServerPools,
     error::{Error, Result},
     peer::S3PeerSys,
     sets::Sets,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListObjectsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete,
-        PartInfo, PutObjReader, StorageAPI,
+        ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init, utils,
 };
@@ -52,11 +52,7 @@ use std::cmp::Ordering;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::Sender;
@@ -265,102 +261,104 @@ impl ECStore {
         self.pools.len() == 1
     }
 
-    pub async fn list_path(&self, opts: &ListPathOptions, delimiter: &str) -> Result<ListObjectsInfo> {
-        // if opts.prefix.ends_with(SLASH_SEPARATOR) {
-        //     return Err(Error::msg("eof"));
-        // }
+    // define in store_list_objects.rs
+    // pub async fn list_path(&self, opts: &ListPathOptions, delimiter: &str) -> Result<ListObjectsInfo> {
+    //     // if opts.prefix.ends_with(SLASH_SEPARATOR) {
+    //     //     return Err(Error::msg("eof"));
+    //     // }
 
-        let mut opts = opts.clone();
+    //     let mut opts = opts.clone();
 
-        if opts.base_dir.is_empty() {
-            opts.base_dir = base_dir_from_prefix(&opts.prefix);
-        }
+    //     if opts.base_dir.is_empty() {
+    //         opts.base_dir = base_dir_from_prefix(&opts.prefix);
+    //     }
 
-        let objects = self.list_merged(&opts, delimiter).await?;
+    //     let objects = self.list_merged(&opts, delimiter).await?;
 
-        let info = ListObjectsInfo {
-            objects,
-            ..Default::default()
-        };
-        Ok(info)
-    }
+    //     let info = ListObjectsInfo {
+    //         objects,
+    //         ..Default::default()
+    //     };
+    //     Ok(info)
+    // }
 
     // 读所有
-    async fn list_merged(&self, opts: &ListPathOptions, delimiter: &str) -> Result<Vec<ObjectInfo>> {
-        let walk_opts = WalkDirOptions {
-            bucket: opts.bucket.clone(),
-            base_dir: opts.base_dir.clone(),
-            ..Default::default()
-        };
+    // define in store_list_objects.rs
+    // async fn list_merged(&self, opts: &ListPathOptions, delimiter: &str) -> Result<Vec<ObjectInfo>> {
+    //     let walk_opts = WalkDirOptions {
+    //         bucket: opts.bucket.clone(),
+    //         base_dir: opts.base_dir.clone(),
+    //         ..Default::default()
+    //     };
 
-        // let (mut wr, mut rd) = tokio::io::duplex(1024);
+    //     // let (mut wr, mut rd) = tokio::io::duplex(1024);
 
-        let mut futures = Vec::new();
+    //     let mut futures = Vec::new();
 
-        for sets in self.pools.iter() {
-            for set in sets.disk_set.iter() {
-                futures.push(set.walk_dir(&walk_opts));
-            }
-        }
+    //     for sets in self.pools.iter() {
+    //         for set in sets.disk_set.iter() {
+    //             futures.push(set.walk_dir(&walk_opts));
+    //         }
+    //     }
 
-        let results = join_all(futures).await;
+    //     let results = join_all(futures).await;
 
-        // let mut errs = Vec::new();
-        let mut ress = Vec::new();
-        let mut uniq = HashSet::new();
+    //     // let mut errs = Vec::new();
+    //     let mut ress = Vec::new();
+    //     let mut uniq = HashSet::new();
 
-        for (disks_ress, _disks_errs) in results {
-            for disks_res in disks_ress.iter() {
-                if disks_res.is_none() {
-                    // TODO handle errs
-                    continue;
-                }
-                let entrys = disks_res.as_ref().unwrap();
+    //     for (disks_ress, _disks_errs) in results {
+    //         for disks_res in disks_ress.iter() {
+    //             if disks_res.is_none() {
+    //                 // TODO handle errs
+    //                 continue;
+    //             }
+    //             let entrys = disks_res.as_ref().unwrap();
 
-                for entry in entrys {
-                    // warn!("lst_merged entry---- {}", &entry.name);
+    //             for entry in entrys {
+    //                 // warn!("lst_merged entry---- {}", &entry.name);
 
-                    if !opts.prefix.is_empty() && !entry.name.starts_with(&opts.prefix) {
-                        continue;
-                    }
+    //                 if !opts.prefix.is_empty() && !entry.name.starts_with(&opts.prefix) {
+    //                     continue;
+    //                 }
 
-                    if !uniq.contains(&entry.name) {
-                        uniq.insert(entry.name.clone());
-                        // TODO: 过滤
+    //                 if !uniq.contains(&entry.name) {
+    //                     uniq.insert(entry.name.clone());
+    //                     // TODO: 过滤
 
-                        if opts.limit > 0 && ress.len() as i32 >= opts.limit {
-                            return Ok(ress);
-                        }
+    //                     if opts.limit > 0 && ress.len() as i32 >= opts.limit {
+    //                         return Ok(ress);
+    //                     }
 
-                        if entry.is_object() {
-                            if !delimiter.is_empty() {
-                                // entry.name.trim_start_matches(pat)
-                            }
+    //                     if entry.is_object() {
+    //                         if !delimiter.is_empty() {
+    //                             // entry.name.trim_start_matches(pat)
+    //                         }
 
-                            let fi = entry.to_fileinfo(&opts.bucket)?;
-                            if let Some(f) = fi {
-                                ress.push(f.to_object_info(&opts.bucket, &entry.name, false));
-                            }
-                            continue;
-                        }
+    //                         let fi = entry.to_fileinfo(&opts.bucket)?;
+    //                         if let Some(f) = fi {
+    //                             ress.push(f.to_object_info(&opts.bucket, &entry.name, false));
+    //                         }
+    //                         continue;
+    //                     }
 
-                        if entry.is_dir() {
-                            ress.push(ObjectInfo {
-                                is_dir: true,
-                                bucket: opts.bucket.clone(),
-                                name: entry.name.clone(),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
-            }
-        }
+    //                     if entry.is_dir() {
+    //                         ress.push(ObjectInfo {
+    //                             is_dir: true,
+    //                             bucket: opts.bucket.clone(),
+    //                             name: entry.name.clone(),
+    //                             ..Default::default()
+    //                         });
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
 
-        // warn!("list_merged errs {:?}", errs);
+    //     // warn!("list_merged errs {:?}", errs);
 
-        Ok(ress)
-    }
+    //     Ok(ress)
+    // }
 
     async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
         let mut futures = Vec::new();
@@ -1020,32 +1018,32 @@ pub struct PoolObjInfo {
     pub err: Option<Error>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ListPathOptions {
-    pub id: String,
+// #[derive(Debug, Default, Clone)]
+// pub struct ListPathOptions {
+//     pub id: String,
 
-    // Bucket of the listing.
-    pub bucket: String,
+//     // Bucket of the listing.
+//     pub bucket: String,
 
-    // Directory inside the bucket.
-    // When unset listPath will set this based on Prefix
-    pub base_dir: String,
+//     // Directory inside the bucket.
+//     // When unset listPath will set this based on Prefix
+//     pub base_dir: String,
 
-    // Scan/return only content with prefix.
-    pub prefix: String,
+//     // Scan/return only content with prefix.
+//     pub prefix: String,
 
-    // FilterPrefix will return only results with this prefix when scanning.
-    // Should never contain a slash.
-    // Prefix should still be set.
-    pub filter_prefix: String,
+//     // FilterPrefix will return only results with this prefix when scanning.
+//     // Should never contain a slash.
+//     // Prefix should still be set.
+//     pub filter_prefix: String,
 
-    // Marker to resume listing.
-    // The response will be the first entry >= this object name.
-    pub marker: String,
+//     // Marker to resume listing.
+//     // The response will be the first entry >= this object name.
+//     pub marker: String,
 
-    // Limit the number of results.
-    pub limit: i32,
-}
+//     // Limit the number of results.
+//     pub limit: i32,
+// }
 
 #[async_trait::async_trait]
 impl ObjectIO for ECStore {
@@ -1514,70 +1512,34 @@ impl StorageAPI for ECStore {
         Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
     }
 
-    // TODO: review
+    // @continuation_token marker
+    // @start_after as marker when continuation_token empty
+    // @delimiter default="/", empty when recursive
+    // @max_keys limit
     async fn list_objects_v2(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         prefix: &str,
-        continuation_token: &str,
-        delimiter: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
         max_keys: i32,
-        _fetch_owner: bool,
-        _start_after: &str,
+        fetch_owner: bool,
+        start_after: Option<String>,
     ) -> Result<ListObjectsV2Info> {
-        let opts = ListPathOptions {
-            bucket: bucket.to_string(),
-            limit: max_keys,
-            prefix: prefix.to_owned(),
-            ..Default::default()
-        };
-
-        let info = self.list_path(&opts, delimiter).await?;
-
-        // warn!("list_objects_v2 info {:?}", info);
-
-        let v2 = ListObjectsV2Info {
-            is_truncated: info.is_truncated,
-            continuation_token: continuation_token.to_owned(),
-            next_continuation_token: info.next_marker,
-            objects: info.objects,
-            prefixes: info.prefixes,
-        };
-
-        Ok(v2)
+        self.inner_list_objects_v2(bucket, prefix, continuation_token, delimiter, max_keys, fetch_owner, start_after)
+            .await
     }
     async fn list_object_versions(
-        &self,
-        _bucket: &str,
-        _prefix: &str,
-        marker: &str,
-        version_marker: &str,
-        _delimiter: &str,
-        _max_keys: i32,
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        if marker.is_empty() && !version_marker.is_empty() {
-            return Err(Error::new(StorageError::NotImplemented));
-        }
-
-        // let opts = ListPathOptions {
-        //     bucket: bucket.to_owned(),
-        //     marker: marker.to_owned(),
-        //     prefix: prefix.to_owned(),
-        //     limit: max_keys,
-        //     ..Default::default()
-        // };
-
-        // let list = self
-        //     .list_path(&opts, delimiter)
-        //     .await
-        //     .map_err(|e| to_object_err(e, vec![bucket]))?;
-
-        // for info in list.objects.iter() {
-        //     //
-        // }
-
-        // FIXME:
-        unimplemented!()
+        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+            .await
     }
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         check_object_args(bucket, object)?;
@@ -1711,12 +1673,12 @@ impl StorageAPI for ECStore {
         &self,
         bucket: &str,
         prefix: &str,
-        key_marker: &str,
-        upload_id_marker: &str,
-        delimiter: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
-        check_list_multipart_args(bucket, prefix, key_marker, upload_id_marker, delimiter)?;
+        check_list_multipart_args(bucket, prefix, &key_marker, &upload_id_marker, &delimiter)?;
 
         if prefix.is_empty() {
             // TODO: return from cache
@@ -1732,14 +1694,21 @@ impl StorageAPI for ECStore {
 
         for pool in self.pools.iter() {
             let res = pool
-                .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
+                .list_multipart_uploads(
+                    bucket,
+                    prefix,
+                    key_marker.clone(),
+                    upload_id_marker.clone(),
+                    delimiter.clone(),
+                    max_uploads,
+                )
                 .await?;
             uploads.extend(res.uploads);
         }
 
         Ok(ListMultipartsInfo {
-            key_marker: key_marker.to_owned(),
-            upload_id_marker: upload_id_marker.to_owned(),
+            key_marker,
+            upload_id_marker,
             max_uploads,
             uploads,
             prefix: prefix.to_owned(),
@@ -1757,7 +1726,7 @@ impl StorageAPI for ECStore {
         for (idx, pool) in self.pools.iter().enumerate() {
             // // TODO: IsSuspended
             let res = pool
-                .list_multipart_uploads(bucket, object, "", "", "", MAX_UPLOADS_LIST)
+                .list_multipart_uploads(bucket, object, None, None, None, MAX_UPLOADS_LIST)
                 .await?;
 
             if !res.uploads.is_empty() {
@@ -2174,9 +2143,11 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
     *GLOBAL_Local_Node_Name.write().await = peer_set[0].clone();
 }
 
-pub fn is_valid_object_prefix(object: &str) -> bool {
+pub fn is_valid_object_prefix(_object: &str) -> bool {
     // Implement object prefix validation
-    !object.is_empty() // Placeholder
+    // !object.is_empty() // Placeholder
+    // FIXME: TODO:
+    true
 }
 
 fn is_valid_object_name(object: &str) -> bool {
@@ -2243,7 +2214,7 @@ fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &str) -> Result<()> {
+pub fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &Option<String>) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
         return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
     }
@@ -2258,18 +2229,20 @@ fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &str) -> Result<()>
 fn check_list_multipart_args(
     bucket: &str,
     prefix: &str,
-    key_marker: &str,
-    upload_id_marker: &str,
-    _delimiter: &str,
+    key_marker: &Option<String>,
+    upload_id_marker: &Option<String>,
+    _delimiter: &Option<String>,
 ) -> Result<()> {
     check_list_objs_args(bucket, prefix, key_marker)?;
 
-    if !upload_id_marker.is_empty() {
-        if key_marker.ends_with('/') {
-            return Err(Error::new(StorageError::InvalidUploadIDKeyCombination(
-                upload_id_marker.to_string(),
-                key_marker.to_string(),
-            )));
+    if let Some(upload_id_marker) = upload_id_marker {
+        if let Some(key_marker) = key_marker {
+            if key_marker.ends_with('/') {
+                return Err(Error::new(StorageError::InvalidUploadIDKeyCombination(
+                    upload_id_marker.to_string(),
+                    key_marker.to_string(),
+                )));
+            }
         }
 
         if let Err(_e) = base64_decode(upload_id_marker.as_bytes()) {

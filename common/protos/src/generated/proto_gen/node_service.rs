@@ -300,17 +300,17 @@ pub struct WalkDirRequest {
     /// indicate which one in the disks
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub walk_dir_options: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub walk_dir_options: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WalkDirResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(string, repeated, tag = "2")]
-    pub meta_cache_entry: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(message, optional, tag = "3")]
-    pub error: ::core::option::Option<Error>,
+    #[prost(string, tag = "2")]
+    pub meta_cache_entry: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RenameDataRequest {
@@ -1390,7 +1390,7 @@ pub mod node_service_client {
         pub async fn walk_dir(
             &mut self,
             request: impl tonic::IntoRequest<super::WalkDirRequest>,
-        ) -> std::result::Result<tonic::Response<super::WalkDirResponse>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<tonic::codec::Streaming<super::WalkDirResponse>>, tonic::Status> {
             self.inner
                 .ready()
                 .await
@@ -1400,7 +1400,7 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "WalkDir"));
-            self.inner.unary(req, path, codec).await
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn rename_data(
             &mut self,
@@ -2361,10 +2361,14 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ListDirRequest>,
         ) -> std::result::Result<tonic::Response<super::ListDirResponse>, tonic::Status>;
+        /// Server streaming response type for the WalkDir method.
+        type WalkDirStream: tonic::codegen::tokio_stream::Stream<Item = std::result::Result<super::WalkDirResponse, tonic::Status>>
+            + std::marker::Send
+            + 'static;
         async fn walk_dir(
             &self,
             request: tonic::Request<super::WalkDirRequest>,
-        ) -> std::result::Result<tonic::Response<super::WalkDirResponse>, tonic::Status>;
+        ) -> std::result::Result<tonic::Response<Self::WalkDirStream>, tonic::Status>;
         async fn rename_data(
             &self,
             request: tonic::Request<super::RenameDataRequest>,
@@ -3155,9 +3159,10 @@ pub mod node_service_server {
                 "/node_service.NodeService/WalkDir" => {
                     #[allow(non_camel_case_types)]
                     struct WalkDirSvc<T: NodeService>(pub Arc<T>);
-                    impl<T: NodeService> tonic::server::UnaryService<super::WalkDirRequest> for WalkDirSvc<T> {
+                    impl<T: NodeService> tonic::server::ServerStreamingService<super::WalkDirRequest> for WalkDirSvc<T> {
                         type Response = super::WalkDirResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type ResponseStream = T::WalkDirStream;
+                        type Future = BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(&mut self, request: tonic::Request<super::WalkDirRequest>) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move { <T as NodeService>::walk_dir(&inner, request).await };
@@ -3175,7 +3180,7 @@ pub mod node_service_server {
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
                             .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
-                        let res = grpc.unary(method, req).await;
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

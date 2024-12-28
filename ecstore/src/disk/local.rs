@@ -12,12 +12,13 @@ use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::{self};
 use crate::cache_value::cache::{Cache, Opts, UpdateFn};
 use crate::disk::error::{
-    convert_access_error, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir, is_sys_err_not_dir,
-    map_err_not_exists, os_err_to_file_err,
+    convert_access_error, is_err_os_not_exist, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir,
+    is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err,
 };
 use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
+use crate::file_meta::read_xl_meta_no_data;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, ShouldSleepFn, SizeSummary};
 use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
@@ -25,6 +26,7 @@ use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
 use crate::heal::heal_commands::{HealScanMode, HealingTracker};
 use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
+use crate::metacache::writer::MetacacheWriter;
 use crate::new_object_layer_fn;
 use crate::set_disk::{
     conv_part_err_to_int, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
@@ -33,13 +35,17 @@ use crate::set_disk::{
 use crate::store_api::{BitrotAlgorithm, StorageAPI};
 use crate::utils::fs::{access, lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::os::get_info;
-use crate::utils::path::{clean, has_suffix, path_join, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR};
+use crate::utils::path::{
+    self, clean, decode_dir_object, has_suffix, path_join, path_join_buf, GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH,
+    SLASH_SEPARATOR,
+};
 use crate::{
     file_meta::FileMeta,
     store_api::{FileInfo, RawFileInfo},
     utils,
 };
 use common::defer;
+use nix::NixPath;
 use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -55,7 +61,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -401,22 +407,53 @@ impl LocalDisk {
     }
 
     /// read xl.meta raw data
-    #[tracing::instrument(level = "debug", skip(self, volume_dir, path))]
+    #[tracing::instrument(level = "debug", skip(self, volume_dir, file_path))]
     async fn read_raw(
         &self,
         bucket: &str,
         volume_dir: impl AsRef<Path>,
-        path: impl AsRef<Path>,
+        file_path: impl AsRef<Path>,
         read_data: bool,
     ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-        let meta_path = path.as_ref().join(Path::new(super::STORAGE_FORMAT_FILE));
-        if read_data {
-            self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
-        } else {
-            self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
-            // FIXME: read_metadata only suport
-            // self.read_metadata_with_dmtime(meta_path).await
+        if file_path.as_ref().is_empty() {
+            return Err(Error::new(DiskError::FileNotFound));
         }
+
+        let meta_path = file_path.as_ref().join(Path::new(super::STORAGE_FORMAT_FILE));
+
+        let res = {
+            if read_data {
+                self.read_all_data_with_dmtime(bucket, volume_dir, meta_path).await
+            } else {
+                match self.read_metadata_with_dmtime(meta_path).await {
+                    Ok(res) => Ok(res),
+                    Err(err) => {
+                        if is_err_os_not_exist(&err)
+                            && !skip_access_checks(volume_dir.as_ref().to_string_lossy().to_string().as_str())
+                        {
+                            if let Err(aerr) = access(volume_dir.as_ref()).await {
+                                if os_is_not_exist(&aerr) {
+                                    return Err(Error::new(DiskError::VolumeNotFound));
+                                }
+                            }
+                        }
+
+                        if let Some(os_err) = err.downcast_ref::<std::io::Error>() {
+                            Err(os_err_to_file_err(std::io::Error::new(os_err.kind(), os_err.to_string())))
+                        } else {
+                            Err(err)
+                        }
+                    }
+                }
+            }
+        };
+
+        let (buf, mtime) = res?;
+        if buf.is_empty() {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        Ok((buf, mtime))
     }
 
     async fn read_metadata(&self, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -425,7 +462,6 @@ impl LocalDisk {
         Ok(data)
     }
 
-    // FIXME: read_metadata only suport
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
 
@@ -444,17 +480,15 @@ impl LocalDisk {
         }
 
         let size = meta.len() as usize;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size)?;
 
-        f.read_to_end(&mut bytes).await.map_err(os_err_to_file_err)?;
+        let data = read_xl_meta_no_data(&mut f, size).await?;
 
         let modtime = match meta.modified() {
             Ok(md) => Some(OffsetDateTime::from(md)),
             Err(_) => None,
         };
 
-        Ok((bytes, modtime))
+        Ok((data, modtime))
     }
 
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -500,7 +534,7 @@ impl LocalDisk {
                     return Err(Error::new(DiskError::UnsupportedDisk));
                 }
 
-                return Err(Error::new(e));
+                return Err(os_err_to_file_err(e));
             }
         };
 
@@ -686,6 +720,240 @@ impl LocalDisk {
         let mut data = Vec::new();
         let n = file.read_to_end(&mut data).await?;
         bitrot_verify(&mut Cursor::new(data), n, part_size, algo, sum.to_vec(), shard_size)
+    }
+
+    async fn scan_dir<W: AsyncWrite + Unpin>(
+        &self,
+        current: &mut String,
+        opts: &WalkDirOptions,
+        out: &mut MetacacheWriter<W>,
+        objs_returned: &mut i32,
+    ) -> Result<()> {
+        let forward = {
+            opts.forward_to.as_ref().filter(|v| v.starts_with(&*current)).map(|v| {
+                let forward = v.trim_start_matches(&*current);
+                if let Some(idx) = forward.find('/') {
+                    forward[..idx].to_owned()
+                } else {
+                    forward.to_owned()
+                }
+            })
+            // if let Some(forward_to) = &opts.forward_to {
+
+            // } else {
+            //     None
+            // }
+            // if !opts.forward_to.is_empty() && opts.forward_to.starts_with(&*current) {
+            //     let forward = opts.forward_to.trim_start_matches(&*current);
+            //     if let Some(idx) = forward.find('/') {
+            //         &forward[..idx]
+            //     } else {
+            //         forward
+            //     }
+            // } else {
+            //     ""
+            // }
+        };
+
+        if opts.limit > 0 && *objs_returned >= opts.limit {
+            return Ok(());
+        }
+
+        let mut entries = match self.list_dir("", &opts.bucket, current, -1).await {
+            Ok(res) => res,
+            Err(e) => {
+                if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
+                    error!("scan list_dir {}, err {:?}", &current, &e);
+                }
+
+                if opts.report_notfound && is_err_file_not_found(&e) && current == &opts.base_dir {
+                    return Err(Error::new(DiskError::FileNotFound));
+                }
+
+                return Ok(());
+            }
+        };
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let s = SLASH_SEPARATOR.chars().next().unwrap_or_default();
+        *current = current.trim_matches(s).to_owned();
+
+        let bucket = opts.bucket.as_str();
+
+        let mut dir_objes = HashSet::new();
+
+        // 第一层过滤
+        for item in entries.iter_mut() {
+            // warn!("walk_dir  get entry {:?}", &entry);
+
+            let entry = item.clone();
+            // check limit
+            if opts.limit > 0 && *objs_returned >= opts.limit {
+                return Ok(());
+            }
+            // check prefix
+            if let Some(filter_prefix) = &opts.filter_prefix {
+                if !entry.starts_with(filter_prefix) {
+                    *item = "".to_owned();
+                    continue;
+                }
+            }
+
+            if let Some(forward) = &forward {
+                if &entry < forward {
+                    *item = "".to_owned();
+                    continue;
+                }
+            }
+
+            if entry.ends_with(SLASH_SEPARATOR) {
+                if entry.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
+                    let entry = format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
+                    dir_objes.insert(entry.clone());
+                    *item = entry;
+                    continue;
+                }
+
+                *item = entry.trim_end_matches(SLASH_SEPARATOR).to_owned();
+                continue;
+            }
+
+            *item = "".to_owned();
+
+            if entry.ends_with(STORAGE_FORMAT_FILE) {
+                //
+                let metadata = self
+                    .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
+                    .await?;
+                let name = entry.trim_end_matches(STORAGE_FORMAT_FILE).trim_end_matches(SLASH_SEPARATOR);
+                let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
+
+                out.write_obj(&MetaCacheEntry {
+                    name,
+                    metadata,
+                    ..Default::default()
+                })
+                .await?;
+                *objs_returned += 1;
+
+                return Ok(());
+            }
+        }
+
+        entries.sort();
+
+        let mut entries = entries.as_slice();
+        if let Some(forward) = &forward {
+            for (i, entry) in entries.iter().enumerate() {
+                if entry >= forward || forward.starts_with(entry.as_str()) {
+                    entries = &entries[i..];
+                    break;
+                }
+            }
+        }
+
+        let mut dir_stack: Vec<String> = Vec::with_capacity(5);
+
+        for entry in entries.iter() {
+            //
+            if opts.limit > 0 && *objs_returned >= opts.limit {
+                return Ok(());
+            }
+
+            if entry.is_empty() {
+                continue;
+            }
+
+            let name = path::path_join_buf(&[current, entry]);
+
+            if !dir_stack.is_empty() {
+                if let Some(pop) = dir_stack.pop() {
+                    if pop < name {
+                        //
+                        out.write_obj(&MetaCacheEntry {
+                            name: pop.clone(),
+                            ..Default::default()
+                        })
+                        .await?;
+
+                        if opts.recursive {
+                            if let Err(er) = Box::pin(self.scan_dir(&mut pop.clone(), opts, out, objs_returned)).await {
+                                error!("scan_dir err {:?}", er);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut meta = MetaCacheEntry {
+                name,
+                ..Default::default()
+            };
+
+            let mut is_dir_obj = false;
+
+            if let Some(_dir) = dir_objes.get(entry) {
+                is_dir_obj = true;
+                meta.name
+                    .truncate(meta.name.len() - meta.name.chars().last().unwrap().len_utf8());
+                meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
+            }
+
+            let fname = format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE);
+
+            match self.read_metadata(self.get_object_path(&opts.bucket, fname.as_str())?).await {
+                Ok(res) => {
+                    if is_dir_obj {
+                        meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
+                        meta.name.push_str(SLASH_SEPARATOR);
+                    }
+
+                    meta.metadata = res;
+
+                    out.write_obj(&meta).await?;
+                    *objs_returned += 1;
+                }
+                Err(err) => {
+                    if let Some(e) = err.downcast_ref::<std::io::Error>() {
+                        if os_is_not_exist(e) || is_sys_err_is_dir(e) {
+                            // NOT an object, append to stack (with slash)
+                            // If dirObject, but no metadata (which is unexpected) we skip it.
+                            if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
+                                meta.name.push_str(SLASH_SEPARATOR);
+                                dir_stack.push(meta.name);
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+            };
+        }
+
+        while let Some(dir) = dir_stack.pop() {
+            if opts.limit > 0 && *objs_returned >= opts.limit {
+                return Ok(());
+            }
+
+            out.write_obj(&MetaCacheEntry {
+                name: dir.clone(),
+                ..Default::default()
+            })
+            .await?;
+            *objs_returned += 1;
+
+            if opts.recursive {
+                let mut dir = dir;
+                if let Err(er) = Box::pin(self.scan_dir(&mut dir, opts, out, objs_returned)).await {
+                    warn!("scan_dir err {:?}", &er);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1251,7 +1519,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let volume_dir = self.get_bucket_path(volume)?;
-        let dir_path_abs = volume_dir.join(Path::new(&dir_path));
+        let dir_path_abs = volume_dir.join(Path::new(&dir_path.trim_start_matches(SLASH_SEPARATOR)));
 
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
@@ -1265,107 +1533,52 @@ impl DiskAPI for LocalDisk {
                 return Err(e);
             }
         };
+
         Ok(entries)
     }
 
-    // TODO: io.writer
-    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
-        // warn!("walk_dir opts {:?}", &opts);
+    // FIXME: TODO: io.writer TODO cancel
+    #[tracing::instrument(level = "debug", skip(self, wr))]
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
-        let mut metas = Vec::new();
+        if !skip_access_checks(&opts.bucket) {
+            if let Err(e) = access(&volume_dir).await {
+                return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
+            }
+        }
+
+        let mut wr = wr;
+
+        let mut out = MetacacheWriter::new(&mut wr);
+
+        let mut objs_returned = 0;
 
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             let fpath = self.get_object_path(
                 &opts.bucket,
-                format!("{}/{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), STORAGE_FORMAT_FILE).as_str(),
+                path_join_buf(&[
+                    format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX).as_str(),
+                    STORAGE_FORMAT_FILE,
+                ])
+                .as_str(),
             )?;
+
             if let Ok(data) = self.read_metadata(fpath).await {
                 let meta = MetaCacheEntry {
                     name: opts.base_dir.clone(),
                     metadata: data,
                     ..Default::default()
                 };
-                metas.push(meta);
-                return Ok(metas);
+                out.write_obj(&meta).await?;
+                objs_returned += 1;
             }
         }
 
-        let mut entries = match self.list_dir("", &opts.bucket, &opts.base_dir, -1).await {
-            Ok(res) => res,
-            Err(e) => {
-                if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
-                    info!("list_dir err {:?}", &e);
-                }
+        let mut current = opts.base_dir.clone();
+        self.scan_dir(&mut current, &opts, &mut out, &mut objs_returned).await?;
 
-                if opts.report_notfound && is_err_file_not_found(&e) {
-                    return Err(e);
-                }
-                return Ok(Vec::new());
-            }
-        };
-
-        if entries.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        entries.sort();
-
-        // 已读计数
-        let objs_returned = 0;
-
-        let bucket = opts.bucket.as_str();
-
-        let mut dir_objes = HashSet::new();
-
-        // 第一层过滤
-        for entry in entries.iter() {
-            // warn!("walk_dir  get entry {:?}", &entry);
-
-            // check limit
-            if opts.limit > 0 && objs_returned >= opts.limit {
-                return Ok(metas);
-            }
-            // check prefix
-            if !opts.filter_prefix.is_empty() && !entry.starts_with(&opts.filter_prefix) {
-                continue;
-            }
-
-            let mut meta = MetaCacheEntry { ..Default::default() };
-
-            let mut name = {
-                if opts.base_dir.is_empty() {
-                    entry.clone()
-                } else {
-                    format!("{}{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), SLASH_SEPARATOR, entry)
-                }
-            };
-
-            if name.ends_with(SLASH_SEPARATOR) {
-                if name.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
-                    name = format!("{}{}", name.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
-                    dir_objes.insert(name.clone());
-                } else {
-                    name = name.as_str().trim_end_matches(SLASH_SEPARATOR).to_owned();
-                }
-            }
-            meta.name = name;
-
-            let fpath = self.get_object_path(bucket, format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE).as_str())?;
-
-            if let Ok(data) = self.read_metadata(&fpath).await {
-                meta.metadata = data;
-            } else {
-                let fpath = self.get_object_path(bucket, &meta.name)?;
-
-                if !is_empty_dir(fpath).await {
-                    meta.name = format!("{}{}", &meta.name, SLASH_SEPARATOR);
-                }
-            }
-
-            metas.push(meta);
-        }
-
-        Ok(metas)
+        Ok(())
     }
 
     // #[tracing::instrument(skip(self))]
@@ -1447,7 +1660,7 @@ impl DiskAPI for LocalDisk {
         let mut xlmeta = FileMeta::new();
 
         if let Some(dst_buf) = has_dst_buf.as_ref() {
-            if FileMeta::is_xl_format(dst_buf) {
+            if FileMeta::is_xl2_v1_format(dst_buf) {
                 if let Ok(nmeta) = FileMeta::load(dst_buf) {
                     xlmeta = nmeta
                 }
@@ -1695,7 +1908,7 @@ impl DiskAPI for LocalDisk {
                     }
                 })?;
 
-            if !FileMeta::is_xl_format(buf.as_slice()) {
+            if !FileMeta::is_xl2_v1_format(buf.as_slice()) {
                 return Err(Error::new(DiskError::FileVersionNotFound));
             }
 

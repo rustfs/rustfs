@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use ecstore::store_err::is_err_object_not_found;
 use log::debug;
 use time::OffsetDateTime;
 use tokio::{
@@ -113,7 +114,7 @@ where
     async fn save_iam_formatter(self: Arc<Self>) -> crate::Result<()> {
         match self.api.load_iam_config::<Format>(Format::PATH).await {
             Ok((format, _)) if format.version >= 1 => return Ok(()),
-            Err(Error::EcstoreError(e)) if !ecstore::disk::error::is_err_file_not_found(&e) => {
+            Err(Error::EcstoreError(e)) if !is_err_object_not_found(&e) => {
                 return Err(Error::EcstoreError(e));
             }
             _ => {}

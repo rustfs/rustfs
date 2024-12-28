@@ -467,8 +467,7 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        // warn!("list_objects_v2 input {:?}", &req.input);
-
+        // warn!("list_objects_v2 req {:?}", &req.input);
         let ListObjectsV2Input {
             bucket,
             continuation_token,
@@ -481,7 +480,11 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
-        let delimiter = delimiter.unwrap_or_default();
+        let max_keys = max_keys.unwrap_or(1000);
+
+        let delimiter = delimiter.filter(|v| !v.is_empty());
+        let continuation_token = continuation_token.filter(|v| !v.is_empty());
+        let start_after = start_after.filter(|v| !v.is_empty());
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -491,16 +494,16 @@ impl S3 for FS {
             .list_objects_v2(
                 &bucket,
                 &prefix,
-                &continuation_token.unwrap_or_default(),
-                &delimiter,
-                max_keys.unwrap_or_default(),
+                continuation_token,
+                delimiter.clone(),
+                max_keys,
                 fetch_owner.unwrap_or_default(),
-                &start_after.unwrap_or_default(),
+                start_after,
             )
             .await
             .map_err(to_s3_error)?;
 
-        // warn!("object_infos {:?}", object_infos);
+        // warn!("object_infos objects {:?}", object_infos.objects);
 
         let objects: Vec<Object> = object_infos
             .objects
@@ -511,6 +514,7 @@ impl S3 for FS {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.size as i64),
+                    e_tag: v.etag.clone(),
                     ..Default::default()
                 };
 
@@ -526,13 +530,23 @@ impl S3 for FS {
 
         let key_count = objects.len() as i32;
 
+        let common_prefixes = object_infos
+            .prefixes
+            .into_iter()
+            .map(|v| CommonPrefix { prefix: Some(v) })
+            .collect();
+
         let output = ListObjectsV2Output {
+            is_truncated: Some(object_infos.is_truncated),
+            continuation_token: object_infos.continuation_token,
+            next_continuation_token: object_infos.next_continuation_token,
             key_count: Some(key_count),
             max_keys: Some(key_count),
             contents: Some(objects),
-            delimiter: Some(delimiter),
+            delimiter,
             name: Some(bucket),
             prefix: Some(prefix),
+            common_prefixes: Some(common_prefixes),
             ..Default::default()
         };
 
@@ -542,9 +556,71 @@ impl S3 for FS {
 
     async fn list_object_versions(
         &self,
-        _req: S3Request<ListObjectVersionsInput>,
+        req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        Err(s3_error!(NotImplemented, "ListObjectVersions is not implemented yet"))
+        let ListObjectVersionsInput {
+            bucket,
+            delimiter,
+            key_marker,
+            version_id_marker,
+            max_keys,
+            prefix,
+            ..
+        } = req.input;
+
+        let prefix = prefix.unwrap_or_default();
+        let max_keys = max_keys.unwrap_or(1000);
+
+        let key_marker = key_marker.filter(|v| !v.is_empty());
+        let version_id_marker = version_id_marker.filter(|v| !v.is_empty());
+        let delimiter = delimiter.filter(|v| !v.is_empty());
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let object_infos = store
+            .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
+            .await
+            .map_err(to_s3_error)?;
+
+        let objects: Vec<ObjectVersion> = object_infos
+            .objects
+            .iter()
+            .filter(|v| !v.name.is_empty())
+            .map(|v| {
+                ObjectVersion {
+                    key: Some(v.name.to_owned()),
+                    last_modified: v.mod_time.map(Timestamp::from),
+                    size: Some(v.size as i64),
+                    version_id: v.version_id.map(|v| v.to_string()),
+                    is_latest: Some(v.is_latest),
+                    e_tag: v.etag.clone(),
+                    ..Default::default() // TODO: another fields
+                }
+            })
+            .collect();
+
+        let key_count = objects.len() as i32;
+
+        let common_prefixes = object_infos
+            .prefixes
+            .into_iter()
+            .map(|v| CommonPrefix { prefix: Some(v) })
+            .collect();
+
+        let output = ListObjectVersionsOutput {
+            // is_truncated: Some(object_infos.is_truncated),
+            max_keys: Some(key_count),
+            delimiter,
+            name: Some(bucket),
+            prefix: Some(prefix),
+            common_prefixes: Some(common_prefixes),
+            versions: Some(objects),
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
     }
 
     #[tracing::instrument(level = "debug", skip(self, req))]

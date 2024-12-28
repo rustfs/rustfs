@@ -3,10 +3,11 @@ use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::Display;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::{collections::HashMap, io::Cursor};
 use time::OffsetDateTime;
-use tracing::warn;
+use tokio::io::AsyncRead;
+use tracing::{error, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -35,6 +36,9 @@ const XL_FLAG_FREE_VERSION: u8 = 1 << 0;
 // const XL_FLAG_USES_DATA_DIR: u8 = 1 << 1;
 const _XL_FLAG_INLINE_DATA: u8 = 1 << 2;
 
+const META_DATA_READ_DEFAULT: usize = 4 << 10;
+const MSGP_UINT32_SIZE: usize = 5;
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub versions: Vec<FileMetaShallowVersion>,
@@ -51,8 +55,9 @@ impl FileMeta {
         }
     }
 
-    pub fn is_xl_format(buf: &[u8]) -> bool {
-        !matches!(Self::read_xl_file_header(buf), Err(_e))
+    // isXL2V1Format
+    pub fn is_xl2_v1_format(buf: &[u8]) -> bool {
+        !matches!(Self::check_xl2_v1(buf), Err(_e))
     }
 
     pub fn load(buf: &[u8]) -> Result<FileMeta> {
@@ -62,9 +67,10 @@ impl FileMeta {
         Ok(xl)
     }
 
-    // read_xl_file_header 读xl文件头，返回后续内容，版本信息
+    // check_xl2_v1 读xl文件头，返回后续内容，版本信息
+    // checkXL2V1
     #[tracing::instrument]
-    pub fn read_xl_file_header(buf: &[u8]) -> Result<(&[u8], u16, u16)> {
+    pub fn check_xl2_v1(buf: &[u8]) -> Result<(&[u8], u16, u16)> {
         if buf.len() < 8 {
             return Err(Error::msg("xl file header not exists"));
         }
@@ -81,12 +87,22 @@ impl FileMeta {
 
         Ok((&buf[8..], major, minor))
     }
+
+    // 固定u32
+    pub fn read_bytes_header(buf: &[u8]) -> Result<(u32, &[u8])> {
+        let (mut size_buf, _) = buf.split_at(5);
+
+        //  取meta数据，buf = crc + data
+        let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
+
+        Ok((bin_len, &buf[5..]))
+    }
     #[tracing::instrument]
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let i = buf.len() as u64;
 
         // check version, buf = buf[8..]
-        let (buf, _, _) = Self::read_xl_file_header(buf)?;
+        let (buf, _, _) = Self::check_xl2_v1(buf)?;
 
         let (mut size_buf, buf) = buf.split_at(5);
 
@@ -484,7 +500,7 @@ impl FileMeta {
                 }
             }
 
-            let mut fi = ver.into_fileinfo(volume, path, has_vid, all_parts)?;
+            let mut fi = ver.to_fileinfo(volume, path, has_vid, all_parts)?;
             fi.is_latest = is_latest;
             if let Some(_d) = succ_mod_time {
                 fi.successor_mod_time = succ_mod_time;
@@ -511,7 +527,7 @@ impl FileMeta {
         for version in self.versions.iter() {
             let mut file_version = FileMetaVersion::default();
             file_version.unmarshal_msg(&version.meta)?;
-            let fi = file_version.into_fileinfo(volume, path, None, all_parts);
+            let fi = file_version.to_fileinfo(volume, path, None, all_parts);
             versions.push(fi);
         }
 
@@ -553,10 +569,10 @@ pub struct FileMetaShallowVersion {
 }
 
 impl FileMetaShallowVersion {
-    pub fn into_fileinfo(&self, volume: &str, path: &str, version_id: Option<Uuid>, all_parts: bool) -> Result<FileInfo> {
+    pub fn to_fileinfo(&self, volume: &str, path: &str, version_id: Option<Uuid>, all_parts: bool) -> Result<FileInfo> {
         let file_version = FileMetaVersion::try_from(self.meta.as_slice())?;
 
-        Ok(file_version.into_fileinfo(volume, path, version_id, all_parts))
+        Ok(file_version.to_fileinfo(volume, path, version_id, all_parts))
     }
 }
 
@@ -760,7 +776,7 @@ impl FileMetaVersion {
         FileMetaVersionHeader::from(self.clone())
     }
 
-    pub fn into_fileinfo(self, volume: &str, path: &str, version_id: Option<Uuid>, all_parts: bool) -> FileInfo {
+    pub fn to_fileinfo(&self, volume: &str, path: &str, version_id: Option<Uuid>, all_parts: bool) -> FileInfo {
         match self.version_type {
             VersionType::Invalid => FileInfo {
                 name: path.to_string(),
@@ -1994,6 +2010,89 @@ async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, o
 
     Ok(fi)
 }
+
+async fn read_more<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    total_size: usize,
+    read_size: usize,
+    has_full: bool,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let has = buf.len();
+
+    if has >= read_size {
+        return Ok(());
+    }
+
+    if has_full || read_size > total_size {
+        return Err(Error::new(io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF")));
+    }
+
+    let extra = read_size - has;
+    if buf.capacity() >= read_size {
+        // Extend the buffer if we have enough space.
+        buf.resize(read_size, 0);
+    } else {
+        buf.extend(vec![0u8; extra]);
+    }
+
+    reader.read_exact(&mut buf[has..]).await?;
+    Ok(())
+}
+
+pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: usize) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut initial = size;
+    let mut has_full = true;
+
+    if initial > META_DATA_READ_DEFAULT {
+        initial = META_DATA_READ_DEFAULT;
+        has_full = false;
+    }
+
+    let mut buf = vec![0u8; initial];
+    reader.read_exact(&mut buf).await?;
+
+    let (tmp_buf, major, minor) = FileMeta::check_xl2_v1(&buf)?;
+
+    match major {
+        1 => match minor {
+            0 => {
+                read_more(reader, &mut buf, size, size, has_full).await?;
+                Ok(buf)
+            }
+            1..=3 => {
+                let (sz, tmp_buf) = FileMeta::read_bytes_header(tmp_buf)?;
+                let mut want = sz as usize + (buf.len() - tmp_buf.len());
+
+                if minor < 2 {
+                    read_more(reader, &mut buf, size, want, has_full).await?;
+                    return Ok(buf[..want].to_vec());
+                }
+
+                let want_max = usize::min(want + MSGP_UINT32_SIZE, size);
+                read_more(reader, &mut buf, size, want_max, has_full).await?;
+
+                if buf.len() < want {
+                    error!("read_xl_meta_no_data buffer too small (length: {}, needed: {})", &buf.len(), want);
+                    return Err(Error::new(DiskError::FileCorrupt));
+                }
+
+                let tmp = &buf[want..];
+                let crc_size = 5;
+                let other_size = tmp.len() - crc_size;
+
+                want += tmp.len() - other_size;
+
+                Ok(buf[..want].to_vec())
+            }
+            _ => Err(Error::new(io::Error::new(io::ErrorKind::InvalidData, "Unknown minor metadata version"))),
+        },
+        _ => Err(Error::new(io::Error::new(io::ErrorKind::InvalidData, "Unknown major metadata version"))),
+    }
+}
 #[cfg(test)]
 mod test {
 
@@ -2012,14 +2111,10 @@ mod test {
             fm.add_version(fi).unwrap();
         }
 
-        // println!("fm:{:?}", &fm);
-
         let buff = fm.marshal_msg().unwrap();
 
         let mut newfm = FileMeta::default();
         newfm.unmarshal_msg(&buff).unwrap();
-
-        // println!("newone:{:?}", newone);
 
         assert_eq!(fm, newfm)
     }
@@ -2106,4 +2201,45 @@ mod test {
         assert_eq!(obj.version_id, obj2.version_id);
         assert_eq!(obj.version_id, vid);
     }
+}
+
+#[tokio::test]
+async fn test_read_xl_meta_no_data() {
+    use tokio::fs;
+    use tokio::fs::File;
+    use tokio::io::AsyncWriteExt;
+
+    let mut fm = FileMeta::new();
+
+    let (m, n) = (3, 2);
+
+    for i in 0..5 {
+        let mut fi = FileInfo::new(i.to_string().as_str(), m, n);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+
+        fm.add_version(fi).unwrap();
+    }
+
+    let mut buff = fm.marshal_msg().unwrap();
+
+    buff.resize(buff.len() + 100, 0);
+
+    let filepath = "./test_xl.meta";
+
+    let mut file = File::create(filepath).await.unwrap();
+    // 写入字符串
+    file.write_all(&buff).await.unwrap();
+
+    let mut f = File::open(filepath).await.unwrap();
+
+    let stat = f.metadata().await.unwrap();
+
+    let data = read_xl_meta_no_data(&mut f, stat.len() as usize).await.unwrap();
+
+    let mut newfm = FileMeta::default();
+    newfm.unmarshal_msg(&data).unwrap();
+
+    fs::remove_file(filepath).await.unwrap();
+
+    assert_eq!(fm, newfm)
 }

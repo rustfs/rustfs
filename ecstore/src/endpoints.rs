@@ -1,5 +1,4 @@
-use tracing::{info, warn};
-use url::Url;
+use tracing::warn;
 
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},

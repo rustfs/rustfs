@@ -731,6 +731,7 @@ version = "0.0.1"
 dependencies = [
  "ecstore",
  "flatbuffers",
+ "futures",
  "lazy_static",
  "lock",
  "madmin",

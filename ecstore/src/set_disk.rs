@@ -20,8 +20,8 @@ use crate::{
         format::FormatV3,
         new_disk, BufferReader, BufferWriter, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption,
         DiskStore, FileInfoVersions, FileReader, FileWriter, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, UpdateMetadataOpts, WalkDirOptions, RUSTFS_META_BUCKET,
-        RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET,
+        RUSTFS_META_TMP_BUCKET,
     },
     erasure::Erasure,
     error::{Error, Result},
@@ -159,6 +159,89 @@ impl SetDisks {
             .collect();
 
         disks
+    }
+
+    pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
+        let mut disks = self.get_disks_internal().await;
+
+        let mut infos = Vec::with_capacity(disks.len());
+
+        let mut futures = Vec::with_capacity(disks.len());
+        let mut numbers: Vec<usize> = (0..disks.len()).collect();
+        {
+            let mut rng = thread_rng();
+            disks.shuffle(&mut rng);
+
+            numbers.shuffle(&mut rand::thread_rng());
+        }
+
+        for &i in numbers.iter() {
+            let disk = disks[i].clone();
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.disk_info(&DiskInfoOptions::default()).await
+                } else {
+                    Err(Error::new(DiskError::DiskNotFound))
+                }
+            });
+        }
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(res) => {
+                    infos.push(res);
+                }
+                Err(err) => {
+                    infos.push(DiskInfo {
+                        error: err.to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        let mut healing: usize = 0;
+
+        let mut scanning_disks = Vec::new();
+        let mut healing_disks = Vec::new();
+        let mut scanning_infos = Vec::new();
+        let mut healing_infos = Vec::new();
+
+        let mut new_disks = Vec::new();
+        let mut new_infos = Vec::new();
+
+        for &i in numbers.iter() {
+            let (info, disk) = (infos[i].clone(), disks[i].clone());
+            if !info.error.is_empty() || disk.is_none() {
+                continue;
+            }
+
+            if info.healing {
+                healing += 1;
+                if incl_healing {
+                    healing_disks.push(disk.unwrap());
+                    healing_infos.push(info);
+                }
+
+                continue;
+            }
+
+            if !info.healing {
+                new_disks.push(disk.unwrap());
+                new_infos.push(info);
+            } else {
+                scanning_disks.push(disk.unwrap());
+                scanning_infos.push(info);
+            }
+        }
+
+        new_disks.extend(scanning_disks);
+        new_infos.extend(scanning_infos);
+        new_disks.extend(healing_disks);
+        new_infos.extend(healing_infos);
+
+        (new_disks, new_infos, healing)
     }
     async fn _get_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_disks_internal().await;
@@ -741,6 +824,7 @@ impl SetDisks {
         };
 
         if let Some(err) = reduce_read_quorum_errs(errs, object_op_ignored_errs().as_ref(), expected_rquorum) {
+            // warn!("object_quorum_from_meta err {:?}", &err);
             return Err(err);
         }
 
@@ -1117,9 +1201,9 @@ impl SetDisks {
         let finfo = match meta.into_fileinfo(bucket, object, "", true, true) {
             Ok(res) => res,
             Err(err) => {
-                for i in 0..errs.len() {
-                    if errs[i].is_none() {
-                        errs[i] = Some(err.clone())
+                for item in errs.iter_mut() {
+                    if item.is_none() {
+                        *item = Some(err.clone())
                     }
                 }
 
@@ -1128,9 +1212,9 @@ impl SetDisks {
         };
 
         if !finfo.is_valid() {
-            for i in 0..errs.len() {
-                if errs[i].is_none() {
-                    errs[i] = Some(Error::new(DiskError::FileCorrupt));
+            for item in errs.iter_mut() {
+                if item.is_none() {
+                    *item = Some(Error::new(DiskError::FileCorrupt));
                 }
             }
 
@@ -1333,42 +1417,42 @@ impl SetDisks {
         Ok((disk, fm))
     }
 
-    pub async fn walk_dir(&self, opts: &WalkDirOptions) -> (Vec<Option<Vec<MetaCacheEntry>>>, Vec<Option<Error>>) {
-        let disks = self.disks.read().await;
+    // pub async fn walk_dir(&self, opts: &WalkDirOptions) -> (Vec<Option<Vec<MetaCacheEntry>>>, Vec<Option<Error>>) {
+    //     let disks = self.disks.read().await;
 
-        let disks = disks.clone();
-        let mut futures = Vec::new();
-        let mut errs = Vec::new();
-        let mut ress = Vec::new();
+    //     let disks = disks.clone();
+    //     let mut futures = Vec::new();
+    //     let mut errs = Vec::new();
+    //     let mut ress = Vec::new();
 
-        for disk in disks.iter() {
-            let opts = opts.clone();
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.walk_dir(opts).await
-                } else {
-                    Err(Error::new(DiskError::DiskNotFound))
-                }
-            });
-        }
+    //     for disk in disks.iter() {
+    //         let opts = opts.clone();
+    //         futures.push(async move {
+    //             if let Some(disk) = disk {
+    //                 disk.walk_dir(opts, &mut Writer::NotUse).await
+    //             } else {
+    //                 Err(Error::new(DiskError::DiskNotFound))
+    //             }
+    //         });
+    //     }
 
-        let results = join_all(futures).await;
+    //     let results = join_all(futures).await;
 
-        for res in results {
-            match res {
-                Ok(entrys) => {
-                    ress.push(Some(entrys));
-                    errs.push(None);
-                }
-                Err(e) => {
-                    ress.push(None);
-                    errs.push(Some(e));
-                }
-            }
-        }
+    //     for res in results {
+    //         match res {
+    //             Ok(entrys) => {
+    //                 ress.push(Some(entrys));
+    //                 errs.push(None);
+    //             }
+    //             Err(e) => {
+    //                 ress.push(None);
+    //                 errs.push(Some(e));
+    //             }
+    //         }
+    //     }
 
-        (ress, errs)
-    }
+    //     (ress, errs)
+    // }
 
     async fn remove_object_part(
         &self,
@@ -1624,7 +1708,8 @@ impl SetDisks {
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
-        let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
+        let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
+            .map_err(|err| to_object_err(err, vec![bucket, object]))?;
 
         if let Some(err) = reduce_read_quorum_errs(&errs, object_op_ignored_errs().as_ref(), read_quorum as usize) {
             error!(
@@ -1633,7 +1718,7 @@ impl SetDisks {
                 read_quorum,
                 &errs
             );
-            return Err(err);
+            return Err(to_object_err(err, vec![bucket, object]));
         }
 
         let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum as usize);
@@ -1879,9 +1964,15 @@ impl SetDisks {
             fallback_disks: fallback_disks.to_vec(),
             bucket: bucket.to_string(),
             path: path.to_string(),
-            filter_prefix: filter_prefix.to_string(),
+            filter_prefix: {
+                if filter_prefix.is_empty() {
+                    None
+                } else {
+                    Some(filter_prefix.to_string())
+                }
+            },
             recursice: true,
-            forward_to: "".to_string(),
+            forward_to: None,
             min_disks: 1,
             report_not_found: false,
             per_disk_limit: 0,
@@ -3039,10 +3130,10 @@ impl SetDisks {
                 continue;
             }
 
-            let mut forward_to = "".to_string();
+            let mut forward_to = None;
             let b = tracker.read().await.get_bucket().await;
             if b == *bucket {
-                forward_to = tracker.read().await.get_object().await;
+                forward_to = Some(tracker.read().await.get_object().await);
             }
 
             if !b.is_empty() {
@@ -3811,24 +3902,24 @@ impl StorageAPI for SetDisks {
     }
 
     async fn list_objects_v2(
-        &self,
+        self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
-        _continuation_token: &str,
-        _delimiter: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
         _max_keys: i32,
         _fetch_owner: bool,
-        _start_after: &str,
+        _start_after: Option<String>,
     ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
     async fn list_object_versions(
-        &self,
+        self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
-        _marker: &str,
-        _version_marker: &str,
-        _delimiter: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
         unimplemented!()
@@ -4092,9 +4183,9 @@ impl StorageAPI for SetDisks {
         &self,
         bucket: &str,
         object: &str,
-        key_marker: &str,
-        upload_id_marker: &str,
-        delimiter: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
         let disks = {
@@ -4188,14 +4279,14 @@ impl StorageAPI for SetDisks {
         uploads.sort_by(|a, b| a.initiated.cmp(&b.initiated));
 
         let mut upload_idx = 0;
-        if !upload_id_marker.is_empty() {
+        if let Some(upload_id_marker) = &upload_id_marker {
             while upload_idx < uploads.len() {
-                if uploads[upload_idx].upload_id != upload_id_marker {
+                if &uploads[upload_idx].upload_id != upload_id_marker {
                     upload_idx += 1;
                     continue;
                 }
 
-                if uploads[upload_idx].upload_id == upload_id_marker {
+                if &uploads[upload_idx].upload_id == upload_id_marker {
                     upload_idx += 1;
                     break;
                 }
@@ -4205,10 +4296,10 @@ impl StorageAPI for SetDisks {
         }
 
         let mut ret_uploads = Vec::new();
-        let mut next_upload_id_marker = String::new();
+        let mut next_upload_id_marker = None;
         while upload_idx < uploads.len() {
             ret_uploads.push(uploads[upload_idx].clone());
-            next_upload_id_marker = uploads[upload_idx].upload_id.clone();
+            next_upload_id_marker = Some(uploads[upload_idx].upload_id.clone());
             upload_idx += 1;
 
             if ret_uploads.len() > max_uploads {
@@ -4219,7 +4310,7 @@ impl StorageAPI for SetDisks {
         let is_truncated = ret_uploads.len() < uploads.len();
 
         if !is_truncated {
-            next_upload_id_marker = "".to_owned();
+            next_upload_id_marker = None;
         }
 
         Ok(ListMultipartsInfo {
@@ -5125,7 +5216,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ma
 
     ret
 }
-async fn get_storage_info(disks: &Vec<Option<DiskStore>>, eps: &Vec<Endpoint>) -> madmin::StorageInfo {
+async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> madmin::StorageInfo {
     let mut disks = get_disks_info(disks, eps).await;
     disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
 

@@ -26,6 +26,7 @@ pub fn get_global_notification_sys() -> Option<&'static NotificationSys> {
 
 pub struct NotificationSys {
     pub peer_clients: Vec<Option<PeerRestClient>>,
+    #[allow(dead_code)]
     pub all_peer_clients: Vec<Option<PeerRestClient>>,
 }
 
@@ -45,6 +46,9 @@ pub struct NotificationPeerErr {
 }
 
 impl NotificationSys {
+    pub fn rest_client_from_hash(&self, _s: &str) -> Option<PeerRestClient> {
+        None
+    }
     pub async fn delete_policy(&self) -> Vec<NotificationPeerErr> {
         unimplemented!()
     }
