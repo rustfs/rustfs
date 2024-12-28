@@ -29,14 +29,14 @@ use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
 
 use common::globals::GLOBAL_Local_Node_Name;
 use ecstore::store_err::StorageError;
-use ecstore::utils::{err_to_proto_err, error_to_u32};
+use ecstore::utils::err_to_proto_err;
 use madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
 };
 use madmin::net::get_net_info;
 use protos::{
     models::{PingBody, PingBodyBuilder},
-    proto_gen::node_service::{node_service_server::NodeService as Node, Error as Proto_Error, *},
+    proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
 use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
