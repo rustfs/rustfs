@@ -391,6 +391,8 @@ impl S3 for FS {
             .await
             .map_err(to_s3_error)?;
 
+        warn!("head_object info {:?}", &info);
+
         let content_type = {
             if let Some(content_type) = info.content_type {
                 match ContentType::from_str(&content_type) {
