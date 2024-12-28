@@ -1,4 +1,3 @@
-use crate::config::error::ConfigError;
 use crate::{disk::error::DiskError, error::Error};
 use std::{collections::HashMap, fmt::Debug};
 // pub type CheckErrorFn = fn(e: &Error) -> bool;
