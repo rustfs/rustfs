@@ -355,6 +355,17 @@ pub fn is_err_file_not_found(err: &Error) -> bool {
     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileNotFound))
 }
 
+pub fn is_err_volume_not_found(err: &Error) -> bool {
+    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::VolumeNotFound))
+}
+
+pub fn is_err_eof(err: &Error) -> bool {
+    if let Some(ioerr) = err.downcast_ref::<io::Error>() {
+        return ioerr.kind() == ErrorKind::UnexpectedEof;
+    }
+    false
+}
+
 pub fn is_sys_err_no_space(e: &io::Error) -> bool {
     if let Some(no) = e.raw_os_error() {
         return no == 28;
@@ -523,6 +534,10 @@ pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
     !errs.is_empty()
 }
 
+pub fn is_all_volume_not_found(errs: &[Option<Error>]) -> bool {
+    DiskError::VolumeNotFound.count_errs(errs) == errs.len()
+}
+
 pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
     if errs.is_empty() {
         return false;
@@ -537,4 +552,12 @@ pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
         }
     }
     errs.len() == not_found_count
+}
+
+pub fn is_err_os_not_exist(err: &Error) -> bool {
+    if let Some(os_err) = err.downcast_ref::<io::Error>() {
+        os_is_not_exist(os_err)
+    } else {
+        false
+    }
 }

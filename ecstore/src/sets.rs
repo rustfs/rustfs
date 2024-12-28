@@ -87,7 +87,7 @@ impl Sets {
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        for i in 0..set_count {
+        for (i, locker) in lockers.iter().enumerate().take(set_count) {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
@@ -145,7 +145,7 @@ impl Sets {
             // warn!("sets new set_drive {:?}", &set_drive);
 
             let set_disks = SetDisks {
-                lockers: lockers[i].clone(),
+                lockers: locker.clone(),
                 locker_owner: GLOBAL_Local_Node_Name.read().await.to_string(),
                 ns_mutex: Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
                 disks: RwLock::new(set_drive),
@@ -451,24 +451,24 @@ impl StorageAPI for Sets {
         self.get_disks_by_key(object).delete_object(bucket, object, opts).await
     }
     async fn list_objects_v2(
-        &self,
+        self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
-        _continuation_token: &str,
-        _delimiter: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
         _max_keys: i32,
         _fetch_owner: bool,
-        _start_after: &str,
+        _start_after: Option<String>,
     ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
     async fn list_object_versions(
-        &self,
+        self: Arc<Self>,
         _bucket: &str,
         _prefix: &str,
-        _marker: &str,
-        _version_marker: &str,
-        _delimiter: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
         _max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
         unimplemented!()
@@ -527,9 +527,9 @@ impl StorageAPI for Sets {
         &self,
         bucket: &str,
         prefix: &str,
-        key_marker: &str,
-        upload_id_marker: &str,
-        delimiter: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
         self.get_disks_by_key(prefix)

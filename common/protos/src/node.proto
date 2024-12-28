@@ -209,13 +209,13 @@ message ListDirResponse {
 
 message WalkDirRequest {
   string disk = 1;  // indicate which one in the disks
-  string walk_dir_options = 2;
+  bytes walk_dir_options = 2;
 }
 
 message WalkDirResponse {
   bool success = 1;
-  repeated string meta_cache_entry = 2;
-  optional Error error = 3;
+  string meta_cache_entry = 2;
+  optional string error_info = 3;
 }
 
 message RenameDataRequest {
@@ -762,7 +762,7 @@ service NodeService {
 //  rpc Append(AppendRequest) returns (AppendResponse) {};
   rpc ReadAt(stream ReadAtRequest) returns (stream ReadAtResponse) {};
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {};
-  rpc WalkDir(WalkDirRequest) returns (WalkDirResponse) {};
+  rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {};
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {};
   rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {};
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {};

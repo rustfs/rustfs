@@ -52,6 +52,9 @@ pub enum StorageError {
     #[error("Object not found: {0}/{1}")]
     ObjectNotFound(String, String),
 
+    #[error("volume not found: {0}")]
+    VolumeNotFound(String),
+
     #[error("Version not found: {0}/{1}-{2}")]
     VersionNotFound(String, String, String),
 
@@ -107,6 +110,7 @@ impl StorageError {
             StorageError::InsufficientWriteQuorum => 0x17,
             StorageError::DecommissionNotStarted => 0x18,
             StorageError::InvalidPart(_, _, _) => 0x19,
+            StorageError::VolumeNotFound(_) => 0x20,
         }
     }
 
@@ -141,6 +145,7 @@ impl StorageError {
             0x17 => Some(StorageError::InsufficientWriteQuorum),
             0x18 => Some(StorageError::DecommissionNotStarted),
             0x19 => Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default())),
+            0x20 => Some(StorageError::VolumeNotFound(Default::default())),
             _ => None,
         }
     }
@@ -258,6 +263,14 @@ pub fn is_err_version_not_found(err: &Error) -> bool {
 pub fn is_err_bucket_exists(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<StorageError>() {
         matches!(e, StorageError::BucketExists(_))
+    } else {
+        false
+    }
+}
+
+pub fn is_err_bucket_not_found(err: &Error) -> bool {
+    if let Some(e) = err.downcast_ref::<StorageError>() {
+        matches!(e, StorageError::VolumeNotFound(_)) || matches!(e, StorageError::BucketNotFound(_))
     } else {
         false
     }

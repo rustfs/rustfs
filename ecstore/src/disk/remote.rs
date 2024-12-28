@@ -10,7 +10,12 @@ use protos::{
         StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
-use tokio::sync::mpsc::{self, Sender};
+use rmp_serde::Serializer;
+use serde::Serialize;
+use tokio::{
+    io::AsyncWrite,
+    sync::mpsc::{self, Sender},
+};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::Request;
 use tracing::info;
@@ -18,8 +23,8 @@ use uuid::Uuid;
 
 use super::{
     endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
-    FileInfoVersions, FileReader, FileWriter, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader,
-    RemoteFileWriter, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter,
+    RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::utils::proto_err_to_err;
 use crate::{
@@ -32,6 +37,7 @@ use crate::{
     },
     store_api::{FileInfo, RawFileInfo},
 };
+use crate::{disk::MetaCacheEntry, metacache::writer::MetacacheWriter};
 use protos::proto_gen::node_service::RenamePartRequst;
 
 #[derive(Debug)]
@@ -376,34 +382,38 @@ impl DiskAPI for RemoteDisk {
         Ok(response.volumes)
     }
 
-    async fn walk_dir(&self, opts: WalkDirOptions) -> Result<Vec<MetaCacheEntry>> {
+    // FIXME: TODO: use writer
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         info!("walk_dir");
-        let walk_dir_options = serde_json::to_string(&opts)?;
+        let mut wr = wr;
+        let mut out = MetacacheWriter::new(&mut wr);
+        let mut buf = Vec::new();
+        opts.serialize(&mut Serializer::new(&mut buf))?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
         let request = Request::new(WalkDirRequest {
             disk: self.endpoint.to_string(),
-            walk_dir_options,
+            walk_dir_options: buf,
         });
+        let mut response = client.walk_dir(request).await?.into_inner();
 
-        let response = client.walk_dir(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
+        loop {
+            match response.next().await {
+                Some(Ok(resp)) => {
+                    if !resp.success {
+                        return Err(Error::from_string(resp.error_info.unwrap_or("".to_string())));
+                    }
+                    let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
+                        .map_err(|_| Error::from_string(format!("Unexpected response: {:?}", response)))?;
+                    out.write_obj(&entry).await?;
+                }
+                None => break,
+                _ => return Err(Error::from_string(format!("Unexpected response: {:?}", response))),
+            }
         }
 
-        let entries = response
-            .meta_cache_entry
-            .into_iter()
-            .filter_map(|json_str| serde_json::from_str::<MetaCacheEntry>(&json_str).ok())
-            .collect();
-
-        Ok(entries)
+        Ok(())
     }
 
     async fn rename_data(

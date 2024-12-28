@@ -9,7 +9,7 @@ use regex::Regex;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::sync::RwLock;
 use tonic::Request;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::disk::error::is_all_buckets_not_found;
 use crate::disk::{DiskAPI, DiskStore};

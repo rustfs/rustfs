@@ -1,6 +1,7 @@
+use std::path::Path;
 use std::path::PathBuf;
 
-const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
+pub const GLOBAL_DIR_SUFFIX: &str = "__XLDIR__";
 
 pub const SLASH_SEPARATOR: &str = "/";
 
@@ -67,6 +68,32 @@ pub fn path_join(elem: &[PathBuf]) -> PathBuf {
     }
 
     joined_path
+}
+
+pub fn path_join_buf(elements: &[&str]) -> String {
+    let trailing_slash = !elements.is_empty() && elements.last().unwrap().ends_with('/');
+
+    let mut dst = String::new();
+    let mut added = 0;
+
+    for e in elements {
+        if added > 0 || !e.is_empty() {
+            if added > 0 {
+                dst.push('/');
+            }
+            dst.push_str(e);
+            added += e.len();
+        }
+    }
+
+    let result = dst.to_string();
+    let cpath = Path::new(&result).components().collect::<PathBuf>();
+    let clean_path = cpath.to_string_lossy();
+
+    if trailing_slash {
+        return format!("{}/", clean_path);
+    }
+    clean_path.to_string()
 }
 
 pub fn path_to_bucket_object_with_base_path(bash_path: &str, path: &str) -> (String, String) {

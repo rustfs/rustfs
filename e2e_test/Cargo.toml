@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 ecstore.workspace = true
 flatbuffers.workspace = true
+futures.workspace = true
 lazy_static.workspace = true
 lock.workspace = true
 protos.workspace = true
