@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tracing::{error, warn};
+use tracing::{error, info};
 
 use crate::config::common::{read_config, save_config};
 use crate::error::{Error, Result};
@@ -358,10 +358,11 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
     let mut bm = match read_bucket_metadata(api.clone(), bucket).await {
         Ok(res) => res,
         Err(err) => {
-            warn!("load_bucket_metadata_parse err {:?}", &err);
             if !config::error::is_not_found(&err) {
                 return Err(err);
             }
+
+            info!("bucketmeta {} not found with err {:?}, start to init ", bucket, &err);
 
             BucketMetadata::new(bucket)
         }
