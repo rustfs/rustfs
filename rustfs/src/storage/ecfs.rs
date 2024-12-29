@@ -308,6 +308,8 @@ impl S3 for FS {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         // mc get 3
 
+        warn!("get_object input {:?}, vid {:?}", &req.input, req.input.version_id);
+
         let GetObjectInput {
             bucket, key, version_id, ..
         } = req.input;
