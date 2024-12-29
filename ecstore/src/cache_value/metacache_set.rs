@@ -164,6 +164,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 let entry = match r.peek().await {
                     Ok(res) => {
                         if let Some(entry) = res {
+                            info!("read entry disk: {}, name: {}", i, entry.name);
                             entry
                         } else {
                             // eof
@@ -195,7 +196,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
 
                 // If no current, add it.
                 if current.name.is_empty() {
-                    top_entries.insert(i, Some(entry.clone()));
+                    top_entries[i] = Some(entry.clone());
                     current = entry;
                     agree += 1;
 
@@ -203,14 +204,14 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
                 // If exact match, we agree.
                 if let Ok((_, true)) = current.matches(&entry, true) {
-                    top_entries.insert(i, Some(entry));
+                    top_entries[i] = Some(entry);
                     agree += 1;
 
                     continue;
                 }
                 // If only the name matches we didn't agree, but add it for resolution.
                 if entry.name == current.name {
-                    top_entries.insert(i, Some(entry));
+                    top_entries[i] = Some(entry);
 
                     continue;
                 }
@@ -220,9 +221,9 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
                 // We got a new, better current.
                 // Clear existing entries.
-                top_entries.clear();
+                top_entries = vec![None; top_entries.len()];
                 agree += 1;
-                top_entries.insert(i, Some(entry.clone()));
+                top_entries[i] = Some(entry.clone());
                 current = entry;
             }
 
@@ -282,6 +283,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
             }
 
+            info!("read entry should heal: {}", current.name);
             if let Some(partial_fn) = opts.partial.as_ref() {
                 partial_fn(MetaCacheEntries(top_entries), &errs).await;
             }
