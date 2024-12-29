@@ -52,6 +52,7 @@ use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
 use crate::storage::error::to_s3_error;
+use crate::storage::options::extract_metadata_from_mime;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -411,7 +412,7 @@ impl S3 for FS {
         };
         let last_modified = info.mod_time.map(Timestamp::from);
 
-        let metadata = Some(info.user_defined);
+        let metadata = info.user_defined;
 
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(info.size))),
@@ -642,6 +643,7 @@ impl S3 for FS {
             key,
             content_length,
             tagging,
+            metadata,
             ..
         } = input;
 
@@ -667,7 +669,10 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut metadata = extract_metadata(&req.headers);
+        let mut metadata = metadata.unwrap_or_default();
+
+        extract_metadata_from_mime(&req.headers, &mut metadata);
+
         if let Some(tags) = tagging {
             metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
         }

@@ -3957,6 +3957,8 @@ impl StorageAPI for SetDisks {
         }
         let (fi, _, _) = self.get_object_fileinfo(bucket, object, opts, false).await?;
 
+        // warn!("get object_info fi {:?}", &fi);
+
         let oi = fi.to_object_info(bucket, object, opts.versioned || opts.version_suspended);
 
         Ok(oi)
@@ -4018,14 +4020,14 @@ impl StorageAPI for SetDisks {
         let obj_info = fi.to_object_info(bucket, object, opts.versioned || opts.version_suspended);
 
         if let Some(ref mut metadata) = fi.metadata {
-            for (k, v) in obj_info.user_defined {
+            for (k, v) in obj_info.user_defined.unwrap_or_default() {
                 metadata.insert(k, v);
             }
             fi.metadata = Some(metadata.clone())
         } else {
             let mut metadata = HashMap::new();
 
-            for (k, v) in obj_info.user_defined {
+            for (k, v) in obj_info.user_defined.unwrap_or_default() {
                 metadata.insert(k, v);
             }
 

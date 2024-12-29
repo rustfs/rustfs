@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::heal_commands::HealResultItem;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct TraceType(u64);
 
 impl TraceType {
@@ -34,12 +34,6 @@ impl TraceType {
     }
 }
 
-impl Default for TraceType {
-    fn default() -> Self {
-        Self(0)
-    }
-}
-
 impl TraceType {
     pub fn contains(&self, x: &TraceType) -> bool {
         (self.0 & x.0) == x.0
@@ -54,12 +48,12 @@ impl TraceType {
     }
 
     pub fn merge(&mut self, other: &TraceType) {
-        self.0 = self.0 | other.0
+        self.0 |= other.0
     }
 
     pub fn set_if(&mut self, b: bool, other: &TraceType) {
         if b {
-            self.0 = self.0 | other.0
+            self.0 |= other.0
         }
     }
 
