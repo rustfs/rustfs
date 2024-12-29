@@ -1,3 +1,4 @@
+use futures::future::join_all;
 use madmin::heal_commands::HealResultItem;
 use std::{cmp::Ordering, env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
@@ -118,13 +119,15 @@ async fn monitor_local_disks_and_heal() {
             }
         }
 
+        let mut futures = Vec::new();
         for disk in heal_disks.into_ref().iter() {
             let disk_clone = disk.clone();
-            spawn(async move {
+            futures.push(async move {
                 GLOBAL_BackgroundHealState
                     .set_disk_healing_status(disk_clone.clone(), true)
                     .await;
                 if heal_fresh_disk(&disk_clone).await.is_err() {
+                    info!("heal_fresh_disk is err");
                     GLOBAL_BackgroundHealState
                         .set_disk_healing_status(disk_clone.clone(), false)
                         .await;
@@ -133,6 +136,7 @@ async fn monitor_local_disks_and_heal() {
                 GLOBAL_BackgroundHealState.pop_heal_local_disks(&[disk_clone]).await;
             });
         }
+        let _ = join_all(futures).await;
         interval.reset();
     }
 }

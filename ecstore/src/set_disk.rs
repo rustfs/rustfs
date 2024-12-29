@@ -1349,6 +1349,7 @@ impl SetDisks {
             Err(e) => {
                 warn!("connect_endpoint err {:?}", &e);
                 if ep.is_local && DiskError::UnformattedDisk.is(&e) {
+                    info!("unformatteddisk will push_heal_local_disks, {:?}", ep);
                     GLOBAL_BackgroundHealState.push_heal_local_disks(&[ep.clone()]).await;
                 }
                 return;
@@ -3485,6 +3486,7 @@ impl SetDisks {
                 tracker.read().await.queue_buckets
             )));
         }
+        drop(result_tx);
         let _ = task.await;
         defer.await;
         Ok(())

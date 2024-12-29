@@ -8,10 +8,7 @@ use crate::{
 };
 use futures::future::join_all;
 use std::{future::Future, pin::Pin, sync::Arc};
-use tokio::{
-    spawn,
-    sync::{broadcast::Receiver as B_Receiver, RwLock},
-};
+use tokio::{spawn, sync::broadcast::Receiver as B_Receiver};
 use tracing::{error, info};
 
 type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
@@ -57,6 +54,7 @@ impl Clone for ListPathRawOptions {
 }
 
 pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> Result<()> {
+    info!("list_path_raw");
     if opts.disks.is_empty() {
         info!("list_path_raw 0 drives provided");
         return Err(Error::from_string("list_path_raw: 0 drives provided"));
@@ -64,7 +62,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
 
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), Error>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
-    let fds = Arc::new(RwLock::new(opts.fallback_disks.clone()));
+    let fds = Arc::new(opts.fallback_disks.clone());
 
     for disk in opts.disks.iter() {
         let opdisk = disk.clone();
@@ -100,47 +98,40 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
             }
 
             while need_fallback {
-                let f_disk = loop {
-                    let mut fds_w = fds_clone.write().await;
-                    if fds_w.is_empty() {
-                        break None;
-                    }
-
-                    if let Some(fd) = fds_w.remove(0) {
-                        if fd.is_online().await {
-                            break Some(fd);
-                        }
-                    }
-                };
-
-                if let Some(disk) = f_disk {
-                    match disk
-                        .as_ref()
-                        .walk_dir(
-                            WalkDirOptions {
-                                bucket: opts_clone.bucket.clone(),
-                                base_dir: opts_clone.path.clone(),
-                                recursive: opts_clone.recursice,
-                                report_notfound: opts_clone.report_not_found,
-                                filter_prefix: opts_clone.filter_prefix.clone(),
-                                forward_to: opts_clone.forward_to.clone(),
-                                limit: opts_clone.per_disk_limit,
-                                ..Default::default()
-                            },
-                            &mut wr,
-                        )
-                        .await
-                    {
-                        Ok(_r) => {
-                            need_fallback = false;
-                        }
-                        Err(err) => {
-                            error!("walk dir2 err {:?}", &err);
+                let disk = match fds_clone.iter().find(|d| d.is_some()) {
+                    Some(d) => {
+                        if let Some(disk) = d.clone() {
+                            disk
+                        } else {
                             break;
                         }
                     }
-                } else {
-                    break;
+                    None => break,
+                };
+                match disk
+                    .as_ref()
+                    .walk_dir(
+                        WalkDirOptions {
+                            bucket: opts_clone.bucket.clone(),
+                            base_dir: opts_clone.path.clone(),
+                            recursive: opts_clone.recursice,
+                            report_notfound: opts_clone.report_not_found,
+                            filter_prefix: opts_clone.filter_prefix.clone(),
+                            forward_to: opts_clone.forward_to.clone(),
+                            limit: opts_clone.per_disk_limit,
+                            ..Default::default()
+                        },
+                        &mut wr,
+                    )
+                    .await
+                {
+                    Ok(_r) => {
+                        need_fallback = false;
+                    }
+                    Err(err) => {
+                        error!("walk dir2 err {:?}", &err);
+                        break;
+                    }
                 }
             }
 
@@ -173,6 +164,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 let entry = match r.peek().await {
                     Ok(res) => {
                         if let Some(entry) = res {
+                            info!("read entry disk: {}, name: {}", i, entry.name);
                             entry
                         } else {
                             // eof
@@ -204,7 +196,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
 
                 // If no current, add it.
                 if current.name.is_empty() {
-                    top_entries.insert(i, Some(entry.clone()));
+                    top_entries[i] = Some(entry.clone());
                     current = entry;
                     agree += 1;
 
@@ -212,14 +204,14 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
                 // If exact match, we agree.
                 if let Ok((_, true)) = current.matches(&entry, true) {
-                    top_entries.insert(i, Some(entry));
+                    top_entries[i] = Some(entry);
                     agree += 1;
 
                     continue;
                 }
                 // If only the name matches we didn't agree, but add it for resolution.
                 if entry.name == current.name {
-                    top_entries.insert(i, Some(entry));
+                    top_entries[i] = Some(entry);
 
                     continue;
                 }
@@ -229,9 +221,9 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
                 // We got a new, better current.
                 // Clear existing entries.
-                top_entries.clear();
+                top_entries = vec![None; top_entries.len()];
                 agree += 1;
-                top_entries.insert(i, Some(entry.clone()));
+                top_entries[i] = Some(entry.clone());
                 current = entry;
             }
 
@@ -291,10 +283,11 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
             }
 
+            info!("read entry should heal: {}", current.name);
             if let Some(partial_fn) = opts.partial.as_ref() {
                 partial_fn(MetaCacheEntries(top_entries), &errs).await;
             }
-            break;
+            // break;
         }
         Ok(())
     });
