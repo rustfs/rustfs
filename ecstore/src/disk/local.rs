@@ -761,7 +761,7 @@ impl LocalDisk {
             Ok(res) => res,
             Err(e) => {
                 if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
-                    error!("scan list_dir {}, err {:?}", &current, &e);
+                    warn!("scan list_dir {}, err {:?}", &current, &e);
                 }
 
                 if opts.report_notfound && is_err_file_not_found(&e) && current == &opts.base_dir {
@@ -1443,7 +1443,7 @@ impl DiskAPI for LocalDisk {
         check_path_length(file_path.to_string_lossy().to_string().as_str())?;
 
         //  TODO: writeAllDirect io.copy
-        info!("file_path: {:?}", file_path);
+        // info!("file_path: {:?}", file_path);
         if let Some(parent) = file_path.parent() {
             os::make_dir_all(parent, &volume_dir).await?;
         }

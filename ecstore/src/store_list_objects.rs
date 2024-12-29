@@ -245,6 +245,8 @@ impl ECStore {
             ..Default::default()
         };
 
+        // warn!("list_objects_generic opts {:?}", &opts);
+
         // use get
         if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_none() {
             match self

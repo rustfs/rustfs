@@ -1,4 +1,5 @@
 use crate::heal::heal_ops::HealSequence;
+use crate::store_utils::clean_metadata;
 use crate::{
     disk::DiskStore,
     error::{Error, Result},
@@ -171,6 +172,7 @@ impl FileInfo {
             version_id = Some(Uuid::nil())
         }
 
+        // etag
         let (content_type, content_encoding, etag) = {
             if let Some(ref meta) = self.metadata {
                 let content_type = meta.get("content-type").cloned();
@@ -182,6 +184,7 @@ impl FileInfo {
                 (None, None, None)
             }
         };
+        // tags
         let user_tags = self
             .metadata
             .as_ref()
@@ -195,6 +198,15 @@ impl FileInfo {
             .unwrap_or_default();
 
         let inlined = self.inline_data();
+
+        // TODO:expires
+        // TODO:ReplicationState
+        // TODO:TransitionedObject
+
+        let metadata = self.metadata.clone().map(|mut v| {
+            clean_metadata(&mut v);
+            v
+        });
 
         ObjectInfo {
             bucket: bucket.to_string(),
@@ -215,6 +227,7 @@ impl FileInfo {
             successor_mod_time: self.successor_mod_time,
             etag,
             inlined,
+            user_defined: metadata,
             ..Default::default()
         }
     }
@@ -627,7 +640,7 @@ pub struct ObjectInfo {
     // Actual size is the real size of the object uploaded by client.
     pub actual_size: Option<usize>,
     pub is_dir: bool,
-    pub user_defined: HashMap<String, String>,
+    pub user_defined: Option<HashMap<String, String>>,
     pub parity_blocks: usize,
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
@@ -646,8 +659,11 @@ pub struct ObjectInfo {
 
 impl ObjectInfo {
     pub fn is_compressed(&self) -> bool {
-        self.user_defined
-            .contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX))
+        if let Some(meta) = &self.user_defined {
+            meta.contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX))
+        } else {
+            false
+        }
     }
 
     pub fn get_actual_size(&self) -> Result<usize> {
@@ -656,13 +672,16 @@ impl ObjectInfo {
         }
 
         if self.is_compressed() {
-            if let Some(size_str) = self.user_defined.get(&format!("{}actual-size", RESERVED_METADATA_PREFIX)) {
-                if !size_str.is_empty() {
-                    // Todo: deal with error
-                    let size = size_str.parse::<usize>()?;
-                    return Ok(size);
+            if let Some(meta) = &self.user_defined {
+                if let Some(size_str) = meta.get(&format!("{}actual-size", RESERVED_METADATA_PREFIX)) {
+                    if !size_str.is_empty() {
+                        // Todo: deal with error
+                        let size = size_str.parse::<usize>()?;
+                        return Ok(size);
+                    }
                 }
             }
+
             let mut actual_size = 0;
             self.parts.iter().for_each(|part| {
                 actual_size += part.actual_size;
