@@ -606,19 +606,20 @@ impl SetDisks {
     }
 
     fn get_upload_id_dir(bucket: &str, object: &str, upload_id: &str) -> String {
-        // warn!("get_upload_id_dir upload_id {:?}", upload_id);
-        let upload_uuid = match base64_decode(upload_id.as_bytes()) {
-            Ok(res) => {
-                let decoded_str = String::from_utf8(res).expect("Failed to convert decoded bytes to a UTF-8 string");
-                let parts: Vec<&str> = decoded_str.splitn(2, '.').collect();
-                if parts.len() == 2 {
-                    parts[1].to_string()
-                } else {
-                    upload_id.to_string()
-                }
-            }
-            Err(_) => upload_id.to_string(),
-        };
+        warn!("get_upload_id_dir upload_id {:?}", upload_id);
+
+        let upload_uuid = base64_decode(upload_id.as_bytes())
+            .and_then(|v| {
+                String::from_utf8(v).map_or(Ok(upload_id.to_owned()), |v| {
+                    let parts: Vec<_> = v.splitn(2, '.').collect();
+                    if parts.len() == 2 {
+                        Ok(parts[1].to_string())
+                    } else {
+                        Ok(upload_id.to_string())
+                    }
+                })
+            })
+            .unwrap_or_default();
 
         format!("{}/{}", Self::get_multipart_sha_dir(bucket, object), upload_uuid)
     }
@@ -4263,12 +4264,10 @@ impl StorageAPI for SetDisks {
                 }
             };
 
-            let deployment_id = { get_global_deployment_id().await };
-
             uploads.push(MultipartInfo {
                 bucket: bucket.to_owned(),
                 object: object.to_owned(),
-                upload_id: base64_encode(format!("{}.{}", deployment_id, upload_id).as_bytes()),
+                upload_id: base64_encode(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes()),
                 initiated: Some(start_time),
                 ..Default::default()
             });
@@ -4325,6 +4324,8 @@ impl StorageAPI for SetDisks {
         })
     }
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
+        warn!("new_multipart_upload opt {:?}", opts);
+
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
@@ -4371,25 +4372,46 @@ impl StorageAPI for SetDisks {
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
+        fi.version_id = if let Some(vid) = &opts.version_id {
+            Some(Uuid::parse_str(vid)?)
+        } else {
+            None
+        };
+
+        if opts.versioned && opts.version_id.is_none() {
+            fi.version_id = Some(Uuid::new_v4());
+        }
+
         fi.data_dir = Some(Uuid::new_v4());
         fi.fresh = true;
 
         let parts_metadata = vec![fi.clone(); disks.len()];
 
+        if !user_defined.contains_key("content-type") {
+            // TODO: get content-type
+        }
+
+        if let Some(sc) = user_defined.get(xhttp::AMZ_STORAGE_CLASS) {
+            if sc == storageclass::STANDARD {
+                let _ = user_defined.remove(xhttp::AMZ_STORAGE_CLASS);
+            }
+        }
+
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
-        let now: OffsetDateTime = OffsetDateTime::now_utc();
+        let mod_time = opts.mod_time.unwrap_or(OffsetDateTime::now_utc());
+
         for fi in parts_metadatas.iter_mut() {
             fi.metadata = Some(user_defined.clone());
-            fi.mod_time = Some(now);
+            fi.mod_time = Some(mod_time);
             fi.fresh = true;
         }
 
-        fi.mod_time = Some(now);
+        // fi.mod_time = Some(now);
 
-        let upload_uuid = format!("{}x{}", Uuid::new_v4(), fi.mod_time.unwrap().unix_timestamp());
+        let upload_uuid = format!("{}x{}", Uuid::new_v4(), mod_time.unix_timestamp_nanos());
 
-        let upload_id = base64_encode(format!("{}.{}", "globalDeploymentID", upload_uuid).as_bytes());
+        let upload_id = base64_encode(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes());
 
         let upload_path = Self::get_upload_id_dir(bucket, object, upload_uuid.as_str());
 

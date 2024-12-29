@@ -224,7 +224,7 @@ impl ECStore {
         set_object_layer(ec.clone()).await;
 
         if let Some(dep_id) = deployment_id {
-            set_global_deployment_id(dep_id).await;
+            set_global_deployment_id(dep_id);
         }
 
         Ok(ec)
