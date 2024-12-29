@@ -36,7 +36,7 @@ lazy_static! {
     pub static ref GLOBAL_BackgroundHealState: Arc<AllHealState> = AllHealState::new(false);
     pub static ref GLOBAL_ALlHealState: Arc<AllHealState> = AllHealState::new(false);
     pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
-    static ref globalDeploymentIDPtr: RwLock<Uuid> = RwLock::new(Uuid::nil());
+    static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
 }
 
 pub fn global_rustfs_port() -> u16 {
@@ -51,14 +51,11 @@ pub fn set_global_rustfs_port(value: u16) {
     GLOBAL_RUSTFS_PORT.set(value).expect("set_global_rustfs_port fail");
 }
 
-pub async fn set_global_deployment_id(id: Uuid) {
-    let mut id_ptr = globalDeploymentIDPtr.write().await;
-    *id_ptr = id
+pub fn set_global_deployment_id(id: Uuid) {
+    globalDeploymentIDPtr.set(id).unwrap();
 }
-pub async fn get_global_deployment_id() -> Uuid {
-    let id_ptr = globalDeploymentIDPtr.read().await;
-
-    *id_ptr
+pub fn get_global_deployment_id() -> Option<String> {
+    globalDeploymentIDPtr.get().map(|v| v.to_string())
 }
 
 pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {

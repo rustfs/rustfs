@@ -23,3 +23,17 @@ pub fn hex(data: impl AsRef<[u8]>) -> String {
 //     h.update(data).unwrap();
 //     h.finish().unwrap()
 // }
+
+#[test]
+fn test_base64() {
+    let src = "c0194290-d911-45cb-8e12-79ec563f46a8x1735460504394878000";
+
+    let s = base64_encode(src.as_bytes());
+
+    println!("{}", &s);
+
+    let de = base64_decode(s.clone().as_bytes()).unwrap();
+    let decoded_str = String::from_utf8(de).unwrap();
+
+    assert_eq!(decoded_str, src)
+}
