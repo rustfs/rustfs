@@ -3479,19 +3479,15 @@ impl SetDisks {
         if let Some(err) = ret_err.as_ref() {
             return Err(err.clone());
         }
-        info!("step 6");
         if !tracker.read().await.queue_buckets.is_empty() {
             return Err(Error::from_string(format!(
                 "not all buckets were healed: {:?}",
                 tracker.read().await.queue_buckets
             )));
         }
-        info!("step 7");
         drop(result_tx);
         let _ = task.await;
-        info!("step 8");
         defer.await;
-        info!("step 9");
         Ok(())
     }
 }
