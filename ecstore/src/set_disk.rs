@@ -4586,13 +4586,20 @@ impl StorageAPI for SetDisks {
         }
 
         // etag
+        let etag = {
+            if let Some(etag) = opts.user_defined.get("etag") {
+                etag.clone()
+            } else {
+                get_complete_multipart_md5(&uploaded_parts)
+            }
+        };
 
         if let Some(metadata) = fi.metadata.as_mut() {
-            if let Some(etag) = opts.user_defined.get("etag") {
-                metadata.insert("etag".to_owned(), etag.clone());
-            } else {
-                metadata.insert("etag".to_owned(), get_complete_multipart_md5(&uploaded_parts));
-            }
+            metadata.insert("etag".to_owned(), etag);
+        } else {
+            let mut metadata = HashMap::with_capacity(1);
+            metadata.insert("etag".to_owned(), etag);
+            fi.metadata = Some(metadata);
         }
 
         // TODO: object_actual_size
