@@ -5,17 +5,43 @@ use std::collections::HashSet as Set;
 use std::fmt;
 use std::{borrow::Cow, collections::HashMap};
 
-use serde::{de, ser::SerializeSeq, Deserialize, Deserializer, Serialize};
-
+use crate::policy::function::func::FuncKeyValue;
 use crate::policy::utils::wildcard;
+use serde::{de, ser::SerializeSeq, Deserialize, Deserializer, Serialize};
 
 use super::{func::InnerFunc, key_name::KeyName};
 
 pub type StringFunc = InnerFunc<StringFuncValue>;
 
 impl StringFunc {
+    pub(crate) fn evaluate(
+        &self,
+        for_all: bool,
+        ignore_case: bool,
+        like: bool,
+        negate: bool,
+        values: &HashMap<String, Vec<String>>,
+    ) -> bool {
+        for inner in self.0.iter() {
+            let result = if like {
+                inner.eval_like(for_all, values) ^ negate
+            } else {
+                inner.eval(for_all, ignore_case, values) ^ negate
+            };
+
+            if !result {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl FuncKeyValue<StringFuncValue> {
     fn eval(&self, for_all: bool, ignore_case: bool, values: &HashMap<String, Vec<String>>) -> bool {
         let rvalues = values
+            // http.CanonicalHeaderKey ?
             .get(self.key.name().as_str())
             .map(|t| {
                 t.iter()
@@ -38,7 +64,7 @@ impl StringFunc {
                 let mut c = Cow::from(c);
                 for key in KeyName::COMMON_KEYS {
                     match values.get(key.name()).and_then(|x| x.get(0)) {
-                        Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(key.name(), v)),
+                        Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
                         _ => continue,
                     };
                 }
@@ -49,6 +75,7 @@ impl StringFunc {
             .collect::<Set<_>>();
 
         let ivalues = rvalues.intersection(&fvalues);
+
         if for_all {
             rvalues.is_empty() || rvalues.len() == ivalues.count()
         } else {
@@ -67,7 +94,7 @@ impl StringFunc {
                         let mut c = Cow::from(c);
                         for key in KeyName::COMMON_KEYS {
                             match values.get(key.name()).and_then(|x| x.get(0)) {
-                                Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(key.name(), v)),
+                                Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
                                 _ => continue,
                             };
                         }
@@ -88,20 +115,12 @@ impl StringFunc {
 
         for_all
     }
-
-    pub(crate) fn evaluate(&self, for_all: bool, ignore_case: bool, like: bool, values: &HashMap<String, Vec<String>>) -> bool {
-        if like {
-            self.eval_like(for_all, values)
-        } else {
-            self.eval(for_all, ignore_case, values)
-        }
-    }
 }
 
 /// 解析values字段
 #[derive(Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
-pub struct StringFuncValue(Set<String>);
+pub struct StringFuncValue(pub Set<String>);
 
 impl Serialize for StringFuncValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -165,7 +184,7 @@ impl<'d> Deserialize<'d> for StringFuncValue {
         if result.0.is_empty() {
             use serde::de::Error;
 
-            return Err(D::Error::custom("empty"));
+            return Err(Error::custom("empty"));
         }
 
         Ok(result)
@@ -175,24 +194,34 @@ impl<'d> Deserialize<'d> for StringFuncValue {
 #[cfg(test)]
 mod tests {
     use super::{StringFunc, StringFuncValue};
+    use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::{
         key::Key,
         key_name::AwsKeyName::*,
         key_name::KeyName::{self, *},
     };
+
+    use crate::policy::function::key_name::S3KeyName::S3LocationConstraint;
     use test_case::test_case;
 
     fn new_func(name: KeyName, variable: Option<String>, values: Vec<&str>) -> StringFunc {
         StringFunc {
-            key: Key { name, variable },
-            values: StringFuncValue(values.into_iter().map(|x| x.to_owned()).collect()),
+            0: vec![FuncKeyValue {
+                key: Key { name, variable },
+                values: StringFuncValue(values.into_iter().map(|x| x.to_owned()).collect()),
+            }],
         }
     }
 
-    #[test_case(r#"{"aws:username": "johndoe"}"#, new_func(Aws(AWSUsername), None, vec!["johndoe"]))]
-    #[test_case(r#"{"aws:username": ["johndoe", "aaa"]}"#, new_func(Aws(AWSUsername), None, vec!["johndoe", "aaa"]))]
-    #[test_case(r#"{"aws:username/value": "johndoe"}"#, new_func(Aws(AWSUsername), Some("value".into()), vec!["johndoe"]))]
-    #[test_case(r#"{"aws:username/value": ["johndoe", "aaa"]}"#, new_func(Aws(AWSUsername), Some("value".into()), vec!["johndoe", "aaa"]))]
+    #[test_case(r#"{"aws:username": "johndoe"}"#,
+        new_func(Aws(AWSUsername), None, vec!["johndoe"])
+    )]
+    #[test_case(r#"{"aws:username": ["johndoe", "aaa"]}"#, new_func(Aws(AWSUsername), None, vec!["johndoe", "aaa"]
+    ))]
+    #[test_case(r#"{"aws:username/value": "johndoe"}"#, new_func(Aws(AWSUsername), Some("value".into()), vec!["johndoe"]
+    ))]
+    #[test_case(r#"{"aws:username/value": ["johndoe", "aaa"]}"#, new_func(Aws(AWSUsername), Some("value".into()), vec!["johndoe", "aaa"]
+    ))]
     fn test_deser(input: &str, expect: StringFunc) -> Result<(), serde_json::Error> {
         let v: StringFunc = serde_json::from_str(input)?;
         assert_eq!(v, expect);
@@ -216,5 +245,179 @@ mod tests {
         let v = serde_json::to_string(&input)?;
         assert_eq!(v.as_str(), expect);
         Ok(())
+    }
+
+    fn new_fkv(name: &str, values: Vec<&str>) -> FuncKeyValue<StringFuncValue> {
+        FuncKeyValue {
+            key: name.try_into().unwrap(),
+            values: StringFuncValue(values.into_iter().map(ToOwned::to_owned).collect()),
+        }
+    }
+
+    fn test_eval(
+        s: FuncKeyValue<StringFuncValue>,
+        for_all: bool,
+        ignore_case: bool,
+        negate: bool,
+        values: Vec<(&str, Vec<&str>)>,
+    ) -> bool {
+        let result = s.eval(
+            for_all,
+            ignore_case,
+            &values
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
+                .collect(),
+        );
+
+        result ^ negate
+    }
+
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => false ; "2")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![] => false ; "3")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("delimiter", vec!["/"])] => false ; "4")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-1"])] => true ; "5")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["ap-southeast-1"])] => true ; "6")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["us-east-1"])] => false ; "7")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![] => false ; "8")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("delimiter", vec!["/"])] => false ; "9")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("groups", vec!["prod", "art"])] => true ; "10")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("groups", vec!["art"])] => true ; "11")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![] => true ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("delimiter", vec!["/"])] => true ; "13")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("groups", vec!["prod", "art"])] => true ; "14")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("groups", vec!["art"])] => true ; "15")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![] => false ; "16")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("delimiter", vec!["/"])] => false ; "17")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec![KeyName::S3(S3LocationConstraint).var_name().as_str()]), false, vec![("LocationConstraint", vec!["us-west-1"])] => true ; "18")]
+    #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/security", vec!["public"])] => true ; "19")]
+    #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/security", vec!["private"])] => false ; "20")]
+    #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/project", vec!["foo"])] => false ; "21")]
+    fn test_string_equals(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
+        test_eval(s, for_all, false, false, values)
+    }
+
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => false ; "1")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => true ; "2")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![] => true ; "3")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("delimiter", vec!["/"])] => true ; "4")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-1"])] => false ; "5")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["ap-southeast-1"])] => false ; "6")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["us-east-1"])] => true ; "7")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![] => true ; "8")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("delimiter", vec!["/"])] => true ; "9")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("groups", vec!["prod", "art"])] => false ; "10")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("groups", vec!["art"])] => false ; "11")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![] => false ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("delimiter", vec!["/"])] => false ; "13")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "14")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("groups", vec!["art"])] => false ; "15")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![] => true ; "16")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("delimiter", vec!["/"])] => true ; "17")]
+    fn test_string_not_equals(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
+        test_eval(s, for_all, false, true, values)
+    }
+
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/MYOBJECT"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/MYOBJECT"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => false ; "2")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/MYOBJECT"]), false, vec![] => false ; "3")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/MYOBJECT"]), false, vec![("delimiter", vec!["/"])] => false ; "4")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-1"])] => true ; "5")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("LocationConstraint", vec!["ap-southeast-1"])] => true ; "6")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("LocationConstraint", vec!["us-east-1"])] => false ; "7")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![] => false ; "8")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("delimiter", vec!["/"])] => false ; "9")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("groups", vec!["prod", "art"])] => true ; "10")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("groups", vec!["art"])] => true ; "11")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![] => true ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("delimiter", vec!["/"])] => true ; "13")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("groups", vec!["prod", "art"])] => true ; "14")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("groups", vec!["art"])] => true ; "15")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![] => false ; "16")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("delimiter", vec!["/"])] => false ; "17")]
+    fn test_string_equals_ignore_case(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
+        test_eval(s, for_all, true, false, values)
+    }
+
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/MYOBJECT"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => false ; "1")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/MYOBJECT"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => true ; "2")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/MYOBJECT"]), false, vec![] => true ; "3")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/MYOBJECT"]), false, vec![("delimiter", vec!["/"])] => true ; "4")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-1"])] => false ; "5")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("LocationConstraint", vec!["ap-southeast-1"])] => false ; "6")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("LocationConstraint", vec!["us-east-1"])] => true ; "7")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![] => true ; "8")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("delimiter", vec!["/"])] => true ; "9")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("groups", vec!["prod", "art"])] => false ; "10")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("groups", vec!["art"])] => false ; "11")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![] => false ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("delimiter", vec!["/"])] => false ; "13")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "14")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("groups", vec!["art"])] => false ; "15")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![] => true ; "16")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("delimiter", vec!["/"])] => true ; "17")]
+    fn test_string_not_equals_ignore_case(
+        s: FuncKeyValue<StringFuncValue>,
+        for_all: bool,
+        values: Vec<(&str, Vec<&str>)>,
+    ) -> bool {
+        test_eval(s, for_all, true, true, values)
+    }
+
+    fn test_eval_like(s: FuncKeyValue<StringFuncValue>, for_all: bool, negate: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
+        let result = s.eval_like(
+            for_all,
+            &values
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
+                .collect(),
+        );
+
+        result ^ negate
+    }
+
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => false ; "2")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![] => false ; "3")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("delimiter", vec!["/"])] => false ; "4")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-1"])] => true ; "5")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["ap-southeast-1"])] => true ; "6")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["us-east-1"])] => false ; "7")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![] => false ; "8")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("delimiter", vec!["/"])] => false ; "9")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-2"])] => true ; "10")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("groups", vec!["prod", "art"])] => true ; "11")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("groups", vec!["art"])] => true ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![] => true ; "13")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("delimiter", vec!["/"])] => true ; "14")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("groups", vec!["prod", "art"])] => true ; "15")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("groups", vec!["art"])] => true ; "16")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![] => false ; "17")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("delimiter", vec!["/"])] => false ; "18")]
+    fn test_string_like(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
+        test_eval_like(s, for_all, false, values)
+    }
+
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => false ; "1")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => true ; "2")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![] => true ; "3")]
+    #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("delimiter", vec!["/"])] => true ; "4")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-1"])] => false ; "5")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["ap-southeast-1"])] => false ; "6")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["us-east-1"])] => true ; "7")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![] => true ; "8")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("delimiter", vec!["/"])] => true ; "9")]
+    #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-2"])] => false ; "10")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("groups", vec!["prod", "art"])] => false ; "11")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("groups", vec!["art"])] => false ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![] => false ; "13")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("delimiter", vec!["/"])] => false ; "14")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "15")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("groups", vec!["art"])] => false ; "16")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![] => true ; "17")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("delimiter", vec!["/"])] => true ; "18")]
+    fn test_string_not_like(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
+        test_eval_like(s, for_all, true, values)
     }
 }

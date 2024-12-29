@@ -35,7 +35,7 @@ impl TryFrom<&str> for KeyName {
 }
 
 impl KeyName {
-    pub const COMMON_KEYS: &[KeyName] = &[
+    pub const COMMON_KEYS: &'static [KeyName] = &[
         // s3
         KeyName::S3(S3KeyName::S3SignatureVersion),
         KeyName::S3(S3KeyName::S3AuthType),
@@ -82,25 +82,42 @@ impl KeyName {
         KeyName::Jwt(JwtKeyName::JWTClientID),
     ];
 
-    pub fn name(&self) -> &str {
+    pub const fn prefix(&self) -> usize {
         match self {
+            KeyName::Aws(_) => "aws:".len(),
+            KeyName::Jwt(_) => "jwt:".len(),
+            KeyName::Ldap(_) => "ldap:".len(),
+            KeyName::Sts(_) => "sts:".len(),
+            KeyName::Svc(_) => "svc:".len(),
+            KeyName::S3(_) => "s3:".len(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &Into::<&str>::into(self)[self.prefix()..]
+    }
+
+    pub fn var_name(&self) -> String {
+        match self {
+            KeyName::Aws(s) => format!("${{aws:{}}}", Into::<&str>::into(s)),
+            KeyName::Jwt(s) => format!("${{jwt:{}}}", Into::<&str>::into(s)),
+            KeyName::Ldap(s) => format!("${{ldap:{}}}", Into::<&str>::into(s)),
+            KeyName::Sts(s) => format!("${{sts:{}}}", Into::<&str>::into(s)),
+            KeyName::Svc(s) => format!("${{svc:{}}}", Into::<&str>::into(s)),
+            KeyName::S3(s) => format!("${{s3:{}}}", Into::<&str>::into(s)),
+        }
+    }
+}
+
+impl From<&KeyName> for &'static str {
+    fn from(k: &KeyName) -> Self {
+        match k {
             KeyName::Aws(aws) => aws.into(),
             KeyName::Jwt(jwt) => jwt.into(),
             KeyName::Ldap(ldap) => ldap.into(),
             KeyName::Sts(sts) => sts.into(),
             KeyName::Svc(svc) => svc.into(),
             KeyName::S3(s3) => s3.into(),
-        }
-    }
-
-    pub fn val_name(&self) -> String {
-        match self {
-            KeyName::Aws(aws) => Into::<&str>::into(aws).to_owned(),
-            KeyName::Jwt(jwt) => Into::<&str>::into(jwt).to_owned(),
-            KeyName::Ldap(ldap) => Into::<&str>::into(ldap).to_owned(),
-            KeyName::Sts(sts) => Into::<&str>::into(sts).to_owned(),
-            KeyName::Svc(svc) => Into::<&str>::into(svc).to_owned(),
-            KeyName::S3(s3) => Into::<&str>::into(s3).to_owned(),
         }
     }
 }
@@ -137,6 +154,21 @@ pub enum S3KeyName {
 
     #[strum(serialize = "s3:max-keys")]
     S3MaxKeys,
+
+    #[strum(serialize = "s3:x-amz-metadata-directive")]
+    S3XAmzMetadataDirective,
+
+    #[strum(serialize = "s3:x-amz-storage-class")]
+    S3XAmzStorageClass,
+
+    #[strum(serialize = "s3:prefix")]
+    S3Prefix,
+
+    #[strum(serialize = "s3:delimiter")]
+    S3Delimiter,
+
+    #[strum(serialize = "s3:ExistingObjectTag")]
+    S3ExistingObjectTag,
 }
 
 #[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]

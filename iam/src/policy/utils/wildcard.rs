@@ -38,6 +38,7 @@ where
     text.as_ref().len() <= pattern.as_ref().len()
 }
 
+#[inline]
 fn inner_match(pattern: impl AsRef<str>, name: impl AsRef<str>, simple: bool) -> bool {
     let (pattern, name) = (pattern.as_ref(), name.as_ref());
 
@@ -49,10 +50,10 @@ fn inner_match(pattern: impl AsRef<str>, name: impl AsRef<str>, simple: bool) ->
         return true;
     }
 
-    deep_match(name.as_bytes(), pattern.as_bytes(), simple)
+    deep_match(pattern.as_bytes(), name.as_bytes(), simple)
 }
 
-fn deep_match(mut name: &[u8], mut pattern: &[u8], simple: bool) -> bool {
+fn deep_match(mut pattern: &[u8], mut name: &[u8], simple: bool) -> bool {
     while !pattern.is_empty() {
         match pattern[0] {
             b'?' => {
@@ -63,8 +64,8 @@ fn deep_match(mut name: &[u8], mut pattern: &[u8], simple: bool) -> bool {
 
             b'*' => {
                 return pattern.len() == 1
-                    || deep_match(name, &pattern[1..], simple)
-                    || (!name.is_empty() && deep_match(&name[1..], pattern, simple));
+                    || deep_match(&pattern[1..], name, simple)
+                    || (!name.is_empty() && deep_match(pattern, &name[1..], simple));
             }
 
             _ => {
@@ -137,6 +138,7 @@ mod tests {
     #[test_case::test_case("my-bucket/mnop*?and", "my-bucket/mnopqanda" => false; "50")]
     #[test_case::test_case("my-?-bucket/abc*", "my-bucket/mnopqanda" => false; "51")]
     #[test_case::test_case("a?", "a" => false; "52")]
+    #[test_case::test_case("*", "mybucket/myobject" => true; "53")]
     fn test_is_match(pattern: &str, text: &str) -> bool {
         is_match(pattern, text)
     }
