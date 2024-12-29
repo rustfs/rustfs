@@ -7,16 +7,18 @@ pub type AddrFunc = InnerFunc<AddrFuncValue>;
 
 impl AddrFunc {
     pub(crate) fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
-        let rvalues = values.get(self.key.name().as_str()).map(|t| t.iter()).unwrap_or_default();
+        for inner in self.0.iter() {
+            let rvalues = values.get(inner.key.name().as_str()).map(|t| t.iter()).unwrap_or_default();
 
-        for r in rvalues {
-            let Ok(ip) = r.parse::<IpAddr>() else {
-                return false;
-            };
+            for r in rvalues {
+                let Ok(ip) = r.parse::<IpAddr>() else {
+                    return false;
+                };
 
-            for ip_net in self.values.0.iter() {
-                if ip_net.contains(ip) {
-                    return true;
+                for ip_net in inner.values.0.iter() {
+                    if ip_net.contains(ip) {
+                        return true;
+                    }
                 }
             }
         }
@@ -47,7 +49,7 @@ impl<'de> Deserialize<'de> for AddrFuncValue {
             where
                 E: serde::de::Error,
             {
-                Ok(AddrFuncValue(vec![Self::to_cidr::<E>(v)?]))
+                Ok(AddrFuncValue(vec![Self::cidr::<E>(v)?]))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -57,7 +59,7 @@ impl<'de> Deserialize<'de> for AddrFuncValue {
                 Ok(AddrFuncValue({
                     let mut data = Vec::with_capacity(seq.size_hint().unwrap_or_default());
                     while let Some(v) = seq.next_element::<&str>()? {
-                        data.push(Self::to_cidr::<A::Error>(v)?)
+                        data.push(Self::cidr::<A::Error>(v)?)
                     }
                     data
                 }))
@@ -65,7 +67,7 @@ impl<'de> Deserialize<'de> for AddrFuncValue {
         }
 
         impl AddrFuncValueVisitor {
-            fn to_cidr<E: serde::de::Error>(v: &str) -> Result<IpNetwork, E> {
+            fn cidr<E: serde::de::Error>(v: &str) -> Result<IpNetwork, E> {
                 let mut cidr_str = Cow::from(v);
                 if v.find('/').is_none() {
                     cidr_str.to_mut().push_str("/32");
@@ -84,6 +86,7 @@ impl<'de> Deserialize<'de> for AddrFuncValue {
 #[cfg(test)]
 mod tests {
     use super::{AddrFunc, AddrFuncValue};
+    use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::{
         key::Key,
         key_name::AwsKeyName::*,
@@ -93,8 +96,10 @@ mod tests {
 
     fn new_func(name: KeyName, variable: Option<String>, value: Vec<&str>) -> AddrFunc {
         AddrFunc {
-            key: Key { name, variable },
-            values: AddrFuncValue(value.into_iter().map(|x| x.parse().unwrap()).collect()),
+            0: vec![FuncKeyValue {
+                key: Key { name, variable },
+                values: AddrFuncValue(value.into_iter().filter_map(|x| x.parse().ok()).collect()),
+            }],
         }
     }
 

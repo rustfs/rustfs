@@ -6,21 +6,23 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub type DateFunc = InnerFunc<DateFuncValue>;
 
 impl DateFunc {
-    pub fn evaluate(
-        &self,
-        op: impl FnOnce(&OffsetDateTime, &OffsetDateTime) -> bool,
-        values: &HashMap<String, Vec<String>>,
-    ) -> bool {
-        let v = match values.get(self.key.name().as_str()).and_then(|x| x.get(0)) {
-            Some(x) => x,
-            None => return false,
-        };
+    pub fn evaluate(&self, op: impl Fn(&OffsetDateTime, &OffsetDateTime) -> bool, values: &HashMap<String, Vec<String>>) -> bool {
+        for inner in self.0.iter() {
+            let v = match values.get(inner.key.name().as_str()).and_then(|x| x.get(0)) {
+                Some(x) => x,
+                None => return false,
+            };
 
-        let Ok(rv) = OffsetDateTime::parse(v, &Rfc3339) else {
-            return false;
-        };
+            let Ok(rv) = OffsetDateTime::parse(v, &Rfc3339) else {
+                return false;
+            };
 
-        op(&self.values.0, &rv)
+            if !op(&inner.values.0, &rv) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -74,6 +76,7 @@ impl<'de> Deserialize<'de> for DateFuncValue {
 #[cfg(test)]
 mod tests {
     use super::{DateFunc, DateFuncValue};
+    use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::{
         key::Key,
         key_name::KeyName::{self, *},
@@ -84,8 +87,10 @@ mod tests {
 
     fn new_func(name: KeyName, variable: Option<String>, value: &str) -> DateFunc {
         DateFunc {
-            key: Key { name, variable },
-            values: DateFuncValue(OffsetDateTime::parse(value, &Rfc3339).unwrap()),
+            0: vec![FuncKeyValue {
+                key: Key { name, variable },
+                values: DateFuncValue(OffsetDateTime::parse(value, &Rfc3339).unwrap()),
+            }],
         }
     }
 

@@ -23,7 +23,7 @@ impl Policy {
 
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
             if statement.is_allowed(args) {
-                return false;
+                return true;
             }
         }
 
@@ -72,12 +72,12 @@ pub mod default {
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
-                        resoures: ResourceSet({
+                        resources: ResourceSet({
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Resource::S3("*".into()));
                             hash_set
                         }),
-                        conditions: Functions(vec![]),
+                        conditions: Functions::default(),
                     }],
                 },
             ),
@@ -96,12 +96,12 @@ pub mod default {
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
-                        resoures: ResourceSet({
+                        resources: ResourceSet({
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Resource::S3("*".into()));
                             hash_set
                         }),
-                        conditions: Functions(vec![]),
+                        conditions: Functions::default(),
                     }],
                 },
             ),
@@ -119,12 +119,12 @@ pub mod default {
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
-                        resoures: ResourceSet({
+                        resources: ResourceSet({
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Resource::S3("*".into()));
                             hash_set
                         }),
-                        conditions: Functions(vec![]),
+                        conditions: Functions::default(),
                     }],
                 },
             ),
@@ -142,12 +142,12 @@ pub mod default {
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
-                        resoures: ResourceSet({
+                        resources: ResourceSet({
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Resource::S3("*".into()));
                             hash_set
                         }),
-                        conditions: Functions(vec![]),
+                        conditions: Functions::default(),
                     }],
                 },
             ),
@@ -172,12 +172,12 @@ pub mod default {
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
-                        resoures: ResourceSet({
+                        resources: ResourceSet({
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Resource::S3("*".into()));
                             hash_set
                         }),
-                        conditions: Functions(vec![]),
+                        conditions: Functions::default(),
                     }],
                 },
             ),
@@ -196,8 +196,8 @@ pub mod default {
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
-                            resoures: ResourceSet(HashSet::new()),
-                            conditions: Functions(vec![]),
+                            resources: ResourceSet(HashSet::new()),
+                            conditions: Functions::default(),
                         },
                         Statement {
                             sid: "".into(),
@@ -208,8 +208,8 @@ pub mod default {
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
-                            resoures: ResourceSet(HashSet::new()),
-                            conditions: Functions(vec![]),
+                            resources: ResourceSet(HashSet::new()),
+                            conditions: Functions::default(),
                         },
                         Statement {
                             sid: "".into(),
@@ -220,12 +220,12 @@ pub mod default {
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
-                            resoures: ResourceSet({
+                            resources: ResourceSet({
                                 let mut hash_set = HashSet::new();
                                 hash_set.insert(Resource::S3("*".into()));
                                 hash_set
                             }),
-                            conditions: Functions(vec![]),
+                            conditions: Functions::default(),
                         },
                     ],
                 },

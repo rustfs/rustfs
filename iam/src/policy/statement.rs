@@ -8,7 +8,7 @@ pub struct Statement {
     pub effect: Effect,
     pub actions: ActionSet,
     pub not_actions: ActionSet,
-    pub resoures: ResourceSet,
+    pub resources: ResourceSet,
     pub conditions: Functions,
 }
 
@@ -61,12 +61,12 @@ impl Statement {
             }
 
             if self.is_kms() {
-                if resource == "/" || self.resoures.is_empty() {
+                if resource == "/" || self.resources.is_empty() {
                     break 'c self.conditions.evaluate(&args.conditions);
                 }
             }
 
-            if !self.resoures.is_match(&resource, &args.conditions) && !self.is_admin() && !self.is_sts() {
+            if !self.resources.is_match(&resource, &args.conditions) && !self.is_admin() && !self.is_sts() {
                 break 'c false;
             }
 
@@ -87,13 +87,13 @@ impl Validator for Statement {
             return Err(Error::NonAction);
         }
 
-        if self.resoures.is_empty() {
+        if self.resources.is_empty() {
             return Err(Error::NonResource);
         }
 
         self.actions.is_valid()?;
         self.not_actions.is_valid()?;
-        self.resoures.is_valid()?;
+        self.resources.is_valid()?;
 
         Ok(())
     }

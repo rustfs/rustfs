@@ -108,7 +108,7 @@ async fn monitor_local_disks_and_heal() {
         info!("heal local disks: {:?}", heal_disks);
 
         let store = new_object_layer_fn().expect("errServerNotInitialized");
-        if let (result, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
+        if let (_result, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
             error!("heal local disk format error: {}", err);
             if let Some(DiskError::NoHealRequired) = err.downcast_ref::<DiskError>() {
             } else {

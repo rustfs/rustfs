@@ -1,7 +1,6 @@
 use crate::policy::{Policy, Validator};
 use crate::service_type::ServiceType;
 use crate::{utils, Error};
-use jsonwebtoken::{encode, Algorithm, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::LazyCell;
