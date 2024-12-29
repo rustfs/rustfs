@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 common.workspace = true
 tokio.workspace = true
+tracing.workspace = true

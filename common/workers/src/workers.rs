@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
+use tracing::info;
 
 pub struct Workers {
     available: Mutex<usize>, // 可用的工作槽
@@ -23,18 +24,23 @@ impl Workers {
 
     // 让一个作业获得执行的机会
     pub async fn take(&self) {
-        let mut available = self.available.lock().await;
-        while *available == 0 {
-            // 等待直到有可用槽
-            self.notify.notified().await;
-            available = self.available.lock().await;
+        loop {
+            let mut available = self.available.lock().await;
+            info!("worker take, {}", *available);
+            if *available == 0 {
+                drop(available);
+                self.notify.notified().await;
+            } else {
+                *available -= 1;
+                break;
+            }
         }
-        *available -= 1; // 减少可用槽
     }
 
     // 让一个作业释放其机会
     pub async fn give(&self) {
         let mut available = self.available.lock().await;
+        info!("worker give, {}", *available);
         *available += 1; // 增加可用槽
         self.notify.notify_one(); // 通知一个等待的任务
     }
@@ -51,6 +57,7 @@ impl Workers {
             // 等待直到所有槽都被释放
             self.notify.notified().await;
         }
+        info!("worker wait end");
     }
 
     pub async fn available(&self) -> usize {
@@ -68,15 +75,17 @@ mod tests {
     async fn test_workers() {
         let workers = Arc::new(Workers::new(5).unwrap());
 
-        for _ in 0..4 {
+        for _ in 0..5 {
             let workers = workers.clone();
             tokio::spawn(async move {
                 workers.take().await;
                 sleep(Duration::from_secs(3)).await;
-                workers.give().await;
             });
         }
 
+        for _ in 0..5 {
+            workers.give().await;
+        }
         // Sleep: wait for spawn task started
         sleep(Duration::from_secs(1)).await;
         workers.wait().await;
