@@ -57,6 +57,7 @@ impl Workers {
             // 等待直到所有槽都被释放
             self.notify.notified().await;
         }
+        info!("worker wait end");
     }
 
     pub async fn available(&self) -> usize {
