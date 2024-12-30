@@ -142,7 +142,7 @@ async fn monitor_local_disks_and_heal() {
 }
 
 async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
-    let (pool_idx, set_idx) = (endpoint.pool_idx as usize, endpoint.disk_idx as usize);
+    let (pool_idx, set_idx) = (endpoint.pool_idx as usize, endpoint.set_idx as usize);
     let disk = match get_disk_via_endpoint(endpoint).await {
         Some(disk) => disk,
         None => {
