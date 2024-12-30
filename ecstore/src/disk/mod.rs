@@ -1561,7 +1561,7 @@ impl Reader for RemoteFileReader {
             path: self.path.to_string(),
             offset: offset.try_into().unwrap(),
             // length: length.try_into().unwrap(),
-            length: 0,
+            length: buf.len().try_into().unwrap(),
         };
         self.tx.send(request).await?;
 

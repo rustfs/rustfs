@@ -2251,8 +2251,8 @@ impl SetDisks {
 
                         if !lastest_meta.deleted && disks_to_heal_count > lastest_meta.erasure.parity_blocks {
                             error!(
-                                "file part corrupt too much, can not to fix, disks_to_heal_count: {}, parity_blocks: {}",
-                                disks_to_heal_count, lastest_meta.erasure.parity_blocks
+                                "file({} : {}) part corrupt too much, can not to fix, disks_to_heal_count: {}, parity_blocks: {}",
+                                bucket, object, disks_to_heal_count, lastest_meta.erasure.parity_blocks
                             );
                             let mut t_errs = vec![None; errs.len()];
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
