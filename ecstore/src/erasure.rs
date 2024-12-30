@@ -588,7 +588,7 @@ impl ShardReader {
     fn can_decode(&self, bufs: &[Option<Vec<u8>>]) -> bool {
         let c = bufs.iter().filter(|v| v.is_some()).count();
         if self.parity_block_count > 0 {
-            c > self.data_block_count
+            c >= self.data_block_count
         } else {
             c == self.data_block_count
         }
