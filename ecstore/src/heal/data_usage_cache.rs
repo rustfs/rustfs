@@ -383,7 +383,7 @@ impl DataUsageCache {
                 .get_object_reader(
                     RUSTFS_META_BUCKET,
                     path.to_str().unwrap(),
-                    HTTPRangeSpec::nil(),
+                    None,
                     HeaderMap::new(),
                     &ObjectOptions {
                         no_lock: true,
@@ -404,7 +404,7 @@ impl DataUsageCache {
                             .get_object_reader(
                                 RUSTFS_META_BUCKET,
                                 name,
-                                HTTPRangeSpec::nil(),
+                                None,
                                 HeaderMap::new(),
                                 &ObjectOptions {
                                     no_lock: true,

@@ -24,7 +24,7 @@ use crate::store_err::{
 };
 use crate::store_init::ec_drives_no_config;
 use crate::utils::crypto::base64_decode;
-use crate::utils::path::{decode_dir_object, encode_dir_object, SLASH_SEPARATOR};
+use crate::utils::path::{decode_dir_object, encode_dir_object, path_join_buf, SLASH_SEPARATOR};
 use crate::utils::xml;
 use crate::{
     bucket::metadata::BucketMetadata,
@@ -116,7 +116,7 @@ impl ECStore {
         )
         .await;
 
-        debug!("endpoint_pools: {:?}", endpoint_pools);
+        // debug!("endpoint_pools: {:?}", endpoint_pools);
 
         let mut common_parity_drives = 0;
 
@@ -531,6 +531,39 @@ impl ECStore {
         };
 
         Ok(idx)
+    }
+
+    async fn get_pool_idx_no_lock(&self, bucket: &str, object: &str, size: i64) -> Result<usize> {
+        let idx = match self.get_pool_idx_existing_no_lock(bucket, object).await {
+            Ok(res) => res,
+            Err(err) => {
+                if !is_err_object_not_found(&err) {
+                    return Err(err);
+                }
+
+                if let Some(idx) = self.get_available_pool_idx(bucket, object, size).await {
+                    idx
+                } else {
+                    return Err(to_object_err(Error::new(DiskError::DiskFull), vec![bucket, object]));
+                }
+            }
+        };
+
+        Ok(idx)
+    }
+
+    async fn get_pool_idx_existing_no_lock(&self, bucket: &str, object: &str) -> Result<usize> {
+        self.get_pool_idx_existing_with_opts(
+            bucket,
+            object,
+            &ObjectOptions {
+                no_lock: true,
+                skip_decommissioned: true,
+                skip_rebalancing: true,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     async fn get_pool_idx_existing_with_opts(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<usize> {
@@ -1052,7 +1085,7 @@ impl ObjectIO for ECStore {
         &self,
         bucket: &str,
         object: &str,
-        range: HTTPRangeSpec,
+        range: Option<HTTPRangeSpec>,
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
@@ -1287,6 +1320,76 @@ impl StorageAPI for ECStore {
         }
 
         Ok(info)
+    }
+
+    // TODO: review
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        check_copy_obj_args(src_bucket, src_object)?;
+        check_copy_obj_args(dst_bucket, dst_object)?;
+
+        let src_object = utils::path::encode_dir_object(src_object);
+        let dst_object = utils::path::encode_dir_object(dst_object);
+
+        let cp_src_dst_same = path_join_buf(&[src_bucket, &src_object]) == path_join_buf(&[dst_bucket, &dst_object]);
+
+        // TODO: nslock
+
+        let pool_idx = self
+            .get_pool_idx_no_lock(src_bucket, &src_object, src_info.size as i64)
+            .await?;
+
+        if cp_src_dst_same {
+            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
+                if src_vid == dst_vid {
+                    return self.pools[pool_idx]
+                        .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, dst_opts)
+                        .await;
+                }
+            }
+
+            if !dst_opts.versioned && src_opts.version_id.is_none() {
+                return self.pools[pool_idx]
+                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, dst_opts)
+                    .await;
+            }
+
+            if dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
+                src_info.version_only = true;
+                return self.pools[pool_idx]
+                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, dst_opts)
+                    .await;
+            }
+        }
+
+        let put_opts = ObjectOptions {
+            user_defined: src_info.user_defined.clone(),
+            versioned: dst_opts.versioned,
+            version_id: dst_opts.version_id.clone(),
+            no_lock: true,
+            mod_time: dst_opts.mod_time,
+            ..Default::default()
+        };
+
+        if let Some(put_object_reader) = src_info.put_object_reader.as_mut() {
+            return self.pools[pool_idx]
+                .put_object(dst_bucket, &dst_object, put_object_reader, &put_opts)
+                .await;
+        }
+
+        Err(Error::new(StorageError::InvalidArgument(
+            src_bucket.to_owned(),
+            src_object.to_owned(),
+            "put_object_reader is none".to_owned(),
+        )))
     }
 
     // TODO: review
@@ -2183,7 +2286,7 @@ fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<
     Ok(())
 }
 
-fn _check_copy_obj_args(bucket: &str, object: &str) -> Result<()> {
+fn check_copy_obj_args(bucket: &str, object: &str) -> Result<()> {
     check_bucket_and_object_names(bucket, object)
 }
 

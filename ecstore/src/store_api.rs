@@ -8,7 +8,7 @@ use crate::{
     xhttp,
 };
 use futures::StreamExt;
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 use madmin::heal_commands::HealResultItem;
 use rmp_serde::Serializer;
 use s3s::{dto::StreamingBlob, Body};
@@ -233,7 +233,7 @@ impl FileInfo {
     }
 
     // to_part_offset 取offset 所在的part index, 返回part index, offset
-    pub fn to_part_offset(&self, offset: i64) -> Result<(usize, i64)> {
+    pub fn to_part_offset(&self, offset: usize) -> Result<(usize, usize)> {
         if offset == 0 {
             return Ok((0, 0));
         }
@@ -241,11 +241,11 @@ impl FileInfo {
         let mut part_offset = offset;
         for (i, part) in self.parts.iter().enumerate() {
             let part_index = i;
-            if part_offset < part.size as i64 {
+            if part_offset < part.size {
                 return Ok((part_index, part_offset));
             }
 
-            part_offset -= part.size as i64
+            part_offset -= part.size
         }
 
         Err(Error::msg("part not found"))
@@ -442,9 +442,44 @@ pub struct GetObjectReader {
 }
 
 impl GetObjectReader {
-    // pub fn new(stream: StreamingBlob, object_info: ObjectInfo) -> Self {
-    //     GetObjectReader { stream, object_info }
-    // }
+    #[tracing::instrument(level = "debug", skip(reader))]
+    pub fn new(
+        reader: StreamingBlob,
+        rs: Option<HTTPRangeSpec>,
+        oi: &ObjectInfo,
+        opts: &ObjectOptions,
+        _h: &HeaderMap<HeaderValue>,
+    ) -> Result<(Self, usize, usize)> {
+        let mut rs = rs;
+
+        if let Some(part_number) = opts.part_number {
+            if rs.is_none() {
+                rs = HTTPRangeSpec::from_object_info(oi, part_number);
+            }
+        }
+
+        if let Some(rs) = rs {
+            let (off, length) = rs.get_offset_length(oi.size)?;
+
+            return Ok((
+                GetObjectReader {
+                    stream: reader,
+                    object_info: oi.clone(),
+                },
+                off,
+                length,
+            ));
+        } else {
+            return Ok((
+                GetObjectReader {
+                    stream: reader,
+                    object_info: oi.clone(),
+                },
+                0,
+                oi.size,
+            ));
+        }
+    }
     pub async fn read_all(&mut self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
 
@@ -463,61 +498,47 @@ impl GetObjectReader {
 #[derive(Debug)]
 pub struct HTTPRangeSpec {
     pub is_suffix_length: bool,
-    pub start: i64,
-    pub end: i64,
+    pub start: usize,
+    pub end: Option<usize>,
 }
 
 impl HTTPRangeSpec {
-    pub fn nil() -> Self {
-        Self {
-            is_suffix_length: false,
-            start: -1,
-            end: -1,
-        }
-    }
-
-    pub fn is_nil(&self) -> bool {
-        self.start == -1 && self.end == -1
-    }
-    pub fn from_object_info(oi: &ObjectInfo, part_number: usize) -> Self {
-        let mut l = oi.parts.len();
-        if part_number < l {
-            l = part_number;
+    pub fn from_object_info(oi: &ObjectInfo, part_number: usize) -> Option<Self> {
+        if oi.size == 0 || oi.parts.is_empty() {
+            return None;
         }
 
         let mut start = 0;
         let mut end = -1;
-        for i in 0..l {
+        for i in 0..oi.parts.len().min(part_number) {
             start = end + 1;
             end = start + oi.parts[i].size as i64 - 1
         }
 
-        HTTPRangeSpec {
+        Some(HTTPRangeSpec {
             is_suffix_length: false,
-            start,
-            end,
-        }
+            start: start as usize,
+            end: {
+                if end < 0 {
+                    None
+                } else {
+                    Some(end as usize)
+                }
+            },
+        })
     }
 
-    pub fn get_offset_length(&self, res_size: i64) -> Result<(i64, i64)> {
-        if self.start == 0 && self.end == 0 {
-            return Ok((0, res_size));
-        }
-
+    pub fn get_offset_length(&self, res_size: usize) -> Result<(usize, usize)> {
         let len = self.get_length(res_size)?;
         let mut start = self.start;
         if self.is_suffix_length {
-            start = self.start + res_size
+            start = res_size - self.start
         }
         Ok((start, len))
     }
-    pub fn get_length(&self, res_size: i64) -> Result<i64> {
-        if self.is_nil() {
-            return Ok(res_size);
-        }
-
+    pub fn get_length(&self, res_size: usize) -> Result<usize> {
         if self.is_suffix_length {
-            let specified_len = -self.start; // 假设 h.start 是一个 i64 类型
+            let specified_len = self.start; // 假设 h.start 是一个 i64 类型
             let mut range_length = specified_len;
 
             if specified_len > res_size {
@@ -527,21 +548,21 @@ impl HTTPRangeSpec {
             return Ok(range_length);
         }
 
-        if self.start > res_size {
+        if self.start >= res_size {
             return Err(Error::msg("The requested range is not satisfiable"));
         }
 
-        if self.end > -1 {
-            let mut end = self.end;
+        if let Some(end) = self.end {
+            let mut end = end;
             if res_size <= end {
                 end = res_size - 1;
             }
 
-            let range_length = end - self.start - 1;
+            let range_length = end - self.start + 1;
             return Ok(range_length);
         }
 
-        if self.end == -1 {
+        if self.end.is_none() {
             let range_length = res_size - self.start;
             return Ok(range_length);
         }
@@ -555,7 +576,7 @@ pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
     pub mod_time: Option<OffsetDateTime>,
-    pub part_number: usize,
+    pub part_number: Option<usize>,
 
     pub delete_prefix: bool,
     pub version_id: Option<String>,
@@ -569,7 +590,7 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub src_pool_idx: usize,
-    pub user_defined: HashMap<String, String>,
+    pub user_defined: Option<HashMap<String, String>>,
     pub preserve_etag: Option<String>,
     pub metadata_chg: bool,
 
@@ -631,7 +652,7 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
@@ -652,9 +673,41 @@ pub struct ObjectInfo {
     pub content_encoding: Option<String>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
-    // pub put_object_reader: Option<PutObjReader>,
+    pub put_object_reader: Option<PutObjReader>,
     pub etag: Option<String>,
     pub inlined: bool,
+    pub metadata_only: bool,
+    pub version_only: bool,
+}
+
+impl Clone for ObjectInfo {
+    fn clone(&self) -> Self {
+        Self {
+            bucket: self.bucket.clone(),
+            name: self.name.clone(),
+            mod_time: self.mod_time,
+            size: self.size,
+            actual_size: self.actual_size,
+            is_dir: self.is_dir,
+            user_defined: self.user_defined.clone(),
+            parity_blocks: self.parity_blocks,
+            data_blocks: self.data_blocks,
+            version_id: self.version_id,
+            delete_marker: self.delete_marker,
+            user_tags: self.user_tags.clone(),
+            parts: self.parts.clone(),
+            is_latest: self.is_latest,
+            content_type: self.content_type.clone(),
+            content_encoding: self.content_encoding.clone(),
+            num_versions: self.num_versions,
+            successor_mod_time: self.successor_mod_time,
+            put_object_reader: None, // reader can not clone
+            etag: self.etag.clone(),
+            inlined: self.inlined,
+            metadata_only: self.metadata_only,
+            version_only: self.version_only,
+        }
+    }
 }
 
 impl ObjectInfo {
@@ -839,7 +892,7 @@ pub trait ObjectIO: Send + Sync + 'static {
         &self,
         bucket: &str,
         object: &str,
-        range: HTTPRangeSpec,
+        range: Option<HTTPRangeSpec>,
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader>;
@@ -889,6 +942,16 @@ pub trait StorageAPI: ObjectIO {
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     // PutObject ObjectIO
     // CopyObject
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<ObjectInfo>;
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
     async fn delete_objects(
         &self,

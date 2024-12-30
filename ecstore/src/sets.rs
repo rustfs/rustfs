@@ -27,8 +27,9 @@ use crate::{
         ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult,
         ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
+    store_err::StorageError,
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
-    utils::hash,
+    utils::{hash, path::path_join_buf},
 };
 
 use crate::heal::heal_ops::HealSequence;
@@ -292,7 +293,7 @@ impl ObjectIO for Sets {
         &self,
         bucket: &str,
         object: &str,
-        range: HTTPRangeSpec,
+        range: Option<HTTPRangeSpec>,
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
@@ -359,6 +360,62 @@ impl StorageAPI for Sets {
 
     async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()
+    }
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let src_set = self.get_disks_by_key(src_object);
+        let dst_set = self.get_disks_by_key(dst_object);
+
+        let cp_src_dst_same = path_join_buf(&[src_bucket, src_object]) == path_join_buf(&[dst_bucket, dst_object]);
+
+        if cp_src_dst_same {
+            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
+                if src_vid == dst_vid {
+                    return src_set
+                        .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                        .await;
+                }
+            }
+
+            if !dst_opts.versioned && src_opts.version_id.is_none() {
+                return src_set
+                    .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                    .await;
+            }
+
+            if dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
+                src_info.version_only = true;
+                return src_set
+                    .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                    .await;
+            }
+        }
+
+        let put_opts = ObjectOptions {
+            user_defined: dst_opts.user_defined.clone(),
+            versioned: dst_opts.versioned,
+            version_id: dst_opts.version_id.clone(),
+            mod_time: dst_opts.mod_time,
+            ..Default::default()
+        };
+
+        if let Some(put_object_reader) = src_info.put_object_reader.as_mut() {
+            return dst_set.put_object(dst_bucket, dst_object, put_object_reader, &put_opts).await;
+        }
+
+        Err(Error::new(StorageError::InvalidArgument(
+            src_bucket.to_owned(),
+            src_object.to_owned(),
+            "put_object_reader2 is none".to_owned(),
+        )))
     }
     async fn delete_objects(
         &self,

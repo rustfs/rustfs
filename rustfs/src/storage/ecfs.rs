@@ -30,6 +30,7 @@ use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
+use ecstore::utils::path::path_join_buf;
 use ecstore::utils::xml;
 use ecstore::xhttp;
 use futures::pin_mut;
@@ -52,7 +53,9 @@ use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
 use crate::storage::error::to_s3_error;
-use crate::storage::options::extract_metadata_from_mime;
+use crate::storage::options::copy_dst_opts;
+use crate::storage::options::copy_src_opts;
+use crate::storage::options::{extract_metadata_from_mime, get_opts};
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -119,13 +122,87 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
-        let input = req.input;
-        let (_bucket, _key) = match input.copy_source {
+        let CopyObjectInput {
+            copy_source,
+            bucket,
+            key,
+            ..
+        } = req.input;
+        let (src_bucket, src_key, version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket { ref bucket, ref key, .. } => (bucket, key),
+            CopySource::Bucket {
+                ref bucket,
+                ref key,
+                version_id,
+            } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
 
-        let output = CopyObjectOutput { ..Default::default() };
+        // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
+
+        let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(to_s3_error)?;
+
+        src_opts.version_id = version_id.clone();
+
+        let mut get_opts = ObjectOptions {
+            version_id: src_opts.version_id.clone(),
+            versioned: src_opts.versioned,
+            version_suspended: src_opts.version_suspended,
+            ..Default::default()
+        };
+
+        let dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, None)
+            .await
+            .map_err(to_s3_error)?;
+
+        let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
+
+        if cp_src_dst_same {
+            get_opts.no_lock = true;
+        }
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let h = HeaderMap::new();
+
+        let gr = store
+            .get_object_reader(&src_bucket, &src_key, None, h, &get_opts)
+            .await
+            .map_err(to_s3_error)?;
+
+        let mut src_info = gr.object_info.clone();
+
+        if cp_src_dst_same {
+            src_info.metadata_only = true;
+        }
+
+        src_info.put_object_reader = Some(PutObjReader {
+            stream: gr.stream,
+            content_length: gr.object_info.size as usize,
+        });
+
+        // check quota
+        // TODO: src metadada
+        // TODO: src tags
+
+        let oi = store
+            .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
+            .await
+            .map_err(to_s3_error)?;
+
+        // warn!("copy_object oi {:?}", &oi);
+
+        let copy_object_result = CopyObjectResult {
+            e_tag: oi.etag,
+            last_modified: oi.mod_time.map(Timestamp::from),
+            ..Default::default()
+        };
+
+        let output = CopyObjectOutput {
+            copy_object_result: Some(copy_object_result),
+            ..Default::default()
+        };
         Ok(S3Response::new(output))
     }
 
@@ -312,16 +389,46 @@ impl S3 for FS {
         // warn!("get_object input {:?}, vid {:?}", &req.input, req.input.version_id);
 
         let GetObjectInput {
-            bucket, key, version_id, ..
+            bucket,
+            key,
+            version_id,
+            part_number,
+            range,
+            ..
         } = req.input;
 
-        let range = HTTPRangeSpec::nil();
+        // let range = HTTPRangeSpec::nil();
 
         let h = HeaderMap::new();
 
-        let metadata = extract_metadata(&req.headers);
+        let part_number = part_number.map(|v| v as usize);
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
+        if let Some(part_num) = part_number {
+            if part_num == 0 {
+                return Err(s3_error!(InvalidArgument, "part_numer invalid"));
+            }
+        }
+
+        let rs = range.map(|v| match v {
+            Range::Int { first, last } => HTTPRangeSpec {
+                is_suffix_length: false,
+                start: first as usize,
+                end: last.map(|v| v as usize),
+            },
+            Range::Suffix { length } => HTTPRangeSpec {
+                is_suffix_length: true,
+                start: length as usize,
+                end: None,
+            },
+        });
+
+        if rs.is_some() && part_number.is_some() {
+            return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
+        }
+
+        // let metadata = extract_metadata(&req.headers);
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
             .map_err(to_s3_error)?;
 
@@ -330,7 +437,7 @@ impl S3 for FS {
         };
 
         let reader = store
-            .get_object_reader(bucket.as_str(), key.as_str(), range, h, &opts)
+            .get_object_reader(bucket.as_str(), key.as_str(), rs, h, &opts)
             .await
             .map_err(to_s3_error)?;
 
