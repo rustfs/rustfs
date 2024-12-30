@@ -50,8 +50,8 @@ impl DRWMutex {
         Self {
             owner,
             names,
-            write_locks: Vec::with_capacity(lockers.len()),
-            read_locks: Vec::with_capacity(lockers.len()),
+            write_locks: vec![String::new(); lockers.len()],
+            read_locks: vec![String::new(); lockers.len()],
             cancel_refresh_sender: None,
             // rng: rand::thread_rng(),
             lockers,
