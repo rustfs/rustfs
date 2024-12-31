@@ -355,6 +355,10 @@ pub fn is_err_file_not_found(err: &Error) -> bool {
     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileNotFound))
 }
 
+pub fn is_err_file_version_not_found(err: &Error) -> bool {
+    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileVersionNotFound))
+}
+
 pub fn is_err_volume_not_found(err: &Error) -> bool {
     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::VolumeNotFound))
 }
