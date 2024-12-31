@@ -80,6 +80,9 @@ pub enum StorageError {
 
     #[error("Decommission not started")]
     DecommissionNotStarted,
+
+    #[error("DoneForNow")]
+    DoneForNow,
 }
 
 impl StorageError {
@@ -111,6 +114,7 @@ impl StorageError {
             StorageError::DecommissionNotStarted => 0x18,
             StorageError::InvalidPart(_, _, _) => 0x19,
             StorageError::VolumeNotFound(_) => 0x20,
+            StorageError::DoneForNow => 0x21,
         }
     }
 
@@ -146,6 +150,7 @@ impl StorageError {
             0x18 => Some(StorageError::DecommissionNotStarted),
             0x19 => Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default())),
             0x20 => Some(StorageError::VolumeNotFound(Default::default())),
+            0x21 => Some(StorageError::DoneForNow),
             _ => None,
         }
     }
