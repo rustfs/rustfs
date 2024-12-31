@@ -3845,7 +3845,6 @@ impl StorageAPI for SetDisks {
             };
 
             if vr.deleted {
-                error!("delete marker {:?}", &vr);
                 del_objects[i] = DeletedObject {
                     delete_marker: vr.deleted,
                     delete_marker_version_id: vr.version_id.map(|v| v.to_string()),

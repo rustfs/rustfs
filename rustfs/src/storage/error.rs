@@ -75,6 +75,7 @@ pub fn to_s3_error(err: Error) -> S3Error {
                     version_id
                 )
             }
+            StorageError::DoneForNow => s3_error!(InternalError, "DoneForNow"),
         };
     }
 

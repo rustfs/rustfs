@@ -14,6 +14,7 @@ use xxhash_rust::xxh64;
 use crate::disk::FileInfoVersions;
 use crate::file_meta_inline::InlineData;
 use crate::store_api::RawFileInfo;
+use crate::store_err::StorageError;
 use crate::{
     disk::error::DiskError,
     error::{Error, Result},
@@ -38,6 +39,8 @@ const _XL_FLAG_INLINE_DATA: u8 = 1 << 2;
 
 const META_DATA_READ_DEFAULT: usize = 4 << 10;
 const MSGP_UINT32_SIZE: usize = 5;
+
+// type ScanHeaderVersionFn = Box<dyn Fn(usize, &[u8], &[u8]) -> Result<()>>;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
@@ -128,9 +131,9 @@ impl FileMeta {
 
         // 解析meta
         if !meta.is_empty() {
-            let (versions_len, _, meta_ver, read_size) = Self::decode_head_ver(meta)?;
+            let (versions_len, _, meta_ver, meta) = Self::decode_xl_headers(meta)?;
 
-            let (_, meta) = meta.split_at(read_size as usize);
+            // let (_, meta) = meta.split_at(read_size as usize);
 
             self.meta_ver = meta_ver;
 
@@ -164,9 +167,9 @@ impl FileMeta {
         Ok(i)
     }
 
-    // decode_head_ver 解析 meta 头，返回 (versions数量，xl_header_version, xl_meta_version, 已读数据长度)
+    // decode_xl_headers 解析 meta 头，返回 (versions数量，xl_header_version, xl_meta_version, 已读数据长度)
     #[tracing::instrument]
-    fn decode_head_ver(buf: &[u8]) -> Result<(usize, u8, u8, u64)> {
+    fn decode_xl_headers(buf: &[u8]) -> Result<(usize, u8, u8, &[u8])> {
         let mut cur = Cursor::new(buf);
 
         let header_ver: u8 = rmp::decode::read_int(&mut cur)?;
@@ -182,7 +185,65 @@ impl FileMeta {
 
         let versions_len: usize = rmp::decode::read_int(&mut cur)?;
 
-        Ok((versions_len, header_ver, meta_ver, cur.position()))
+        Ok((versions_len, header_ver, meta_ver, &buf[cur.position() as usize..]))
+    }
+
+    fn decode_versions<F: FnMut(usize, &[u8], &[u8]) -> Result<()>>(buf: &[u8], versions: usize, mut fnc: F) -> Result<()> {
+        let mut cur: Cursor<&[u8]> = Cursor::new(buf);
+
+        for i in 0..versions {
+            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+            let start = cur.position() as usize;
+            let end = start + bin_len;
+            let header_buf = &buf[start..end];
+
+            cur.set_position(end as u64);
+
+            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+            let start = cur.position() as usize;
+            let end = start + bin_len;
+            let ver_meta_buf = &buf[start..end];
+
+            cur.set_position(end as u64);
+
+            if let Err(err) = fnc(i, header_buf, ver_meta_buf) {
+                if let Some(e) = err.downcast_ref::<StorageError>() {
+                    if e == &StorageError::DoneForNow {
+                        return Ok(());
+                    }
+                }
+
+                return Err(err);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn is_latest_delete_marker(buf: &[u8]) -> bool {
+        let header = Self::decode_xl_headers(buf).ok();
+        if let Some((versions, _hdr_v, _meta_v, meta)) = header {
+            if versions == 0 {
+                return false;
+            }
+
+            let mut is_delete_marker = false;
+
+            let _ = Self::decode_versions(meta, versions, |_: usize, hdr: &[u8], _: &[u8]| {
+                let mut header = FileMetaVersionHeader::default();
+                if header.unmarshal_msg(hdr).is_err() {
+                    return Err(Error::new(StorageError::DoneForNow));
+                }
+
+                is_delete_marker = header.version_type == VersionType::Delete;
+
+                Err(Error::new(StorageError::DoneForNow))
+            });
+
+            is_delete_marker
+        } else {
+            false
+        }
     }
 
     #[tracing::instrument]

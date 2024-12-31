@@ -662,7 +662,7 @@ impl MetaCacheEntry {
         !self.metadata.is_empty() && self.name.ends_with(SLASH_SEPARATOR)
     }
 
-    pub fn is_latest_deletemarker(&mut self) -> bool {
+    pub fn is_latest_delete_marker(&mut self) -> bool {
         if let Some(cached) = &self.cached {
             if cached.versions.is_empty() {
                 return true;
@@ -678,7 +678,7 @@ impl MetaCacheEntry {
         match FileMeta::check_xl2_v1(&self.metadata) {
             Ok((meta, _, _)) => {
                 if !meta.is_empty() {
-                    // TODO: IsLatestDeleteMarker
+                    return FileMeta::is_latest_delete_marker(meta);
                 }
             }
             Err(_) => return true,

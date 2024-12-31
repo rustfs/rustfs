@@ -1366,17 +1366,18 @@ impl StorageAPI for ECStore {
         for (i, res) in results.into_iter().enumerate() {
             match res {
                 Ok((pinfo, _)) => {
-                    if pinfo.object_info.delete_marker && opts.version_id.is_none() {
-                        del_objects[i] = DeletedObject {
-                            delete_marker: pinfo.object_info.delete_marker,
-                            delete_marker_version_id: pinfo.object_info.version_id.map(|v| v.to_string()),
-                            object_name: utils::path::decode_dir_object(&pinfo.object_info.name),
-                            delete_marker_mtime: pinfo.object_info.mod_time,
-                            ..Default::default()
-                        };
-                    }
-
                     if let Some(obj) = objects.get(i) {
+                        if pinfo.object_info.delete_marker && obj.version_id.is_none() {
+                            del_objects[i] = DeletedObject {
+                                delete_marker: pinfo.object_info.delete_marker,
+                                delete_marker_version_id: pinfo.object_info.version_id.map(|v| v.to_string()),
+                                object_name: utils::path::decode_dir_object(&pinfo.object_info.name),
+                                delete_marker_mtime: pinfo.object_info.mod_time,
+                                ..Default::default()
+                            };
+                            continue;
+                        }
+
                         if !pool_obj_idx_map.contains_key(&pinfo.index) {
                             pool_obj_idx_map.insert(pinfo.index, vec![obj.clone()]);
                         } else if let Some(val) = pool_obj_idx_map.get_mut(&pinfo.index) {

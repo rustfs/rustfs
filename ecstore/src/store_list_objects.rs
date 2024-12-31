@@ -692,7 +692,7 @@ async fn gather_results(
 
         // TODO: isLatestDeletemarker
         if !opts.include_directories
-            && (entry.is_dir() || (!opts.versioned && entry.is_object() && entry.is_latest_deletemarker()))
+            && (entry.is_dir() || (!opts.versioned && entry.is_object() && entry.is_latest_delete_marker()))
         {
             continue;
         }
@@ -713,7 +713,7 @@ async fn gather_results(
             }
         }
 
-        if !opts.incl_deleted && entry.is_object() && entry.is_latest_deletemarker() && entry.is_object_dir() {
+        if !opts.incl_deleted && entry.is_object() && entry.is_latest_delete_marker() && entry.is_object_dir() {
             continue;
         }
 
