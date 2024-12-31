@@ -1,5 +1,6 @@
 use super::error::{
-    is_err_file_not_found, is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files, os_is_not_exist, os_is_permission,
+    is_err_file_not_found, is_err_file_version_not_found, is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files,
+    os_is_not_exist, os_is_permission,
 };
 use super::os::{is_root_disk, rename_all};
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
@@ -560,10 +561,22 @@ impl LocalDisk {
         let volume_dir = self.get_bucket_path(volume)?;
         let xlpath = self.get_object_path(volume, format!("{}/{}", path, super::STORAGE_FORMAT_FILE).as_str())?;
 
-        let data = self
-            .read_all_data(volume, volume_dir.as_path(), &xlpath)
-            .await
-            .unwrap_or_default();
+        let data = match self.read_all_data_with_dmtime(volume, volume_dir.as_path(), &xlpath).await {
+            Ok((data, _)) => data,
+            Err(err) => {
+                if is_err_file_not_found(&err) && !skip_access_checks(volume) {
+                    if let Err(er) = access(&volume_dir).await {
+                        if os_is_not_exist(&er) {
+                            return Err(Error::new(DiskError::VolumeNotFound));
+                        }
+                    }
+
+                    return Err(Error::new(DiskError::FileNotFound));
+                }
+
+                return Err(err);
+            }
+        };
 
         if data.is_empty() {
             return Err(Error::new(DiskError::FileNotFound));
@@ -574,10 +587,22 @@ impl LocalDisk {
         fm.unmarshal_msg(&data)?;
 
         for fi in fis {
-            let data_dir = fm.delete_version(fi)?;
+            let data_dir = match fm.delete_version(fi) {
+                Ok(res) => res,
+                Err(err) => {
+                    if !fi.deleted && (is_err_file_not_found(&err) || is_err_file_version_not_found(&err)) {
+                        continue;
+                    }
 
-            if data_dir.is_some() {
-                let dir_path = self.get_object_path(volume, format!("{}/{}", path, data_dir.unwrap()).as_str())?;
+                    return Err(err);
+                }
+            };
+
+            if let Some(dir) = data_dir {
+                let vid = fi.version_id.unwrap_or(Uuid::nil());
+                let _ = fm.data.remove(vec![vid, dir]);
+
+                let dir_path = self.get_object_path(volume, format!("{}/{}", path, dir).as_str())?;
                 self.move_to_trash(&dir_path, true, false).await?;
             }
         }
@@ -761,7 +786,7 @@ impl LocalDisk {
             Ok(res) => res,
             Err(e) => {
                 if !DiskError::VolumeNotFound.is(&e) && !is_err_file_not_found(&e) {
-                    warn!("scan list_dir {}, err {:?}", &current, &e);
+                    info!("scan list_dir {}, err {:?}", &current, &e);
                 }
 
                 if opts.report_notfound && is_err_file_not_found(&e) && current == &opts.base_dir {
