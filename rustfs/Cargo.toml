@@ -41,7 +41,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
-tokio-util = { version = "0.7.12", features = ["io", "compat"] }
+tokio-util = { version = "0.7.13", features = ["io", "compat"] }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
@@ -61,7 +61,7 @@ url.workspace = true
 admin = { path = "../api/admin" }
 axum.workspace = true
 matchit = "0.8.4"
-shadow-rs = "0.36.0"
+shadow-rs = "0.37.0"
 const-str = { version = "0.5.7", features = ["std", "proc"] }
 atoi = "2.0.0"
 serde_urlencoded = "0.7.1"
@@ -79,7 +79,7 @@ futures-util.workspace = true
 # uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
 s3s.workspace = true
-clap = { version = "4.5.21", features = ["derive"] }
+clap = { version = "4.5.23", features = ["derive"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
 hyper-util = { version = "0.1.10", features = [
     "tokio",
@@ -88,5 +88,5 @@ hyper-util = { version = "0.1.10", features = [
 ] }
 transform-stream = "0.3.0"
 netif = "0.1.6"
-shadow-rs = "0.36.0"
+shadow-rs = "0.37.0"
 # pin-utils = "0.1.0"

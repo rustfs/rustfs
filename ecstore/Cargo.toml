@@ -18,7 +18,7 @@ bytes.workspace = true
 common.workspace = true
 chrono.workspace = true
 reader.workspace = true
-glob = "0.3.1"
+glob = "0.3.2"
 thiserror.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
@@ -44,7 +44,7 @@ path-absolutize = "3.1.1"
 protos.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
-tokio-util = { version = "0.7.12", features = ["io", "compat"] }
+tokio-util = { version = "0.7.13", features = ["io", "compat"] }
 crc32fast = "1.4.2"
 siphasher = "1.0.1"
 base64-simd = "0.8.0"
@@ -53,11 +53,11 @@ hex-simd = "0.8.0"
 path-clean = "1.0.1"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
-tokio-stream = "0.1.15"
+tokio-stream = "0.1.17"
 tonic.workspace = true
 tower.workspace = true
 byteorder = "1.5.0"
-xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 num = "0.4.3"
 num_cpus = "1.16"
 s3s-policy.workspace = true
