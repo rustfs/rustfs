@@ -26,7 +26,7 @@ RustFS 是一个使用 Rust 编程语言构建的高性能分布式对象存储�
 2. [MinIO的优点你们会继续保持吗？](/docs/cn/why-good.md )
 3. [为什么选择重写MinIO不是重写Ceph?](/docs/cn/why-ceph.md)
 4. [为什么是对象存储而不是块存储？](/docs/cn/why-object-storage.md)
-5. [们支持哪些语言交流？](/docs/cn/why-language.md)
+5. [支持哪些语言交流？](/docs/cn/why-language.md)
 6. [开源协议的选择？](/docs/cn/how-opensource.md)
 7. [如何加入RustFS开源？](/docs/cn/howtojoin.md)
 
