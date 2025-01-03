@@ -117,13 +117,7 @@ impl Store for ObjectStore {
         debug!("load iam config, path: {}", path.as_ref());
         let mut reader = self
             .object_api
-            .get_object_reader(
-                Self::BUCKET_NAME,
-                path.as_ref(),
-                HTTPRangeSpec::nil(),
-                Default::default(),
-                &Default::default(),
-            )
+            .get_object_reader(Self::BUCKET_NAME, path.as_ref(), None, Default::default(), &Default::default())
             .await
             .map_err(crate::Error::EcstoreError)?;
 

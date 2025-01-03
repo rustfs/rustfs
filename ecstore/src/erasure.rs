@@ -10,8 +10,8 @@ use std::fmt::Debug;
 use std::io::ErrorKind;
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::info;
 use tracing::warn;
+use tracing::{error, info};
 // use tracing::debug;
 use uuid::Uuid;
 
@@ -263,7 +263,10 @@ impl Erasure {
                 .await
             {
                 Ok(n) => n,
-                Err(err) => return (bytes_writed, Some(err)),
+                Err(err) => {
+                    error!("write_data_blocks err {:?}", &err);
+                    return (bytes_writed, Some(err));
+                }
             };
 
             bytes_writed += writed_n;
