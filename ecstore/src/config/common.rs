@@ -6,7 +6,7 @@ use super::{storageclass, Config, GLOBAL_StorageClass, KVS};
 use crate::config::error::is_not_found;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
-use crate::store_api::{HTTPRangeSpec, ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use crate::store_err::is_err_object_not_found;
 use crate::utils::path::SLASH_SEPARATOR;
 use http::HeaderMap;
@@ -31,7 +31,6 @@ lazy_static! {
 }
 pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
-
     Ok(data)
 }
 
@@ -40,10 +39,9 @@ async fn read_config_with_metadata<S: StorageAPI>(
     file: &str,
     opts: &ObjectOptions,
 ) -> Result<(Vec<u8>, ObjectInfo)> {
-    let range = HTTPRangeSpec::nil();
     let h = HeaderMap::new();
     let mut rd = api
-        .get_object_reader(RUSTFS_META_BUCKET, file, range, h, opts)
+        .get_object_reader(RUSTFS_META_BUCKET, file, None, h, opts)
         .await
         .map_err(|err| {
             if is_err_object_not_found(&err) {
