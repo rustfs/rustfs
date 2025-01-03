@@ -903,7 +903,9 @@ impl LocalDisk {
                         .await?;
 
                         if opts.recursive {
-                            if let Err(er) = Box::pin(self.scan_dir(&mut pop.clone(), opts, out, objs_returned)).await {
+                            let mut opts = opts.clone();
+                            opts.filter_prefix = None;
+                            if let Err(er) = Box::pin(self.scan_dir(&mut pop.clone(), &opts, out, objs_returned)).await {
                                 error!("scan_dir err {:?}", er);
                             }
                         }
@@ -970,7 +972,9 @@ impl LocalDisk {
 
             if opts.recursive {
                 let mut dir = dir;
-                if let Err(er) = Box::pin(self.scan_dir(&mut dir, opts, out, objs_returned)).await {
+                let mut opts = opts.clone();
+                opts.filter_prefix = None;
+                if let Err(er) = Box::pin(self.scan_dir(&mut dir, &opts, out, objs_returned)).await {
                     warn!("scan_dir err {:?}", &er);
                 }
             }
