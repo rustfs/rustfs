@@ -358,7 +358,7 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
     let mut bm = match read_bucket_metadata(api.clone(), bucket).await {
         Ok(res) => res,
         Err(err) => {
-            if !config::error::is_not_found(&err) {
+            if !config::error::is_err_config_not_found(&err) {
                 return Err(err);
             }
 

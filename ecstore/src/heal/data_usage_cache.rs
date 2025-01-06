@@ -18,6 +18,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
+use tracing::warn;
 
 use super::data_scanner::{SizeSummary, DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS};
 use super::data_usage::{BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo, DATA_USAGE_ROOT};
@@ -379,6 +380,7 @@ impl DataUsageCache {
         let mut retries = 0;
         while retries < 5 {
             let path = Path::new(BUCKET_META_PREFIX).join(name);
+            warn!("Loading data usage cache from backend: {}", path.display());
             match store
                 .get_object_reader(
                     RUSTFS_META_BUCKET,
@@ -398,37 +400,42 @@ impl DataUsageCache {
                     }
                     break;
                 }
-                Err(err) => match err.downcast_ref::<DiskError>() {
-                    Some(DiskError::FileNotFound) | Some(DiskError::VolumeNotFound) => {
-                        match store
-                            .get_object_reader(
-                                RUSTFS_META_BUCKET,
-                                name,
-                                None,
-                                HeaderMap::new(),
-                                &ObjectOptions {
-                                    no_lock: true,
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                        {
-                            Ok(mut reader) => {
-                                if let Ok(info) = Self::unmarshal(&reader.read_all().await?) {
-                                    d = info
-                                }
-                                break;
-                            }
-                            Err(_) => match err.downcast_ref::<DiskError>() {
-                                Some(DiskError::FileNotFound) | Some(DiskError::VolumeNotFound) => {
+                Err(err) => {
+                    warn!("Failed to load data usage cache from backend: {}", &err);
+                    match err.downcast_ref::<DiskError>() {
+                        Some(DiskError::FileNotFound) | Some(DiskError::VolumeNotFound) => {
+                            match store
+                                .get_object_reader(
+                                    RUSTFS_META_BUCKET,
+                                    name,
+                                    None,
+                                    HeaderMap::new(),
+                                    &ObjectOptions {
+                                        no_lock: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(mut reader) => {
+                                    if let Ok(info) = Self::unmarshal(&reader.read_all().await?) {
+                                        d = info
+                                    }
                                     break;
                                 }
-                                _ => {}
-                            },
+                                Err(_) => match err.downcast_ref::<DiskError>() {
+                                    Some(DiskError::FileNotFound) | Some(DiskError::VolumeNotFound) => {
+                                        break;
+                                    }
+                                    _ => {}
+                                },
+                            }
+                        }
+                        _ => {
+                            break;
                         }
                     }
-                    _ => {}
-                },
+                }
             }
             retries += 1;
             let dur = {
@@ -446,11 +453,14 @@ impl DataUsageCache {
         let buf_clone = buf.clone();
 
         let store_clone = store.clone();
-        let name_clone = name.to_string();
+
+        let name = Path::new(BUCKET_META_PREFIX).join(name).to_string_lossy().to_string();
+
+        let name_clone = name.clone();
         tokio::spawn(async move {
             let _ = save_config(store_clone, &format!("{}{}", &name_clone, ".bkp"), &buf_clone).await;
         });
-        save_config(store, name, &buf).await
+        save_config(store, &name, &buf).await
     }
 
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {

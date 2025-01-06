@@ -116,7 +116,7 @@ pub struct StorageInfo {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct BackendDisks(HashMap<String, usize>);
+pub struct BackendDisks(pub HashMap<String, usize>);
 
 impl BackendDisks {
     pub fn new() -> Self {
@@ -147,4 +147,178 @@ pub struct BackendInfo {
     pub rr_sc_parity: Option<usize>,
     pub total_sets: Vec<usize>,
     pub drives_per_set: Vec<usize>,
+}
+
+pub const ITEM_OFFLINE: &str = "offline";
+pub const ITEM_INITIALIZING: &str = "initializing";
+pub const ITEM_ONLINE: &str = "online";
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct MemStats {
+    pub alloc: u64,
+    pub total_alloc: u64,
+    pub mallocs: u64,
+    pub frees: u64,
+    pub heap_alloc: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ServerProperties {
+    pub state: String,
+    pub endpoint: String,
+    pub scheme: String,
+    pub uptime: u64,
+    pub version: String,
+    #[serde(rename = "commitID")]
+    pub commit_id: String,
+    pub network: HashMap<String, String>,
+    #[serde(rename = "drives")]
+    pub disks: Vec<Disk>,
+    #[serde(rename = "poolNumber")]
+    pub pool_number: i32,
+    #[serde(rename = "poolNumbers")]
+    pub pool_numbers: Vec<i32>,
+    pub mem_stats: MemStats,
+    pub max_procs: u64,
+    pub num_cpu: u64,
+    pub runtime_version: String,
+    pub rustfs_env_vars: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Kms {
+    pub status: Option<String>,
+    pub encrypt: Option<String>,
+    pub decrypt: Option<String>,
+    pub endpoint: Option<String>,
+    pub version: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Ldap {
+    pub status: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Status {
+    pub status: Option<String>,
+}
+
+pub type Audit = HashMap<String, Status>;
+
+pub type Logger = HashMap<String, Status>;
+
+pub type TargetIDStatus = HashMap<String, Status>;
+
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct Services {
+    pub kms: Option<Kms>, // deprecated july 2023
+    #[serde(rename = "kmsStatus")]
+    pub kms_status: Option<Vec<Kms>>,
+    pub ldap: Option<Ldap>,
+    pub logger: Option<Vec<Logger>>,
+    pub audit: Option<Vec<Audit>>,
+    pub notifications: Option<Vec<HashMap<String, Vec<TargetIDStatus>>>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Buckets {
+    pub count: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Objects {
+    pub count: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Versions {
+    pub count: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct DeleteMarkers {
+    pub count: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Usage {
+    pub size: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct ErasureSetInfo {
+    pub id: i32,
+    #[serde(rename = "rawUsage")]
+    pub raw_usage: u64,
+    #[serde(rename = "rawCapacity")]
+    pub raw_capacity: u64,
+    pub usage: u64,
+    #[serde(rename = "objectsCount")]
+    pub objects_count: u64,
+    #[serde(rename = "versionsCount")]
+    pub versions_count: u64,
+    #[serde(rename = "deleteMarkersCount")]
+    pub delete_markers_count: u64,
+    #[serde(rename = "healDisks")]
+    pub heal_disks: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub enum BackendType {
+    #[default]
+    #[serde(rename = "FS")]
+    FsType,
+    #[serde(rename = "Erasure")]
+    ErasureType,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FSBackend {
+    #[serde(rename = "backendType")]
+    pub backend_type: BackendType,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct ErasureBackend {
+    #[serde(rename = "backendType")]
+    pub backend_type: BackendType,
+    #[serde(rename = "onlineDisks")]
+    pub online_disks: usize,
+    #[serde(rename = "offlineDisks")]
+    pub offline_disks: usize,
+    #[serde(rename = "standardSCParity")]
+    pub standard_sc_parity: Option<usize>,
+    #[serde(rename = "rrSCParity")]
+    pub rr_sc_parity: Option<usize>,
+    #[serde(rename = "totalSets")]
+    pub total_sets: Vec<usize>,
+    #[serde(rename = "totalDrivesPerSet")]
+    pub drives_per_set: Vec<usize>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct InfoMessage {
+    pub mode: Option<String>,
+    pub domain: Option<Vec<String>>,
+    pub region: Option<String>,
+    #[serde(rename = "sqsARN")]
+    pub sqs_arn: Option<Vec<String>>,
+    #[serde(rename = "deploymentID")]
+    pub deployment_id: Option<String>,
+    pub buckets: Option<Buckets>,
+    pub objects: Option<Objects>,
+    pub versions: Option<Versions>,
+    #[serde(rename = "deletemarkers")]
+    pub delete_markers: Option<DeleteMarkers>,
+    pub usage: Option<Usage>,
+    pub services: Option<Services>,
+    pub backend: Option<ErasureBackend>,
+    pub servers: Option<Vec<ServerProperties>>,
+    pub pools: Option<std::collections::HashMap<i32, std::collections::HashMap<i32, ErasureSetInfo>>>,
 }
