@@ -6,8 +6,6 @@ use std::{
     time::Duration,
 };
 
-use crate::config::error::is_not_found;
-use crate::global::GLOBAL_MRFState;
 use crate::{
     bitrot::{bitrot_verify, close_bitrot_writers, new_bitrot_filereader, new_bitrot_filewriter, BitrotFileWriter},
     cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
@@ -52,6 +50,7 @@ use crate::{
     },
     xhttp,
 };
+use crate::{config::error::is_err_config_not_found, global::GLOBAL_MRFState};
 use crate::{disk::STORAGE_FORMAT_FILE, heal::mrf::PartialOperation};
 use crate::{file_meta::file_info_from_raw, heal::data_usage_cache::DataUsageCache};
 use crate::{
@@ -1894,7 +1893,7 @@ impl SetDisks {
                                     version_id: fi.version_id.map(|v| v.to_string()),
                                     set_index,
                                     pool_index,
-                                    bitrot_scan: !is_not_found(e),
+                                    bitrot_scan: !is_err_config_not_found(e),
                                     ..Default::default()
                                 })
                                 .await;

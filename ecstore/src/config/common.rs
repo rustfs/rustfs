@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::error::ConfigError;
+use super::error::{is_err_config_not_found, ConfigError};
 use super::{storageclass, Config, GLOBAL_StorageClass, KVS};
-use crate::config::error::is_not_found;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
@@ -102,7 +101,7 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
     let data = match read_config(api.clone(), config_file.as_str()).await {
         Ok(res) => res,
         Err(err) => {
-            if is_not_found(&err) {
+            if is_err_config_not_found(&err) {
                 warn!("config not found, start to init");
                 let cfg = new_and_save_server_config(api).await?;
                 warn!("config init done");
@@ -124,7 +123,7 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
             let cfg_data = match read_config(api.clone(), config_file.as_str()).await {
                 Ok(res) => res,
                 Err(err) => {
-                    if is_not_found(&err) {
+                    if is_err_config_not_found(&err) {
                         warn!("config not found init start");
                         let cfg = new_and_save_server_config(api).await?;
                         warn!("config not found init done");

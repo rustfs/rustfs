@@ -1,12 +1,14 @@
 use super::router::Operation;
 use crate::storage::error::to_s3_error;
 use bytes::Bytes;
+use ecstore::admin_server_info::get_server_info;
 use ecstore::bucket::policy::action::{Action, ActionSet};
 use ecstore::bucket::policy::bucket_policy::{BPStatement, BucketPolicy};
 use ecstore::bucket::policy::effect::Effect;
 use ecstore::bucket::policy::resource::{Resource, ResourceSet};
 use ecstore::error::Error as ec_Error;
 use ecstore::global::GLOBAL_ALlHealState;
+use ecstore::heal::data_usage::load_data_usage_from_backend;
 use ecstore::heal::heal_commands::HealOpts;
 use ecstore::heal::heal_ops::new_heal_sequence;
 use ecstore::metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType};
@@ -47,6 +49,7 @@ use tracing::{error, info, warn};
 
 pub mod service_account;
 pub mod trace;
+pub mod user;
 
 const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_VERSION: &str = "2011-06-15";
@@ -271,7 +274,12 @@ impl Operation for ServerInfoHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ServerInfoHandler");
 
-        return Err(s3_error!(NotImplemented));
+        let info = get_server_info(true).await;
+
+        let output = serde_json::to_string(&info)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed"))?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
     }
 }
 
@@ -315,7 +323,19 @@ impl Operation for DataUsageInfoHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle DataUsageInfoHandler");
 
-        return Err(s3_error!(NotImplemented));
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let info = load_data_usage_from_backend(store).await.map_err(|e| {
+            error!("load_data_usage_from_backend failed {:?}", e);
+            s3_error!(InternalError, "load_data_usage_from_backend failed")
+        })?;
+
+        let output = serde_json::to_string(&info)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed"))?;
+
+        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
     }
 }
 

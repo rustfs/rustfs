@@ -1,9 +1,9 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use ecstore::{
-    config::error::is_not_found,
+    config::error::is_err_config_not_found,
     store::ECStore,
-    store_api::{HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader},
+    store_api::{ObjectIO, ObjectInfo, ObjectOptions, PutObjReader},
     utils::path::dir,
     StorageAPI,
 };
@@ -59,7 +59,7 @@ impl ObjectStore {
                 match items {
                     Ok(items) => Result::<_, crate::Error>::Ok(items.prefixes),
                     Err(e) => {
-                        if is_not_found(&e) {
+                        if is_err_config_not_found(&e) {
                             Result::<_, crate::Error>::Ok(vec![])
                         } else {
                             Err(Error::StringError(format!("list {prefix} failed, err: {e:?}")))
@@ -290,7 +290,7 @@ impl Store for ObjectStore {
 
                             match self.load_mapped_policy(UserType::Sts, parent.as_str(), false).await {
                                 Ok(m) => sts_policies.lock().await.insert(name.to_owned(), m),
-                                Err(Error::EcstoreError(e)) if is_not_found(&e) => return Ok(()),
+                                Err(Error::EcstoreError(e)) if is_err_config_not_found(&e) => return Ok(()),
                                 Err(e) => return Err(e),
                             };
                         }

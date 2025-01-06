@@ -31,7 +31,7 @@ impl ConfigError {
     }
 }
 
-pub fn is_not_found(err: &Error) -> bool {
+pub fn is_err_config_not_found(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<ConfigError>() {
         ConfigError::is_not_found(e)
     } else if let Some(e) = err.downcast_ref::<disk::error::DiskError>() {
