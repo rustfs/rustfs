@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
 use crate::global::get_global_endpoints;
@@ -7,6 +5,8 @@ use crate::peer_rest_client::PeerRestClient;
 use crate::StorageAPI;
 use futures::future::join_all;
 use lazy_static::lazy_static;
+use madmin::{ItemState, ServerProperties};
+use std::sync::OnceLock;
 use tracing::error;
 
 lazy_static! {
@@ -93,6 +93,30 @@ impl NotificationSys {
 
         let backend = api.backend_info().await;
         madmin::StorageInfo { disks, backend }
+    }
+
+    pub async fn server_info(&self) -> Vec<ServerProperties> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+
+        for client in self.peer_clients.iter() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client.server_info().await {
+                        Ok(info) => info,
+                        Err(_) => ServerProperties {
+                            endpoint: client.host.to_string(),
+                            state: ItemState::Offline.to_string().to_owned(),
+                            disks: get_offline_disks(&client.host.to_string(), &get_global_endpoints()),
+                            ..Default::default()
+                        },
+                    }
+                } else {
+                    ServerProperties::default()
+                }
+            });
+        }
+
+        join_all(futures).await
     }
 
     pub async fn reload_pool_meta(&self) {

@@ -4,8 +4,9 @@ pub mod router;
 
 use common::error::Result;
 // use ecstore::global::{is_dist_erasure, is_erasure};
-use handlers::service_account::{
-    AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount,
+use handlers::{
+    service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
+    user,
 };
 use hyper::Method;
 use router::{AdminOperation, S3Router};
@@ -14,19 +15,19 @@ use s3s::route::S3Route;
 const ADMIN_PREFIX: &str = "/rustfs/admin";
 
 pub fn make_admin_route() -> Result<impl S3Route> {
-    let mut r = S3Router::new();
+    let mut r: S3Router<AdminOperation> = S3Router::new();
 
+    // 1
     r.insert(Method::POST, "/", AdminOperation(&handlers::AssumeRoleHandle {}))?;
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/accountinfo").as_str(),
-        AdminOperation(&handlers::AccountInfoHandler {}),
-    )?;
+
+    regist_user_route(&mut r)?;
+
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/service").as_str(),
         AdminOperation(&handlers::ServiceHandle {}),
     )?;
+    // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info").as_str(),
@@ -42,11 +43,13 @@ pub fn make_admin_route() -> Result<impl S3Route> {
         format!("{}{}", ADMIN_PREFIX, "/v3/inspect-data").as_str(),
         AdminOperation(&handlers::InspectDataHandler {}),
     )?;
+    // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/storageinfo").as_str(),
         AdminOperation(&handlers::StorageInfoHandler {}),
     )?;
+    // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/datausageinfo").as_str(),
@@ -58,21 +61,25 @@ pub fn make_admin_route() -> Result<impl S3Route> {
         AdminOperation(&handlers::MetricsHandler {}),
     )?;
 
+    // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/list").as_str(),
         AdminOperation(&handlers::ListPools {}),
     )?;
+    // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/status").as_str(),
         AdminOperation(&handlers::StatusPool {}),
     )?;
+    // todo
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/decommission").as_str(),
         AdminOperation(&handlers::StartDecommission {}),
     )?;
+    // todo
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/cancel").as_str(),
@@ -109,6 +116,28 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     )?;
     // }
 
+    Ok(r)
+}
+
+fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
+    // 1
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/accountinfo").as_str(),
+        AdminOperation(&handlers::AccountInfoHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/add-user").as_str(),
+        AdminOperation(&user::AddUser {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-user-status").as_str(),
+        AdminOperation(&user::SetUserStatus {}),
+    )?;
+
+    // Service accounts
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/update-service-account").as_str(),
@@ -139,5 +168,5 @@ pub fn make_admin_route() -> Result<impl S3Route> {
         AdminOperation(&AddServiceAccount {}),
     )?;
 
-    Ok(r)
+    Ok(())
 }

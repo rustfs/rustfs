@@ -1,14 +1,20 @@
-use std::{collections::HashMap, time::SystemTime};
-
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::mpsc::Receiver;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
-    config::common::save_config,
+    bucket::metadata_sys::get_replication_config,
+    config::{
+        common::{read_config, save_config},
+        error::is_err_config_not_found,
+    },
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    error::Result,
     new_object_layer_fn,
+    store::ECStore,
+    store_err::to_object_err,
     utils::path::SLASH_SEPARATOR,
 };
 
@@ -132,4 +138,73 @@ pub async fn store_data_usage_in_backend(mut rx: Receiver<DataUsageInfo>) {
             }
         }
     }
+}
+
+// TODO: cancel ctx
+pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo> {
+    let buf = match read_config(store, &DATA_USAGE_OBJ_NAME_PATH).await {
+        Ok(data) => data,
+        Err(e) => {
+            error!("Failed to read data usage info from backend: {}", e);
+            if is_err_config_not_found(&e) {
+                return Ok(DataUsageInfo::default());
+            }
+
+            return Err(to_object_err(e, vec![RUSTFS_META_BUCKET, &DATA_USAGE_OBJ_NAME_PATH]));
+        }
+    };
+
+    let mut data_usage_info: DataUsageInfo = serde_json::from_slice(&buf)?;
+
+    warn!("Loaded data usage info from backend {:?}", &data_usage_info);
+
+    if data_usage_info.buckets_usage.is_empty() {
+        data_usage_info.buckets_usage = data_usage_info
+            .bucket_sizes
+            .iter()
+            .map(|(bucket, &size)| {
+                (
+                    bucket.clone(),
+                    BucketUsageInfo {
+                        size,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+    }
+
+    if data_usage_info.bucket_sizes.is_empty() {
+        data_usage_info.bucket_sizes = data_usage_info
+            .buckets_usage
+            .iter()
+            .map(|(bucket, bui)| (bucket.clone(), bui.size))
+            .collect();
+    }
+
+    for (bucket, bui) in &data_usage_info.buckets_usage {
+        if bui.replicated_size_v1 > 0
+            || bui.replication_failed_count_v1 > 0
+            || bui.replication_failed_size_v1 > 0
+            || bui.replication_pending_count_v1 > 0
+        {
+            if let Ok((cfg, _)) = get_replication_config(bucket).await {
+                if !cfg.role.is_empty() {
+                    data_usage_info.replication_info.insert(
+                        cfg.role.clone(),
+                        BucketTargetUsageInfo {
+                            replication_failed_size: bui.replication_failed_size_v1,
+                            replication_failed_count: bui.replication_failed_count_v1,
+                            replicated_size: bui.replicated_size_v1,
+                            replication_pending_count: bui.replication_pending_count_v1,
+                            replication_pending_size: bui.replication_pending_size_v1,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(data_usage_info)
 }
