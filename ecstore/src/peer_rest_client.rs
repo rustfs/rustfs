@@ -1,7 +1,4 @@
-use std::{collections::HashMap, io::Cursor, time::SystemTime};
-
 use crate::{
-    admin_server_info::ServerProperties,
     endpoints::EndpointServerPools,
     global::is_dist_erasure,
     heal::heal_commands::BgHealState,
@@ -13,6 +10,7 @@ use madmin::{
     health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysService},
     metrics::RealtimeMetrics,
     net::NetInfo,
+    ServerProperties,
 };
 use protos::{
     node_service_time_out_client,
@@ -28,6 +26,7 @@ use protos::{
 };
 use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize as _};
+use std::{collections::HashMap, io::Cursor, time::SystemTime};
 use tonic::Request;
 use tracing::warn;
 

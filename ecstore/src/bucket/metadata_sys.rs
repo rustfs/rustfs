@@ -253,7 +253,7 @@ impl BucketMetadataSys {
             let meta = match self.get_config_from_disk(bucket).await {
                 Ok(res) => res,
                 Err(err) => {
-                    if !config::error::is_not_found(&err) {
+                    if !config::error::is_err_config_not_found(&err) {
                         return Err(err);
                     } else {
                         BucketMetadata::new(bucket)
@@ -357,7 +357,7 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_versioning_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Ok((VersioningConfiguration::default(), OffsetDateTime::UNIX_EPOCH));
                 } else {
                     return Err(err);
@@ -377,7 +377,7 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_bucket_policy err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::BucketPolicyNotFound));
                 } else {
                     return Err(err);
@@ -397,7 +397,7 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_tagging_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::TaggingNotFound));
                 } else {
                     return Err(err);
@@ -417,7 +417,7 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_object_lock_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::BucketObjectLockConfigNotFound));
                 } else {
                     return Err(err);
@@ -437,7 +437,7 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_lifecycle_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::BucketLifecycleNotFound));
                 } else {
                     return Err(err);
@@ -461,7 +461,7 @@ impl BucketMetadataSys {
             Ok((bm, _)) => bm.notification_config.clone(),
             Err(err) => {
                 warn!("get_notification_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     None
                 } else {
                     return Err(err);
@@ -477,7 +477,7 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_sse_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::BucketSSEConfigNotFound));
                 } else {
                     return Err(err);
@@ -508,7 +508,7 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_quota_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::BucketQuotaConfigNotFound));
                 } else {
                     return Err(err);
@@ -528,7 +528,7 @@ impl BucketMetadataSys {
             Ok(res) => res,
             Err(err) => {
                 warn!("get_replication_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::BucketReplicationConfigNotFound));
                 } else {
                     return Err(err);
@@ -552,7 +552,7 @@ impl BucketMetadataSys {
             Ok(res) => res,
             Err(err) => {
                 warn!("get_replication_config err {:?}", &err);
-                if config::error::is_not_found(&err) {
+                if config::error::is_err_config_not_found(&err) {
                     return Err(Error::new(BucketMetadataError::BucketRemoteTargetNotFound));
                 } else {
                     return Err(err);
