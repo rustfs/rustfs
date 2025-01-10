@@ -58,7 +58,7 @@ use tokio::select;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::{interval, sleep};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const MAX_UPLOADS_LIST: usize = 10000;
@@ -1223,8 +1223,10 @@ impl StorageAPI for ECStore {
         let mut buckets = self.peer_sys.list_bucket(opts).await?;
 
         if !opts.no_metadata {
+            warn!("list_bucket meta");
             for bucket in buckets.iter_mut() {
                 if let Ok(created) = metadata_sys::created_at(&bucket.name).await {
+                    warn!("list_bucket created {:?}", &created);
                     bucket.created = Some(created);
                 }
             }
@@ -1287,9 +1289,7 @@ impl StorageAPI for ECStore {
 
         let mut meta = BucketMetadata::new(bucket);
 
-        if let Some(crd) = opts.created_at {
-            meta.set_created(crd);
-        }
+        meta.set_created(opts.created_at);
 
         if opts.lock_enabled {
             meta.object_lock_config_xml = xml::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
