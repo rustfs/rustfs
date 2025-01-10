@@ -33,6 +33,7 @@ use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr, str::FromStr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
+use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -166,7 +167,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
 
-        let hybrid_service = TowerToHyperService::new(hybrid(hyper_service, rpc_service));
+        let hybrid_service = TowerToHyperService::new(
+            tower::ServiceBuilder::new()
+                .layer(CorsLayer::very_permissive())
+                .service(hybrid(hyper_service, rpc_service)),
+        );
 
         let http_server = ConnBuilder::new(TokioExecutor::new());
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());

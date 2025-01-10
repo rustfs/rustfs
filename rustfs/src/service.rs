@@ -77,6 +77,19 @@ pin_project! {
     }
 }
 
+impl<RestBody, GrpcBody> Default for HybridBody<RestBody, GrpcBody>
+where
+    RestBody: Default,
+
+    GrpcBody: Default,
+{
+    fn default() -> Self {
+        Self::Rest {
+            rest_body: RestBody::default(),
+        }
+    }
+}
+
 impl<RestBody, GrpcBody> http_body::Body for HybridBody<RestBody, GrpcBody>
 where
     RestBody: http_body::Body + Send + Unpin,

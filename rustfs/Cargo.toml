@@ -68,6 +68,7 @@ serde_urlencoded = "0.7.1"
 crypto = { path = "../crypto" }
 iam = { path = "../iam" }
 jsonwebtoken = "9.3.0"
+tower-http = { version = "0.6.2", features = ["cors"] }
 
 [build-dependencies]
 prost-build.workspace = true
