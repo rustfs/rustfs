@@ -287,8 +287,13 @@ impl BucketMetadata {
         Ok(updated)
     }
 
-    pub fn set_created(&mut self, created: OffsetDateTime) {
-        self.created = created
+    pub fn set_created(&mut self, created: Option<OffsetDateTime>) {
+        self.created = {
+            match created {
+                Some(t) => t,
+                None => OffsetDateTime::now_utc(),
+            }
+        }
     }
 
     pub async fn save(&mut self) -> Result<()> {
