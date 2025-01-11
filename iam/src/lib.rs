@@ -104,3 +104,8 @@ pub async fn list_users() -> crate::Result<HashMap<String, madmin::UserInfo>> {
 pub async fn get_user(ak: &str) -> crate::Result<(Option<UserIdentity>, bool)> {
     get()?.check_key(ak).await
 }
+
+pub async fn create_user(ak: &str, sk: &str, status: &str) -> crate::Result<OffsetDateTime> {
+    get()?.add_user(ak, sk, status).await
+    // notify
+}
