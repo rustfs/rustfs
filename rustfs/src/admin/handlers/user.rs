@@ -22,6 +22,7 @@ pub struct AddUser {}
 #[async_trait::async_trait]
 impl Operation for AddUser {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle AddUser");
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
@@ -61,7 +62,6 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "can't create user with service account access key"));
         }
 
-        warn!("handle AddUser");
         return Err(s3_error!(NotImplemented));
     }
 }

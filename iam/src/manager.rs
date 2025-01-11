@@ -310,7 +310,7 @@ where
         Ok(m)
     }
 
-    pub async fn add_user(&self, access_key: &str, secret_key: &str, status: &str) -> crate::Result<()> {
+    pub async fn add_user(&self, access_key: &str, secret_key: &str, status: &str) -> crate::Result<OffsetDateTime> {
         let status = {
             match status {
                 "disabled" => auth::ACCOUNT_ON,
@@ -319,6 +319,34 @@ where
             }
         };
 
-        todo!()
+        let users = self.cache.users.load();
+        if let Some(x) = users.get(access_key) {
+            if x.credentials.is_temp() {
+                return Err(crate::Error::IAMActionNotAllowed);
+            }
+        }
+
+        let user_entiry = UserIdentity::from(Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            status: status.to_string(),
+            ..Default::default()
+        });
+        let path = format!(
+            "config/iam/{}{}/identity.json",
+            UserType::Reg.prefix(),
+            user_entiry.credentials.access_key
+        );
+        debug!("save object: {path:?}");
+        self.api.save_iam_config(&user_entiry, path).await?;
+
+        Cache::add_or_update(
+            &self.cache.users,
+            &user_entiry.credentials.access_key,
+            &user_entiry,
+            OffsetDateTime::now_utc(),
+        );
+
+        Ok(user_entiry.update_at.unwrap_or(OffsetDateTime::now_utc()))
     }
 }

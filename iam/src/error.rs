@@ -46,6 +46,8 @@ pub enum Error {
 
     #[error("invalid access_key")]
     InvalidAccessKey,
+    #[error("action not allowed")]
+    IAMActionNotAllowed,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
