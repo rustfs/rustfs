@@ -126,13 +126,32 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
         format!("{}{}", ADMIN_PREFIX, "/v3/accountinfo").as_str(),
         AdminOperation(&handlers::AccountInfoHandler {}),
     )?;
+
     r.insert(
         Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-users").as_str(),
+        AdminOperation(&user::ListUsers {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/user-info").as_str(),
+        AdminOperation(&user::GetUserInfo {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/remove-user").as_str(),
+        AdminOperation(&user::RemoveUser {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-user").as_str(),
         AdminOperation(&user::AddUser {}),
     )?;
     r.insert(
-        Method::GET,
+        Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-status").as_str(),
         AdminOperation(&user::SetUserStatus {}),
     )?;

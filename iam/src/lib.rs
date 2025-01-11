@@ -3,7 +3,10 @@ use ecstore::store::ECStore;
 use log::debug;
 use manager::IamCache;
 use policy::{Args, Policy};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use store::object::ObjectStore;
 use time::OffsetDateTime;
 
@@ -85,6 +88,19 @@ pub async fn add_service_account(cred: Credentials) -> crate::Result<OffsetDateT
     get()?.add_service_account(cred).await
 }
 
-pub async fn check_key(ak: &str) -> crate::Result<Option<UserIdentity>> {
+pub async fn check_key(ak: &str) -> crate::Result<(Option<UserIdentity>, bool)> {
+    if let Some(sys_cred) = get_global_action_cred() {
+        if sys_cred.access_key == ak {
+            return Ok((Some(UserIdentity::new(sys_cred)), true));
+        }
+    }
+    get()?.check_key(ak).await
+}
+
+pub async fn list_users() -> crate::Result<HashMap<String, madmin::UserInfo>> {
+    get()?.get_users().await
+}
+
+pub async fn get_user(ak: &str) -> crate::Result<(Option<UserIdentity>, bool)> {
     get()?.check_key(ak).await
 }

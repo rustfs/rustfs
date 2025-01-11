@@ -22,7 +22,8 @@ use ecstore::GLOBAL_Endpoints;
 use futures::{Stream, StreamExt};
 use http::Uri;
 use hyper::StatusCode;
-use iam::get_global_action_cred;
+use iam::auth::create_new_credentials_with_metadata;
+use iam::{auth, get_global_action_cred};
 use madmin::metrics::RealtimeMetrics;
 use madmin::utils::parse_duration;
 use matchit::Params;
@@ -107,6 +108,63 @@ fn get_token_signing_key() -> Option<String> {
     }
 }
 
+pub async fn check_key_valid(st: &str, ak: &str) -> S3Result<(auth::Credentials, bool)> {
+    let Some(mut cred) = get_global_action_cred() else {
+        return Err(s3_error!(InternalError, "action cred not init"));
+    };
+
+    if cred.access_key != ak {
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+
+        match iam_store
+            .check_key(ak)
+            .await
+            .map_err(|_e| s3_error!(InternalError, "check key failed"))?
+        {
+            (Some(u), true) => {
+                cred = u.credentials;
+            }
+            (Some(u), false) => {
+                if u.credentials.status == "off" {
+                    return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
+                }
+
+                return Err(s3_error!(InvalidRequest, "check key failed"));
+            }
+            _ => {
+                return Err(s3_error!(InvalidRequest, "check key failed"));
+            }
+        }
+
+        return Ok((cred, true));
+    }
+    unimplemented!()
+}
+
+pub fn check_claims_from_token(token: &str, cred: &auth::Credentials) -> crate::Result<HashMap<String, Vec<String>>> {
+    // if !token.is_empty() && cred.access_key.is_empty() {
+    //     return Err(Error::NoAccessKey);
+    // }
+
+    // if token.is_empty() && cred.is_temp() && !cred.is_service_account() {
+    //     return Err(Error::InvalidToken);
+    // }
+
+    // if !token.is_empty() && !cred.is_temp() {
+    //     return Err(Error::InvalidToken);
+    // }
+
+    // if !cred.is_service_account() && cred.is_temp() && token != cred.session_token {
+    //     return Err(Error::InvalidToken);
+    // }
+
+    // if cred.is_temp() || cred.is_expired() {
+    //     return Err(Error::InvalidAccessKey);
+    // }
+
+    unimplemented!()
+}
+
 pub struct AssumeRoleHandle {}
 #[async_trait::async_trait]
 impl Operation for AssumeRoleHandle {
@@ -164,7 +222,7 @@ impl Operation for AssumeRoleHandle {
 
         claims.access_key = ak.clone();
 
-        let mut cred = match iam::auth::Credentials::create_new_credentials_with_metadata(&ak, &sk, &claims, &secret, Some(exp)) {
+        let mut cred = match create_new_credentials_with_metadata(&ak, &sk, &claims, &secret, Some(exp)) {
             Ok(res) => res,
             Err(_er) => return Err(s3_error!(InvalidRequest, "")),
         };
