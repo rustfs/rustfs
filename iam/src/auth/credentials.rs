@@ -100,7 +100,7 @@ pub struct Credentials {
     pub status: String,
     pub parent_user: String,
     pub groups: Option<Vec<String>>,
-    pub claims: Option<HashMap<String, Vec<String>>>,
+    pub claims: Option<HashMap<String, String>>,
     pub name: Option<String>,
     pub description: Option<String>,
 }

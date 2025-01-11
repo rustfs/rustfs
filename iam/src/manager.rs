@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::{
     arn::ARN,
-    auth::{Credentials, UserIdentity},
+    auth::{self, Credentials, UserIdentity},
     cache::Cache,
     format::Format,
     handler::Handler,
@@ -308,5 +308,17 @@ where
         }
 
         Ok(m)
+    }
+
+    pub async fn add_user(&self, access_key: &str, secret_key: &str, status: &str) -> crate::Result<()> {
+        let status = {
+            match status {
+                "disabled" => auth::ACCOUNT_ON,
+                auth::ACCOUNT_ON => auth::ACCOUNT_ON,
+                _ => auth::ACCOUNT_OFF,
+            }
+        };
+
+        todo!()
     }
 }

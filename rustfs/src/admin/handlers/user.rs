@@ -7,7 +7,10 @@ use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;
 
-use crate::admin::router::Operation;
+use crate::admin::{
+    handlers::{check_key_valid, get_session_token},
+    router::Operation,
+};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AddUserQuery {
@@ -29,6 +32,10 @@ impl Operation for AddUser {
             }
         };
 
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
         let ak = query.access_key.as_deref().unwrap_or_default();
 
         if let Some(sys_cred) = get_global_action_cred() {
@@ -44,6 +51,14 @@ impl Operation for AddUser {
             if user.credentials.is_temp() || user.credentials.is_service_account() {
                 return Err(s3_error!(InvalidArgument, "can't create user with service account access key"));
             }
+        }
+
+        let token = get_session_token(&req.headers);
+
+        let (cred, _) = check_key_valid(token, &input_cred.access_key).await?;
+
+        if (cred.is_temp() || cred.is_service_account()) && cred.parent_user == input_cred.access_key {
+            return Err(s3_error!(InvalidArgument, "can't create user with service account access key"));
         }
 
         warn!("handle AddUser");
