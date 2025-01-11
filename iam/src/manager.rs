@@ -8,7 +8,7 @@ use std::{
 };
 
 use ecstore::store_err::is_err_object_not_found;
-use log::debug;
+use log::{debug, warn};
 use time::OffsetDateTime;
 use tokio::{
     select,
@@ -188,7 +188,7 @@ where
             OffsetDateTime::now_utc(),
         );
 
-        Ok(user_entiry.update_at)
+        Ok(user_entiry.update_at.unwrap_or(OffsetDateTime::now_utc()))
     }
 
     pub async fn is_allowed<'a>(&self, args: Args<'a>) -> bool {
@@ -209,7 +209,7 @@ where
         Ok((u.clone(), None))
     }
 
-    pub async fn check_key(&self, ak: &str) -> crate::Result<Option<UserIdentity>> {
+    pub async fn check_key(&self, ak: &str) -> crate::Result<(Option<UserIdentity>, bool)> {
         let user = self
             .cache
             .users
@@ -219,8 +219,14 @@ where
             .or_else(|| self.cache.sts_accounts.load().get(ak).cloned());
 
         match user {
-            Some(u) if u.credentials.is_valid() => Ok(Some(u)),
-            _ => Ok(None),
+            Some(u) => {
+                if u.credentials.is_valid() {
+                    Ok((Some(u), true))
+                } else {
+                    Ok((Some(u), false))
+                }
+            }
+            _ => Ok((None, false)),
         }
     }
     pub async fn policy_db_get(&self, name: &str, _groups: Option<Vec<String>>) -> crate::Result<Vec<String>> {
@@ -262,5 +268,45 @@ where
         );
 
         Ok(())
+    }
+
+    // returns all users (not STS or service accounts)
+    pub async fn get_users(&self) -> crate::Result<HashMap<String, madmin::UserInfo>> {
+        let mut m = HashMap::new();
+
+        let users = self.cache.users.load();
+        let policies = self.cache.user_policies.load();
+        let group_members = self.cache.user_group_memeberships.load();
+
+        for (k, v) in users.iter() {
+            warn!("k: {}, v: {:?}", k, v.credentials);
+
+            if v.credentials.is_temp() || v.credentials.is_service_account() {
+                continue;
+            }
+
+            let mut u = madmin::UserInfo {
+                status: if v.credentials.is_valid() {
+                    madmin::AccountStatus::Enabled
+                } else {
+                    madmin::AccountStatus::Disabled
+                },
+                updated_at: v.update_at,
+                ..Default::default()
+            };
+
+            if let Some(p) = policies.get(k) {
+                u.policy_name = Some(p.policies.clone());
+                u.updated_at = Some(p.update_at);
+            }
+
+            if let Some(members) = group_members.get(k) {
+                u.member_of = Some(members.iter().cloned().collect());
+            }
+
+            m.insert(k.clone(), u);
+        }
+
+        Ok(m)
     }
 }

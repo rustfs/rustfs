@@ -1,7 +1,7 @@
 use crate::Error;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngCore};
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub fn gen_access_key(length: usize) -> crate::Result<String> {
     const ALPHA_NUMERIC_TABLE: [char; 36] = [
@@ -43,6 +43,17 @@ pub fn gen_secret_key(length: usize) -> crate::Result<String> {
 pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let header = Header::new(Algorithm::HS512);
     encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
+}
+
+pub fn extract_claims<T: DeserializeOwned>(
+    token: &str,
+    secret: &str,
+) -> Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
+    jsonwebtoken::decode::<T>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &jsonwebtoken::Validation::new(Algorithm::HS512),
+    )
 }
 
 #[cfg(test)]

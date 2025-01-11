@@ -7,9 +7,13 @@ pub fn decode_tags(tags: &str) -> Vec<Tag> {
     let mut list = Vec::new();
 
     for (k, v) in values {
+        if k.is_empty() || v.is_empty() {
+            continue;
+        }
+
         list.push(Tag {
-            key: k.to_string(),
-            value: v.to_string(),
+            key: Some(k.to_string()),
+            value: Some(v.to_string()),
         });
     }
 
@@ -20,7 +24,9 @@ pub fn encode_tags(tags: Vec<Tag>) -> String {
     let mut encoded = form_urlencoded::Serializer::new(String::new());
 
     for tag in tags.iter() {
-        encoded.append_pair(tag.key.as_str(), tag.value.as_str());
+        if let (Some(k), Some(v)) = (tag.key.as_ref(), tag.value.as_ref()) {
+            encoded.append_pair(k.as_str(), v.as_str());
+        }
     }
 
     encoded.finish()
