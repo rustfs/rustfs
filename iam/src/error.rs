@@ -37,6 +37,17 @@ pub enum Error {
 
     #[error("jwt err {0}")]
     JWTError(jsonwebtoken::errors::Error),
+
+    #[error("no access key")]
+    NoAccessKey,
+
+    #[error("invalid token")]
+    InvalidToken,
+
+    #[error("invalid access_key")]
+    InvalidAccessKey,
+    #[error("action not allowed")]
+    IAMActionNotAllowed,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
