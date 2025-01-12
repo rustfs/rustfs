@@ -4,12 +4,14 @@ use ecstore::{
     config::error::is_err_config_not_found,
     store::ECStore,
     store_api::{ObjectIO, ObjectInfo, ObjectOptions, PutObjReader},
-    utils::path::dir,
-    StorageAPI,
+    store_list_objects::{ObjectInfoOrErr, WalkOptions},
+    utils::path::{dir, SLASH_SEPARATOR},
 };
 use futures::future::try_join_all;
 use log::{debug, warn};
 use serde::{de::DeserializeOwned, Serialize};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc::{self};
 
 use super::Store;
 use crate::{
@@ -31,45 +33,54 @@ impl ObjectStore {
         Self { object_api }
     }
 
-    async fn list_iam_config_items(&self, prefix: &str, items: &[&str]) -> crate::Result<Vec<String>> {
-        debug!("list iam config items, prefix: {prefix}");
+    async fn list_iam_config_items(&self, prefix: &str) -> crate::Result<Vec<String>> {
+        debug!("list iam config items, prefix: {}", &prefix);
 
         // todo, 实现walk，使用walk
-        let mut futures = Vec::with_capacity(items.len());
 
-        for item in items {
-            let prefix = format!("{}{}", prefix, item);
-            futures.push(async move {
-                // let items = self
-                //     .object_api
-                //     .clone()
-                //     .list_path(&ListPathOptions {
-                //         bucket: Self::BUCKET_NAME.into(),
-                //         prefix: prefix.clone(),
-                //         ..Default::default()
-                //     })
-                //     .await;
+        let (ctx_tx, ctx_rx) = broadcast::channel(1);
 
-                let items = self
-                    .object_api
-                    .clone()
-                    .list_objects_v2(Self::BUCKET_NAME, &prefix.clone(), None, None, 0, false, None)
-                    .await;
+        // let prefix = format!("{}{}", prefix, item);
 
-                match items {
-                    Ok(items) => Result::<_, crate::Error>::Ok(items.prefixes),
-                    Err(e) => {
-                        if is_err_config_not_found(&e) {
-                            Result::<_, crate::Error>::Ok(vec![])
-                        } else {
-                            Err(Error::StringError(format!("list {prefix} failed, err: {e:?}")))
-                        }
-                    }
-                }
-            });
+        let ctx_rx = ctx_rx.resubscribe();
+
+        let (tx, mut rx) = mpsc::channel::<ObjectInfoOrErr>(100);
+        let store = self.object_api.clone();
+
+        let path = prefix.to_owned();
+        tokio::spawn(async move { store.walk(ctx_rx, Self::BUCKET_NAME, &path, tx, WalkOptions::default()).await });
+
+        let mut ret = Vec::new();
+
+        while let Some(v) = rx.recv().await {
+            if let Some(err) = v.err {
+                warn!("list_iam_config_items {:?}", err);
+                let _ = ctx_tx.send(true);
+
+                return Err(Error::EcstoreError(err));
+            }
+
+            if let Some(item) = v.item {
+                let name = item.name.trim_start_matches(prefix).trim_end_matches(SLASH_SEPARATOR);
+                ret.push(name.to_owned());
+            }
         }
+
+        Ok(ret)
+
+        // match items {
+        //     Ok(items) => Result::<_, crate::Error>::Ok(items.prefixes),
+        //     Err(e) => {
+        //         if is_err_config_not_found(&e) {
+        //             Result::<_, crate::Error>::Ok(vec![])
+        //         } else {
+        //             Err(Error::StringError(format!("list {prefix} failed, err: {e:?}")))
+        //         }
+        //     }
+        // }
+
         // TODO: FIXME:
-        Ok(try_join_all(futures).await?.into_iter().flat_map(|x| x.into_iter()).collect())
+        // Ok(try_join_all(futures).await?.into_iter().flat_map(|x| x.into_iter()).collect())
     }
 
     async fn load_policy(&self, name: &str) -> crate::Result<PolicyDoc> {
@@ -152,7 +163,7 @@ impl Store for ObjectStore {
     }
 
     async fn load_policy_docs(&self) -> crate::Result<HashMap<String, PolicyDoc>> {
-        let paths = self.list_iam_config_items("config/iam/", &["policies/"]).await?;
+        let paths = self.list_iam_config_items("config/iam/policies/").await?;
 
         let mut result = Self::get_default_policyes();
         for path in paths {
@@ -174,7 +185,9 @@ impl Store for ObjectStore {
     }
 
     async fn load_users(&self, user_type: UserType) -> crate::Result<HashMap<String, UserIdentity>> {
-        let paths = self.list_iam_config_items("config/iam/", &[user_type.prefix()]).await?;
+        let paths = self
+            .list_iam_config_items(format!("{}{}", "config/iam/", user_type.prefix()).as_str())
+            .await?;
 
         let mut result = HashMap::new();
         for path in paths {
@@ -202,21 +215,18 @@ impl Store for ObjectStore {
 
     /// load all and make a new cache.
     async fn load_all(&self, cache: &Cache) -> crate::Result<()> {
-        let items = self
-            .list_iam_config_items(
-                "config/iam/",
-                &[
-                    "policydb/",
-                    "policies/",
-                    "groups/",
-                    "policydb/users/",
-                    "policydb/groups/",
-                    "service-accounts/",
-                    "policydb/sts-users/",
-                    "sts/",
-                ],
-            )
-            .await?;
+        let _items = &[
+            "policydb/",
+            "policies/",
+            "groups/",
+            "policydb/users/",
+            "policydb/groups/",
+            "service-accounts/",
+            "policydb/sts-users/",
+            "sts/",
+        ];
+
+        let items = self.list_iam_config_items("config/iam/").await?;
         debug!("all iam items: {items:?}");
 
         let (policy_docs, users, user_policies, sts_policies, sts_accounts) = (

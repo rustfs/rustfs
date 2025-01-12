@@ -66,10 +66,6 @@ impl Operation for AddUser {
     }
 }
 
-fn check_claims_from_token(_token: &str) -> bool {
-    true
-}
-
 pub struct SetUserStatus {}
 #[async_trait::async_trait]
 impl Operation for SetUserStatus {

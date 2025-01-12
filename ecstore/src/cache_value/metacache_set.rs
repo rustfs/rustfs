@@ -54,7 +54,7 @@ impl Clone for ListPathRawOptions {
 }
 
 pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> Result<()> {
-    info!("list_path_raw");
+    // println!("list_path_raw {},{}", &opts.bucket, &opts.path);
     if opts.disks.is_empty() {
         info!("list_path_raw 0 drives provided");
         return Err(Error::from_string("list_path_raw: 0 drives provided"));
@@ -283,11 +283,9 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
             }
 
-            info!("read entry should heal: {}", current.name);
             if let Some(partial_fn) = opts.partial.as_ref() {
                 partial_fn(MetaCacheEntries(top_entries), &errs).await;
             }
-            // break;
         }
         Ok(())
     });
