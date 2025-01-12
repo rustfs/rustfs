@@ -261,7 +261,7 @@ where
         self.api.save_iam_config(&user_entiry, path).await?;
 
         Cache::add_or_update(
-            &self.cache.users,
+            &self.cache.sts_accounts,
             &user_entiry.credentials.access_key,
             &user_entiry,
             OffsetDateTime::now_utc(),
