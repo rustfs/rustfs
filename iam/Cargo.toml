@@ -28,6 +28,7 @@ rand.workspace = true
 base64-simd = "0.8.0"
 jsonwebtoken = "9.3.0"
 tracing.workspace = true
+madmin.workspace = true
 
 [dev-dependencies]
 test-case.workspace = true

@@ -5,6 +5,8 @@ pub mod metrics;
 pub mod net;
 pub mod service_commands;
 pub mod trace;
+pub mod user;
 pub mod utils;
 
 pub use info_commands::*;
+pub use user::*;

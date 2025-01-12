@@ -1243,6 +1243,7 @@ dependencies = [
  "itertools 0.14.0",
  "jsonwebtoken",
  "log",
+ "madmin",
  "rand",
  "serde",
  "serde_json",
@@ -2508,7 +2509,7 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 [[package]]
 name = "s3s"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=3291c0ca0284971569499cbe75bd69ef7bde8321#3291c0ca0284971569499cbe75bd69ef7bde8321"
+source = "git+https://github.com/Nugine/s3s.git?rev=05efc3f87e9f5d1a6c9760c79cf1f70dcdd100c8#05efc3f87e9f5d1a6c9760c79cf1f70dcdd100c8"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -2555,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "s3s-policy"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=3291c0ca0284971569499cbe75bd69ef7bde8321#3291c0ca0284971569499cbe75bd69ef7bde8321"
+source = "git+https://github.com/Nugine/s3s.git?rev=05efc3f87e9f5d1a6c9760c79cf1f70dcdd100c8#05efc3f87e9f5d1a6c9760c79cf1f70dcdd100c8"
 dependencies = [
  "indexmap 2.6.0",
  "serde",
