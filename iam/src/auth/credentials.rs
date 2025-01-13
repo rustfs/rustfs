@@ -18,6 +18,23 @@ const SECRET_KEY_MAX_LEN: usize = 40;
 pub const ACCOUNT_ON: &str = "on";
 pub const ACCOUNT_OFF: &str = "off";
 
+const RESERVED_CHARS: &str = "=,";
+
+// ContainsReservedChars - returns whether the input string contains reserved characters.
+pub fn contains_reserved_chars(s: &str) -> bool {
+    s.contains(RESERVED_CHARS)
+}
+
+// IsAccessKeyValid - validate access key for right length.
+pub fn is_access_key_valid(access_key: &str) -> bool {
+    access_key.len() >= ACCESS_KEY_MIN_LEN
+}
+
+// IsSecretKeyValid - validate secret key for right length.
+pub fn is_secret_key_valid(secret_key: &str) -> bool {
+    secret_key.len() >= SECRET_KEY_MIN_LEN
+}
+
 #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
 struct CredentialHeader {
     access_key: String,
@@ -116,6 +133,10 @@ impl Credentials {
     }
 
     pub fn is_expired(&self) -> bool {
+        if self.expiration.is_none() {
+            return false;
+        }
+
         self.expiration
             .as_ref()
             .map(|e| time::OffsetDateTime::now_utc() > *e)

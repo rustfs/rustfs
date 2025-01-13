@@ -500,7 +500,7 @@ impl StorageAPI for Sets {
         Ok((del_objects, del_errs))
     }
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
-        if opts.delete_prefix {
+        if opts.delete_prefix && !opts.delete_prefix_object {
             self.delete_prefix(bucket, object).await?;
             return Ok(ObjectInfo::default());
         }
