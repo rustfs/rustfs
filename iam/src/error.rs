@@ -32,8 +32,14 @@ pub enum Error {
     #[error("CredNotInitialized")]
     CredNotInitialized,
 
-    #[error("invalid key length")]
+    #[error("invalid access key length")]
     InvalidAccessKeyLength,
+
+    #[error("invalid secret key length")]
+    InvalidSecretKeyLength,
+
+    #[error("access key contains reserved characters =,")]
+    ContainsReservedChars,
 
     #[error("jwt err {0}")]
     JWTError(jsonwebtoken::errors::Error),

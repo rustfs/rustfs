@@ -9,6 +9,7 @@ use std::{
 
 use ecstore::store_err::is_err_object_not_found;
 use log::{debug, warn};
+use madmin::AccountStatus;
 use time::OffsetDateTime;
 use tokio::{
     select,
@@ -295,6 +296,8 @@ where
                 ..Default::default()
             };
 
+            warn!("uinfo {:?}", u);
+
             if let Some(p) = policies.get(k) {
                 u.policy_name = Some(p.policies.clone());
                 u.updated_at = Some(p.update_at);
@@ -313,7 +316,7 @@ where
     pub async fn add_user(&self, access_key: &str, secret_key: &str, status: &str) -> crate::Result<OffsetDateTime> {
         let status = {
             match status {
-                "disabled" => auth::ACCOUNT_ON,
+                val if val == AccountStatus::Enabled.as_ref() => auth::ACCOUNT_ON,
                 auth::ACCOUNT_ON => auth::ACCOUNT_ON,
                 _ => auth::ACCOUNT_OFF,
             }
@@ -321,6 +324,7 @@ where
 
         let users = self.cache.users.load();
         if let Some(x) = users.get(access_key) {
+            warn!("user already exists: {:?}", x);
             if x.credentials.is_temp() {
                 return Err(crate::Error::IAMActionNotAllowed);
             }
@@ -329,7 +333,121 @@ where
         let user_entiry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: secret_key.to_string(),
-            status: status.to_string(),
+            status: status.to_owned(),
+            ..Default::default()
+        });
+        let path = format!(
+            "config/iam/{}{}/identity.json",
+            UserType::Reg.prefix(),
+            user_entiry.credentials.access_key
+        );
+        debug!("save object: {path:?}");
+        self.api.save_iam_config(&user_entiry, path).await?;
+
+        Cache::add_or_update(
+            &self.cache.users,
+            &user_entiry.credentials.access_key,
+            &user_entiry,
+            OffsetDateTime::now_utc(),
+        );
+
+        Ok(user_entiry.update_at.unwrap_or(OffsetDateTime::now_utc()))
+    }
+
+    pub async fn delete_user(&self, access_key: &str, utype: UserType) -> crate::Result<()> {
+        let users = self.cache.users.load();
+        if let Some(x) = users.get(access_key) {
+            if x.credentials.is_temp() {
+                return Err(crate::Error::IAMActionNotAllowed);
+            }
+        }
+
+        // if utype == UserType::Reg {}
+
+        let path = format!("config/iam/{}{}/identity.json", UserType::Reg.prefix(), access_key);
+        debug!("delete object: {path:?}");
+        self.api.delete_iam_config(path).await?;
+
+        // delete cache
+        Cache::delete(&self.cache.users, access_key, OffsetDateTime::now_utc());
+
+        Ok(())
+    }
+
+    pub async fn get_user(&self, access_key: &str) -> crate::Result<Option<UserIdentity>> {
+        let u = self
+            .cache
+            .users
+            .load()
+            .get(access_key)
+            .cloned()
+            .or_else(|| self.cache.sts_accounts.load().get(access_key).cloned());
+
+        Ok(u)
+    }
+
+    pub async fn get_user_info(&self, access_key: &str) -> crate::Result<madmin::UserInfo> {
+        let users = self.cache.users.load();
+        let policies = self.cache.user_policies.load();
+        let group_members = self.cache.user_group_memeberships.load();
+
+        let u = match users.get(access_key) {
+            Some(u) => u,
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
+        };
+
+        if u.credentials.is_temp() || u.credentials.is_service_account() {
+            return Err(Error::IAMActionNotAllowed);
+        }
+
+        let mut uinfo = madmin::UserInfo {
+            status: if u.credentials.is_valid() {
+                madmin::AccountStatus::Enabled
+            } else {
+                madmin::AccountStatus::Disabled
+            },
+            updated_at: u.update_at,
+            ..Default::default()
+        };
+
+        if let Some(p) = policies.get(access_key) {
+            uinfo.policy_name = Some(p.policies.clone());
+            uinfo.updated_at = Some(p.update_at);
+        }
+
+        if let Some(members) = group_members.get(access_key) {
+            uinfo.member_of = Some(members.iter().cloned().collect());
+        }
+
+        Ok(uinfo)
+    }
+
+    pub async fn set_user_status(&self, access_key: &str, status: AccountStatus) -> crate::Result<OffsetDateTime> {
+        if access_key.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let users = self.cache.users.load();
+        let u = match users.get(access_key) {
+            Some(u) => u,
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
+        };
+
+        if u.credentials.is_temp() || u.credentials.is_service_account() {
+            return Err(Error::IAMActionNotAllowed);
+        }
+
+        let status = {
+            match status {
+                AccountStatus::Enabled => auth::ACCOUNT_ON,
+                _ => auth::ACCOUNT_OFF,
+            }
+        };
+
+        let user_entiry = UserIdentity::from(Credentials {
+            access_key: access_key.to_string(),
+            secret_key: u.credentials.secret_key.clone(),
+            status: status.to_owned(),
             ..Default::default()
         });
         let path = format!(

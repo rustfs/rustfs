@@ -340,7 +340,7 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
             )
             .await
             {
-                let data_usage_info = cache.dui(DATA_USAGE_ROOT, &vec![]);
+                let data_usage_info = cache.dui(DATA_USAGE_ROOT, &[]);
                 erasure_set.objects_count = data_usage_info.objects_total_count;
                 erasure_set.versions_count = data_usage_info.versions_total_count;
                 erasure_set.delete_markers_count = data_usage_info.delete_markers_total_count;
