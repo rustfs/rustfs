@@ -16,7 +16,7 @@ pub use function::Functions;
 pub use id::ID;
 pub use policy::{default::DEFAULT_POLICIES, Policy};
 pub use resource::ResourceSet;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use serde_json::Value;
 pub use statement::Statement;
 use std::collections::HashMap;
@@ -93,6 +93,7 @@ pub trait Validator {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum UserType {
     Svc,
     Sts,

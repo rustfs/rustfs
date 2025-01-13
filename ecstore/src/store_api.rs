@@ -579,6 +579,7 @@ pub struct ObjectOptions {
     pub part_number: Option<usize>,
 
     pub delete_prefix: bool,
+    pub delete_prefix_object: bool,
     pub version_id: Option<String>,
     pub no_lock: bool,
 

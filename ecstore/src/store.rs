@@ -398,8 +398,20 @@ impl ECStore {
 
         Ok(())
     }
-    async fn delete_prefix(&self, _bucket: &str, _object: &str) -> Result<()> {
-        unimplemented!()
+    async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
+        for pool in self.pools.iter() {
+            pool.delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {

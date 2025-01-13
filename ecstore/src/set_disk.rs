@@ -3526,6 +3526,42 @@ impl SetDisks {
         defer.await;
         Ok(())
     }
+
+    async fn delete_prefix(&self, bucket: &str, prefix: &str) -> Result<()> {
+        let disks = self.get_disks_internal().await;
+        let write_quorum = disks.len() / 2 + 1;
+
+        let mut futures = Vec::with_capacity(disks.len());
+
+        for disk_op in disks.iter() {
+            let bucket = bucket.to_string();
+            let prefix = prefix.to_string();
+            futures.push(async move {
+                if let Some(disk) = disk_op {
+                    disk.delete(
+                        &bucket,
+                        &prefix,
+                        DeleteOptions {
+                            recursive: true,
+                            immediate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                } else {
+                    Ok(())
+                }
+            });
+        }
+
+        let errs = join_all(futures).await.into_iter().map(|v| v.err()).collect::<Vec<_>>();
+
+        if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
+            return Err(err);
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -4048,7 +4084,14 @@ impl StorageAPI for SetDisks {
 
         Ok((del_objects, del_errs))
     }
-    async fn delete_object(&self, _bucket: &str, _object: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        if opts.delete_prefix {
+            self.delete_prefix(bucket, object)
+                .await
+                .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+
+            return Ok(ObjectInfo::default());
+        }
         unimplemented!()
     }
 

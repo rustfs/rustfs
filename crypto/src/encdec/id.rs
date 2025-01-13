@@ -3,6 +3,7 @@ use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 
 #[repr(u8)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum ID {
     Argon2idAESGCM = 0x00,
     Argon2idChaCHa20Poly1305 = 0x01,

@@ -1,8 +1,9 @@
-use auth::{Credentials, UserIdentity};
+use auth::{contains_reserved_chars, is_access_key_valid, is_secret_key_valid, Credentials, UserIdentity};
 use ecstore::store::ECStore;
 use log::debug;
+use madmin::AccountStatus;
 use manager::IamCache;
-use policy::{Args, Policy};
+use policy::{Args, Policy, UserType};
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
@@ -71,7 +72,7 @@ pub fn get() -> crate::Result<Arc<IamCache<ObjectStore>>> {
     IAM_SYS.get().map(Arc::clone).ok_or(Error::IamSysNotInitialized)
 }
 
-pub async fn is_allowed<'a>(args: Args<'a>) -> crate::Result<bool> {
+pub async fn is_allowed(args: Args<'_>) -> crate::Result<bool> {
     Ok(get()?.is_allowed(args).await)
 }
 
@@ -106,6 +107,42 @@ pub async fn get_user(ak: &str) -> crate::Result<(Option<UserIdentity>, bool)> {
 }
 
 pub async fn create_user(ak: &str, sk: &str, status: &str) -> crate::Result<OffsetDateTime> {
+    if !is_access_key_valid(ak) {
+        return Err(Error::InvalidAccessKeyLength);
+    }
+
+    if contains_reserved_chars(ak) {
+        return Err(Error::ContainsReservedChars);
+    }
+
+    if !is_secret_key_valid(sk) {
+        return Err(Error::InvalidSecretKeyLength);
+    }
     get()?.add_user(ak, sk, status).await
     // notify
+}
+
+pub async fn delete_user(ak: &str, _notify: bool) -> crate::Result<()> {
+    get()?.delete_user(ak, UserType::Reg).await
+    // TODO NOTIFY
+}
+
+pub async fn is_temp_user(ak: &str) -> crate::Result<(bool, String)> {
+    if let Some(user) = get()?.get_user(ak).await? {
+        Ok((user.credentials.is_temp(), user.credentials.parent_user))
+    } else {
+        Err(Error::NoSuchUser(ak.to_string()))
+    }
+}
+
+pub async fn get_user_info(ak: &str) -> crate::Result<madmin::UserInfo> {
+    get()?.get_user_info(ak).await
+}
+
+pub async fn set_user_status(ak: &str, status: AccountStatus) -> crate::Result<OffsetDateTime> {
+    get()?.set_user_status(ak, status).await
+}
+
+pub async fn list_service_accounts(ak: &str) -> crate::Result<Vec<Credentials>> {
+    get()?.list_service_accounts(ak).await
 }
