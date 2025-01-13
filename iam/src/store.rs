@@ -18,6 +18,7 @@ pub trait Store: Clone + Send + Sync + 'static {
         Item: DeserializeOwned;
 
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> crate::Result<()>;
+    async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> crate::Result<()>;
 
     async fn load_all(&self, cache: &Cache) -> crate::Result<()>;
 

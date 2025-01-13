@@ -6,6 +6,7 @@ use ecstore::{
     store_api::{ObjectIO, ObjectInfo, ObjectOptions, PutObjReader},
     store_list_objects::{ObjectInfoOrErr, WalkOptions},
     utils::path::{dir, SLASH_SEPARATOR},
+    StorageAPI,
 };
 use futures::future::try_join_all;
 use log::{debug, warn};
@@ -121,6 +122,22 @@ impl ObjectStore {
 
 #[async_trait::async_trait]
 impl Store for ObjectStore {
+    async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> crate::Result<()> {
+        self.object_api
+            .delete_object(
+                Self::BUCKET_NAME,
+                path.as_ref(),
+                ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(crate::Error::EcstoreError)?;
+
+        Ok(())
+    }
     async fn load_iam_config<Item>(&self, path: impl AsRef<str> + Send) -> crate::Result<(Item, ObjectInfo)>
     where
         Item: DeserializeOwned,

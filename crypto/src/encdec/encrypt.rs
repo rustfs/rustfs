@@ -44,6 +44,9 @@ fn encrypt<T: aes_gcm::aead::Aead>(
     use crate::error::Error;
 
     let nonce = T::generate_nonce(rand::thread_rng());
+
+    println!("encrypt nonce len {}, {:?}", nonce.len(), &id);
+
     let encryptor = stream.encrypt(&nonce, data).map_err(Error::ErrEncryptFailed)?;
 
     let mut ciphertext = Vec::with_capacity(salt.len() + 1 + nonce.len() + encryptor.len());

@@ -1,20 +1,20 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use time::OffsetDateTime;
 
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct AddServiceAccountReq {
-    pub access_key: String,
-    pub secret_key: String,
+// #[derive(Deserialize, Default)]
+// #[serde(rename_all = "camelCase", default)]
+// pub struct AddServiceAccountReq {
+//     pub access_key: String,
+//     pub secret_key: String,
 
-    pub policy: Option<Vec<u8>>,
-    pub target_user: Option<String>,
-    pub name: String,
-    pub description: String,
-    #[serde(with = "time::serde::rfc3339::option")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expiration: Option<OffsetDateTime>,
-}
+//     pub policy: Option<Vec<u8>>,
+//     pub target_user: Option<String>,
+//     pub name: String,
+//     pub description: String,
+//     #[serde(with = "time::serde::rfc3339::option")]
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub expiration: Option<OffsetDateTime>,
+// }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
