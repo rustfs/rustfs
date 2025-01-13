@@ -94,7 +94,7 @@ where
         Ok(())
     }
 
-    async fn notify(&self) {
+    async fn _notify(&self) {
         self.send_chan.send(OffsetDateTime::now_utc().unix_timestamp()).await.unwrap();
     }
 
@@ -354,7 +354,7 @@ where
         Ok(user_entiry.update_at.unwrap_or(OffsetDateTime::now_utc()))
     }
 
-    pub async fn delete_user(&self, access_key: &str, utype: UserType) -> crate::Result<()> {
+    pub async fn delete_user(&self, access_key: &str, _utype: UserType) -> crate::Result<()> {
         let users = self.cache.users.load();
         if let Some(x) = users.get(access_key) {
             if x.credentials.is_temp() {
@@ -363,6 +363,7 @@ where
         }
 
         // if utype == UserType::Reg {}
+        // TODO: Delete user from group memberships
 
         let path = format!("config/iam/{}{}/identity.json", UserType::Reg.prefix(), access_key);
         debug!("delete object: {path:?}");
@@ -466,5 +467,63 @@ where
         );
 
         Ok(user_entiry.update_at.unwrap_or(OffsetDateTime::now_utc()))
+    }
+
+    pub async fn is_temp_user(&self, access_key: &str) -> crate::Result<(bool, String)> {
+        let users = self.cache.users.load();
+        let u = match users.get(access_key) {
+            Some(u) => u,
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
+        };
+
+        if u.credentials.is_temp() {
+            Ok((true, u.credentials.parent_user.clone()))
+        } else {
+            Ok((false, String::new()))
+        }
+    }
+    pub async fn remove_users_from_group(&self, group: &str, members: Vec<String>) -> crate::Result<OffsetDateTime> {
+        if group.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let users = self.cache.users.load();
+        let groups = self.cache.groups.load();
+        let group_members_cache = self.cache.user_group_memeberships.load();
+
+        for member in members.iter() {
+            let u = users.get(member).ok_or(Error::NoSuchUser(member.to_string()))?;
+
+            if u.credentials.is_temp() || u.credentials.is_service_account() {
+                return Err(Error::IAMActionNotAllowed);
+            }
+        }
+
+        let group_info = groups.get(group).ok_or(Error::NoSuchGroup(group.to_string()))?;
+
+        let mut group_members = match group_members_cache.get(group) {
+            Some(m) => m.clone(),
+            None => return Err(Error::NoSuchGroup(group.to_string())),
+        };
+
+        if members.is_empty() && !group_members.is_empty() {
+            return Err(Error::GroupNotEmpty);
+        }
+
+        if members.is_empty() {
+            group_members.clear();
+        } else {
+            for member in members.iter() {
+                group_members.remove(member);
+            }
+        }
+
+        let path = format!("config/iam/group/{}.json", group);
+        debug!("save object: {path:?}");
+        self.api.save_iam_config(&members, path).await?;
+
+        Cache::add_or_update(&self.cache.user_group_memeberships, group, &group_members, OffsetDateTime::now_utc());
+
+        Ok(OffsetDateTime::now_utc())
     }
 }

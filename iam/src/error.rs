@@ -17,6 +17,12 @@ pub enum Error {
     #[error("user '{0}' does not exist")]
     NoSuchUser(String),
 
+    #[error("group '{0}' does not exist")]
+    NoSuchGroup(String),
+
+    #[error("group not empty")]
+    GroupNotEmpty,
+
     #[error("invalid arguments specified")]
     InvalidArgument,
 
@@ -57,3 +63,7 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub fn is_err_no_such_user(e: &Error) -> bool {
+    matches!(e, Error::NoSuchUser(_))
+}
