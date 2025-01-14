@@ -27,9 +27,8 @@ impl AddrFunc {
     }
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, PartialEq, Eq, Debug)]
 #[serde(transparent)]
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
 pub struct AddrFuncValue(Vec<IpNetwork>);
 
 impl<'de> Deserialize<'de> for AddrFuncValue {
@@ -73,9 +72,9 @@ impl<'de> Deserialize<'de> for AddrFuncValue {
                     cidr_str.to_mut().push_str("/32");
                 }
 
-                Ok(cidr_str
+                cidr_str
                     .parse::<IpNetwork>()
-                    .map_err(|_| E::custom(format!("{v} can not be parsed to CIDR")))?)
+                    .map_err(|_| E::custom(format!("{v} can not be parsed to CIDR")))
             }
         }
 

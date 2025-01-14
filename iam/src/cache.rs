@@ -11,8 +11,9 @@ use time::OffsetDateTime;
 
 use crate::{
     auth::UserIdentity,
-    policy::{Args, GroupInfo, MappedPolicy, Policy, PolicyDoc},
-    Error,
+    policy::PolicyDoc,
+    store::{GroupInfo, MappedPolicy},
+    sys::Args,
 };
 
 pub struct Cache {
@@ -85,6 +86,21 @@ impl Cache {
             map.remove(key);
         })
     }
+
+    pub fn build_user_group_memberships(&self) {
+        let groups = self.groups.load();
+        let mut user_group_memeberships = HashMap::new();
+        for (group_name, group) in groups.iter() {
+            for user_name in &group.members {
+                user_group_memeberships
+                    .entry(user_name.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(group_name.clone());
+            }
+        }
+        self.user_group_memeberships
+            .store(Arc::new(CacheEntity::new(user_group_memeberships)));
+    }
 }
 
 impl CacheInner {
@@ -93,37 +109,37 @@ impl CacheInner {
         self.users.get(user_name).or_else(|| self.sts_accounts.get(user_name))
     }
 
-    fn get_policy(&self, _name: &str, _groups: &[String]) -> crate::Result<Vec<Policy>> {
-        todo!()
-    }
+    // fn get_policy(&self, _name: &str, _groups: &[String]) -> crate::Result<Vec<Policy>> {
+    //     todo!()
+    // }
 
-    /// 如果是临时用户，返回Ok(Some(partent_name)))
-    /// 如果不是临时用户，返回Ok(None)
-    fn is_temp_user(&self, user_name: &str) -> crate::Result<Option<&str>> {
-        let user = self
-            .get_user(user_name)
-            .ok_or_else(|| Error::NoSuchUser(user_name.to_owned()))?;
+    // /// 如果是临时用户，返回Ok(Some(partent_name)))
+    // /// 如果不是临时用户，返回Ok(None)
+    // fn is_temp_user(&self, user_name: &str) -> crate::Result<Option<&str>> {
+    //     let user = self
+    //         .get_user(user_name)
+    //         .ok_or_else(|| Error::NoSuchUser(user_name.to_owned()))?;
 
-        if user.credentials.is_temp() {
-            Ok(Some(&user.credentials.parent_user))
-        } else {
-            Ok(None)
-        }
-    }
+    //     if user.credentials.is_temp() {
+    //         Ok(Some(&user.credentials.parent_user))
+    //     } else {
+    //         Ok(None)
+    //     }
+    // }
 
-    /// 如果是临时用户，返回Ok(Some(partent_name)))
-    /// 如果不是临时用户，返回Ok(None)
-    fn is_service_account(&self, user_name: &str) -> crate::Result<Option<&str>> {
-        let user = self
-            .get_user(user_name)
-            .ok_or_else(|| Error::NoSuchUser(user_name.to_owned()))?;
+    // /// 如果是临时用户，返回Ok(Some(partent_name)))
+    // /// 如果不是临时用户，返回Ok(None)
+    // fn is_service_account(&self, user_name: &str) -> crate::Result<Option<&str>> {
+    //     let user = self
+    //         .get_user(user_name)
+    //         .ok_or_else(|| Error::NoSuchUser(user_name.to_owned()))?;
 
-        if user.credentials.is_service_account() {
-            Ok(Some(&user.credentials.parent_user))
-        } else {
-            Ok(None)
-        }
-    }
+    //     if user.credentials.is_service_account() {
+    //         Ok(Some(&user.credentials.parent_user))
+    //     } else {
+    //         Ok(None)
+    //     }
+    // }
 
     // todo
     pub fn is_allowed_sts(&self, _args: &Args, _parent: &str) -> bool {

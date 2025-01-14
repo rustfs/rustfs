@@ -8,14 +8,13 @@ use serde::{
 
 pub type NumberFunc = InnerFunc<NumberFuncValue>;
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NumberFuncValue(i64);
 
 impl NumberFunc {
     pub fn evaluate(&self, op: impl Fn(&i64, &i64) -> bool, if_exists: bool, values: &HashMap<String, Vec<String>>) -> bool {
         for inner in self.0.iter() {
-            let v = match values.get(inner.key.name().as_str()).and_then(|x| x.get(0)) {
+            let v = match values.get(inner.key.name().as_str()).and_then(|x| x.first()) {
                 Some(x) => x,
                 None => return if_exists,
             };
@@ -49,7 +48,7 @@ impl<'de> Deserialize<'de> for NumberFuncValue {
     {
         struct NumberVisitor;
 
-        impl<'de> Visitor<'de> for NumberVisitor {
+        impl Visitor<'_> for NumberVisitor {
             type Value = NumberFuncValue;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {

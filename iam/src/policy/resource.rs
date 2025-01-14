@@ -1,24 +1,36 @@
+use ecstore::error::{Error, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
     ops::Deref,
 };
 
-use serde::{Deserialize, Serialize};
+use crate::sys::Validator;
 
 use super::{
     function::key_name::KeyName,
     utils::{path, wildcard},
-    Error, Validator,
+    Error as IamError,
 };
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ResourceSet(pub HashSet<Resource>);
 
 impl ResourceSet {
     pub fn is_match(&self, resource: &str, conditons: &HashMap<String, Vec<String>>) -> bool {
         for re in self.0.iter() {
             if re.is_match(resource, conditons) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn match_resource(&self, resource: &str) -> bool {
+        for re in self.0.iter() {
+            if re.match_resource(resource) {
                 return true;
             }
         }
@@ -36,7 +48,8 @@ impl Deref for ResourceSet {
 }
 
 impl Validator for ResourceSet {
-    fn is_valid(&self) -> Result<(), Error> {
+    type Error = Error;
+    fn is_valid(&self) -> Result<()> {
         for resource in self.0.iter() {
             resource.is_valid()?;
         }
@@ -45,7 +58,13 @@ impl Validator for ResourceSet {
     }
 }
 
-#[derive(Hash, Eq, PartialEq, Serialize, Deserialize, Clone)]
+impl PartialEq for ResourceSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.0.iter().all(|x| other.0.contains(x))
+    }
+}
+
+#[derive(Hash, Eq, PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub enum Resource {
     S3(String),
     Kms(String),
@@ -76,15 +95,19 @@ impl Resource {
 
         wildcard::is_match(pattern, resource)
     }
+
+    pub fn match_resource(&self, resource: &str) -> bool {
+        self.is_match(resource, &HashMap::new())
+    }
 }
 
 impl TryFrom<&str> for Resource {
     type Error = Error;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let resource = if value.starts_with(Self::S3_PREFIX) {
-            Resource::S3(value[Self::S3_PREFIX.len()..].into())
+            Resource::S3(value.strip_prefix(Self::S3_PREFIX).unwrap().into())
         } else {
-            return Err(Error::InvalidResource("unknown".into(), value.into()));
+            return Err(IamError::InvalidResource("unknown".into(), value.into()).into());
         };
 
         resource.is_valid()?;
@@ -93,11 +116,12 @@ impl TryFrom<&str> for Resource {
 }
 
 impl Validator for Resource {
+    type Error = Error;
     fn is_valid(&self) -> Result<(), Error> {
         match self {
             Self::S3(pattern) => {
                 if pattern.is_empty() || pattern.starts_with('/') {
-                    return Err(Error::InvalidResource("s3".into(), pattern.into()));
+                    return Err(IamError::InvalidResource("s3".into(), pattern.into()).into());
                 }
             }
             Self::Kms(pattern) => {
@@ -108,7 +132,7 @@ impl Validator for Resource {
                         .map(|(i, _)| i)
                         .is_some()
                 {
-                    return Err(Error::InvalidResource("kms".into(), pattern.into()));
+                    return Err(IamError::InvalidResource("kms".into(), pattern.into()).into());
                 }
             }
         }

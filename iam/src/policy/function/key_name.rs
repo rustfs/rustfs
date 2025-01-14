@@ -54,9 +54,9 @@ impl KeyName {
         KeyName::Aws(AwsKeyName::AWSUsername),
         KeyName::Aws(AwsKeyName::AWSGroups),
         // ldap
-        KeyName::Ldap(LdapKeyName::LDAPUser),
-        KeyName::Ldap(LdapKeyName::LDAPUsername),
-        KeyName::Ldap(LdapKeyName::LDAPGroups),
+        KeyName::Ldap(LdapKeyName::User),
+        KeyName::Ldap(LdapKeyName::Username),
+        KeyName::Ldap(LdapKeyName::Groups),
         // jwt
         KeyName::Jwt(JwtKeyName::JWTSub),
         KeyName::Jwt(JwtKeyName::JWTIss),
@@ -252,13 +252,13 @@ pub enum SvcKeyName {
 #[serde(try_from = "&str", into = "&str")]
 pub enum LdapKeyName {
     #[strum(serialize = "ldap:user")]
-    LDAPUser,
+    User,
 
     #[strum(serialize = "ldap:username")]
-    LDAPUsername,
+    Username,
 
     #[strum(serialize = "ldap:groups")]
-    LDAPGroups,
+    Groups,
 }
 
 #[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]
@@ -312,7 +312,7 @@ mod tests {
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
-    #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::LDAPUser))]
+    #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
     #[test_case("sts:DurationSeconds", KeyName::Sts(StsKeyName::STSDurationSeconds))]
     #[test_case("svc:DurationSeconds", KeyName::Svc(SvcKeyName::SVCDurationSeconds))]
     fn key_name_from_str_successful(val: &str, except: KeyName) {
@@ -332,7 +332,7 @@ mod tests {
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
-    #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::LDAPUser))]
+    #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
     #[test_case("sts:DurationSeconds", KeyName::Sts(StsKeyName::STSDurationSeconds))]
     #[test_case("svc:DurationSeconds", KeyName::Svc(SvcKeyName::SVCDurationSeconds))]
     fn key_name_deserialize(val: &str, except: KeyName) {
@@ -349,7 +349,7 @@ mod tests {
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
-    #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::LDAPUser))]
+    #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
     #[test_case("sts:DurationSeconds", KeyName::Sts(StsKeyName::STSDurationSeconds))]
     #[test_case("svc:DurationSeconds", KeyName::Svc(SvcKeyName::SVCDurationSeconds))]
     fn key_name_serialize(except: &str, value: KeyName) {

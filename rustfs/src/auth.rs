@@ -31,11 +31,7 @@ impl S3Auth for IAMAuth {
         warn!("Failed to get secret key from simple auth");
 
         if let Ok(iam_store) = iam::get() {
-            let c = CacheInner::from(&iam_store.cache);
-            warn!("Failed to get secret key from simple auth, try cache {}", access_key);
-            warn!("users {:?}", c.users.values());
-            warn!("sts_accounts {:?}", c.sts_accounts.values());
-            if let Some(id) = c.get_user(access_key) {
+            if let Some(id) = iam_store.get_user(access_key).await {
                 warn!("get cred {:?}", id.credentials);
                 return Ok(SecretKey::from(id.credentials.secret_key.clone()));
             }

@@ -29,6 +29,8 @@ base64-simd = "0.8.0"
 jsonwebtoken = "9.3.0"
 tracing.workspace = true
 madmin.workspace = true
+lazy_static.workspace = true
+regex = "1.11.1"
 
 [dev-dependencies]
 test-case.workspace = true
