@@ -15,7 +15,7 @@ pub mod key_name;
 pub mod number;
 pub mod string;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct Functions {
     for_any_value: Vec<Condition>,
     for_all_values: Vec<Condition>,
@@ -143,6 +143,21 @@ impl<'de> Deserialize<'de> for Functions {
     }
 }
 
+impl PartialEq for Functions {
+    fn eq(&self, other: &Self) -> bool {
+        if !(self.for_all_values.len() == other.for_all_values.len()
+            && self.for_any_value.len() == other.for_any_value.len()
+            && self.for_normal.len() == other.for_normal.len())
+        {
+            return false;
+        }
+
+        self.for_any_value.iter().all(|x| other.for_any_value.contains(x))
+            && self.for_all_values.iter().all(|x| other.for_all_values.contains(x))
+            && self.for_normal.iter().all(|x| other.for_normal.contains(x))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Value;
 
@@ -151,7 +166,6 @@ mod tests {
     use crate::policy::function::condition::Condition::*;
     use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::key::Key;
-    use crate::policy::function::key_name::KeyName;
     use crate::policy::function::string::StringFunc;
     use crate::policy::function::string::StringFuncValue;
     use crate::policy::Functions;
@@ -369,7 +383,6 @@ mod tests {
                     values: StringFuncValue(vec!["us-east-1"].into_iter().map(ToOwned::to_owned).collect()),
                 }],
             })],
-            ..Default::default()
         },
         r#"{"ForAllValues:StringNotLike":{"s3:LocationConstraint":"us-east-1"},"ForAnyValue:StringNotLike":{"s3:LocationConstraint":["us-east-1","us-east-2"]},"StringNotLike":{"s3:LocationConstraint":"us-east-1"}}"#;
         "3"

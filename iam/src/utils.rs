@@ -1,16 +1,16 @@
-use crate::Error;
+use ecstore::error::{Error, Result};
 use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngCore};
 use serde::{de::DeserializeOwned, Serialize};
 
-pub fn gen_access_key(length: usize) -> crate::Result<String> {
+pub fn gen_access_key(length: usize) -> Result<String> {
     const ALPHA_NUMERIC_TABLE: [char; 36] = [
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
         'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
     ];
 
     if length < 3 {
-        return Err(Error::StringError("access key length is too short".into()));
+        return Err(Error::msg("access key length is too short"));
     }
 
     let mut result = String::with_capacity(length);
@@ -27,7 +27,7 @@ pub fn gen_secret_key(length: usize) -> crate::Result<String> {
     use base64_simd::URL_SAFE_NO_PAD;
 
     if length < 8 {
-        return Err(Error::StringError("secret key length is too short".into()));
+        return Err(Error::msg("secret key length is too short"));
     }
     let mut rng = rand::thread_rng();
 

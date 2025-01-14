@@ -8,7 +8,7 @@ pub type DateFunc = InnerFunc<DateFuncValue>;
 impl DateFunc {
     pub fn evaluate(&self, op: impl Fn(&OffsetDateTime, &OffsetDateTime) -> bool, values: &HashMap<String, Vec<String>>) -> bool {
         for inner in self.0.iter() {
-            let v = match values.get(inner.key.name().as_str()).and_then(|x| x.get(0)) {
+            let v = match values.get(inner.key.name().as_str()).and_then(|x| x.first()) {
                 Some(x) => x,
                 None => return false,
             };
@@ -26,8 +26,7 @@ impl DateFunc {
     }
 }
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DateFuncValue(OffsetDateTime);
 
 impl Serialize for DateFuncValue {
@@ -52,7 +51,7 @@ impl<'de> Deserialize<'de> for DateFuncValue {
     {
         struct DateVisitor;
 
-        impl<'de> de::Visitor<'de> for DateVisitor {
+        impl de::Visitor<'_> for DateVisitor {
             type Value = DateFuncValue;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {

@@ -23,6 +23,7 @@ use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
 use hyper::StatusCode;
 use iam::auth::{create_new_credentials_with_metadata, get_claims_from_token_with_secret};
+use iam::error::Error as IamError;
 use iam::{auth, get_global_action_cred};
 use madmin::metrics::RealtimeMetrics;
 use madmin::utils::parse_duration;
@@ -120,91 +121,116 @@ fn get_token_signing_key() -> Option<String> {
     }
 }
 
+// check_key_valid get auth.cred
 pub async fn check_key_valid(token: Option<String>, ak: &str) -> S3Result<(auth::Credentials, bool)> {
     let Some(mut cred) = get_global_action_cred() else {
-        return Err(s3_error!(InternalError, "action cred not init"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("get_global_action_cred {:?}", IamError::IamSysNotInitialized),
+        ));
     };
 
     let sys_cred = cred.clone();
 
     if cred.access_key != ak {
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+        let Ok(iam_store) = iam::get() else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
+            ));
+        };
 
-        match iam_store
+        let (u, ok) = iam_store
             .check_key(ak)
             .await
-            .map_err(|_e| s3_error!(InternalError, "check key failed"))?
-        {
-            (Some(u), true) => {
-                cred = u.credentials;
-            }
-            (Some(u), false) => {
-                if u.credentials.status == "off" {
-                    return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
-                }
-
-                return Err(s3_error!(InvalidRequest, "check key failed"));
-            }
-            _ => {
-                return Err(s3_error!(InvalidRequest, "check key failed"));
-            }
-        }
-    }
-
-    if let Some(st) = token {
-        let claims = check_claims_from_token(&st, &cred)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {}", e)))?;
-        cred.claims = Some(claims.to_map());
+
+        // if !ok {
+        //     if u.credentials.status == "off" {
+        //         return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
+        //     }
+
+        //     return Err(s3_error!(InvalidRequest, "check key failed"));
+        // }
+
+        // match iam_store
+        //     .check_key(ak)
+        //     .await
+        //     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {}", e)))?
+        // {
+        //     (Some(u), true) => {
+        //         cred = u.credentials;
+        //     }
+        //     (Some(u), false) => {
+        //         if u.credentials.status == "off" {
+        //             return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
+        //         }
+
+        //         return Err(s3_error!(InvalidRequest, "check key failed"));
+        //     }
+        //     _ => {
+        //         return Err(s3_error!(InvalidRequest, "check key failed"));
+        //     }
+        // }
     }
 
-    let owner = sys_cred.access_key == cred.access_key || cred.parent_user == sys_cred.access_key;
+    unimplemented!()
 
-    // permitRootAccess
-    // SessionPolicyName
-    Ok((cred, owner))
+    // if let Some(st) = token {
+    //     let claims = check_claims_from_token(&st, &cred)
+    //         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {}", e)))?;
+    //     cred.claims = Some(claims.to_map());
+    // }
+
+    // let owner = sys_cred.access_key == cred.access_key || cred.parent_user == sys_cred.access_key;
+
+    // // permitRootAccess
+    // // SessionPolicyName
+    // Ok((cred, owner))
 }
 
 pub fn check_claims_from_token(token: &str, cred: &auth::Credentials) -> S3Result<STSClaims> {
-    if !token.is_empty() && cred.access_key.is_empty() {
-        return Err(s3_error!(InvalidRequest, "no access key"));
-    }
+    unimplemented!()
+    // if !token.is_empty() && cred.access_key.is_empty() {
+    //     return Err(s3_error!(InvalidRequest, "no access key"));
+    // }
 
-    if token.is_empty() && cred.is_temp() && !cred.is_service_account() {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
-    }
+    // if token.is_empty() && cred.is_temp() && !cred.is_service_account() {
+    //     return Err(s3_error!(InvalidRequest, "invalid token"));
+    // }
 
-    if !token.is_empty() && !cred.is_temp() {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
-    }
+    // if !token.is_empty() && !cred.is_temp() {
+    //     return Err(s3_error!(InvalidRequest, "invalid token"));
+    // }
 
-    if !cred.is_service_account() && cred.is_temp() && token != cred.session_token {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
-    }
+    // if !cred.is_service_account() && cred.is_temp() && token != cred.session_token {
+    //     return Err(s3_error!(InvalidRequest, "invalid token"));
+    // }
 
-    if cred.is_temp() || cred.is_expired() {
-        return Err(s3_error!(InvalidRequest, "invalid access key"));
-    }
+    // if cred.is_temp() || cred.is_expired() {
+    //     return Err(s3_error!(InvalidRequest, "invalid access key"));
+    // }
 
-    let Some(sys_cred) = get_global_action_cred() else {
-        return Err(s3_error!(InternalError, "action cred not init"));
-    };
+    // let Some(sys_cred) = get_global_action_cred() else {
+    //     return Err(s3_error!(InternalError, "action cred not init"));
+    // };
 
-    let mut secret = sys_cred.secret_key;
+    // let mut secret = sys_cred.secret_key;
 
-    let mut token = token;
+    // let mut token = token;
 
-    if cred.is_service_account() {
-        token = cred.session_token.as_str();
-        secret = cred.secret_key.clone();
-    }
+    // if cred.is_service_account() {
+    //     token = cred.session_token.as_str();
+    //     secret = cred.secret_key.clone();
+    // }
 
-    if !token.is_empty() {
-        let claims: STSClaims =
-            get_claims_from_token_with_secret(token, &secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?;
-        return Ok(claims);
-    }
+    // if !token.is_empty() {
+    //     let claims: HashMap<String, String> =
+    //         get_claims_from_token_with_secret(token, &secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?;
+    //     return Ok(claims);
+    // }
 
-    Ok(STSClaims::default())
+    // Ok(STSClaims::default())
 }
 
 pub fn get_session_token(hds: &HeaderMap) -> Option<String> {
@@ -216,88 +242,89 @@ pub struct AssumeRoleHandle {}
 #[async_trait::async_trait]
 impl Operation for AssumeRoleHandle {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle AssumeRoleHandle");
+        unimplemented!()
+        // warn!("handle AssumeRoleHandle");
 
-        let Some(user) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
+        // let Some(user) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
 
-        // TODO: 判断权限, 不允许sts访问
+        // // TODO: 判断权限, 不允许sts访问
 
-        let mut input = req.input;
+        // let mut input = req.input;
 
-        let Some(bytes) = input.take_bytes() else {
-            return Err(s3_error!(InvalidRequest, "get body failed"));
-        };
-        let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
+        // let Some(bytes) = input.take_bytes() else {
+        //     return Err(s3_error!(InvalidRequest, "get body failed"));
+        // };
+        // let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
 
-        if body.action.as_str() != ASSUME_ROLE_ACTION {
-            return Err(s3_error!(InvalidArgument, "not suport action"));
-        }
+        // if body.action.as_str() != ASSUME_ROLE_ACTION {
+        //     return Err(s3_error!(InvalidArgument, "not suport action"));
+        // }
 
-        if body.version.as_str() != ASSUME_ROLE_VERSION {
-            return Err(s3_error!(InvalidArgument, "not suport version"));
-        }
+        // if body.version.as_str() != ASSUME_ROLE_VERSION {
+        //     return Err(s3_error!(InvalidArgument, "not suport version"));
+        // }
 
-        warn!("AssumeRole get cred {:?}", &user);
-        warn!("AssumeRole get body {:?}", &body);
+        // warn!("AssumeRole get cred {:?}", &user);
+        // warn!("AssumeRole get body {:?}", &body);
 
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+        // let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
 
-        if let Err(_err) = iam_store.policy_db_get(&user.access_key, None).await {
-            return Err(s3_error!(InvalidArgument, "invalid policy arg"));
-        }
+        // if let Err(_err) = iam_store.policy_db_get(&user.access_key, None).await {
+        //     return Err(s3_error!(InvalidArgument, "invalid policy arg"));
+        // }
 
-        let Some(secret) = get_token_signing_key() else {
-            return Err(s3_error!(InvalidArgument, "sk not init"));
-        };
+        // let Some(secret) = get_token_signing_key() else {
+        //     return Err(s3_error!(InvalidArgument, "sk not init"));
+        // };
 
-        let exp = {
-            if body.duration_seconds > 0 {
-                body.duration_seconds
-            } else {
-                3600
-            }
-        };
+        // let exp = {
+        //     if body.duration_seconds > 0 {
+        //         body.duration_seconds
+        //     } else {
+        //         3600
+        //     }
+        // };
 
-        let mut claims = STSClaims {
-            parent: user.access_key.clone(),
-            exp,
-            ..Default::default()
-        };
+        // let mut claims = STSClaims {
+        //     parent: user.access_key.clone(),
+        //     exp,
+        //     ..Default::default()
+        // };
 
-        let ak = iam::utils::gen_access_key(20).unwrap_or_default();
-        let sk = iam::utils::gen_secret_key(32).unwrap_or_default();
+        // let ak = iam::utils::gen_access_key(20).unwrap_or_default();
+        // let sk = iam::utils::gen_secret_key(32).unwrap_or_default();
 
-        claims.access_key = ak.clone();
+        // claims.access_key = ak.clone();
 
-        let mut cred = match create_new_credentials_with_metadata(&ak, &sk, &claims, &secret, Some(exp)) {
-            Ok(res) => res,
-            Err(_er) => return Err(s3_error!(InvalidRequest, "")),
-        };
+        // let mut cred = match create_new_credentials_with_metadata(&ak, &sk, &claims, &secret, Some(exp)) {
+        //     Ok(res) => res,
+        //     Err(_er) => return Err(s3_error!(InvalidRequest, "")),
+        // };
 
-        cred.parent_user = user.access_key.clone();
+        // cred.parent_user = user.access_key.clone();
 
-        if let Err(err) = iam_store.set_temp_user(&cred.access_key, &cred, "").await {
-            error!("set_temp_user err {:?}", err);
-            return Err(s3_error!(InternalError, "set_temp_user failed"));
-        }
+        // if let Err(err) = iam_store.set_temp_user(&cred.access_key, &cred, None).await {
+        //     error!("set_temp_user err {:?}", err);
+        //     return Err(s3_error!(InternalError, "set_temp_user failed"));
+        // }
 
-        let resp = AssumeRoleOutput {
-            credentials: Some(Credentials {
-                access_key_id: cred.access_key,
-                expiration: Timestamp::from(
-                    cred.expiration
-                        .unwrap_or(OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600))),
-                ),
-                secret_access_key: cred.secret_key,
-                session_token: cred.session_token,
-            }),
-            ..Default::default()
-        };
+        // let resp = AssumeRoleOutput {
+        //     credentials: Some(Credentials {
+        //         access_key_id: cred.access_key,
+        //         expiration: Timestamp::from(
+        //             cred.expiration
+        //                 .unwrap_or(OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600))),
+        //         ),
+        //         secret_access_key: cred.secret_key,
+        //         session_token: cred.session_token,
+        //     }),
+        //     ..Default::default()
+        // };
 
-        // getAssumeRoleCredentials
-        let output = xml::serialize::<AssumeRoleOutput>(&resp).unwrap();
+        // // getAssumeRoleCredentials
+        // let output = xml::serialize::<AssumeRoleOutput>(&resp).unwrap();
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+        // Ok(S3Response::new((StatusCode::OK, Body::from(output))))
     }
 }
 

@@ -1,9 +1,9 @@
 use super::key_name::KeyName;
-use crate::policy::{Error, Validator};
+use crate::{policy::Error as PolicyError, sys::Validator};
+use ecstore::error::Error;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(into = "String")]
 #[serde(try_from = "&str")]
 pub struct Key {
@@ -11,7 +11,9 @@ pub struct Key {
     pub variable: Option<String>,
 }
 
-impl Validator for Key {}
+impl Validator for Key {
+    type Error = Error;
+}
 
 impl Key {
     pub fn is(&self, other: &KeyName) -> bool {
@@ -36,7 +38,7 @@ impl From<Key> for String {
         let mut data = String::from(Into::<&str>::into(&value.name));
         if let Some(x) = value.variable.as_ref() {
             data.push('/');
-            data.push_str(&x);
+            data.push_str(x);
         }
         data
     }
@@ -47,7 +49,7 @@ impl TryFrom<&str> for Key {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let mut iter = value.splitn(2, '/');
-        let name = iter.next().ok_or_else(|| Error::InvalidKey(value.to_string()))?;
+        let name = iter.next().ok_or_else(|| PolicyError::InvalidKey(value.to_string()))?;
         let variable = iter.next().map(Into::into);
 
         Ok(Self {

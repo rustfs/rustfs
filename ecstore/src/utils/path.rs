@@ -71,7 +71,7 @@ pub fn path_join(elem: &[PathBuf]) -> PathBuf {
 }
 
 pub fn path_join_buf(elements: &[&str]) -> String {
-    let trailing_slash = !elements.is_empty() && elements.last().unwrap().ends_with('/');
+    let trailing_slash = !elements.is_empty() && elements.last().unwrap().ends_with(SLASH_SEPARATOR);
 
     let mut dst = String::new();
     let mut added = 0;
@@ -79,7 +79,7 @@ pub fn path_join_buf(elements: &[&str]) -> String {
     for e in elements {
         if added > 0 || !e.is_empty() {
             if added > 0 {
-                dst.push('/');
+                dst.push_str(SLASH_SEPARATOR);
             }
             dst.push_str(e);
             added += e.len();
@@ -91,7 +91,7 @@ pub fn path_join_buf(elements: &[&str]) -> String {
     let clean_path = cpath.to_string_lossy();
 
     if trailing_slash {
-        return format!("{}/", clean_path);
+        return format!("{}{}", clean_path, SLASH_SEPARATOR);
     }
     clean_path.to_string()
 }

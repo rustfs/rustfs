@@ -33,7 +33,7 @@ pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u
     Ok(data)
 }
 
-async fn read_config_with_metadata<S: StorageAPI>(
+pub async fn read_config_with_metadata<S: StorageAPI>(
     api: Arc<S>,
     file: &str,
     opts: &ObjectOptions,
@@ -70,6 +70,30 @@ pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: &[u8]) ->
         },
     )
     .await
+}
+
+pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()> {
+    match api
+        .delete_object(
+            RUSTFS_META_BUCKET,
+            file,
+            ObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if is_err_object_not_found(&err) {
+                Err(Error::new(ConfigError::NotFound))
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: &[u8], opts: &ObjectOptions) -> Result<()> {

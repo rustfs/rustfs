@@ -5,7 +5,7 @@ use serde_json::Value;
 pub mod path;
 pub mod wildcard;
 
-pub fn get_values_from_claims(claim: &HashMap<String, Value>, chaim_name: &str) -> (Vec<String>, bool) {
+pub fn _get_values_from_claims(claim: &HashMap<String, Value>, chaim_name: &str) -> (Vec<String>, bool) {
     let mut result = vec![];
     let Some(pname) = claim.get(chaim_name) else {
         return (result, false);
@@ -39,7 +39,7 @@ pub fn get_values_from_claims(claim: &HashMap<String, Value>, chaim_name: &str) 
     (result, true)
 }
 
-pub fn split_path(path: &str, second_index: bool) -> (&str, &str) {
+pub fn _split_path(path: &str, second_index: bool) -> (&str, &str) {
     let index = if second_index {
         let Some(first) = path.find('/') else {
             return (path, "");
@@ -63,7 +63,7 @@ pub fn split_path(path: &str, second_index: bool) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_path;
+    use super::_split_path;
 
     #[test_case::test_case("format.json", false => ("format.json", ""))]
     #[test_case::test_case("users/tester.json", false => ("users/", "tester.json"))]
@@ -82,6 +82,6 @@ mod tests {
         ("policydb/groups/", "cn=project/d,ou=groups,ou=swengg,dc=min,dc=io.json"))
     ]
     fn test_split_path(path: &str, second_index: bool) -> (&str, &str) {
-        split_path(path, second_index)
+        _split_path(path, second_index)
     }
 }

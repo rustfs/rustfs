@@ -63,7 +63,7 @@ impl FuncKeyValue<StringFuncValue> {
             .map(|c| {
                 let mut c = Cow::from(c);
                 for key in KeyName::COMMON_KEYS {
-                    match values.get(key.name()).and_then(|x| x.get(0)) {
+                    match values.get(key.name()).and_then(|x| x.first()) {
                         Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
                         _ => continue,
                     };
@@ -93,7 +93,7 @@ impl FuncKeyValue<StringFuncValue> {
                     .map(|c| {
                         let mut c = Cow::from(c);
                         for key in KeyName::COMMON_KEYS {
-                            match values.get(key.name()).and_then(|x| x.get(0)) {
+                            match values.get(key.name()).and_then(|x| x.first()) {
                                 Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
                                 _ => continue,
                             };
@@ -118,8 +118,8 @@ impl FuncKeyValue<StringFuncValue> {
 }
 
 /// 解析values字段
-#[derive(Clone)]
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+
 pub struct StringFuncValue(pub Set<String>);
 
 impl Serialize for StringFuncValue {
