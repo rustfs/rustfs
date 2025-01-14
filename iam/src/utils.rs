@@ -1,7 +1,7 @@
 use crate::Error;
 use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngCore};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Serialize};
 
 pub fn gen_access_key(length: usize) -> crate::Result<String> {
     const ALPHA_NUMERIC_TABLE: [char; 36] = [

@@ -23,7 +23,8 @@ pub trait Store: Clone + Send + Sync + 'static {
     async fn load_all(&self, cache: &Cache) -> crate::Result<()>;
 
     fn get_default_policyes() -> HashMap<String, PolicyDoc> {
-        DEFAULT_POLICIES
+        let default_policies = DEFAULT_POLICIES;
+        default_policies
             .iter()
             .map(|(n, p)| {
                 (
