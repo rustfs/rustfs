@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use http::HeaderMap;
 use hyper::StatusCode;
 use iam::{
     auth::CredentialsBuilder,
@@ -10,7 +11,7 @@ use iam::{
 };
 use madmin::{AddServiceAccountReq, ListServiceAccountsResp, ServiceAccountInfo};
 use matchit::Params;
-use s3s::{s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
 use tracing::{debug, warn};
 
@@ -277,7 +278,10 @@ impl Operation for ListServiceAccount {
         let data = serde_json::to_vec(&ListServiceAccountsResp { accounts })
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {}", e)))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(data))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
