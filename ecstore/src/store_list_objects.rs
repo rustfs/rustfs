@@ -14,7 +14,7 @@ use crate::store::check_list_objs_args;
 use crate::store_api::{FileInfo, ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectOptions};
 use crate::store_err::{is_err_bucket_not_found, to_object_err, StorageError};
 use crate::utils::path::{self, base_dir_from_prefix, SLASH_SEPARATOR};
-use crate::{bucket, StorageAPI};
+use crate::StorageAPI;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
@@ -1377,33 +1377,33 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    // use std::sync::Arc;
 
-    use crate::cache_value::metacache_set::list_path_raw;
-    use crate::cache_value::metacache_set::ListPathRawOptions;
-    use crate::disk::endpoint::Endpoint;
-    use crate::disk::error::is_err_eof;
-    use crate::disk::format::FormatV3;
-    use crate::disk::new_disk;
-    use crate::disk::DiskAPI;
-    use crate::disk::DiskOption;
-    use crate::disk::MetaCacheEntries;
-    use crate::disk::MetaCacheEntry;
-    use crate::disk::WalkDirOptions;
-    use crate::endpoints::EndpointServerPools;
-    use crate::error::Error;
-    use crate::metacache::writer::MetacacheReader;
-    use crate::set_disk::SetDisks;
-    use crate::store::ECStore;
-    use crate::store_list_objects::ListPathOptions;
-    use crate::store_list_objects::WalkOptions;
-    use crate::store_list_objects::WalkVersionsSortOrder;
-    use futures::future::join_all;
-    use lock::namespace_lock::NsLockMap;
-    use tokio::sync::broadcast;
-    use tokio::sync::mpsc;
-    use tokio::sync::RwLock;
-    use uuid::Uuid;
+    // use crate::cache_value::metacache_set::list_path_raw;
+    // use crate::cache_value::metacache_set::ListPathRawOptions;
+    // use crate::disk::endpoint::Endpoint;
+    // use crate::disk::error::is_err_eof;
+    // use crate::disk::format::FormatV3;
+    // use crate::disk::new_disk;
+    // use crate::disk::DiskAPI;
+    // use crate::disk::DiskOption;
+    // use crate::disk::MetaCacheEntries;
+    // use crate::disk::MetaCacheEntry;
+    // use crate::disk::WalkDirOptions;
+    // use crate::endpoints::EndpointServerPools;
+    // use crate::error::Error;
+    // use crate::metacache::writer::MetacacheReader;
+    // use crate::set_disk::SetDisks;
+    // use crate::store::ECStore;
+    // use crate::store_list_objects::ListPathOptions;
+    // use crate::store_list_objects::WalkOptions;
+    // use crate::store_list_objects::WalkVersionsSortOrder;
+    // use futures::future::join_all;
+    // use lock::namespace_lock::NsLockMap;
+    // use tokio::sync::broadcast;
+    // use tokio::sync::mpsc;
+    // use tokio::sync::RwLock;
+    // use uuid::Uuid;
 
     // #[tokio::test]
     // async fn test_walk_dir() {
@@ -1634,35 +1634,35 @@ mod test {
     //     println!("ret {:?}", ret);
     // }
 
-    #[tokio::test]
-    async fn test_walk() {
-        let server_address = "localhost:9000";
+    // #[tokio::test]
+    // async fn test_walk() {
+    //     let server_address = "localhost:9000";
 
-        let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-            server_address,
-            vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-        )
-        .unwrap();
+    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
+    //         server_address,
+    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
+    //     )
+    //     .unwrap();
 
-        let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-            .await
-            .unwrap();
+    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
+    //         .await
+    //         .unwrap();
 
-        ECStore::init(store.clone()).await.unwrap();
+    //     ECStore::init(store.clone()).await.unwrap();
 
-        let (_tx, rx) = broadcast::channel(1);
+    //     let (_tx, rx) = broadcast::channel(1);
 
-        let bucket = ".rustfs.sys";
-        let prefix = "config/iam/sts/";
+    //     let bucket = ".rustfs.sys";
+    //     let prefix = "config/iam/sts/";
 
-        let (sender, mut recv) = mpsc::channel(10);
+    //     let (sender, mut recv) = mpsc::channel(10);
 
-        let opts = WalkOptions::default();
+    //     let opts = WalkOptions::default();
 
-        store.walk(rx, bucket, prefix, sender, opts).await.unwrap();
+    //     store.walk(rx, bucket, prefix, sender, opts).await.unwrap();
 
-        while let Some(entry) = recv.recv().await {
-            println!("get entry {:?}", entry)
-        }
-    }
+    //     while let Some(entry) = recv.recv().await {
+    //         println!("get entry {:?}", entry)
+    //     }
+    // }
 }
