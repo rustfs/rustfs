@@ -71,6 +71,10 @@ where
 
         // warn!("get uri {}", &uri);
 
+        if req.credentials.is_none() {
+            return Err(s3_error!(AccessDenied, "Signature is required"));
+        }
+
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
             return op.call(req, mat.params).await;

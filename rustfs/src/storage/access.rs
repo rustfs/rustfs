@@ -8,6 +8,7 @@ use s3s::access::{S3Access, S3AccessContext};
 
 use s3s::auth::Credentials;
 use s3s::{dto::*, s3_error, S3Request, S3Result};
+use tracing::info;
 use uuid::Uuid;
 
 #[allow(dead_code)]
@@ -43,7 +44,18 @@ impl S3Access for FS {
     // /// + [`cx.extensions_mut()`](S3AccessContext::extensions_mut)
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // 上层验证了 ak/sk
-        // warn!("check s3_op {:?} cred {:?}", cx.s3_op().name(), cx.credentials());
+        info!(
+            "s3 check path: {:?}, s3_op: {:?}, cred: {:?}",
+            cx.s3_path(),
+            cx.s3_op().name(),
+            cx.credentials()
+        );
+
+        if cx.credentials().is_none() {
+            return Err(s3_error!(AccessDenied, "Signature is required"));
+        };
+
+        // TODO: FIXME: check auth
 
         let action = match Action::from_str(format!("s3:{}", cx.s3_op().name()).as_str()) {
             Ok(res) => Some(res),
