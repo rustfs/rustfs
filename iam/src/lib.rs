@@ -128,11 +128,7 @@ pub async fn delete_user(ak: &str, _notify: bool) -> crate::Result<()> {
 }
 
 pub async fn is_temp_user(ak: &str) -> crate::Result<(bool, String)> {
-    if let Some(user) = get()?.get_user(ak).await? {
-        Ok((user.credentials.is_temp(), user.credentials.parent_user))
-    } else {
-        Err(Error::NoSuchUser(ak.to_string()))
-    }
+    get()?.is_temp_user(ak).await
 }
 
 pub async fn get_user_info(ak: &str) -> crate::Result<madmin::UserInfo> {
@@ -145,4 +141,8 @@ pub async fn set_user_status(ak: &str, status: AccountStatus) -> crate::Result<O
 
 pub async fn list_service_accounts(ak: &str) -> crate::Result<Vec<Credentials>> {
     get()?.list_service_accounts(ak).await
+}
+
+pub async fn remove_users_from_group(group: &str, members: Vec<String>) -> crate::Result<OffsetDateTime> {
+    get()?.remove_users_from_group(group, members).await
 }

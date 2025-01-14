@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 
 use crate::{
     auth::UserIdentity,
-    policy::{Args, MappedPolicy, Policy, PolicyDoc},
+    policy::{Args, GroupInfo, MappedPolicy, Policy, PolicyDoc},
     Error,
 };
 
@@ -21,7 +21,7 @@ pub struct Cache {
     pub user_policies: ArcSwap<CacheEntity<MappedPolicy>>,
     pub sts_accounts: ArcSwap<CacheEntity<UserIdentity>>,
     pub sts_policies: ArcSwap<CacheEntity<MappedPolicy>>,
-    pub groups: ArcSwap<CacheEntity<String>>,
+    pub groups: ArcSwap<CacheEntity<GroupInfo>>,
     pub user_group_memeberships: ArcSwap<CacheEntity<HashSet<String>>>,
     pub group_policies: ArcSwap<CacheEntity<MappedPolicy>>,
 }
@@ -89,7 +89,7 @@ impl Cache {
 
 impl CacheInner {
     #[inline]
-    pub fn get_user<'a>(&self, user_name: &'a str) -> Option<&UserIdentity> {
+    pub fn get_user(&self, user_name: &str) -> Option<&UserIdentity> {
         self.users.get(user_name).or_else(|| self.sts_accounts.get(user_name))
     }
 
@@ -99,7 +99,7 @@ impl CacheInner {
 
     /// 如果是临时用户，返回Ok(Some(partent_name)))
     /// 如果不是临时用户，返回Ok(None)
-    fn is_temp_user<'a>(&self, user_name: &'a str) -> crate::Result<Option<&str>> {
+    fn is_temp_user(&self, user_name: &str) -> crate::Result<Option<&str>> {
         let user = self
             .get_user(user_name)
             .ok_or_else(|| Error::NoSuchUser(user_name.to_owned()))?;
@@ -113,7 +113,7 @@ impl CacheInner {
 
     /// 如果是临时用户，返回Ok(Some(partent_name)))
     /// 如果不是临时用户，返回Ok(None)
-    fn is_service_account<'a>(&self, user_name: &'a str) -> crate::Result<Option<&str>> {
+    fn is_service_account(&self, user_name: &str) -> crate::Result<Option<&str>> {
         let user = self
             .get_user(user_name)
             .ok_or_else(|| Error::NoSuchUser(user_name.to_owned()))?;
@@ -137,7 +137,7 @@ impl CacheInner {
         false
     }
 
-    pub fn is_allowed(&self, args: Args) -> bool {
+    pub fn is_allowed(&self, _args: Args) -> bool {
         todo!()
     }
 
@@ -199,7 +199,7 @@ pub struct CacheInner {
     pub user_policies: G<MappedPolicy>,
     pub sts_accounts: G<UserIdentity>,
     pub sts_policies: G<MappedPolicy>,
-    pub groups: G<String>,
+    pub groups: G<GroupInfo>,
     pub user_group_memeberships: G<HashSet<String>>,
     pub group_policies: G<MappedPolicy>,
 }
@@ -239,7 +239,7 @@ mod tests {
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
             let c = &cache;
             f.push(async move {
-                Cache::add_or_update(&c, &key, &index, OffsetDateTime::now_utc());
+                Cache::add_or_update(c, &key, &index, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
@@ -259,7 +259,7 @@ mod tests {
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
             let c = &cache;
             f.push(async move {
-                Cache::add_or_update(&c, &key, &index, OffsetDateTime::now_utc());
+                Cache::add_or_update(c, &key, &index, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
@@ -274,7 +274,7 @@ mod tests {
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
             let c = &cache;
             f.push(async move {
-                Cache::add_or_update(&c, &key, &(index * 1000), OffsetDateTime::now_utc());
+                Cache::add_or_update(c, &key, &(index * 1000), OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
@@ -294,7 +294,7 @@ mod tests {
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
             let c = &cache;
             f.push(async move {
-                Cache::add_or_update(&c, &key, &index, OffsetDateTime::now_utc());
+                Cache::add_or_update(c, &key, &index, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
@@ -309,7 +309,7 @@ mod tests {
         for key in (0..100).map(|x| x.to_string()) {
             let c = &cache;
             f.push(async move {
-                Cache::delete(&c, &key, OffsetDateTime::now_utc());
+                Cache::delete(c, &key, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;

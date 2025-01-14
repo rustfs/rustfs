@@ -1,8 +1,8 @@
-use http::StatusCode;
+use http::{HeaderMap, StatusCode};
 use iam::get_global_action_cred;
 use madmin::{AccountStatus, AddOrUpdateUserReq};
 use matchit::Params;
-use s3s::{s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;
@@ -87,7 +87,10 @@ impl Operation for AddUser {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("create_user err {}", e)))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::empty())))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
 
@@ -128,7 +131,10 @@ impl Operation for SetUserStatus {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("set_user_status err {}", e)))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::empty())))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
 
@@ -151,7 +157,10 @@ impl Operation for ListUsers {
         // let body = encrypt_data(input_cred.secret_key.expose().as_bytes(), &data)
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("encrypt_data err {}", e)))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(data))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
@@ -188,7 +197,10 @@ impl Operation for RemoveUser {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("delete_user err {}", e)))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::empty())))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
 
@@ -220,6 +232,9 @@ impl Operation for GetUserInfo {
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal user err {}", e)))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(data))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }

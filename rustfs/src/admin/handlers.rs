@@ -27,6 +27,7 @@ use iam::{auth, get_global_action_cred};
 use madmin::metrics::RealtimeMetrics;
 use madmin::utils::parse_duration;
 use matchit::Params;
+use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -48,6 +49,7 @@ use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
+pub mod group;
 pub mod service_account;
 pub mod trace;
 pub mod user;
@@ -353,10 +355,13 @@ impl Operation for AccountInfoHandler {
             policy: bucket_policy,
         };
 
-        let output = serde_json::to_string(&info)
+        let data = serde_json::to_vec(&info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
@@ -379,10 +384,13 @@ impl Operation for ServerInfoHandler {
 
         let info = get_server_info(true).await;
 
-        let output = serde_json::to_string(&info)
+        let data = serde_json::to_vec(&info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed"))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
@@ -412,10 +420,13 @@ impl Operation for StorageInfoHandler {
 
         let info = store.storage_info().await;
 
-        let output = serde_json::to_string(&info)
+        let data = serde_json::to_vec(&info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
@@ -435,10 +446,13 @@ impl Operation for DataUsageInfoHandler {
             s3_error!(InternalError, "load_data_usage_from_backend failed")
         })?;
 
-        let output = serde_json::to_string(&info)
+        let data = serde_json::to_vec(&info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed"))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
@@ -859,10 +873,13 @@ impl Operation for ListPools {
             pools_status.push(state);
         }
 
-        let output = serde_json::to_string(&pools_status)
+        let data = serde_json::to_vec(&pools_status)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
@@ -926,10 +943,13 @@ impl Operation for StatusPool {
 
         let pools_status = store.status(idx).await.map_err(to_s3_error)?;
 
-        let output = serde_json::to_string(&pools_status)
+        let data = serde_json::to_vec(&pools_status)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 

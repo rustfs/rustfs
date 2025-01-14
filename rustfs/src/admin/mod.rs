@@ -5,6 +5,7 @@ pub mod router;
 use common::error::Result;
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
+    group,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     user,
 };
@@ -159,6 +160,30 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-status").as_str(),
         AdminOperation(&user::SetUserStatus {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/groups").as_str(),
+        AdminOperation(&group::ListGroups {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/group").as_str(),
+        AdminOperation(&group::Group {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-group-status").as_str(),
+        AdminOperation(&group::SetGroupStatus {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/update-group-members").as_str(),
+        AdminOperation(&group::UpdateGroupMembers {}),
     )?;
 
     // Service accounts
