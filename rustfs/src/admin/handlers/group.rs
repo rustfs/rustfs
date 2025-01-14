@@ -1,5 +1,5 @@
 use http::StatusCode;
-use iam::{error::is_err_no_such_user, get_global_action_cred, Error};
+use iam::{error::is_err_no_such_user, get_global_action_cred};
 use madmin::GroupAddRemove;
 use matchit::Params;
 use s3s::{s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
