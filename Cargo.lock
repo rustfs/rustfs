@@ -2509,7 +2509,7 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 [[package]]
 name = "s3s"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=05efc3f87e9f5d1a6c9760c79cf1f70dcdd100c8#05efc3f87e9f5d1a6c9760c79cf1f70dcdd100c8"
+source = "git+https://github.com/Nugine/s3s.git?rev=529c8933a11528c506d5fbf7c4c2ab155db37dfe#529c8933a11528c506d5fbf7c4c2ab155db37dfe"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -2556,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "s3s-policy"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=05efc3f87e9f5d1a6c9760c79cf1f70dcdd100c8#05efc3f87e9f5d1a6c9760c79cf1f70dcdd100c8"
+source = "git+https://github.com/Nugine/s3s.git?rev=529c8933a11528c506d5fbf7c4c2ab155db37dfe#529c8933a11528c506d5fbf7c4c2ab155db37dfe"
 dependencies = [
  "indexmap 2.6.0",
  "serde",
