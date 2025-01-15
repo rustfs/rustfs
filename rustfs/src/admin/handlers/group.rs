@@ -33,8 +33,13 @@ impl Operation for UpdateGroupMembers {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle UpdateGroupMembers");
 
-        let Some(body) = req.input.bytes() else {
-            return Err(s3_error!(InvalidRequest, "get body failed"));
+        let mut input = req.input;
+        let body = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("get body failed, e: {:?}", e);
+                return Err(s3_error!(InvalidRequest, "get body failed"));
+            }
         };
 
         let args: GroupAddRemove = serde_json::from_slice(&body)

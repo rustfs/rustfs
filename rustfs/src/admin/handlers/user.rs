@@ -53,10 +53,6 @@ impl Operation for AddUser {
             }
         };
 
-        // let Some(body) = req.input.bytes() else {
-        //     return Err(s3_error!(InvalidRequest, "get body failed"));
-        // };
-
         // let body_bytes = decrypt_data(input_cred.secret_key.expose().as_bytes(), &body)
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("decrypt_data err {}", e)))?;
 
