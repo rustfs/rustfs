@@ -32,8 +32,13 @@ impl Operation for AddServiceAccount {
         };
         let _is_owner = true; // 先按true处理，后期根据请求决定。
 
-        let Some(body) = req.input.bytes() else {
-            return Err(s3_error!(InvalidRequest, "get body failed"));
+        let mut input = req.input;
+        let body = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("get body failed, e: {:?}", e);
+                return Err(s3_error!(InvalidRequest, "get body failed"));
+            }
         };
 
         let mut create_req: AddServiceAccountReq =
