@@ -27,7 +27,7 @@ impl Operation for AddUser {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
             } else {
                 AddUserQuery::default()
@@ -44,9 +44,18 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Some(body) = req.input.bytes() else {
-            return Err(s3_error!(InvalidRequest, "get body failed"));
+        let mut input = req.input;
+        let body = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("get body failed, e: {:?}", e);
+                return Err(s3_error!(InvalidRequest, "get body failed"));
+            }
         };
+
+        // let Some(body) = req.input.bytes() else {
+        //     return Err(s3_error!(InvalidRequest, "get body failed"));
+        // };
 
         // let body_bytes = decrypt_data(input_cred.secret_key.expose().as_bytes(), &body)
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("decrypt_data err {}", e)))?;
