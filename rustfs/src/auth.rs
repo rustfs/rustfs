@@ -1,4 +1,3 @@
-use iam::cache::CacheInner;
 use log::warn;
 use s3s::auth::S3Auth;
 use s3s::auth::SecretKey;

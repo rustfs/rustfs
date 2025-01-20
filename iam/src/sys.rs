@@ -210,14 +210,14 @@ impl<T: Store> IamSys<T> {
             Vec::new()
         };
 
-        let mut m = HashMap::new();
-        m.insert("parent".to_owned(), parent_user.to_owned());
+        let mut m: HashMap<String, Value> = HashMap::new();
+        m.insert("parent".to_owned(), serde_json::Value::String(parent_user.to_owned()));
 
         if !policy_buf.is_empty() {
-            m.insert(SESSION_POLICY_NAME.to_owned(), base64_encode(&policy_buf));
-            m.insert(iam_policy_claim_name_sa(), EMBEDDED_POLICY_TYPE.to_owned());
+            m.insert(SESSION_POLICY_NAME.to_owned(), serde_json::Value::String(base64_encode(&policy_buf)));
+            m.insert(iam_policy_claim_name_sa(), serde_json::Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
         } else {
-            m.insert(iam_policy_claim_name_sa(), INHERITED_POLICY_TYPE.to_owned());
+            m.insert(iam_policy_claim_name_sa(), serde_json::Value::String(INHERITED_POLICY_TYPE.to_owned()));
         }
 
         if let Some(claims) = opts.claims {
@@ -234,7 +234,7 @@ impl<T: Store> IamSys<T> {
             generate_credentials()?
         };
 
-        let mut cred = create_new_credentials_with_metadata(&access_key, &secret_key, &m, &secret_key, None)?;
+        let mut cred = create_new_credentials_with_metadata(&access_key, &secret_key, &m, &secret_key)?;
         cred.parent_user = parent_user.to_owned();
         cred.groups = Some(groups);
         cred.status = ACCOUNT_ON.to_owned();
@@ -671,7 +671,7 @@ pub struct NewServiceAccountOpts {
     pub description: Option<String>,
     pub expiration: Option<OffsetDateTime>,
     pub allow_site_replicator_account: bool,
-    pub claims: Option<HashMap<String, String>>,
+    pub claims: Option<HashMap<String, Value>>,
 }
 
 pub struct UpdateServiceAccountOpts {
