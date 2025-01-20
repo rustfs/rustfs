@@ -177,22 +177,17 @@ pub fn generate_credentials() -> Result<(String, String)> {
     Ok((ak, sk))
 }
 
-pub fn get_new_credentials_with_metadata<T: Serialize>(
-    claims: &T,
-    token_secret: &str,
-    exp: Option<usize>,
-) -> Result<Credentials> {
+pub fn get_new_credentials_with_metadata(claims: &HashMap<String, Value>, token_secret: &str) -> Result<Credentials> {
     let (ak, sk) = generate_credentials()?;
 
-    create_new_credentials_with_metadata(&ak, &sk, claims, token_secret, exp)
+    create_new_credentials_with_metadata(&ak, &sk, claims, token_secret)
 }
 
-pub fn create_new_credentials_with_metadata<T: Serialize>(
+pub fn create_new_credentials_with_metadata(
     ak: &str,
     sk: &str,
-    claims: &T,
+    claims: &HashMap<String, Value>,
     token_secret: &str,
-    exp: Option<usize>,
 ) -> Result<Credentials> {
     if ak.len() < ACCESS_KEY_MIN_LEN || ak.len() > ACCESS_KEY_MAX_LEN {
         return Err(Error::new(IamError::InvalidAccessKeyLength));
@@ -202,6 +197,18 @@ pub fn create_new_credentials_with_metadata<T: Serialize>(
         return Err(Error::new(IamError::InvalidAccessKeyLength));
     }
 
+    let expiration = {
+        if let Some(v) = claims.get("exp") {
+            if let Some(expiry) = v.as_i64() {
+                Some(OffsetDateTime::from_unix_timestamp(expiry)?.to_offset(OffsetDateTime::now_local()?.offset()))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     let token = utils::generate_jwt(claims, token_secret)?;
 
     Ok(Credentials {
@@ -209,7 +216,7 @@ pub fn create_new_credentials_with_metadata<T: Serialize>(
         secret_key: sk.to_owned(),
         session_token: token,
         status: ACCOUNT_ON.to_owned(),
-        expiration: exp.map(|v| OffsetDateTime::now_utc().saturating_add(Duration::seconds(v as i64))),
+        expiration,
         ..Default::default()
     })
 }

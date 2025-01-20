@@ -773,7 +773,14 @@ where
     }
 
     pub async fn set_temp_user(&self, access_key: &str, cred: &Credentials, policy_name: Option<&str>) -> Result<OffsetDateTime> {
-        if access_key.is_empty() || cred.is_temp() || cred.is_expired() || cred.parent_user.is_empty() {
+        if access_key.is_empty() || !cred.is_temp() || cred.is_expired() || cred.parent_user.is_empty() {
+            error!(
+                "set temp user invalid argument, access_key: {},  is_temp: {}, is_expired: {}, parent_user_empty: {}",
+                access_key,
+                cred.is_temp(),
+                cred.is_expired(),
+                cred.parent_user.is_empty()
+            );
             return Err(Error::new(IamError::InvalidArgument));
         }
 
