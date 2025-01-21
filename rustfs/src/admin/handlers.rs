@@ -1,6 +1,7 @@
 use super::router::Operation;
 use crate::storage::error::to_s3_error;
 use bytes::Bytes;
+use const_str::from_utf8;
 use ecstore::admin_server_info::get_server_info;
 use ecstore::bucket::policy::action::{Action, ActionSet};
 use ecstore::bucket::policy::bucket_policy::{BPStatement, BucketPolicy};
@@ -233,9 +234,14 @@ impl Operation for AssumeRoleHandle {
 
         let mut input = req.input;
 
-        let Some(bytes) = input.take_bytes() else {
-            return Err(s3_error!(InvalidRequest, "get body failed"));
+        let bytes = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("get body failed, e: {:?}", e);
+                return Err(s3_error!(InvalidRequest, "get body failed"));
+            }
         };
+
         let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
 
         if body.action.as_str() != ASSUME_ROLE_ACTION {
