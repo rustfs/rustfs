@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 
 const ACCESS_KEY_MIN_LEN: usize = 3;
 const ACCESS_KEY_MAX_LEN: usize = 20;
