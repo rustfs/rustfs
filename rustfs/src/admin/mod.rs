@@ -171,7 +171,7 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/group").as_str(),
-        AdminOperation(&group::Group {}),
+        AdminOperation(&group::GetGroup {}),
     )?;
 
     r.insert(
@@ -192,7 +192,7 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
         format!("{}{}", ADMIN_PREFIX, "/v3/update-service-account").as_str(),
         AdminOperation(&UpdateServiceAccount {}),
     )?;
-
+    // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info-service-account").as_str(),
@@ -205,13 +205,13 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
         format!("{}{}", ADMIN_PREFIX, "/v3/list-service-accounts").as_str(),
         AdminOperation(&ListServiceAccount {}),
     )?;
-
+    // 1
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/delete-service-accounts").as_str(),
         AdminOperation(&DeleteServiceAccount {}),
     )?;
-
+    // 1
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-service-accounts").as_str(),

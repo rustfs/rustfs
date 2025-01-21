@@ -1,11 +1,22 @@
-use http::StatusCode;
-use iam::{error::is_err_no_such_user, get_global_action_cred};
+use http::{HeaderMap, StatusCode};
+use iam::{
+    error::{is_err_no_such_group, is_err_no_such_user},
+    get_global_action_cred,
+};
 use madmin::GroupAddRemove;
 use matchit::Params;
-use s3s::{s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use serde::Deserialize;
+use serde_urlencoded::from_bytes;
 use tracing::warn;
 
-use crate::admin::router::Operation;
+use crate::admin::{router::Operation, utils::has_space_be};
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GroupQuery {
+    pub group: String,
+    pub status: Option<String>,
+}
 
 pub struct ListGroups {}
 #[async_trait::async_trait]
@@ -13,17 +24,101 @@ impl Operation for ListGroups {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListGroups");
 
-        Err(s3_error!(NotImplemented))
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+
+        let groups = iam_store.list_groups().await.map_err(|e| {
+            warn!("list groups failed, e: {:?}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+        })?;
+
+        let body = serde_json::to_vec(&groups).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
 }
 
-pub struct Group {}
+pub struct GetGroup {}
 #[async_trait::async_trait]
-impl Operation for Group {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle Group");
+impl Operation for GetGroup {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle GetGroup");
 
-        Err(s3_error!(NotImplemented))
+        let query = {
+            if let Some(query) = req.uri.query() {
+                let input: GroupQuery =
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
+                input
+            } else {
+                GroupQuery::default()
+            }
+        };
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+
+        let g = iam_store.get_group_description(&query.group).await.map_err(|e| {
+            warn!("get group failed, e: {:?}", e);
+            S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+        })?;
+
+        let body = serde_json::to_vec(&g).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+    }
+}
+
+pub struct SetGroupStatus {}
+#[async_trait::async_trait]
+impl Operation for SetGroupStatus {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle SetGroupStatus");
+
+        let query = {
+            if let Some(query) = req.uri.query() {
+                let input: GroupQuery =
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
+                input
+            } else {
+                GroupQuery::default()
+            }
+        };
+
+        if query.group.is_empty() {
+            return Err(s3_error!(InvalidArgument, "group is required"));
+        }
+
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+
+        if let Some(status) = query.status {
+            match status.as_str() {
+                "enabled" => {
+                    iam_store.set_group_status(&query.group, true).await.map_err(|e| {
+                        warn!("enable group failed, e: {:?}", e);
+                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    })?;
+                }
+                "disabled" => {
+                    iam_store.set_group_status(&query.group, false).await.map_err(|e| {
+                        warn!("enable group failed, e: {:?}", e);
+                        S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                    })?;
+                }
+                _ => {
+                    return Err(s3_error!(InvalidArgument, "invalid status"));
+                }
+            }
+        } else {
+            return Err(s3_error!(InvalidArgument, "status is required"));
+        }
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
 
@@ -83,20 +178,31 @@ impl Operation for UpdateGroupMembers {
 
         if args.is_remove {
             warn!("remove group members");
+            iam_store
+                .remove_users_from_group(&args.group, args.members)
+                .await
+                .map_err(|e| {
+                    warn!("remove group members failed, e: {:?}", e);
+                    S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+                })?;
         } else {
             warn!("add group members");
+
+            if let Err(err) = iam_store.get_group_description(&args.group).await {
+                if is_err_no_such_group(&err) && has_space_be(&args.group) {
+                    return Err(s3_error!(InvalidArgument, "not such group"));
+                }
+            }
+
+            iam_store.add_users_to_group(&args.group, args.members).await.map_err(|e| {
+                warn!("add group members failed, e: {:?}", e);
+                S3Error::with_message(S3ErrorCode::InternalError, e.to_string())
+            })?;
         }
 
-        Err(s3_error!(NotImplemented))
-    }
-}
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-pub struct SetGroupStatus {}
-#[async_trait::async_trait]
-impl Operation for SetGroupStatus {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle SetGroupStatus");
-
-        Err(s3_error!(NotImplemented))
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }

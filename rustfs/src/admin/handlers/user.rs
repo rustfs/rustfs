@@ -156,17 +156,42 @@ impl Operation for SetUserStatus {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct BucketQuery {
+    #[serde(rename = "bucket")]
+    pub bucket: String,
+}
 pub struct ListUsers {}
 #[async_trait::async_trait]
 impl Operation for ListUsers {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListUsers");
+
+        let query = {
+            if let Some(query) = req.uri.query() {
+                let input: BucketQuery =
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                input
+            } else {
+                BucketQuery::default()
+            }
+        };
+
         let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
 
-        let users = iam_store
-            .list_users()
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+        let users = {
+            if !query.bucket.is_empty() {
+                iam_store
+                    .list_bucket_users(query.bucket.as_str())
+                    .await
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
+            } else {
+                iam_store
+                    .list_users()
+                    .await
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
+            }
+        };
 
         let data = serde_json::to_vec(&users)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {}", e)))?;

@@ -11,7 +11,7 @@ pub enum GroupStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GroupAddRemove {
-    group: String,
+    pub group: String,
     pub members: Vec<String>,
     #[serde(rename = "groupStatus")]
     pub status: GroupStatus,
