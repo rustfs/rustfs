@@ -27,6 +27,7 @@ use crate::store::UserType;
 use ecstore::error::{Error, Result};
 use ecstore::utils::crypto::base64_decode;
 use ecstore::utils::crypto::base64_encode;
+use madmin::AddOrUpdateUserReq;
 use madmin::GroupDesc;
 use serde_json::json;
 use serde_json::Value;
@@ -178,9 +179,9 @@ impl<T: Store> IamSys<T> {
     pub async fn new_service_account(
         &self,
         parent_user: &str,
-        groups: Vec<String>,
+        groups: Option<Vec<String>>,
         opts: NewServiceAccountOpts,
-    ) -> Result<OffsetDateTime> {
+    ) -> Result<(Credentials, OffsetDateTime)> {
         if parent_user.is_empty() {
             return Err(IamError::InvalidArgument.into());
         }
@@ -236,14 +237,15 @@ impl<T: Store> IamSys<T> {
 
         let mut cred = create_new_credentials_with_metadata(&access_key, &secret_key, &m, &secret_key)?;
         cred.parent_user = parent_user.to_owned();
-        cred.groups = Some(groups);
+        cred.groups = groups;
         cred.status = ACCOUNT_ON.to_owned();
         cred.name = opts.name;
         cred.description = opts.description;
         cred.expiration = opts.expiration;
 
-        self.store.add_service_account(cred).await
+        let create_at = self.store.add_service_account(cred.clone()).await?;
 
+        Ok((cred, create_at))
         // TODO: notification
     }
 
@@ -387,7 +389,7 @@ impl<T: Store> IamSys<T> {
         // TODO: notification
     }
 
-    pub async fn create_user(&self, access_key: &str, secret_key: &str, status: &str) -> Result<OffsetDateTime> {
+    pub async fn create_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
         if !is_access_key_valid(access_key) {
             return Err(IamError::InvalidAccessKeyLength.into());
         }
@@ -396,11 +398,11 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::ContainsReservedChars.into());
         }
 
-        if !is_secret_key_valid(secret_key) {
+        if !is_secret_key_valid(&args.secret_key) {
             return Err(IamError::InvalidSecretKeyLength.into());
         }
 
-        self.store.add_user(access_key, secret_key, status).await
+        self.store.add_user(access_key, args).await
         // TODO: notification
     }
 
@@ -470,7 +472,7 @@ impl<T: Store> IamSys<T> {
         // TODO: notification
     }
 
-    pub async fn policy_db_get(&self, name: &str, groups: &[String]) -> Result<Vec<String>> {
+    pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         self.store.policy_db_get(name, groups).await
     }
 
@@ -580,7 +582,7 @@ impl<T: Store> IamSys<T> {
         is_owner || combined_policy.is_allowed(&parent_args)
     }
 
-    async fn get_combined_policy(&self, policies: &[String]) -> Policy {
+    pub async fn get_combined_policy(&self, policies: &[String]) -> Policy {
         self.store.merge_policies(&policies.join(",")).await.1
     }
 
@@ -676,7 +678,7 @@ pub struct NewServiceAccountOpts {
 
 pub struct UpdateServiceAccountOpts {
     pub session_policy: Option<Policy>,
-    pub secret_key: String,
+    pub secret_key: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub expiration: Option<OffsetDateTime>,
@@ -702,7 +704,7 @@ pub trait Validator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args<'a> {
     pub account: &'a str,
-    pub groups: &'a [String],
+    pub groups: &'a Option<Vec<String>>,
     pub action: Action,
     pub bucket: &'a str,
     pub conditions: &'a HashMap<String, Vec<String>>,

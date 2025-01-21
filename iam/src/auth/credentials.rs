@@ -1,6 +1,6 @@
 use crate::error::Error as IamError;
 use crate::policy::Policy;
-use crate::sys::Validator;
+use crate::sys::{iam_policy_claim_name_sa, Validator, INHERITED_POLICY_TYPE};
 use crate::utils;
 use crate::utils::extract_claims;
 use ecstore::error::{Error, Result};
@@ -158,6 +158,21 @@ impl Credentials {
             .unwrap_or_default()
     }
 
+    pub fn is_implied_policy(&self) -> bool {
+        if self.is_service_account() {
+            return self
+                .claims
+                .as_ref()
+                .map(|x| {
+                    x.get(&iam_policy_claim_name_sa())
+                        .map_or(false, |v| v == INHERITED_POLICY_TYPE)
+                })
+                .unwrap_or_default();
+        }
+
+        false
+    }
+
     pub fn is_valid(&self) -> bool {
         if self.status == "off" {
             return false;
@@ -200,7 +215,7 @@ pub fn create_new_credentials_with_metadata(
     let expiration = {
         if let Some(v) = claims.get("exp") {
             if let Some(expiry) = v.as_i64() {
-                Some(OffsetDateTime::from_unix_timestamp(expiry)?.to_offset(OffsetDateTime::now_local()?.offset()))
+                Some(OffsetDateTime::from_unix_timestamp(expiry)?.to_offset(OffsetDateTime::now_utc().offset()))
             } else {
                 None
             }

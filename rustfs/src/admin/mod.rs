@@ -1,6 +1,6 @@
 pub mod handlers;
-pub mod models;
 pub mod router;
+pub mod utils;
 
 use common::error::Result;
 // use ecstore::global::{is_dist_erasure, is_erasure};
