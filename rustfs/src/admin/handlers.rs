@@ -270,10 +270,7 @@ impl Operation for AssumeRoleHandle {
 
         let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
 
-        if let Err(_err) = iam_store
-            .policy_db_get(&cred.access_key, &cred.groups.unwrap_or_default())
-            .await
-        {
+        if let Err(_err) = iam_store.policy_db_get(&cred.access_key, &cred.groups).await {
             return Err(s3_error!(InvalidArgument, "invalid policy arg"));
         }
 

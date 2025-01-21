@@ -17,7 +17,7 @@ use ecstore::{
     error::{Error, Result},
 };
 use log::{debug, warn};
-use madmin::{AccountStatus, GroupDesc};
+use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -483,12 +483,12 @@ where
         let mut cr = ui.credentials.clone();
         let current_secret_key = cr.secret_key.clone();
 
-        if !opts.secret_key.is_empty() {
-            if !is_secret_key_valid(&opts.secret_key) {
+        if let Some(secret) = opts.secret_key {
+            if !is_secret_key_valid(&secret) {
                 return Err(IamError::InvalidSecretKeyLength.into());
             }
 
-            cr.secret_key = opts.secret_key;
+            cr.secret_key = secret;
         }
 
         if opts.name.is_some() {
@@ -554,7 +554,7 @@ where
         Ok(OffsetDateTime::now_utc())
     }
 
-    pub async fn policy_db_get(&self, name: &str, groups: &[String]) -> Result<Vec<String>> {
+    pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         if name.is_empty() {
             return Err(Error::new(IamError::InvalidArgument));
         }
@@ -562,11 +562,13 @@ where
         let (mut policies, _) = self.policy_db_get_internal(name, false, false).await?;
         let present = !policies.is_empty();
 
-        for group in groups.iter() {
-            let (gp, _) = self.policy_db_get_internal(group, true, present).await?;
-            gp.iter().for_each(|v| {
-                policies.push(v.clone());
-            });
+        if let Some(groups) = groups {
+            for group in groups.iter() {
+                let (gp, _) = self.policy_db_get_internal(group, true, present).await?;
+                gp.iter().for_each(|v| {
+                    policies.push(v.clone());
+                });
+            }
         }
 
         Ok(policies)
@@ -946,7 +948,7 @@ where
         m
     }
 
-    pub async fn add_user(&self, access_key: &str, secret_key: &str, status: &str) -> Result<OffsetDateTime> {
+    pub async fn add_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
         let users = self.cache.users.load();
         if let Some(x) = users.get(access_key) {
             warn!("user already exists: {:?}", x);
@@ -956,15 +958,14 @@ where
         }
 
         let status = {
-            match status {
-                val if val == AccountStatus::Enabled.as_ref() => auth::ACCOUNT_ON,
-                auth::ACCOUNT_ON => auth::ACCOUNT_ON,
+            match &args.status {
+                AccountStatus::Enabled => auth::ACCOUNT_ON,
                 _ => auth::ACCOUNT_OFF,
             }
         };
         let user_entiry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
-            secret_key: secret_key.to_string(),
+            secret_key: args.secret_key.to_string(),
             status: status.to_owned(),
             ..Default::default()
         });

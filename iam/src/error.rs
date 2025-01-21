@@ -132,3 +132,11 @@ pub fn is_err_no_such_group(err: &ecstore::error::Error) -> bool {
         false
     }
 }
+
+pub fn is_err_no_such_service_account(err: &ecstore::error::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<Error>() {
+        matches!(e, Error::NoSuchServiceAccount(_))
+    } else {
+        false
+    }
+}

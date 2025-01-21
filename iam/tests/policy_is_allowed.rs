@@ -605,7 +605,13 @@ struct ArgsBuilder {
 fn policy_is_allowed(policy: Policy, args: ArgsBuilder) -> bool {
     policy.is_allowed(&Args {
         account: &args.account,
-        groups: &args.groups,
+        groups: &{
+            if args.groups.is_empty() {
+                None
+            } else {
+                Some(args.groups.clone())
+            }
+        },
         action: args.action.as_str().try_into().unwrap(),
         bucket: &args.bucket,
         conditions: &args.conditions,
