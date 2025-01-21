@@ -97,19 +97,19 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
         real_time_metrics.aggregated.scanner = Some(metrics);
     }
 
-    if types.contains(&MetricType::OS) {}
+    // if types.contains(&MetricType::OS) {}
 
-    if types.contains(&MetricType::BATCH_JOBS) {}
+    // if types.contains(&MetricType::BATCH_JOBS) {}
 
-    if types.contains(&MetricType::SITE_RESYNC) {}
+    // if types.contains(&MetricType::SITE_RESYNC) {}
 
-    if types.contains(&MetricType::NET) {}
+    // if types.contains(&MetricType::NET) {}
 
-    if types.contains(&MetricType::MEM) {}
+    // if types.contains(&MetricType::MEM) {}
 
-    if types.contains(&MetricType::CPU) {}
+    // if types.contains(&MetricType::CPU) {}
 
-    if types.contains(&MetricType::RPC) {}
+    // if types.contains(&MetricType::RPC) {}
 
     real_time_metrics
         .by_host
@@ -128,10 +128,8 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
     let mut metrics = HashMap::new();
     let storage_info = store.local_storage_info().await;
     for d in storage_info.disks.iter() {
-        if !disks.is_empty() {
-            if !disks.contains(&d.endpoint) {
-                continue;
-            }
+        if !disks.is_empty() && !disks.contains(&d.endpoint) {
+            continue;
         }
 
         if d.state != *DRIVE_STATE_OK && d.state != *DRIVE_STATE_UNFORMATTED {

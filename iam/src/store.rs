@@ -1,46 +1,133 @@
 pub mod object;
 
-use std::collections::HashMap;
-
-use ecstore::store_api::ObjectInfo;
-use serde::{de::DeserializeOwned, Serialize};
-
-use crate::{
-    auth::UserIdentity,
-    cache::Cache,
-    policy::{MappedPolicy, PolicyDoc, UserType, DEFAULT_POLICIES},
-};
+use crate::{auth::UserIdentity, cache::Cache, policy::PolicyDoc};
+use ecstore::error::Result;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use time::OffsetDateTime;
 
 #[async_trait::async_trait]
 pub trait Store: Clone + Send + Sync + 'static {
-    async fn load_iam_config<Item>(&self, path: impl AsRef<str> + Send) -> crate::Result<(Item, ObjectInfo)>
-    where
-        Item: DeserializeOwned;
+    async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()>;
+    async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item>;
+    async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()>;
 
-    async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> crate::Result<()>;
-    async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> crate::Result<()>;
+    async fn save_user_identity(&self, name: &str, user_type: UserType, item: UserIdentity, ttl: Option<usize>) -> Result<()>;
+    async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
+    async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;
 
-    async fn load_all(&self, cache: &Cache) -> crate::Result<()>;
+    async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
+    async fn load_users(&self, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()>;
+    async fn load_secret_key(&self, name: &str, user_type: UserType) -> Result<String>;
 
-    fn get_default_policyes() -> HashMap<String, PolicyDoc> {
-        let default_policies = DEFAULT_POLICIES;
-        default_policies
-            .iter()
-            .map(|(n, p)| {
-                (
-                    n.to_string(),
-                    PolicyDoc {
-                        version: 1,
-                        policy: p.clone(),
-                        ..Default::default()
-                    },
-                )
-            })
+    async fn save_group_info(&self, name: &str, item: GroupInfo) -> Result<()>;
+    async fn delete_group_info(&self, name: &str) -> Result<()>;
+    async fn load_group(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()>;
+    async fn load_groups(&self, m: &mut HashMap<String, GroupInfo>) -> Result<()>;
+
+    async fn save_policy_doc(&self, name: &str, item: PolicyDoc) -> Result<()>;
+    async fn delete_policy_doc(&self, name: &str) -> Result<()>;
+    async fn load_policy(&self, name: &str) -> Result<PolicyDoc>;
+    async fn load_policy_doc(&self, name: &str, m: &mut HashMap<String, PolicyDoc>) -> Result<()>;
+    async fn load_policy_docs(&self, m: &mut HashMap<String, PolicyDoc>) -> Result<()>;
+
+    async fn save_mapped_policy(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        item: MappedPolicy,
+        ttl: Option<usize>,
+    ) -> Result<()>;
+    async fn delete_mapped_policy(&self, name: &str, user_type: UserType, is_group: bool) -> Result<()>;
+    async fn load_mapped_policy(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        m: &mut HashMap<String, MappedPolicy>,
+    ) -> Result<()>;
+    async fn load_mapped_policys(&self, user_type: UserType, is_group: bool, m: &mut HashMap<String, MappedPolicy>)
+        -> Result<()>;
+
+    async fn load_all(&self, cache: &Cache) -> Result<()>;
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum UserType {
+    Svc,
+    Sts,
+    Reg,
+}
+
+impl UserType {
+    pub fn prefix(&self) -> &'static str {
+        match self {
+            UserType::Svc => "service-accounts/",
+            UserType::Sts => "sts/",
+            UserType::Reg => "users/",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MappedPolicy {
+    pub version: i64,
+    pub policies: String,
+    pub update_at: OffsetDateTime,
+}
+
+impl Default for MappedPolicy {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            policies: "".to_owned(),
+            update_at: OffsetDateTime::now_utc(),
+        }
+    }
+}
+
+impl MappedPolicy {
+    pub fn new(policy: &str) -> Self {
+        Self {
+            version: 1,
+            policies: policy.to_owned(),
+            update_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    pub fn to_slice(&self) -> Vec<String> {
+        self.policies
+            .split(",")
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.to_string())
             .collect()
     }
 
-    async fn load_users(&self, user_type: UserType) -> crate::Result<HashMap<String, UserIdentity>>;
+    pub fn policy_set(&self) -> HashSet<String> {
+        self.policies
+            .split(",")
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.to_string())
+            .collect()
+    }
+}
 
-    async fn load_policy_docs(&self) -> crate::Result<HashMap<String, PolicyDoc>>;
-    async fn load_mapped_policy(&self, user_type: UserType, name: &str, is_group: bool) -> crate::Result<MappedPolicy>;
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GroupInfo {
+    pub version: i64,
+    pub status: String,
+    pub members: Vec<String>,
+    pub update_at: Option<OffsetDateTime>,
+}
+
+impl GroupInfo {
+    pub fn new(members: Vec<String>) -> Self {
+        Self {
+            version: 1,
+            status: "enabled".to_owned(),
+            members,
+            update_at: Some(OffsetDateTime::now_utc()),
+        }
+    }
 }

@@ -4,7 +4,7 @@ use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
 use crate::set_disk::SetDisks;
-use crate::store_api::{BucketInfo, HTTPRangeSpec, ObjectIO, ObjectOptions};
+use crate::store_api::{BucketInfo, ObjectIO, ObjectOptions};
 use bytesize::ByteSize;
 use http::HeaderMap;
 use path_clean::PathClean;

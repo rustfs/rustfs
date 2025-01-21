@@ -7,10 +7,10 @@ use serde::{
 
 use super::key::Key;
 
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+#[derive(PartialEq, Eq, Debug)]
 pub struct InnerFunc<T>(pub(crate) Vec<FuncKeyValue<T>>);
 
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+#[derive(PartialEq, Eq, Debug)]
 pub struct FuncKeyValue<T> {
     pub key: Key,
     pub values: T,

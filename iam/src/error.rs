@@ -17,8 +17,23 @@ pub enum Error {
     #[error("user '{0}' does not exist")]
     NoSuchUser(String),
 
+    #[error("account '{0}' does not exist")]
+    NoSuchAccount(String),
+
+    #[error("service account '{0}' does not exist")]
+    NoSuchServiceAccount(String),
+
+    #[error("temp account '{0}' does not exist")]
+    NoSuchTempAccount(String),
+
     #[error("group '{0}' does not exist")]
     NoSuchGroup(String),
+
+    #[error("policy does not exist")]
+    NoSuchPolicy,
+
+    #[error("policy in use")]
+    PolicyInUse,
 
     #[error("group not empty")]
     GroupNotEmpty,
@@ -47,6 +62,9 @@ pub enum Error {
     #[error("access key contains reserved characters =,")]
     ContainsReservedChars,
 
+    #[error("group name contains reserved characters =,")]
+    GroupNameContainsReservedChars,
+
     #[error("jwt err {0}")]
     JWTError(jsonwebtoken::errors::Error),
 
@@ -60,10 +78,65 @@ pub enum Error {
     InvalidAccessKey,
     #[error("action not allowed")]
     IAMActionNotAllowed,
+
+    #[error("no secret key with access key")]
+    NoSecretKeyWithAccessKey,
+
+    #[error("no access key with secret key")]
+    NoAccessKeyWithSecretKey,
+
+    #[error("policy too large")]
+    PolicyTooLarge,
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+// pub fn is_err_no_such_user(e: &Error) -> bool {
+//     matches!(e, Error::NoSuchUser(_))
+// }
 
-pub fn is_err_no_such_user(e: &Error) -> bool {
-    matches!(e, Error::NoSuchUser(_))
+pub fn is_err_no_such_policy(err: &ecstore::error::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<Error>() {
+        matches!(e, Error::NoSuchPolicy)
+    } else {
+        false
+    }
+}
+
+pub fn is_err_no_such_user(err: &ecstore::error::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<Error>() {
+        matches!(e, Error::NoSuchUser(_))
+    } else {
+        false
+    }
+}
+
+pub fn is_err_no_such_account(err: &ecstore::error::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<Error>() {
+        matches!(e, Error::NoSuchAccount(_))
+    } else {
+        false
+    }
+}
+
+pub fn is_err_no_such_temp_account(err: &ecstore::error::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<Error>() {
+        matches!(e, Error::NoSuchTempAccount(_))
+    } else {
+        false
+    }
+}
+
+pub fn is_err_no_such_group(err: &ecstore::error::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<Error>() {
+        matches!(e, Error::NoSuchGroup(_))
+    } else {
+        false
+    }
+}
+
+pub fn is_err_no_such_service_account(err: &ecstore::error::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<Error>() {
+        matches!(e, Error::NoSuchServiceAccount(_))
+    } else {
+        false
+    }
 }

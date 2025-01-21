@@ -1,3 +1,5 @@
+use std::str::from_utf8;
+
 use http::{HeaderMap, StatusCode};
 use iam::get_global_action_cred;
 use madmin::{AccountStatus, AddOrUpdateUserReq};
@@ -10,6 +12,7 @@ use tracing::warn;
 use crate::admin::{
     handlers::{check_key_valid, get_session_token},
     router::Operation,
+    utils::has_space_be,
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -23,7 +26,6 @@ pub struct AddUser {}
 #[async_trait::async_trait]
 impl Operation for AddUser {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle AddUser");
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
@@ -37,6 +39,8 @@ impl Operation for AddUser {
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
+
+        let (cred, _owner) = check_key_valid(get_session_token(&req.headers), &input_cred.access_key).await?;
 
         let ak = query.access_key.as_deref().unwrap_or_default();
 
@@ -71,24 +75,30 @@ impl Operation for AddUser {
             }
         }
 
-        if let (Some(user), true) = iam::get_user(ak)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {}", e)))?
-        {
-            if user.credentials.is_temp() || user.credentials.is_service_account() {
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+
+        if let Some(user) = iam_store.get_user(ak).await {
+            if (user.credentials.is_temp() || user.credentials.is_service_account()) && cred.parent_user == ak {
                 return Err(s3_error!(InvalidArgument, "can't create user with service account access key"));
             }
+        } else if has_space_be(ak) {
+            return Err(s3_error!(InvalidArgument, "access key has space"));
         }
 
-        let token = get_session_token(&req.headers);
-
-        let (cred, _) = check_key_valid(token, &input_cred.access_key).await?;
-
-        if (cred.is_temp() || cred.is_service_account()) && cred.parent_user == input_cred.access_key {
-            return Err(s3_error!(InvalidArgument, "can't create user with service account access key"));
+        if from_utf8(ak.as_bytes()).is_err() {
+            return Err(s3_error!(InvalidArgument, "access key is not utf8"));
         }
 
-        iam::create_user(ak, &args.secret_key, "enabled")
+        // let check_deny_only = if ak == cred.access_key {
+        //     true
+        // } else {
+        //     false
+        // };
+
+        // TODO: is_allowed
+
+        iam_store
+            .create_user(ak, &args)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("create_user err {}", e)))?;
 
@@ -132,7 +142,10 @@ impl Operation for SetUserStatus {
         let status = AccountStatus::try_from(query.status.as_deref().unwrap_or_default())
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e))?;
 
-        iam::set_user_status(ak, status)
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+
+        iam_store
+            .set_user_status(ak, status)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("set_user_status err {}", e)))?;
 
@@ -143,14 +156,42 @@ impl Operation for SetUserStatus {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct BucketQuery {
+    #[serde(rename = "bucket")]
+    pub bucket: String,
+}
 pub struct ListUsers {}
 #[async_trait::async_trait]
 impl Operation for ListUsers {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListUsers");
-        let users = iam::list_users()
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+
+        let query = {
+            if let Some(query) = req.uri.query() {
+                let input: BucketQuery =
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                input
+            } else {
+                BucketQuery::default()
+            }
+        };
+
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+
+        let users = {
+            if !query.bucket.is_empty() {
+                iam_store
+                    .list_bucket_users(query.bucket.as_str())
+                    .await
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
+            } else {
+                iam_store
+                    .list_users()
+                    .await
+                    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?
+            }
+        };
 
         let data = serde_json::to_vec(&users)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {}", e)))?;
@@ -174,6 +215,7 @@ pub struct RemoveUser {}
 impl Operation for RemoveUser {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle RemoveUser");
+
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
@@ -190,7 +232,10 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let (is_temp, _) = iam::is_temp_user(ak)
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+
+        let (is_temp, _) = iam_store
+            .is_temp_user(ak)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("is_temp_user err {}", e)))?;
 
@@ -198,7 +243,17 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "can't remove temp user"));
         }
 
-        iam::delete_user(ak, true)
+        let (cred, _owner) = check_key_valid(get_session_token(&req.headers), ak).await?;
+
+        let sys_cred = get_global_action_cred()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
+
+        if ak == sys_cred.access_key || ak == cred.access_key {
+            return Err(s3_error!(InvalidArgument, "can't remove self"));
+        }
+
+        iam_store
+            .delete_user(ak, true)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("delete_user err {}", e)))?;
 
@@ -214,6 +269,7 @@ pub struct GetUserInfo {}
 impl Operation for GetUserInfo {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle GetUserInfo");
+
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
@@ -230,7 +286,10 @@ impl Operation for GetUserInfo {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let info = iam::get_user_info(ak)
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+
+        let info = iam_store
+            .get_user_info(ak)
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
