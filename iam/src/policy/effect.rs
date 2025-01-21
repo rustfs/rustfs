@@ -1,9 +1,10 @@
+use ecstore::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use strum::{EnumString, IntoStaticStr};
 
-use super::{Error, Validator};
+use crate::sys::Validator;
 
-#[derive(Serialize, Clone, Deserialize, EnumString, IntoStaticStr, Default)]
+#[derive(Serialize, Clone, Deserialize, EnumString, IntoStaticStr, Default, Debug, PartialEq)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum Effect {
     #[default]
@@ -24,7 +25,8 @@ impl Effect {
 }
 
 impl Validator for Effect {
-    fn is_valid(&self) -> Result<(), Error> {
+    type Error = Error;
+    fn is_valid(&self) -> Result<()> {
         Ok(())
     }
 }

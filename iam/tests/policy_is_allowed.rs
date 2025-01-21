@@ -3,7 +3,9 @@ use iam::policy::action::ActionSet;
 use iam::policy::action::S3Action::*;
 use iam::policy::resource::ResourceSet;
 use iam::policy::Effect::*;
-use iam::policy::{Args, Policy, Statement, DEFAULT_VERSION};
+use iam::policy::{Policy, Statement};
+use iam::sys::Args;
+use iam::sys::DEFAULT_VERSION;
 use serde_json::Value;
 use std::collections::HashMap;
 use test_case::test_case;
@@ -44,7 +46,7 @@ struct ArgsBuilder {
 )]
 #[test_case(
     Policy{
-        version: DEFAULT_VERSION.into(),
+        version: iam::sys::DEFAULT_VERSION.into(),
         statements: vec![
             Statement{
                     effect: Allow,
@@ -579,7 +581,7 @@ struct ArgsBuilder {
 )]
 #[test_case(
     Policy{
-        version: DEFAULT_VERSION.into(),
+        version: iam::sys::DEFAULT_VERSION.into(),
         statements: vec![
             Statement{
                     effect: Deny,
@@ -603,7 +605,13 @@ struct ArgsBuilder {
 fn policy_is_allowed(policy: Policy, args: ArgsBuilder) -> bool {
     policy.is_allowed(&Args {
         account: &args.account,
-        groups: &args.groups,
+        groups: &{
+            if args.groups.is_empty() {
+                None
+            } else {
+                Some(args.groups.clone())
+            }
+        },
         action: args.action.as_str().try_into().unwrap(),
         bucket: &args.bucket,
         conditions: &args.conditions,

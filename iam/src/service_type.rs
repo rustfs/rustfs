@@ -1,4 +1,4 @@
-use crate::Error;
+use crate::error::Error;
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum ServiceType {

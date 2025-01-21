@@ -1,15 +1,16 @@
+use ecstore::error::{Error, Result};
+use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
-use serde::{Deserialize, Serialize};
+use crate::sys::Validator;
 
-use super::{Error, Validator};
-
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ID(pub String);
 
 impl Validator for ID {
+    type Error = Error;
     /// if id is a valid utf string, then it is valid.
-    fn is_valid(&self) -> Result<(), Error> {
+    fn is_valid(&self) -> Result<()> {
         Ok(())
     }
 }

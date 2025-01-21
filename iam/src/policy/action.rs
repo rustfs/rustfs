@@ -1,11 +1,13 @@
-use std::{collections::HashSet, ops::Deref};
-
+use ecstore::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, ops::Deref};
 use strum::{EnumString, IntoStaticStr};
 
-use super::{utils::wildcard, Error, Validator};
+use crate::sys::Validator;
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+use super::{utils::wildcard, Error as IamError};
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ActionSet(pub HashSet<Action>);
 
 impl ActionSet {
@@ -35,12 +37,19 @@ impl Deref for ActionSet {
 }
 
 impl Validator for ActionSet {
-    fn is_valid(&self) -> Result<(), super::Error> {
+    type Error = Error;
+    fn is_valid(&self) -> Result<()> {
         Ok(())
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
+impl PartialEq for ActionSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.0.iter().all(|x| other.0.contains(x))
+    }
+}
+
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug)]
 #[serde(try_from = "&str", untagged)]
 pub enum Action {
     S3Action(S3Action),
@@ -77,26 +86,28 @@ impl TryFrom<&str> for Action {
     type Error = Error;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         if value.starts_with(Self::S3_PREFIX) {
-            Ok(Self::S3Action(S3Action::try_from(value).map_err(|_| Error::InvalidAction(value.into()))?))
+            Ok(Self::S3Action(
+                S3Action::try_from(value).map_err(|_| IamError::InvalidAction(value.into()))?,
+            ))
         } else if value.starts_with(Self::ADMIN_PREFIX) {
             Ok(Self::AdminAction(
-                AdminAction::try_from(value).map_err(|_| Error::InvalidAction(value.into()))?,
+                AdminAction::try_from(value).map_err(|_| IamError::InvalidAction(value.into()))?,
             ))
         } else if value.starts_with(Self::STS_PREFIX) {
             Ok(Self::StsAction(
-                StsAction::try_from(value).map_err(|_| Error::InvalidAction(value.into()))?,
+                StsAction::try_from(value).map_err(|_| IamError::InvalidAction(value.into()))?,
             ))
         } else if value.starts_with(Self::KMS_PREFIX) {
             Ok(Self::KmsAction(
-                KmsAction::try_from(value).map_err(|_| Error::InvalidAction(value.into()))?,
+                KmsAction::try_from(value).map_err(|_| IamError::InvalidAction(value.into()))?,
             ))
         } else {
-            Err(Error::InvalidAction(value.into()))
+            Err(IamError::InvalidAction(value.into()).into())
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug)]
 #[cfg_attr(test, derive(Default))]
 #[serde(try_from = "&str", into = "&str")]
 pub enum S3Action {
@@ -113,7 +124,7 @@ pub enum S3Action {
     GetObjectVersionAction,
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum AdminAction {
     #[strum(serialize = "admin:*")]
@@ -144,11 +155,11 @@ pub enum AdminAction {
     CreateServiceAccountAdminAction,
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum StsAction {}
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum KmsAction {
     #[strum(serialize = "kms:*")]

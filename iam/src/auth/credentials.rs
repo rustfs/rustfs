@@ -1,14 +1,14 @@
-use crate::policy::{Policy, Validator};
-use crate::service_type::ServiceType;
+use crate::error::Error as IamError;
+use crate::policy::Policy;
+use crate::sys::{iam_policy_claim_name_sa, Validator, INHERITED_POLICY_TYPE};
+use crate::utils;
 use crate::utils::extract_claims;
-use crate::{utils, Error};
+use ecstore::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::cell::LazyCell;
 use std::collections::HashMap;
-use time::format_description::BorrowedFormatItem;
-use time::{Date, Duration, OffsetDateTime};
+use time::OffsetDateTime;
 
 const ACCESS_KEY_MIN_LEN: usize = 3;
 const ACCESS_KEY_MAX_LEN: usize = 20;
@@ -35,78 +35,78 @@ pub fn is_secret_key_valid(secret_key: &str) -> bool {
     secret_key.len() >= SECRET_KEY_MIN_LEN
 }
 
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
-struct CredentialHeader {
-    access_key: String,
-    scop: CredentialHeaderScope,
-}
+// #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+// struct CredentialHeader {
+//     access_key: String,
+//     scop: CredentialHeaderScope,
+// }
 
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
-struct CredentialHeaderScope {
-    date: Date,
-    region: String,
-    service: ServiceType,
-    request: String,
-}
+// #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+// struct CredentialHeaderScope {
+//     date: Date,
+//     region: String,
+//     service: ServiceType,
+//     request: String,
+// }
 
-impl TryFrom<&str> for CredentialHeader {
-    type Error = Error;
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let mut elem = value.trim().splitn(2, '=');
-        let (Some(h), Some(cred_elems)) = (elem.next(), elem.next()) else {
-            return Err(Error::ErrCredMalformed);
-        };
+// impl TryFrom<&str> for CredentialHeader {
+//     type Error = Error;
+//     fn try_from(value: &str) -> Result<Self, Self::Error> {
+//         let mut elem = value.trim().splitn(2, '=');
+//         let (Some(h), Some(cred_elems)) = (elem.next(), elem.next()) else {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         };
 
-        if h != "Credential" {
-            return Err(Error::ErrCredMalformed);
-        }
+//         if h != "Credential" {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         }
 
-        let mut cred_elems = cred_elems.trim().rsplitn(5, '/');
+//         let mut cred_elems = cred_elems.trim().rsplitn(5, '/');
 
-        let Some(request) = cred_elems.next() else {
-            return Err(Error::ErrCredMalformed);
-        };
+//         let Some(request) = cred_elems.next() else {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         };
 
-        let Some(service) = cred_elems.next() else {
-            return Err(Error::ErrCredMalformed);
-        };
+//         let Some(service) = cred_elems.next() else {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         };
 
-        let Some(region) = cred_elems.next() else {
-            return Err(Error::ErrCredMalformed);
-        };
+//         let Some(region) = cred_elems.next() else {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         };
 
-        let Some(date) = cred_elems.next() else {
-            return Err(Error::ErrCredMalformed);
-        };
+//         let Some(date) = cred_elems.next() else {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         };
 
-        let Some(ak) = cred_elems.next() else {
-            return Err(Error::ErrCredMalformed);
-        };
+//         let Some(ak) = cred_elems.next() else {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         };
 
-        if ak.len() < 3 {
-            return Err(Error::ErrCredMalformed);
-        }
+//         if ak.len() < 3 {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         }
 
-        if request != "aws4_request" {
-            return Err(Error::ErrCredMalformed);
-        }
+//         if request != "aws4_request" {
+//             return Err(Error::new(IamError::ErrCredMalformed));
+//         }
 
-        Ok(CredentialHeader {
-            access_key: ak.to_owned(),
-            scop: CredentialHeaderScope {
-                date: {
-                    const FORMATTER: LazyCell<Vec<BorrowedFormatItem<'static>>> =
-                        LazyCell::new(|| time::format_description::parse("[year][month][day]").unwrap());
+//         Ok(CredentialHeader {
+//             access_key: ak.to_owned(),
+//             scop: CredentialHeaderScope {
+//                 date: {
+//                     const FORMATTER: LazyCell<Vec<BorrowedFormatItem<'static>>> =
+//                         LazyCell::new(|| time::format_description::parse("[year][month][day]").unwrap());
 
-                    Date::parse(date, &FORMATTER).map_err(|_| Error::ErrCredMalformed)?
-                },
-                region: region.to_owned(),
-                service: service.try_into()?,
-                request: request.to_owned(),
-            },
-        })
-    }
-}
+//                     Date::parse(date, &FORMATTER).map_err(|_| Error::new(IamError::ErrCredMalformed))?
+//                 },
+//                 region: region.to_owned(),
+//                 service: service.try_into()?,
+//                 request: request.to_owned(),
+//             },
+//         })
+//     }
+// }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Credentials {
@@ -117,20 +117,20 @@ pub struct Credentials {
     pub status: String,
     pub parent_user: String,
     pub groups: Option<Vec<String>>,
-    pub claims: Option<HashMap<String, String>>,
+    pub claims: Option<HashMap<String, Value>>,
     pub name: Option<String>,
     pub description: Option<String>,
 }
 
 impl Credentials {
-    pub fn new(elem: &str) -> crate::Result<Self> {
-        let header: CredentialHeader = elem.try_into()?;
-        Self::check_key_value(header)
-    }
+    // pub fn new(elem: &str) -> Result<Self> {
+    //     let header: CredentialHeader = elem.try_into()?;
+    //     Self::check_key_value(header)
+    // }
 
-    pub fn check_key_value(_header: CredentialHeader) -> crate::Result<Self> {
-        todo!()
-    }
+    // pub fn check_key_value(_header: CredentialHeader) -> Result<Self> {
+    //     todo!()
+    // }
 
     pub fn is_expired(&self) -> bool {
         if self.expiration.is_none() {
@@ -158,6 +158,21 @@ impl Credentials {
             .unwrap_or_default()
     }
 
+    pub fn is_implied_policy(&self) -> bool {
+        if self.is_service_account() {
+            return self
+                .claims
+                .as_ref()
+                .map(|x| {
+                    x.get(&iam_policy_claim_name_sa())
+                        .map_or(false, |v| v == INHERITED_POLICY_TYPE)
+                })
+                .unwrap_or_default();
+        }
+
+        false
+    }
+
     pub fn is_valid(&self) -> bool {
         if self.status == "off" {
             return false;
@@ -171,48 +186,65 @@ impl Credentials {
     }
 }
 
-pub fn get_new_credentials_with_metadata<T: Serialize>(
-    claims: &T,
-    token_secret: &str,
-    exp: Option<usize>,
-) -> crate::Result<Credentials> {
-    let ak = utils::gen_access_key(20).unwrap_or_default();
-    let sk = utils::gen_secret_key(32).unwrap_or_default();
-
-    create_new_credentials_with_metadata(&ak, &sk, claims, token_secret, exp)
+pub fn generate_credentials() -> Result<(String, String)> {
+    let ak = utils::gen_access_key(20)?;
+    let sk = utils::gen_secret_key(40)?;
+    Ok((ak, sk))
 }
 
-pub fn create_new_credentials_with_metadata<T: Serialize>(
+pub fn get_new_credentials_with_metadata(claims: &HashMap<String, Value>, token_secret: &str) -> Result<Credentials> {
+    let (ak, sk) = generate_credentials()?;
+
+    create_new_credentials_with_metadata(&ak, &sk, claims, token_secret)
+}
+
+pub fn create_new_credentials_with_metadata(
     ak: &str,
     sk: &str,
-    claims: &T,
+    claims: &HashMap<String, Value>,
     token_secret: &str,
-    exp: Option<usize>,
-) -> crate::Result<Credentials> {
+) -> Result<Credentials> {
     if ak.len() < ACCESS_KEY_MIN_LEN || ak.len() > ACCESS_KEY_MAX_LEN {
-        return Err(Error::InvalidAccessKeyLength);
+        return Err(Error::new(IamError::InvalidAccessKeyLength));
     }
 
     if sk.len() < SECRET_KEY_MIN_LEN || sk.len() > SECRET_KEY_MAX_LEN {
-        return Err(Error::InvalidAccessKeyLength);
+        return Err(Error::new(IamError::InvalidAccessKeyLength));
     }
 
-    let token = utils::generate_jwt(claims, token_secret).map_err(Error::JWTError)?;
+    let expiration = {
+        if let Some(v) = claims.get("exp") {
+            if let Some(expiry) = v.as_i64() {
+                Some(OffsetDateTime::from_unix_timestamp(expiry)?.to_offset(OffsetDateTime::now_utc().offset()))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let token = utils::generate_jwt(claims, token_secret)?;
 
     Ok(Credentials {
         access_key: ak.to_owned(),
         secret_key: sk.to_owned(),
         session_token: token,
         status: ACCOUNT_ON.to_owned(),
-        expiration: exp.map(|v| OffsetDateTime::now_utc().saturating_add(Duration::seconds(v as i64))),
+        expiration,
         ..Default::default()
     })
 }
 
-pub fn get_claims_from_token_with_secret<T: DeserializeOwned>(token: &str, secret: &str) -> crate::Result<T> {
-    let ms = extract_claims::<T>(token, secret).map_err(Error::JWTError)?;
+pub fn get_claims_from_token_with_secret<T: DeserializeOwned>(token: &str, secret: &str) -> Result<T> {
+    let ms = extract_claims::<T>(token, secret)?;
     // TODO SessionPolicyName
     Ok(ms.claims)
+}
+
+pub fn jwt_sign<T: Serialize>(claims: &T, token_secret: &str) -> Result<String> {
+    let token = utils::generate_jwt(claims, token_secret)?;
+    Ok(token)
 }
 
 #[derive(Default)]
@@ -284,30 +316,30 @@ impl CredentialsBuilder {
         self
     }
 
-    pub fn try_build(self) -> crate::Result<Credentials> {
+    pub fn try_build(self) -> Result<Credentials> {
         self.try_into()
     }
 }
 
 impl TryFrom<CredentialsBuilder> for Credentials {
-    type Error = crate::Error;
+    type Error = Error;
     fn try_from(mut value: CredentialsBuilder) -> Result<Self, Self::Error> {
         if value.parent_user.is_empty() {
-            return Err(Error::InvalidArgument);
+            return Err(Error::new(IamError::InvalidArgument));
         }
 
         if (value.access_key.is_empty() && !value.secret_key.is_empty())
             || (!value.access_key.is_empty() && value.secret_key.is_empty())
         {
-            return Err(Error::StringError("Either ak or sk is empty".into()));
+            return Err(Error::msg("Either ak or sk is empty"));
         }
 
         if value.parent_user == value.access_key.as_str() {
-            return Err(Error::InvalidArgument);
+            return Err(Error::new(IamError::InvalidArgument));
         }
 
         if value.access_key == "site-replicator-0" && !value.allow_site_replicator_account {
-            return Err(Error::InvalidArgument);
+            return Err(Error::new(IamError::InvalidArgument));
         }
 
         let mut claim = serde_json::json!({
@@ -316,9 +348,9 @@ impl TryFrom<CredentialsBuilder> for Credentials {
 
         if let Some(p) = value.session_policy {
             p.is_valid()?;
-            let policy_buf = serde_json::to_vec(&p).map_err(|_| Error::InvalidArgument)?;
+            let policy_buf = serde_json::to_vec(&p).map_err(|_| Error::new(IamError::InvalidArgument))?;
             if policy_buf.len() > 4096 {
-                return Err(crate::Error::StringError("session policy is too large".into()));
+                return Err(Error::msg("session policy is too large"));
             }
             claim["sessionPolicy"] = serde_json::json!(base64_simd::STANDARD.encode_to_string(&policy_buf));
             claim["sa-policy"] = serde_json::json!("embedded-policy");
@@ -355,21 +387,21 @@ impl TryFrom<CredentialsBuilder> for Credentials {
         };
 
         if !value.secret_key.is_empty() {
-            let session_token = crypto::jwt_encode(value.access_key.as_bytes(), &claim)
-                .map_err(|_| crate::Error::StringError("session policy is too large".into()))?;
+            let session_token =
+                crypto::jwt_encode(value.access_key.as_bytes(), &claim).map_err(|_| Error::msg("session policy is too large"))?;
             cred.session_token = session_token;
             // cred.expiration = Some(
             //     OffsetDateTime::from_unix_timestamp(
             //         claim
             //             .get("exp")
             //             .and_then(|x| x.as_i64())
-            //             .ok_or(crate::Error::StringError("invalid exp".into()))?,
+            //             .ok_or(Error::StringError("invalid exp".into()))?,
             //     )
-            //     .map_err(|_| crate::Error::StringError("invalie timestamp".into()))?,
+            //     .map_err(|_| Error::StringError("invalie timestamp".into()))?,
             // );
         } else {
             // cred.expiration =
-            // Some(OffsetDateTime::from_unix_timestamp(0).map_err(|_| crate::Error::StringError("invalie timestamp".into()))?);
+            // Some(OffsetDateTime::from_unix_timestamp(0).map_err(|_| Error::StringError("invalie timestamp".into()))?);
         }
 
         cred.expiration = value.expiration;
@@ -380,66 +412,66 @@ impl TryFrom<CredentialsBuilder> for Credentials {
     }
 }
 
-#[cfg(test)]
-#[allow(non_snake_case)]
-mod tests {
-    use test_case::test_case;
-    use time::Date;
+// #[cfg(test)]
+// #[allow(non_snake_case)]
+// mod tests {
+//     use test_case::test_case;
+//     use time::Date;
 
-    use super::CredentialHeader;
-    use super::CredentialHeaderScope;
-    use crate::service_type::ServiceType;
+//     use super::CredentialHeader;
+//     use super::CredentialHeaderScope;
+//     use crate::service_type::ServiceType;
 
-    #[test_case(
-        "Credential=aaaaaaaaaaaaaaaaaaaa/20241127/us-east-1/s3/aws4_request" =>
-        CredentialHeader{
-            access_key: "aaaaaaaaaaaaaaaaaaaa".into(),
-            scop: CredentialHeaderScope {
-                date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
-                region: "us-east-1".to_owned(),
-                service: ServiceType::S3,
-                request: "aws4_request".into(),
-            }
-        };
-        "1")]
-    #[test_case(
-        "Credential=aaaaaaaaaaa/aaaaaaaaa/20241127/us-east-1/s3/aws4_request" =>
-        CredentialHeader{
-            access_key: "aaaaaaaaaaa/aaaaaaaaa".into(),
-            scop: CredentialHeaderScope {
-                date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
-                region: "us-east-1".to_owned(),
-                service: ServiceType::S3,
-                request: "aws4_request".into(),
-            }
-        };
-        "2")]
-    #[test_case(
-        "Credential=aaaaaaaaaaa/aaaaaaaaa/20241127/us-east-1/sts/aws4_request" =>
-        CredentialHeader{
-            access_key: "aaaaaaaaaaa/aaaaaaaaa".into(),
-            scop: CredentialHeaderScope {
-                date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
-                region: "us-east-1".to_owned(),
-                service: ServiceType::STS,
-                request: "aws4_request".into(),
-            }
-        };
-        "3")]
-    fn test_CredentialHeader_from_str_successful(input: &str) -> CredentialHeader {
-        CredentialHeader::try_from(input).unwrap()
-    }
+//     #[test_case(
+//         "Credential=aaaaaaaaaaaaaaaaaaaa/20241127/us-east-1/s3/aws4_request" =>
+//         CredentialHeader{
+//             access_key: "aaaaaaaaaaaaaaaaaaaa".into(),
+//             scop: CredentialHeaderScope {
+//                 date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
+//                 region: "us-east-1".to_owned(),
+//                 service: ServiceType::S3,
+//                 request: "aws4_request".into(),
+//             }
+//         };
+//         "1")]
+//     #[test_case(
+//         "Credential=aaaaaaaaaaa/aaaaaaaaa/20241127/us-east-1/s3/aws4_request" =>
+//         CredentialHeader{
+//             access_key: "aaaaaaaaaaa/aaaaaaaaa".into(),
+//             scop: CredentialHeaderScope {
+//                 date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
+//                 region: "us-east-1".to_owned(),
+//                 service: ServiceType::S3,
+//                 request: "aws4_request".into(),
+//             }
+//         };
+//         "2")]
+//     #[test_case(
+//         "Credential=aaaaaaaaaaa/aaaaaaaaa/20241127/us-east-1/sts/aws4_request" =>
+//         CredentialHeader{
+//             access_key: "aaaaaaaaaaa/aaaaaaaaa".into(),
+//             scop: CredentialHeaderScope {
+//                 date: Date::from_calendar_date(2024, time::Month::November, 27).unwrap(),
+//                 region: "us-east-1".to_owned(),
+//                 service: ServiceType::STS,
+//                 request: "aws4_request".into(),
+//             }
+//         };
+//         "3")]
+//     fn test_CredentialHeader_from_str_successful(input: &str) -> CredentialHeader {
+//         CredentialHeader::try_from(input).unwrap()
+//     }
 
-    #[test_case("Credential")]
-    #[test_case("Cred=")]
-    #[test_case("Credential=abc")]
-    #[test_case("Credential=a/20241127/us-east-1/s3/aws4_request")]
-    #[test_case("Credential=aa/20241127/us-east-1/s3/aws4_request")]
-    #[test_case("Credential=aaaa/20241127/us-east-1/asa/aws4_request")]
-    #[test_case("Credential=aaaa/20241127/us-east-1/sts/aws4a_request")]
-    fn test_CredentialHeader_from_str_failed(input: &str) {
-        if CredentialHeader::try_from(input).is_ok() {
-            unreachable!()
-        }
-    }
-}
+//     #[test_case("Credential")]
+//     #[test_case("Cred=")]
+//     #[test_case("Credential=abc")]
+//     #[test_case("Credential=a/20241127/us-east-1/s3/aws4_request")]
+//     #[test_case("Credential=aa/20241127/us-east-1/s3/aws4_request")]
+//     #[test_case("Credential=aaaa/20241127/us-east-1/asa/aws4_request")]
+//     #[test_case("Credential=aaaa/20241127/us-east-1/sts/aws4a_request")]
+//     fn test_credential_header_from_str_failed(input: &str) {
+//         if CredentialHeader::try_from(input).is_ok() {
+//             unreachable!()
+//         }
+//     }
+// }

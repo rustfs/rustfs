@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum AccountStatus {
     #[serde(rename = "enabled")]
     Enabled,
@@ -129,11 +129,94 @@ pub struct AddServiceAccountReq {
     pub secret_key: String,
 
     #[serde(rename = "name")]
-    pub name: String,
+    pub name: Option<String>,
 
     #[serde(rename = "description", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
     #[serde(rename = "expiration", skip_serializing_if = "Option::is_none")]
     pub expiration: Option<OffsetDateTime>,
+}
+
+impl AddServiceAccountReq {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.access_key.is_empty() {
+            return Err("accessKey is empty".to_string());
+        }
+
+        if self.secret_key.is_empty() {
+            return Err("secretKey is empty".to_string());
+        }
+
+        if self.name.is_none() {
+            return Err("name is empty".to_string());
+        }
+
+        // TODO: validate
+
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Credentials<'a> {
+    pub access_key: &'a str,
+    pub secret_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expiration: Option<OffsetDateTime>,
+}
+
+#[derive(Serialize)]
+pub struct AddServiceAccountResp<'a> {
+    pub credentials: Credentials<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InfoServiceAccountResp {
+    pub parent_user: String,
+    pub account_status: String,
+    pub implied_policy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expiration: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateServiceAccountReq {
+    #[serde(rename = "newPolicy", skip_serializing_if = "Option::is_none")]
+    pub new_policy: Option<String>,
+
+    #[serde(rename = "newSecretKey", skip_serializing_if = "Option::is_none")]
+    pub new_secret_key: Option<String>,
+
+    #[serde(rename = "newStatus", skip_serializing_if = "Option::is_none")]
+    pub new_status: Option<String>,
+
+    #[serde(rename = "newName", skip_serializing_if = "Option::is_none")]
+    pub new_name: Option<String>,
+
+    #[serde(rename = "newDescription", skip_serializing_if = "Option::is_none")]
+    pub new_description: Option<String>,
+
+    #[serde(rename = "newExpiration", skip_serializing_if = "Option::is_none")]
+    pub new_expiration: Option<OffsetDateTime>,
+}
+
+impl UpdateServiceAccountReq {
+    pub fn validate(&self) -> Result<(), String> {
+        // TODO: validate
+        Ok(())
+    }
 }

@@ -7,7 +7,7 @@ pub type BoolFunc = InnerFunc<BoolFuncValue>;
 impl BoolFunc {
     pub fn evaluate_bool(&self, values: &HashMap<String, Vec<String>>) -> bool {
         for inner in self.0.iter() {
-            if !match values.get(inner.key.name().as_str()).and_then(|x| x.get(0)) {
+            if !match values.get(inner.key.name().as_str()).and_then(|x| x.first()) {
                 Some(x) => inner.values.0.to_string().as_str() == x,
                 None => false,
             } {
@@ -32,8 +32,7 @@ impl BoolFunc {
     }
 }
 
-#[derive(Clone)]
-#[cfg_attr(test, derive(PartialEq, Eq, Debug))]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BoolFuncValue(bool);
 
 impl Serialize for BoolFuncValue {

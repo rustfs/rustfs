@@ -1,12 +1,12 @@
 use serde::de::{Error, MapAccess};
 use serde::ser::SerializeMap;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::Deserialize;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
 use super::{addr::AddrFunc, binary::BinaryFunc, bool_null::BoolFunc, date::DateFunc, number::NumberFunc, string::StringFunc};
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Debug)]
 pub enum Condition {
     StringEquals(StringFunc),
     StringNotEquals(StringFunc),
@@ -102,7 +102,7 @@ impl Condition {
             StringNotEqualsIgnoreCase(s) => s.evaluate(for_all, true, false, true, values),
             StringLike(s) => s.evaluate(for_all, false, true, false, values),
             StringNotLike(s) => s.evaluate(for_all, false, true, true, values),
-            BinaryEquals(s) => todo!(),
+            BinaryEquals(s) => s.evaluate(values),
             IpAddress(s) => s.evaluate(values),
             NotIpAddress(s) => s.evaluate(values),
             Null(s) => s.evaluate_null(values),
@@ -161,6 +161,38 @@ impl Condition {
             Condition::DateLessThanEquals(s) => se.serialize_value(s),
             Condition::DateGreaterThan(s) => se.serialize_value(s),
             Condition::DateGreaterThanEquals(s) => se.serialize_value(s),
+        }
+    }
+}
+
+impl PartialEq for Condition {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::StringEquals(l0), Self::StringEquals(r0)) => l0 == r0,
+            (Self::StringNotEquals(l0), Self::StringNotEquals(r0)) => l0 == r0,
+            (Self::StringEqualsIgnoreCase(l0), Self::StringEqualsIgnoreCase(r0)) => l0 == r0,
+            (Self::StringNotEqualsIgnoreCase(l0), Self::StringNotEqualsIgnoreCase(r0)) => l0 == r0,
+            (Self::StringLike(l0), Self::StringLike(r0)) => l0 == r0,
+            (Self::StringNotLike(l0), Self::StringNotLike(r0)) => l0 == r0,
+            (Self::BinaryEquals(l0), Self::BinaryEquals(r0)) => l0 == r0,
+            (Self::IpAddress(l0), Self::IpAddress(r0)) => l0 == r0,
+            (Self::NotIpAddress(l0), Self::NotIpAddress(r0)) => l0 == r0,
+            (Self::Null(l0), Self::Null(r0)) => l0 == r0,
+            (Self::Bool(l0), Self::Bool(r0)) => l0 == r0,
+            (Self::NumericEquals(l0), Self::NumericEquals(r0)) => l0 == r0,
+            (Self::NumericNotEquals(l0), Self::NumericNotEquals(r0)) => l0 == r0,
+            (Self::NumericLessThan(l0), Self::NumericLessThan(r0)) => l0 == r0,
+            (Self::NumericLessThanEquals(l0), Self::NumericLessThanEquals(r0)) => l0 == r0,
+            (Self::NumericGreaterThan(l0), Self::NumericGreaterThan(r0)) => l0 == r0,
+            (Self::NumericGreaterThanIfExists(l0), Self::NumericGreaterThanIfExists(r0)) => l0 == r0,
+            (Self::NumericGreaterThanEquals(l0), Self::NumericGreaterThanEquals(r0)) => l0 == r0,
+            (Self::DateEquals(l0), Self::DateEquals(r0)) => l0 == r0,
+            (Self::DateNotEquals(l0), Self::DateNotEquals(r0)) => l0 == r0,
+            (Self::DateLessThan(l0), Self::DateLessThan(r0)) => l0 == r0,
+            (Self::DateLessThanEquals(l0), Self::DateLessThanEquals(r0)) => l0 == r0,
+            (Self::DateGreaterThan(l0), Self::DateGreaterThan(r0)) => l0 == r0,
+            (Self::DateGreaterThanEquals(l0), Self::DateGreaterThanEquals(r0)) => l0 == r0,
+            _ => false,
         }
     }
 }

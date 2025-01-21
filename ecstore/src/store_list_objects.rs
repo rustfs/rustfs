@@ -672,6 +672,7 @@ impl ECStore {
         Ok(Vec::new())
     }
 
+    #[allow(unused_assignments)]
     pub async fn walk(
         self: Arc<Self>,
         rx: B_Receiver<bool>,
