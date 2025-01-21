@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub fn is_simple_match<P, N>(pattern: P, name: N) -> bool
 where
     P: AsRef<str>,
@@ -14,12 +15,13 @@ where
     inner_match(pattern, name, false)
 }
 
+#[allow(dead_code)]
 pub fn is_match_as_pattern_prefix<P, N>(pattern: P, text: N) -> bool
 where
     P: AsRef<str>,
     N: AsRef<str>,
 {
-    let (mut p, mut t) = (pattern.as_ref().as_bytes().into_iter(), text.as_ref().as_bytes().into_iter());
+    let (mut p, mut t) = (pattern.as_ref().as_bytes().iter(), text.as_ref().as_bytes().iter());
 
     while let (Some(&x), Some(&y)) = (p.next(), t.next()) {
         if x == b'*' {

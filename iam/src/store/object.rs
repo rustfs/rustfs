@@ -862,10 +862,12 @@ impl Store for ObjectStore {
         // sts users
         if let Some(item_name_list) = listed_config_items.get(STS_LIST_KEY) {
             for item in item_name_list.iter() {
+                info!("load sts user path: {}", item);
+
                 let name = ecstore::utils::path::dir(item);
                 info!("load sts user: {}", name);
                 if let Err(err) = self.load_user(&name, UserType::Sts, &mut sts_items_cache).await {
-                    return Err(Error::msg(std::format!("load user failed: {}", err)));
+                    info!("load sts user failed: {}", err);
                 };
             }
         }
@@ -879,7 +881,7 @@ impl Store for ObjectStore {
                     .load_mapped_policy(name, UserType::Sts, false, &mut sts_policies_cache)
                     .await
                 {
-                    return Err(Error::msg(std::format!("load user failed: {}", err)));
+                    info!("load sts user policy failed: {}", err);
                 };
             }
         }

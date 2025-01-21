@@ -2,7 +2,7 @@ use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::heal::background_heal_ops::{heal_bucket, heal_object};
 use crate::heal::heal_commands::{HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN};
 use crate::utils::path::SLASH_SEPARATOR;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::ops::Sub;
@@ -15,7 +15,7 @@ use tracing::error;
 use uuid::Uuid;
 
 pub const MRF_OPS_QUEUE_SIZE: u64 = 100000;
-pub const HEAL_DIR: &'static str = ".heal";
+pub const HEAL_DIR: &str = ".heal";
 pub const HEAL_MRFMETA_FORMAT: u64 = 1;
 pub const HEAL_MRFMETA_VERSION_V1: u64 = 1;
 
@@ -47,6 +47,12 @@ pub struct MRFState {
     rx: RwLock<Receiver<PartialOperation>>,
     closed: AtomicBool,
     closing: AtomicBool,
+}
+
+impl Default for MRFState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MRFState {
@@ -89,29 +95,27 @@ impl MRFState {
                     if let Err(err) = heal_bucket(&op.bucket).await {
                         error!("heal bucket failed, bucket: {}, err: {:?}", op.bucket, err);
                     }
+                } else if op.versions.is_empty() {
+                    if let Err(err) =
+                        heal_object(&op.bucket, &op.object, &op.version_id.clone().unwrap_or_default(), scan_mode).await
+                    {
+                        error!("heal object failed, bucket: {}, object: {}, err: {:?}", op.bucket, op.object, err);
+                    }
                 } else {
-                    if op.versions.is_empty() {
-                        if let Err(err) =
-                            heal_object(&op.bucket, &op.object, &op.version_id.clone().unwrap_or_default(), scan_mode).await
-                        {
-                            error!("heal object failed, bucket: {}, object: {}, err: {:?}", op.bucket, op.object, err);
-                        }
-                    } else {
-                        let vers = op.versions.len() / 16;
-                        if vers > 0 {
-                            for i in 0..vers {
-                                let start = i * 16;
-                                let end = start + 16;
-                                if let Err(err) = heal_object(
-                                    &op.bucket,
-                                    &op.object,
-                                    &Uuid::from_slice(&op.versions[start..end]).expect("").to_string(),
-                                    scan_mode,
-                                )
-                                .await
-                                {
-                                    error!("heal object failed, bucket: {}, object: {}, err: {:?}", op.bucket, op.object, err);
-                                }
+                    let vers = op.versions.len() / 16;
+                    if vers > 0 {
+                        for i in 0..vers {
+                            let start = i * 16;
+                            let end = start + 16;
+                            if let Err(err) = heal_object(
+                                &op.bucket,
+                                &op.object,
+                                &Uuid::from_slice(&op.versions[start..end]).expect("").to_string(),
+                                scan_mode,
+                            )
+                            .await
+                            {
+                                error!("heal object failed, bucket: {}, object: {}, err: {:?}", op.bucket, op.object, err);
                             }
                         }
                     }
