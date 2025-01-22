@@ -169,7 +169,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
-                .layer(CorsLayer::very_permissive())
+                .layer(CorsLayer::permissive())
                 .service(hybrid(hyper_service, rpc_service)),
         );
 

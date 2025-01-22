@@ -243,12 +243,20 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "can't remove temp user"));
         }
 
-        let (cred, _owner) = check_key_valid(get_session_token(&req.headers), ak).await?;
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, _owner) = check_key_valid(get_session_token(&req.headers), &input_cred.access_key).await?;
 
         let sys_cred = get_global_action_cred()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
 
         if ak == sys_cred.access_key || ak == cred.access_key {
+            warn!(
+                "can't remove self or system access key {}, {}, {}",
+                ak, sys_cred.access_key, cred.access_key
+            );
             return Err(s3_error!(InvalidArgument, "can't remove self"));
         }
 
