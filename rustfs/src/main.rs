@@ -1,6 +1,7 @@
 mod admin;
 mod auth;
 mod config;
+mod console;
 mod grpc;
 mod service;
 mod storage;
@@ -176,7 +177,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         let http_server = ConnBuilder::new(TokioExecutor::new());
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-        info!("server is running at http://{local_addr}");
+        println!("server is running at http://{local_addr}");
 
         loop {
             let (socket, _) = tokio::select! {
@@ -238,6 +239,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_auto_heal().await;
 
     info!("server was started");
+
+    tokio::spawn(async move {
+        console::start_static_file_server(&opt.console_address).await;
+    });
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
