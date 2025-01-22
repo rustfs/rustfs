@@ -1098,7 +1098,7 @@ where
 
     fn update_user_with_claims(&self, k: &str, u: UserIdentity) -> Result<()> {
         let mut u = u;
-        if u.credentials.session_token.is_empty() {
+        if !u.credentials.session_token.is_empty() {
             u.credentials.claims = Some(extract_jwt_claims(&u)?);
         }
 
