@@ -1,7 +1,6 @@
 use super::router::Operation;
 use crate::storage::error::to_s3_error;
 use bytes::Bytes;
-use const_str::from_utf8;
 use ecstore::admin_server_info::get_server_info;
 use ecstore::bucket::policy::action::{Action, ActionSet};
 use ecstore::bucket::policy::bucket_policy::{BPStatement, BucketPolicy};
@@ -56,6 +55,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 pub mod group;
+pub mod policy;
 pub mod service_account;
 pub mod trace;
 pub mod user;
