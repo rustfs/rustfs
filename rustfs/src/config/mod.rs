@@ -53,4 +53,7 @@ pub struct Opt {
     /// Domain name used for virtual-hosted-style requests.
     #[arg(long)]
     pub domain_name: Option<String>,
+
+    #[arg(long, default_value_t = format!("0.0.0.0:{}", 0))]
+    pub console_address: String,
 }
