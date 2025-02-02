@@ -56,13 +56,13 @@ tower.workspace = true
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
 transform-stream.workspace = true
-uuid = "1.11.0"
+uuid = "1.12.1"
 url.workspace = true
 admin = { path = "../api/admin" }
 axum.workspace = true
-matchit = "0.8.4"
-shadow-rs = "0.37.0"
-const-str = { version = "0.5.7", features = ["std", "proc"] }
+matchit = "0.8.6"
+shadow-rs = "0.38.0"
+const-str = { version = "0.6.1", features = ["std", "proc"] }
 atoi = "2.0.0"
 serde_urlencoded = "0.7.1"
 crypto = { path = "../crypto" }
@@ -81,14 +81,14 @@ futures-util.workspace = true
 # uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
 s3s.workspace = true
-clap = { version = "4.5.23", features = ["derive"] }
+clap = { version = "4.5.27", features = ["derive"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
 hyper-util = { version = "0.1.10", features = [
     "tokio",
     "server-auto",
     "server-graceful",
 ] }
-transform-stream = "0.3.0"
+transform-stream = "0.3.1"
 netif = "0.1.6"
-shadow-rs = "0.37.0"
+shadow-rs = "0.38.0"
 # pin-utils = "0.1.0"
