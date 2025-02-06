@@ -46,7 +46,6 @@ use crate::{
     utils,
 };
 use common::defer;
-use nix::NixPath;
 use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -414,7 +413,7 @@ impl LocalDisk {
         file_path: impl AsRef<Path>,
         read_data: bool,
     ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-        if file_path.as_ref().is_empty() {
+        if file_path.as_ref().as_os_str().is_empty() {
             return Err(Error::new(DiskError::FileNotFound));
         }
 

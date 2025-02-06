@@ -21,7 +21,7 @@ thiserror.workspace = true
 strum = { version = "0.26.3", features = ["derive"] }
 arc-swap = "1.7.1"
 crypto = { path = "../crypto" }
-ipnetwork = "0.21.1"
+ipnetwork = { version = "0.21.1", features = ["serde"] }
 itertools = "0.14.0"
 futures.workspace = true
 rand.workspace = true
