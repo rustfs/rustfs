@@ -54,6 +54,9 @@ pub struct Opt {
     #[arg(long)]
     pub domain_name: Option<String>,
 
+    #[arg(long, default_value_t = false)]
+    pub console_enable: bool,
+
     #[arg(long, default_value_t = format!("0.0.0.0:{}", 0))]
     pub console_address: String,
 }

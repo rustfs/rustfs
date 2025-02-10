@@ -105,7 +105,7 @@ pub async fn check_key_valid(security_token: Option<String>, ak: &str) -> S3Resu
         let (u, ok) = iam_store
             .check_key(ak)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {}", e)))?;
 
         if !ok {
             if let Some(u) = u {
@@ -159,7 +159,7 @@ pub fn check_claims_from_token(token: &str, cred: &auth::Credentials) -> S3Resul
     }
 
     if cred.is_temp() || cred.is_expired() {
-        return Err(s3_error!(InvalidRequest, "invalid access key"));
+        return Err(s3_error!(InvalidRequest, "invalid access key is temp or expired"));
     }
 
     let Some(sys_cred) = get_global_action_cred() else {
