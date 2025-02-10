@@ -240,9 +240,12 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     info!("server was started");
 
-    tokio::spawn(async move {
-        console::start_static_file_server(&opt.console_address).await;
-    });
+    if opt.console_enable {
+        info!("console is enabled");
+        tokio::spawn(async move {
+            console::start_static_file_server(&opt.console_address).await;
+        });
+    }
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
