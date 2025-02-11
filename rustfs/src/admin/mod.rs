@@ -128,34 +128,35 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
         AdminOperation(&handlers::AccountInfoHandler {}),
     )?;
 
-    // 1
+    // ?[bucket=xxx]
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-users").as_str(),
         AdminOperation(&user::ListUsers {}),
     )?;
 
-    // 1
+    // ?accessKey=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/user-info").as_str(),
         AdminOperation(&user::GetUserInfo {}),
     )?;
 
-    // 1
+    // ?accessKey=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-user").as_str(),
         AdminOperation(&user::RemoveUser {}),
     )?;
 
-    // 1
+    // ?accessKey=xxx
+    // body: AddOrUpdateUserReq
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-user").as_str(),
         AdminOperation(&user::AddUser {}),
     )?;
-    // 1
+    // ?accessKey=xxx&status=enabled
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-status").as_str(),
@@ -168,18 +169,21 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
         AdminOperation(&group::ListGroups {}),
     )?;
 
+    // ?group=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/group").as_str(),
         AdminOperation(&group::GetGroup {}),
     )?;
 
+    // ?group=xxx&status=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-group-status").as_str(),
         AdminOperation(&group::SetGroupStatus {}),
     )?;
 
+    // @body GroupAddRemove
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/update-group-members").as_str(),
@@ -187,31 +191,33 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
     )?;
 
     // Service accounts
+    // ?accessKey=xxx
+    // @body: UpdateServiceAccountReq
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/update-service-account").as_str(),
         AdminOperation(&UpdateServiceAccount {}),
     )?;
-    // 1
+    // ?accessKey=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info-service-account").as_str(),
         AdminOperation(&InfoServiceAccount {}),
     )?;
 
-    // 1
+    // ?[user=xxx]
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-service-accounts").as_str(),
         AdminOperation(&ListServiceAccount {}),
     )?;
-    // 1
+    // ?accessKey=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/delete-service-accounts").as_str(),
         AdminOperation(&DeleteServiceAccount {}),
     )?;
-    // 1
+    // @body: AddServiceAccountReq
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-service-accounts").as_str(),
