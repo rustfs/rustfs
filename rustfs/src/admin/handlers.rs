@@ -94,6 +94,7 @@ pub async fn check_key_valid(security_token: Option<String>, ak: &str) -> S3Resu
 
     let sys_cred = cred.clone();
 
+    // warn!("check_key_valid cred {:?}, as: {:?}", &cred, &ak);
     if cred.access_key != ak {
         let Ok(iam_store) = iam::get() else {
             return Err(S3Error::with_message(
@@ -123,6 +124,9 @@ pub async fn check_key_valid(security_token: Option<String>, ak: &str) -> S3Resu
 
         cred = u.credentials;
     }
+
+    // warn!("check_key_valid cred {:?}", &cred);
+    // warn!("check_key_valid security_token {:?}", &security_token);
 
     let claims = check_claims_from_token(&security_token.unwrap_or_default(), &cred)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {}", e)))?;
@@ -158,8 +162,8 @@ pub fn check_claims_from_token(token: &str, cred: &auth::Credentials) -> S3Resul
         return Err(s3_error!(InvalidRequest, "invalid token"));
     }
 
-    if cred.is_temp() || cred.is_expired() {
-        return Err(s3_error!(InvalidRequest, "invalid access key is temp or expired"));
+    if cred.is_temp() && cred.is_expired() {
+        return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
     }
 
     let Some(sys_cred) = get_global_action_cred() else {
