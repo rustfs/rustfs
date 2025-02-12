@@ -6,8 +6,11 @@ use std::collections::HashSet;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Policy {
+    #[serde(default, rename = "ID")]
     pub id: ID,
+    #[serde(rename = "Version")]
     pub version: String,
+    #[serde(rename = "Statement")]
     pub statements: Vec<Statement>,
 }
 
@@ -153,6 +156,7 @@ pub mod default {
                             hash_set
                         }),
                         conditions: Functions::default(),
+                        ..Default::default()
                     }],
                 },
             ),
@@ -177,6 +181,7 @@ pub mod default {
                             hash_set
                         }),
                         conditions: Functions::default(),
+                        ..Default::default()
                     }],
                 },
             ),
@@ -200,6 +205,7 @@ pub mod default {
                             hash_set
                         }),
                         conditions: Functions::default(),
+                        ..Default::default()
                     }],
                 },
             ),
@@ -223,6 +229,7 @@ pub mod default {
                             hash_set
                         }),
                         conditions: Functions::default(),
+                        ..Default::default()
                     }],
                 },
             ),
@@ -253,6 +260,7 @@ pub mod default {
                             hash_set
                         }),
                         conditions: Functions::default(),
+                        ..Default::default()
                     }],
                 },
             ),
@@ -273,6 +281,7 @@ pub mod default {
                             not_actions: ActionSet(Default::default()),
                             resources: ResourceSet(HashSet::new()),
                             conditions: Functions::default(),
+                            ..Default::default()
                         },
                         Statement {
                             sid: "".into(),
@@ -285,6 +294,7 @@ pub mod default {
                             not_actions: ActionSet(Default::default()),
                             resources: ResourceSet(HashSet::new()),
                             conditions: Functions::default(),
+                            ..Default::default()
                         },
                         Statement {
                             sid: "".into(),
@@ -301,10 +311,84 @@ pub mod default {
                                 hash_set
                             }),
                             conditions: Functions::default(),
+                            ..Default::default()
                         },
                     ],
                 },
             ),
         ]
     });
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use ecstore::error::Result;
+
+    #[tokio::test]
+    async fn test_parse_policy() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::dada/*"],
+      "Condition": {
+        "StringEquals": {
+          "s3:ExistingObjectTag/security": "public"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObjectTagging"],
+      "Resource": ["arn:aws:s3:::dada/*"],
+      "Condition": {
+        "StringEquals": {
+          "s3:ExistingObjectTag/security": "public"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::dada/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::dada/*"
+      ],
+      "Condition": {
+        "ForAllValues:StringLike": {
+          "s3:RequestObjectTagKeys": [
+            "security",
+            "virus"
+          ]
+        }
+      }
+    }
+  ]
+}
+"#;
+
+        let p = Policy::parse_config(data.as_bytes())?;
+
+        // println!("{:?}", p);
+
+        let str = serde_json::to_string(&p)?;
+
+        // println!("----- {}", str);
+
+        let _p2 = Policy::parse_config(str.as_bytes())?;
+        // println!("33{:?}", p2);
+
+        // assert_eq!(p, p2);
+        Ok(())
+    }
 }

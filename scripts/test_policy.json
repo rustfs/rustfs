@@ -1,0 +1,59 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::dada/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "s3:ExistingObjectTag/security": "public"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:DeleteObjectTagging"
+            ],
+            "Resource": [
+                "arn:aws:s3:::dada/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "s3:ExistingObjectTag/security": "public"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:DeleteObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::dada/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::dada/*"
+            ],
+            "Condition": {
+                "ForAllValues:StringLike": {
+                    "s3:RequestObjectTagKeys": [
+                        "security",
+                        "virus"
+                    ]
+                }
+            }
+        }
+    ]
+}
