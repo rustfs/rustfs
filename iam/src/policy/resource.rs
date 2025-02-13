@@ -64,7 +64,7 @@ impl PartialEq for ResourceSet {
     }
 }
 
-#[derive(Hash, Eq, PartialEq, Serialize, Deserialize, Clone, Debug)]
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub enum Resource {
     S3(String),
     Kms(String),
@@ -137,6 +137,28 @@ impl Validator for Resource {
             }
         }
         Ok(())
+    }
+}
+
+impl Serialize for Resource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Resource::S3(s) => serializer.serialize_str(&format!("{}{}", Self::S3_PREFIX, s)),
+            Resource::Kms(s) => serializer.serialize_str(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Resource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Resource::try_from(value.as_str()).map_err(serde::de::Error::custom)
     }
 }
 

@@ -6,11 +6,19 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Statement {
+    #[serde(rename = "Sid", default)]
     pub sid: ID,
+    #[serde(rename = "Effect")]
     pub effect: Effect,
+    #[serde(rename = "Action")]
     pub actions: ActionSet,
+    #[serde(rename = "NotAction", default)]
     pub not_actions: ActionSet,
+    #[serde(rename = "Resource", default)]
     pub resources: ResourceSet,
+    #[serde(rename = "NotResource", default)]
+    pub not_resources: ResourceSet,
+    #[serde(rename = "Condition", default)]
     pub conditions: Functions,
 }
 
@@ -84,7 +92,7 @@ impl Validator for Statement {
         // check sid
         self.sid.is_valid()?;
 
-        if self.actions.is_empty() || self.not_actions.is_empty() {
+        if self.actions.is_empty() && self.not_actions.is_empty() {
             return Err(IamError::NonAction.into());
         }
 
