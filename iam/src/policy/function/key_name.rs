@@ -169,6 +169,10 @@ pub enum S3KeyName {
 
     #[strum(serialize = "s3:ExistingObjectTag")]
     S3ExistingObjectTag,
+    #[strum(serialize = "s3:RequestObjectTagKeys")]
+    S3RequestObjectTagKeys,
+    #[strum(serialize = "s3:RequestObjectTag")]
+    S3RequestObjectTag,
 }
 
 #[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]
