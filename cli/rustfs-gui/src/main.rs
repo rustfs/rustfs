@@ -3,7 +3,7 @@ use dioxus::logger::tracing::debug;
 use dioxus::prelude::*;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use views::HomeViews;
+use views::{HomeViews, SettingViews};
 
 mod components;
 mod utils;
@@ -20,6 +20,8 @@ enum Route {
     #[layout(Navbar)]
     #[route("/")]
     HomeViews {},
+    #[route("/settings")]
+    SettingViews {},
 }
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
