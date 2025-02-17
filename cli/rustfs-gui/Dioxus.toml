@@ -36,16 +36,6 @@ category = "Utility"
 copyright = "Copyright 2025 rustfs.com"
 
 icon = [
-    "assets/icons/icon_16x16.png",
-    "assets/icons/icon_16x16@2x.png",
-    "assets/icons/icon_32x32.png",
-    "assets/icons/icon_32x32@2x.png",
-    "assets/icons/icon_128x128.png",
-    "assets/icons/icon_128x128@2x.png",
-    "assets/icons/icon_256x256.png",
-    "assets/icons/icon_256x256@2x.png",
-    "assets/icons/icon_512x512.png",
-    "assets/icons/icon_512x512@2x.png",
     "assets/icons/icon.icns",
     "assets/icons/icon.ico"
 ]
