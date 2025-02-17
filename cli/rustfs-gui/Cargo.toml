@@ -17,6 +17,8 @@ rfd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "process", "sync"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
+tracing-appender = { workspace = true }
 zip = { workspace = true }
 
 

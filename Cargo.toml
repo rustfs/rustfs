@@ -95,6 +95,7 @@ tower = { version = "0.5.2", features = ["timeout"] }
 tracing = "0.1.41"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
+tracing-appender = "0.2.3"
 transform-stream = "0.3.1"
 url = "2.5.4"
 uuid = { version = "1.12.1", features = [
