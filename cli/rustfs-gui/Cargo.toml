@@ -7,7 +7,42 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 dioxus = { workspace = true, features = ["router"] }
+dirs = { workspace = true }
+futures-util = { workspace = true }
+keyring = { workspace = true }
+reqwest = { workspace = true }
+rfd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "process", "sync"] }
+zip = { workspace = true }
+
+
+
+[features]
+default = ["desktop"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]
+
+[profile]
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"
+
+[profile.release]
+opt-level = 3  # 优化级别（0-3）
+lto = true     # 启用链接时优化
+codegen-units = 1  # 减少代码生成单元以提高优化效果
 
 [lints]
 workspace = true
