@@ -1,0 +1,13 @@
+[package]
+name = "rustfs-gui"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+dioxus = { workspace = true, features = ["router"] }
+
+[lints]
+workspace = true
