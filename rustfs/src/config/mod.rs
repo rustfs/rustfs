@@ -39,24 +39,24 @@ pub struct Opt {
     pub volumes: Vec<String>,
 
     /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
-    #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_PORT))]
+    #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_PORT), env = "RUSTFS_ADDRESS")]
     pub address: String,
 
     /// Access key used for authentication.
-    #[arg(long)]
-    pub access_key: Option<String>,
+    #[arg(long, default_value_t = DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
+    pub access_key: String,
 
     /// Secret key used for authentication.
-    #[arg(long)]
-    pub secret_key: Option<String>,
+    #[arg(long, default_value_t = DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
+    pub secret_key: String,
 
     /// Domain name used for virtual-hosted-style requests.
-    #[arg(long)]
+    #[arg(long, env = "RUSTFS_DOMAIN_NAME")]
     pub domain_name: Option<String>,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
-    #[arg(long, default_value_t = format!("0.0.0.0:{}", 0))]
+    #[arg(long, default_value_t = format!("127.0.0.1:{}", 0), env = "RUSTFS_CONSOLE_ADDRESS")]
     pub console_address: String,
 }
