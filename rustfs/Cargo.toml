@@ -81,7 +81,7 @@ futures-util.workspace = true
 # uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
 s3s.workspace = true
-clap = { version = "4.5.27", features = ["derive"] }
+clap = { version = "4.5.27", features = ["derive","env"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
 hyper-util = { version = "0.1.10", features = [
     "tokio",
