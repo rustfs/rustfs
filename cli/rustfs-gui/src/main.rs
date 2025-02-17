@@ -1,4 +1,5 @@
 mod components;
+mod utils;
 mod views;
 
 use dioxus::prelude::*;
