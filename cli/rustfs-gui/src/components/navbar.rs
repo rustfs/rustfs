@@ -1,4 +1,4 @@
-use crate::Route;
+use crate::router::Route;
 use dioxus::logger::tracing::debug;
 use dioxus::prelude::*;
 
@@ -11,6 +11,7 @@ pub fn Navbar() -> Element {
 
         div { id: "navbar", class: "hidden", style: "display: none;",
             Link { to: Route::HomeViews {}, "Home" }
+            Link { to: Route::SettingViews {}, "Setting" }
         }
 
         Outlet::<Route> {}
