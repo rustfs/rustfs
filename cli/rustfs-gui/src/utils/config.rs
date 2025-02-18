@@ -122,36 +122,24 @@ impl RustFSConfig {
         if let Ok(stored_json) = entry.get_password() {
             if let Ok(stored_config) = serde_json::from_str::<RustFSConfig>(&stored_json) {
                 // update fields that are not empty and non default
-                if !stored_config.address.is_empty()
-                    && stored_config.address != Self::DEFAULT_ADDRESS_VALUE
-                {
+                if !stored_config.address.is_empty() && stored_config.address != Self::DEFAULT_ADDRESS_VALUE {
                     config.address = stored_config.address;
                     let (host, port) = Self::extract_host_port(config.address.as_str())
-                        .ok_or_else(|| {
-                            format!("无法从地址 '{}' 中提取主机和端口", config.address)
-                        })?;
+                        .ok_or_else(|| format!("无法从地址 '{}' 中提取主机和端口", config.address))?;
                     config.host = host.to_string();
                     config.port = port.to_string();
                 }
-                if !stored_config.access_key.is_empty()
-                    && stored_config.access_key != Self::DEFAULT_ACCESS_KEY_VALUE
-                {
+                if !stored_config.access_key.is_empty() && stored_config.access_key != Self::DEFAULT_ACCESS_KEY_VALUE {
                     config.access_key = stored_config.access_key;
                 }
-                if !stored_config.secret_key.is_empty()
-                    && stored_config.secret_key != Self::DEFAULT_SECRET_KEY_VALUE
-                {
+                if !stored_config.secret_key.is_empty() && stored_config.secret_key != Self::DEFAULT_SECRET_KEY_VALUE {
                     config.secret_key = stored_config.secret_key;
                 }
-                if !stored_config.domain_name.is_empty()
-                    && stored_config.domain_name != Self::DEFAULT_DOMAIN_NAME_VALUE
-                {
+                if !stored_config.domain_name.is_empty() && stored_config.domain_name != Self::DEFAULT_DOMAIN_NAME_VALUE {
                     config.domain_name = stored_config.domain_name;
                 }
                 // The stored volume_name is updated only if it is not empty and different from the default
-                if !stored_config.volume_name.is_empty()
-                    && stored_config.volume_name != Self::default_volume_name()
-                {
+                if !stored_config.volume_name.is_empty() && stored_config.volume_name != Self::default_volume_name() {
                     config.volume_name = stored_config.volume_name;
                 }
                 if !stored_config.console_address.is_empty()

@@ -1,16 +1,17 @@
 #navbar {
-  display: flex;
-  flex-direction: row;
+    display: flex;
+    flex-direction: row;
 }
 
 #navbar a {
-  color: #ffffff;
-  margin-right: 20px;
-  text-decoration: none;
-  transition: color 0.2s ease;
+    color: #ffffff;
+    margin-right: 20px;
+    text-decoration: none;
+    transition: color 0.2s ease;
 }
 
 #navbar a:hover {
-  cursor: pointer;
-  color: #ffffff; // #91a4d2;
+    cursor: pointer;
+    color: #ffffff;
+/ / #91a4d2;
 }

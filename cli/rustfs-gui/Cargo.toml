@@ -42,9 +42,9 @@ inherits = "dev"
 inherits = "dev"
 
 [profile.release]
-opt-level = 3  # 优化级别（0-3）
-lto = true     # 启用链接时优化
-codegen-units = 1  # 减少代码生成单元以提高优化效果
+opt-level = 3  # Optimization Level (0-3)
+lto = true     # Optimize when linking
+codegen-units = 1  # Reduce code generation units to improve optimization
 
 [lints]
 workspace = true
