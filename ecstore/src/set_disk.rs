@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::{Cursor, Write},
+    io::Write,
     path::Path,
     sync::Arc,
     time::Duration,
@@ -1855,20 +1855,23 @@ impl SetDisks {
                 // debug!("read part_path {}", &part_path);
 
                 if let Some(disk) = disk_op {
-                    let filereader = {
-                        if let Some(ref data) = files[idx].data {
-                            FileReader::Buffer(BufferReader::new(data.clone()))
-                        } else {
-                            let disk = disk.clone();
-                            let part_path =
-                                format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or(Uuid::nil()), part_number);
+                    // let filereader = {
+                    //     if let Some(ref data) = files[idx].data {
+                    //         FileReader::Buffer(BufferReader::new(data.clone()))
+                    //     } else {
+                    //         let disk = disk.clone();
+                    //         let part_path =
+                    //             format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or(Uuid::nil()), part_number);
 
-                            disk.read_file(bucket, &part_path).await?
-                        }
-                    };
+                    //         disk.read_file(bucket, &part_path).await?
+                    //     }
+                    // };
                     let checksum_info = files[idx].erasure.get_checksum_info(part_number);
                     let reader = new_bitrot_filereader(
-                        filereader,
+                        disk.clone(),
+                        files[idx].data.clone(),
+                        bucket.to_owned(),
+                        format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or(Uuid::nil()), part_number),
                         till_offset,
                         checksum_info.algorithm,
                         erasure.shard_size(erasure.block_size),
@@ -2411,18 +2414,21 @@ impl SetDisks {
                                 let mut prefer = vec![false; latest_disks.len()];
                                 for (index, disk) in latest_disks.iter().enumerate() {
                                     if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
-                                        let filereader = {
-                                            if let Some(ref data) = metadata.data {
-                                                FileReader::Buffer(BufferReader::new(data.clone()))
-                                            } else {
-                                                let disk = disk.clone();
-                                                let part_path = format!("{}/{}/part.{}", object, src_data_dir, part.number);
+                                        // let filereader = {
+                                        //     if let Some(ref data) = metadata.data {
+                                        //         FileReader::Buffer(BufferReader::new(data.clone()))
+                                        //     } else {
+                                        //         let disk = disk.clone();
+                                        //         let part_path = format!("{}/{}/part.{}", object, src_data_dir, part.number);
 
-                                                disk.read_file(bucket, &part_path).await?
-                                            }
-                                        };
+                                        //         disk.read_file(bucket, &part_path).await?
+                                        //     }
+                                        // };
                                         let reader = new_bitrot_filereader(
-                                            filereader,
+                                            disk.clone(),
+                                            metadata.data.clone(),
+                                            bucket.to_owned(),
+                                            format!("{}/{}/part.{}", object, src_data_dir, part.number),
                                             till_offset,
                                             checksum_algo.clone(),
                                             erasure.shard_size(erasure.block_size),
@@ -5239,13 +5245,15 @@ async fn disks_with_all_parts(
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
                 let data_len = data.len();
                 let verify_err = match bitrot_verify(
-                    &mut Cursor::new(data.to_vec()),
+                    FileReader::Buffer(BufferReader::new(data.clone(), 0, data_len)),
                     data_len,
                     meta.erasure.shard_file_size(meta.size),
                     checksum_info.algorithm,
                     checksum_info.hash,
                     meta.erasure.shard_size(meta.erasure.block_size),
-                ) {
+                )
+                .await
+                {
                     Ok(_) => None,
                     Err(err) => Some(err),
                 };

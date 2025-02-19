@@ -23,10 +23,9 @@ use uuid::Uuid;
 
 use super::{
     endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
-    FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileReader, RemoteFileWriter,
-    RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileWriter, RenameDataResp,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
-use crate::utils::proto_err_to_err;
 use crate::{
     disk::error::DiskError,
     error::{Error, Result},
@@ -37,6 +36,7 @@ use crate::{
     },
     store_api::{FileInfo, RawFileInfo},
 };
+use crate::{disk::HttpFileReader, utils::proto_err_to_err};
 use crate::{disk::MetaCacheEntry, metacache::writer::MetacacheWriter};
 use protos::proto_gen::node_service::RenamePartRequst;
 
@@ -346,14 +346,21 @@ impl DiskAPI for RemoteDisk {
 
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         info!("read_file");
-        Ok(FileReader::Remote(
-            RemoteFileReader::new(
-                self.endpoint.clone(),
-                volume.to_string(),
-                path.to_string(),
-                node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?,
+        Ok(FileReader::Http(
+            HttpFileReader::new(self.endpoint.grid_host().as_str(), self.endpoint.to_string().as_str(), volume, path, 0, 0)
+                .await?,
+        ))
+    }
+
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        Ok(FileReader::Http(
+            HttpFileReader::new(
+                self.endpoint.grid_host().as_str(),
+                self.endpoint.to_string().as_str(),
+                volume,
+                path,
+                offset,
+                length,
             )
             .await?,
         ))

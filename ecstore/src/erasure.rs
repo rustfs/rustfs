@@ -419,6 +419,7 @@ impl Erasure {
         // num_shards * self.shard_size(self.block_size)
     }
 
+    // where erasure reading begins.
     pub fn shard_file_offset(&self, start_offset: usize, length: usize, total_length: usize) -> usize {
         let shard_size = self.shard_size(self.block_size);
         let shard_file_size = self.shard_file_size(total_length);
@@ -528,6 +529,7 @@ impl ShardReader {
     pub async fn read(&mut self) -> Result<Vec<Option<Vec<u8>>>> {
         // let mut disks = self.readers;
         let reader_length = self.readers.len();
+        // 需要读取的块长度
         let mut read_length = self.shard_size;
         if self.offset + read_length > self.shard_file_size {
             read_length = self.shard_file_size - self.offset

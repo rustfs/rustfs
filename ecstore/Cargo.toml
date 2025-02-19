@@ -66,6 +66,7 @@ pin-project-lite.workspace = true
 md-5.workspace = true
 madmin.workspace = true
 workers.workspace = true
+reqwest = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 
