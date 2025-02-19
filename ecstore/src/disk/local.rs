@@ -19,7 +19,7 @@ use crate::disk::error::{
 use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
 use crate::error::{Error, Result};
-use crate::file_meta::read_xl_meta_no_data;
+use crate::file_meta::{get_file_info, read_xl_meta_no_data, FileInfoOpts};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, ShouldSleepFn, SizeSummary};
 use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
@@ -1995,10 +1995,8 @@ impl DiskAPI for LocalDisk {
 
         let (data, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
 
-        let mut meta = FileMeta::default();
-        meta.unmarshal_msg(&data)?;
+        let fi = get_file_info(&data, volume, path, version_id, FileInfoOpts { data: read_data }).await?;
 
-        let fi = meta.into_fileinfo(volume, path, version_id, read_data, true)?;
         Ok(fi)
     }
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {

@@ -47,6 +47,7 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use transform_stream::AsyncTryStream;
@@ -751,6 +752,7 @@ impl S3 for FS {
             content_length,
             tagging,
             metadata,
+            version_id,
             ..
         } = input;
 
@@ -784,9 +786,11 @@ impl S3 for FS {
             metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, None, &req.headers, Some(metadata))
+        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
             .await
             .map_err(to_s3_error)?;
+
+        debug!("put_object opts {:?}", &opts);
 
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)
@@ -810,7 +814,11 @@ impl S3 for FS {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let CreateMultipartUploadInput {
-            bucket, key, tagging, ..
+            bucket,
+            key,
+            tagging,
+            version_id,
+            ..
         } = req.input;
 
         // mc cp step 3
@@ -827,7 +835,7 @@ impl S3 for FS {
             metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, None, &req.headers, Some(metadata))
+        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
             .await
             .map_err(to_s3_error)?;
 
