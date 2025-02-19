@@ -49,7 +49,8 @@ use common::defer;
 use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::io::Cursor;
+use std::io::SeekFrom;
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -59,7 +60,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -735,13 +736,24 @@ impl LocalDisk {
         sum: &[u8],
         shard_size: usize,
     ) -> Result<()> {
-        let mut file = utils::fs::open_file(part_path, O_CREATE | O_WRONLY)
+        let file = utils::fs::open_file(part_path, O_CREATE | O_WRONLY)
             .await
             .map_err(os_err_to_file_err)?;
 
-        let mut data = Vec::new();
-        let n = file.read_to_end(&mut data).await?;
-        bitrot_verify(&mut Cursor::new(data), n, part_size, algo, sum.to_vec(), shard_size)
+        // let mut data = Vec::new();
+        // let n = file.read_to_end(&mut data).await?;
+
+        let meta = file.metadata().await?;
+
+        bitrot_verify(
+            FileReader::Local(LocalFileReader::new(file)),
+            meta.size() as usize,
+            part_size,
+            algo,
+            sum.to_vec(),
+            shard_size,
+        )
+        .await
     }
 
     async fn scan_dir<W: AsyncWrite + Unpin>(
@@ -1533,6 +1545,50 @@ impl DiskAPI for LocalDisk {
         Ok(FileReader::Local(LocalFileReader::new(f)))
     }
 
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        let volume_dir = self.get_bucket_path(volume)?;
+        if !skip_access_checks(volume) {
+            if let Err(e) = utils::fs::access(&volume_dir).await {
+                return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
+            }
+        }
+
+        let file_path = volume_dir.join(Path::new(&path));
+        check_path_length(file_path.to_string_lossy().to_string().as_str())?;
+
+        let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await.map_err(|err| {
+            if let Some(e) = err.to_io_err() {
+                if os_is_not_exist(&e) {
+                    Error::new(DiskError::FileNotFound)
+                } else if os_is_permission(&e) || is_sys_err_not_dir(&e) {
+                    Error::new(DiskError::FileAccessDenied)
+                } else if is_sys_err_io(&e) {
+                    Error::new(DiskError::FaultyDisk)
+                } else if is_sys_err_too_many_files(&e) {
+                    Error::new(DiskError::TooManyOpenFiles)
+                } else {
+                    Error::new(e)
+                }
+            } else {
+                err
+            }
+        })?;
+
+        let meta = f.metadata().await?;
+        if meta.len() < (offset + length) as u64 {
+            error!(
+                "read_file_stream: file size is less than offset + length {} + {} = {}",
+                offset,
+                length,
+                meta.len()
+            );
+            return Err(Error::new(DiskError::FileCorrupt));
+        }
+
+        f.seek(SeekFrom::Start(offset as u64)).await?;
+
+        Ok(FileReader::Local(LocalFileReader::new(f)))
+    }
     #[tracing::instrument(level = "debug", skip(self))]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {

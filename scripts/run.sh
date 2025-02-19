@@ -6,8 +6,8 @@ fi
 
 current_dir=$(pwd)
 
-mkdir -p ./target/volume/test
-# mkdir -p ./target/volume/test{0..4}
+# mkdir -p ./target/volume/test
+mkdir -p ./target/volume/test{0..4}
 
 
 if [ -z "$RUST_LOG" ]; then
@@ -19,8 +19,8 @@ fi
 
 # export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
 
-# RUSTFS_VOLUMES="./target/volume/test{0...4}"
-export RUSTFS_VOLUMES="./target/volume/test"
+export RUSTFS_VOLUMES="./target/volume/test{0...4}"
+# export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS="0.0.0.0:9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9002"
