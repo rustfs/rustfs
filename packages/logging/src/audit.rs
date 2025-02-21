@@ -1,3 +1,12 @@
+#[cfg(feature = "audit-kafka")]
+use rdkafka::{
+    producer::{FutureProducer, FutureRecord},
+    ClientConfig,
+};
+
+#[cfg(feature = "audit-webhook")]
+use reqwest::Client;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -72,6 +81,80 @@ impl AuditTarget for FileAuditTarget {
     }
 }
 
+#[cfg(feature = "audit-webhook")]
+/// Webhook audit objectives
+pub struct WebhookAuditTarget {
+    client: Client,
+    url: String,
+}
+
+#[cfg(feature = "audit-webhook")]
+impl WebhookAuditTarget {
+    pub fn new(url: &str) -> Self {
+        Self {
+            client: Client::new(),
+            url: url.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "audit-webhook")]
+impl AuditTarget for WebhookAuditTarget {
+    fn send(&self, entry: AuditEntry) {
+        let client = self.client.clone();
+        let url = self.url.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.post(&url).json(&entry).send().await {
+                eprintln!("Failed to send to Webhook: {:?}", e);
+            }
+        });
+    }
+}
+
+#[cfg(feature = "audit-kafka")]
+/// Kafka audit objectives
+pub struct KafkaAuditTarget {
+    producer: FutureProducer,
+    topic: String,
+}
+
+#[cfg(feature = "audit-kafka")]
+impl KafkaAuditTarget {
+    pub fn new(brokers: &str, topic: &str) -> Self {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .expect("Kafka producer creation failed");
+        Self {
+            producer,
+            topic: topic.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "audit-kafka")]
+impl AuditTarget for KafkaAuditTarget {
+    fn send(&self, entry: AuditEntry) {
+        let topic = self.topic.clone();
+        let span_id = entry.span_id.clone();
+        let payload = serde_json::to_string(&entry).unwrap();
+        // let record = FutureRecord::to(&topic).payload(&payload).key(&span_id);
+        tokio::spawn({
+            // 在异步闭包内部创建 record
+            let topic = topic;
+            let payload = payload;
+            let span_id = span_id;
+            let producer = self.producer.clone();
+            async move {
+                let record = FutureRecord::to(&topic).payload(&payload).key(&span_id);
+                if let Err(e) = producer.send(record, std::time::Duration::from_secs(0)).await {
+                    eprintln!("Failed to send to Kafka: {:?}", e);
+                }
+            }
+        });
+    }
+}
 /// AuditLogger is a logger that logs audit entries
 /// to multiple targets
 ///
@@ -110,6 +193,7 @@ impl AuditLogger {
     /// # Example
     /// ```
     /// use rustfs_logging::{AuditLogger, AuditEntry, FileAuditTarget};
+    ///
     /// let logger = AuditLogger::new(vec![Box::new(FileAuditTarget)]);
     /// ```
     pub fn new(targets: Vec<Box<dyn AuditTarget>>) -> Self {

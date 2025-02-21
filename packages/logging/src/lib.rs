@@ -9,6 +9,10 @@
 /// log_info("This is an informational message");
 /// log_error("This is an error message");
 /// ```
+#[cfg(feature = "audit-kafka")]
+pub use audit::KafkaAuditTarget;
+#[cfg(feature = "audit-webhook")]
+pub use audit::WebhookAuditTarget;
 pub use audit::{AuditEntry, AuditLogger, AuditTarget, FileAuditTarget};
 pub use logger::{log_debug, log_error, log_info};
 pub use telemetry::Telemetry;
@@ -66,11 +70,17 @@ mod tests {
     }
 
     #[tokio::test]
+    // #[cfg(feature = "audit-webhook")]
+    // #[cfg(feature = "audit-kafka")]
     async fn test_main() {
         let telemetry = Telemetry::init();
 
         // Initialize multiple audit objectives
-        let audit_targets: Vec<Box<dyn AuditTarget>> = vec![Box::new(FileAuditTarget)];
+        let audit_targets: Vec<Box<dyn AuditTarget>> = vec![
+            Box::new(FileAuditTarget),
+            // Box::new(KafkaAuditTarget::new("localhost:9092", "rustfs-audit")),
+            // Box::new(WebhookAuditTarget::new("http://localhost:8080/audit")),
+        ];
         let audit_logger = AuditLogger::new(audit_targets);
 
         // Test the PUT operation

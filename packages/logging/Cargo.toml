@@ -9,6 +9,11 @@ version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+audit-kafka = ["dep:rdkafka", "dep:serde_json"]
+audit-webhook = ["dep:reqwest"]
+
 [dependencies]
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
@@ -20,6 +25,9 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tokio = { workspace = true, features = ["full"] }
+rdkafka = { workspace = true, features = ["tokio"], optional = true }
+reqwest = { workspace = true, features = ["json"], optional = true }
+serde_json = { workspace = true, optional = true }
 
 
 
