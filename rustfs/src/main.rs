@@ -3,8 +3,10 @@ mod auth;
 mod config;
 mod console;
 mod grpc;
+mod logging;
 mod service;
 mod storage;
+
 use crate::auth::IAMAuth;
 use clap::Parser;
 use common::{
@@ -68,7 +70,7 @@ fn main() -> Result<()> {
     //解析获得到的参数
     let opt = config::Opt::parse();
 
-    //设置trace
+    //设置 trace
     setup_tracing();
 
     //运行参数
@@ -91,17 +93,17 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     debug!("server_address {}", &server_address);
 
-    //设置AK和SK
+    //设置 AK 和 SK
 
     iam::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone())).unwrap();
     set_global_rustfs_port(server_port);
 
-    //监听地址,端口从参数中获取
+    //监听地址，端口从参数中获取
     let listener = TcpListener::bind(server_address.clone()).await?;
     //获取监听地址
     let local_addr: SocketAddr = listener.local_addr()?;
 
-    // 用于rpc
+    // 用于 rpc
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
 
@@ -123,13 +125,13 @@ async fn run(opt: config::Opt) -> Result<()> {
         .map_err(|err| Error::from_string(err.to_string()))?;
 
     // Setup S3 service
-    // 本项目使用s3s库来实现s3服务
+    // 本项目使用 s3s 库来实现 s3 服务
     let service = {
         let store = storage::ecfs::FS::new();
         // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(server_address.clone(), endpoint_pools).await?);
         let mut b = S3ServiceBuilder::new(store.clone());
 
-        //显示info信息
+        //显示 info 信息
         info!("authentication is enabled {}, {}", &opt.access_key, &opt.secret_key);
         b.set_auth(IAMAuth::new(opt.access_key, opt.secret_key));
 
