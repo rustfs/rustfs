@@ -606,11 +606,17 @@ where
 
             if !policy_present {
                 let mut m = HashMap::new();
-                self.api.load_mapped_policy(name, UserType::Reg, true, &mut m).await?;
+                if let Err(err) = self.api.load_mapped_policy(name, UserType::Reg, true, &mut m).await {
+                    if !is_err_no_such_policy(&err) {
+                        return Err(err);
+                    }
+                }
                 if let Some(p) = m.get(name) {
                     Cache::add_or_update(&self.cache.group_policies, name, p, OffsetDateTime::now_utc());
                     return Ok((p.to_slice(), p.update_at));
                 }
+
+                return Ok((Vec::new(), OffsetDateTime::now_utc()));
             }
 
             return Ok((Vec::new(), OffsetDateTime::now_utc()));
