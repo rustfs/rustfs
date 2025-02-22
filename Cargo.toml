@@ -75,7 +75,7 @@ protos = { path = "./common/protos" }
 rand = "0.8.5"
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration", "stream"] }
 rdkafka = { version = "0.37", features = ["tokio"] }
-rfd = "0.15.2"
+rfd = { version = "0.15.2", default-features = false, features = ["xdg-portal", "tokio"] }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rustfs-logging = { path = "packages/logging", version = "0.0.1" }
