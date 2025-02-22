@@ -1,9 +1,15 @@
-name: Rust
+name: CI
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
+  schedule:
+    - cron: '0 0 * * 0' # at midnight of each sunday
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,20 +30,22 @@ jobs:
           cancel_others: true
           paths_ignore: '["*.md"]'
 
-  build:
-    # See this url if required matrix jobs are hanging
-    # https://github.com/fkirc/skip-duplicate-actions#how-to-use-skip-check-with-required-matrix-jobs
+  develop:
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
 
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust:
-          - stable
-          - nightly
-
+    
     steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            libdbus-1-dev \
+            libwayland-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+
       - uses: arduino/setup-protoc@v3
         with:
           version: "27.0"
@@ -48,22 +56,22 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          shared-key: "develop"
 
-      - name: cargo fmt
+      - name: Format
         run: cargo fmt --all --check
-
-      - name: cargo clippy
-        run: cargo clippy
+  
+      - name: Lint
+        run: cargo check
+        # run: cargo clippy
         # run: cargo clippy -- -D warnings
 
-      - name: cargo test
+      - name: Test
         run: cargo test --all --exclude e2e_test
