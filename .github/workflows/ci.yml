@@ -37,6 +37,14 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+      - name: install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            libwayland-dev \
+            libdbus-1-dev \
+            libwebkit2gtk-4.1-dev
+
       - uses: arduino/setup-protoc@v3
         with:
           version: "27.0"
