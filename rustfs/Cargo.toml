@@ -61,7 +61,7 @@ url.workspace = true
 admin = { path = "../api/admin" }
 axum.workspace = true
 matchit = "0.8.6"
-shadow-rs = "0.38.0"
+shadow-rs.workspace = true
 const-str = { version = "0.6.1", features = ["std", "proc"] }
 atoi = "2.0.0"
 serde_urlencoded = "0.7.1"
@@ -90,5 +90,5 @@ hyper-util = { version = "0.1.10", features = [
 ] }
 transform-stream = "0.3.1"
 netif = "0.1.6"
-shadow-rs = "0.38.0"
+shadow-rs.workspace = true
 # pin-utils = "0.1.0"
