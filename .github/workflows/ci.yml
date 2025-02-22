@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: install system dependencies
+      - name: Install system dependencies
         run: |
           sudo apt update
           sudo apt install -y \
@@ -63,13 +63,13 @@ jobs:
         with:
           cache-on-failure: true
   
-      - name: format
+      - name: Format
         run: cargo fmt --all --check
   
-      - name: lint
+      - name: Lint
         run: cargo check
         # run: cargo clippy
         # run: cargo clippy -- -D warnings
 
-      - name: test
+      - name: Test
         run: cargo test --all --exclude e2e_test
