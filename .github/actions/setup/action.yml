@@ -1,0 +1,45 @@
+name: "setup"
+
+description: "setup environment for rustfs"
+
+inputs:
+  rust-version:
+    required: true
+    default: "stable"
+  cache-shared-key:
+    required: true
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          libdbus-1-dev \
+          libwayland-dev \
+          libwebkit2gtk-4.1-dev \
+          libxdo-dev
+
+    - uses: arduino/setup-protoc@v3
+      with:
+        version: "27.0"
+
+    - uses: Nugine/setup-flatc@v1
+      with:
+        version: "24.3.25"
+
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.rust-version }}
+        components: rustfmt, clippy
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        shared-key: ${{ inputs.cache-shared-key }}
+
+    - uses: mlugg/setup-zig@v1
+    - uses: taiki-e/install-action@cargo-zigbuild
