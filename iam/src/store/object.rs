@@ -4,7 +4,7 @@ use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
     get_global_action_cred,
-    manager::get_default_policyes,
+    manager::{extract_jwt_claims, get_default_policyes},
     policy::PolicyDoc,
 };
 use ecstore::{
@@ -420,8 +420,20 @@ impl Store for ObjectStore {
             u.credentials.access_key = name.to_owned();
         }
 
-        if u.credentials.session_token.is_empty() {
-            //  TODO: 解析sts
+        if !u.credentials.session_token.is_empty() {
+            match extract_jwt_claims(&u) {
+                Ok(claims) => {
+                    u.credentials.claims = Some(claims);
+                }
+                Err(err) => {
+                    if u.credentials.is_temp() {
+                        let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
+                        let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
+                    }
+                    warn!("extract_jwt_claims failed: {}", err);
+                    return Err(Error::new(crate::error::Error::NoSuchUser(name.to_owned())));
+                }
+            }
         }
 
         Ok(u)
@@ -807,7 +819,7 @@ impl Store for ObjectStore {
         }
 
         // group policy
-        if let Some(item_name_list) = listed_config_items.get(SVC_ACC_LIST_KEY) {
+        if let Some(item_name_list) = listed_config_items.get(POLICY_DB_GROUPS_LIST_KEY) {
             let mut items_cache = CacheEntity::default();
 
             for item in item_name_list.iter() {
@@ -815,7 +827,9 @@ impl Store for ObjectStore {
 
                 info!("load group policy: {}", name);
                 if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await {
-                    return Err(Error::msg(std::format!("load group failed: {}", err)));
+                    if !is_err_no_such_policy(&err) {
+                        return Err(Error::msg(std::format!("load group policy failed: {}", err)));
+                    }
                 };
             }
 
@@ -825,7 +839,7 @@ impl Store for ObjectStore {
         let mut sts_policies_cache = CacheEntity::default();
 
         // svc users
-        if let Some(item_name_list) = listed_config_items.get(POLICY_DB_GROUPS_LIST_KEY) {
+        if let Some(item_name_list) = listed_config_items.get(SVC_ACC_LIST_KEY) {
             let mut items_cache = HashMap::default();
 
             for item in item_name_list.iter() {

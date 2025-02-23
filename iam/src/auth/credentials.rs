@@ -224,7 +224,7 @@ pub fn create_new_credentials_with_metadata(
         }
     };
 
-    let token = utils::generate_jwt(claims, token_secret)?;
+    let token = utils::generate_jwt(&claims, token_secret)?;
 
     Ok(Credentials {
         access_key: ak.to_owned(),

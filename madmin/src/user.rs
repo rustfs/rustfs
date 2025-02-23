@@ -104,7 +104,7 @@ pub struct ServiceAccountInfo {
     #[serde(rename = "description", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    #[serde(rename = "expiration", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expiration", with = "time::serde::rfc3339::option")]
     pub expiration: Option<OffsetDateTime>,
 }
 
@@ -134,7 +134,7 @@ pub struct AddServiceAccountReq {
     #[serde(rename = "description", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    #[serde(rename = "expiration", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expiration", with = "time::serde::rfc3339::option")]
     pub expiration: Option<OffsetDateTime>,
 }
 

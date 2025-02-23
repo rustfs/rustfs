@@ -42,6 +42,7 @@ impl Operation for AddServiceAccount {
 
         let mut create_req: AddServiceAccountReq =
             serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
+
         create_req.expiration = create_req.expiration.and_then(|expire| expire.replace_millisecond(0).ok());
 
         if has_space_be(&create_req.access_key) {
@@ -128,7 +129,7 @@ impl Operation for AddServiceAccount {
             .await
             .map_err(|e| {
                 debug!("create service account failed, e: {:?}", e);
-                s3_error!(InternalError, "create service account failed")
+                s3_error!(InternalError, "create service account failed, e: {:?}", e)
             })?;
 
         let resp = AddServiceAccountResp {
