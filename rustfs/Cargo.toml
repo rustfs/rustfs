@@ -70,6 +70,8 @@ iam = { path = "../iam" }
 jsonwebtoken = "9.3.0"
 tower-http = { version = "0.6.2", features = ["cors"] }
 include_dir = "0.7.4"
+pnet = "0.35.0"
+mime_guess = "2.0.5"
 
 [build-dependencies]
 prost-build.workspace = true

@@ -5,3 +5,4 @@
 /test
 /logs
 .devcontainer
+rustfs/static/*
