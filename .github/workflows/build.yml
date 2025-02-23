@@ -12,33 +12,36 @@ jobs:
   build-rustfs:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        variant:
+          - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default"  }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default"  }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31"     }
+
     steps:
       - uses: actions/checkout@v4
-      
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: arduino/setup-protoc@v3
+      - uses: ./.github/actions/setup
         with:
-          version: "27.0"
+          cache-shared-key: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
 
-      - uses: Nugine/setup-flatc@v1
-        with:
-          version: "24.3.25"
-
-      - name: Build binaries
+      - name: Build
         run: |
-          touch rustfs/build.rs
-          cargo build -p rustfs --bins 
-          
-          touch rustfs/build.rs
-          cargo build -p rustfs --bins --release
-
-          mkdir -p target/artifacts
-          mv ./target/debug/rustfs    ./target/artifacts/rustfs.debug.x86_64-unknown-linux-gnu
-          mv ./target/release/rustfs  ./target/artifacts/rustfs.release.x86_64-unknown-linux-gnu
+          ./scripts/build.py \
+            --profile ${{ matrix.variant.profile }} \
+            --target ${{ matrix.variant.target }} \
+            --glibc ${{ matrix.variant.glibc }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: rustfs
+          name: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
           path: ./target/artifacts/*
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build-rustfs
+    steps:
+      - uses: actions/upload-artifact/merge@v4
+        with:
+          name: rustfs
+          delete-merged: true

@@ -37,33 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Install system dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y \
-            libdbus-1-dev \
-            libwayland-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev
-
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "27.0"
-
-      - uses: Nugine/setup-flatc@v1
-        with:
-          version: "24.3.25"
-
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          shared-key: "develop"
+      - uses: ./.github/actions/setup
 
       - name: Format
         run: cargo fmt --all --check
