@@ -60,6 +60,7 @@ impl AuditTarget for FileAuditTarget {
     /// Send an audit entry to a file
     /// # Arguments
     /// *   `entry` - The audit entry to send
+    ///
     /// # Example
     /// ```
     /// use rustfs_logging::{AuditEntry, AuditTarget, FileAuditTarget};
@@ -75,7 +76,6 @@ impl AuditTarget for FileAuditTarget {
     /// };
     /// FileAuditTarget.send(entry);
     /// ```
-    ///
     fn send(&self, entry: AuditEntry) {
         println!("File audit: {:?}", entry);
     }
@@ -83,6 +83,14 @@ impl AuditTarget for FileAuditTarget {
 
 #[cfg(feature = "audit-webhook")]
 /// Webhook audit objectives
+/// #Arguments
+/// * `client` - The reqwest client
+/// * `url` - The URL of the webhook
+/// # Example 
+/// ```
+/// use rustfs_logging::WebhookAuditTarget;
+/// let target = WebhookAuditTarget::new("http://localhost:8080");
+/// ```
 pub struct WebhookAuditTarget {
     client: Client,
     url: String,
@@ -113,6 +121,52 @@ impl AuditTarget for WebhookAuditTarget {
 
 #[cfg(feature = "audit-kafka")]
 /// Kafka audit objectives
+/// # Arguments
+/// * `producer` - The Kafka producer
+/// * `topic` - The Kafka topic
+/// # Example
+/// ```
+/// use rustfs_logging::KafkaAuditTarget;
+/// let target = KafkaAuditTarget::new("localhost:9092", "rustfs-audit");
+/// ```
+/// # Note
+/// This feature requires the `rdkafka` crate
+/// # Example
+/// ```toml
+/// [dependencies]
+/// rdkafka = "0.26.0"
+/// rustfs_logging = { version = "0.1.0", features = ["audit-kafka"] }
+/// ```
+/// # Note
+/// The `rdkafka` crate requires the `librdkafka` library to be installed
+/// # Example
+/// ```sh
+/// sudo apt-get install librdkafka-dev
+/// ```
+/// # Note
+/// The `rdkafka` crate requires the `libssl-dev` and `pkg-config` packages to be installed
+/// # Example
+/// ```sh
+/// sudo apt-get install libssl-dev pkg-config
+/// ```
+/// # Note
+/// The `rdkafka` crate requires the `zlib1g-dev` package to be installed
+/// # Example
+/// ```sh
+/// sudo apt-get install zlib1g-dev
+/// ```
+/// # Note
+/// The `rdkafka` crate requires the `zstd` package to be installed
+/// # Example
+/// ```sh
+/// sudo apt-get install zstd
+/// ```
+/// # Note
+/// The `rdkafka` crate requires the `lz4` package to be installed
+/// # Example
+/// ```sh
+/// sudo apt-get install lz4
+/// ```
 pub struct KafkaAuditTarget {
     producer: FutureProducer,
     topic: String,
@@ -178,7 +232,31 @@ impl AuditTarget for KafkaAuditTarget {
 ///     logger.log(entry).await;
 /// }
 /// ```
+
 #[derive(Debug)]
+/// AuditLogger is a logger that logs audit entries
+/// to multiple targets
+/// # Example
+/// ```
+/// use rustfs_logging::{AuditEntry, AuditLogger, FileAuditTarget};
+/// let logger = AuditLogger::new(vec![Box::new(FileAuditTarget)]);
+/// ```
+/// # Note
+/// This feature requires the `tokio` crate
+/// # Example
+/// ```toml
+/// [dependencies]
+/// tokio = { version = "1", features = ["full"] }
+/// rustfs_logging = { version = "0.1.0"}
+/// ```
+/// # Note
+/// This feature requires the `serde` crate
+/// # Example
+/// ```toml
+/// [dependencies]
+/// serde = { version = "1", features = ["derive"] }
+/// rustfs_logging = { version = "0.1.0"}
+/// ```
 pub struct AuditLogger {
     tx: mpsc::Sender<AuditEntry>,
 }
