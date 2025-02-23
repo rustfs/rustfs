@@ -42,6 +42,9 @@ pub struct Opt {
     #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_PORT), env = "RUSTFS_ADDRESS")]
     pub address: String,
 
+    #[arg(long, default_value_t = format!("http://localhost:{}", DEFAULT_PORT), env = "RUSTFS_SERVER_ENDPOINT")]
+    pub server_endpoint: String,
+
     /// Access key used for authentication.
     #[arg(long, default_value_t = DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
     pub access_key: String,
