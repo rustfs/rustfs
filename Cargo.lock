@@ -5345,6 +5345,7 @@ dependencies = [
  "madmin",
  "matchit 0.8.6",
  "mime",
+ "mime_guess",
  "netif",
  "pin-project-lite",
  "prost",
