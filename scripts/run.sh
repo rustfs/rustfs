@@ -11,6 +11,7 @@ mkdir -p ./target/volume/test{0..4}
 
 
 if [ -z "$RUST_LOG" ]; then
+export RUST_BACKTRACE=1
     export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
 fi
 
@@ -18,21 +19,15 @@ fi
 
 # export RUSTFS_STORAGE_CLASS_INLINE_BLOCK="512 KB"
 
-
-# DATA_DIR_ARG="./target/volume/test{0...4}"
-DATA_DIR_ARG="./target/volume/test"
+# RUSTFS_VOLUMES="./target/volume/test{0...4}"
+export RUSTFS_VOLUMES="./target/volume/test"
+export RUSTFS_ADDRESS="0.0.0.0:9000"
+export RUSTFS_CONSOLE_ENABLE=true
+export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9002"
 
 if [ -n "$1" ]; then
-	DATA_DIR_ARG="$1"
+	export RUSTFS_VOLUMES="$1"
 fi
 
 
-# cargo run  "$DATA_DIR_ARG"
-    # -- --access-key AKEXAMPLERUSTFS    \
-    # --secret-key SKEXAMPLERUSTFS    \
-    # --address       0.0.0.0:9010       \
-    # --domain-name   127.0.0.1:9010  \
-    # "$DATA_DIR_ARG"
-
-./target/debug/rustfs "$DATA_DIR_ARG"
-# cargo run ./target/volume/test
+./target/debug/rustfs 

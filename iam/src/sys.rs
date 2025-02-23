@@ -229,6 +229,11 @@ impl<T: Store> IamSys<T> {
             }
         }
 
+        m.insert(
+            "exp".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(opts.expiration.map_or(0, |t| t.unix_timestamp()))),
+        );
+
         let (access_key, secret_key) = if !opts.access_key.is_empty() || !opts.secret_key.is_empty() {
             (opts.access_key, opts.secret_key)
         } else {

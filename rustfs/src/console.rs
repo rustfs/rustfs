@@ -7,6 +7,7 @@ use axum::{
 };
 
 use include_dir::{include_dir, Dir};
+use serde::Serialize;
 
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
 
@@ -25,9 +26,26 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     }
 }
 
-pub async fn start_static_file_server(addrs: &str) {
+#[derive(Debug, Clone, Serialize)]
+struct Config {
+    fs_addr: String,
+}
+
+async fn config_handler(axum::extract::Extension(fs_addr): axum::extract::Extension<String>) -> impl IntoResponse {
+    let cfg = serde_json::to_string(&Config { fs_addr }).unwrap_or_default();
+
+    Response::builder()
+        .header("content-type", "application/json")
+        .status(StatusCode::OK)
+        .body(Body::from(cfg))
+        .unwrap()
+}
+
+pub async fn start_static_file_server(addrs: &str, fs_addr: &str) {
     // 创建路由
-    let app = Router::new().route("/*file", get(static_handler));
+    let app = Router::new()
+        .route("/config.json", get(config_handler).layer(axum::extract::Extension(fs_addr.to_string())))
+        .route("/*file", get(static_handler));
 
     let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
 

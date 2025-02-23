@@ -58,7 +58,7 @@ use tokio::select;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::{interval, sleep};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 const MAX_UPLOADS_LIST: usize = 10000;
@@ -1235,10 +1235,8 @@ impl StorageAPI for ECStore {
         let mut buckets = self.peer_sys.list_bucket(opts).await?;
 
         if !opts.no_metadata {
-            warn!("list_bucket meta");
             for bucket in buckets.iter_mut() {
                 if let Ok(created) = metadata_sys::created_at(&bucket.name).await {
-                    warn!("list_bucket created {:?}", &created);
                     bucket.created = Some(created);
                 }
             }

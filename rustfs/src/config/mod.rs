@@ -35,7 +35,7 @@ const LONG_VERSION: &str = concat!(
 #[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
-    #[arg(required = true)]
+    #[arg(required = true, env = "RUSTFS_VOLUMES")]
     pub volumes: Vec<String>,
 
     /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname

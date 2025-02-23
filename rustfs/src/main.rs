@@ -234,7 +234,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     if opt.console_enable {
         info!("console is enabled");
         tokio::spawn(async move {
-            console::start_static_file_server(&opt.console_address).await;
+            console::start_static_file_server(&opt.console_address, &opt.address).await;
         });
     }
 
