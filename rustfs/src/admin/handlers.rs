@@ -18,12 +18,11 @@ use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::StorageAPI;
 use ecstore::utils::crypto::base64_encode;
 use ecstore::utils::path::path_join;
-use ecstore::utils::xml;
 use ecstore::GLOBAL_Endpoints;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
 use hyper::StatusCode;
-use iam::auth::{get_claims_from_token_with_secret, get_new_credentials_with_metadata};
+use iam::auth::get_claims_from_token_with_secret;
 use iam::error::Error as IamError;
 use iam::policy::Policy;
 use iam::sys::SESSION_POLICY_NAME;
@@ -33,10 +32,7 @@ use madmin::utils::parse_duration;
 use matchit::Params;
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{
-    dto::{AssumeRoleOutput, Credentials, Timestamp},
-    s3_error, Body, S3Error, S3Request, S3Response, S3Result,
-};
+use s3s::{s3_error, Body, S3Error, S3Request, S3Response, S3Result};
 use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,7 +43,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration as std_Duration;
-use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc::{self};
 use tokio::time::interval;
 use tokio::{select, spawn};
@@ -57,31 +52,9 @@ use tracing::{error, info, warn};
 pub mod group;
 pub mod policy;
 pub mod service_account;
+pub mod sts;
 pub mod trace;
 pub mod user;
-
-const ASSUME_ROLE_ACTION: &str = "AssumeRole";
-const ASSUME_ROLE_VERSION: &str = "2011-06-15";
-
-#[derive(Deserialize, Debug, Default)]
-#[serde(rename_all = "PascalCase", default)]
-pub struct AssumeRoleRequest {
-    pub action: String,
-    pub duration_seconds: usize,
-    pub version: String,
-    pub role_arn: String,
-    pub role_session_name: String,
-    pub policy: String,
-    pub external_id: String,
-}
-
-fn get_token_signing_key() -> Option<String> {
-    if let Some(s) = get_global_action_cred() {
-        Some(s.secret_key.clone())
-    } else {
-        None
-    }
-}
 
 // check_key_valid get auth.cred
 pub async fn check_key_valid(security_token: Option<String>, ak: &str) -> S3Result<(auth::Credentials, bool)> {
@@ -214,114 +187,6 @@ pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str
     }
 
     Ok(())
-}
-
-pub struct AssumeRoleHandle {}
-#[async_trait::async_trait]
-impl Operation for AssumeRoleHandle {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle AssumeRoleHandle");
-
-        let Some(user) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
-
-        let session_token = get_session_token(&req.headers);
-        if session_token.is_some() {
-            return Err(s3_error!(InvalidRequest, "AccessDenied1"));
-        }
-
-        let (cred, _owner) = check_key_valid(session_token, &user.access_key).await?;
-
-        // // TODO: 判断权限, 不允许sts访问
-        if cred.is_temp() || cred.is_service_account() {
-            return Err(s3_error!(InvalidRequest, "AccessDenied"));
-        }
-
-        let mut input = req.input;
-
-        let bytes = match input.store_all_unlimited().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
-            }
-        };
-
-        let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
-
-        if body.action.as_str() != ASSUME_ROLE_ACTION {
-            return Err(s3_error!(InvalidArgument, "not suport action"));
-        }
-
-        if body.version.as_str() != ASSUME_ROLE_VERSION {
-            return Err(s3_error!(InvalidArgument, "not suport version"));
-        }
-
-        let mut claims = cred.claims.unwrap_or_default();
-
-        populate_session_policy(&mut claims, &body.policy)?;
-
-        let exp = {
-            if body.duration_seconds > 0 {
-                body.duration_seconds
-            } else {
-                3600
-            }
-        };
-
-        claims.insert(
-            "exp".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(OffsetDateTime::now_utc().unix_timestamp() + exp as i64)),
-        );
-
-        claims.insert("parent".to_string(), serde_json::Value::String(cred.access_key.clone()));
-
-        // warn!("AssumeRole get cred {:?}", &user);
-        // warn!("AssumeRole get body {:?}", &body);
-
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
-
-        if let Err(_err) = iam_store.policy_db_get(&cred.access_key, &cred.groups).await {
-            return Err(s3_error!(InvalidArgument, "invalid policy arg"));
-        }
-
-        let Some(secret) = get_token_signing_key() else {
-            return Err(s3_error!(InvalidArgument, "global active sk not init"));
-        };
-
-        info!("AssumeRole get claims {:?}", &claims);
-
-        let mut new_cred = get_new_credentials_with_metadata(&claims, &secret)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get new cred failed {}", e)))?;
-
-        new_cred.parent_user = cred.access_key.clone();
-
-        info!("AssumeRole get new_cred {:?}", &new_cred);
-
-        if let Err(_err) = iam_store.set_temp_user(&new_cred.access_key, &new_cred, None).await {
-            return Err(s3_error!(InternalError, "set_temp_user failed"));
-        }
-
-        // TODO: globalSiteReplicationSys
-
-        let resp = AssumeRoleOutput {
-            credentials: Some(Credentials {
-                access_key_id: new_cred.access_key,
-                expiration: Timestamp::from(
-                    new_cred
-                        .expiration
-                        .unwrap_or(OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600))),
-                ),
-                secret_access_key: new_cred.secret_key,
-                session_token: new_cred.session_token,
-            }),
-            ..Default::default()
-        };
-
-        // getAssumeRoleCredentials
-        let output = xml::serialize::<AssumeRoleOutput>(&resp).unwrap();
-
-        Ok(S3Response::new((StatusCode::OK, Body::from(output))))
-    }
 }
 
 #[derive(Debug, Serialize, Default)]

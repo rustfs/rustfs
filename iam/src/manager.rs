@@ -4,6 +4,7 @@ use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
     format::Format,
+    get_global_action_cred,
     policy::{Policy, PolicyDoc, DEFAULT_POLICIES},
     store::{object::IAM_CONFIG_PREFIX, GroupInfo, MappedPolicy, Store, UserType},
     sys::{
@@ -1577,8 +1578,27 @@ fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
     }
 }
 
+pub fn get_token_signing_key() -> Option<String> {
+    if let Some(s) = get_global_action_cred() {
+        Some(s.secret_key.clone())
+    } else {
+        None
+    }
+}
+
 pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
-    get_claims_from_token_with_secret(&u.credentials.session_token, &u.credentials.secret_key)
+    let Some(sys_key) = get_token_signing_key() else {
+        return Err(Error::msg("global active sk not init"));
+    };
+
+    let keys = vec![&sys_key, &u.credentials.secret_key];
+
+    for key in keys {
+        if let Ok(claims) = get_claims_from_token_with_secret(&u.credentials.session_token, key) {
+            return Ok(claims);
+        }
+    }
+    Err(Error::msg("unable to extract claims"))
 }
 
 fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (String, Policy) {
