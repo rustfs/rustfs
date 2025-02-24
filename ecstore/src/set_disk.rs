@@ -5463,7 +5463,11 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
 
     for part in parts.iter() {
         if let Some(etag) = &part.e_tag {
-            buf.extend(etag.bytes());
+            if let Ok(etag_bytes) = hex_simd::decode_to_vec(etag.as_bytes()) {
+                buf.extend(etag_bytes);
+            } else {
+                buf.extend(etag.bytes());
+            }
         }
     }
 
