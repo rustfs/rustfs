@@ -4050,9 +4050,9 @@ dependencies = [
 
 [[package]]
 name = "numeric_cast"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6699ec124a5322dd30184abe24b2b9a92237ed0fe8e038f1f410bf7cccfe8b33"
+checksum = "a3c00a0c9600379bd32f8972de90676a7672cba3bf4886986bc05902afc1e093"
 
 [[package]]
 name = "objc"
@@ -5574,7 +5574,7 @@ checksum = "6ea1a2d0a644769cc99faa24c3ad26b379b786fe7c36fd3c546254801650e6dd"
 [[package]]
 name = "s3s"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=529c8933a11528c506d5fbf7c4c2ab155db37dfe#529c8933a11528c506d5fbf7c4c2ab155db37dfe"
+source = "git+https://github.com/Nugine/s3s.git?rev=7c78bd75f818783f1263041b61ab08b8182519b4#7c78bd75f818783f1263041b61ab08b8182519b4"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -5621,7 +5621,7 @@ dependencies = [
 [[package]]
 name = "s3s-policy"
 version = "0.11.0-dev"
-source = "git+https://github.com/Nugine/s3s.git?rev=529c8933a11528c506d5fbf7c4c2ab155db37dfe#529c8933a11528c506d5fbf7c4c2ab155db37dfe"
+source = "git+https://github.com/Nugine/s3s.git?rev=7c78bd75f818783f1263041b61ab08b8182519b4#7c78bd75f818783f1263041b61ab08b8182519b4"
 dependencies = [
  "indexmap 2.7.1",
  "serde",
