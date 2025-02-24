@@ -8,9 +8,7 @@ use axum::{
 
 use include_dir::{include_dir, Dir};
 use mime_guess::from_path;
-use pnet::datalink::interfaces;
 use serde::Serialize;
-use std::net::SocketAddr;
 
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
 
@@ -111,36 +109,36 @@ async fn config_handler(axum::extract::Extension(fs_addr): axum::extract::Extens
 
 pub async fn start_static_file_server(addrs: &str, fs_addr: &str) {
     // 将字符串解析为 SocketAddr
-    let socket_addr: SocketAddr = fs_addr.parse().unwrap();
+    // let socket_addr: SocketAddr = fs_addr.parse().unwrap();
 
-    // 提取 IP 地址和端口号
-    let mut src_ip = socket_addr.ip();
-    let port = socket_addr.port();
+    // // 提取 IP 地址和端口号
+    // let mut src_ip = socket_addr.ip();
+    // let port = socket_addr.port();
 
-    if src_ip.to_string() == "0.0.0.0" {
-        for iface in interfaces() {
-            if iface.is_loopback() || !iface.is_up() {
-                continue;
-            }
-            for ip in iface.ips {
-                if ip.is_ipv4() {
-                    src_ip = ip.ip();
-                }
-            }
-        }
-    }
+    // if src_ip.to_string() == "0.0.0.0" {
+    //     for iface in interfaces() {
+    //         if iface.is_loopback() || !iface.is_up() {
+    //             continue;
+    //         }
+    //         for ip in iface.ips {
+    //             if ip.is_ipv4() {
+    //                 src_ip = ip.ip();
+    //             }
+    //         }
+    //     }
+    // }
 
-    // FIXME: TODO: protocol from config
-    let s3_url = format!("http://{}:{}", src_ip, port);
+    // // FIXME: TODO: protocol from config
+    // let s3_url = format!("http://{}:{}", src_ip, port);
 
     // 创建路由
     let app = Router::new()
-        .route("/config.json", get(config_handler).layer(axum::extract::Extension(s3_url.clone())))
+        .route("/config.json", get(config_handler).layer(axum::extract::Extension(fs_addr.to_owned())))
         .nest_service("/", get(static_handler));
 
     let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
 
-    println!("console running on: http://{} with s3 api {}", listener.local_addr().unwrap(), s3_url);
+    println!("console running on: http://{} with s3 api {}", listener.local_addr().unwrap(), fs_addr);
 
     axum::serve(listener, app).await.unwrap();
 }
