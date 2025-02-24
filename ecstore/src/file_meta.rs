@@ -2067,9 +2067,7 @@ pub async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &st
         });
     }
 
-    warn!("get_file_info vid {:?}", &vid);
     let fi = meta.into_fileinfo(volume, path, version_id, opts.data, true)?;
-    warn!("get_file_info {:?}", &fi);
     Ok(fi)
 }
 
