@@ -961,7 +961,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        store
+        let oi = store
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(to_s3_error)?;
@@ -969,6 +969,7 @@ impl S3 for FS {
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
+            e_tag: oi.etag,
             ..Default::default()
         };
         Ok(S3Response::new(output))
