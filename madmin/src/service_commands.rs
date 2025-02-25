@@ -71,29 +71,29 @@ impl ServiceTraceOpts {
             })
             .collect();
 
-        self.s3 = query_pairs.get("s3").map_or(false, |v| v == "true");
-        self.os = query_pairs.get("os").map_or(false, |v| v == "true");
-        self.scanner = query_pairs.get("scanner").map_or(false, |v| v == "true");
-        self.decommission = query_pairs.get("decommission").map_or(false, |v| v == "true");
-        self.healing = query_pairs.get("healing").map_or(false, |v| v == "true");
-        self.batch_replication = query_pairs.get("batch-replication").map_or(false, |v| v == "true");
-        self.batch_key_rotation = query_pairs.get("batch-keyrotation").map_or(false, |v| v == "true");
-        self.batch_expire = query_pairs.get("batch-expire").map_or(false, |v| v == "true");
-        if query_pairs.get("all").map_or(false, |v| v == "true") {
+        self.s3 = query_pairs.get("s3").is_some_and(|v| v == "true");
+        self.os = query_pairs.get("os").is_some_and(|v| v == "true");
+        self.scanner = query_pairs.get("scanner").is_some_and(|v| v == "true");
+        self.decommission = query_pairs.get("decommission").is_some_and(|v| v == "true");
+        self.healing = query_pairs.get("healing").is_some_and(|v| v == "true");
+        self.batch_replication = query_pairs.get("batch-replication").is_some_and(|v| v == "true");
+        self.batch_key_rotation = query_pairs.get("batch-keyrotation").is_some_and(|v| v == "true");
+        self.batch_expire = query_pairs.get("batch-expire").is_some_and(|v| v == "true");
+        if query_pairs.get("all").is_some_and(|v| v == "true") {
             self.s3 = true;
             self.internal = true;
             self.storage = true;
             self.os = true;
         }
 
-        self.rebalance = query_pairs.get("rebalance").map_or(false, |v| v == "true");
-        self.storage = query_pairs.get("storage").map_or(false, |v| v == "true");
-        self.internal = query_pairs.get("internal").map_or(false, |v| v == "true");
-        self.only_errors = query_pairs.get("err").map_or(false, |v| v == "true");
-        self.replication_resync = query_pairs.get("replication-resync").map_or(false, |v| v == "true");
-        self.bootstrap = query_pairs.get("bootstrap").map_or(false, |v| v == "true");
-        self.ftp = query_pairs.get("ftp").map_or(false, |v| v == "true");
-        self.ilm = query_pairs.get("ilm").map_or(false, |v| v == "true");
+        self.rebalance = query_pairs.get("rebalance").is_some_and(|v| v == "true");
+        self.storage = query_pairs.get("storage").is_some_and(|v| v == "true");
+        self.internal = query_pairs.get("internal").is_some_and(|v| v == "true");
+        self.only_errors = query_pairs.get("err").is_some_and(|v| v == "true");
+        self.replication_resync = query_pairs.get("replication-resync").is_some_and(|v| v == "true");
+        self.bootstrap = query_pairs.get("bootstrap").is_some_and(|v| v == "true");
+        self.ftp = query_pairs.get("ftp").is_some_and(|v| v == "true");
+        self.ilm = query_pairs.get("ilm").is_some_and(|v| v == "true");
 
         if let Some(threshold) = query_pairs.get("threshold") {
             let duration = parse_duration(threshold)?;

@@ -19,7 +19,7 @@ impl IAMAuth {
 impl S3Auth for IAMAuth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
         if access_key.is_empty() {
-            return Err(s3_error!(NotSignedUp, "Your account is not signed up"));
+            return Err(s3_error!(UnauthorizedAccess, "Your account is not signed up"));
         }
 
         if let Ok(key) = self.simple_auth.get_secret_key(access_key).await {
@@ -32,6 +32,6 @@ impl S3Auth for IAMAuth {
             }
         }
 
-        Err(s3_error!(NotSignedUp, "Your account is not signed up2"))
+        Err(s3_error!(UnauthorizedAccess, "Your account is not signed up2"))
     }
 }
