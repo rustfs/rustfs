@@ -550,6 +550,7 @@ impl S3 for FS {
             .map(|v| Bucket {
                 creation_date: v.created.map(Timestamp::from),
                 name: Some(v.name.clone()),
+                ..Default::default()
             })
             .collect();
 
