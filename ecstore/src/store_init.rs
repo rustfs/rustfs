@@ -140,7 +140,7 @@ pub fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<Form
 
     let format = formats
         .iter()
-        .find(|f| f.as_ref().map_or(false, |v| v.drives().eq(max_drives)))
+        .find(|f| f.as_ref().is_some_and(|v| v.drives().eq(max_drives)))
         .ok_or(Error::new(ErasureError::ErasureReadQuorum))?;
 
     let mut format = format.as_ref().unwrap().clone();

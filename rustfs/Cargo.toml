@@ -69,8 +69,8 @@ crypto = { path = "../crypto" }
 iam = { path = "../iam" }
 jsonwebtoken = "9.3.0"
 tower-http = { version = "0.6.2", features = ["cors"] }
-include_dir = "0.7.4"
 mime_guess = "2.0.5"
+rust-embed = { version = "8.5.0", features = ["interpolate-folder-path"] }
 
 [build-dependencies]
 prost-build.workspace = true

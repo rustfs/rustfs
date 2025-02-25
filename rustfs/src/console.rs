@@ -6,30 +6,32 @@ use axum::{
     Router,
 };
 
-use include_dir::{include_dir, Dir};
 use mime_guess::from_path;
+use rust_embed::RustEmbed;
 use serde::Serialize;
 
-static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
+#[derive(RustEmbed)]
+#[folder = "$CARGO_MANIFEST_DIR/static"]
+struct StaticFiles;
 
 async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
     if path.is_empty() {
         path = "index.html"
     }
-    if let Some(file) = STATIC_DIR.get_file(path) {
-        let mime_type = from_path(file.path().as_os_str()).first_or_octet_stream();
+    if let Some(file) = StaticFiles::get(path) {
+        let mime_type = from_path(path).first_or_octet_stream();
         Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.to_string())
-            .body(Body::from(file.contents()))
+            .body(Body::from(file.data))
             .unwrap()
-    } else if let Some(file) = STATIC_DIR.get_file("index.html") {
-        let mime_type = from_path(file.path().as_os_str()).first_or_octet_stream();
+    } else if let Some(file) = StaticFiles::get("index.html") {
+        let mime_type = from_path("index.html").first_or_octet_stream();
         Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.to_string())
-            .body(Body::from(file.contents()))
+            .body(Body::from(file.data))
             .unwrap()
     } else {
         Response::builder()
@@ -108,29 +110,6 @@ async fn config_handler(axum::extract::Extension(fs_addr): axum::extract::Extens
 }
 
 pub async fn start_static_file_server(addrs: &str, fs_addr: &str) {
-    // 将字符串解析为 SocketAddr
-    // let socket_addr: SocketAddr = fs_addr.parse().unwrap();
-
-    // // 提取 IP 地址和端口号
-    // let mut src_ip = socket_addr.ip();
-    // let port = socket_addr.port();
-
-    // if src_ip.to_string() == "0.0.0.0" {
-    //     for iface in interfaces() {
-    //         if iface.is_loopback() || !iface.is_up() {
-    //             continue;
-    //         }
-    //         for ip in iface.ips {
-    //             if ip.is_ipv4() {
-    //                 src_ip = ip.ip();
-    //             }
-    //         }
-    //     }
-    // }
-
-    // // FIXME: TODO: protocol from config
-    // let s3_url = format!("http://{}:{}", src_ip, port);
-
     // 创建路由
     let app = Router::new()
         .route("/config.json", get(config_handler).layer(axum::extract::Extension(fs_addr.to_owned())))
