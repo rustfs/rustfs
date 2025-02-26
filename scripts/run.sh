@@ -24,7 +24,7 @@ export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS="0.0.0.0:9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9002"
-export RUSTFS_SERVER_ENDPOINT="http://localhost:9000"
+# export RUSTFS_SERVER_DOMAINS="localhost:9000"
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
