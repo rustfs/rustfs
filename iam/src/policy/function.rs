@@ -131,9 +131,9 @@ impl<'de> Deserialize<'de> for Functions {
                     }
                 }
 
-                // if inner_data.is_empty() {
-                //     return Err(Error::custom("has no condition element"));
-                // }
+                if inner_data.is_empty() {
+                    return Err(Error::custom("has no condition element"));
+                }
 
                 Ok(inner_data)
             }
