@@ -1208,8 +1208,9 @@ pub struct VolumeInfo {
     pub created: Option<OffsetDateTime>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
 pub struct ReadOptions {
+    pub incl_free_versions: bool,
     pub read_data: bool,
     pub healing: bool,
 }

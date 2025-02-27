@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use time::macros::offset;
 use time::OffsetDateTime;
 
 const ACCESS_KEY_MIN_LEN: usize = 3;
@@ -212,10 +213,19 @@ pub fn create_new_credentials_with_metadata(
         return Err(Error::new(IamError::InvalidAccessKeyLength));
     }
 
+    if token_secret.is_empty() {
+        return Ok(Credentials {
+            access_key: ak.to_owned(),
+            secret_key: sk.to_owned(),
+            status: ACCOUNT_OFF.to_owned(),
+            ..Default::default()
+        });
+    }
+
     let expiration = {
         if let Some(v) = claims.get("exp") {
             if let Some(expiry) = v.as_i64() {
-                Some(OffsetDateTime::from_unix_timestamp(expiry)?.to_offset(OffsetDateTime::now_utc().offset()))
+                Some(OffsetDateTime::from_unix_timestamp(expiry)?.to_offset(offset!(+8)))
             } else {
                 None
             }
@@ -224,7 +234,7 @@ pub fn create_new_credentials_with_metadata(
         }
     };
 
-    let token = utils::generate_jwt(claims, token_secret)?;
+    let token = utils::generate_jwt(&claims, token_secret)?;
 
     Ok(Credentials {
         access_key: ak.to_owned(),

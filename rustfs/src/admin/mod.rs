@@ -7,7 +7,7 @@ use common::error::Result;
 use handlers::{
     group, policy,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
-    user,
+    sts, user,
 };
 use hyper::Method;
 use router::{AdminOperation, S3Router};
@@ -19,7 +19,7 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new();
 
     // 1
-    r.insert(Method::POST, "/", AdminOperation(&handlers::AssumeRoleHandle {}))?;
+    r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
 
     regist_user_route(&mut r)?;
 

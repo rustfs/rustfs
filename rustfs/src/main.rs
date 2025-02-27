@@ -31,7 +31,7 @@ use hyper_util::{
 };
 use iam::init_iam_sys;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
-use s3s::service::S3ServiceBuilder;
+use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
@@ -139,6 +139,11 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         b.set_route(admin::make_admin_route()?);
 
+        if !opt.server_domains.is_empty() {
+            info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
+            b.set_host(MultiDomain::new(&opt.server_domains)?);
+        }
+
         // // Enable parsing virtual-hosted-style requests
         // if let Some(dm) = opt.domain_name {
         //     info!("virtual-hosted-style requests are enabled use domain_name {}", &dm);
@@ -236,7 +241,13 @@ async fn run(opt: config::Opt) -> Result<()> {
     if opt.console_enable {
         info!("console is enabled");
         tokio::spawn(async move {
-            console::start_static_file_server(&opt.console_address).await;
+            let ep = if !opt.server_domains.is_empty() {
+                format!("http://{}", opt.server_domains[0].clone())
+            } else {
+                format!("http://127.0.0.1:{}", server_port)
+            };
+
+            console::start_static_file_server(&opt.console_address, &ep).await;
         });
     }
 

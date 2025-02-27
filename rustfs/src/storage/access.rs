@@ -52,7 +52,7 @@ impl S3Access for FS {
         );
 
         if cx.credentials().is_none() {
-            return Err(s3_error!(AccessDenied, "Signature is required"));
+            return Err(s3_error!(UnauthorizedAccess, "Signature is required"));
         };
 
         // TODO: FIXME: check auth

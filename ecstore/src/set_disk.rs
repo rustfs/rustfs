@@ -1088,7 +1088,11 @@ impl SetDisks {
         let mut errors = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
-            let opts = ReadOptions { read_data, healing };
+            let opts = ReadOptions {
+                read_data,
+                healing,
+                ..Default::default()
+            };
             futures.push(async move {
                 if let Some(disk) = disk {
                     if version_id.is_empty() {
@@ -3634,7 +3638,7 @@ impl ObjectIO for SetDisks {
         Ok(reader)
     }
 
-    #[tracing::instrument(level = "debug", skip(self, data))]
+    #[tracing::instrument(level = "debug", skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let disks = self.disks.read().await;
 
@@ -5463,7 +5467,11 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
 
     for part in parts.iter() {
         if let Some(etag) = &part.e_tag {
-            buf.extend(etag.bytes());
+            if let Ok(etag_bytes) = hex_simd::decode_to_vec(etag.as_bytes()) {
+                buf.extend(etag_bytes);
+            } else {
+                buf.extend(etag.bytes());
+            }
         }
     }
 

@@ -554,7 +554,7 @@ impl FileMeta {
             let header = &ver.header;
 
             if let Some(vid) = has_vid {
-                if header.version_id == Some(vid) {
+                if header.version_id != Some(vid) {
                     is_latest = false;
                     succ_mod_time = header.mod_time;
                     continue;
@@ -2045,7 +2045,7 @@ pub struct FileInfoOpts {
     pub data: bool,
 }
 
-async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opts: FileInfoOpts) -> Result<FileInfo> {
+pub async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, opts: FileInfoOpts) -> Result<FileInfo> {
     let vid = {
         if version_id.is_empty() {
             None
@@ -2068,7 +2068,6 @@ async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &str, o
     }
 
     let fi = meta.into_fileinfo(volume, path, version_id, opts.data, true)?;
-
     Ok(fi)
 }
 

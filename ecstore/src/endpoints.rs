@@ -504,7 +504,7 @@ impl EndpointServerPools {
         self.0
             .first()
             .and_then(|v| v.endpoints.as_ref().first())
-            .map_or(false, |v| v.is_local)
+            .is_some_and(|v| v.is_local)
     }
 
     /// returns a sorted list of nodes in this cluster
