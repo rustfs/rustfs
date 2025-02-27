@@ -86,7 +86,7 @@ impl AuditTarget for FileAuditTarget {
 /// #Arguments
 /// * `client` - The reqwest client
 /// * `url` - The URL of the webhook
-/// # Example 
+/// # Example
 /// ```
 /// use rustfs_logging::WebhookAuditTarget;
 /// let target = WebhookAuditTarget::new("http://localhost:8080");
@@ -310,6 +310,10 @@ impl AuditLogger {
     /// }
     /// ```
     pub async fn log(&self, entry: AuditEntry) {
+        // 将日志消息记录到当前 Span
+        tracing::Span::current()
+            .record("log_message", &entry.bucket)
+            .record("source", &entry.event_type);
         let _ = self.tx.send(entry).await;
     }
 }
