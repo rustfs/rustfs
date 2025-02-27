@@ -47,6 +47,7 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use transform_stream::AsyncTryStream;
@@ -549,6 +550,7 @@ impl S3 for FS {
             .map(|v| Bucket {
                 creation_date: v.created.map(Timestamp::from),
                 name: Some(v.name.clone()),
+                ..Default::default()
             })
             .collect();
 
@@ -751,6 +753,7 @@ impl S3 for FS {
             content_length,
             tagging,
             metadata,
+            version_id,
             ..
         } = input;
 
@@ -784,9 +787,11 @@ impl S3 for FS {
             metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, None, &req.headers, Some(metadata))
+        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
             .await
             .map_err(to_s3_error)?;
+
+        debug!("put_object opts {:?}", &opts);
 
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)
@@ -810,7 +815,11 @@ impl S3 for FS {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let CreateMultipartUploadInput {
-            bucket, key, tagging, ..
+            bucket,
+            key,
+            tagging,
+            version_id,
+            ..
         } = req.input;
 
         // mc cp step 3
@@ -827,7 +836,7 @@ impl S3 for FS {
             metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, None, &req.headers, Some(metadata))
+        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
             .await
             .map_err(to_s3_error)?;
 
@@ -952,7 +961,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        store
+        let oi = store
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(to_s3_error)?;
@@ -960,6 +969,7 @@ impl S3 for FS {
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
+            e_tag: oi.etag,
             ..Default::default()
         };
         Ok(S3Response::new(output))

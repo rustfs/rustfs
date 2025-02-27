@@ -40,9 +40,10 @@ impl Operation for AddServiceAccount {
             }
         };
 
-        let mut create_req: AddServiceAccountReq =
+        let create_req: AddServiceAccountReq =
             serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
-        create_req.expiration = create_req.expiration.and_then(|expire| expire.replace_millisecond(0).ok());
+
+        // create_req.expiration = create_req.expiration.and_then(|expire| expire.replace_millisecond(0).ok());
 
         if has_space_be(&create_req.access_key) {
             return Err(s3_error!(InvalidRequest, "access key has spaces"));
@@ -71,7 +72,7 @@ impl Operation for AddServiceAccount {
         let req_groups = cred.groups.clone();
         let mut req_is_derived_cred = false;
 
-        if cred.is_owner() || cred.is_service_account() {
+        if cred.is_service_account() || cred.is_temp() {
             req_parent_user = cred.parent_user.clone();
             req_is_derived_cred = true;
         }
@@ -128,7 +129,7 @@ impl Operation for AddServiceAccount {
             .await
             .map_err(|e| {
                 debug!("create service account failed, e: {:?}", e);
-                s3_error!(InternalError, "create service account failed")
+                s3_error!(InternalError, "create service account failed, e: {:?}", e)
             })?;
 
         let resp = AddServiceAccountResp {

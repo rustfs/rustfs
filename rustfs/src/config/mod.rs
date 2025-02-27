@@ -35,12 +35,15 @@ const LONG_VERSION: &str = concat!(
 #[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
-    #[arg(required = true)]
+    #[arg(required = true, env = "RUSTFS_VOLUMES")]
     pub volumes: Vec<String>,
 
     /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
     #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_PORT), env = "RUSTFS_ADDRESS")]
     pub address: String,
+
+    #[arg(long, env = "RUSTFS_SERVER_DOMAINS")]
+    pub server_domains: Vec<String>,
 
     /// Access key used for authentication.
     #[arg(long, default_value_t = DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]

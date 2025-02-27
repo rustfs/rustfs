@@ -9,6 +9,9 @@ inputs:
   cache-shared-key:
     required: true
     default: ""
+  cache-save-if:
+    required: true
+    default: true
 
 runs:
   using: "composite"
@@ -39,7 +42,9 @@ runs:
     - uses: Swatinem/rust-cache@v2
       with:
         cache-on-failure: true
+        cache-all-crates: true
         shared-key: ${{ inputs.cache-shared-key }}
+        save-if: ${{ inputs.cache-save-if }}
 
     - uses: mlugg/setup-zig@v1
     - uses: taiki-e/install-action@cargo-zigbuild

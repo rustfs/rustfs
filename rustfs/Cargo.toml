@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "rustfs"
+path = "src/main.rs"
 
 [lints]
 workspace = true
@@ -69,7 +72,8 @@ crypto = { path = "../crypto" }
 iam = { path = "../iam" }
 jsonwebtoken = "9.3.0"
 tower-http = { version = "0.6.2", features = ["cors"] }
-include_dir = "0.7.4"
+mime_guess = "2.0.5"
+rust-embed = { version = "8.5.0", features = ["interpolate-folder-path"] }
 
 [build-dependencies]
 prost-build.workspace = true
