@@ -61,6 +61,7 @@ lazy_static = "1.5.0"
 mime = "0.3.17"
 netif = "0.1.6"
 opentelemetry = { version = "0.28" }
+opentelemetry-appender-tracing = { version = "0.28.1" }
 opentelemetry_sdk = { version = "0.28" }
 opentelemetry-stdout = { version = "0.28.0" }
 opentelemetry-otlp = { version = "0.28" }
@@ -119,3 +120,21 @@ md-5 = "0.10.6"
 workers = { path = "./common/workers" }
 test-case = "3.3.1"
 zip = "2.2.2"
+
+
+[profile]
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"
+
+[profile.release]
+opt-level = 3  # Optimization Level (0-3)
+lto = true     # Optimize when linking
+codegen-units = 1  # Reduce code generation units to improve optimization
