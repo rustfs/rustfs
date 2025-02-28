@@ -6,9 +6,13 @@ use axum::{
     Router,
 };
 
+use const_str::concat;
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
+use shadow_rs::shadow;
+
+shadow!(build);
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/static"]
@@ -99,8 +103,19 @@ struct License {
     url: String,
 }
 
+#[allow(clippy::const_is_empty)]
 async fn config_handler(axum::extract::Extension(fs_addr): axum::extract::Extension<String>) -> impl IntoResponse {
-    let cfg = Config::new(&fs_addr, "v0.0.1", "2025-01-01").to_json();
+    let ver = {
+        if !build::TAG.is_empty() {
+            build::TAG
+        } else if !build::SHORT_COMMIT.is_empty() {
+            concat!("@", build::SHORT_COMMIT)
+        } else {
+            build::PKG_VERSION
+        }
+    };
+
+    let cfg = Config::new(&fs_addr, ver, build::COMMIT_DATE_3339).to_json();
 
     Response::builder()
         .header("content-type", "application/json")
