@@ -32,75 +32,43 @@ jobs:
             --target ${{ matrix.variant.target }} \
             --glibc ${{ matrix.variant.glibc }}
 
-      # Download the zip file（Linux/macOS used bash）
-      - name: Download Static Assets (Linux/macOS)
+      - name: Download and Extract Static Assets
         run: |
           url="https://dl.rustfs.com/console/rustfs-console-latest.zip"
-          file=$(basename "$url")
-          curl -L -o "$file" "$url"
-          if [ ! -f "$file" ]; then
-            echo "Error: Failed to download $file"
-            exit 1
-          fi
-          echo "Downloaded $file successfully"
-          ls -l "$file"
-          ls -la
-
-      # Unzip the zip file（Linux/macOS used bash）
-      - name: Extract Static Assets (Linux/macOS)
-        run: |
-          ls -la
-          # Find the first .zip or .tar.gz file
-          file=""
-          for f in *.zip *.tar.gz; do
-            if [ -f "$f" ]; then
-              file="$f"
-              break
-            fi
-          done
-          if [ -z "$file" ]; then
-            echo "Error: No .zip or .tar.gz file found in the current directory"
-            ls -la  # Displays the contents of the current directory for debugging
-            exit 1
-          fi
-          # Outputs the name of the file found
-          echo "Found file: $file"
           mkdir -p static
-          if [[ "$file" == *.zip ]]; then
-            echo "Unzipping $file to static/"
-            unzip "$file" -d static || { echo "Error: Failed to unzip $file"; exit 1; }
-          elif [[ "$file" == *.tar.gz ]]; then
-            echo "Extracting $file to static/"
-            tar -xzf "$file" -C static || { echo "Error: Failed to extract $file"; exit 1; }
-          else
-            echo "Error: Unsupported file format: $file"
-            exit 1
-          fi
-          # Check whether the decompression is successful
-          if [ $? -ne 0 ]; then
-            echo "Error: Failed to extract $file"
-            exit 2
-          fi
-          rm "$file"
+          curl -L -o static_assets.zip "$url"
+          unzip -o static_assets.zip -d static
+          rm static_assets.zip
           ls -la static
-      # Packing binaries and static directory（Linux/macOS used bash）
-      - name: Package Binary and Static Assets (Linux/macOS)
+
+      - name: Package Binary and Static Assets
+        id: package
         run: |
-          ls -la target/artifacts
-          mkdir -p release-package
-          if [ -f target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin ]; then
-            cp target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin release-package/
-          else
-            cp target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.bin release-package/
+          # Create artifact filename
+          ARTIFACT_NAME="rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
+          if [ "${{ matrix.variant.glibc }}" != "default" ]; then
+            ARTIFACT_NAME="${ARTIFACT_NAME}-glibc${{ matrix.variant.glibc }}"
           fi
-          cp -r static release-package/
-          zip -r rustfs${{ matrix.variant.profile }}-${{ matrix.variant.target }}-${{ matrix.variant.glibc }}.zip release-package/*
+          echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+          
+          # Determine binary path
+          bin_path="target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.bin"
+          if [ -f "target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin" ]; then
+            bin_path="target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin"
+          fi
+          
+          # Create package
+          mkdir -p ${ARTIFACT_NAME}
+          cp "$bin_path" ${ARTIFACT_NAME}/rustfs
+          cp -r static/* ${ARTIFACT_NAME}/
+          zip -r ${ARTIFACT_NAME}.zip ${ARTIFACT_NAME}
           ls -la
 
       - uses: actions/upload-artifact@v4
         with:
-          name: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
-          path: ./release-package/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}.zip
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_name }}.zip
+          retention-days: 7
 
   merge:
     runs-on: ubuntu-latest
@@ -108,5 +76,6 @@ jobs:
     steps:
       - uses: actions/upload-artifact/merge@v4
         with:
-          name: rustfs
+          name: rustfs-packages
+          pattern: 'rustfs-*'
           delete-merged: true
