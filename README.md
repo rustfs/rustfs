@@ -1,27 +1,26 @@
 # How to compile RustFS
 
-|  Must package  |  Version  |
-| - |  - |
-|  Rust | 1.8.5 |
-| protoc | 27.0 |
-| flatc |  24.0+ |
+| Must package | Version |
+|--------------|---------|
+| Rust         | 1.8.5   |
+| protoc       | 27.0    |
+| flatc        | 24.0+   |
 
+Download Links:
 
-Download  Links:
 https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip
+
 https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip
 
 Or use Docker:
 
 - uses: arduino/setup-protoc@v3
-        with:
-          version: "27.0"
+  with:
+  version: "27.0"
 
- - uses: Nugine/setup-flatc@v1
-        with:
-          version: "24.3.25"
-
-
+- uses: Nugine/setup-flatc@v1
+  with:
+  version: "24.3.25"
 
 # How to add Console web
 
@@ -31,7 +30,6 @@ Or use Docker:
 
 3. Compile RustFS
 
-   
 # Star RustFS
 
 Add Env infomation:
@@ -46,6 +44,7 @@ export RUSTFS_SERVER_ENDPOINT="http://127.0.0.1:9000"
 ```
 
 You need replace your real data folder:
+
 ```
 ./rustfs /data/rustfs
 ```
