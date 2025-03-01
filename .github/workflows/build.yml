@@ -86,6 +86,7 @@ jobs:
       # Packing binaries and static directory（Linux/macOS used bash）
       - name: Package Binary and Static Assets (Linux/macOS)
         run: |
+          ls -la target/artifacts
           mkdir -p release-package
           cp target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }} release-package/
           cp -r static release-package/
