@@ -83,8 +83,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
-          cache-shared-key: "develop"
-          cache-save-if: "false"
+          cache-shared-key: "test"
       - run: cargo test --all --exclude e2e_test
 
   s3s-e2e:
