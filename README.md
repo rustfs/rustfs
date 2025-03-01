@@ -29,4 +29,23 @@ Or use Docker:
 
 2. Mkdir in this repos folder `./rustfs/static`
 
+3. Compile RustFS
+
    
+# Star RustFS
+
+Add Env infomation:
+
+```
+export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
+export RUSTFS_VOLUMES="./target/volume/test"
+export RUSTFS_ADDRESS="0.0.0.0:9000"
+export RUSTFS_CONSOLE_ENABLE=true
+export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9001"
+export RUSTFS_SERVER_ENDPOINT="http://127.0.0.1:9000"
+```
+
+You need replace your real data folder:
+```
+./rustfs /data/rustfs
+```
