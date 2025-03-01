@@ -21,6 +21,7 @@ runs:
       run: |
         sudo apt update
         sudo apt install -y \
+          lld \
           libdbus-1-dev \
           libwayland-dev \
           libwebkit2gtk-4.1-dev \
