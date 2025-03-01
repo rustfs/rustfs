@@ -131,9 +131,9 @@ impl<'de> Deserialize<'de> for Functions {
                     }
                 }
 
-                if inner_data.is_empty() {
+                /* if inner_data.is_empty() {
                     return Err(Error::custom("has no condition element"));
-                }
+                } */
 
                 Ok(inner_data)
             }
@@ -180,7 +180,7 @@ mod tests {
                 "s3:x-amz-server-side-encryption-customer-algorithm": "true"
             }
         }"# => false; "1")]
-    #[test_case(r#"{}"# => false; "2")]
+    #[test_case(r#"{}"# => true; "2")]
     #[test_case(
         r#"{
             "StringLike": {
