@@ -88,7 +88,11 @@ jobs:
         run: |
           ls -la target/artifacts
           mkdir -p release-package
-          cp target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }} release-package/
+          if [ -f target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin ]; then
+            cp target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin release-package/
+          else
+            cp target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.bin release-package/
+          fi
           cp -r static release-package/
           zip -r rustfs${{ matrix.variant.profile }}-${{ matrix.variant.target }}-${{ matrix.variant.glibc }}.zip release-package/*
           ls -la
