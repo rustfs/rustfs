@@ -1,5 +1,6 @@
 use axum::{
     body::Body,
+    extract::Host,
     http::{Response, StatusCode},
     response::IntoResponse,
     routing::get,
@@ -10,11 +11,13 @@ use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::OnceLock;
 use tracing::info;
 
 shadow!(build);
+
+const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/static"]
@@ -47,8 +50,10 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub(crate) struct Config {
+    #[serde(skip)]
+    port: u16,
     api: Api,
     s3: S3,
     release: Release,
@@ -57,13 +62,14 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    fn new(url: &str, version: &str, date: &str) -> Self {
+    fn new(local_ip: Ipv4Addr, port: u16, version: &str, date: &str) -> Self {
         Config {
+            port,
             api: Api {
-                base_url: format!("{}/rustfs/admin/v3", url),
+                base_url: format!("http://{}:{}/{}", local_ip, port, RUSTFS_ADMIN_PREFIX),
             },
             s3: S3 {
-                endpoint: url.to_owned(),
+                endpoint: format!("http://{}:{}", local_ip, port),
                 region: "cn-east-1".to_owned(),
             },
             release: Release {
@@ -100,25 +106,25 @@ impl Config {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct Api {
     #[serde(rename = "baseURL")]
     base_url: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct S3 {
     endpoint: String,
     region: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct Release {
     version: String,
     date: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct License {
     name: String,
     url: String,
@@ -126,7 +132,7 @@ struct License {
 
 pub(crate) static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
-pub(crate) fn init_console_cfg(fs_addr: &str) {
+pub(crate) fn init_console_cfg(local_ip: Ipv4Addr, port: u16) {
     CONSOLE_CONFIG.get_or_init(|| {
         let ver = {
             if !build::TAG.is_empty() {
@@ -138,18 +144,39 @@ pub(crate) fn init_console_cfg(fs_addr: &str) {
             }
         };
 
-        Config::new(fs_addr, ver.as_str(), build::COMMIT_DATE_3339)
+        Config::new(local_ip, port, ver.as_str(), build::COMMIT_DATE_3339)
     });
 }
 
+// fn is_socket_addr_or_ip_addr(host: &str) -> bool {
+//     host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
+// }
+
 #[allow(clippy::const_is_empty)]
-async fn config_handler() -> impl IntoResponse {
-    let cfg = CONSOLE_CONFIG.get().unwrap().to_json();
+async fn config_handler(Host(host): Host) -> impl IntoResponse {
+    let host_with_port = if host.contains(':') { host } else { format!("{}:80", host) };
+
+    let is_addr = host_with_port
+        .to_socket_addrs()
+        .map(|addrs| addrs.into_iter().find(|v| v.is_ipv4()))
+        .unwrap_or_default();
+
+    let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
+
+    let url = if let Some(addr) = is_addr {
+        format!("http://{}:{}", addr.ip(), cfg.port)
+    } else {
+        let (host, _) = host_with_port.split_once(':').unwrap_or_default();
+        format!("http://{}:{}", host, cfg.port)
+    };
+
+    cfg.api.base_url = format!("{}{}", url, RUSTFS_ADMIN_PREFIX);
+    cfg.s3.endpoint = url;
 
     Response::builder()
         .header("content-type", "application/json")
         .status(StatusCode::OK)
-        .body(Body::from(cfg))
+        .body(Body::from(cfg.to_json()))
         .unwrap()
 }
 
