@@ -25,9 +25,9 @@ Or use Docker:
 
 # How to add Console web
 
-1. Wget http://dl.rustfs.com/console/console.latest.tar.gz
+1. wget [http://dl.rustfs.com/console/console.latest.tar.gz](https://dl.rustfs.com/console/rustfs-console-latest.zip)
 
-2. Mkdir in this repos folder `./rustfs/static`
+2. mkdir in this repos folder `./rustfs/static`
 
 3. Compile RustFS
 
