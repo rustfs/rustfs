@@ -128,7 +128,3 @@ inherits = "dev"
 opt-level = 3  # Optimization Level (0-3)
 lto = true     # Optimize when linking
 codegen-units = 1  # Reduce code generation units to improve optimization
-
-[patch."https://github.com/Nugine/s3s.git"]
-s3s = { path = "s3s/crates/s3s" }
-s3s-policy = { path = "s3s/crates/s3s-policy" }
