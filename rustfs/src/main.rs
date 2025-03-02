@@ -13,6 +13,7 @@ use rustfs_macro::timed_println;
 
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
+use chrono::Datelike;
 use clap::Parser;
 use common::{
     error::{Error, Result},
@@ -44,15 +45,13 @@ use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
-use chrono::Datelike;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let enable_color = std::io::stdout().is_terminal();
 
     let subscriber = fmt()
@@ -80,7 +79,7 @@ fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
 fn print_server_info() {
     let cfg = CONSOLE_CONFIG.get().unwrap();
     let current_year = chrono::Utc::now().year();
-    
+
     // 使用过程宏打印服务器信息
     timed_println!("RustFS Object Storage Server");
     timed_println!(format!("Copyright: 2024-{} RustFS, Inc", current_year));
@@ -135,14 +134,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
             "Formatting {}st pool, {} set(s), {} drives per set.",
-            i + 1, eps.set_count, eps.drives_per_set
+            i + 1,
+            eps.set_count,
+            eps.drives_per_set
         );
-        
+
         // Add warning for host with multiple drives in a set (similar to MinIO)
         if eps.drives_per_set > 1 {
-            warn!(
-                "WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable."
-            );
+            warn!("WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable.");
         }
     }
 
@@ -290,7 +289,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     let srv_addr = format!("http://{}:{}", local_ip, server_port);
     init_console_cfg(&srv_addr);
     print_server_info();
-
 
     if opt.console_enable {
         debug!("console is enabled");
