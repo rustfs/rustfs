@@ -75,6 +75,7 @@ tower-http = { version = "0.6.2", features = ["cors"] }
 mime_guess = "2.0.5"
 rust-embed = { version = "8.5.0", features = ["interpolate-folder-path"] }
 local-ip-address = "0.6.3"
+chrono = "0.4"
 
 [build-dependencies]
 prost-build.workspace = true
