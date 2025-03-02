@@ -1152,15 +1152,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc64fast-nvme"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4955638f00a809894c947f85a024020a20815b65a5eea633798ea7924edab2b3"
-dependencies = [
- "crc",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5563,18 +5554,17 @@ checksum = "6ea1a2d0a644769cc99faa24c3ad26b379b786fe7c36fd3c546254801650e6dd"
 [[package]]
 name = "s3s"
 version = "0.11.0-dev"
+source = "git+https://github.com/Nugine/s3s.git?rev=ab139f72fe768fb9d8cecfe36269451da1ca9779#ab139f72fe768fb9d8cecfe36269451da1ca9779"
 dependencies = [
  "arrayvec",
  "async-trait",
  "atoi",
  "base64-simd",
- "block-buffer 0.11.0-rc.3",
  "bytes",
  "bytestring",
  "chrono",
  "crc32c",
  "crc32fast",
- "crc64fast-nvme",
  "digest 0.11.0-pre.9",
  "futures",
  "hex-simd",
@@ -5611,6 +5601,7 @@ dependencies = [
 [[package]]
 name = "s3s-policy"
 version = "0.11.0-dev"
+source = "git+https://github.com/Nugine/s3s.git?rev=ab139f72fe768fb9d8cecfe36269451da1ca9779#ab139f72fe768fb9d8cecfe36269451da1ca9779"
 dependencies = [
  "indexmap 2.7.1",
  "serde",
