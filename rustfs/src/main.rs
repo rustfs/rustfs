@@ -5,6 +5,7 @@ mod console;
 mod grpc;
 mod service;
 mod storage;
+mod utils;
 use crate::auth::IAMAuth;
 use clap::Parser;
 use common::{
@@ -42,13 +43,17 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
 
-    let env_filter = EnvFilter::from_default_env();
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
     let enable_color = std::io::stdout().is_terminal();
 
     let subscriber = fmt()
-        .pretty()
+        // .pretty()
         .with_env_filter(env_filter)
         .with_ansi(enable_color)
+        // Remove file and line number information from log output
+        .with_file(false)
+        .with_line_number(false)
         .finish()
         .with(ErrorLayer::default());
 
@@ -100,13 +105,39 @@ async fn run(opt: config::Opt) -> Result<()> {
     let listener = TcpListener::bind(server_address.clone()).await?;
     //获取监听地址
     let local_addr: SocketAddr = listener.local_addr()?;
+    let local_ip = utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
     // 用于rpc
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
 
+    // Print MinIO-style logging for pool formatting
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
-        debug!(
+        info!(
+            "Formatting {}st pool, {} set(s), {} drives per set.",
+            i + 1, eps.set_count, eps.drives_per_set
+        );
+        
+        // Add warning for host with multiple drives in a set (similar to MinIO)
+        if eps.drives_per_set > 1 {
+            warn!(
+                "WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable."
+            );
+        }
+    }
+
+    // Print MinIO-style server information
+    info!("RustFS Object Storage Server");
+
+    // Detailed endpoint information (showing all API endpoints)
+    let api_endpoints = format!("http://{}:{}", local_ip, server_port);
+    let localhost_endpoint = format!("http://127.0.0.1:{}", server_port);
+    info!("API: {}  {}", api_endpoints, localhost_endpoint);
+    info!("   RootUser: {}", opt.access_key);
+    info!("   RootPass: {}", opt.secret_key);
+
+    for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
+        info!(
             "created endpoints {}, set_count:{}, drives_per_set: {}, cmd: {:?}",
             i, eps.set_count, eps.drives_per_set, eps.cmd_line
         );
@@ -131,6 +162,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         //显示info信息
         info!("authentication is enabled {}, {}", &opt.access_key, &opt.secret_key);
+
         b.set_auth(IAMAuth::new(opt.access_key, opt.secret_key));
 
         b.set_access(store.clone());
@@ -173,11 +205,10 @@ async fn run(opt: config::Opt) -> Result<()> {
         let http_server = ConnBuilder::new(TokioExecutor::new());
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-        println!("server is running at http://{local_addr}");
 
         loop {
             let (socket, _) = tokio::select! {
-                res =  listener.accept() => {
+                res = listener.accept() => {
                     match res {
                         Ok(conn) => conn,
                         Err(err) => {
@@ -234,18 +265,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     // init auto heal
     init_auto_heal().await;
 
-    info!("server was started");
-
     if opt.console_enable {
-        info!("console is enabled");
+        debug!("console is enabled");
         tokio::spawn(async move {
-            let ep = if !opt.server_domains.is_empty() {
-                format!("http://{}", opt.server_domains[0].clone())
-            } else {
-                format!("http://127.0.0.1:{}", server_port)
-            };
-
-            console::start_static_file_server(&opt.console_address, &ep).await;
+            console::start_static_file_server(&opt.console_address, local_ip, server_port).await;
         });
     }
 
