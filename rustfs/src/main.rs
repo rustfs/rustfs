@@ -10,11 +10,12 @@ mod utils;
 // 导入过程宏
 extern crate rustfs_macro;
 use rustfs_macro::timed_println;
+use tracing::Level;
 
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 use chrono::Datelike;
-use clap::Parser;
+use clap::{builder, Parser};
 use common::{
     error::{Error, Result},
     globals::set_global_addr,
@@ -46,7 +47,7 @@ use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -54,13 +55,13 @@ fn setup_tracing() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let enable_color = std::io::stdout().is_terminal();
 
-    let subscriber = fmt()
-        // .pretty()
+    let subscriber = tracing_subscriber::fmt::fmt()
+        .pretty()
         .with_env_filter(env_filter)
         .with_ansi(enable_color)
         // Remove file and line number information from log output
-        .with_file(false)
-        .with_line_number(false)
+        .with_file(true)
+        .with_line_number(true)
         .finish()
         .with(ErrorLayer::default());
 
