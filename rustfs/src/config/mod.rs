@@ -60,6 +60,6 @@ pub struct Opt {
     #[arg(long, default_value_t = false, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
-    #[arg(long, default_value_t = format!("127.0.0.1:{}", 0), env = "RUSTFS_CONSOLE_ADDRESS")]
+    #[arg(long, default_value_t = format!("127.0.0.1:{}", 9002), env = "RUSTFS_CONSOLE_ADDRESS")]
     pub console_address: String,
 }
