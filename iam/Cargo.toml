@@ -18,7 +18,7 @@ ecstore = { path = "../ecstore" }
 serde_json.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
-strum = { version = "0.26.3", features = ["derive"] }
+strum = { version = "0.27.1", features = ["derive"] }
 arc-swap = "1.7.1"
 crypto = { path = "../crypto" }
 ipnetwork = { version = "0.21.1", features = ["serde"] }
