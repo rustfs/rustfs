@@ -15,15 +15,24 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default"  }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default"  }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31"     }
+          - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
 
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
           cache-shared-key: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
+
+      - name: Download and Extract Static Assets
+        run: |
+          url="https://dl.rustfs.com/console/rustfs-console-latest.zip"
+          mkdir -p static
+          curl -L -o static_assets.zip "$url"
+          unzip -o static_assets.zip -d ./rustfs/static
+          rm static_assets.zip
+          ls -la ./rustfs/static
 
       - name: Build
         run: |
@@ -32,10 +41,34 @@ jobs:
             --target ${{ matrix.variant.target }} \
             --glibc ${{ matrix.variant.glibc }}
 
+      - name: Package Binary and Static Assets
+        id: package
+        run: |
+          # Create artifact filename
+          ARTIFACT_NAME="rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
+          if [ "${{ matrix.variant.glibc }}" != "default" ]; then
+            ARTIFACT_NAME="${ARTIFACT_NAME}-glibc${{ matrix.variant.glibc }}"
+          fi
+          echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+          
+          # Determine binary path
+          bin_path="target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.bin"
+          if [ -f "target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin" ]; then
+            bin_path="target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin"
+          fi
+          
+          # Create package
+          mkdir -p ${ARTIFACT_NAME}
+          cp "$bin_path" ${ARTIFACT_NAME}/rustfs
+          # cp -r static ${ARTIFACT_NAME}/
+          zip -r ${ARTIFACT_NAME}.zip ${ARTIFACT_NAME}
+          ls -la
+
       - uses: actions/upload-artifact@v4
         with:
-          name: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
-          path: ./target/artifacts/*
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_name }}.zip
+          retention-days: 7
 
   merge:
     runs-on: ubuntu-latest
@@ -43,5 +76,6 @@ jobs:
     steps:
       - uses: actions/upload-artifact/merge@v4
         with:
-          name: rustfs
+          name: rustfs-packages
+          pattern: 'rustfs-*'
           delete-merged: true

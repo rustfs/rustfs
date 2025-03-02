@@ -65,7 +65,7 @@ tower.workspace = true
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
 transform-stream.workspace = true
-uuid = "1.12.1"
+uuid = "1.15.1"
 url.workspace = true
 admin = { path = "../api/admin" }
 axum.workspace = true
@@ -79,7 +79,7 @@ iam = { path = "../iam" }
 jsonwebtoken = "9.3.0"
 tower-http = { version = "0.6.2", features = ["cors"] }
 mime_guess = "2.0.5"
-rust-embed = { version = "8.5.0", features = ["interpolate-folder-path"] }
+rust-embed = { version = "8.6.0", features = ["interpolate-folder-path"] }
 local-ip-address = "0.6.3"
 chrono = "0.4"
 # 添加proc-macro所需依赖
@@ -97,7 +97,7 @@ futures-util.workspace = true
 # uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
 s3s.workspace = true
-clap = { version = "4.5.27", features = ["derive","env"] }
+clap = { version = "4.5.31", features = ["derive","env"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
 hyper-util = { version = "0.1.10", features = [
     "tokio",
