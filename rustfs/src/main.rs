@@ -7,15 +7,10 @@ mod service;
 mod storage;
 mod utils;
 
-// 导入过程宏
-extern crate rustfs_macro;
-use rustfs_macro::timed_println;
-use tracing::Level;
-
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 use chrono::Datelike;
-use clap::{builder, Parser};
+use clap::Parser;
 use common::{
     error::{Error, Result},
     globals::set_global_addr,
@@ -45,7 +40,7 @@ use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, event, span};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
@@ -59,7 +54,6 @@ fn setup_tracing() {
         .pretty()
         .with_env_filter(env_filter)
         .with_ansi(enable_color)
-        // Remove file and line number information from log output
         .with_file(true)
         .with_line_number(true)
         .finish()
@@ -81,12 +75,12 @@ fn print_server_info() {
     let cfg = CONSOLE_CONFIG.get().unwrap();
     let current_year = chrono::Utc::now().year();
 
-    // 使用过程宏打印服务器信息
-    timed_println!("RustFS Object Storage Server");
-    timed_println!(format!("Copyright: 2024-{} RustFS, Inc", current_year));
-    timed_println!(format!("License: {}", cfg.license()));
-    timed_println!(format!("Version: {}", cfg.version()));
-    timed_println!(format!("Docs: {}", cfg.doc()));
+    // 使用自定义宏打印服务器信息
+    info!("RustFS Object Storage Server");
+    info!("Copyright: 2024-{} RustFS, Inc", current_year);
+    info!("License: {}", cfg.license());
+    info!("Version: {}", cfg.version());
+    info!("Docs: {}", cfg.doc());
 }
 
 fn main() -> Result<()> {
@@ -149,9 +143,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("http://{}:{}", local_ip, server_port);
     let localhost_endpoint = format!("http://127.0.0.1:{}", server_port);
-    timed_println!(format!("API: {}  {}", api_endpoints, localhost_endpoint));
-    timed_println!(format!("   RootUser: {}", opt.access_key.clone()));
-    timed_println!(format!("   RootPass: {}", opt.secret_key.clone()));
+    info!("API: {}  {}", api_endpoints, localhost_endpoint);
+    info!("   RootUser: {}", opt.access_key.clone());
+    info!("   RootPass: {}", opt.secret_key.clone());
     if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
         warn!("Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables", DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY);
     }
@@ -191,7 +185,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         b.set_route(admin::make_admin_route()?);
 
-        if !opt.server_domains.is_empty() {
+        if (!opt.server_domains.is_empty()) {
             info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
             b.set_host(MultiDomain::new(&opt.server_domains)?);
         }
