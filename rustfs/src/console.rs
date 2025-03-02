@@ -6,11 +6,13 @@ use axum::{
     Router,
 };
 
-use const_str::concat;
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
+use tracing::info;
+use std::net::Ipv4Addr;
+use std::sync::OnceLock;
 
 shadow!(build);
 
@@ -103,19 +105,27 @@ struct License {
     url: String,
 }
 
-#[allow(clippy::const_is_empty)]
-async fn config_handler(axum::extract::Extension(fs_addr): axum::extract::Extension<String>) -> impl IntoResponse {
-    let ver = {
-        if !build::TAG.is_empty() {
-            build::TAG
-        } else if !build::SHORT_COMMIT.is_empty() {
-            concat!("@", build::SHORT_COMMIT)
-        } else {
-            build::PKG_VERSION
-        }
-    };
+static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
-    let cfg = Config::new(&fs_addr, ver, build::COMMIT_DATE_3339).to_json();
+fn initialize_config(fs_addr: &str) {
+    CONSOLE_CONFIG.get_or_init(|| {
+        let ver = {
+            if !build::TAG.is_empty() {
+                build::TAG.to_string()
+            } else if !build::SHORT_COMMIT.is_empty() {
+                format!("@{}", build::SHORT_COMMIT)
+            } else {
+                build::PKG_VERSION.to_string()
+            }
+        };
+
+        Config::new(fs_addr, ver.as_str(), build::COMMIT_DATE_3339)
+    });
+}
+
+#[allow(clippy::const_is_empty)]
+async fn config_handler() -> impl IntoResponse {
+    let cfg = CONSOLE_CONFIG.get().unwrap().to_json();
 
     Response::builder()
         .header("content-type", "application/json")
@@ -124,15 +134,18 @@ async fn config_handler(axum::extract::Extension(fs_addr): axum::extract::Extens
         .unwrap()
 }
 
-pub async fn start_static_file_server(addrs: &str, fs_addr: &str) {
+pub async fn start_static_file_server(addrs: &str, local_ip: Ipv4Addr, server_port: u16) {
+    let srv_addr = format!("http://{}:{}", local_ip, server_port);
+    initialize_config(&srv_addr);
     // 创建路由
     let app = Router::new()
-        .route("/config.json", get(config_handler).layer(axum::extract::Extension(fs_addr.to_owned())))
+        .route("/config.json", get(config_handler))
         .nest_service("/", get(static_handler));
 
     let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
 
-    println!("console running on: http://{} with s3 api {}", listener.local_addr().unwrap(), fs_addr);
+    info!("console running on: http://{}:{} with s3 api {}", local_ip, local_addr.port(), srv_addr);
 
     axum::serve(listener, app).await.unwrap();
 }
