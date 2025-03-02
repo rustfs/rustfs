@@ -11,6 +11,12 @@ rust-version.workspace = true
 name = "rustfs"
 path = "src/main.rs"
 
+# 添加proc-macro库声明
+[lib]
+name = "rustfs_macro"
+path = "src/macro/mod.rs"
+proc-macro = true
+
 [lints]
 workspace = true
 
@@ -76,6 +82,10 @@ mime_guess = "2.0.5"
 rust-embed = { version = "8.5.0", features = ["interpolate-folder-path"] }
 local-ip-address = "0.6.3"
 chrono = "0.4"
+# 添加proc-macro所需依赖
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
 
 [build-dependencies]
 prost-build.workspace = true

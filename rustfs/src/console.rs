@@ -8,6 +8,7 @@ use axum::{
 
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
+use rustfs_macro::timed_println;
 use serde::Serialize;
 use shadow_rs::shadow;
 use tracing::info;
@@ -162,10 +163,10 @@ pub async fn start_static_file_server(addrs: &str, local_ip: Ipv4Addr, access_ke
     let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
     let local_addr = listener.local_addr().unwrap();
 
-    info!("WebUI: http://{}:{} http://127.0.0.1:{}", 
-          local_ip, local_addr.port(), local_addr.port());
-    info!("   RootUser: {}", access_key);
-    info!("   RootPass: {}", secret_key);
+    timed_println!(format!("WebUI: http://{}:{} http://127.0.0.1:{}", 
+          local_ip, local_addr.port(), local_addr.port()));
+    timed_println!(format!("   RootUser: {}", access_key));
+    timed_println!(format!("   RootPass: {}", secret_key));
     
     axum::serve(listener, app).await.unwrap();
 }

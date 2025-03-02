@@ -6,6 +6,11 @@ mod grpc;
 mod service;
 mod storage;
 mod utils;
+
+// 导入过程宏
+extern crate rustfs_macro;
+use rustfs_macro::timed_println;
+
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 use clap::Parser;
@@ -75,11 +80,13 @@ fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
 fn print_server_info() {
     let cfg = CONSOLE_CONFIG.get().unwrap();
     let current_year = chrono::Utc::now().year();
-    info!("RustFS Object Storage Server");
-    info!("Copyright: 2024-{} RustFS, Inc", current_year);
-    info!("License: {}", cfg.license());
-    info!("Version: {}", cfg.version());
-    info!("Docs: {}", cfg.doc())
+    
+    // 使用过程宏打印服务器信息
+    timed_println!("RustFS Object Storage Server");
+    timed_println!(format!("Copyright: 2024-{} RustFS, Inc", current_year));
+    timed_println!(format!("License: {}", cfg.license()));
+    timed_println!(format!("Version: {}", cfg.version()));
+    timed_println!(format!("Docs: {}", cfg.doc()));
 }
 
 fn main() -> Result<()> {
@@ -139,15 +146,15 @@ async fn run(opt: config::Opt) -> Result<()> {
         }
     }
 
-    // Print MinIO-style server information
-    info!("RustFS Object Storage Server");
-
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("http://{}:{}", local_ip, server_port);
     let localhost_endpoint = format!("http://127.0.0.1:{}", server_port);
-    info!("API: {}  {}", api_endpoints, localhost_endpoint);
-    info!("   RootUser: {}", opt.access_key.clone());
-    info!("   RootPass: {}", opt.secret_key.clone());
+    timed_println!(format!("API: {}  {}", api_endpoints, localhost_endpoint));
+    timed_println!(format!("   RootUser: {}", opt.access_key.clone()));
+    timed_println!(format!("   RootPass: {}", opt.secret_key.clone()));
+    if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+        warn!("Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables", DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY);
+    }
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
@@ -283,9 +290,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let srv_addr = format!("http://{}:{}", local_ip, server_port);
     init_console_cfg(&srv_addr);
     print_server_info();
-    if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
-        warn!("Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables", DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY);
-    }
+
 
     if opt.console_enable {
         debug!("console is enabled");
