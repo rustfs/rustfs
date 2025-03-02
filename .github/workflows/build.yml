@@ -25,21 +25,21 @@ jobs:
         with:
           cache-shared-key: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
 
+      - name: Download and Extract Static Assets
+        run: |
+          url="https://dl.rustfs.com/console/rustfs-console-latest.zip"
+          mkdir -p static
+          curl -L -o static_assets.zip "$url"
+          unzip -o static_assets.zip -d ./rustfs/static
+          rm static_assets.zip
+          ls -la ./rustfs/static
+
       - name: Build
         run: |
           ./scripts/build.py \
             --profile ${{ matrix.variant.profile }} \
             --target ${{ matrix.variant.target }} \
             --glibc ${{ matrix.variant.glibc }}
-
-      - name: Download and Extract Static Assets
-        run: |
-          url="https://dl.rustfs.com/console/rustfs-console-latest.zip"
-          mkdir -p static
-          curl -L -o static_assets.zip "$url"
-          unzip -o static_assets.zip -d static
-          rm static_assets.zip
-          ls -la static
 
       - name: Package Binary and Static Assets
         id: package
@@ -60,7 +60,7 @@ jobs:
           # Create package
           mkdir -p ${ARTIFACT_NAME}
           cp "$bin_path" ${ARTIFACT_NAME}/rustfs
-          cp -r static ${ARTIFACT_NAME}/
+          # cp -r static ${ARTIFACT_NAME}/
           zip -r ${ARTIFACT_NAME}.zip ${ARTIFACT_NAME}
           ls -la
 
