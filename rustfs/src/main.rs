@@ -40,7 +40,7 @@ use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn, event, span};
+use tracing::{debug, error, event, info, span, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
