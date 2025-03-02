@@ -53,7 +53,7 @@ pub(crate) struct Config {
     s3: S3,
     release: Release,
     license: License,
-    doc: String
+    doc: String,
 }
 
 impl Config {
@@ -74,7 +74,7 @@ impl Config {
                 name: "Apache-2.0".to_string(),
                 url: "https://www.apache.org/licenses/LICENSE-2.0".to_string(),
             },
-            doc: "https://rustfs.com/docs/".to_string()
+            doc: "https://rustfs.com/docs/".to_string(),
         }
     }
 
@@ -162,10 +162,14 @@ pub async fn start_static_file_server(addrs: &str, local_ip: Ipv4Addr, access_ke
     let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
     let local_addr = listener.local_addr().unwrap();
 
-    timed_println!(format!("WebUI: http://{}:{} http://127.0.0.1:{}", 
-          local_ip, local_addr.port(), local_addr.port()));
+    timed_println!(format!(
+        "WebUI: http://{}:{} http://127.0.0.1:{}",
+        local_ip,
+        local_addr.port(),
+        local_addr.port()
+    ));
     timed_println!(format!("   RootUser: {}", access_key));
     timed_println!(format!("   RootPass: {}", secret_key));
-    
+
     axum::serve(listener, app).await.unwrap();
 }
