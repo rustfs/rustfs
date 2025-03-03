@@ -211,6 +211,7 @@ pub struct UpdateServiceAccountReq {
     pub new_description: Option<String>,
 
     #[serde(rename = "newExpiration", skip_serializing_if = "Option::is_none")]
+    #[serde(with = "time::serde::rfc3339::option")]
     pub new_expiration: Option<OffsetDateTime>,
 }
 

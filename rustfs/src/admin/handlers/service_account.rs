@@ -53,6 +53,16 @@ impl Operation for AddServiceAccount {
             .validate()
             .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
 
+        let session_policy = if let Some(policy) = &create_req.policy {
+            let p = Policy::parse_config(policy.as_bytes()).map_err(|e| {
+                debug!("parse policy failed, e: {:?}", e);
+                s3_error!(InvalidArgument, "parse policy failed")
+            })?;
+            Some(p)
+        } else {
+            None
+        };
+
         let Some(sys_cred) = get_global_action_cred() else {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
@@ -95,7 +105,7 @@ impl Operation for AddServiceAccount {
             name: create_req.name,
             description: create_req.description,
             expiration: create_req.expiration,
-            session_policy: create_req.policy.and_then(|p| Policy::parse_config(p.as_bytes()).ok()),
+            session_policy,
             ..Default::default()
         };
 
