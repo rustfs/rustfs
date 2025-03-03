@@ -40,9 +40,9 @@ use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, event, info, span, warn};
+use tracing::{debug, error, info, warn};
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -185,7 +185,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         b.set_route(admin::make_admin_route()?);
 
-        if (!opt.server_domains.is_empty()) {
+        if !opt.server_domains.is_empty() {
             info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
             b.set_host(MultiDomain::new(&opt.server_domains)?);
         }
