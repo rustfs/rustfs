@@ -52,7 +52,7 @@ pub struct RemoteDisk {
 impl RemoteDisk {
     pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
         // let root = fs::canonicalize(ep.url.path()).await?;
-        let root = PathBuf::from(ep.url.path());
+        let root = PathBuf::from(ep.get_file_path());
         let addr = format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), ep.url.port().unwrap());
         Ok(Self {
             id: Mutex::new(None),
