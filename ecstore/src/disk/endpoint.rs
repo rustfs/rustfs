@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use crate::utils::net;
 use path_absolutize::Absolutize;
-use path_clean::PathClean;
 use std::{fmt::Display, path::Path};
 use url::{ParseError, Url};
 
@@ -44,7 +43,7 @@ impl TryFrom<&str> for Endpoint {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         // check whether given path is not empty.
         if ["", "/", "\\"].iter().any(|&v| v.eq(value)) {
-            return Err(ErrorCode::EmptyPath().with_message("empty or root endpoint is not supported"));
+            return Err(Error::from_string("empty or root endpoint is not supported"));
         }
 
         let mut is_local = false;
