@@ -231,7 +231,7 @@ impl PoolEndpointList {
                         .map_err(|e| Error::from_string(format!("host '{}' cannot resolve: {}", host, e)))?
                 });
 
-                let path = ep.url.path();
+                let path = ep.get_file_path();
                 match path_ip_map.entry(path) {
                     Entry::Occupied(mut e) => {
                         if e.get().intersection(host_ip_set).count() > 0 {
@@ -255,7 +255,7 @@ impl PoolEndpointList {
                     continue;
                 }
 
-                let path = ep.url.path();
+                let path = ep.get_file_path();
                 if local_path_set.contains(path) {
                     return Err(Error::from_string(format!(
                         "path '{}' cannot be served by different address on same server",
@@ -272,7 +272,7 @@ impl PoolEndpointList {
             let mut local_endpoint_count = 0;
 
             for ep in endpoints.as_ref() {
-                ep_path_set.insert(ep.url.path());
+                ep_path_set.insert(ep.get_file_path());
                 if ep.is_local && ep.url.has_host() {
                     local_server_host_set.insert(ep.url.host());
                     local_port_set.insert(ep.url.port());
