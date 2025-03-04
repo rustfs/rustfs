@@ -1,18 +1,18 @@
 [workspace]
 members = [
-    "madmin",
-    "rustfs",
-    "ecstore",
-    "e2e_test",
-    "common/common",
-    "common/lock",
-    "common/protos",
-    "api/admin",
-    "reader",
-    "common/workers",
-    "iam",
-    "crypto",
-    "cli/rustfs-gui",
+    "madmin",            # Management dashboard and admin API interface
+    "rustfs",            # Core file system implementation
+    "ecstore",           # Erasure coding storage implementation
+    "e2e_test",          # End-to-end test suite
+    "common/common",     # Shared utilities and data structures
+    "common/lock",       # Distributed locking implementation
+    "common/protos",     # Protocol buffer definitions
+    "api/admin",         # Admin HTTP API endpoints
+    "reader",            # Object reading service
+    "common/workers",    # Worker thread pools and task scheduling
+    "iam",               # Identity and Access Management
+    "crypto",            # Cryptography and security features
+    "cli/rustfs-gui",    # Graphical user interface client
 ]
 resolver = "2"
 
@@ -112,7 +112,6 @@ test-case = "3.3.1"
 zip = "2.2.3"
 
 
-[profile]
 
 [profile.wasm-dev]
 inherits = "dev"
