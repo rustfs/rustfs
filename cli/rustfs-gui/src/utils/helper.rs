@@ -1,6 +1,5 @@
 use crate::utils::RustFSConfig;
 use dioxus::logger::tracing::{debug, error, info};
-use futures_util::TryStreamExt;
 use lazy_static::lazy_static;
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
@@ -205,70 +204,8 @@ impl ServiceManager {
             perms.set_mode(0o755);
             std::fs::set_permissions(&executable_path, perms)?;
         }
-        // Self::show_info("服务程序已成功下载并准备就绪");
-        // }
 
         Ok(executable_path)
-    }
-
-    /// Download the file
-    /// This function is a modified version of the example from the `reqwest` crate documentation
-    ///
-    /// # Example
-    /// ```
-    /// let url = "https://api.xmb.xyz/download/rustfs.zip";
-    /// let path = Path::new("rustfs.zip");
-    /// download_file(url, path).await;
-    /// ```
-    async fn download_file(url: &str, path: &Path) -> Result<(), Box<dyn Error>> {
-        let client = reqwest::Client::new();
-        let res = client.get(url).send().await?;
-
-        if !res.status().is_success() {
-            return Err(format!("下载失败：{}", res.status()).into());
-        }
-
-        let mut file = tokio::fs::File::create(path).await?;
-        let mut stream = res.bytes_stream();
-        while let Ok(Some(chunk)) = stream.try_next().await {
-            file.write_all(&chunk).await?;
-        }
-
-        Ok(())
-    }
-
-    /// unzip the file
-    /// This function is a modified version of the example from the `zip` crate documentation
-    ///
-    /// # Example
-    /// ```
-    /// let zip_path = Path::new("rustfs.zip");
-    /// let extract_path = Path::new("rustfs");
-    /// unzip_file(zip_path, extract_path);
-    /// ```
-    async fn unzip_file(zip_path: &Path, extract_path: &Path) -> Result<(), Box<dyn Error>> {
-        use std::fs::File;
-        let file = File::open(zip_path)?;
-        let mut archive = zip::ZipArchive::new(file)?;
-
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
-            let out_path = extract_path.join(file.name());
-
-            if file.name().ends_with('/') {
-                std::fs::create_dir_all(&out_path)?;
-            } else {
-                if let Some(p) = out_path.parent() {
-                    if !p.exists() {
-                        std::fs::create_dir_all(p)?;
-                    }
-                }
-                let mut outfile = File::create(&out_path)?;
-                std::io::copy(&mut file, &mut outfile)?;
-            }
-        }
-
-        Ok(())
     }
 
     /// Helper function: Extracts the port from the address string
