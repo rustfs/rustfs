@@ -85,8 +85,19 @@ jobs:
     # if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
+      - name: Cache dioxus-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dioxus-cli-
+
       - name: Install dioxus-cli
-        run: cargo install dioxus-cli
+        run: |
+          if [ ! -f ~/.cargo/bin/dx ]; then
+            cargo install dioxus-cli
+          fi
 
       - name: Build and Bundle rustfs-gui
         run: |
