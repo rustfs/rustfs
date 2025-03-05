@@ -1,4 +1,4 @@
-use crate::router::Route;
+use crate::route::Route;
 use dioxus::logger::tracing::debug;
 use dioxus::prelude::*;
 
