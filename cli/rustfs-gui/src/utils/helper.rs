@@ -1,14 +1,32 @@
 use crate::utils::RustFSConfig;
 use dioxus::logger::tracing::{debug, error, info};
 use futures_util::TryStreamExt;
+use lazy_static::lazy_static;
+use rust_embed::RustEmbed;
+use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::Duration;
+use tokio::fs;
+use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
+
+#[derive(RustEmbed)]
+#[folder = "$CARGO_MANIFEST_DIR/embedded-rustfs/"]
+struct Asset;
+
+// Use `lazy_static` to cache the checksum of embedded resources
+lazy_static! {
+    static ref RUSTFS_HASH: Mutex<String> = {
+        let rustfs_file = if cfg!(windows) { "rustfs.exe" } else { "rustfs" };
+        let rustfs_data = Asset::get(rustfs_file).expect("RustFs binary not embedded");
+        let hash = hex::encode(Sha256::digest(&rustfs_data.data));
+        Mutex::new(hash)
+    };
+}
 
 /// Service command
 /// This enum represents the commands that can be sent to the service manager
@@ -159,44 +177,36 @@ impl ServiceManager {
             }
         }
 
-        let executable_path = if cfg!(windows) {
-            bin_dir.join("rustfs.exe")
-        } else {
-            bin_dir.join("rustfs")
-        };
+        let rustfs_file = if cfg!(windows) { "rustfs.exe" } else { "rustfs" };
+        let executable_path = bin_dir.join(rustfs_file);
+        let hash_path = bin_dir.join("embedded_rustfs.sha256");
 
-        // If the executable file doesn't exist, download and unzip it
-        if !executable_path.exists() {
-            // download the file
-            let tmp_zip = rustfs_dir.join("rustfs.zip");
-            let file_download_url = if cfg!(windows) {
-                "https://api.xmb.xyz/download/rustfs-win.zip"
-            } else {
-                "https://api.xmb.xyz/download/rustfs.zip"
-            };
-
-            let download_task = Self::download_file(file_download_url, &tmp_zip);
-            let unzip_task = async {
-                download_task.await?;
-                Self::unzip_file(&tmp_zip, &bin_dir)?;
-                tokio::fs::remove_file(&tmp_zip).await?;
-                Ok::<(), Box<dyn Error>>(())
-            };
-            unzip_task.await?;
-
-            // delete the temporary zip file
-            tokio::fs::remove_file(&tmp_zip).await?;
-
-            // set execution permissions on unix systems
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&executable_path)?.permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&executable_path, perms)?;
+        if executable_path.exists() && hash_path.exists() {
+            let cached_hash = fs::read_to_string(&hash_path).await?;
+            let expected_hash = RUSTFS_HASH.lock().await;
+            if cached_hash == *expected_hash {
+                println!("Use cached rustfs: {:?}", executable_path);
+                return Ok(executable_path);
             }
-            Self::show_info("服务程序已成功下载并准备就绪");
         }
+
+        // Extract and write files
+        let rustfs_data = Asset::get(rustfs_file).expect("RustFS binary not embedded");
+        let mut file = File::create(&executable_path).await?;
+        file.write_all(&rustfs_data.data).await?;
+        let expected_hash = hex::encode(Sha256::digest(&rustfs_data.data));
+        fs::write(&hash_path, expected_hash).await?;
+
+        // set execution permissions on unix systems
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&executable_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&executable_path, perms)?;
+        }
+        // Self::show_info("服务程序已成功下载并准备就绪");
+        // }
 
         Ok(executable_path)
     }
@@ -236,7 +246,8 @@ impl ServiceManager {
     /// let extract_path = Path::new("rustfs");
     /// unzip_file(zip_path, extract_path);
     /// ```
-    fn unzip_file(zip_path: &Path, extract_path: &Path) -> Result<(), Box<dyn Error>> {
+    async fn unzip_file(zip_path: &Path, extract_path: &Path) -> Result<(), Box<dyn Error>> {
+        use std::fs::File;
         let file = File::open(zip_path)?;
         let mut archive = zip::ZipArchive::new(file)?;
 
