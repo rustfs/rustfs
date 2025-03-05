@@ -101,9 +101,11 @@ jobs:
 
       - name: Build and Bundle rustfs-gui
         run: |
+          ls -la
           relaese_path = "target/${{ matrix.variant.target }}"
           mkdir -p ${relaese_path}
           cd cli/rustfs-gui
+          ls -la embedded-rustfs
           if [[ "${{ matrix.variant.target }}" == *"apple-darwin"* ]]; then
             dx bundle --platform macos --package-types "macos" --package-types "dmg" --package-types "ios" --release --profile release --out-dir ../../${relaese_path}
           elif [[ "${{ matrix.variant.target }}" == *"windows-msvc"* ]]; then
