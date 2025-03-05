@@ -11,15 +11,17 @@ chrono = { workspace = true }
 dioxus = { workspace = true, features = ["router"] }
 dirs = { workspace = true }
 futures-util = { workspace = true }
+hex = { workspace = true }
 keyring = { workspace = true }
-reqwest = { workspace = true }
+lazy_static = { workspace = true }
 rfd = { workspace = true }
+rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "process", "sync"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tracing-appender = { workspace = true }
-zip = { workspace = true }
 
 [features]
 default = ["desktop"]
