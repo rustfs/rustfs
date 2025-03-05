@@ -65,7 +65,6 @@ jobs:
           ls -la
           
           # Copy files to the specified directory
-          mkdir -p cli/rustfs-gui/embedded-rustfs
           cp -r ${ARTIFACT_NAME}/rustfs cli/rustfs-gui/embedded-rustfs/
 
       - uses: actions/upload-artifact@v4
@@ -102,20 +101,20 @@ jobs:
       - name: Build and Bundle rustfs-gui
         run: |
           ls -la
-          relaese_path = "target/${{ matrix.variant.target }}"
-          mkdir -p ${relaese_path}
+          release_path="target/${{ matrix.variant.target }}"
+          mkdir -p ${release_path}
           cd cli/rustfs-gui
           ls -la embedded-rustfs
           if [[ "${{ matrix.variant.target }}" == *"apple-darwin"* ]]; then
-            dx bundle --platform macos --package-types "macos" --package-types "dmg" --package-types "ios" --release --profile release --out-dir ../../${relaese_path}
+            dx bundle --platform macos --package-types "macos" --package-types "dmg" --package-types "ios" --release --profile release --out-dir ../../${release_path}
           elif [[ "${{ matrix.variant.target }}" == *"windows-msvc"* ]]; then
-            dx bundle --platform windows --package-types "msi" --release --profile release --out-dir ../../${relaese_path}
+            dx bundle --platform windows --package-types "msi" --release --profile release --out-dir ../../${release_path}
           fi
           cd ../..
           GUI_ARTIFACT_NAME="rustfs-gui-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
-          zip -r ${GUI_ARTIFACT_NAME}.zip ${relaese_path}/rustfs-gui
+          zip -r ${GUI_ARTIFACT_NAME}.zip ${release_path}/rustfs-gui
           echo "gui_artifact_name=${GUI_ARTIFACT_NAME}" >> $GITHUB_OUTPUT
-          ls -la ${relaese_path}
+          ls -la ${release_path}
 
       - uses: actions/upload-artifact@v4
         with:
