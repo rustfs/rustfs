@@ -6,3 +6,4 @@
 /logs
 .devcontainer
 rustfs/static/*
+vendor

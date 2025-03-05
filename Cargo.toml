@@ -1,18 +1,18 @@
 [workspace]
 members = [
-    "madmin",            # Management dashboard and admin API interface
-    "rustfs",            # Core file system implementation
-    "ecstore",           # Erasure coding storage implementation
-    "e2e_test",          # End-to-end test suite
-    "common/common",     # Shared utilities and data structures
-    "common/lock",       # Distributed locking implementation
-    "common/protos",     # Protocol buffer definitions
-    "api/admin",         # Admin HTTP API endpoints
-    "reader",            # Object reading service
-    "common/workers",    # Worker thread pools and task scheduling
-    "iam",               # Identity and Access Management
-    "crypto",            # Cryptography and security features
-    "cli/rustfs-gui",    # Graphical user interface client
+    "madmin", # Management dashboard and admin API interface
+    "rustfs", # Core file system implementation
+    "ecstore", # Erasure coding storage implementation
+    "e2e_test", # End-to-end test suite
+    "common/common", # Shared utilities and data structures
+    "common/lock", # Distributed locking implementation
+    "common/protos", # Protocol buffer definitions
+    "api/admin", # Admin HTTP API endpoints
+    "reader", # Object reading service
+    "common/workers", # Worker thread pools and task scheduling
+    "iam", # Identity and Access Management
+    "crypto", # Cryptography and security features
+    "cli/rustfs-gui", # Graphical user interface client
 ]
 resolver = "2"
 
@@ -45,6 +45,7 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 common = { path = "./common/common" }
 reader = { path = "./reader" }
+hex = "0.4.3"
 hyper = "1.6.0"
 hyper-util = { version = "0.1.10", features = [
     "tokio",
@@ -57,6 +58,7 @@ humantime = "2.1.0"
 keyring = { version = "3.6.1", features = ["apple-native", "windows-native", "sync-secret-service"] }
 lock = { path = "./common/lock" }
 lazy_static = "1.5.0"
+local-ip-address = "0.6.3"
 mime = "0.3.17"
 netif = "0.1.6"
 pin-project-lite = "0.2"
@@ -71,6 +73,7 @@ reqwest = { version = "0.12.12", default-features = false, features = ["rustls-t
 rfd = { version = "0.15.2", default-features = false, features = ["xdg-portal", "tokio"] }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
+rust-embed = "8.6.0"
 s3s = { git = "https://github.com/Nugine/s3s.git", rev = "ab139f72fe768fb9d8cecfe36269451da1ca9779", default-features = true, features = [
     "tower",
 ] }
@@ -78,6 +81,7 @@ s3s-policy = { git = "https://github.com/Nugine/s3s.git", rev = "ab139f72fe768fb
 shadow-rs = { version = "0.38.0", default-features = false }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
+sha2 = "0.10.8"
 tempfile = "3.16.0"
 thiserror = "2.0.11"
 time = { version = "0.3.37", features = [
