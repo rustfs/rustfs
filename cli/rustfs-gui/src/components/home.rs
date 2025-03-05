@@ -1,5 +1,5 @@
 use crate::components::navbar::LoadingSpinner;
-use crate::router::Route;
+use crate::route::Route;
 use crate::utils::{RustFSConfig, ServiceManager};
 use chrono::Datelike;
 use dioxus::logger::tracing::debug;
