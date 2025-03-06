@@ -1,5 +1,5 @@
-use crate::admin::{handlers::check_key_valid, utils::has_space_be};
-use crate::admin::{handlers::get_session_token, router::Operation};
+use crate::admin::utils::has_space_be;
+use crate::{admin::router::Operation, auth::check_key_valid};
 use http::HeaderMap;
 use hyper::StatusCode;
 use iam::{
@@ -29,7 +29,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) = check_key_valid(get_session_token(&req.headers), &req_cred.access_key).await?;
+        let (cred, _owner) = check_key_valid(&req.headers, &req_cred.access_key).await?;
 
         let mut input = req.input;
         let body = match input.store_all_unlimited().await {
@@ -171,12 +171,6 @@ pub struct UpdateServiceAccount {}
 impl Operation for UpdateServiceAccount {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle UpdateServiceAccount");
-
-        // let Some(req_cred) = req.credentials else {
-        //     return Err(s3_error!(InvalidRequest, "get cred failed"));
-        // };
-
-        // let (cred, _owner) = check_key_valid(get_session_token(&req.headers), &req_cred.access_key).await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -363,12 +357,10 @@ impl Operation for ListServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) = check_key_valid(get_session_token(&req.headers), &input_cred.access_key)
-            .await
-            .map_err(|e| {
-                debug!("check key failed: {e:?}");
-                s3_error!(InternalError, "check key failed")
-            })?;
+        let (cred, _owner) = check_key_valid(&req.headers, &input_cred.access_key).await.map_err(|e| {
+            debug!("check key failed: {e:?}");
+            s3_error!(InternalError, "check key failed")
+        })?;
 
         let target_account = if let Some(user) = query.user {
             if user != input_cred.access_key {
@@ -423,12 +415,10 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) = check_key_valid(get_session_token(&req.headers), &input_cred.access_key)
-            .await
-            .map_err(|e| {
-                debug!("check key failed: {e:?}");
-                s3_error!(InternalError, "check key failed")
-            })?;
+        let (_cred, _owner) = check_key_valid(&req.headers, &input_cred.access_key).await.map_err(|e| {
+            debug!("check key failed: {e:?}");
+            s3_error!(InternalError, "check key failed")
+        })?;
 
         let query = {
             if let Some(query) = req.uri.query() {

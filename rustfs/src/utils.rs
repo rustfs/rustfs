@@ -1,4 +1,3 @@
-use local_ip_address;
 use std::net::IpAddr;
 
 pub(crate) fn get_local_ip() -> Option<std::net::Ipv4Addr> {
