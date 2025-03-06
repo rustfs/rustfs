@@ -16,9 +16,9 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default" }
+          # - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default" }
           - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
+          # - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
 
     steps:
       - uses: actions/checkout@v4
@@ -63,9 +63,6 @@ jobs:
           cp "$bin_path" ${ARTIFACT_NAME}/rustfs
           zip -r ${ARTIFACT_NAME}.zip ${ARTIFACT_NAME}
           ls -la
-          
-          # Copy files to the specified directory
-          cp -r ${ARTIFACT_NAME}/rustfs cli/rustfs-gui/embedded-rustfs/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -80,10 +77,20 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { profile: release, target: x86_64-unknown-linux-gnu }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
     # if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4.1
+        with:
+          name: "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
+      - name: Display structure of downloaded files
+        run: |
+          ls -R 
+          cp -r "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"/rustfs cli/rustfs-gui/embedded-rustfs/
+          ls -la cli/rustfs-gui/embedded-rustfs
+          exit 0
       - name: Cache dioxus-cli
         uses: actions/cache@v4
         with:
