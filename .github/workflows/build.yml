@@ -79,7 +79,7 @@ jobs:
         variant:
           - { profile: release, target: x86_64-unknown-linux-gnu }
           # - { profile: release, target: x86_64-apple-darwin }
-    # if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
       - name: Download artifact
@@ -108,10 +108,39 @@ jobs:
       - name: Build and Bundle rustfs-gui
         run: |
           ls -la
+          
           release_path="target/${{ matrix.variant.target }}"
           mkdir -p ${release_path}
           cd cli/rustfs-gui
           ls -la embedded-rustfs
+          
+          # Configure the linker based on the target
+          case "${{ matrix.target }}" in
+          "x86_64-unknown-linux-gnu")
+          # Default gcc
+          export CC_x86_64_unknown_linux_gnu=gcc
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
+          ;;
+          "aarch64-unknown-linux-gnu")
+          # AArch64 Cross-compiler
+          export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          ;;
+          "x86_64-apple-darwin")
+          # macOS default clang
+          export CC_x86_64_apple_darwin=clang
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang
+          ;;
+          "aarch64-apple-darwin")
+          # macOS ARM64 used clang
+          export CC_aarch64_apple_darwin=clang
+          export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=clang
+          ;;
+          esac
+          # Validating Environment Variables (for Debugging)
+          echo "CC for ${{ matrix.target }}: $CC_${{ matrix.target }}"
+          echo "Linker for ${{ matrix.target }}: $CARGO_TARGET_${{ matrix.target }}_LINKER"
+          
           if [[ "${{ matrix.variant.target }}" == *"apple-darwin"* ]]; then
             dx bundle --platform macos --package-types "macos" --package-types "dmg" --package-types "ios" --release --profile release --out-dir ../../${release_path}
           elif [[ "${{ matrix.variant.target }}" == *"windows-msvc"* ]]; then
@@ -121,7 +150,7 @@ jobs:
           fi
           cd ../..
           GUI_ARTIFACT_NAME="rustfs-gui-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
-          zip -r ${GUI_ARTIFACT_NAME}.zip ${release_path}/rustfs-gui
+          zip -r ${GUI_ARTIFACT_NAME}.zip ${release_path}/*
           echo "gui_artifact_name=${GUI_ARTIFACT_NAME}" >> $GITHUB_OUTPUT
           ls -la ${release_path}
 
