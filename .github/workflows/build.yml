@@ -88,9 +88,8 @@ jobs:
       - name: Display structure of downloaded files
         run: |
           ls -R 
-          unzip -o "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}.zip" -d ./cli/rustfs-gui/embedded-rustfs/
+          unzip -o -j "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}.zip" -d ./cli/rustfs-gui/embedded-rustfs/
           ls -la cli/rustfs-gui/embedded-rustfs
-          exit 0
       - name: Cache dioxus-cli
         uses: actions/cache@v4
         with:
