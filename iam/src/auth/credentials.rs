@@ -152,10 +152,7 @@ impl Credentials {
         const IAM_POLICY_CLAIM_NAME_SA: &str = "sa-policy";
         self.claims
             .as_ref()
-            .map(|x| {
-                x.get(IAM_POLICY_CLAIM_NAME_SA)
-                    .map_or(false, |_| !self.parent_user.is_empty())
-            })
+            .map(|x| x.get(IAM_POLICY_CLAIM_NAME_SA).is_some_and(|_| !self.parent_user.is_empty()))
             .unwrap_or_default()
     }
 
@@ -164,10 +161,7 @@ impl Credentials {
             return self
                 .claims
                 .as_ref()
-                .map(|x| {
-                    x.get(&iam_policy_claim_name_sa())
-                        .map_or(false, |v| v == INHERITED_POLICY_TYPE)
-                })
+                .map(|x| x.get(&iam_policy_claim_name_sa()).is_some_and(|v| v == INHERITED_POLICY_TYPE))
                 .unwrap_or_default();
         }
 

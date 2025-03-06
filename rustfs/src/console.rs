@@ -9,6 +9,12 @@ use axum::{
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
+use shadow_rs::shadow;
+use std::net::Ipv4Addr;
+use std::sync::OnceLock;
+use tracing::info;
+
+shadow!(build);
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/static"]
@@ -42,11 +48,12 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct Config {
+pub(crate) struct Config {
     api: Api,
     s3: S3,
     release: Release,
     license: License,
+    doc: String,
 }
 
 impl Config {
@@ -67,11 +74,29 @@ impl Config {
                 name: "Apache-2.0".to_string(),
                 url: "https://www.apache.org/licenses/LICENSE-2.0".to_string(),
             },
+            doc: "https://rustfs.com/docs/".to_string(),
         }
     }
 
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub(crate) fn version(&self) -> String {
+        format!(
+            "RELEASE.{} (rust {} {})",
+            self.release.date.clone(),
+            build::RUST_VERSION,
+            build::BUILD_TARGET
+        )
+    }
+
+    pub(crate) fn license(&self) -> String {
+        format!("{} {}", self.license.name.clone(), self.license.url.clone())
+    }
+
+    pub(crate) fn doc(&self) -> String {
+        self.doc.clone()
     }
 }
 
@@ -99,8 +124,27 @@ struct License {
     url: String,
 }
 
-async fn config_handler(axum::extract::Extension(fs_addr): axum::extract::Extension<String>) -> impl IntoResponse {
-    let cfg = Config::new(&fs_addr, "v0.0.1", "2025-01-01").to_json();
+pub(crate) static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
+
+pub(crate) fn init_console_cfg(fs_addr: &str) {
+    CONSOLE_CONFIG.get_or_init(|| {
+        let ver = {
+            if !build::TAG.is_empty() {
+                build::TAG.to_string()
+            } else if !build::SHORT_COMMIT.is_empty() {
+                format!("@{}", build::SHORT_COMMIT)
+            } else {
+                build::PKG_VERSION.to_string()
+            }
+        };
+
+        Config::new(fs_addr, ver.as_str(), build::COMMIT_DATE_3339)
+    });
+}
+
+#[allow(clippy::const_is_empty)]
+async fn config_handler() -> impl IntoResponse {
+    let cfg = CONSOLE_CONFIG.get().unwrap().to_json();
 
     Response::builder()
         .header("content-type", "application/json")
@@ -109,15 +153,18 @@ async fn config_handler(axum::extract::Extension(fs_addr): axum::extract::Extens
         .unwrap()
 }
 
-pub async fn start_static_file_server(addrs: &str, fs_addr: &str) {
+pub async fn start_static_file_server(addrs: &str, local_ip: Ipv4Addr, access_key: &str, secret_key: &str) {
     // 创建路由
     let app = Router::new()
-        .route("/config.json", get(config_handler).layer(axum::extract::Extension(fs_addr.to_owned())))
+        .route("/config.json", get(config_handler))
         .nest_service("/", get(static_handler));
 
     let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
 
-    println!("console running on: http://{} with s3 api {}", listener.local_addr().unwrap(), fs_addr);
+    info!("WebUI: http://{}:{} http://127.0.0.1:{}", local_ip, local_addr.port(), local_addr.port());
+    info!("   RootUser: {}", access_key);
+    info!("   RootPass: {}", secret_key);
 
     axum::serve(listener, app).await.unwrap();
 }

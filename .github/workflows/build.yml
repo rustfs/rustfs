@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - main
+    tags: [ 'v*', '*' ]
 
 jobs:
   build-rustfs:
@@ -15,15 +16,24 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default"  }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default"  }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31"     }
+          - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
 
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
           cache-shared-key: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
+
+      - name: Download and Extract Static Assets
+        run: |
+          url="https://dl.rustfs.com/console/rustfs-console-latest.zip"
+          mkdir -p static
+          curl -L -o static_assets.zip "$url"
+          unzip -o static_assets.zip -d ./rustfs/static
+          rm static_assets.zip
+          ls -la ./rustfs/static
 
       - name: Build
         run: |
@@ -32,16 +42,130 @@ jobs:
             --target ${{ matrix.variant.target }} \
             --glibc ${{ matrix.variant.glibc }}
 
+      - name: Package Binary and Static Assets
+        id: package
+        run: |
+          # Create artifact filename
+          ARTIFACT_NAME="rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
+          if [ "${{ matrix.variant.glibc }}" != "default" ]; then
+            ARTIFACT_NAME="${ARTIFACT_NAME}-glibc${{ matrix.variant.glibc }}"
+          fi
+          echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+          
+          # Determine binary path
+          bin_path="target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.bin"
+          if [ -f "target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin" ]; then
+            bin_path="target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin"
+          fi
+          
+          # Create package
+          mkdir -p ${ARTIFACT_NAME}
+          cp "$bin_path" ${ARTIFACT_NAME}/rustfs
+          zip -r ${ARTIFACT_NAME}.zip ${ARTIFACT_NAME}
+          ls -la
+
       - uses: actions/upload-artifact@v4
         with:
-          name: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
-          path: ./target/artifacts/*
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_name }}.zip
+          retention-days: 7
+
+  build-rustfs-gui:
+    runs-on: ubuntu-latest
+    needs: build-rustfs
+
+    strategy:
+      matrix:
+        variant:
+          - { profile: release, target: x86_64-unknown-linux-gnu }
+          # - { profile: release, target: x86_64-apple-darwin }
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
+      - name: Display structure of downloaded files
+        run: |
+          ls -R 
+          unzip -o -j "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}.zip" -d ./cli/rustfs-gui/embedded-rustfs/
+          ls -la cli/rustfs-gui/embedded-rustfs
+      - name: Cache dioxus-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dioxus-cli-
+
+      - name: Install dioxus-cli
+        run: |
+          if [ ! -f ~/.cargo/bin/dx ]; then
+            cargo install dioxus-cli
+          fi
+
+      - name: Build and Bundle rustfs-gui
+        run: |
+          ls -la
+          
+          release_path="target/${{ matrix.variant.target }}"
+          mkdir -p ${release_path}
+          cd cli/rustfs-gui
+          ls -la embedded-rustfs
+          
+          # Configure the linker based on the target
+          case "${{ matrix.target }}" in
+          "x86_64-unknown-linux-gnu")
+          # Default gcc
+          export CC_x86_64_unknown_linux_gnu=gcc
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
+          ;;
+          "aarch64-unknown-linux-gnu")
+          # AArch64 Cross-compiler
+          export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          ;;
+          "x86_64-apple-darwin")
+          # macOS default clang
+          export CC_x86_64_apple_darwin=clang
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang
+          ;;
+          "aarch64-apple-darwin")
+          # macOS ARM64 used clang
+          export CC_aarch64_apple_darwin=clang
+          export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=clang
+          ;;
+          esac
+          # Validating Environment Variables (for Debugging)
+          echo "CC for ${{ matrix.target }}: $CC_${{ matrix.target }}"
+          echo "Linker for ${{ matrix.target }}: $CARGO_TARGET_${{ matrix.target }}_LINKER"
+          
+          if [[ "${{ matrix.variant.target }}" == *"apple-darwin"* ]]; then
+            dx bundle --platform macos --package-types "macos" --package-types "dmg" --package-types "ios" --release --profile release --out-dir ../../${release_path}
+          elif [[ "${{ matrix.variant.target }}" == *"windows-msvc"* ]]; then
+            dx bundle --platform windows --package-types "msi" --release --profile release --out-dir ../../${release_path}
+          elif [[ "${{ matrix.variant.target }}" == *"unknown-linux-gnu"* ]]; then
+            dx bundle --platform linux --package-types "deb" --package-types "rpm" --package-types "appimage" --release --profile release --out-dir ../../${release_path}
+          fi
+          cd ../..
+          GUI_ARTIFACT_NAME="rustfs-gui-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
+          zip -r ${GUI_ARTIFACT_NAME}.zip ${release_path}/*
+          echo "gui_artifact_name=${GUI_ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+          ls -la ${release_path}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.gui_artifact_name }}
+          path: ${{ steps.package.outputs.gui_artifact_name }}.zip
+          retention-days: 7
 
   merge:
     runs-on: ubuntu-latest
-    needs: build-rustfs
+    needs: [ build-rustfs, build-rustfs-gui ]
     steps:
       - uses: actions/upload-artifact/merge@v4
         with:
-          name: rustfs
+          name: rustfs-packages
+          pattern: 'rustfs-*'
           delete-merged: true

@@ -1,5 +1,5 @@
 use ecstore::error::{Error, Result};
-use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngCore};
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -42,7 +42,7 @@ pub fn gen_secret_key(length: usize) -> crate::Result<String> {
 
 pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let header = Header::new(Algorithm::HS512);
-    encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
+    jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
 }
 
 pub fn extract_claims<T: DeserializeOwned>(
@@ -58,7 +58,8 @@ pub fn extract_claims<T: DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use super::{gen_access_key, gen_secret_key};
+    use super::{gen_access_key, gen_secret_key, generate_jwt};
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn test_gen_access_key() {
@@ -76,4 +77,34 @@ mod tests {
         let b = gen_secret_key(10).unwrap();
         assert_ne!(a, b);
     }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Claims {
+        sub: String,
+        company: String,
+    }
+
+    #[test]
+    fn test_generate_jwt() {
+        let claims = Claims {
+            sub: "user1".to_string(),
+            company: "example".to_string(),
+        };
+        let secret = "my_secret";
+        let token = generate_jwt(&claims, secret).unwrap();
+
+        assert!(!token.is_empty());
+    }
+
+    // #[test]
+    // fn test_extract_claims() {
+    //     let claims = Claims {
+    //         sub: "user1".to_string(),
+    //         company: "example".to_string(),
+    //     };
+    //     let secret = "my_secret";
+    //     let token = generate_jwt(&claims, secret).unwrap();
+    //     let decoded_claims = extract_claims::<Claims>(&token, secret).unwrap();
+    //     assert_eq!(decoded_claims.claims, claims);
+    // }
 }

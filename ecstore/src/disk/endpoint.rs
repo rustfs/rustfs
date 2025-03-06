@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use crate::utils::net;
 use path_absolutize::Absolutize;
-use path_clean::PathClean;
 use std::{fmt::Display, path::Path};
 use url::{ParseError, Url};
 
@@ -29,7 +28,7 @@ pub struct Endpoint {
 impl Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.url.scheme() == "file" {
-            write!(f, "{}", self.url.path())
+            write!(f, "{}", self.get_file_path())
         } else {
             write!(f, "{}", self.url)
         }
@@ -42,12 +41,8 @@ impl TryFrom<&str> for Endpoint {
 
     /// Performs the conversion.
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        /// check whether given path is not empty.
-        fn is_empty_path(path: impl AsRef<Path>) -> bool {
-            ["", "/", "\\"].iter().any(|&v| Path::new(v).eq(path.as_ref()))
-        }
-
-        if is_empty_path(value) {
+        // check whether given path is not empty.
+        if ["", "/", "\\"].iter().any(|&v| v.eq(value)) {
             return Err(Error::from_string("empty or root endpoint is not supported"));
         }
 
@@ -67,35 +62,26 @@ impl TryFrom<&str> for Endpoint {
                     return Err(Error::from_string("invalid URL endpoint format"));
                 }
 
-                let path = Path::new(url.path()).clean();
-                if is_empty_path(&path) {
-                    return Err(Error::from_string("empty or root path is not supported in URL endpoint"));
-                }
+                let path = url.path().to_string();
 
-                if let Some(v) = path.to_str() {
-                    url.set_path(v)
-                }
+                #[cfg(not(windows))]
+                let path = Path::new(&path).absolutize()?;
 
                 // On windows having a preceding SlashSeparator will cause problems, if the
                 // command line already has C:/<export-folder/ in it. Final resulting
                 // path on windows might become C:/C:/ this will cause problems
                 // of starting rustfs server properly in distributed mode on windows.
                 // As a special case make sure to trim the separator.
-
-                // NOTE: It is also perfectly fine for windows users to have a path
-                // without C:/ since at that point we treat it as relative path
-                // and obtain the full filesystem path as well. Providing C:/
-                // style is necessary to provide paths other than C:/,
-                // such as F:/, D:/ etc.
-                //
-                // Another additional benefit here is that this style also
-                // supports providing \\host\share support as well.
                 #[cfg(windows)]
-                {
-                    let path = url.path().to_owned();
-                    if Path::new(&path[1..]).is_absolute() {
-                        url.set_path(&path[1..]);
-                    }
+                let path = Path::new(&path[1..]).absolutize()?;
+
+                if path.parent().is_none() || Path::new("").eq(&path) {
+                    return Err(Error::from_string("empty or root path is not supported in URL endpoint"));
+                }
+
+                match path.to_str() {
+                    Some(v) => url.set_path(v),
+                    None => return Err(Error::from_string("invalid path")),
                 }
 
                 url
@@ -181,6 +167,15 @@ impl Endpoint {
             (Some(host), None) => format!("{}", host),
             _ => String::new(),
         }
+    }
+
+    pub fn get_file_path(&self) -> &str {
+        let path = self.url.path();
+
+        #[cfg(windows)]
+        let path = &path[1..];
+
+        path
     }
 }
 

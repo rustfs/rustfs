@@ -32,7 +32,7 @@ s3s.workspace = true
 http.workspace = true
 highway = "1.3.0"
 url.workspace = true
-uuid = { version = "1.12.1", features = ["v4", "fast-rng", "serde"] }
+uuid = { version = "1.15.1", features = ["v4", "fast-rng", "serde"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 transform-stream = "0.3.1"
 lazy_static.workspace = true

@@ -114,7 +114,7 @@ impl Debug for LocalDisk {
 
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
-        let root = fs::canonicalize(ep.url.path()).await?;
+        let root = fs::canonicalize(ep.get_file_path()).await?;
 
         if cleanup {
             // TODO: 删除tmp数据

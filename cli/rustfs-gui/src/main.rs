@@ -1,5 +1,5 @@
 mod components;
-mod router;
+mod route;
 mod utils;
 mod views;
 

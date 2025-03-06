@@ -6,3 +6,5 @@
 /logs
 .devcontainer
 rustfs/static/*
+vendor
+cli/rustfs-gui/embedded-rustfs/rustfs

@@ -846,7 +846,9 @@ impl Store for ObjectStore {
                 let name = ecstore::utils::path::dir(item);
                 info!("load svc user: {}", name);
                 if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await {
-                    return Err(Error::msg(std::format!("load_user failed: {}", err)));
+                    if !is_err_no_such_user(&err) {
+                        return Err(Error::msg(std::format!("load svc user failed: {}", err)));
+                    }
                 };
             }
 
