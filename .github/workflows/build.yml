@@ -82,7 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Download artifact
-        uses: actions/download-artifact@v4.1
+        uses: actions/download-artifact@v4
         with:
           name: "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
       - name: Display structure of downloaded files
