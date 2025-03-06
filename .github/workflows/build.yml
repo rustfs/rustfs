@@ -77,7 +77,7 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - { profile: release, target: x86_64-unknown-linux-gnu }
     # if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
@@ -88,7 +88,7 @@ jobs:
       - name: Display structure of downloaded files
         run: |
           ls -R 
-          cp -r "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"/rustfs cli/rustfs-gui/embedded-rustfs/
+          unzip -o "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}.zip" -d ./cli/rustfs-gui/embedded-rustfs/
           ls -la cli/rustfs-gui/embedded-rustfs
           exit 0
       - name: Cache dioxus-cli
