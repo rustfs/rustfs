@@ -16,9 +16,9 @@ jobs:
     strategy:
       matrix:
         variant:
-          # - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default" }
           - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
-          # - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
 
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +78,7 @@ jobs:
       matrix:
         variant:
           - { profile: release, target: x86_64-unknown-linux-gnu }
+          # - { profile: release, target: x86_64-apple-darwin }
     # if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
@@ -115,6 +116,8 @@ jobs:
             dx bundle --platform macos --package-types "macos" --package-types "dmg" --package-types "ios" --release --profile release --out-dir ../../${release_path}
           elif [[ "${{ matrix.variant.target }}" == *"windows-msvc"* ]]; then
             dx bundle --platform windows --package-types "msi" --release --profile release --out-dir ../../${release_path}
+          elif [[ "${{ matrix.variant.target }}" == *"unknown-linux-gnu"* ]]; then
+            dx bundle --platform linux --package-types "deb" --package-types "rpm" --package-types "appimage" --release --profile release --out-dir ../../${release_path}
           fi
           cd ../..
           GUI_ARTIFACT_NAME="rustfs-gui-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
