@@ -132,6 +132,7 @@ struct License {
 
 pub(crate) static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
+#[allow(clippy::const_is_empty)]
 pub(crate) fn init_console_cfg(local_ip: Ipv4Addr, port: u16) {
     CONSOLE_CONFIG.get_or_init(|| {
         let ver = {

@@ -16,17 +16,11 @@ use ecstore::new_object_layer_fn;
 use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::StorageAPI;
-use ecstore::utils::crypto::base64_encode;
 use ecstore::utils::path::path_join;
 use ecstore::GLOBAL_Endpoints;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
 use hyper::StatusCode;
-use iam::auth::get_claims_from_token_with_secret;
-use iam::error::Error as IamError;
-use iam::policy::Policy;
-use iam::sys::SESSION_POLICY_NAME;
-use iam::{auth, get_global_action_cred};
 use madmin::metrics::RealtimeMetrics;
 use madmin::utils::parse_duration;
 use matchit::Params;
@@ -35,7 +29,6 @@ use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{s3_error, Body, S3Error, S3Request, S3Response, S3Result};
 use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use serde_urlencoded::from_bytes;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -55,139 +48,6 @@ pub mod service_account;
 pub mod sts;
 pub mod trace;
 pub mod user;
-
-// check_key_valid get auth.cred
-pub async fn check_key_valid(security_token: Option<String>, ak: &str) -> S3Result<(auth::Credentials, bool)> {
-    let Some(mut cred) = get_global_action_cred() else {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("get_global_action_cred {:?}", IamError::IamSysNotInitialized),
-        ));
-    };
-
-    let sys_cred = cred.clone();
-
-    // warn!("check_key_valid cred {:?}, as: {:?}", &cred, &ak);
-    if cred.access_key != ak {
-        let Ok(iam_store) = iam::get() else {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
-            ));
-        };
-
-        let (u, ok) = iam_store
-            .check_key(ak)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {}", e)))?;
-
-        if !ok {
-            if let Some(u) = u {
-                if u.credentials.status == "off" {
-                    return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
-                }
-            }
-
-            return Err(s3_error!(InvalidRequest, "check key failed"));
-        }
-
-        let Some(u) = u else {
-            return Err(s3_error!(InvalidRequest, "check key failed"));
-        };
-
-        cred = u.credentials;
-    }
-
-    // warn!("check_key_valid cred {:?}", &cred);
-    // warn!("check_key_valid security_token {:?}", &security_token);
-
-    let claims = check_claims_from_token(&security_token.unwrap_or_default(), &cred)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {}", e)))?;
-
-    cred.claims = if !claims.is_empty() { Some(claims) } else { None };
-
-    let mut owner = sys_cred.access_key == cred.access_key || cred.parent_user == sys_cred.access_key;
-
-    // permitRootAccess
-    if let Some(claims) = &cred.claims {
-        if claims.contains_key(SESSION_POLICY_NAME) {
-            owner = false
-        }
-    }
-
-    Ok((cred, owner))
-}
-
-pub fn check_claims_from_token(token: &str, cred: &auth::Credentials) -> S3Result<HashMap<String, Value>> {
-    if !token.is_empty() && cred.access_key.is_empty() {
-        return Err(s3_error!(InvalidRequest, "no access key"));
-    }
-
-    if token.is_empty() && cred.is_temp() && !cred.is_service_account() {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
-    }
-
-    if !token.is_empty() && !cred.is_temp() {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
-    }
-
-    if !cred.is_service_account() && cred.is_temp() && token != cred.session_token {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
-    }
-
-    if cred.is_temp() && cred.is_expired() {
-        return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
-    }
-
-    let Some(sys_cred) = get_global_action_cred() else {
-        return Err(s3_error!(InternalError, "action cred not init"));
-    };
-
-    let mut secret = sys_cred.secret_key;
-
-    // TODO: REPLICATION
-
-    let mut token = token;
-
-    if cred.is_service_account() {
-        token = cred.session_token.as_str();
-        secret = cred.secret_key.clone();
-    }
-
-    if !token.is_empty() {
-        let claims: HashMap<String, Value> =
-            get_claims_from_token_with_secret(token, &secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?;
-        return Ok(claims);
-    }
-
-    Ok(HashMap::new())
-}
-
-pub fn get_session_token(hds: &HeaderMap) -> Option<String> {
-    hds.get("x-amz-security-token")
-        .map(|v| v.to_str().unwrap_or_default().to_string())
-}
-
-pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str) -> S3Result<()> {
-    if !policy.is_empty() {
-        let session_policy = Policy::parse_config(policy.as_bytes())
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse policy err {}", e)))?;
-        if session_policy.version.is_empty() {
-            return Err(s3_error!(InvalidRequest, "invalid policy"));
-        }
-
-        let policy_buf = serde_json::to_vec(&session_policy)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal policy err {}", e)))?;
-
-        if policy_buf.len() > 2048 {
-            return Err(s3_error!(InvalidRequest, "policy too large"));
-        }
-
-        claims.insert(SESSION_POLICY_NAME.to_string(), serde_json::Value::String(base64_encode(&policy_buf)));
-    }
-
-    Ok(())
-}
 
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
