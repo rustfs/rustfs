@@ -79,6 +79,9 @@ pub enum Error {
     #[error("action not allowed")]
     IAMActionNotAllowed,
 
+    #[error("invalid expiration")]
+    InvalidExpiration,
+
     #[error("no secret key with access key")]
     NoSecretKeyWithAccessKey,
 

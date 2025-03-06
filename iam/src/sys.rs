@@ -197,6 +197,10 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::IAMActionNotAllowed.into());
         }
 
+        if opts.expiration.is_none() {
+            return Err(IamError::InvalidExpiration.into());
+        }
+
         // TODO: check allow_site_replicator_account
 
         let policy_buf = if let Some(policy) = opts.session_policy {
@@ -229,9 +233,13 @@ impl<T: Store> IamSys<T> {
             }
         }
 
+        // set expiration time default to 1 hour
         m.insert(
             "exp".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(opts.expiration.map_or(0, |t| t.unix_timestamp()))),
+            serde_json::Value::Number(serde_json::Number::from(
+                opts.expiration
+                    .map_or(OffsetDateTime::now_utc().unix_timestamp() + 3600, |t| t.unix_timestamp()),
+            )),
         );
 
         let (access_key, secret_key) = if !opts.access_key.is_empty() || !opts.secret_key.is_empty() {
@@ -385,7 +393,7 @@ impl<T: Store> IamSys<T> {
             return Ok(());
         };
 
-        if u.credentials.is_service_account() {
+        if !u.credentials.is_service_account() {
             return Ok(());
         }
 

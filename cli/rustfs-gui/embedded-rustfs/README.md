@@ -1,0 +1,1 @@
+rustfs bin path, do not delete

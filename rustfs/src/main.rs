@@ -6,13 +6,17 @@ mod grpc;
 mod logging;
 mod service;
 mod storage;
+mod utils;
 
 use crate::auth::IAMAuth;
+use crate::console::{init_console_cfg, CONSOLE_CONFIG};
+use chrono::Datelike;
 use clap::Parser;
 use common::{
     error::{Error, Result},
     globals::set_global_addr,
 };
+use config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::utils::net::{self, get_available_port};
 use ecstore::{
@@ -39,18 +43,20 @@ use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
 
-    let env_filter = EnvFilter::from_default_env();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let enable_color = std::io::stdout().is_terminal();
 
-    let subscriber = fmt()
+    let subscriber = tracing_subscriber::fmt::fmt()
         .pretty()
         .with_env_filter(env_filter)
         .with_ansi(enable_color)
+        .with_file(true)
+        .with_line_number(true)
         .finish()
         .with(ErrorLayer::default());
 
@@ -64,6 +70,18 @@ fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
         Some(t) if token == t => Ok(req),
         _ => Err(Status::unauthenticated("No valid auth token")),
     }
+}
+
+fn print_server_info() {
+    let cfg = CONSOLE_CONFIG.get().unwrap();
+    let current_year = chrono::Utc::now().year();
+
+    // 使用自定义宏打印服务器信息
+    info!("RustFS Object Storage Server");
+    info!("Copyright: 2024-{} RustFS, Inc", current_year);
+    info!("License: {}", cfg.license());
+    info!("Version: {}", cfg.version());
+    info!("Docs: {}", cfg.doc());
 }
 
 fn main() -> Result<()> {
@@ -102,13 +120,39 @@ async fn run(opt: config::Opt) -> Result<()> {
     let listener = TcpListener::bind(server_address.clone()).await?;
     //获取监听地址
     let local_addr: SocketAddr = listener.local_addr()?;
+    let local_ip = utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
     // 用于 rpc
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
 
+    // Print MinIO-style logging for pool formatting
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
-        debug!(
+        info!(
+            "Formatting {}st pool, {} set(s), {} drives per set.",
+            i + 1,
+            eps.set_count,
+            eps.drives_per_set
+        );
+
+        // Add warning for host with multiple drives in a set (similar to MinIO)
+        if eps.drives_per_set > 1 {
+            warn!("WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable.");
+        }
+    }
+
+    // Detailed endpoint information (showing all API endpoints)
+    let api_endpoints = format!("http://{}:{}", local_ip, server_port);
+    let localhost_endpoint = format!("http://127.0.0.1:{}", server_port);
+    info!("API: {}  {}", api_endpoints, localhost_endpoint);
+    info!("   RootUser: {}", opt.access_key.clone());
+    info!("   RootPass: {}", opt.secret_key.clone());
+    if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+        warn!("Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables", DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY);
+    }
+
+    for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
+        info!(
             "created endpoints {}, set_count:{}, drives_per_set: {}, cmd: {:?}",
             i, eps.set_count, eps.drives_per_set, eps.cmd_line
         );
@@ -131,9 +175,12 @@ async fn run(opt: config::Opt) -> Result<()> {
         // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(server_address.clone(), endpoint_pools).await?);
         let mut b = S3ServiceBuilder::new(store.clone());
 
+        let access_key = opt.access_key.clone();
+        let secret_key = opt.secret_key.clone();
         //显示 info 信息
-        info!("authentication is enabled {}, {}", &opt.access_key, &opt.secret_key);
-        b.set_auth(IAMAuth::new(opt.access_key, opt.secret_key));
+        debug!("authentication is enabled {}, {}", &access_key, &secret_key);
+
+        b.set_auth(IAMAuth::new(access_key, secret_key));
 
         b.set_access(store.clone());
 
@@ -175,11 +222,10 @@ async fn run(opt: config::Opt) -> Result<()> {
         let http_server = ConnBuilder::new(TokioExecutor::new());
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-        println!("server is running at http://{local_addr}");
 
         loop {
             let (socket, _) = tokio::select! {
-                res =  listener.accept() => {
+                res = listener.accept() => {
                     match res {
                         Ok(conn) => conn,
                         Err(err) => {
@@ -222,7 +268,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         error!("ECStore init faild {:?}", &err);
         Error::from_string(err.to_string())
     })?;
-    warn!(" init store success!");
+    debug!("init store success!");
 
     init_iam_sys(store.clone()).await.unwrap();
 
@@ -236,18 +282,17 @@ async fn run(opt: config::Opt) -> Result<()> {
     // init auto heal
     init_auto_heal().await;
 
-    info!("server was started");
+    let srv_addr = format!("http://{}:{}", local_ip, server_port);
+    init_console_cfg(&srv_addr);
+    print_server_info();
 
     if opt.console_enable {
-        info!("console is enabled");
+        debug!("console is enabled");
+        let access_key = opt.access_key.clone();
+        let secret_key = opt.secret_key.clone();
+        let console_address = opt.console_address.clone();
         tokio::spawn(async move {
-            let ep = if !opt.server_domains.is_empty() {
-                format!("http://{}", opt.server_domains[0].clone())
-            } else {
-                format!("http://127.0.0.1:{}", server_port)
-            };
-
-            console::start_static_file_server(&opt.console_address, &ep).await;
+            console::start_static_file_server(&console_address, local_ip, &access_key, &secret_key).await;
         });
     }
 
