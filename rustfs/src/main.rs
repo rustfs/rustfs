@@ -282,8 +282,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     // init auto heal
     init_auto_heal().await;
 
-    let srv_addr = format!("http://{}:{}", local_ip, server_port);
-    init_console_cfg(&srv_addr);
+    init_console_cfg(local_ip, server_port);
+
     print_server_info();
 
     if opt.console_enable {

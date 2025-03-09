@@ -1,16 +1,19 @@
-use crate::admin::{
-    handlers::{check_key_valid, get_session_token, populate_session_policy},
-    router::Operation,
+use std::collections::HashMap;
+
+use crate::{
+    admin::router::Operation,
+    auth::{check_key_valid, get_session_token},
 };
-use ecstore::utils::xml;
+use ecstore::utils::{crypto::base64_encode, xml};
 use http::StatusCode;
-use iam::{auth::get_new_credentials_with_metadata, manager::get_token_signing_key};
+use iam::{auth::get_new_credentials_with_metadata, manager::get_token_signing_key, policy::Policy, sys::SESSION_POLICY_NAME};
 use matchit::Params;
 use s3s::{
     dto::{AssumeRoleOutput, Credentials, Timestamp},
     s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use serde_urlencoded::from_bytes;
 use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
@@ -43,7 +46,7 @@ impl Operation for AssumeRoleHandle {
             return Err(s3_error!(InvalidRequest, "AccessDenied1"));
         }
 
-        let (cred, _owner) = check_key_valid(session_token, &user.access_key).await?;
+        let (cred, _owner) = check_key_valid(&req.headers, &user.access_key).await?;
 
         // // TODO: 判断权限, 不允许sts访问
         if cred.is_temp() || cred.is_service_account() {
@@ -136,4 +139,25 @@ impl Operation for AssumeRoleHandle {
 
         Ok(S3Response::new((StatusCode::OK, Body::from(output))))
     }
+}
+
+pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str) -> S3Result<()> {
+    if !policy.is_empty() {
+        let session_policy = Policy::parse_config(policy.as_bytes())
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse policy err {}", e)))?;
+        if session_policy.version.is_empty() {
+            return Err(s3_error!(InvalidRequest, "invalid policy"));
+        }
+
+        let policy_buf = serde_json::to_vec(&session_policy)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal policy err {}", e)))?;
+
+        if policy_buf.len() > 2048 {
+            return Err(s3_error!(InvalidRequest, "policy too large"));
+        }
+
+        claims.insert(SESSION_POLICY_NAME.to_string(), serde_json::Value::String(base64_encode(&policy_buf)));
+    }
+
+    Ok(())
 }
