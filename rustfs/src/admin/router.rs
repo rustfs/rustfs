@@ -78,6 +78,14 @@ where
 
         return Err(s3_error!(NotImplemented));
     }
+
+    // check_access before call
+    async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        match req.credentials {
+            Some(_) => Ok(()),
+            None => Err(s3_error!(AccessDenied, "Signature is required")),
+        }
+    }
 }
 
 #[async_trait::async_trait]

@@ -1,6 +1,8 @@
+use super::access::authorize_request;
 use super::options::del_opts;
 use super::options::extract_metadata;
 use super::options::put_opts;
+use crate::storage::access::ReqInfo;
 use bytes::Bytes;
 use common::error::Result;
 use ecstore::bucket::error::BucketMetadataError;
@@ -36,6 +38,8 @@ use ecstore::xhttp;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
+use iam::policy::action::Action;
+use iam::policy::action::S3Action;
 use lazy_static::lazy_static;
 use log::warn;
 use s3s::dto::*;
@@ -536,14 +540,36 @@ impl S3 for FS {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn list_buckets(&self, _: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
+    async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         // mc ls
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(to_s3_error)?;
+        let mut bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(to_s3_error)?;
+
+        let mut req = req;
+
+        if authorize_request(&mut req, vec![Action::S3Action(S3Action::ListAllMyBucketsAction)])
+            .await
+            .is_err()
+        {
+            bucket_infos.retain(|info| {
+                let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+
+                req_info.bucket = Some(info.name.clone());
+
+                futures::executor::block_on(async {
+                    authorize_request(&mut req, vec![Action::S3Action(S3Action::ListBucketAction)])
+                        .await
+                        .is_ok()
+                        || authorize_request(&mut req, vec![Action::S3Action(S3Action::GetBucketLocationAction)])
+                            .await
+                            .is_ok()
+                })
+            });
+        }
 
         let buckets: Vec<Bucket> = bucket_infos
             .iter()
@@ -911,9 +937,9 @@ impl S3 for FS {
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let _input = req.input;
 
-        let output = UploadPartCopyOutput { ..Default::default() };
+        let _output = UploadPartCopyOutput { ..Default::default() };
 
-        Ok(S3Response::new(output))
+        unimplemented!("upload_part_copy");
     }
 
     #[tracing::instrument(level = "debug", skip(self, req))]

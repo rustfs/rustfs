@@ -1,28 +1,55 @@
-use std::str::FromStr;
-
 use super::ecfs::FS;
-
-use ecstore::bucket::policy::action::Action;
-use http::HeaderMap;
+use crate::auth::{check_key_valid, get_condition_values};
+use iam::auth;
+use iam::error::Error as IamError;
+use iam::policy::action::{Action, S3Action};
+use iam::sys::Args;
 use s3s::access::{S3Access, S3AccessContext};
-
-use s3s::auth::Credentials;
-use s3s::{dto::*, s3_error, S3Request, S3Result};
+use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Result};
+use std::collections::HashMap;
 use tracing::info;
-use uuid::Uuid;
 
 #[allow(dead_code)]
 #[derive(Default, Clone)]
-struct ReqInfo {
-    pub card: Option<Credentials>,
-    pub action: Option<Action>,
+pub(crate) struct ReqInfo {
+    pub cred: auth::Credentials,
+    pub is_owner: bool,
     pub bucket: Option<String>,
     pub object: Option<String>,
-    pub version_id: Option<Uuid>,
+    pub version_id: Option<String>,
 }
 
-async fn authorize_request(_req: &ReqInfo, _hs: &HeaderMap, _action: Action) -> S3Result<()> {
-    // TODO: globalIAMSys.IsAllowed
+pub async fn authorize_request<T>(req: &mut S3Request<T>, actions: Vec<Action>) -> S3Result<()> {
+    let Ok(iam_store) = iam::get() else {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
+        ));
+    };
+
+    let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+
+    let default_claims = HashMap::new();
+    let claims = req_info.cred.claims.as_ref().unwrap_or(&default_claims);
+    let conditions = get_condition_values(&req.headers, &req_info.cred);
+
+    for action in actions {
+        let args = &Args {
+            account: &req_info.cred.access_key,
+            groups: &req_info.cred.groups,
+            action,
+            bucket: req_info.bucket.as_deref().unwrap_or(""),
+            conditions: &conditions,
+            is_owner: req_info.is_owner,
+            object: req_info.object.as_deref().unwrap_or(""),
+            claims,
+            deny_only: false,
+        };
+        if !iam_store.is_allowed(args).await {
+            return Err(s3_error!(AccessDenied, "Access Denied"));
+        }
+    }
+
     Ok(())
 }
 
@@ -45,30 +72,27 @@ impl S3Access for FS {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // 上层验证了 ak/sk
         info!(
-            "s3 check path: {:?}, s3_op: {:?}, cred: {:?}",
+            "s3 check uri: {:?}, method: {:?} path: {:?}, s3_op: {:?}, cred: {:?}, headers:{:?}",
+            cx.uri(),
+            cx.method(),
             cx.s3_path(),
             cx.s3_op().name(),
-            cx.credentials()
+            cx.credentials(),
+            cx.headers(),
+            // cx.extensions_mut(),
         );
 
-        if cx.credentials().is_none() {
+        let Some(input_cred) = cx.credentials() else {
             return Err(s3_error!(UnauthorizedAccess, "Signature is required"));
         };
 
-        // TODO: FIXME: check auth
-
-        let action = match Action::from_str(format!("s3:{}", cx.s3_op().name()).as_str()) {
-            Ok(res) => Some(res),
-            Err(_) => None,
-        };
+        let (cred, is_owner) = check_key_valid(cx.headers(), &input_cred.access_key).await?;
 
         let req_info = ReqInfo {
-            card: cx.credentials().cloned(),
-            action,
+            cred,
+            is_owner,
             ..Default::default()
         };
-
-        // warn!("req_info {:?}", req_info);
 
         let ext = cx.extensions_mut();
         ext.insert(req_info);
@@ -82,14 +106,23 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
-        if let Some(req_info) = req.extensions.get_mut::<ReqInfo>() {
-            let CreateBucketInput { bucket, .. } = &req.input;
-            req_info.bucket = Some(bucket.to_owned());
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
 
-            authorize_request(req_info, &req.headers, Action::CreateBucket).await
-        } else {
-            Err(s3_error!(AccessDenied, "AccessDenied"))
+        authorize_request(req, vec![Action::S3Action(S3Action::CreateBucketAction)]).await?;
+
+        if req.input.object_lock_enabled_for_bucket.is_some_and(|v| v) {
+            authorize_request(
+                req,
+                vec![
+                    Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction),
+                    Action::S3Action(S3Action::PutBucketVersioningAction),
+                ],
+            )
+            .await?;
         }
+
+        Ok(())
     }
     /// Checks whether the AbortMultipartUpload request has accesses to the resources.
     ///
@@ -108,8 +141,32 @@ impl S3Access for FS {
     /// Checks whether the CopyObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn copy_object(&self, _req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
-        Ok(())
+    async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
+        {
+            let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+            let (src_bucket, src_key, version_id) = match &req.input.copy_source {
+                CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+                CopySource::Bucket {
+                    ref bucket,
+                    ref key,
+                    version_id,
+                } => (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string())),
+            };
+
+            req_info.bucket = Some(src_bucket);
+            req_info.object = Some(src_key);
+            req_info.version_id = version_id;
+
+            authorize_request(req, vec![Action::S3Action(S3Action::GetObjectAction)]).await?;
+        }
+
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectAction)]).await
     }
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
@@ -122,7 +179,15 @@ impl S3Access for FS {
     /// Checks whether the DeleteBucket request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket(&self, _req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
+    async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::DeleteBucketAction)]).await?;
+
+        if req.input.force_delete.is_some_and(|v| v) {
+            authorize_request(req, vec![Action::S3Action(S3Action::ForceDeleteBucketAction)]).await?;
+        }
         Ok(())
     }
 
@@ -139,15 +204,21 @@ impl S3Access for FS {
     /// Checks whether the DeleteBucketCors request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket_cors(&self, _req: &mut S3Request<DeleteBucketCorsInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_bucket_cors(&self, req: &mut S3Request<DeleteBucketCorsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketCorsAction)]).await
     }
 
     /// Checks whether the DeleteBucketEncryption request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket_encryption(&self, _req: &mut S3Request<DeleteBucketEncryptionInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_bucket_encryption(&self, req: &mut S3Request<DeleteBucketEncryptionInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketEncryptionAction)]).await
     }
 
     /// Checks whether the DeleteBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -173,8 +244,11 @@ impl S3Access for FS {
     /// Checks whether the DeleteBucketLifecycle request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket_lifecycle(&self, _req: &mut S3Request<DeleteBucketLifecycleInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_bucket_lifecycle(&self, req: &mut S3Request<DeleteBucketLifecycleInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketLifecycleAction)]).await
     }
 
     /// Checks whether the DeleteBucketMetricsConfiguration request has accesses to the resources.
@@ -197,22 +271,31 @@ impl S3Access for FS {
     /// Checks whether the DeleteBucketPolicy request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket_policy(&self, _req: &mut S3Request<DeleteBucketPolicyInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_bucket_policy(&self, req: &mut S3Request<DeleteBucketPolicyInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::DeleteBucketPolicyAction)]).await
     }
 
     /// Checks whether the DeleteBucketReplication request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket_replication(&self, _req: &mut S3Request<DeleteBucketReplicationInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_bucket_replication(&self, req: &mut S3Request<DeleteBucketReplicationInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutReplicationConfigurationAction)]).await
     }
 
     /// Checks whether the DeleteBucketTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_bucket_tagging(&self, _req: &mut S3Request<DeleteBucketTaggingInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_bucket_tagging(&self, req: &mut S3Request<DeleteBucketTaggingInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketTaggingAction)]).await
     }
 
     /// Checks whether the DeleteBucketWebsite request has accesses to the resources.
@@ -225,15 +308,25 @@ impl S3Access for FS {
     /// Checks whether the DeleteObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_object(&self, _req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::DeleteObjectAction)]).await
     }
 
     /// Checks whether the DeleteObjectTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn delete_object_tagging(&self, _req: &mut S3Request<DeleteObjectTaggingInput>) -> S3Result<()> {
-        Ok(())
+    async fn delete_object_tagging(&self, req: &mut S3Request<DeleteObjectTaggingInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::DeleteObjectTaggingAction)]).await
     }
 
     /// Checks whether the DeleteObjects request has accesses to the resources.
@@ -263,8 +356,11 @@ impl S3Access for FS {
     /// Checks whether the GetBucketAcl request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_acl(&self, _req: &mut S3Request<GetBucketAclInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_acl(&self, req: &mut S3Request<GetBucketAclInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketPolicyAction)]).await
     }
 
     /// Checks whether the GetBucketAnalyticsConfiguration request has accesses to the resources.
@@ -280,15 +376,21 @@ impl S3Access for FS {
     /// Checks whether the GetBucketCors request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_cors(&self, _req: &mut S3Request<GetBucketCorsInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_cors(&self, req: &mut S3Request<GetBucketCorsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketCorsAction)]).await
     }
 
     /// Checks whether the GetBucketEncryption request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_encryption(&self, _req: &mut S3Request<GetBucketEncryptionInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_encryption(&self, req: &mut S3Request<GetBucketEncryptionInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketEncryptionAction)]).await
     }
 
     /// Checks whether the GetBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -316,16 +418,22 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn get_bucket_lifecycle_configuration(
         &self,
-        _req: &mut S3Request<GetBucketLifecycleConfigurationInput>,
+        req: &mut S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<()> {
-        Ok(())
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketLifecycleAction)]).await
     }
 
     /// Checks whether the GetBucketLocation request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_location(&self, _req: &mut S3Request<GetBucketLocationInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_location(&self, req: &mut S3Request<GetBucketLocationInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketLocationAction)]).await
     }
 
     /// Checks whether the GetBucketLogging request has accesses to the resources.
@@ -347,9 +455,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn get_bucket_notification_configuration(
         &self,
-        _req: &mut S3Request<GetBucketNotificationConfigurationInput>,
+        req: &mut S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<()> {
-        Ok(())
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketNotificationAction)]).await
     }
 
     /// Checks whether the GetBucketOwnershipControls request has accesses to the resources.
@@ -362,22 +473,31 @@ impl S3Access for FS {
     /// Checks whether the GetBucketPolicy request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_policy(&self, _req: &mut S3Request<GetBucketPolicyInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_policy(&self, req: &mut S3Request<GetBucketPolicyInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketPolicyAction)]).await
     }
 
     /// Checks whether the GetBucketPolicyStatus request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_policy_status(&self, _req: &mut S3Request<GetBucketPolicyStatusInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_policy_status(&self, req: &mut S3Request<GetBucketPolicyStatusInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketPolicyStatusAction)]).await
     }
 
     /// Checks whether the GetBucketReplication request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_replication(&self, _req: &mut S3Request<GetBucketReplicationInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_replication(&self, req: &mut S3Request<GetBucketReplicationInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetReplicationConfigurationAction)]).await
     }
 
     /// Checks whether the GetBucketRequestPayment request has accesses to the resources.
@@ -390,15 +510,21 @@ impl S3Access for FS {
     /// Checks whether the GetBucketTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_tagging(&self, _req: &mut S3Request<GetBucketTaggingInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_tagging(&self, req: &mut S3Request<GetBucketTaggingInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketTaggingAction)]).await
     }
 
     /// Checks whether the GetBucketVersioning request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_bucket_versioning(&self, _req: &mut S3Request<GetBucketVersioningInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_bucket_versioning(&self, req: &mut S3Request<GetBucketVersioningInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketVersioningAction)]).await
     }
 
     /// Checks whether the GetBucketWebsite request has accesses to the resources.
@@ -411,50 +537,92 @@ impl S3Access for FS {
     /// Checks whether the GetObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_object(&self, _req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectAction)]).await
     }
 
     /// Checks whether the GetObjectAcl request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_object_acl(&self, _req: &mut S3Request<GetObjectAclInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_object_acl(&self, req: &mut S3Request<GetObjectAclInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketPolicyAction)]).await
     }
 
     /// Checks whether the GetObjectAttributes request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_object_attributes(&self, _req: &mut S3Request<GetObjectAttributesInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_object_attributes(&self, req: &mut S3Request<GetObjectAttributesInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        let mut actions = Vec::new();
+        if req.input.version_id.is_some() {
+            actions.push(Action::S3Action(S3Action::GetObjectVersionAttributesAction));
+            actions.push(Action::S3Action(S3Action::GetObjectVersionAction));
+        } else {
+            actions.push(Action::S3Action(S3Action::GetObjectAttributesAction));
+            actions.push(Action::S3Action(S3Action::GetObjectAction));
+        }
+
+        authorize_request(req, actions).await
     }
 
     /// Checks whether the GetObjectLegalHold request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_object_legal_hold(&self, _req: &mut S3Request<GetObjectLegalHoldInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_object_legal_hold(&self, req: &mut S3Request<GetObjectLegalHoldInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectLegalHoldAction)]).await
     }
 
     /// Checks whether the GetObjectLockConfiguration request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_object_lock_configuration(&self, _req: &mut S3Request<GetObjectLockConfigurationInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_object_lock_configuration(&self, req: &mut S3Request<GetObjectLockConfigurationInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketObjectLockConfigurationAction)]).await
     }
 
     /// Checks whether the GetObjectRetention request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_object_retention(&self, _req: &mut S3Request<GetObjectRetentionInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_object_retention(&self, req: &mut S3Request<GetObjectRetentionInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectRetentionAction)]).await
     }
 
     /// Checks whether the GetObjectTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn get_object_tagging(&self, _req: &mut S3Request<GetObjectTaggingInput>) -> S3Result<()> {
-        Ok(())
+    async fn get_object_tagging(&self, req: &mut S3Request<GetObjectTaggingInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectTaggingAction)]).await
     }
 
     /// Checks whether the GetObjectTorrent request has accesses to the resources.
@@ -474,15 +642,23 @@ impl S3Access for FS {
     /// Checks whether the HeadBucket request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn head_bucket(&self, _req: &mut S3Request<HeadBucketInput>) -> S3Result<()> {
-        Ok(())
+    async fn head_bucket(&self, req: &mut S3Request<HeadBucketInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::ListBucketAction)]).await
     }
 
     /// Checks whether the HeadObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn head_object(&self, _req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
-        Ok(())
+    async fn head_object(&self, req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectAction)]).await
     }
 
     /// Checks whether the ListBucketAnalyticsConfigurations request has accesses to the resources.
@@ -529,14 +705,18 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_buckets(&self, _req: &mut S3Request<ListBucketsInput>) -> S3Result<()> {
+        // check inside
         Ok(())
     }
 
     /// Checks whether the ListMultipartUploads request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn list_multipart_uploads(&self, _req: &mut S3Request<ListMultipartUploadsInput>) -> S3Result<()> {
-        Ok(())
+    async fn list_multipart_uploads(&self, req: &mut S3Request<ListMultipartUploadsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::ListBucketMultipartUploadsAction)]).await
     }
 
     /// Checks whether the ListObjectVersions request has accesses to the resources.
@@ -549,15 +729,21 @@ impl S3Access for FS {
     /// Checks whether the ListObjects request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn list_objects(&self, _req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
-        Ok(())
+    async fn list_objects(&self, req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::ListBucketAction)]).await
     }
 
     /// Checks whether the ListObjectsV2 request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn list_objects_v2(&self, _req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
-        Ok(())
+    async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::ListBucketAction)]).await
     }
 
     /// Checks whether the ListParts request has accesses to the resources.
@@ -580,8 +766,11 @@ impl S3Access for FS {
     /// Checks whether the PutBucketAcl request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_acl(&self, _req: &mut S3Request<PutBucketAclInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_acl(&self, req: &mut S3Request<PutBucketAclInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketPolicyAction)]).await
     }
 
     /// Checks whether the PutBucketAnalyticsConfiguration request has accesses to the resources.
@@ -597,15 +786,21 @@ impl S3Access for FS {
     /// Checks whether the PutBucketCors request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_cors(&self, _req: &mut S3Request<PutBucketCorsInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_cors(&self, req: &mut S3Request<PutBucketCorsInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketCorsAction)]).await
     }
 
     /// Checks whether the PutBucketEncryption request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_encryption(&self, _req: &mut S3Request<PutBucketEncryptionInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_encryption(&self, req: &mut S3Request<PutBucketEncryptionInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketEncryptionAction)]).await
     }
 
     /// Checks whether the PutBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -633,9 +828,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_bucket_lifecycle_configuration(
         &self,
-        _req: &mut S3Request<PutBucketLifecycleConfigurationInput>,
+        req: &mut S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<()> {
-        Ok(())
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketLifecycleAction)]).await
     }
 
     /// Checks whether the PutBucketLogging request has accesses to the resources.
@@ -657,9 +855,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_bucket_notification_configuration(
         &self,
-        _req: &mut S3Request<PutBucketNotificationConfigurationInput>,
+        req: &mut S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<()> {
-        Ok(())
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketNotificationAction)]).await
     }
 
     /// Checks whether the PutBucketOwnershipControls request has accesses to the resources.
@@ -672,15 +873,21 @@ impl S3Access for FS {
     /// Checks whether the PutBucketPolicy request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_policy(&self, _req: &mut S3Request<PutBucketPolicyInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_policy(&self, req: &mut S3Request<PutBucketPolicyInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketPolicyAction)]).await
     }
 
     /// Checks whether the PutBucketReplication request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_replication(&self, _req: &mut S3Request<PutBucketReplicationInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_replication(&self, req: &mut S3Request<PutBucketReplicationInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutReplicationConfigurationAction)]).await
     }
 
     /// Checks whether the PutBucketRequestPayment request has accesses to the resources.
@@ -693,15 +900,21 @@ impl S3Access for FS {
     /// Checks whether the PutBucketTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_tagging(&self, _req: &mut S3Request<PutBucketTaggingInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_tagging(&self, req: &mut S3Request<PutBucketTaggingInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketTaggingAction)]).await
     }
 
     /// Checks whether the PutBucketVersioning request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_bucket_versioning(&self, _req: &mut S3Request<PutBucketVersioningInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_bucket_versioning(&self, req: &mut S3Request<PutBucketVersioningInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketVersioningAction)]).await
     }
 
     /// Checks whether the PutBucketWebsite request has accesses to the resources.
@@ -714,43 +927,71 @@ impl S3Access for FS {
     /// Checks whether the PutObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_object(&self, _req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectAction)]).await
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_object_acl(&self, _req: &mut S3Request<PutObjectAclInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_object_acl(&self, req: &mut S3Request<PutObjectAclInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketPolicyAction)]).await
     }
 
     /// Checks whether the PutObjectLegalHold request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_object_legal_hold(&self, _req: &mut S3Request<PutObjectLegalHoldInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_object_legal_hold(&self, req: &mut S3Request<PutObjectLegalHoldInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectLegalHoldAction)]).await
     }
 
     /// Checks whether the PutObjectLockConfiguration request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_object_lock_configuration(&self, _req: &mut S3Request<PutObjectLockConfigurationInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_object_lock_configuration(&self, req: &mut S3Request<PutObjectLockConfigurationInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)]).await
     }
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_object_retention(&self, _req: &mut S3Request<PutObjectRetentionInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_object_retention(&self, req: &mut S3Request<PutObjectRetentionInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectRetentionAction)]).await
     }
 
     /// Checks whether the PutObjectTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn put_object_tagging(&self, _req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
-        Ok(())
+    async fn put_object_tagging(&self, req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectTaggingAction)]).await
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.
@@ -763,22 +1004,35 @@ impl S3Access for FS {
     /// Checks whether the RestoreObject request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn restore_object(&self, _req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
-        Ok(())
+    async fn restore_object(&self, req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+        req_info.version_id = req.input.version_id.clone();
+
+        authorize_request(req, vec![Action::S3Action(S3Action::RestoreObjectAction)]).await
     }
 
     /// Checks whether the SelectObjectContent request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn select_object_content(&self, _req: &mut S3Request<SelectObjectContentInput>) -> S3Result<()> {
-        Ok(())
+    async fn select_object_content(&self, req: &mut S3Request<SelectObjectContentInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectAction)]).await
     }
 
     /// Checks whether the UploadPart request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
-    async fn upload_part(&self, _req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
-        Ok(())
+    async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
+        let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
+        req_info.bucket = Some(req.input.bucket.clone());
+        req_info.object = Some(req.input.key.clone());
+
+        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectAction)]).await
     }
 
     /// Checks whether the UploadPartCopy request has accesses to the resources.

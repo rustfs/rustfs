@@ -9,10 +9,9 @@ use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;
 
-use crate::admin::{
-    handlers::{check_key_valid, get_session_token},
-    router::Operation,
-    utils::has_space_be,
+use crate::{
+    admin::{router::Operation, utils::has_space_be},
+    auth::check_key_valid,
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -40,7 +39,7 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) = check_key_valid(get_session_token(&req.headers), &input_cred.access_key).await?;
+        let (cred, _owner) = check_key_valid(&req.headers, &input_cred.access_key).await?;
 
         let ak = query.access_key.as_deref().unwrap_or_default();
 
@@ -247,7 +246,7 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) = check_key_valid(get_session_token(&req.headers), &input_cred.access_key).await?;
+        let (cred, _owner) = check_key_valid(&req.headers, &input_cred.access_key).await?;
 
         let sys_cred = get_global_action_cred()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
