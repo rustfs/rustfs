@@ -7,7 +7,7 @@ use tracing::{debug, error, info};
 ///     
 /// # Example
 /// ```
-/// use rustfs_logging::log_info;
+/// use rustfs_obs::log_info;
 ///
 /// log_info("This is an info message");
 /// ```
@@ -22,7 +22,7 @@ pub fn log_info(msg: &str) {
 ///
 /// # Example
 /// ```
-/// use rustfs_logging::log_error;
+/// use rustfs_obs::log_error;
 ///
 /// log_error("This is an error message");
 /// ```
@@ -37,7 +37,7 @@ pub fn log_error(msg: &str) {
 ///
 /// # Example
 /// ```
-/// use rustfs_logging::log_debug;
+/// use rustfs_obs::log_debug;
 ///
 /// log_debug("This is a debug message");
 /// ```

@@ -25,7 +25,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 ///
 /// # Example
 /// ```
-/// use rustfs_logging::Telemetry;
+/// use rustfs_obs::Telemetry;
 ///
 /// let _telemetry = Telemetry::init();
 /// ```

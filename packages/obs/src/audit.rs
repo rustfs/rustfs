@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 /// * `span_id` - The span ID of the event
 /// # Example
 /// ```
-/// use rustfs_logging::AuditEntry;
+/// use rustfs_obs::AuditEntry;
 /// let entry = AuditEntry {
 ///     version: "1.0".to_string(),
 ///     event_type: "read".to_string(),
@@ -63,7 +63,7 @@ impl AuditTarget for FileAuditTarget {
     ///
     /// # Example
     /// ```
-    /// use rustfs_logging::{AuditEntry, AuditTarget, FileAuditTarget};
+    /// use rustfs_obs::{AuditEntry, AuditTarget, FileAuditTarget};
     /// let entry = AuditEntry {
     ///     version: "1.0".to_string(),
     ///     event_type: "read".to_string(),
@@ -88,7 +88,7 @@ impl AuditTarget for FileAuditTarget {
 /// * `url` - The URL of the webhook
 /// # Example
 /// ```
-/// use rustfs_logging::WebhookAuditTarget;
+/// use rustfs_obs::WebhookAuditTarget;
 /// let target = WebhookAuditTarget::new("http://localhost:8080");
 /// ```
 pub struct WebhookAuditTarget {
@@ -126,7 +126,7 @@ impl AuditTarget for WebhookAuditTarget {
 /// * `topic` - The Kafka topic
 /// # Example
 /// ```
-/// use rustfs_logging::KafkaAuditTarget;
+/// use rustfs_obs::KafkaAuditTarget;
 /// let target = KafkaAuditTarget::new("localhost:9092", "rustfs-audit");
 /// ```
 /// # Note
@@ -135,7 +135,7 @@ impl AuditTarget for WebhookAuditTarget {
 /// ```toml
 /// [dependencies]
 /// rdkafka = "0.26.0"
-/// rustfs_logging = { version = "0.1.0", features = ["audit-kafka"] }
+/// rustfs_obs = { version = "0.1.0", features = ["audit-kafka"] }
 /// ```
 /// # Note
 /// The `rdkafka` crate requires the `librdkafka` library to be installed
@@ -214,7 +214,7 @@ impl AuditTarget for KafkaAuditTarget {
 ///
 /// # Example
 /// ```
-/// use rustfs_logging::{AuditEntry, AuditLogger, FileAuditTarget};
+/// use rustfs_obs::{AuditEntry, AuditLogger, FileAuditTarget};
 ///
 /// #[tokio::main]
 /// async fn main() {
@@ -238,7 +238,7 @@ impl AuditTarget for KafkaAuditTarget {
 /// to multiple targets
 /// # Example
 /// ```
-/// use rustfs_logging::{AuditEntry, AuditLogger, FileAuditTarget};
+/// use rustfs_obs::{AuditEntry, AuditLogger, FileAuditTarget};
 /// let logger = AuditLogger::new(vec![Box::new(FileAuditTarget)]);
 /// ```
 /// # Note
@@ -247,7 +247,7 @@ impl AuditTarget for KafkaAuditTarget {
 /// ```toml
 /// [dependencies]
 /// tokio = { version = "1", features = ["full"] }
-/// rustfs_logging = { version = "0.1.0"}
+/// rustfs_obs = { version = "0.1.0"}
 /// ```
 /// # Note
 /// This feature requires the `serde` crate
@@ -255,7 +255,7 @@ impl AuditTarget for KafkaAuditTarget {
 /// ```toml
 /// [dependencies]
 /// serde = { version = "1", features = ["derive"] }
-/// rustfs_logging = { version = "0.1.0"}
+/// rustfs_obs = { version = "0.1.0"}
 /// ```
 pub struct AuditLogger {
     tx: mpsc::Sender<AuditEntry>,
@@ -270,7 +270,7 @@ impl AuditLogger {
     /// * An AuditLogger
     /// # Example
     /// ```
-    /// use rustfs_logging::{AuditLogger, AuditEntry, FileAuditTarget};
+    /// use rustfs_obs::{AuditLogger, AuditEntry, FileAuditTarget};
     ///
     /// let logger = AuditLogger::new(vec![Box::new(FileAuditTarget)]);
     /// ```
@@ -291,7 +291,7 @@ impl AuditLogger {
     /// * `entry` - The audit entry to log
     /// # Example
     /// ```
-    /// use rustfs_logging::{AuditEntry, AuditLogger, FileAuditTarget};
+    /// use rustfs_obs::{AuditEntry, AuditLogger, FileAuditTarget};
     ///
     /// #[tokio::main]
     /// async fn main() {

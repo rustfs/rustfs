@@ -1,5 +1,5 @@
 [package]
-name = "rustfs-logging"
+name = "rustfs-obs"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
