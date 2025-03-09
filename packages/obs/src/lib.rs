@@ -5,7 +5,7 @@
 ///
 /// # Examples
 /// ```
-/// use rustfs_logging::{log_info, log_error};
+/// use rustfs_obs::{log_info, log_error};
 ///
 /// log_info("This is an informational message");
 /// log_error("This is an error message");
@@ -24,7 +24,7 @@ mod telemetry;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{log_info, AuditEntry, AuditLogger, AuditTarget, FileAuditTarget, Telemetry};
     use chrono::Utc;
     use opentelemetry::global;
     use opentelemetry::trace::{TraceContextExt, Tracer};

@@ -76,6 +76,7 @@ mime_guess = "2.0.5"
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 local-ip-address = { workspace = true }
 chrono = { workspace = true }
+rustfs-obs = { workspace = true }
 
 [build-dependencies]
 prost-build.workspace = true
