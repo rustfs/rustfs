@@ -1,6 +1,7 @@
 pub mod endpoint;
 pub mod error;
 pub mod format;
+pub mod io;
 pub mod local;
 pub mod os;
 pub mod remote;
@@ -14,10 +15,8 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
-use crate::utils::proto_err_to_err;
 use crate::{
     bucket::{metadata_sys::get_versioning_config, versioning::VersioningApi},
-    erasure::Writer,
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion, VersionType},
     heal::{
@@ -28,28 +27,16 @@ use crate::{
     store_api::{FileInfo, ObjectInfo, RawFileInfo},
     utils::path::SLASH_SEPARATOR,
 };
-
 use endpoint::Endpoint;
 use error::DiskError;
-use futures::StreamExt;
+use io::{FileReader, FileWriter};
 use local::LocalDisk;
 use madmin::info_commands::DiskMetrics;
-use protos::proto_gen::node_service::{node_service_client::NodeServiceClient, WriteRequest, WriteResponse};
 use remote::RemoteDisk;
 use serde::{Deserialize, Serialize};
-use std::io::Read as _;
-use std::pin::Pin;
-use std::task::Poll;
-use std::{any::Any, cmp::Ordering, fmt::Debug, io::Cursor, path::PathBuf, sync::Arc};
+use std::{cmp::Ordering, fmt::Debug, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
-use tokio::io::AsyncRead;
-use tokio::{
-    fs::File,
-    io::{AsyncWrite, AsyncWriteExt},
-    sync::mpsc::{self, Sender},
-};
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{service::interceptor::InterceptedService, transport::Channel, Request, Status, Streaming};
+use tokio::{io::AsyncWrite, sync::mpsc::Sender};
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
@@ -1256,164 +1243,142 @@ pub struct ReadOptions {
 //     }
 // }
 
-#[derive(Debug)]
-pub enum FileWriter {
-    Local(LocalFileWriter),
-    Remote(RemoteFileWriter),
-    Buffer(BufferWriter),
-}
+// #[derive(Debug)]
+// pub struct BufferWriter {
+//     pub inner: Vec<u8>,
+// }
 
-#[async_trait::async_trait]
-impl Writer for FileWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+// impl BufferWriter {
+//     pub fn new(inner: Vec<u8>) -> Self {
+//         Self { inner }
+//     }
+//     #[allow(clippy::should_implement_trait)]
+//     pub fn as_ref(&self) -> &[u8] {
+//         self.inner.as_ref()
+//     }
+// }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        match self {
-            Self::Local(writer) => writer.write(buf).await,
-            Self::Remote(writter) => writter.write(buf).await,
-            Self::Buffer(writer) => writer.write(buf).await,
-        }
-    }
-}
+// #[async_trait::async_trait]
+// impl Writer for BufferWriter {
+//     fn as_any(&self) -> &dyn Any {
+//         self
+//     }
 
-#[derive(Debug)]
-pub struct BufferWriter {
-    pub inner: Vec<u8>,
-}
+//     async fn write(&mut self, buf: &[u8]) -> Result<()> {
+//         let _ = self.inner.write(buf).await?;
+//         self.inner.flush().await?;
 
-impl BufferWriter {
-    pub fn new(inner: Vec<u8>) -> Self {
-        Self { inner }
-    }
-    #[allow(clippy::should_implement_trait)]
-    pub fn as_ref(&self) -> &[u8] {
-        self.inner.as_ref()
-    }
-}
+//         Ok(())
+//     }
+// }
 
-#[async_trait::async_trait]
-impl Writer for BufferWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+// #[derive(Debug)]
+// pub struct LocalFileWriter {
+//     pub inner: File,
+// }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        let _ = self.inner.write(buf).await?;
-        self.inner.flush().await?;
+// impl LocalFileWriter {
+//     pub fn new(inner: File) -> Self {
+//         Self { inner }
+//     }
+// }
 
-        Ok(())
-    }
-}
+// #[async_trait::async_trait]
+// impl Writer for LocalFileWriter {
+//     fn as_any(&self) -> &dyn Any {
+//         self
+//     }
 
-#[derive(Debug)]
-pub struct LocalFileWriter {
-    pub inner: File,
-}
+//     async fn write(&mut self, buf: &[u8]) -> Result<()> {
+//         let _ = self.inner.write(buf).await?;
+//         self.inner.flush().await?;
 
-impl LocalFileWriter {
-    pub fn new(inner: File) -> Self {
-        Self { inner }
-    }
-}
+//         Ok(())
+//     }
+// }
 
-#[async_trait::async_trait]
-impl Writer for LocalFileWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+// type NodeClient = NodeServiceClient<
+//     InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
+// >;
 
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        let _ = self.inner.write(buf).await?;
-        self.inner.flush().await?;
+// #[derive(Debug)]
+// pub struct RemoteFileWriter {
+//     pub endpoint: Endpoint,
+//     pub volume: String,
+//     pub path: String,
+//     pub is_append: bool,
+//     tx: Sender<WriteRequest>,
+//     resp_stream: Streaming<WriteResponse>,
+// }
 
-        Ok(())
-    }
-}
+// impl RemoteFileWriter {
+//     pub async fn new(endpoint: Endpoint, volume: String, path: String, is_append: bool, mut client: NodeClient) -> Result<Self> {
+//         let (tx, rx) = mpsc::channel(128);
+//         let in_stream = ReceiverStream::new(rx);
 
-type NodeClient = NodeServiceClient<
-    InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
->;
+//         let response = client.write_stream(in_stream).await.unwrap();
 
-#[derive(Debug)]
-pub struct RemoteFileWriter {
-    pub endpoint: Endpoint,
-    pub volume: String,
-    pub path: String,
-    pub is_append: bool,
-    tx: Sender<WriteRequest>,
-    resp_stream: Streaming<WriteResponse>,
-}
+//         let resp_stream = response.into_inner();
 
-impl RemoteFileWriter {
-    pub async fn new(endpoint: Endpoint, volume: String, path: String, is_append: bool, mut client: NodeClient) -> Result<Self> {
-        let (tx, rx) = mpsc::channel(128);
-        let in_stream = ReceiverStream::new(rx);
+//         Ok(Self {
+//             endpoint,
+//             volume,
+//             path,
+//             is_append,
+//             tx,
+//             resp_stream,
+//         })
+//     }
+// }
 
-        let response = client.write_stream(in_stream).await.unwrap();
+// #[async_trait::async_trait]
+// impl Writer for RemoteFileWriter {
+//     fn as_any(&self) -> &dyn Any {
+//         self
+//     }
 
-        let resp_stream = response.into_inner();
+//     async fn write(&mut self, buf: &[u8]) -> Result<()> {
+//         let request = WriteRequest {
+//             disk: self.endpoint.to_string(),
+//             volume: self.volume.to_string(),
+//             path: self.path.to_string(),
+//             is_append: self.is_append,
+//             data: buf.to_vec(),
+//         };
+//         self.tx.send(request).await?;
 
-        Ok(Self {
-            endpoint,
-            volume,
-            path,
-            is_append,
-            tx,
-            resp_stream,
-        })
-    }
-}
+//         if let Some(resp) = self.resp_stream.next().await {
+//             // match resp {
+//             //     Ok(resp) => {
+//             //         if resp.success {
+//             //             info!("write stream success");
+//             //         } else {
+//             //             info!("write stream failed: {}", resp.error_info.unwrap_or("".to_string()));
+//             //         }
+//             //     }
+//             //     Err(_err) => {
 
-#[async_trait::async_trait]
-impl Writer for RemoteFileWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+//             //     }
+//             // }
+//             let resp = resp?;
+//             if resp.success {
+//                 info!("write stream success");
+//             } else {
+//                 return if let Some(err) = &resp.error {
+//                     Err(proto_err_to_err(err))
+//                 } else {
+//                     Err(Error::from_string(""))
+//                 };
+//             }
+//         } else {
+//             let error_info = "can not get response";
+//             info!("write stream failed: {}", error_info);
+//             return Err(Error::from_string(error_info));
+//         }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        let request = WriteRequest {
-            disk: self.endpoint.to_string(),
-            volume: self.volume.to_string(),
-            path: self.path.to_string(),
-            is_append: self.is_append,
-            data: buf.to_vec(),
-        };
-        self.tx.send(request).await?;
-
-        if let Some(resp) = self.resp_stream.next().await {
-            // match resp {
-            //     Ok(resp) => {
-            //         if resp.success {
-            //             info!("write stream success");
-            //         } else {
-            //             info!("write stream failed: {}", resp.error_info.unwrap_or("".to_string()));
-            //         }
-            //     }
-            //     Err(_err) => {
-
-            //     }
-            // }
-            let resp = resp?;
-            if resp.success {
-                info!("write stream success");
-            } else {
-                return if let Some(err) = &resp.error {
-                    Err(proto_err_to_err(err))
-                } else {
-                    Err(Error::from_string(""))
-                };
-            }
-        } else {
-            let error_info = "can not get response";
-            info!("write stream failed: {}", error_info);
-            return Err(Error::from_string(error_info));
-        }
-
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }
 
 // #[async_trait::async_trait]
 // pub trait Reader {
@@ -1421,29 +1386,6 @@ impl Writer for RemoteFileWriter {
 //     // async fn seek(&mut self, offset: usize) -> Result<()>;
 //     // async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize>;
 // }
-
-#[derive(Debug)]
-pub enum FileReader {
-    Local(LocalFileReader),
-    // Remote(RemoteFileReader),
-    Buffer(BufferReader),
-    Http(HttpFileReader),
-}
-
-impl AsyncRead for FileReader {
-    #[tracing::instrument(level = "debug", skip(self, buf))]
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        match &mut *self {
-            Self::Local(reader) => Pin::new(&mut reader.inner).poll_read(cx, buf),
-            Self::Buffer(reader) => Pin::new(&mut reader.inner).poll_read(cx, buf),
-            Self::Http(reader) => Pin::new(reader).poll_read(cx, buf),
-        }
-    }
-}
 
 // #[async_trait::async_trait]
 // impl Reader for FileReader {
@@ -1471,44 +1413,44 @@ impl AsyncRead for FileReader {
 //     // }
 // }
 
-#[derive(Debug)]
-pub struct BufferReader {
-    pub inner: Cursor<Vec<u8>>,
-    remaining: usize,
-}
+// #[derive(Debug)]
+// pub struct BufferReader {
+//     pub inner: Cursor<Vec<u8>>,
+//     remaining: usize,
+// }
 
-impl BufferReader {
-    pub fn new(inner: Vec<u8>, offset: usize, read_length: usize) -> Self {
-        let mut cur = Cursor::new(inner);
-        cur.set_position(offset as u64);
-        Self {
-            inner: cur,
-            remaining: offset + read_length,
-        }
-    }
-}
+// impl BufferReader {
+//     pub fn new(inner: Vec<u8>, offset: usize, read_length: usize) -> Self {
+//         let mut cur = Cursor::new(inner);
+//         cur.set_position(offset as u64);
+//         Self {
+//             inner: cur,
+//             remaining: offset + read_length,
+//         }
+//     }
+// }
 
-impl AsyncRead for BufferReader {
-    #[tracing::instrument(level = "debug", skip(self, buf))]
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        match Pin::new(&mut self.inner).poll_read(cx, buf) {
-            Poll::Ready(Ok(_)) => {
-                if self.inner.position() as usize >= self.remaining {
-                    self.remaining -= buf.filled().len();
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
+// impl AsyncRead for BufferReader {
+//     #[tracing::instrument(level = "debug", skip(self, buf))]
+//     fn poll_read(
+//         mut self: Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//         buf: &mut tokio::io::ReadBuf<'_>,
+//     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+//         match Pin::new(&mut self.inner).poll_read(cx, buf) {
+//             Poll::Ready(Ok(_)) => {
+//                 if self.inner.position() as usize >= self.remaining {
+//                     self.remaining -= buf.filled().len();
+//                     Poll::Ready(Ok(()))
+//                 } else {
+//                     Poll::Pending
+//                 }
+//             }
+//             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+//             Poll::Pending => Poll::Pending,
+//         }
+//     }
+// }
 
 // #[async_trait::async_trait]
 // impl Reader for BufferReader {
@@ -1537,17 +1479,17 @@ impl AsyncRead for BufferReader {
 //     // }
 // }
 
-#[derive(Debug)]
-pub struct LocalFileReader {
-    pub inner: File,
-    // pos: usize,
-}
+// #[derive(Debug)]
+// pub struct LocalFileReader {
+//     pub inner: File,
+//     // pos: usize,
+// }
 
-impl LocalFileReader {
-    pub fn new(inner: File) -> Self {
-        Self { inner }
-    }
-}
+// impl LocalFileReader {
+//     pub fn new(inner: File) -> Self {
+//         Self { inner }
+//     }
+// }
 
 // #[async_trait::async_trait]
 // impl Reader for LocalFileReader {
@@ -1579,16 +1521,16 @@ impl LocalFileReader {
 //     // }
 // }
 
-impl AsyncRead for LocalFileReader {
-    #[tracing::instrument(level = "debug", skip(self, buf))]
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
+// impl AsyncRead for LocalFileReader {
+//     #[tracing::instrument(level = "debug", skip(self, buf))]
+//     fn poll_read(
+//         mut self: Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//         buf: &mut tokio::io::ReadBuf<'_>,
+//     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+//         Pin::new(&mut self.inner).poll_read(cx, buf)
+//     }
+// }
 
 // #[derive(Debug)]
 // pub struct RemoteFileReader {
@@ -1668,87 +1610,5 @@ impl AsyncRead for LocalFileReader {
 //         buf: &mut tokio::io::ReadBuf<'_>,
 //     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
 //         unimplemented!("poll_read")
-//     }
-// }
-
-#[derive(Debug)]
-pub struct HttpFileReader {
-    // client: reqwest::Client,
-    // url: String,
-    // disk: String,
-    // volume: String,
-    // path: String,
-    // offset: usize,
-    // length: usize,
-    inner: reqwest::blocking::Response,
-    // buf: Vec<u8>,
-    pos: usize,
-}
-
-impl HttpFileReader {
-    pub async fn new(url: &str, disk: &str, volume: &str, path: &str, offset: usize, length: usize) -> Result<Self> {
-        let client = reqwest::blocking::Client::new();
-        let resp = client
-            .get(format!(
-                "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-                url, disk, volume, path, offset, length
-            ))
-            .send()?;
-        Ok(Self {
-            // client: reqwest::Client::new(),
-            // url: url.to_string(),
-            // disk: disk.to_string(),
-            // volume: volume.to_string(),
-            // path: path.to_string(),
-            // offset,
-            // length,
-            inner: resp,
-            // buf: Vec::new(),
-            pos: 0,
-        })
-    }
-
-    // pub async fn get_response(&self) -> Result<&Response, std::io::Error> {
-    //     if let Some(resp) = self.inner.get() {
-    //         return Ok(resp);
-    //     } else {
-    //         let client = reqwest::Client::new();
-    //         let resp = client
-    //             .get(&format!(
-    //                 "{}/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-    //                 self.url, self.disk, self.volume, self.path, self.offset, self.length
-    //             ))
-    //             .send()
-    //             .await
-    //             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    //         self.inner.set(resp);
-    //         Ok(self.inner.get().unwrap())
-    //     }
-    // }
-}
-
-impl AsyncRead for HttpFileReader {
-    #[tracing::instrument(level = "debug", skip(self, buf))]
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        let buf = buf.initialize_unfilled();
-        self.inner.read_exact(buf)?;
-        self.pos += buf.len();
-        Poll::Ready(Ok(()))
-    }
-}
-
-// impl Reader for HttpFileReader {
-//     async fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-//         if self.pos != offset {
-//             self.inner.seek(SeekFrom::Start(offset as u64))?;
-//             self.pos = offset;
-//         }
-//         let bytes_read = self.inner.read(buf)?;
-//         self.pos += bytes_read;
-//         Ok(bytes_read)
 //     }
 // }

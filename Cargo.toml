@@ -7,7 +7,6 @@ members = [
     "common/common", # Shared utilities and data structures
     "common/lock", # Distributed locking implementation
     "common/protos", # Protocol buffer definitions
-    "api/admin", # Admin HTTP API endpoints
     "reader", # Object reading service
     "common/workers", # Worker thread pools and task scheduling
     "iam", # Identity and Access Management

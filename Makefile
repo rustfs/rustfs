@@ -37,9 +37,9 @@ probe-e2e:
 # in target/rockylinux9.3/release/rustfs
 BUILD_OS ?= rockylinux9.3
 .PHONY: build
-build: ROCKYLINUX_BUILD_IMAGE_NAME = $(BUILD_OS):v1
+build: ROCKYLINUX_BUILD_IMAGE_NAME = rustfs-$(BUILD_OS):v1
 build: ROCKYLINUX_BUILD_CONTAINER_NAME = rustfs-$(BUILD_OS)-build
-build: BUILD_CMD = /root/.cargo/bin/cargo build --release --target-dir /root/s3-rustfs/target/$(BUILD_OS)
+build: BUILD_CMD = /root/.cargo/bin/cargo build --release --bin rustfs --target-dir /root/s3-rustfs/target/$(BUILD_OS)
 build:
 	$(DOCKER_CLI) build -t $(ROCKYLINUX_BUILD_IMAGE_NAME) -f $(DOCKERFILE_PATH)/Dockerfile.$(BUILD_OS) .
 	$(DOCKER_CLI) run --rm --name $(ROCKYLINUX_BUILD_CONTAINER_NAME) -v $(shell pwd):/root/s3-rustfs -it $(ROCKYLINUX_BUILD_IMAGE_NAME) $(BUILD_CMD)

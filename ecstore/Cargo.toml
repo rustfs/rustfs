@@ -67,6 +67,7 @@ md-5.workspace = true
 madmin.workspace = true
 workers.workspace = true
 reqwest = { workspace = true }
+urlencoding = "2.1.3"
 
 [target.'cfg(not(windows))'.dependencies]
 

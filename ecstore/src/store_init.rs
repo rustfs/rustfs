@@ -53,6 +53,7 @@ pub async fn connect_load_init_formats(
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
 ) -> Result<FormatV3, Error> {
+    warn!("connect_load_init_formats first_disk: {}", first_disk);
     let (formats, errs) = load_format_erasure_all(disks, false).await;
 
     debug!("load_format_erasure_all errs {:?}", &errs);
@@ -63,12 +64,13 @@ pub async fn connect_load_init_formats(
 
     if first_disk && DiskError::should_init_erasure_disks(&errs) {
         //  UnformattedDisk, not format file create
+        warn!("first_disk && should_init_erasure_disks");
         // new format and save
         let fms = init_format_erasure(disks, set_count, set_drive_count, deployment_id);
 
         let errs = save_format_file_all(disks, &fms).await;
 
-        debug!("save_format_file_all errs {:?}", &errs);
+        warn!("save_format_file_all errs {:?}", &errs);
         // TODO: check quorum
         // reduceWriteQuorumErrs(&errs)?;
 
@@ -76,6 +78,12 @@ pub async fn connect_load_init_formats(
 
         return Ok(fm);
     }
+
+    warn!(
+        "first_disk: {}, should_init_erasure_disks: {}",
+        first_disk,
+        DiskError::should_init_erasure_disks(&errs)
+    );
 
     let unformatted = DiskError::quorum_unformatted_disks(&errs);
     if unformatted && !first_disk {

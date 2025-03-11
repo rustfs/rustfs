@@ -18,21 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627"
 
 [[package]]
-name = "admin"
-version = "0.0.1"
-dependencies = [
- "axum",
- "ecstore",
- "futures-util",
- "hyper",
- "mime",
- "serde",
- "serde_json",
- "time",
- "tower 0.5.2",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1960,6 +1945,7 @@ dependencies = [
  "tracing-error",
  "transform-stream",
  "url",
+ "urlencoding",
  "uuid",
  "winapi",
  "workers",
@@ -5309,7 +5295,6 @@ dependencies = [
 name = "rustfs"
 version = "0.1.0"
 dependencies = [
- "admin",
  "async-trait",
  "atoi",
  "axum",

@@ -99,7 +99,7 @@ fn get_fs_type(fs_type: FsType) -> &'static str {
     match fs_type {
         statfs::TMPFS_MAGIC => "TMPFS",
         statfs::MSDOS_SUPER_MAGIC => "MSDOS",
-        statfs::XFS_SUPER_MAGIC => "XFS",
+        // statfs::XFS_SUPER_MAGIC => "XFS",
         statfs::NFS_SUPER_MAGIC => "NFS",
         statfs::EXT4_SUPER_MAGIC => "EXT4",
         statfs::ECRYPTFS_SUPER_MAGIC => "ecryptfs",
