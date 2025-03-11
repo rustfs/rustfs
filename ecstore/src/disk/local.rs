@@ -17,7 +17,7 @@ use crate::disk::error::{
     is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err,
 };
 use crate::disk::os::{check_path_length, is_empty_dir};
-use crate::disk::{LocalFileReader, LocalFileWriter, STORAGE_FORMAT_FILE};
+use crate::disk::STORAGE_FORMAT_FILE;
 use crate::error::{Error, Result};
 use crate::file_meta::{get_file_info, read_xl_meta_no_data, FileInfoOpts};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
@@ -745,15 +745,7 @@ impl LocalDisk {
 
         let meta = file.metadata().await?;
 
-        bitrot_verify(
-            FileReader::Local(LocalFileReader::new(file)),
-            meta.size() as usize,
-            part_size,
-            algo,
-            sum.to_vec(),
-            shard_size,
-        )
-        .await
+        bitrot_verify(FileReader::Local(file), meta.size() as usize, part_size, algo, sum.to_vec(), shard_size).await
     }
 
     async fn scan_dir<W: AsyncWrite + Unpin>(
@@ -1297,6 +1289,7 @@ impl DiskAPI for LocalDisk {
         Ok(resp)
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
@@ -1311,11 +1304,17 @@ impl DiskAPI for LocalDisk {
         let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
 
         if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
+            warn!(
+                "rename_part src and dst must be both dir or file src_is_dir:{}, dst_is_dir:{}",
+                src_is_dir, dst_is_dir
+            );
             return Err(Error::from(DiskError::FileAccessDenied));
         }
 
         let src_file_path = src_volume_dir.join(Path::new(src_path));
         let dst_file_path = dst_volume_dir.join(Path::new(dst_path));
+
+        warn!("rename_part src_file_path:{:?}, dst_file_path:{:?}", &src_file_path, &dst_file_path);
 
         check_path_length(src_file_path.to_string_lossy().as_ref())?;
         check_path_length(dst_file_path.to_string_lossy().as_ref())?;
@@ -1337,12 +1336,14 @@ impl DiskAPI for LocalDisk {
 
             if let Some(meta) = meta_op {
                 if !meta.is_dir() {
+                    warn!("rename_part src is not dir {:?}", &src_file_path);
                     return Err(Error::new(DiskError::FileAccessDenied));
                 }
             }
 
             if let Err(e) = utils::fs::remove(&dst_file_path).await {
                 if is_sys_err_not_empty(&e) || is_sys_err_not_dir(&e) {
+                    warn!("rename_part remove dst failed {:?} err {:?}", &dst_file_path, e);
                     return Err(Error::new(DiskError::FileAccessDenied));
                 } else if is_sys_err_io(&e) {
                     return Err(Error::new(DiskError::FaultyDisk));
@@ -1355,6 +1356,7 @@ impl DiskAPI for LocalDisk {
         if let Err(err) = os::rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await {
             if let Some(e) = err.to_io_err() {
                 if is_sys_err_not_empty(&e) || is_sys_err_not_dir(&e) {
+                    warn!("rename_part rename all failed {:?} err {:?}", &dst_file_path, e);
                     return Err(Error::new(DiskError::FileAccessDenied));
                 }
 
@@ -1467,8 +1469,10 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    // TODO: use io.reader
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
+        warn!("disk create_file: origvolume: {}, volume: {}, path: {}", origvolume, volume, path);
+
         if !origvolume.is_empty() {
             let origvolume_dir = self.get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume) {
@@ -1491,12 +1495,16 @@ impl DiskAPI for LocalDisk {
             .await
             .map_err(os_err_to_file_err)?;
 
-        Ok(FileWriter::Local(LocalFileWriter::new(f)))
+        Ok(FileWriter::Local(f))
 
         // Ok(())
     }
+
+    #[tracing::instrument(level = "debug", skip(self))]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
+        warn!("disk append_file:  volume: {}, path: {}", volume, path);
+
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             if let Err(e) = utils::fs::access(&volume_dir).await {
@@ -1509,11 +1517,13 @@ impl DiskAPI for LocalDisk {
 
         let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
 
-        Ok(FileWriter::Local(LocalFileWriter::new(f)))
+        Ok(FileWriter::Local(f))
     }
 
     // TODO: io verifier
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
+        warn!("disk read_file: volume: {}, path: {}", volume, path);
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             if let Err(e) = utils::fs::access(&volume_dir).await {
@@ -1542,10 +1552,16 @@ impl DiskAPI for LocalDisk {
             }
         })?;
 
-        Ok(FileReader::Local(LocalFileReader::new(f)))
+        Ok(FileReader::Local(f))
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        warn!(
+            "disk read_file_stream: volume: {}, path: {}, offset: {}, length: {}",
+            volume, path, offset, length
+        );
+
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             if let Err(e) = utils::fs::access(&volume_dir).await {
@@ -1587,7 +1603,7 @@ impl DiskAPI for LocalDisk {
 
         f.seek(SeekFrom::Start(offset as u64)).await?;
 
-        Ok(FileReader::Local(LocalFileReader::new(f)))
+        Ok(FileReader::Local(f))
     }
     #[tracing::instrument(level = "debug", skip(self))]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {

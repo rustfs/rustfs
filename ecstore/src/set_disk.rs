@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::Write,
+    io::{Cursor, Write},
     path::Path,
     sync::Arc,
     time::Duration,
@@ -14,10 +14,10 @@ use crate::{
         endpoint::Endpoint,
         error::{is_all_not_found, DiskError},
         format::FormatV3,
-        new_disk, BufferReader, BufferWriter, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption,
-        DiskStore, FileInfoVersions, FileReader, FileWriter, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET,
-        RUSTFS_META_TMP_BUCKET,
+        io::{FileReader, FileWriter},
+        new_disk, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
+        MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+        UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
     },
     erasure::Erasure,
     error::{Error, Result},
@@ -1361,7 +1361,7 @@ impl SetDisks {
         for (i, opdisk) in disks.iter().enumerate() {
             if let Some(disk) = opdisk {
                 if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
-                    info!("Disk {:?} is online", disk);
+                    info!("Disk {:?} is online", disk.to_string());
                     continue;
                 }
 
@@ -2452,7 +2452,7 @@ impl SetDisks {
                                     if let Some(disk) = disk {
                                         let filewriter = {
                                             if is_inline_buffer {
-                                                FileWriter::Buffer(BufferWriter::new(Vec::new()))
+                                                FileWriter::Buffer(Cursor::new(Vec::new()))
                                             } else {
                                                 let disk = disk.clone();
                                                 let part_path = format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number);
@@ -2501,7 +2501,7 @@ impl SetDisks {
                                         if let Some(ref writer) = writers[index] {
                                             if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
                                                 if let FileWriter::Buffer(buffer_writer) = w.writer() {
-                                                    parts_metadata[index].data = Some(buffer_writer.as_ref().to_vec());
+                                                    parts_metadata[index].data = Some(buffer_writer.clone().into_inner());
                                                 }
                                             }
                                         }
@@ -3744,7 +3744,7 @@ impl ObjectIO for SetDisks {
             if let Some(disk) = disk_op {
                 let filewriter = {
                     if is_inline_buffer {
-                        FileWriter::Buffer(BufferWriter::new(Vec::new()))
+                        FileWriter::Buffer(Cursor::new(Vec::new()))
                     } else {
                         let disk = disk.clone();
 
@@ -3759,6 +3759,8 @@ impl ObjectIO for SetDisks {
                 writers.push(None);
             }
         }
+
+        warn!("put_object data.content_length {}", data.content_length);
 
         // TODO: etag from header
         let mut etag_stream = EtagReader::new(&mut data.stream, None, None);
@@ -3789,7 +3791,7 @@ impl ObjectIO for SetDisks {
                 if let Some(ref writer) = writers[i] {
                     if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
                         if let FileWriter::Buffer(buffer_writer) = w.writer() {
-                            fi.data = Some(buffer_writer.as_ref().to_vec());
+                            fi.data = Some(buffer_writer.clone().into_inner());
                         }
                     }
                 }
@@ -4294,6 +4296,7 @@ impl StorageAPI for SetDisks {
         unimplemented!()
     }
 
+    #[tracing::instrument(level = "debug", skip(self, data, opts))]
     async fn put_object_part(
         &self,
         bucket: &str,
@@ -5245,7 +5248,7 @@ async fn disks_with_all_parts(
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
                 let data_len = data.len();
                 let verify_err = match bitrot_verify(
-                    FileReader::Buffer(BufferReader::new(data.clone(), 0, data_len)),
+                    FileReader::Buffer(Cursor::new(data.clone())),
                     data_len,
                     meta.erasure.shard_file_size(meta.size),
                     checksum_info.algorithm,

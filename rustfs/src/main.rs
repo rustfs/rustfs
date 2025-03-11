@@ -152,8 +152,8 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
-            "created endpoints {}, set_count:{}, drives_per_set: {}, cmd: {:?}",
-            i, eps.set_count, eps.drives_per_set, eps.cmd_line
+            "created endpoints {}, set_count:{}, drives_per_set: {}, cmd: {:?}, \n{:?}",
+            i, eps.set_count, eps.drives_per_set, eps.cmd_line, eps
         );
     }
 

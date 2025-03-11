@@ -22,8 +22,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::{
-    endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
-    FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteFileWriter, RenameDataResp,
+    endpoint::Endpoint, io::HttpFileReader, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
+    DiskOption, FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
     UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
 };
 use crate::{
@@ -36,7 +36,7 @@ use crate::{
     },
     store_api::{FileInfo, RawFileInfo},
 };
-use crate::{disk::HttpFileReader, utils::proto_err_to_err};
+use crate::{disk::io::HttpFileWriter, utils::proto_err_to_err};
 use crate::{disk::MetaCacheEntry, metacache::writer::MetacacheWriter};
 use protos::proto_gen::node_service::RenamePartRequst;
 
@@ -286,6 +286,7 @@ impl DiskAPI for RemoteDisk {
 
         Ok(())
     }
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         info!("rename_file");
         let mut client = node_service_time_out_client(&self.addr)
@@ -312,58 +313,55 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
-    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter> {
         info!("create_file");
-        Ok(FileWriter::Remote(
-            RemoteFileWriter::new(
-                self.endpoint.clone(),
-                volume.to_string(),
-                path.to_string(),
-                false,
-                node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?,
-            )
-            .await?,
-        ))
+        Ok(FileWriter::Http(HttpFileWriter::new(
+            self.endpoint.grid_host().as_str(),
+            self.endpoint.to_string().as_str(),
+            volume,
+            path,
+            file_size,
+            false,
+        )?))
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         info!("append_file");
-        Ok(FileWriter::Remote(
-            RemoteFileWriter::new(
-                self.endpoint.clone(),
-                volume.to_string(),
-                path.to_string(),
-                true,
-                node_service_time_out_client(&self.addr)
-                    .await
-                    .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?,
-            )
-            .await?,
-        ))
+        Ok(FileWriter::Http(HttpFileWriter::new(
+            self.endpoint.grid_host().as_str(),
+            self.endpoint.to_string().as_str(),
+            volume,
+            path,
+            0,
+            true,
+        )?))
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         info!("read_file");
-        Ok(FileReader::Http(
-            HttpFileReader::new(self.endpoint.grid_host().as_str(), self.endpoint.to_string().as_str(), volume, path, 0, 0)
-                .await?,
-        ))
+        Ok(FileReader::Http(HttpFileReader::new(
+            self.endpoint.grid_host().as_str(),
+            self.endpoint.to_string().as_str(),
+            volume,
+            path,
+            0,
+            0,
+        )?))
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        Ok(FileReader::Http(
-            HttpFileReader::new(
-                self.endpoint.grid_host().as_str(),
-                self.endpoint.to_string().as_str(),
-                volume,
-                path,
-                offset,
-                length,
-            )
-            .await?,
-        ))
+        Ok(FileReader::Http(HttpFileReader::new(
+            self.endpoint.grid_host().as_str(),
+            self.endpoint.to_string().as_str(),
+            volume,
+            path,
+            offset,
+            length,
+        )?))
     }
 
     async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
