@@ -10,11 +10,15 @@ version.workspace = true
 workspace = true
 
 [features]
-default = []
-audit-kafka = ["dep:rdkafka", "dep:serde_json"]
-audit-webhook = ["dep:reqwest"]
+default = ["file"]
+kafka = ["dep:rdkafka", "dep:serde_json"]
+webhook = ["dep:reqwest"]
+file = []
 
 [dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+config = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
@@ -23,13 +27,15 @@ opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "metrics"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 serde = { workspace = true }
 tracing = { workspace = true }
+tracing-core = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["sync", "fs"] }
 rdkafka = { workspace = true, features = ["tokio"], optional = true }
-reqwest = { workspace = true, features = ["json"], optional = true }
+reqwest = { workspace = true, optional = true, default-features = false }
 serde_json = { workspace = true, optional = true }
-
+thiserror = { workspace = true }
+local-ip-address = { workspace = true }
 
 
 [dev-dependencies]

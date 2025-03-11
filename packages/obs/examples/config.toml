@@ -1,0 +1,31 @@
+[observability]
+endpoint = "http://localhost:4317"
+use_stdout = true
+sample_ratio = 0.5
+meter_interval = 30
+service_name = "logging_service"
+service_version = "0.1.0"
+deployment_environment = "develop"
+
+[sinks]
+[sinks.kafka]
+enabled = false
+bootstrap_servers = "localhost:9092"
+topic = "logs"
+batch_size = 100 # Default is 100 if not specified
+batch_timeout_ms = 1000 # Default is 1000ms if not specified
+
+[sinks.webhook]
+enabled = false
+url = "http://localhost:8080/webhook"
+batch_size = 100 # Default is 3 if not specified
+batch_timeout_ms = 1000 # Default is 100ms if not specified
+
+[sinks.file]
+enabled = true
+path = "app.log"
+batch_size = 100
+batch_timeout_ms = 1000 # Default is 8192 bytes if not specified
+
+[logger]
+queue_capacity = 10000
