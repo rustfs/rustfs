@@ -29,14 +29,16 @@ use crate::{
 };
 use endpoint::Endpoint;
 use error::DiskError;
-use io::{FileReader, FileWriter};
 use local::LocalDisk;
 use madmin::info_commands::DiskMetrics;
 use remote::RemoteDisk;
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, fmt::Debug, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
-use tokio::{io::AsyncWrite, sync::mpsc::Sender};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::mpsc::Sender,
+};
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
@@ -371,6 +373,9 @@ pub async fn new_disk(ep: &endpoint::Endpoint, opt: &DiskOption) -> Result<DiskS
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }
+
+pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
+pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
 #[async_trait::async_trait]
 pub trait DiskAPI: Debug + Send + Sync + 'static {

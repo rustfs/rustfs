@@ -22,9 +22,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::{
-    endpoint::Endpoint, io::HttpFileReader, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
+    FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts,
+    VolumeInfo, WalkDirOptions,
 };
 use crate::{
     disk::error::DiskError,
@@ -36,7 +36,10 @@ use crate::{
     },
     store_api::{FileInfo, RawFileInfo},
 };
-use crate::{disk::io::HttpFileWriter, utils::proto_err_to_err};
+use crate::{
+    disk::io::{new_http_reader, HttpFileWriter},
+    utils::proto_err_to_err,
+};
 use crate::{disk::MetaCacheEntry, metacache::writer::MetacacheWriter};
 use protos::proto_gen::node_service::RenamePartRequst;
 
@@ -316,7 +319,7 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter> {
         info!("create_file");
-        Ok(FileWriter::Http(HttpFileWriter::new(
+        Ok(Box::new(HttpFileWriter::new(
             self.endpoint.grid_host().as_str(),
             self.endpoint.to_string().as_str(),
             volume,
@@ -329,7 +332,7 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         info!("append_file");
-        Ok(FileWriter::Http(HttpFileWriter::new(
+        Ok(Box::new(HttpFileWriter::new(
             self.endpoint.grid_host().as_str(),
             self.endpoint.to_string().as_str(),
             volume,
@@ -342,26 +345,20 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         info!("read_file");
-        Ok(FileReader::Http(HttpFileReader::new(
-            self.endpoint.grid_host().as_str(),
-            self.endpoint.to_string().as_str(),
-            volume,
-            path,
-            0,
-            0,
-        )?))
+        Ok(new_http_reader(self.endpoint.grid_host().as_str(), self.endpoint.to_string().as_str(), volume, path, 0, 0).await?)
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        Ok(FileReader::Http(HttpFileReader::new(
+        Ok(new_http_reader(
             self.endpoint.grid_host().as_str(),
             self.endpoint.to_string().as_str(),
             volume,
             path,
             offset,
             length,
-        )?))
+        )
+        .await?)
     }
 
     async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {

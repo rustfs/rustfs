@@ -19,7 +19,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
-pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
+pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 pub const RESERVED_METADATA_PREFIX: &str = "X-Rustfs-Internal-";
 pub const RESERVED_METADATA_PREFIX_LOWER: &str = "X-Rustfs-Internal-";
 pub const RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";

@@ -3,7 +3,6 @@ use super::router::Operation;
 use super::router::S3Router;
 use crate::storage::ecfs::bytes_stream;
 use common::error::Result;
-use ecstore::disk::io::FileReader;
 use ecstore::disk::DiskAPI;
 use ecstore::store::find_local_disk;
 use futures::TryStreamExt;
@@ -19,7 +18,6 @@ use s3s::S3Result;
 use serde_urlencoded::from_bytes;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
-use tracing::warn;
 
 pub const RPC_PREFIX: &str = "/rustfs/rpc";
 
@@ -52,8 +50,6 @@ pub struct ReadFile {}
 #[async_trait::async_trait]
 impl Operation for ReadFile {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ReadFile");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: ReadFileQuery =
@@ -68,39 +64,15 @@ impl Operation for ReadFile {
             return Err(s3_error!(InvalidArgument, "disk not found"));
         };
 
-        let file: FileReader = disk
+        let file = disk
             .read_file_stream(&query.volume, &query.path, query.offset, query.length)
             .await
             .map_err(|e| s3_error!(InternalError, "read file err {}", e))?;
 
-        let s = bytes_stream(ReaderStream::new(file), query.length);
-
-        Ok(S3Response::new((StatusCode::OK, Body::from(StreamingBlob::wrap(s)))))
-
-        // let querys = req.uri.query().map(|q| {
-        //     let mut querys = HashMap::new();
-        //     for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
-        //         println!("{}={}", k, v);
-        //         querys.insert(k.to_string(), v.to_string());
-        //     }
-        //     querys
-        // });
-
-        // // TODO: file_path from root
-
-        // if let Some(file_path) = querys.and_then(|q| q.get("file_path").cloned()) {
-        //     let file = fs::OpenOptions::new()
-        //         .read(true)
-        //         .open(file_path)
-        //         .await
-        //         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("open file err {}", e)))?;
-
-        //     let s = bytes_stream(ReaderStream::new(file), 0);
-
-        //     return Ok(S3Response::new((StatusCode::OK, Body::from(StreamingBlob::wrap(s)))));
-        // }
-
-        // Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::empty())))
+        Ok(S3Response::new((
+            StatusCode::OK,
+            Body::from(StreamingBlob::wrap(bytes_stream(ReaderStream::new(file), query.length))),
+        )))
     }
 }
 
@@ -117,8 +89,6 @@ pub struct PutFile {}
 #[async_trait::async_trait]
 impl Operation for PutFile {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle PutFile");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: PutFileQuery =
