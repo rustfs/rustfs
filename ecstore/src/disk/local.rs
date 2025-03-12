@@ -745,7 +745,7 @@ impl LocalDisk {
 
         let meta = file.metadata().await?;
 
-        bitrot_verify(FileReader::Local(file), meta.size() as usize, part_size, algo, sum.to_vec(), shard_size).await
+        bitrot_verify(Box::new(file), meta.size() as usize, part_size, algo, sum.to_vec(), shard_size).await
     }
 
     async fn scan_dir<W: AsyncWrite + Unpin>(
@@ -1314,7 +1314,7 @@ impl DiskAPI for LocalDisk {
         let src_file_path = src_volume_dir.join(Path::new(src_path));
         let dst_file_path = dst_volume_dir.join(Path::new(dst_path));
 
-        warn!("rename_part src_file_path:{:?}, dst_file_path:{:?}", &src_file_path, &dst_file_path);
+        // warn!("rename_part src_file_path:{:?}, dst_file_path:{:?}", &src_file_path, &dst_file_path);
 
         check_path_length(src_file_path.to_string_lossy().as_ref())?;
         check_path_length(dst_file_path.to_string_lossy().as_ref())?;
@@ -1471,7 +1471,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
-        warn!("disk create_file: origvolume: {}, volume: {}, path: {}", origvolume, volume, path);
+        // warn!("disk create_file: origvolume: {}, volume: {}, path: {}", origvolume, volume, path);
 
         if !origvolume.is_empty() {
             let origvolume_dir = self.get_bucket_path(origvolume)?;
@@ -1495,7 +1495,7 @@ impl DiskAPI for LocalDisk {
             .await
             .map_err(os_err_to_file_err)?;
 
-        Ok(FileWriter::Local(f))
+        Ok(Box::new(f))
 
         // Ok(())
     }
@@ -1517,7 +1517,7 @@ impl DiskAPI for LocalDisk {
 
         let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
 
-        Ok(FileWriter::Local(f))
+        Ok(Box::new(f))
     }
 
     // TODO: io verifier
@@ -1552,7 +1552,7 @@ impl DiskAPI for LocalDisk {
             }
         })?;
 
-        Ok(FileReader::Local(f))
+        Ok(Box::new(f))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1603,7 +1603,7 @@ impl DiskAPI for LocalDisk {
 
         f.seek(SeekFrom::Start(offset as u64)).await?;
 
-        Ok(FileReader::Local(f))
+        Ok(Box::new(f))
     }
     #[tracing::instrument(level = "debug", skip(self))]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
@@ -2291,6 +2291,9 @@ impl DiskAPI for LocalDisk {
         self.scanning.fetch_add(1, Ordering::SeqCst);
         defer!(|| { self.scanning.fetch_sub(1, Ordering::SeqCst) });
 
+        // must befor metadata_sys
+        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+
         // Check if the current bucket has replication configuration
         if let Ok((rcfg, _)) = metadata_sys::get_replication_config(&cache.info.name).await {
             if has_active_rules(&rcfg, "", true) {
@@ -2298,7 +2301,6 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
         let loc = self.get_disk_location();
         let disks = store.get_disks(loc.pool_idx.unwrap(), loc.disk_idx.unwrap()).await?;
         let disk = Arc::new(LocalDisk::new(&self.endpoint(), false).await?);

@@ -6,7 +6,6 @@ use futures::future::join_all;
 use futures::{pin_mut, Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::any::Any;
-use std::fmt::Debug;
 use std::io::ErrorKind;
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -500,11 +499,10 @@ pub trait Writer {
 }
 
 #[async_trait::async_trait]
-pub trait ReadAt: Debug {
+pub trait ReadAt {
     async fn read_at(&mut self, offset: usize, length: usize) -> Result<(Vec<u8>, usize)>;
 }
 
-#[derive(Debug)]
 pub struct ShardReader {
     readers: Vec<Option<BitrotReader>>, // 磁盘
     data_block_count: usize,            // 总的分片数量

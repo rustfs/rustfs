@@ -1,9 +1,5 @@
 use crate::{
-    disk::{
-        error::DiskError,
-        io::{FileReader, FileWriter},
-        Disk, DiskAPI,
-    },
+    disk::{error::DiskError, Disk, DiskAPI, FileReader, FileWriter},
     erasure::{ReadAt, Writer},
     error::{Error, Result},
     store_api::BitrotAlgorithm,
@@ -488,23 +484,45 @@ pub async fn bitrot_verify(
 // }
 
 pub struct BitrotFileWriter {
-    pub inner: FileWriter,
+    inner: Option<FileWriter>,
     hasher: Hasher,
     _shard_size: usize,
+    inline: bool,
+    inline_data: Vec<u8>,
 }
 
 impl BitrotFileWriter {
-    pub fn new(inner: FileWriter, algo: BitrotAlgorithm, _shard_size: usize) -> Self {
+    pub async fn new(
+        disk: Arc<Disk>,
+        volume: &str,
+        path: &str,
+        inline: bool,
+        algo: BitrotAlgorithm,
+        _shard_size: usize,
+    ) -> Result<Self> {
+        let inner = if !inline {
+            Some(disk.create_file("", volume, path, 0).await?)
+        } else {
+            None
+        };
+
         let hasher = algo.new_hasher();
-        Self {
+
+        Ok(Self {
             inner,
+            inline,
+            inline_data: Vec::new(),
             hasher,
             _shard_size,
-        }
+        })
     }
 
-    pub fn writer(&self) -> &FileWriter {
-        &self.inner
+    // pub fn writer(&self) -> &FileWriter {
+    //     &self.inner
+    // }
+
+    pub fn inline_data(&self) -> &[u8] {
+        &self.inline_data
     }
 }
 
@@ -521,18 +539,43 @@ impl Writer for BitrotFileWriter {
         self.hasher.reset();
         self.hasher.update(buf);
         let hash_bytes = self.hasher.clone().finalize();
-        let _ = self.inner.write_all(&hash_bytes).await?;
-        let _ = self.inner.write_all(buf).await?;
+
+        if let Some(f) = self.inner.as_mut() {
+            f.write_all(&hash_bytes).await?;
+            f.write_all(buf).await?;
+        } else {
+            self.inline_data.extend_from_slice(&hash_bytes);
+            self.inline_data.extend_from_slice(buf);
+        }
+
+        Ok(())
+    }
+    async fn close(&mut self) -> Result<()> {
+        if self.inline {
+            return Ok(());
+        }
+
+        if let Some(f) = self.inner.as_mut() {
+            f.shutdown().await?;
+        }
 
         Ok(())
     }
 }
 
-pub fn new_bitrot_filewriter(inner: FileWriter, algo: BitrotAlgorithm, shard_size: usize) -> BitrotWriter {
-    Box::new(BitrotFileWriter::new(inner, algo, shard_size))
+pub async fn new_bitrot_filewriter(
+    disk: Arc<Disk>,
+    volume: &str,
+    path: &str,
+    inline: bool,
+    algo: BitrotAlgorithm,
+    shard_size: usize,
+) -> Result<BitrotWriter> {
+    let w = BitrotFileWriter::new(disk, volume, path, inline, algo, shard_size).await?;
+
+    Ok(Box::new(w))
 }
 
-#[derive(Debug)]
 struct BitrotFileReader {
     disk: Arc<Disk>,
     data: Option<Vec<u8>>,
@@ -599,7 +642,7 @@ impl ReadAt for BitrotFileReader {
             let stream_offset = (offset / self.shard_size) * self.hasher.size() + offset;
 
             if let Some(data) = self.data.clone() {
-                self.reader = Some(FileReader::Buffer(Cursor::new(data)));
+                self.reader = Some(Box::new(Cursor::new(data)));
             } else {
                 self.reader = Some(
                     self.disk
