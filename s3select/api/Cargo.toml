@@ -1,0 +1,10 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+datafusion = { workspace = true }
+futures = { workspace = true }
+snafu = { workspace = true, features = ["backtrace"] }
