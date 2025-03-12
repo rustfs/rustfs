@@ -1,0 +1,12 @@
+[package]
+name = "query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+api = { path = "../api" }
+async-trait.workspace = true
+datafusion = { workspace = true }
+derive_builder = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
