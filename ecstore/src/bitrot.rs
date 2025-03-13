@@ -1,7 +1,8 @@
 use crate::{
-    disk::{error::DiskError, Disk, DiskAPI, FileReader, FileWriter},
+    disk::{error::DiskError, Disk, DiskAPI},
     erasure::{ReadAt, Writer},
     error::{Error, Result},
+    io::{FileReader, FileWriter},
     store_api::BitrotAlgorithm,
 };
 use blake2::Blake2b512;

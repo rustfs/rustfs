@@ -138,7 +138,7 @@ impl Sets {
                 if let Some(_disk_id) = has_disk_id {
                     set_drive.push(disk);
                 } else {
-                    warn!("sets new set_drive {}-{} get_disk_id is none", i, j);
+                    error!("sets new set_drive {}-{} get_disk_id is none", i, j);
                     set_drive.push(None);
                 }
             }
@@ -207,7 +207,7 @@ impl Sets {
                },
 
                _ = cloned_token.cancelled() => {
-                warn!("ctx cancelled");
+                warn!("monitor_and_connect_endpoints ctx cancelled");
                 break;
                }
             }

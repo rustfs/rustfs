@@ -124,10 +124,11 @@ pub async fn store_data_usage_in_backend(mut rx: Receiver<DataUsageInfo>) {
             Some(data_usage_info) => {
                 if let Ok(data) = serde_json::to_vec(&data_usage_info) {
                     if attempts > 10 {
-                        let _ = save_config(store.clone(), &format!("{}{}", *DATA_USAGE_OBJ_NAME_PATH, ".bkp"), &data).await;
+                        let _ =
+                            save_config(store.clone(), &format!("{}{}", *DATA_USAGE_OBJ_NAME_PATH, ".bkp"), data.clone()).await;
                         attempts += 1;
                     }
-                    let _ = save_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH, &data).await;
+                    let _ = save_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH, data).await;
                     attempts += 1;
                 } else {
                     continue;

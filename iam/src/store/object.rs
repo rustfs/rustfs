@@ -370,7 +370,7 @@ impl Store for ObjectStore {
         let mut data = serde_json::to_vec(&item)?;
         data = Self::encrypt_data(&data)?;
 
-        save_config(self.object_api.clone(), path.as_ref(), &data).await
+        save_config(self.object_api.clone(), path.as_ref(), data).await
     }
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()> {
         delete_config(self.object_api.clone(), path.as_ref()).await

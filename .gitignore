@@ -4,6 +4,7 @@
 .vscode
 /test
 /logs
+/data
 .devcontainer
 rustfs/static/*
 vendor

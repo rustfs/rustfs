@@ -1,13 +1,11 @@
 use crate::bitrot::{BitrotReader, BitrotWriter};
-use crate::error::{Error, Result, StdError};
+use crate::error::{Error, Result};
 use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
-use bytes::Bytes;
 use futures::future::join_all;
-use futures::{pin_mut, Stream, StreamExt};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::any::Any;
 use std::io::ErrorKind;
-use tokio::io::DuplexStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
 use tracing::{error, info};
@@ -49,22 +47,22 @@ impl Erasure {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, body, writers))]
+    #[tracing::instrument(level = "debug", skip(self, reader, writers))]
     pub async fn encode<S>(
         &mut self,
-        body: S,
+        reader: &mut S,
         writers: &mut [Option<BitrotWriter>],
         // block_size: usize,
         total_size: usize,
         write_quorum: usize,
     ) -> Result<usize>
     where
-        S: Stream<Item = Result<Bytes, StdError>> + Send + Sync,
+        S: AsyncRead + Unpin + Send + 'static,
     {
-        pin_mut!(body);
-        let mut reader = tokio_util::io::StreamReader::new(
-            body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
-        );
+        // pin_mut!(body);
+        // let mut reader = tokio_util::io::StreamReader::new(
+        //     body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+        // );
 
         let mut total: usize = 0;
 
@@ -101,6 +99,7 @@ impl Erasure {
             let blocks = self.encode_data(&self.buf)?;
             let mut errs = Vec::new();
 
+            // TODO: 并发写入
             for (i, w_op) in writers.iter_mut().enumerate() {
                 if let Some(w) = w_op {
                     match w.write(blocks[i].as_ref()).await {
@@ -204,14 +203,17 @@ impl Erasure {
         // Ok(total)
     }
 
-    pub async fn decode(
+    pub async fn decode<W>(
         &self,
-        writer: &mut DuplexStream,
+        writer: &mut W,
         readers: Vec<Option<BitrotReader>>,
         offset: usize,
         length: usize,
         total_length: usize,
-    ) -> (usize, Option<Error>) {
+    ) -> (usize, Option<Error>)
+    where
+        W: AsyncWriteExt + Send + Unpin + 'static,
+    {
         if length == 0 {
             return (0, None);
         }
@@ -281,14 +283,17 @@ impl Erasure {
         (bytes_writed, None)
     }
 
-    async fn write_data_blocks(
+    async fn write_data_blocks<W>(
         &self,
-        writer: &mut DuplexStream,
+        writer: &mut W,
         bufs: Vec<Option<Vec<u8>>>,
         data_blocks: usize,
         offset: usize,
         length: usize,
-    ) -> Result<usize> {
+    ) -> Result<usize>
+    where
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
         if bufs.len() < data_blocks {
             return Err(Error::msg("read bufs not match data_blocks"));
         }

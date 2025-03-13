@@ -5,9 +5,9 @@ use super::error::{
 use super::os::{is_root_disk, rename_all};
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
-    os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions,
-    FileReader, FileWriter, Info, MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE_BACKUP,
+    os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, Info,
+    MetaCacheEntry, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
+    WalkDirOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE_BACKUP,
 };
 use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::{self};
@@ -27,6 +27,7 @@ use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
 use crate::heal::heal_commands::{HealScanMode, HealingTracker};
 use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
+use crate::io::{FileReader, FileWriter};
 use crate::metacache::writer::MetacacheWriter;
 use crate::new_object_layer_fn;
 use crate::set_disk::{
@@ -326,7 +327,7 @@ impl LocalDisk {
             }
         }
 
-        // FIXME: 先清空回收站吧，有时间再添加判断逻辑
+        // TODO: 优化 FIXME: 先清空回收站吧，有时间再添加判断逻辑
 
         if let Err(err) = {
             if trash_path.is_dir() {
@@ -1523,7 +1524,7 @@ impl DiskAPI for LocalDisk {
     // TODO: io verifier
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        warn!("disk read_file: volume: {}, path: {}", volume, path);
+        // warn!("disk read_file: volume: {}, path: {}", volume, path);
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             if let Err(e) = utils::fs::access(&volume_dir).await {
@@ -1557,10 +1558,10 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        warn!(
-            "disk read_file_stream: volume: {}, path: {}, offset: {}, length: {}",
-            volume, path, offset, length
-        );
+        // warn!(
+        //     "disk read_file_stream: volume: {}, path: {}, offset: {}, length: {}",
+        //     volume, path, offset, length
+        // );
 
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
@@ -1748,7 +1749,7 @@ impl DiskAPI for LocalDisk {
                     return Err(os_err_to_file_err(e));
                 }
 
-                info!("read xl.meta failed, dst_file_path: {:?}, err: {:?}", dst_file_path, e);
+                // info!("read xl.meta failed, dst_file_path: {:?}, err: {:?}", dst_file_path, e);
                 None
             }
         };
@@ -2247,7 +2248,6 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn delete_volume(&self, volume: &str) -> Result<()> {
-        info!("delete_volume, volume: {}", volume);
         let p = self.get_bucket_path(volume)?;
 
         // TODO: 不能用递归删除，如果目录下面有文件，返回errVolumeNotEmpty

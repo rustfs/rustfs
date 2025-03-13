@@ -116,7 +116,7 @@ impl PoolMeta {
         data.write_all(&buf)?;
 
         for pool in pools {
-            save_config(pool, POOL_META_NAME, &data).await?;
+            save_config(pool, POOL_META_NAME, data.clone()).await?;
         }
 
         Ok(())
