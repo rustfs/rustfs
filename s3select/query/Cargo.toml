@@ -5,8 +5,13 @@ edition.workspace = true
 
 [dependencies]
 api = { path = "../api" }
+async-recursion = { workspace = true }
 async-trait.workspace = true
 datafusion = { workspace = true }
 derive_builder = { workspace = true }
+futures = { workspace = true }
+parking_lot = { version = "0.12.1" }
+s3s.workspace = true
+snafu = { workspace = true, features = ["backtrace"] }
 tokio = { workspace = true }
 tracing = { workspace = true }

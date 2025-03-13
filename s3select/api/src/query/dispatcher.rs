@@ -12,10 +12,6 @@ use super::{
 
 #[async_trait]
 pub trait QueryDispatcher: Send + Sync {
-    async fn start(&self) -> QueryResult<()>;
-
-    fn stop(&self);
-
     // fn create_query_id(&self) -> QueryId;
 
     // fn query_info(&self, id: &QueryId);

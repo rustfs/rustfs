@@ -183,9 +183,19 @@ name = "api"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bytes",
+ "chrono",
  "datafusion",
+ "ecstore",
  "futures",
+ "futures-core",
+ "http",
+ "object_store",
+ "s3s",
  "snafu",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -5711,7 +5721,7 @@ dependencies = [
  "crypto",
  "futures",
  "ipnetwork",
- "itertools",
+ "itertools 0.14.0",
  "jsonwebtoken",
  "lazy_static",
  "log",
@@ -5989,9 +5999,14 @@ name = "query"
 version = "0.0.1"
 dependencies = [
  "api",
+ "async-recursion",
  "async-trait",
  "datafusion",
  "derive_builder",
+ "futures",
+ "parking_lot 0.12.3",
+ "s3s",
+ "snafu",
  "tokio",
  "tracing",
 ]
@@ -6189,22 +6204,6 @@ name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
-
-[[package]]
-name = "reader"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "futures",
- "hex-simd",
- "md-5",
- "pin-project-lite",
- "s3s",
- "sha2 0.11.0-pre.4",
- "thiserror 2.0.11",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "recursive"
@@ -6524,6 +6523,7 @@ dependencies = [
 name = "rustfs"
 version = "0.1.0"
 dependencies = [
+ "api",
  "async-trait",
  "atoi",
  "axum",
@@ -6533,6 +6533,8 @@ dependencies = [
  "common",
  "const-str",
  "crypto",
+ "csv",
+ "datafusion",
  "ecstore",
  "flatbuffers",
  "futures",
@@ -6560,6 +6562,7 @@ dependencies = [
  "prost-types",
  "protobuf",
  "protos",
+ "query",
  "rmp-serde",
  "rust-embed",
  "s3s",

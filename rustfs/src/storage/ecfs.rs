@@ -4,8 +4,11 @@ use super::options::extract_metadata;
 use super::options::put_opts;
 use crate::auth::get_condition_values;
 use crate::storage::access::ReqInfo;
+use api::query::Context;
+use api::query::Query;
 use bytes::Bytes;
 use common::error::Result;
+use datafusion::arrow::json::writer::JsonArray;
 use ecstore::bucket::error::BucketMetadataError;
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
@@ -39,6 +42,9 @@ use ecstore::xhttp;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
+use iam::policy::action::Action;
+use api::server::dbms::DatabaseManagerSystem;
+use iam::policy::action::S3Action;
 use lazy_static::lazy_static;
 use log::warn;
 use policy::auth;
@@ -47,6 +53,7 @@ use policy::policy::action::S3Action;
 use policy::policy::BucketPolicy;
 use policy::policy::BucketPolicyArgs;
 use policy::policy::Validator;
+use query::instance::make_cnosdbms;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -54,6 +61,8 @@ use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use std::fmt::Debug;
 use std::str::FromStr;
 use tokio_util::io::ReaderStream;
@@ -1858,6 +1867,70 @@ impl S3 for FS {
             }
         }
         Ok(S3Response::new(PutObjectAclOutput::default()))
+    }
+
+    async fn select_object_content(
+        &self,
+        req: S3Request<SelectObjectContentInput>,
+    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        info!("handle select_object_content");
+
+        let input = req.input;
+        info!("{:?}", input);
+
+        let db = make_cnosdbms(input).await.map_err(|_| {
+            s3_error!(InternalError)
+        })?;
+        let query = Query::new(Context {input: input.clone()}, input.request.expression);
+        let result = db.execute(&query).await.map_err(|_| {
+            s3_error!(InternalError)
+        })?;
+
+        let results = result.result().chunk_result().await.unwrap().to_vec();
+
+        let mut buffer = Vec::new();
+        if input.request.output_serialization.csv.is_some() {
+            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
+            for batch in results {
+                csv_writer
+                    .write(&batch)
+                    .map_err(|e| s3_error!(InternalError, "cann't encode output to csv. e: {}", e.to_string()))?;
+            }
+        } else if input.request.output_serialization.json.is_some() {
+            let mut json_writer = JsonWriterBuilder::new()
+                .with_explicit_nulls(true)
+                .build::<_, JsonArray>(&mut buffer);
+            for batch in results {
+                json_writer
+                    .write(&batch)
+                    .map_err(|e| s3_error!(InternalError, "cann't encode output to json. e: {}", e.to_string()))?;
+            }
+            json_writer
+                .finish()
+                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
+        } else {
+            return Err(s3_error!(InvalidArgument, "unknow output format"));
+        }
+
+        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
+        let stream = ReceiverStream::new(rx);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
+                .await;
+            let _ = tx
+                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
+                    payload: Some(Bytes::from(buffer)),
+                })))
+                .await;
+            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
+
+            drop(tx);
+        });
+
+        Ok(S3Response::new(SelectObjectContentOutput {
+            payload: Some(SelectObjectContentEventStream::new(stream)),
+        }))
     }
 }
 

@@ -5,6 +5,16 @@ edition.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
 datafusion = { workspace = true }
+ecstore.workspace = true
 futures = { workspace = true }
+futures-core = "0.3.31"
+http.workspace = true
+object_store = "0.11.2"
+s3s.workspace = true
 snafu = { workspace = true, features = ["backtrace"] }
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true

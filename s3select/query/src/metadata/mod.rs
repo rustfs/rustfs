@@ -5,10 +5,12 @@ use api::ResolvedTable;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
+use datafusion::datasource::listing::ListingTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::var_provider::is_system_variables;
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
+use datafusion::sql::ResolvedTableReference;
 use datafusion::variable::VarType;
 use datafusion::{
     config::ConfigOptions,
@@ -21,16 +23,17 @@ pub mod base_table;
 
 #[async_trait]
 pub trait ContextProviderExtension: ContextProvider {
-    fn get_table_source(&self, name: TableReference) -> datafusion::common::Result<Arc<TableSourceAdapter>>;
+    fn get_table_source_(&self, name: TableReference) -> datafusion::common::Result<Arc<TableSourceAdapter>>;
 }
 
 pub type TableHandleProviderRef = Arc<dyn TableHandleProvider + Send + Sync>;
 
 pub trait TableHandleProvider {
-    fn build_table_handle(&self, session_state: &SessionState, table_name: &str) -> DFResult<TableHandle>;
+    fn build_table_handle(&self, provider: Arc<ListingTable>) -> DFResult<TableHandle>;
 }
 
 pub struct MetadataProvider {
+    provider: Arc<ListingTable>,
     session: SessionCtx,
     config_options: ConfigOptions,
     func_manager: FuncMetaManagerRef,
@@ -40,11 +43,13 @@ pub struct MetadataProvider {
 impl MetadataProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        provider: Arc<ListingTable>,
         current_session_table_provider: TableHandleProviderRef,
         func_manager: FuncMetaManagerRef,
         session: SessionCtx,
     ) -> Self {
         Self {
+            provider,
             current_session_table_provider,
             config_options: session.inner().config_options().clone(),
             session,
@@ -52,43 +57,22 @@ impl MetadataProvider {
         }
     }
 
-    fn build_table_handle(&self, name: &ResolvedTable) -> datafusion::common::Result<TableHandle> {
-        let table_name = name.table();
-
-        self.current_session_table_provider.build_table_handle(table_name)
+    fn build_table_handle(&self) -> datafusion::common::Result<TableHandle> {
+        self.current_session_table_provider
+            .build_table_handle(self.provider.clone())
     }
+
+    async fn init(&self) {}
 }
 
-#[async_trait::async_trait]
 impl ContextProviderExtension for MetadataProvider {
-    fn get_table_source(&self, table_ref: TableReference) -> datafusion::common::Result<Arc<TableSourceAdapter>> {
-        let name = table_ref
-            .clone()
-            .resolve_object(self.session.tenant(), self.session.default_database())?;
+    fn get_table_source_(&self, table_ref: TableReference) -> datafusion::common::Result<Arc<TableSourceAdapter>> {
+        let name = table_ref.clone().resolve("", "");
+        let table_name = &*name.table;
 
-        let table_name = name.table();
-        let database_name = name.database();
-        let tenant_name = name.tenant();
+        let table_handle = self.build_table_handle()?;
 
-        // Cannot query across tenants
-        if self.session.tenant() != tenant_name {
-            return Err(DataFusionError::Plan(format!(
-                "Tenant conflict, the current connection's tenant is {}",
-                self.session.tenant()
-            )));
-        }
-
-        // save access table
-        self.access_databases.write().push_table(database_name, table_name);
-
-        let table_handle = self.build_table_handle(&name)?;
-
-        Ok(Arc::new(TableSourceAdapter::try_new(
-            table_ref.to_owned_reference(),
-            database_name,
-            table_name,
-            table_handle,
-        )?))
+        Ok(Arc::new(TableSourceAdapter::try_new(table_ref.clone(), table_name, table_handle)?))
     }
 }
 
@@ -132,7 +116,7 @@ impl ContextProvider for MetadataProvider {
     }
 
     fn get_table_source(&self, name: TableReference) -> DFResult<Arc<dyn TableSource>> {
-        Ok(self.get_table_source(name)?)
+        Ok(self.get_table_source_(name)?)
     }
 
     fn udf_names(&self) -> Vec<String> {
