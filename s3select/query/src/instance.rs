@@ -1,12 +1,22 @@
 use std::sync::Arc;
 
 use api::{
-    query::{dispatcher::QueryDispatcher, execution::QueryStateMachineRef, logical_planner::Plan, Query},
+    query::{
+        dispatcher::QueryDispatcher, execution::QueryStateMachineRef, logical_planner::Plan, session::SessionCtxFactory, Query,
+    },
     server::dbms::{DatabaseManagerSystem, QueryHandle},
     QueryResult,
 };
 use async_trait::async_trait;
 use derive_builder::Builder;
+use s3s::dto::SelectObjectContentInput;
+
+use crate::{
+    dispatcher::manager::SimpleQueryDispatcherBuilder,
+    execution::{factory::SqlQueryExecutionFactory, scheduler::local::LocalScheduler},
+    metadata::base_table::BaseTableProvider,
+    sql::{optimizer::CascadeOptimizerBuilder, parser::DefaultParser},
+};
 
 #[derive(Builder)]
 pub struct RustFSms<D: QueryDispatcher> {
@@ -19,10 +29,6 @@ impl<D> DatabaseManagerSystem for RustFSms<D>
 where
     D: QueryDispatcher,
 {
-    async fn start(&self) -> QueryResult<()> {
-        self.query_dispatcher.start().await
-    }
-
     async fn execute(&self, query: &Query) -> QueryResult<QueryHandle> {
         let result = self.query_dispatcher.execute_query(query).await?;
 
@@ -54,15 +60,31 @@ where
 
         Ok(QueryHandle::new(query.clone(), result))
     }
+}
 
-    fn metrics(&self) -> String {
-        let infos = self.query_dispatcher.running_query_infos();
-        let status = self.query_dispatcher.running_query_status();
+pub async fn make_cnosdbms(input: SelectObjectContentInput) -> QueryResult<impl DatabaseManagerSystem> {
+    // TODO session config need load global system config
+    let session_factory = Arc::new(SessionCtxFactory {});
+    let parser = Arc::new(DefaultParser::default());
+    let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+    // TODO wrap, and num_threads configurable
+    let scheduler = Arc::new(LocalScheduler {});
 
-        format!(
-            "infos: {}\nstatus: {}\n",
-            infos.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>().join(","),
-            status.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>().join(",")
-        )
-    }
+    let query_execution_factory = Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler));
+
+    let default_table_provider = Arc::new(BaseTableProvider::default());
+
+    let query_dispatcher = SimpleQueryDispatcherBuilder::default()
+        .with_input(input)
+        .with_default_table_provider(default_table_provider)
+        .with_session_factory(session_factory)
+        .with_parser(parser)
+        .with_query_execution_factory(query_execution_factory)
+        .build()?;
+
+    let mut builder = RustFSmsBuilder::default();
+
+    let db_server = builder.query_dispatcher(query_dispatcher).build().expect("build db server");
+
+    Ok(db_server)
 }

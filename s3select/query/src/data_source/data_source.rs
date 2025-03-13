@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::write;
@@ -10,7 +11,6 @@ use datafusion::datasource::listing::ListingTable;
 use datafusion::datasource::{provider_as_source, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableSource};
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 use datafusion::sql::TableReference;
 use tracing::debug;
@@ -28,11 +28,9 @@ pub struct TableSourceAdapter {
 impl TableSourceAdapter {
     pub fn try_new(
         table_ref: impl Into<TableReference>,
-        database_name: impl Into<String>,
         table_name: impl Into<String>,
         table_handle: impl Into<TableHandle>,
     ) -> Result<Self, DataFusionError> {
-        let database_name = database_name.into();
         let table_name: String = table_name.into();
 
         let table_handle = table_handle.into();
@@ -46,7 +44,7 @@ impl TableSourceAdapter {
             TableHandle::TableProvider(t) => {
                 let table_source = provider_as_source(t.clone());
                 if let Some(plan) = table_source.get_logical_plan() {
-                    LogicalPlanBuilder::from(plan.clone()).build()?
+                    LogicalPlanBuilder::from(plan.into_owned()).build()?
                 } else {
                     LogicalPlanBuilder::scan(table_ref, table_source, None)?.build()?
                 }
@@ -91,8 +89,8 @@ impl TableSource for TableSourceAdapter {
     }
 
     /// Called by [`InlineTableScan`]
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-        Some(&self.plan)
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+        Some(Cow::Owned(self.plan.clone()))
     }
 }
 

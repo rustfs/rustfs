@@ -43,18 +43,6 @@ pub trait QueryExecution: Send + Sync {
     async fn start(&self) -> QueryResult<Output>;
     // 停止
     fn cancel(&self) -> QueryResult<()>;
-    // query状态
-    // 查询计划
-    // 静态信息
-    // fn info(&self) -> QueryInfo;
-    // 运行时信息
-    // fn status(&self) -> QueryStatus;
-    // sql
-    // 资源占用（cpu时间/内存/吞吐量等）
-    // 是否需要持久化query信息
-    fn need_persist(&self) -> bool {
-        false
-    }
 }
 
 pub enum Output {

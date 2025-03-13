@@ -1,5 +1,11 @@
+use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::logical_expr::LogicalPlan as DFPlan;
+
+use crate::QueryResult;
+
+use super::ast::ExtStatement;
+use super::session::SessionCtx;
 
 #[derive(Clone)]
 pub enum Plan {
@@ -26,4 +32,9 @@ impl QueryPlan {
     pub fn is_explain(&self) -> bool {
         matches!(self.df_plan, DFPlan::Explain(_) | DFPlan::Analyze(_))
     }
+}
+
+#[async_trait]
+pub trait LogicalPlanner {
+    async fn create_logical_plan(&self, statement: ExtStatement, session: &SessionCtx) -> QueryResult<Plan>;
 }

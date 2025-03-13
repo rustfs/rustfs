@@ -1,8 +1,9 @@
 use std::fmt::Display;
 
-use datafusion::common::DataFusionError;
+use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
 use snafu::{Backtrace, Location, Snafu};
 
+pub mod object_store;
 pub mod query;
 pub mod server;
 
@@ -16,6 +17,21 @@ pub enum QueryError {
         location: Location,
         backtrace: Backtrace,
     },
+
+    #[snafu(display("This feature is not implemented: {}", err))]
+    NotImplemented { err: String },
+
+    #[snafu(display("Multi-statement not allow, found num:{}, sql:{}", num, sql))]
+    MultiStatement { num: usize, sql: String },
+
+    #[snafu(display("Failed to build QueryDispatcher. err: {}", err))]
+    BuildQueryDispatcher { err: String },
+
+    #[snafu(display("The query has been canceled"))]
+    Cancel,
+
+    #[snafu(display("{}", source))]
+    Parser { source: ParserError },
 }
 
 impl From<DataFusionError> for QueryError {
