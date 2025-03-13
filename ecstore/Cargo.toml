@@ -17,7 +17,6 @@ blake2 = "0.10.6"
 bytes.workspace = true
 common.workspace = true
 chrono.workspace = true
-reader.workspace = true
 glob = "0.3.2"
 thiserror.workspace = true
 flatbuffers.workspace = true

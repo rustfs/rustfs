@@ -1921,7 +1921,6 @@ dependencies = [
  "pin-project-lite",
  "protos",
  "rand 0.8.5",
- "reader",
  "reed-solomon-erasure",
  "regex",
  "reqwest",
@@ -4980,22 +4979,6 @@ name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
-
-[[package]]
-name = "reader"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "futures",
- "hex-simd",
- "md-5",
- "pin-project-lite",
- "s3s",
- "sha2 0.11.0-pre.4",
- "thiserror 2.0.11",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "redox_syscall"

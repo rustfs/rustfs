@@ -1,74 +1,82 @@
-version: '3.8'
-
 services:
-  node1:
+  node0:
     image: rustfs:v1  # 替换为你的镜像名称和标签
-    container_name: node1
+    container_name: node0
+    hostname: node0
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
+      - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
     platform: linux/amd64
     ports:
-      - "9001:9000"  # 映射宿主机的 9001 端口到容器的 9000 端口
+      - "9000:9000"  # 映射宿主机的 9001 端口到容器的 9000 端口
+      - "8000:9001"  # 映射宿主机的 9001 端口到容器的 9000 端口
     volumes:
-      - ..:/root/data  # 将当前路径挂载到容器内的 /root/data
-    command: "/root/rustfs"
-    networks:
-      - my_network
+      - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
+      # - ./data/node0:/data  # 将当前路径挂载到容器内的 /root/data
+    command: "/app/rustfs"
+
+  node1:
+    image: rustfs:v1
+    container_name: node1
+    hostname: node1
+    environment:
+      - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+    platform: linux/amd64
+    ports:
+      - "9001:9000"  # 映射宿主机的 9002 端口到容器的 9000 端口
+    volumes:
+      - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs 
+      # - ./data/node1:/data
+    command: "/app/rustfs"
 
   node2:
     image: rustfs:v1
     container_name: node2
+    hostname: node2
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
+      - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
     platform: linux/amd64
     ports:
-      - "9002:9000"  # 映射宿主机的 9002 端口到容器的 9000 端口
+      - "9002:9000"  # 映射宿主机的 9003 端口到容器的 9000 端口
     volumes:
-      - ..:/root/data
-    command: "mkdir -p /root/data/target/volume/test{1..4} && /root/data/target/ubuntu22.04/release/rustfs"
-    networks:
-      - my_network
+      - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
+      # - ./data/node2:/data
+    command: "/app/rustfs"
 
   node3:
     image: rustfs:v1
     container_name: node3
+    hostname: node3
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
+      - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
     platform: linux/amd64
     ports:
-      - "9003:9000"  # 映射宿主机的 9003 端口到容器的 9000 端口
+      - "9003:9000"  # 映射宿主机的 9004 端口到容器的 9000 端口
     volumes:
-      - ..:/root/data
-    command: "mkdir -p /root/data/target/volume/test{1..4} && /root/data/target/ubuntu22.04/release/rustfs"
-    networks:
-      - my_network
+      - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
+      # - ./data/node3:/data
+    command: "/app/rustfs"
 
-  node4:
-    image: rustfs:v1
-    container_name: node4
-    environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
-      - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
-    platform: linux/amd64
-    ports:
-      - "9004:9000"  # 映射宿主机的 9004 端口到容器的 9000 端口
-    volumes:
-      - ..:/root/data
-    command: "mkdir -p /root/data/target/volume/test{1..4} && /root/data/target/ubuntu22.04/release/rustfs"
-    networks:
-      - my_network
 
-networks:
-  my_network:
-    driver: bridge
+
+
+
+      2025-03-14T05:23:15.661154Z  INFO ecstore::disk::os: reliable_rename rm dst failed. src_file_path: "/data/rustfs1/.rustfs.sys/tmp/c7fabb9c-48c8-4827-b5e2-13271c3867c3x1741929793/part.38", dst_file_path: "/data/rustfs1/.rustfs.sys/multipart/494d877741f5e87d5160dc4e1bd4fbdacda64559ea0b7d16cdbeed61f252b98f/a83dc20f-e73a-46d0-a02b-11b330ba6e7ex1741929773056730169/641d3efd-cca0-418e-983b-ca2d47652900/part.38", base_dir: "/data/rustfs1/.rustfs.sys/multipart", err: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+    at ecstore/src/disk/os.rs:144
+
+  2025-03-14T05:23:15.953116Z  INFO ecstore::disk::os: reliable_rename rm dst failed. src_file_path: "/data/rustfs3/.rustfs.sys/tmp/e712821f-bc3f-4ffe-8a0c-0daa379d00d4x1741929793/part.39", dst_file_path: "/data/rustfs3/.rustfs.sys/multipart/494d877741f5e87d5160dc4e1bd4fbdacda64559ea0b7d16cdbeed61f252b98f/a83dc20f-e73a-46d0-a02b-11b330ba6e7ex1741929773056730169/641d3efd-cca0-418e-983b-ca2d47652900/part.39", base_dir: "/data/rustfs3/.rustfs.sys/multipart", err: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+    at ecstore/src/disk/os.rs:144
+
+  2025-03-14T05:23:15.953218Z  INFO ecstore::disk::os: reliable_rename rm dst failed. src_file_path: "/data/rustfs2/.rustfs.sys/tmp/e712821f-bc3f-4ffe-8a0c-0daa379d00d4x1741929793/part.39", dst_file_path: "/data/rustfs2/.rustfs.sys/multipart/494d877741f5e87d5160dc4e1bd4fbdacda64559ea0b7d16cdbeed61f252b98f/a83dc20f-e73a-46d0-a02b-11b330ba6e7ex1741929773056730169/641d3efd-cca0-418e-983b-ca2d47652900/part.39", base_dir: "/data/rustfs2/.rustfs.sys/multipart", err: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+    at ecstore/src/disk/os.rs:144

@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 use super::{
     endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
-    FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts,
-    VolumeInfo, WalkDirOptions,
+    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
+    WalkDirOptions,
 };
 use crate::{
     disk::error::DiskError,
@@ -36,11 +36,11 @@ use crate::{
     },
     store_api::{FileInfo, RawFileInfo},
 };
+use crate::{disk::MetaCacheEntry, metacache::writer::MetacacheWriter};
 use crate::{
-    disk::io::{new_http_reader, HttpFileWriter},
+    io::{FileReader, FileWriter, HttpFileReader, HttpFileWriter},
     utils::proto_err_to_err,
 };
-use crate::{disk::MetaCacheEntry, metacache::writer::MetacacheWriter};
 use protos::proto_gen::node_service::RenamePartRequst;
 
 #[derive(Debug)]
@@ -135,7 +135,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
-        info!("read_all");
+        info!("read_all {}/{}", volume, path);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
@@ -146,8 +146,6 @@ impl DiskAPI for RemoteDisk {
         });
 
         let response = client.read_all(request).await?.into_inner();
-
-        info!("read_all success");
 
         if !response.success {
             return Err(Error::new(DiskError::FileNotFound));
@@ -182,7 +180,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        info!("delete");
+        info!("delete {}/{}/{}", self.endpoint.to_string(), volume, path);
         let options = serde_json::to_string(&opt)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
@@ -264,7 +262,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
-        info!("rename_part");
+        info!("rename_part {}/{}", src_volume, src_path);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
@@ -318,7 +316,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter> {
-        info!("create_file");
+        info!("create_file {}/{}/{}", self.endpoint.to_string(), volume, path);
         Ok(Box::new(HttpFileWriter::new(
             self.endpoint.grid_host().as_str(),
             self.endpoint.to_string().as_str(),
@@ -331,7 +329,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        info!("append_file");
+        info!("append_file {}/{}", volume, path);
         Ok(Box::new(HttpFileWriter::new(
             self.endpoint.grid_host().as_str(),
             self.endpoint.to_string().as_str(),
@@ -344,25 +342,31 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        info!("read_file");
-        Ok(new_http_reader(self.endpoint.grid_host().as_str(), self.endpoint.to_string().as_str(), volume, path, 0, 0).await?)
+        info!("read_file {}/{}", volume, path);
+        Ok(Box::new(
+            HttpFileReader::new(self.endpoint.grid_host().as_str(), self.endpoint.to_string().as_str(), volume, path, 0, 0)
+                .await?,
+        ))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        Ok(new_http_reader(
-            self.endpoint.grid_host().as_str(),
-            self.endpoint.to_string().as_str(),
-            volume,
-            path,
-            offset,
-            length,
-        )
-        .await?)
+        info!("read_file_stream {}/{}/{}", self.endpoint.to_string(), volume, path);
+        Ok(Box::new(
+            HttpFileReader::new(
+                self.endpoint.grid_host().as_str(),
+                self.endpoint.to_string().as_str(),
+                volume,
+                path,
+                offset,
+                length,
+            )
+            .await?,
+        ))
     }
 
     async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
-        info!("list_dir");
+        info!("list_dir {}/{}", volume, _dir_path);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
@@ -386,7 +390,8 @@ impl DiskAPI for RemoteDisk {
 
     // FIXME: TODO: use writer
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
-        info!("walk_dir");
+        let now = std::time::SystemTime::now();
+        info!("walk_dir {}/{}/{:?}", self.endpoint.to_string(), opts.bucket, opts.filter_prefix);
         let mut wr = wr;
         let mut out = MetacacheWriter::new(&mut wr);
         let mut buf = Vec::new();
@@ -415,6 +420,12 @@ impl DiskAPI for RemoteDisk {
             }
         }
 
+        info!(
+            "walk_dir {}/{:?} done {:?}",
+            opts.bucket,
+            opts.filter_prefix,
+            now.elapsed().unwrap_or_default()
+        );
         Ok(())
     }
 
@@ -426,7 +437,7 @@ impl DiskAPI for RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        info!("rename_data");
+        info!("rename_data {}/{}/{}/{}", self.addr, self.endpoint.to_string(), dst_volume, dst_path);
         let file_info = serde_json::to_string(&fi)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
@@ -608,7 +619,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
-        info!("write_metadata");
+        info!("write_metadata {}/{}", volume, path);
         let file_info = serde_json::to_string(&fi)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
@@ -670,7 +681,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
-        info!("read_xl");
+        info!("read_xl {}/{}/{}", self.endpoint.to_string(), volume, path);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
@@ -779,7 +790,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
-        info!("read_multiple");
+        info!("read_multiple {}/{}/{}", self.endpoint.to_string(), req.bucket, req.prefix);
         let read_multiple_req = serde_json::to_string(&req)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
@@ -809,7 +820,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn delete_volume(&self, volume: &str) -> Result<()> {
-        info!("delete_volume");
+        info!("delete_volume {}/{}", self.endpoint.to_string(), volume);
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
@@ -832,7 +843,6 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
-        info!("delete_volume");
         let opts = serde_json::to_string(&opts)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await

@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-
 use super::error::{is_err_config_not_found, ConfigError};
 use super::{storageclass, Config, GLOBAL_StorageClass, KVS};
 use crate::disk::RUSTFS_META_BUCKET;
@@ -10,8 +7,9 @@ use crate::store_err::is_err_object_not_found;
 use crate::utils::path::SLASH_SEPARATOR;
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use s3s::dto::StreamingBlob;
-use s3s::Body;
+use std::collections::HashSet;
+use std::io::Cursor;
+use std::sync::Arc;
 use tracing::{error, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
@@ -59,7 +57,7 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
     Ok((data, rd.object_info))
 }
 
-pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: &[u8]) -> Result<()> {
+pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
     save_config_with_opts(
         api,
         file,
@@ -96,14 +94,10 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
     }
 }
 
-async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: &[u8], opts: &ObjectOptions) -> Result<()> {
+async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
+    let size = data.len();
     let _ = api
-        .put_object(
-            RUSTFS_META_BUCKET,
-            file,
-            &mut PutObjReader::new(StreamingBlob::from(Body::from(data.to_vec())), data.len()),
-            opts,
-        )
+        .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::new(Box::new(Cursor::new(data)), size), opts)
         .await?;
     Ok(())
 }
@@ -174,7 +168,7 @@ async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Result<
 
     let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
 
-    save_config(api, &config_file, data.as_slice()).await
+    save_config(api, &config_file, data).await
 }
 
 pub async fn lookup_configs<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) {

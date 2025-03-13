@@ -164,7 +164,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 let entry = match r.peek().await {
                     Ok(res) => {
                         if let Some(entry) = res {
-                            info!("read entry disk: {}, name: {}", i, entry.name);
+                            // info!("read entry disk: {}, name: {}", i, entry.name);
                             entry
                         } else {
                             // eof
