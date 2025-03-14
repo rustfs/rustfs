@@ -82,12 +82,7 @@ impl<'a> ExtParser<'a> {
 
     /// Parse a new expression
     fn parse_statement(&mut self) -> Result<ExtStatement> {
-        match self.parser.peek_token().token {
-            Token::Word(w) => match w.keyword {
-                _ => Ok(ExtStatement::SqlStatement(Box::new(self.parser.parse_statement()?))),
-            },
-            _ => Ok(ExtStatement::SqlStatement(Box::new(self.parser.parse_statement()?))),
-        }
+        Ok(ExtStatement::SqlStatement(Box::new(self.parser.parse_statement()?)))
     }
 
     // Report unexpected token

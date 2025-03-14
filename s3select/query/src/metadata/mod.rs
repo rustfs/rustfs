@@ -1,23 +1,19 @@
 use std::sync::Arc;
 
 use api::query::{function::FuncMetaManagerRef, session::SessionCtx};
-use api::ResolvedTable;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
 use datafusion::datasource::listing::ListingTable;
-use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
 use datafusion::logical_expr::var_provider::is_system_variables;
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
-use datafusion::sql::ResolvedTableReference;
 use datafusion::variable::VarType;
 use datafusion::{
     config::ConfigOptions,
     sql::{planner::ContextProvider, TableReference},
 };
 
-use crate::data_source::data_source::{TableHandle, TableSourceAdapter};
+use crate::data_source::table_source::{TableHandle, TableSourceAdapter};
 
 pub mod base_table;
 
@@ -58,11 +54,8 @@ impl MetadataProvider {
     }
 
     fn build_table_handle(&self) -> datafusion::common::Result<TableHandle> {
-        self.current_session_table_provider
-            .build_table_handle(self.provider.clone())
+        self.current_session_table_provider.build_table_handle(self.provider.clone())
     }
-
-    async fn init(&self) {}
 }
 
 impl ContextProviderExtension for MetadataProvider {

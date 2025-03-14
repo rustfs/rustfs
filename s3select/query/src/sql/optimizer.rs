@@ -31,18 +31,14 @@ impl Optimizer for CascadeOptimizer {
         let physical_plan = {
             self.physical_planner
                 .create_physical_plan(&optimized_logical_plan, session)
-                .await
-                .map(|p| p)
-                .map_err(|err| err)?
+                .await?
         };
 
         debug!("Original physical plan:\n{}\n", displayable(physical_plan.as_ref()).indent(false));
 
         let optimized_physical_plan = {
             self.physical_optimizer
-                .optimize(physical_plan, session)
-                .map(|p| p)
-                .map_err(|err| err)?
+                .optimize(physical_plan, session)?
         };
 
         Ok(optimized_physical_plan)

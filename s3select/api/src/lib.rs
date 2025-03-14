@@ -32,6 +32,12 @@ pub enum QueryError {
 
     #[snafu(display("{}", source))]
     Parser { source: ParserError },
+
+    #[snafu(display("Udf not exists, name:{}.", name))]
+    FunctionNotExists { name: String },
+
+    #[snafu(display("Udf already exists, name:{}.", name))]
+    FunctionExists { name: String },
 }
 
 impl From<DataFusionError> for QueryError {

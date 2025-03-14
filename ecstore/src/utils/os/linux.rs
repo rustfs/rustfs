@@ -151,7 +151,7 @@ fn read_drive_stats(stats_file: &str) -> Result<IOStats> {
 fn read_stat(file_name: &str) -> Result<Vec<u64>> {
     // 打开文件
     let path = Path::new(file_name);
-    let file = File::open(&path)?;
+    let file = File::open(path)?;
 
     // 创建一个 BufReader
     let reader = io::BufReader::new(file);
@@ -161,7 +161,8 @@ fn read_stat(file_name: &str) -> Result<Vec<u64>> {
     if let Some(line) = reader.lines().next() {
         let line = line?;
         // 分割行并解析为 u64
-        for token in line.trim().split_whitespace() {
+        // https://rust-lang.github.io/rust-clippy/master/index.html#trim_split_whitespace
+        for token in line.split_whitespace() {
             let ui64: u64 = token.parse()?;
             stats.push(ui64);
         }

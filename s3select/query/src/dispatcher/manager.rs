@@ -1,7 +1,6 @@
 use std::{
-    collections::HashMap,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -31,14 +30,10 @@ use datafusion::{
 };
 use futures::{Stream, StreamExt};
 use s3s::dto::SelectObjectContentInput;
-use tokio::task::JoinHandle;
 
 use crate::{
     execution::factory::QueryExecutionFactoryRef,
-    metadata::{
-        base_table::BaseTableProvider,
-        ContextProviderExtension, MetadataProvider, TableHandleProviderRef,
-    },
+    metadata::{base_table::BaseTableProvider, ContextProviderExtension, MetadataProvider, TableHandleProviderRef},
     sql::logical::planner::DefaultLogicalPlanner,
 };
 
@@ -46,7 +41,7 @@ use crate::{
 pub struct SimpleQueryDispatcher {
     input: SelectObjectContentInput,
     // client for default tenant
-    default_table_provider: TableHandleProviderRef,
+    _default_table_provider: TableHandleProviderRef,
     session_factory: Arc<SessionCtxFactory>,
     // parser
     parser: Arc<dyn Parser + Send + Sync>,
@@ -264,7 +259,7 @@ impl SimpleQueryDispatcherBuilder {
 
         let dispatcher = Arc::new(SimpleQueryDispatcher {
             input,
-            default_table_provider,
+            _default_table_provider: default_table_provider,
             session_factory,
             parser,
             query_execution_factory,
