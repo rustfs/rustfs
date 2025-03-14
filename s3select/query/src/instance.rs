@@ -63,11 +63,11 @@ where
     }
 }
 
-pub async fn make_cnosdbms(input: SelectObjectContentInput) -> QueryResult<impl DatabaseManagerSystem> {
+pub async fn make_cnosdbms(input: SelectObjectContentInput, is_test: bool) -> QueryResult<impl DatabaseManagerSystem> {
     // init Function Manager, we can define some UDF if need
     let func_manager = SimpleFunctionMetadataManager::default();
     // TODO session config need load global system config
-    let session_factory = Arc::new(SessionCtxFactory {});
+    let session_factory = Arc::new(SessionCtxFactory { is_test });
     let parser = Arc::new(DefaultParser::default());
     let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
     // TODO wrap, and num_threads configurable
@@ -91,4 +91,74 @@ pub async fn make_cnosdbms(input: SelectObjectContentInput) -> QueryResult<impl 
     let db_server = builder.query_dispatcher(query_dispatcher).build().expect("build db server");
 
     Ok(db_server)
+}
+
+#[cfg(test)]
+mod tests {
+    use api::{
+        query::{Context, Query},
+        server::dbms::DatabaseManagerSystem,
+    };
+    use datafusion::{arrow::util::pretty, assert_batches_eq};
+    use s3s::dto::{
+        CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
+        SelectObjectContentRequest,
+    };
+
+    use crate::instance::make_cnosdbms;
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_simple_sql() {
+        let sql = "select * from S3Object";
+        let input = SelectObjectContentInput {
+            bucket: "dandan".to_string(),
+            expected_bucket_owner: None,
+            key: "test.csv".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: sql.to_string(),
+                expression_type: ExpressionType::from_static("SQL"),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput::default()),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        };
+        let db = make_cnosdbms(input.clone(), true).await.unwrap();
+        let query = Query::new(Context { input }, sql.to_string());
+
+        let result = db.execute(&query).await.unwrap();
+
+        let results = result.result().chunk_result().await.unwrap().to_vec();
+
+        let expected = [
+            "+----------------+----------+----------+------------+----------+",
+            "| column_1       | column_2 | column_3 | column_4   | column_5 |",
+            "+----------------+----------+----------+------------+----------+",
+            "| id             | name     | age      | department | salary   |",
+            "|             1  | Alice    | 25       | HR         | 5000     |",
+            "|             2  | Bob      | 30       | IT         | 6000     |",
+            "|             3  | Charlie  | 35       | Finance    | 7000     |",
+            "|             4  | Diana    | 22       | Marketing  | 4500     |",
+            "|             5  | Eve      | 28       | IT         | 5500     |",
+            "|             6  | Frank    | 40       | Finance    | 8000     |",
+            "|             7  | Grace    | 26       | HR         | 5200     |",
+            "|             8  | Henry    | 32       | IT         | 6200     |",
+            "|             9  | Ivy      | 24       | Marketing  | 4800     |",
+            "|             10 | Jack     | 38       | Finance    | 7500     |",
+            "+----------------+----------+----------+------------+----------+",
+        ];
+
+        assert_batches_eq!(expected, &results);
+        pretty::print_batches(&results).unwrap();
+    }
 }

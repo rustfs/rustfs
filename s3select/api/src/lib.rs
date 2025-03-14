@@ -38,6 +38,9 @@ pub enum QueryError {
 
     #[snafu(display("Udf already exists, name:{}.", name))]
     FunctionExists { name: String },
+
+    #[snafu(display("Store Error, e:{}.", e))]
+    StoreError { e: String },
 }
 
 impl From<DataFusionError> for QueryError {
