@@ -98,7 +98,7 @@ impl QueryDispatcher for SimpleQueryDispatcher {
     }
 
     async fn build_query_state_machine(&self, query: Query) -> QueryResult<Arc<QueryStateMachine>> {
-        let session = self.session_factory.create_session_ctx(query.context())?;
+        let session = self.session_factory.create_session_ctx(query.context()).await?;
 
         let query_state_machine = Arc::new(QueryStateMachine::begin(query, session));
         Ok(query_state_machine)

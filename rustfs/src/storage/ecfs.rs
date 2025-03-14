@@ -1880,7 +1880,7 @@ impl S3 for FS {
         let input = req.input;
         info!("{:?}", input);
 
-        let db = make_cnosdbms(input.clone()).await.map_err(|e| {
+        let db = make_cnosdbms(input.clone(), false).await.map_err(|e| {
             error!("make db failed, {}", e.to_string());
             s3_error!(InternalError)
         })?;

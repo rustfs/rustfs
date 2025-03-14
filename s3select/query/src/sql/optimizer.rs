@@ -36,10 +36,7 @@ impl Optimizer for CascadeOptimizer {
 
         debug!("Original physical plan:\n{}\n", displayable(physical_plan.as_ref()).indent(false));
 
-        let optimized_physical_plan = {
-            self.physical_optimizer
-                .optimize(physical_plan, session)?
-        };
+        let optimized_physical_plan = { self.physical_optimizer.optimize(physical_plan, session)? };
 
         Ok(optimized_physical_plan)
     }
