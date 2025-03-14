@@ -14,6 +14,7 @@ use s3s::dto::SelectObjectContentInput;
 use crate::{
     dispatcher::manager::SimpleQueryDispatcherBuilder,
     execution::{factory::SqlQueryExecutionFactory, scheduler::local::LocalScheduler},
+    function::simple_func_manager::SimpleFunctionMetadataManager,
     metadata::base_table::BaseTableProvider,
     sql::{optimizer::CascadeOptimizerBuilder, parser::DefaultParser},
 };
@@ -63,6 +64,8 @@ where
 }
 
 pub async fn make_cnosdbms(input: SelectObjectContentInput) -> QueryResult<impl DatabaseManagerSystem> {
+    // init Function Manager, we can define some UDF if need
+    let func_manager = SimpleFunctionMetadataManager::default();
     // TODO session config need load global system config
     let session_factory = Arc::new(SessionCtxFactory {});
     let parser = Arc::new(DefaultParser::default());
@@ -76,6 +79,7 @@ pub async fn make_cnosdbms(input: SelectObjectContentInput) -> QueryResult<impl 
 
     let query_dispatcher = SimpleQueryDispatcherBuilder::default()
         .with_input(input)
+        .with_func_manager(Arc::new(func_manager))
         .with_default_table_provider(default_table_provider)
         .with_session_factory(session_factory)
         .with_parser(parser)

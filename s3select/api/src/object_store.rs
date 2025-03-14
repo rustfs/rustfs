@@ -79,7 +79,7 @@ impl ObjectStore for EcObjectStore {
         let stream = stream::unfold(reader.stream, |mut blob| async move {
             match blob.next().await {
                 Some(Ok(chunk)) => {
-                    let bytes = Bytes::from(chunk);
+                    let bytes = chunk;
                     Some((Ok(bytes), blob))
                 }
                 _ => None,

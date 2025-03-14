@@ -23,8 +23,6 @@ use tracing::debug;
 
 use crate::sql::analyzer::DefaultAnalyzer;
 
-const PUSH_DOWN_PROJECTION_INDEX: usize = 24;
-
 pub trait LogicalOptimizer: Send + Sync {
     fn optimize(&self, plan: &QueryPlan, session: &SessionCtx) -> QueryResult<LogicalPlan>;
 
@@ -93,7 +91,7 @@ impl Default for DefaultLogicalOptimizer {
 
 impl LogicalOptimizer for DefaultLogicalOptimizer {
     fn optimize(&self, plan: &QueryPlan, session: &SessionCtx) -> QueryResult<LogicalPlan> {
-        let analyzed_plan = { self.analyzer.analyze(&plan.df_plan, session).map(|p| p).map_err(|e| e)? };
+        let analyzed_plan = { self.analyzer.analyze(&plan.df_plan, session)? };
 
         debug!("Analyzed logical plan:\n{}\n", plan.df_plan.display_indent_schema(),);
 
@@ -101,9 +99,7 @@ impl LogicalOptimizer for DefaultLogicalOptimizer {
             SessionStateBuilder::new_from_existing(session.inner().clone())
                 .with_optimizer_rules(self.rules.clone())
                 .build()
-                .optimize(&analyzed_plan)
-                .map(|p| p)
-                .map_err(|e| e)?
+                .optimize(&analyzed_plan)?
         };
 
         Ok(optimizeed_plan)

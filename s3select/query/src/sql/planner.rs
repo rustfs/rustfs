@@ -13,14 +13,14 @@ use datafusion::sql::{planner::SqlToRel, sqlparser::ast::Statement};
 use crate::metadata::ContextProviderExtension;
 
 pub struct SqlPlanner<'a, S: ContextProviderExtension> {
-    schema_provider: &'a S,
+    _schema_provider: &'a S,
     df_planner: SqlToRel<'a, S>,
 }
 
 #[async_trait]
-impl<'a, S: ContextProviderExtension + Send + Sync> LogicalPlanner for SqlPlanner<'a, S> {
+impl<S: ContextProviderExtension + Send + Sync> LogicalPlanner for SqlPlanner<'_, S> {
     async fn create_logical_plan(&self, statement: ExtStatement, session: &SessionCtx) -> QueryResult<Plan> {
-        let plan = { self.statement_to_plan(statement, session).await.map_err(|err| err)? };
+        let plan = { self.statement_to_plan(statement, session).await? };
 
         Ok(plan)
     }
@@ -30,7 +30,7 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlanner<'a, S> {
     /// Create a new query planner
     pub fn new(schema_provider: &'a S) -> Self {
         SqlPlanner {
-            schema_provider,
+            _schema_provider: schema_provider,
             df_planner: SqlToRel::new(schema_provider),
         }
     }

@@ -6,9 +6,12 @@ use crate::auth::get_condition_values;
 use crate::storage::access::ReqInfo;
 use api::query::Context;
 use api::query::Query;
+use api::server::dbms::DatabaseManagerSystem;
 use bytes::Bytes;
 use common::error::Result;
+use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use ecstore::bucket::error::BucketMetadataError;
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
@@ -43,7 +46,6 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use iam::policy::action::Action;
-use api::server::dbms::DatabaseManagerSystem;
 use iam::policy::action::S3Action;
 use lazy_static::lazy_static;
 use log::warn;
@@ -61,10 +63,10 @@ use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use std::fmt::Debug;
 use std::str::FromStr;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
 use tracing::debug;
@@ -1878,13 +1880,12 @@ impl S3 for FS {
         let input = req.input;
         info!("{:?}", input);
 
-        let db = make_cnosdbms(input).await.map_err(|_| {
+        let db = make_cnosdbms(input.clone()).await.map_err(|e| {
+            error!("make db failed, {}", e.to_string());
             s3_error!(InternalError)
         })?;
-        let query = Query::new(Context {input: input.clone()}, input.request.expression);
-        let result = db.execute(&query).await.map_err(|_| {
-            s3_error!(InternalError)
-        })?;
+        let query = Query::new(Context { input: input.clone() }, input.request.expression);
+        let result = db.execute(&query).await.map_err(|_| s3_error!(InternalError))?;
 
         let results = result.result().chunk_result().await.unwrap().to_vec();
 

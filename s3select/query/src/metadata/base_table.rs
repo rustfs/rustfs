@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::common::Result as DFResult;
 use datafusion::datasource::listing::ListingTable;
 
-use crate::data_source::data_source::TableHandle;
+use crate::data_source::table_source::TableHandle;
 
 use super::TableHandleProvider;
 
