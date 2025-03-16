@@ -258,10 +258,10 @@ impl FileSink {
         buffer_size: usize,
         flush_interval_ms: u64,
         flush_threshold: usize,
-    ) -> Result<Self, std::io::Error> {
+    ) -> Result<Self, io::Error> {
         let file = OpenOptions::new().append(true).create(true).open(&path).await?;
 
-        let writer = tokio::io::BufWriter::with_capacity(buffer_size, file);
+        let writer = io::BufWriter::with_capacity(buffer_size, file);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -421,11 +421,10 @@ pub fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
 
         // Use synchronous file operations
         let file_result = std::fs::OpenOptions::new().append(true).create(true).open(&path);
-
         match file_result {
             Ok(file) => {
                 let buffer_size = config.sinks.file.buffer_size.unwrap_or(8192);
-                let writer = tokio::io::BufWriter::with_capacity(buffer_size, tokio::fs::File::from_std(file));
+                let writer = io::BufWriter::with_capacity(buffer_size, tokio::fs::File::from_std(file));
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

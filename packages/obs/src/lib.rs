@@ -13,20 +13,53 @@ mod worker;
 
 pub use config::load_config;
 pub use config::{AppConfig, OtelConfig};
-pub use entry::{LogEntry, SerializableLevel};
+pub use entry::log::{LogEntry, SerializableLevel};
 pub use logger::start_logger;
+pub use logger::{
+    ensure_logger_initialized, get_global_logger, init_global_logger, locked_logger, log_debug, log_error, log_info, log_trace,
+    log_warn, log_with_context,
+};
 pub use logger::{LogError, Logger};
 pub use sink::Sink;
+use std::sync::Arc;
 pub use telemetry::init_telemetry;
+use tokio::sync::Mutex;
 pub use utils::{get_local_ip, get_local_ip_with_default};
 pub use worker::start_worker;
 
-/// Log module initialization function
+/// Initialize the observability module
 ///
-/// Return to Logger and Clean Guard
-pub fn init_logging(config: AppConfig) -> (Logger, telemetry::OtelGuard) {
+/// # Parameters
+/// - `config`: Configuration information
+///
+/// # Returns
+/// A tuple containing the logger and the telemetry guard
+///
+/// # Example
+/// ```
+/// use rustfs_obs::{AppConfig, init_obs};
+///
+/// let config = AppConfig::default();
+/// let (logger, guard) = init_obs(config);
+/// ```
+pub async fn init_obs(config: AppConfig) -> (Arc<Mutex<Logger>>, telemetry::OtelGuard) {
     let guard = init_telemetry(&config.observability);
     let sinks = sink::create_sinks(&config);
-    let logger = start_logger(&config, sinks);
+    let logger = init_global_logger(&config, sinks).await;
     (logger, guard)
+}
+
+/// Get the global logger instance
+/// This function returns a reference to the global logger instance.
+///
+/// # Returns
+/// A reference to the global logger instance
+///
+/// # Example
+/// ```
+/// use rustfs_obs::get_logger;
+/// let logger = get_logger();
+/// ```
+pub fn get_logger() -> &'static Arc<Mutex<Logger>> {
+    get_global_logger()
 }
