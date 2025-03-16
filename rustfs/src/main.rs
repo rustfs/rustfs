@@ -35,6 +35,7 @@ use hyper_util::{
 };
 use iam::init_iam_sys;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustfs_obs::{init_obs, load_config};
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
 use std::{io::IsTerminal, net::SocketAddr};
@@ -45,6 +46,7 @@ use tracing::{debug, error, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[allow(dead_code)]
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
 
@@ -89,8 +91,10 @@ fn main() -> Result<()> {
     let opt = config::Opt::parse();
 
     //设置 trace
-    setup_tracing();
-
+    // setup_tracing();
+    let config = load_config(Some("packages/obs/examples/config".to_string()));
+    // Initialize the logger asynchronously
+    let (_logger, _guard) = tokio::runtime::Runtime::new()?.block_on(async { init_obs(config).await });
     //运行参数
     run(opt)
 }

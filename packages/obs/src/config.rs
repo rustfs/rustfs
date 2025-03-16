@@ -15,7 +15,7 @@ pub struct OtelConfig {
 }
 
 /// Kafka Sink Configuration - Add batch parameters
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct KafkaSinkConfig {
     pub enabled: bool,
     pub bootstrap_servers: String,
@@ -25,7 +25,7 @@ pub struct KafkaSinkConfig {
 }
 
 /// Webhook Sink Configuration - Add Retry Parameters
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct WebhookSinkConfig {
     pub enabled: bool,
     pub url: String,
@@ -34,7 +34,7 @@ pub struct WebhookSinkConfig {
 }
 
 /// File Sink Configuration - Add buffering parameters
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct FileSinkConfig {
     pub enabled: bool,
     pub path: String,
@@ -44,7 +44,7 @@ pub struct FileSinkConfig {
 }
 
 /// Sink configuration collection
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct SinkConfig {
     pub kafka: KafkaSinkConfig,
     pub webhook: WebhookSinkConfig,
@@ -52,13 +52,13 @@ pub struct SinkConfig {
 }
 
 ///Logger Configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct LoggerConfig {
     pub queue_capacity: Option<usize>,
 }
 
 /// Overall application configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct AppConfig {
     pub observability: OtelConfig,
     pub sinks: SinkConfig,

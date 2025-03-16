@@ -13,6 +13,8 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_NAME, SERVICE_VERSION},
     SCHEMA_URL,
 };
+use std::io::IsTerminal;
+use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -155,63 +157,72 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     let meter_provider = init_meter_provider(config);
     let tracer = tracer_provider.tracer(config.service_name.clone());
 
-    let logger_provider = if config.endpoint.is_empty() {
-        SdkLoggerProvider::builder()
-            .with_resource(resource(config))
-            .with_simple_exporter(opentelemetry_stdout::LogExporter::default())
-            .build()
-    } else {
-        let exporter = opentelemetry_otlp::LogExporter::builder()
-            .with_tonic()
-            .with_endpoint(&config.endpoint)
-            .build()
-            .unwrap();
-        SdkLoggerProvider::builder()
-            .with_resource(resource(config))
-            .with_batch_exporter(exporter)
-            .with_batch_exporter(opentelemetry_stdout::LogExporter::default())
-            .build()
+    // Initialize logger provider based on configuration
+    let logger_provider = {
+        let mut builder = SdkLoggerProvider::builder().with_resource(resource(config));
+
+        if config.endpoint.is_empty() {
+            // Use stdout exporter when no endpoint is configured
+            builder = builder.with_simple_exporter(opentelemetry_stdout::LogExporter::default());
+        } else {
+            // Configure OTLP exporter when endpoint is provided
+            let exporter = opentelemetry_otlp::LogExporter::builder()
+                .with_tonic()
+                .with_endpoint(&config.endpoint)
+                .build()
+                .unwrap();
+
+            builder = builder.with_batch_exporter(exporter);
+
+            // Add stdout exporter if requested
+            if config.use_stdout {
+                builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
+            }
+        }
+
+        builder.build()
     };
 
-    let otel_layer = layer::OpenTelemetryTracingBridge::new(&logger_provider);
-    // For the OpenTelemetry layer, add a tracing filter to filter events from
-    // OpenTelemetry and its dependent crates (opentelemetry-otlp uses crates
-    // like reqwest/tonic etc.) from being sent back to OTel itself, thus
-    // preventing infinite telemetry generation. The filter levels are set as
-    // follows:
-    // - Allow `info` level and above by default.
-    // - Restrict `opentelemetry`, `hyper`, `tonic`, and `reqwest` completely.
-    // Note: This will also drop events from crates like `tonic` etc. even when
-    // they are used outside the OTLP Exporter. For more details, see:
-    // https://github.com/open-telemetry/opentelemetry-rust/issues/761
-    let filter_otel = EnvFilter::new("info")
-        .add_directive("hyper=off".parse().unwrap())
-        .add_directive("opentelemetry=off".parse().unwrap())
-        .add_directive("tonic=off".parse().unwrap())
-        .add_directive("h2=off".parse().unwrap())
-        .add_directive("reqwest=off".parse().unwrap());
-    let otel_layer = otel_layer.with_filter(filter_otel);
+    // Setup OpenTelemetryTracingBridge layer
+    let otel_layer = {
+        // Filter to prevent infinite telemetry loops
+        // This blocks events from OpenTelemetry and its dependent libraries (tonic, reqwest, etc.)
+        // from being sent back to OpenTelemetry itself
+        let filter_otel = EnvFilter::new("info")
+            .add_directive("hyper=off".parse().unwrap())
+            .add_directive("opentelemetry=off".parse().unwrap())
+            .add_directive("tonic=off".parse().unwrap())
+            .add_directive("h2=off".parse().unwrap())
+            .add_directive("reqwest=off".parse().unwrap());
+
+        layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(filter_otel)
+    };
     let registry = tracing_subscriber::registry()
         .with(tracing_subscriber::filter::LevelFilter::INFO)
         .with(OpenTelemetryLayer::new(tracer))
         .with(MetricsLayer::new(meter_provider.clone()))
         .with(otel_layer);
-    if config.endpoint.is_empty() {
-        // Create a new tracing::Fmt layer to print the logs to stdout. It has a
-        // default filter of `info` level and above, and `debug` and above for logs
-        // from OpenTelemetry crates. The filter levels can be customized as needed.
-        let filter_fmt = EnvFilter::new("info").add_directive("opentelemetry=debug".parse().unwrap());
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_thread_names(true)
-            .with_filter(filter_fmt);
+    // Configure formatting layer
+    let enable_color = std::io::stdout().is_terminal();
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(enable_color)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true);
 
-        registry
-            .with(tracing_subscriber::fmt::layer().with_ansi(true))
-            .with(fmt_layer)
-            .init();
+    // Creating a formatting layer with explicit type to avoid type mismatches
+    let fmt_layer = if config.endpoint.is_empty() {
+        // Local debug mode: add filter to show OpenTelemetry debug logs
+        let filter_fmt = EnvFilter::new("info").add_directive("opentelemetry=debug".parse().unwrap());
+        fmt_layer.with_filter(filter_fmt)
     } else {
-        registry.with(tracing_subscriber::fmt::layer().with_ansi(false)).init();
-        println!("Logs and meter,tracer enabled");
+        // Production mode: use default filter settings
+        fmt_layer.with_filter(EnvFilter::new("info").add_directive("opentelemetry=off".parse().unwrap()))
+    };
+
+    registry.with(ErrorLayer::default()).with(fmt_layer).init();
+    if !config.endpoint.is_empty() {
+        tracing::info!("OpenTelemetry telemetry initialized with OTLP endpoint: {}", config.endpoint);
     }
 
     OtelGuard {

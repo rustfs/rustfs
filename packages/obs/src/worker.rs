@@ -1,4 +1,4 @@
-use crate::{entry::LogEntry, sink::Sink};
+use crate::{entry::log::LogEntry, sink::Sink};
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 

@@ -52,6 +52,7 @@ pub struct LogEntry {
     pub level: SerializableLevel,      // Log Level
     pub message: String,               // Log messages
     pub source: String,                // Log source (such as module name)
+    pub target: Option<String>,        // Log target
     pub request_id: Option<String>,    // Request ID (Common Server Fields)
     pub user_id: Option<String>,       // User ID (Common Server Fields)
     pub fields: Vec<(String, String)>, // Attached fields (key value pairs)
@@ -63,6 +64,7 @@ impl LogEntry {
         level: Level,
         message: String,
         source: String,
+        target: Option<String>,
         request_id: Option<String>,
         user_id: Option<String>,
         fields: Vec<(String, String)>,
@@ -72,6 +74,7 @@ impl LogEntry {
             level: SerializableLevel::from(level),
             message,
             source,
+            target,
             request_id,
             user_id,
             fields,
