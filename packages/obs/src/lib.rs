@@ -13,6 +13,8 @@ mod worker;
 
 pub use config::load_config;
 pub use config::{AppConfig, OtelConfig};
+pub use entry::audit::{ApiDetails, AuditEntry};
+pub use entry::base::{Args, Entry, Info, LogKind, ObjectVersion, Trace, API};
 pub use entry::log::{LogEntry, SerializableLevel};
 pub use logger::start_logger;
 pub use logger::{

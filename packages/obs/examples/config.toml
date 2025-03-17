@@ -1,6 +1,6 @@
 [observability]
 endpoint = "http://localhost:4317"
-use_stdout = true
+use_stdout = false
 sample_ratio = 0.5
 meter_interval = 30
 service_name = "rustfs_obs_service"
