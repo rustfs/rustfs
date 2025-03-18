@@ -34,6 +34,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use iam::init_iam_sys;
+use once_cell::sync::OnceCell;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_obs::{init_obs, load_config};
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
@@ -45,6 +46,20 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Guard that holds a reference to the global observability subsystem.
+/// This struct ensures that tracing/logging components remain alive for the
+/// application's lifetime. The underlying guard is dropped when this struct
+/// is dropped, which may flush logs or perform cleanup operations.
+#[allow(dead_code)]
+struct TracingGuard(Box<dyn std::any::Any + Send + Sync>);
+
+impl Drop for TracingGuard {
+    fn drop(&mut self) {
+        debug!("Dropping global tracing guard, flushing logs");
+    }
+}
+static GLOBAL_GUARD: OnceCell<TracingGuard> = OnceCell::new();
 
 #[allow(dead_code)]
 fn setup_tracing() {
@@ -87,26 +102,28 @@ fn print_server_info() {
 }
 
 fn main() -> Result<()> {
-    //解析获得到的参数
+    // Parse the obtained parameters
     let opt = config::Opt::parse();
 
-    //设置 trace
+    // 设置 trace
     // setup_tracing();
 
     let config = load_config(Some(opt.clone().obs_config));
     // Initialize Observability
-    let (_logger, _guard) = tokio::runtime::Runtime::new()?.block_on(async { init_obs(config).await });
+    let (_logger, guard) = tokio::runtime::Runtime::new()?.block_on(async { init_obs(config).await });
 
-    //运行参数
+    // Pack and store the guard
+    GLOBAL_GUARD.set(TracingGuard(Box::new(guard))).unwrap_or_else(|_| {
+        error!("Unable to set global tracing guard");
+    });
+
+    // Run parameters
     run(opt)
 }
 
 #[tokio::main]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
-    // let config = load_config(Some(opt.clone().obs_config));
-    // Initialize Observability
-    // let (_logger, _guard) = init_obs(config).await;
 
     let mut server_addr = net::check_local_server_addr(opt.address.as_str()).unwrap();
 

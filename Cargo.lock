@@ -5633,6 +5633,7 @@ dependencies = [
  "mime",
  "mime_guess",
  "netif",
+ "once_cell",
  "pin-project-lite",
  "prost",
  "prost-build",
