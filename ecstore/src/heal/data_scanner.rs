@@ -217,7 +217,7 @@ async fn run_data_scanner() {
                 globalScannerMetrics.write().await.set_cycle(Some(cycle_info.clone())).await;
                 let mut wr = Vec::new();
                 cycle_info.serialize(&mut Serializer::new(&mut wr)).unwrap();
-                let _ = save_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH, &wr).await;
+                let _ = save_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH, wr).await;
             }
             Err(err) => {
                 info!("ns_scanner failed: {:?}", err);
@@ -268,7 +268,7 @@ async fn save_background_heal_info(store: Arc<ECStore>, info: &BackgroundHealInf
         Ok(info) => info,
         Err(_) => return,
     };
-    let _ = save_config(store, &BACKGROUND_HEAL_INFO_PATH, &b).await;
+    let _ = save_config(store, &BACKGROUND_HEAL_INFO_PATH, b).await;
 }
 
 async fn get_cycle_scan_mode(current_cycle: u64, bitrot_start_cycle: u64, bitrot_start_time: SystemTime) -> HealScanMode {

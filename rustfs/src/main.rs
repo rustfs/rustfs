@@ -161,6 +161,10 @@ async fn run(opt: config::Opt) -> Result<()> {
             "created endpoints {}, set_count:{}, drives_per_set: {}, cmd: {:?}",
             i, eps.set_count, eps.drives_per_set, eps.cmd_line
         );
+
+        for ep in eps.endpoints.as_ref().iter() {
+            info!("  - {}", ep);
+        }
     }
 
     set_global_addr(&opt.address).await;

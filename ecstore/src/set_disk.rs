@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
+    mem::replace,
     path::Path,
     sync::Arc,
     time::Duration,
@@ -14,10 +15,9 @@ use crate::{
         endpoint::Endpoint,
         error::{is_all_not_found, DiskError},
         format::FormatV3,
-        new_disk, BufferReader, BufferWriter, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption,
-        DiskStore, FileInfoVersions, FileReader, FileWriter, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET,
-        RUSTFS_META_TMP_BUCKET,
+        new_disk, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
+        MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+        UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
     },
     erasure::Erasure,
     error::{Error, Result},
@@ -35,6 +35,7 @@ use crate::{
         },
         heal_ops::BG_HEALING_UUID,
     },
+    io::{EtagReader, READ_BUFFER_SIZE},
     quorum::{object_op_ignored_errs, reduce_read_quorum_errs, reduce_write_quorum_errs, QuorumError},
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, FileInfo, GetObjectReader, HTTPRangeSpec,
@@ -67,6 +68,7 @@ use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
 use lock::{
+    // drwmutex::Options,
     drwmutex::Options,
     namespace_lock::{new_nslock, NsLockMap},
     LockApi,
@@ -77,14 +79,12 @@ use rand::{
     thread_rng,
     {seq::SliceRandom, Rng},
 };
-use reader::reader::EtagReader;
-use s3s::{dto::StreamingBlob, Body};
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::time::SystemTime;
 use time::OffsetDateTime;
 use tokio::{
-    io::DuplexStream,
+    io::{empty, AsyncWrite},
     sync::{broadcast, RwLock},
 };
 use tokio::{
@@ -636,7 +636,7 @@ impl SetDisks {
     }
 
     fn get_upload_id_dir(bucket: &str, object: &str, upload_id: &str) -> String {
-        warn!("get_upload_id_dir upload_id {:?}", upload_id);
+        // warn!("get_upload_id_dir upload_id {:?}", upload_id);
 
         let upload_uuid = base64_decode(upload_id.as_bytes())
             .and_then(|v| {
@@ -1361,7 +1361,7 @@ impl SetDisks {
         for (i, opdisk) in disks.iter().enumerate() {
             if let Some(disk) = opdisk {
                 if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
-                    info!("Disk {:?} is online", disk);
+                    info!("Disk {:?} is online", disk.to_string());
                     continue;
                 }
 
@@ -1786,19 +1786,22 @@ impl SetDisks {
         skip( writer,disks,fi,files),
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
-    async fn get_object_with_fileinfo(
+    async fn get_object_with_fileinfo<W>(
         // &self,
         bucket: &str,
         object: &str,
         offset: usize,
         length: usize,
-        writer: &mut DuplexStream,
+        writer: &mut W,
         fi: FileInfo,
         files: Vec<FileInfo>,
         disks: &[Option<DiskStore>],
         set_index: usize,
         pool_index: usize,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
         let total_size = fi.size;
@@ -1855,20 +1858,12 @@ impl SetDisks {
                 // debug!("read part_path {}", &part_path);
 
                 if let Some(disk) = disk_op {
-                    let filereader = {
-                        if let Some(ref data) = files[idx].data {
-                            FileReader::Buffer(BufferReader::new(data.clone()))
-                        } else {
-                            let disk = disk.clone();
-                            let part_path =
-                                format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or(Uuid::nil()), part_number);
-
-                            disk.read_file(bucket, &part_path).await?
-                        }
-                    };
                     let checksum_info = files[idx].erasure.get_checksum_info(part_number);
                     let reader = new_bitrot_filereader(
-                        filereader,
+                        disk.clone(),
+                        files[idx].data.clone(),
+                        bucket.to_owned(),
+                        format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or(Uuid::nil()), part_number),
                         till_offset,
                         checksum_info.algorithm,
                         erasure.shard_size(erasure.block_size),
@@ -2221,10 +2216,10 @@ impl SetDisks {
                         let mut outdate_disks = vec![None; disk_len];
                         let mut disks_to_heal_count = 0;
 
-                        info!(
-                            "errs: {:?}, data_errs_by_disk: {:?}, lastest_meta: {:?}",
-                            errs, data_errs_by_disk, lastest_meta
-                        );
+                        // info!(
+                        //     "errs: {:?}, data_errs_by_disk: {:?}, lastest_meta: {:?}",
+                        //     errs, data_errs_by_disk, lastest_meta
+                        // );
                         for index in 0..available_disks.len() {
                             let (yes, reason) = should_heal_object_on_disk(
                                 &errs[index],
@@ -2411,18 +2406,21 @@ impl SetDisks {
                                 let mut prefer = vec![false; latest_disks.len()];
                                 for (index, disk) in latest_disks.iter().enumerate() {
                                     if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
-                                        let filereader = {
-                                            if let Some(ref data) = metadata.data {
-                                                FileReader::Buffer(BufferReader::new(data.clone()))
-                                            } else {
-                                                let disk = disk.clone();
-                                                let part_path = format!("{}/{}/part.{}", object, src_data_dir, part.number);
+                                        // let filereader = {
+                                        //     if let Some(ref data) = metadata.data {
+                                        //         Box::new(BufferReader::new(data.clone()))
+                                        //     } else {
+                                        //         let disk = disk.clone();
+                                        //         let part_path = format!("{}/{}/part.{}", object, src_data_dir, part.number);
 
-                                                disk.read_file(bucket, &part_path).await?
-                                            }
-                                        };
+                                        //         disk.read_file(bucket, &part_path).await?
+                                        //     }
+                                        // };
                                         let reader = new_bitrot_filereader(
-                                            filereader,
+                                            disk.clone(),
+                                            metadata.data.clone(),
+                                            bucket.to_owned(),
+                                            format!("{}/{}/part.{}", object, src_data_dir, part.number),
                                             till_offset,
                                             checksum_algo.clone(),
                                             erasure.shard_size(erasure.block_size),
@@ -2444,21 +2442,25 @@ impl SetDisks {
 
                                 for disk in out_dated_disks.iter() {
                                     if let Some(disk) = disk {
-                                        let filewriter = {
-                                            if is_inline_buffer {
-                                                FileWriter::Buffer(BufferWriter::new(Vec::new()))
-                                            } else {
-                                                let disk = disk.clone();
-                                                let part_path = format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number);
-                                                disk.create_file("", RUSTFS_META_TMP_BUCKET, &part_path, 0).await?
-                                            }
-                                        };
+                                        // let filewriter = {
+                                        //     if is_inline_buffer {
+                                        //         Box::new(Cursor::new(Vec::new()))
+                                        //     } else {
+                                        //         let disk = disk.clone();
+                                        //         let part_path = format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number);
+                                        //         disk.create_file("", RUSTFS_META_TMP_BUCKET, &part_path, 0).await?
+                                        //     }
+                                        // };
 
                                         let writer = new_bitrot_filewriter(
-                                            filewriter,
+                                            disk.clone(),
+                                            RUSTFS_META_TMP_BUCKET,
+                                            format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number).as_str(),
+                                            is_inline_buffer,
                                             DEFAULT_BITROT_ALGO,
                                             erasure.shard_size(erasure.block_size),
-                                        );
+                                        )
+                                        .await?;
 
                                         writers.push(Some(writer));
                                     } else {
@@ -2494,9 +2496,7 @@ impl SetDisks {
                                     if is_inline_buffer {
                                         if let Some(ref writer) = writers[index] {
                                             if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
-                                                if let FileWriter::Buffer(buffer_writer) = w.writer() {
-                                                    parts_metadata[index].data = Some(buffer_writer.as_ref().to_vec());
-                                                }
+                                                parts_metadata[index].data = Some(w.inline_data().to_vec());
                                             }
                                         }
                                         parts_metadata[index].set_inline_data();
@@ -3607,7 +3607,7 @@ impl ObjectIO for SetDisks {
             }
 
             let reader = GetObjectReader {
-                stream: StreamingBlob::from(Body::from(Vec::new())),
+                stream: Box::new(Cursor::new(Vec::new())),
                 object_info,
             };
             return Ok(reader);
@@ -3615,10 +3615,9 @@ impl ObjectIO for SetDisks {
 
         // TODO: remote
 
-        let (rd, mut wd) = tokio::io::duplex(fi.erasure.block_size);
+        let (rd, wd) = tokio::io::duplex(READ_BUFFER_SIZE);
 
-        let (reader, offset, length) =
-            GetObjectReader::new(StreamingBlob::wrap(tokio_util::io::ReaderStream::new(rd)), range, &object_info, opts, &h)?;
+        let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
 
         // let disks = disks.clone();
         let bucket = bucket.to_owned();
@@ -3627,12 +3626,23 @@ impl ObjectIO for SetDisks {
         let pool_index = self.pool_index;
         tokio::spawn(async move {
             if let Err(e) = Self::get_object_with_fileinfo(
-                &bucket, &object, offset, length, &mut wd, fi, files, &disks, set_index, pool_index,
+                &bucket,
+                &object,
+                offset,
+                length,
+                &mut Box::new(wd),
+                fi,
+                files,
+                &disks,
+                set_index,
+                pool_index,
             )
             .await
             {
                 error!("get_object_with_fileinfo err {:?}", e);
             };
+
+            // error!("get_object_with_fileinfo end");
         });
 
         Ok(reader)
@@ -3736,17 +3746,25 @@ impl ObjectIO for SetDisks {
 
         for disk_op in shuffle_disks.iter() {
             if let Some(disk) = disk_op {
-                let filewriter = {
-                    if is_inline_buffer {
-                        FileWriter::Buffer(BufferWriter::new(Vec::new()))
-                    } else {
-                        let disk = disk.clone();
+                // let filewriter = {
+                //     if is_inline_buffer {
+                //         Box::new(Cursor::new(Vec::new()))
+                //     } else {
+                //         let disk = disk.clone();
 
-                        disk.create_file("", RUSTFS_META_TMP_BUCKET, &tmp_object, 0).await?
-                    }
-                };
+                //         disk.create_file("", RUSTFS_META_TMP_BUCKET, &tmp_object, 0).await?
+                //     }
+                // };
 
-                let writer = new_bitrot_filewriter(filewriter, DEFAULT_BITROT_ALGO, erasure.shard_size(erasure.block_size));
+                let writer = new_bitrot_filewriter(
+                    disk.clone(),
+                    RUSTFS_META_TMP_BUCKET,
+                    &tmp_object,
+                    is_inline_buffer,
+                    DEFAULT_BITROT_ALGO,
+                    erasure.shard_size(erasure.block_size),
+                )
+                .await?;
 
                 writers.push(Some(writer));
             } else {
@@ -3754,12 +3772,18 @@ impl ObjectIO for SetDisks {
             }
         }
 
+        let stream = replace(&mut data.stream, Box::new(empty()));
+        let mut etag_stream = EtagReader::new(stream);
+
         // TODO: etag from header
-        let mut etag_stream = EtagReader::new(&mut data.stream, None, None);
 
         let w_size = erasure
             .encode(&mut etag_stream, &mut writers, data.content_length, write_quorum)
             .await?; // TODO: 出错，删除临时目录
+
+        if let Err(err) = close_bitrot_writers(&mut writers).await {
+            error!("close_bitrot_writers err {:?}", err);
+        }
 
         let etag = etag_stream.etag();
         //TODO: userDefined
@@ -3782,9 +3806,7 @@ impl ObjectIO for SetDisks {
             if is_inline_buffer {
                 if let Some(ref writer) = writers[i] {
                     if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
-                        if let FileWriter::Buffer(buffer_writer) = w.writer() {
-                            fi.data = Some(buffer_writer.as_ref().to_vec());
-                        }
+                        fi.data = Some(w.inline_data().to_vec());
                     }
                 }
             }
@@ -4081,7 +4103,7 @@ impl StorageAPI for SetDisks {
 
         for errs in results.into_iter().flatten() {
             // TODO: handle err reduceWriteQuorumErrs
-            for err in errs.iter() {
+            for err in errs.iter().flatten() {
                 warn!("result err {:?}", err);
             }
         }
@@ -4288,6 +4310,7 @@ impl StorageAPI for SetDisks {
         unimplemented!()
     }
 
+    #[tracing::instrument(level = "debug", skip(self, data, opts))]
     async fn put_object_part(
         &self,
         bucket: &str,
@@ -4318,10 +4341,18 @@ impl StorageAPI for SetDisks {
         for disk in disks.iter() {
             if let Some(disk) = disk {
                 // let writer = disk.append_file(RUSTFS_META_TMP_BUCKET, &tmp_part_path).await?;
-                let filewriter = disk
-                    .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, data.content_length)
-                    .await?;
-                let writer = new_bitrot_filewriter(filewriter, DEFAULT_BITROT_ALGO, erasure.shard_size(erasure.block_size));
+                // let filewriter = disk
+                //     .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, data.content_length)
+                //     .await?;
+                let writer = new_bitrot_filewriter(
+                    disk.clone(),
+                    RUSTFS_META_TMP_BUCKET,
+                    &tmp_part_path,
+                    false,
+                    DEFAULT_BITROT_ALGO,
+                    erasure.shard_size(erasure.block_size),
+                )
+                .await?;
                 writers.push(Some(writer));
             } else {
                 writers.push(None);
@@ -4330,11 +4361,16 @@ impl StorageAPI for SetDisks {
 
         let mut erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
-        let mut etag_stream = EtagReader::new(&mut data.stream, None, None);
+        let stream = replace(&mut data.stream, Box::new(empty()));
+        let mut etag_stream = EtagReader::new(stream);
 
         let w_size = erasure
             .encode(&mut etag_stream, &mut writers, data.content_length, write_quorum)
             .await?;
+
+        if let Err(err) = close_bitrot_writers(&mut writers).await {
+            error!("close_bitrot_writers err {:?}", err);
+        }
 
         let mut etag = etag_stream.etag();
 
@@ -4811,25 +4847,28 @@ impl StorageAPI for SetDisks {
             }
         }
 
+        // TODO: 优化 cleanupMultipartPath
         for p in curr_fi.parts.iter() {
-            self.remove_part_meta(
-                bucket,
-                object,
-                upload_id,
-                curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
-                p.number,
-            )
-            .await?;
-
-            if !fi.parts.iter().any(|v| v.number == p.number) {
-                self.remove_object_part(
+            let _ = self
+                .remove_part_meta(
                     bucket,
                     object,
                     upload_id,
                     curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
                     p.number,
                 )
-                .await?;
+                .await;
+
+            if !fi.parts.iter().any(|v| v.number == p.number) {
+                let _ = self
+                    .remove_object_part(
+                        bucket,
+                        object,
+                        upload_id,
+                        curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
+                        p.number,
+                    )
+                    .await;
             }
         }
 
@@ -5205,7 +5244,7 @@ async fn disks_with_all_parts(
             }
         }
     }
-    info!("meta_errs: {:?}, errs: {:?}", meta_errs, errs);
+    // info!("meta_errs: {:?}, errs: {:?}", meta_errs, errs);
     meta_errs.iter().enumerate().for_each(|(index, err)| {
         if err.is_some() {
             let part_err = conv_part_err_to_int(err);
@@ -5215,7 +5254,7 @@ async fn disks_with_all_parts(
         }
     });
 
-    info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
+    // info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
     for (index, disk) in online_disks.iter().enumerate() {
         if meta_errs[index].is_some() {
             continue;
@@ -5239,13 +5278,15 @@ async fn disks_with_all_parts(
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
                 let data_len = data.len();
                 let verify_err = match bitrot_verify(
-                    &mut Cursor::new(data.to_vec()),
+                    Box::new(Cursor::new(data.clone())),
                     data_len,
                     meta.erasure.shard_file_size(meta.size),
                     checksum_info.algorithm,
                     checksum_info.hash,
                     meta.erasure.shard_size(meta.erasure.block_size),
-                ) {
+                )
+                .await
+                {
                     Ok(_) => None,
                     Err(err) => Some(err),
                 };
@@ -5300,7 +5341,7 @@ async fn disks_with_all_parts(
             }
         }
     }
-    info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
+    // info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
     for (part, disks) in data_errs_by_part.iter() {
         for (idx, disk) in disks.iter().enumerate() {
             if let Some(vec) = data_errs_by_disk.get_mut(&idx) {
@@ -5308,7 +5349,7 @@ async fn disks_with_all_parts(
             }
         }
     }
-    info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
+    // info!("data_errs_by_part: {:?}, data_errs_by_disk: {:?}", data_errs_by_part, data_errs_by_disk);
     for (i, disk) in online_disks.iter().enumerate() {
         if meta_errs[i].is_none() && disk.is_some() && !has_part_err(&data_errs_by_disk[&i]) {
             available_disks[i] = Some(disk.clone().unwrap());

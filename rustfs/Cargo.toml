@@ -61,7 +61,6 @@ tracing-subscriber.workspace = true
 transform-stream.workspace = true
 uuid = "1.15.1"
 url.workspace = true
-admin = { path = "../api/admin" }
 axum.workspace = true
 matchit = "0.8.6"
 shadow-rs.workspace = true

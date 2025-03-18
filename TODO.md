@@ -57,3 +57,11 @@
 - [ ] 对象压缩
 - [ ] STS
 - [ ] 分层（阿里云、腾讯云、S3远程对接）
+
+
+
+## 性能优化
+- [ ] bitrot impl AsyncRead/AsyncWrite
+- [ ] erasure 并发读写
+- [ ] 完善删除逻辑, 并发处理,先移动到回收站,空间不足时清空回收站
+- [ ] list_object 使用reader传输
