@@ -350,10 +350,9 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
 
 #[tokio::test]
 async fn test_writer() {
-    use crate::io::VecAsyncReader;
-    use crate::io::VecAsyncWriter;
+    use std::io::Cursor;
 
-    let mut f = VecAsyncWriter::new(Vec::new());
+    let mut f = Cursor::new(Vec::new());
 
     let mut w = MetacacheWriter::new(&mut f);
 
@@ -373,16 +372,16 @@ async fn test_writer() {
 
     w.close().await.unwrap();
 
-    let data = f.get_buffer().to_vec();
+    let data = f.into_inner();
 
-    let nf = VecAsyncReader::new(data);
+    let nf = Cursor::new(data);
 
     let mut r = MetacacheReader::new(nf);
     let nobjs = r.read_all().await.unwrap();
 
-    for info in nobjs.iter() {
-        println!("new {:?}", &info);
-    }
+    // for info in nobjs.iter() {
+    //     println!("new {:?}", &info);
+    // }
 
     assert_eq!(objs, nobjs)
 }

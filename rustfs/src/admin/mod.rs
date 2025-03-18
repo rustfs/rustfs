@@ -1,5 +1,6 @@
 pub mod handlers;
 pub mod router;
+mod rpc;
 pub mod utils;
 
 use common::error::Result;
@@ -11,6 +12,7 @@ use handlers::{
 };
 use hyper::Method;
 use router::{AdminOperation, S3Router};
+use rpc::regist_rpc_route;
 use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
@@ -21,6 +23,7 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
 
+    regist_rpc_route(&mut r)?;
     regist_user_route(&mut r)?;
 
     r.insert(

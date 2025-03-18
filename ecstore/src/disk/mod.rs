@@ -14,10 +14,8 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
-use crate::utils::proto_err_to_err;
 use crate::{
     bucket::{metadata_sys::get_versioning_config, versioning::VersioningApi},
-    erasure::Writer,
     error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion, VersionType},
     heal::{
@@ -25,36 +23,19 @@ use crate::{
         data_usage_cache::{DataUsageCache, DataUsageEntry},
         heal_commands::{HealScanMode, HealingTracker},
     },
+    io::{FileReader, FileWriter},
     store_api::{FileInfo, ObjectInfo, RawFileInfo},
     utils::path::SLASH_SEPARATOR,
 };
 use endpoint::Endpoint;
 use error::DiskError;
-use futures::StreamExt;
 use local::LocalDisk;
 use madmin::info_commands::DiskMetrics;
-use protos::proto_gen::node_service::{
-    node_service_client::NodeServiceClient, ReadAtRequest, ReadAtResponse, WriteRequest, WriteResponse,
-};
 use remote::RemoteDisk;
 use serde::{Deserialize, Serialize};
-use std::{
-    any::Any,
-    cmp::Ordering,
-    fmt::Debug,
-    io::{Cursor, SeekFrom},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{cmp::Ordering, fmt::Debug, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
-    sync::mpsc::{self, Sender},
-};
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{service::interceptor::InterceptedService, transport::Channel, Request, Status, Streaming};
-use tracing::info;
+use tokio::{io::AsyncWrite, sync::mpsc::Sender};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -206,6 +187,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        match self {
+            Disk::Local(local_disk) => local_disk.read_file_stream(volume, path, offset, length).await,
+            Disk::Remote(remote_disk) => remote_disk.read_file_stream(volume, path, offset, length).await,
+        }
+    }
+
     async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
         match self {
             Disk::Local(local_disk) => local_disk.list_dir(_origvolume, volume, _dir_path, _count).await,
@@ -336,7 +324,6 @@ impl DiskAPI for Disk {
     }
 
     async fn delete_volume(&self, volume: &str) -> Result<()> {
-        info!("delete_volume, volume: {}", volume);
         match self {
             Disk::Local(local_disk) => local_disk.delete_volume(volume).await,
             Disk::Remote(remote_disk) => remote_disk.delete_volume(volume).await,
@@ -357,7 +344,6 @@ impl DiskAPI for Disk {
         scan_mode: HealScanMode,
         we_sleep: ShouldSleepFn,
     ) -> Result<DataUsageCache> {
-        info!("ns_scanner");
         match self {
             Disk::Local(local_disk) => local_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
             Disk::Remote(remote_disk) => remote_disk.ns_scanner(cache, updates, scan_mode, we_sleep).await,
@@ -451,6 +437,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // 读目录下的所有文件、目录
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
     // ReadFileStream
@@ -1188,20 +1175,6 @@ pub struct ReadMultipleResp {
     pub mod_time: Option<OffsetDateTime>,
 }
 
-// impl Default for ReadMultipleResp {
-//     fn default() -> Self {
-//         Self {
-//             bucket: String::new(),
-//             prefix: String::new(),
-//             file: String::new(),
-//             exists: false,
-//             error: String::new(),
-//             data: Vec::new(),
-//             mod_time: OffsetDateTime::UNIX_EPOCH,
-//         }
-//     }
-// }
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VolumeInfo {
     pub name: String,
@@ -1213,384 +1186,4 @@ pub struct ReadOptions {
     pub incl_free_versions: bool,
     pub read_data: bool,
     pub healing: bool,
-}
-
-// pub struct FileWriter {
-//     pub inner: Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>,
-// }
-
-// impl AsyncWrite for FileWriter {
-//     fn poll_write(
-//         mut self: Pin<&mut Self>,
-//         cx: &mut std::task::Context<'_>,
-//         buf: &[u8],
-//     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-//         Pin::new(&mut self.inner).poll_write(cx, buf)
-//     }
-
-//     fn poll_flush(
-//         mut self: Pin<&mut Self>,
-//         cx: &mut std::task::Context<'_>,
-//     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-//         Pin::new(&mut self.inner).poll_flush(cx)
-//     }
-
-//     fn poll_shutdown(
-//         mut self: Pin<&mut Self>,
-//         cx: &mut std::task::Context<'_>,
-//     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-//         Pin::new(&mut self.inner).poll_shutdown(cx)
-//     }
-// }
-
-// impl FileWriter {
-//     pub fn new<W>(inner: W) -> Self
-//     where
-//         W: AsyncWrite + Send + Sync + 'static,
-//     {
-//         Self { inner: Box::pin(inner) }
-//     }
-// }
-
-#[derive(Debug)]
-pub enum FileWriter {
-    Local(LocalFileWriter),
-    Remote(RemoteFileWriter),
-    Buffer(BufferWriter),
-}
-
-#[async_trait::async_trait]
-impl Writer for FileWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        match self {
-            Self::Local(writer) => writer.write(buf).await,
-            Self::Remote(writter) => writter.write(buf).await,
-            Self::Buffer(writer) => writer.write(buf).await,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct BufferWriter {
-    pub inner: Vec<u8>,
-}
-
-impl BufferWriter {
-    pub fn new(inner: Vec<u8>) -> Self {
-        Self { inner }
-    }
-    #[allow(clippy::should_implement_trait)]
-    pub fn as_ref(&self) -> &[u8] {
-        self.inner.as_ref()
-    }
-}
-
-#[async_trait::async_trait]
-impl Writer for BufferWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        let _ = self.inner.write(buf).await?;
-        self.inner.flush().await?;
-
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub struct LocalFileWriter {
-    pub inner: File,
-}
-
-impl LocalFileWriter {
-    pub fn new(inner: File) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait::async_trait]
-impl Writer for LocalFileWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        let _ = self.inner.write(buf).await?;
-        self.inner.flush().await?;
-
-        Ok(())
-    }
-}
-
-type NodeClient = NodeServiceClient<
-    InterceptedService<Channel, Box<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static>>,
->;
-
-#[derive(Debug)]
-pub struct RemoteFileWriter {
-    pub endpoint: Endpoint,
-    pub volume: String,
-    pub path: String,
-    pub is_append: bool,
-    tx: Sender<WriteRequest>,
-    resp_stream: Streaming<WriteResponse>,
-}
-
-impl RemoteFileWriter {
-    pub async fn new(endpoint: Endpoint, volume: String, path: String, is_append: bool, mut client: NodeClient) -> Result<Self> {
-        let (tx, rx) = mpsc::channel(128);
-        let in_stream = ReceiverStream::new(rx);
-
-        let response = client.write_stream(in_stream).await.unwrap();
-
-        let resp_stream = response.into_inner();
-
-        Ok(Self {
-            endpoint,
-            volume,
-            path,
-            is_append,
-            tx,
-            resp_stream,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Writer for RemoteFileWriter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        let request = WriteRequest {
-            disk: self.endpoint.to_string(),
-            volume: self.volume.to_string(),
-            path: self.path.to_string(),
-            is_append: self.is_append,
-            data: buf.to_vec(),
-        };
-        self.tx.send(request).await?;
-
-        if let Some(resp) = self.resp_stream.next().await {
-            // match resp {
-            //     Ok(resp) => {
-            //         if resp.success {
-            //             info!("write stream success");
-            //         } else {
-            //             info!("write stream failed: {}", resp.error_info.unwrap_or("".to_string()));
-            //         }
-            //     }
-            //     Err(_err) => {
-
-            //     }
-            // }
-            let resp = resp?;
-            if resp.success {
-                info!("write stream success");
-            } else {
-                return if let Some(err) = &resp.error {
-                    Err(proto_err_to_err(err))
-                } else {
-                    Err(Error::from_string(""))
-                };
-            }
-        } else {
-            let error_info = "can not get response";
-            info!("write stream failed: {}", error_info);
-            return Err(Error::from_string(error_info));
-        }
-
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-pub trait Reader {
-    async fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize>;
-    async fn seek(&mut self, offset: usize) -> Result<()>;
-    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize>;
-}
-
-#[derive(Debug)]
-pub enum FileReader {
-    Local(LocalFileReader),
-    Remote(RemoteFileReader),
-    Buffer(BufferReader),
-}
-
-#[async_trait::async_trait]
-impl Reader for FileReader {
-    async fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        match self {
-            Self::Local(reader) => reader.read_at(offset, buf).await,
-            Self::Remote(reader) => reader.read_at(offset, buf).await,
-            Self::Buffer(reader) => reader.read_at(offset, buf).await,
-        }
-    }
-    async fn seek(&mut self, offset: usize) -> Result<()> {
-        match self {
-            Self::Local(reader) => reader.seek(offset).await,
-            Self::Remote(reader) => reader.seek(offset).await,
-            Self::Buffer(reader) => reader.seek(offset).await,
-        }
-    }
-    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize> {
-        match self {
-            Self::Local(reader) => reader.read_exact(buf).await,
-            Self::Remote(reader) => reader.read_exact(buf).await,
-            Self::Buffer(reader) => reader.read_exact(buf).await,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct BufferReader {
-    pub inner: Cursor<Vec<u8>>,
-    pos: usize,
-}
-
-impl BufferReader {
-    pub fn new(inner: Vec<u8>) -> Self {
-        Self {
-            inner: Cursor::new(inner),
-            pos: 0,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Reader for BufferReader {
-    #[tracing::instrument(level = "debug", skip(self, buf))]
-    async fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        self.seek(offset).await?;
-        self.read_exact(buf).await
-    }
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn seek(&mut self, offset: usize) -> Result<()> {
-        if self.pos != offset {
-            self.inner.set_position(offset as u64);
-        }
-
-        Ok(())
-    }
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let bytes_read = self.inner.read_exact(buf).await?;
-        self.pos += buf.len();
-        Ok(bytes_read)
-    }
-}
-
-#[derive(Debug)]
-pub struct LocalFileReader {
-    pub inner: File,
-    pos: usize,
-}
-
-impl LocalFileReader {
-    pub fn new(inner: File) -> Self {
-        Self { inner, pos: 0 }
-    }
-}
-
-#[async_trait::async_trait]
-impl Reader for LocalFileReader {
-    #[tracing::instrument(level = "debug", skip(self, buf))]
-    async fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        self.seek(offset).await?;
-        self.read_exact(buf).await
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn seek(&mut self, offset: usize) -> Result<()> {
-        if self.pos != offset {
-            self.inner.seek(SeekFrom::Start(offset as u64)).await?;
-            self.pos = offset;
-        }
-
-        Ok(())
-    }
-    #[tracing::instrument(level = "debug", skip(self, buf))]
-    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let bytes_read = self.inner.read_exact(buf).await?;
-        self.pos += buf.len();
-        Ok(bytes_read)
-    }
-}
-
-#[derive(Debug)]
-pub struct RemoteFileReader {
-    pub endpoint: Endpoint,
-    pub volume: String,
-    pub path: String,
-    tx: Sender<ReadAtRequest>,
-    resp_stream: Streaming<ReadAtResponse>,
-}
-
-impl RemoteFileReader {
-    pub async fn new(endpoint: Endpoint, volume: String, path: String, mut client: NodeClient) -> Result<Self> {
-        let (tx, rx) = mpsc::channel(128);
-        let in_stream = ReceiverStream::new(rx);
-
-        let response = client.read_at(in_stream).await.unwrap();
-
-        let resp_stream = response.into_inner();
-
-        Ok(Self {
-            endpoint,
-            volume,
-            path,
-            tx,
-            resp_stream,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Reader for RemoteFileReader {
-    async fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let request = ReadAtRequest {
-            disk: self.endpoint.to_string(),
-            volume: self.volume.to_string(),
-            path: self.path.to_string(),
-            offset: offset.try_into().unwrap(),
-            // length: length.try_into().unwrap(),
-            length: buf.len().try_into().unwrap(),
-        };
-        self.tx.send(request).await?;
-
-        if let Some(resp) = self.resp_stream.next().await {
-            let resp = resp?;
-            if resp.success {
-                info!("read at stream success");
-
-                buf.copy_from_slice(&resp.data);
-
-                Ok(resp.read_size.try_into().unwrap())
-            } else {
-                return if let Some(err) = &resp.error {
-                    Err(proto_err_to_err(err))
-                } else {
-                    Err(Error::from_string(""))
-                };
-            }
-        } else {
-            let error_info = "can not get response";
-            info!("read at stream failed: {}", error_info);
-            Err(Error::from_string(error_info))
-        }
-    }
-    async fn seek(&mut self, _offset: usize) -> Result<()> {
-        unimplemented!()
-    }
-    async fn read_exact(&mut self, _buf: &mut [u8]) -> Result<usize> {
-        unimplemented!()
-    }
 }

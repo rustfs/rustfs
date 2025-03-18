@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tracing::{error, info};
+use tracing::error;
 
 use crate::config::common::{read_config, save_config};
 use crate::error::{Error, Result};
@@ -311,7 +311,7 @@ impl BucketMetadata {
 
         buf.extend_from_slice(&data);
 
-        save_config(store, self.save_file_path().as_str(), &buf).await?;
+        save_config(store, self.save_file_path().as_str(), buf).await?;
 
         Ok(())
     }
@@ -367,7 +367,7 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
                 return Err(err);
             }
 
-            info!("bucketmeta {} not found with err {:?}, start to init ", bucket, &err);
+            // info!("bucketmeta {} not found with err {:?}, start to init ", bucket, &err);
 
             BucketMetadata::new(bucket)
         }

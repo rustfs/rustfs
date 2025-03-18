@@ -20,6 +20,7 @@ use ecstore::bucket::policy_sys::PolicySys;
 use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
+use ecstore::io::READ_BUFFER_SIZE;
 use ecstore::new_object_layer_fn;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
@@ -51,6 +52,8 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use tokio_util::io::ReaderStream;
+use tokio_util::io::StreamReader;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -464,8 +467,13 @@ impl S3 for FS {
         };
         let last_modified = info.mod_time.map(Timestamp::from);
 
+        let body = Some(StreamingBlob::wrap(bytes_stream(
+            ReaderStream::with_capacity(reader.stream, READ_BUFFER_SIZE),
+            info.size,
+        )));
+
         let output = GetObjectOutput {
-            body: Some(reader.stream),
+            body,
             content_length: Some(info.size as i64),
             last_modified,
             content_type,
@@ -799,6 +807,10 @@ impl S3 for FS {
             }
         };
 
+        let body = Box::new(StreamReader::new(
+            body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+        ));
+
         let mut reader = PutObjReader::new(body, content_length as usize);
 
         let Some(store) = new_object_layer_fn() else {
@@ -910,6 +922,10 @@ impl S3 for FS {
                 }
             }
         };
+
+        let body = Box::new(StreamReader::new(
+            body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+        ));
 
         // mc cp step 4
         let mut data = PutObjReader::new(body, content_length as usize);

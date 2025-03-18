@@ -1,4 +1,5 @@
 use crate::heal::heal_ops::HealSequence;
+use crate::io::FileReader;
 use crate::store_utils::clean_metadata;
 use crate::{
     disk::DiskStore,
@@ -7,19 +8,20 @@ use crate::{
     utils::path::decode_dir_object,
     xhttp,
 };
-use futures::StreamExt;
 use http::{HeaderMap, HeaderValue};
 use madmin::heal_commands::HealResultItem;
 use rmp_serde::Serializer;
-use s3s::{dto::StreamingBlob, Body};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::io::Cursor;
 use std::sync::Arc;
 use time::OffsetDateTime;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
-pub const BLOCK_SIZE_V2: usize = 1048576; // 1M
+pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 pub const RESERVED_METADATA_PREFIX: &str = "X-Rustfs-Internal-";
 pub const RESERVED_METADATA_PREFIX_LOWER: &str = "X-Rustfs-Internal-";
 pub const RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
@@ -416,35 +418,42 @@ pub struct DeleteBucketOptions {
     pub srdelete_op: SRBucketDeleteOp,
 }
 
-#[derive(Debug)]
 pub struct PutObjReader {
-    pub stream: StreamingBlob,
+    pub stream: FileReader,
     pub content_length: usize,
 }
 
+impl Debug for PutObjReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PutObjReader")
+            .field("content_length", &self.content_length)
+            .finish()
+    }
+}
+
 impl PutObjReader {
-    pub fn new(stream: StreamingBlob, content_length: usize) -> Self {
+    pub fn new(stream: FileReader, content_length: usize) -> Self {
         PutObjReader { stream, content_length }
     }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
         let content_length = data.len();
         PutObjReader {
-            stream: Body::from(data).into(),
+            stream: Box::new(Cursor::new(data)),
             content_length,
         }
     }
 }
 
 pub struct GetObjectReader {
-    pub stream: StreamingBlob,
+    pub stream: FileReader,
     pub object_info: ObjectInfo,
 }
 
 impl GetObjectReader {
     #[tracing::instrument(level = "debug", skip(reader))]
     pub fn new(
-        reader: StreamingBlob,
+        reader: FileReader,
         rs: Option<HTTPRangeSpec>,
         oi: &ObjectInfo,
         opts: &ObjectOptions,
@@ -482,14 +491,15 @@ impl GetObjectReader {
     }
     pub async fn read_all(&mut self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
+        self.stream.read_to_end(&mut data).await?;
 
-        while let Some(x) = self.stream.next().await {
-            let buf = match x {
-                Ok(res) => res,
-                Err(e) => return Err(Error::msg(e.to_string())),
-            };
-            data.extend_from_slice(buf.as_ref());
-        }
+        // while let Some(x) = self.stream.next().await {
+        //     let buf = match x {
+        //         Ok(res) => res,
+        //         Err(e) => return Err(Error::msg(e.to_string())),
+        //     };
+        //     data.extend_from_slice(buf.as_ref());
+        // }
 
         Ok(data)
     }

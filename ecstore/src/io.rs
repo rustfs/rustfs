@@ -1,226 +1,153 @@
-use std::io::Read;
-use std::io::Write;
+use futures::TryStreamExt;
+use md5::Digest;
+use md5::Md5;
 use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::fs::File;
-use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
+use std::task::Context;
+use std::task::Poll;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::ReadBuf;
+use tokio::sync::oneshot;
+use tokio_util::io::ReaderStream;
+use tokio_util::io::StreamReader;
+use tracing::error;
+use tracing::warn;
 
-pub enum Reader {
-    File(File),
-    Buffer(VecAsyncReader),
+pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
+pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+
+pub const READ_BUFFER_SIZE: usize = 1024 * 1024;
+
+#[derive(Debug)]
+pub struct HttpFileWriter {
+    wd: tokio::io::DuplexStream,
+    err_rx: oneshot::Receiver<std::io::Error>,
 }
 
-impl AsyncRead for Reader {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Reader::File(file) => Pin::new(file).poll_read(cx, buf),
-            Reader::Buffer(buffer) => Pin::new(buffer).poll_read(cx, buf),
-        }
+impl HttpFileWriter {
+    pub fn new(url: &str, disk: &str, volume: &str, path: &str, size: usize, append: bool) -> std::io::Result<Self> {
+        let (rd, wd) = tokio::io::duplex(READ_BUFFER_SIZE);
+
+        let (err_tx, err_rx) = oneshot::channel::<std::io::Error>();
+
+        let body = reqwest::Body::wrap_stream(ReaderStream::with_capacity(rd, READ_BUFFER_SIZE));
+
+        let url = url.to_owned();
+        let disk = disk.to_owned();
+        let volume = volume.to_owned();
+        let path = path.to_owned();
+
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            if let Err(err) = client
+                .put(format!(
+                    "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
+                    url,
+                    urlencoding::encode(&disk),
+                    urlencoding::encode(&volume),
+                    urlencoding::encode(&path),
+                    append,
+                    size
+                ))
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            {
+                error!("HttpFileWriter put file err: {:?}", err);
+
+                if let Err(er) = err_tx.send(err) {
+                    error!("HttpFileWriter tx.send err: {:?}", er);
+                }
+            }
+        });
+
+        Ok(Self { wd, err_rx })
     }
 }
 
-#[derive(Default)]
-pub enum Writer {
-    #[default]
-    NotUse,
-    File(File),
-    Buffer(VecAsyncWriter),
-}
-
-impl AsyncWrite for Writer {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Writer::File(file) => Pin::new(file).poll_write(cx, buf),
-            Writer::Buffer(buff) => Pin::new(buff).poll_write(cx, buf),
-            Writer::NotUse => Poll::Ready(Ok(0)),
+impl AsyncWrite for HttpFileWriter {
+    #[tracing::instrument(level = "debug", skip(self, buf))]
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        if let Ok(err) = self.as_mut().err_rx.try_recv() {
+            return Poll::Ready(Err(err));
         }
+
+        Pin::new(&mut self.wd).poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Writer::File(file) => Pin::new(file).poll_flush(cx),
-            Writer::Buffer(buff) => Pin::new(buff).poll_flush(cx),
-            Writer::NotUse => Poll::Ready(Ok(())),
-        }
+    #[tracing::instrument(level = "debug", skip(self))]
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::result::Result<(), std::io::Error>> {
+        Pin::new(&mut self.wd).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Writer::File(file) => Pin::new(file).poll_shutdown(cx),
-            Writer::Buffer(buff) => Pin::new(buff).poll_shutdown(cx),
-            Writer::NotUse => Poll::Ready(Ok(())),
-        }
+    #[tracing::instrument(level = "debug", skip(self))]
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::result::Result<(), std::io::Error>> {
+        Pin::new(&mut self.wd).poll_shutdown(cx)
     }
 }
 
-pub struct AsyncToSync<R> {
+pub struct HttpFileReader {
+    inner: FileReader,
+}
+
+impl HttpFileReader {
+    pub async fn new(url: &str, disk: &str, volume: &str, path: &str, offset: usize, length: usize) -> std::io::Result<Self> {
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
+                url,
+                urlencoding::encode(disk),
+                urlencoding::encode(volume),
+                urlencoding::encode(path),
+                offset,
+                length
+            ))
+            .send()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let inner = Box::new(StreamReader::new(resp.bytes_stream().map_err(std::io::Error::other)));
+
+        Ok(Self { inner })
+    }
+}
+
+impl AsyncRead for HttpFileReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+pub struct EtagReader<R> {
     inner: R,
+    md5: Md5,
 }
 
-impl<R: AsyncRead + Unpin> AsyncToSync<R> {
-    pub fn new_reader(inner: R) -> Self {
-        Self { inner }
+impl<R> EtagReader<R> {
+    pub fn new(inner: R) -> Self {
+        EtagReader { inner, md5: Md5::new() }
     }
-    fn read_async(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
-        let mut read_buf = ReadBuf::new(buf);
-        // Poll the underlying AsyncRead to fill the ReadBuf
-        match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
+
+    pub fn etag(self) -> String {
+        hex_simd::encode_to_string(self.md5.finalize(), hex_simd::AsciiCase::Lower)
     }
 }
 
-impl<R: AsyncWrite + Unpin> AsyncToSync<R> {
-    pub fn new_writer(inner: R) -> Self {
-        Self { inner }
-    }
-    // This function will perform a write using AsyncWrite
-    fn write_async(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
-        match result {
-            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
+impl<R: AsyncRead + Unpin> AsyncRead for EtagReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let bytes = buf.filled();
+                self.md5.update(bytes);
 
-    // This function will perform a flush using AsyncWrite
-    fn flush_async(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-}
-
-impl<R: AsyncRead + Unpin> Read for AsyncToSync<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        loop {
-            match self.read_async(&mut cx, buf) {
-                Poll::Ready(Ok(n)) => return Ok(n),
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Pending => {
-                    // If Pending, we need to wait for the readiness.
-                    // Here, we can use an arbitrary mechanism to yield control,
-                    // this might be blocking until some readiness occurs can be complex.
-                    // A full blocking implementation would require an async runtime to block on.
-                    std::thread::sleep(std::time::Duration::from_millis(1)); // Replace with proper waiting if needed
-                }
+                Poll::Ready(Ok(()))
             }
+            other => other,
         }
-    }
-}
-
-impl<W: AsyncWrite + Unpin> Write for AsyncToSync<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        loop {
-            match self.write_async(&mut cx, buf) {
-                Poll::Ready(Ok(n)) => return Ok(n),
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Pending => {
-                    // Here we are blocking and waiting for the async operation to complete.
-                    std::thread::sleep(std::time::Duration::from_millis(1)); // Not efficient, see notes.
-                }
-            }
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        loop {
-            match self.flush_async(&mut cx) {
-                Poll::Ready(Ok(())) => return Ok(()),
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Pending => {
-                    // Again, blocking to wait for flush.
-                    std::thread::sleep(std::time::Duration::from_millis(1)); // Not efficient, see notes.
-                }
-            }
-        }
-    }
-}
-
-pub struct VecAsyncWriter {
-    buffer: Vec<u8>,
-}
-
-impl VecAsyncWriter {
-    /// Create a new VecAsyncWriter with an empty Vec<u8>.  
-    pub fn new(buffer: Vec<u8>) -> Self {
-        VecAsyncWriter { buffer }
-    }
-
-    /// Retrieve the underlying buffer.  
-    pub fn get_buffer(&self) -> &[u8] {
-        &self.buffer
-    }
-}
-
-// Implementing AsyncWrite trait for VecAsyncWriter
-impl AsyncWrite for VecAsyncWriter {
-    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let len = buf.len();
-
-        // Assume synchronous writing for simplicity
-        self.get_mut().buffer.extend_from_slice(buf);
-
-        // Returning the length of written data
-        Poll::Ready(Ok(len))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // In this case, flushing is a no-op for a Vec<u8>
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Similar to flush, shutdown has no effect here
-        Poll::Ready(Ok(()))
-    }
-}
-
-pub struct VecAsyncReader {
-    buffer: Vec<u8>,
-    position: usize,
-}
-
-impl VecAsyncReader {
-    /// Create a new VecAsyncReader with the given Vec<u8>.  
-    pub fn new(buffer: Vec<u8>) -> Self {
-        VecAsyncReader { buffer, position: 0 }
-    }
-
-    /// Reset the reader position.  
-    pub fn reset(&mut self) {
-        self.position = 0;
-    }
-}
-
-// Implementing AsyncRead trait for VecAsyncReader
-impl AsyncRead for VecAsyncReader {
-    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-
-        // Check how many bytes are available to read
-        let len = this.buffer.len();
-        let bytes_available = len - this.position;
-
-        if bytes_available == 0 {
-            // If there's no more data to read, return ready with an Eof
-            return Poll::Ready(Ok(()));
-        }
-
-        // Calculate how much we can read into the provided buffer
-        let to_read = std::cmp::min(bytes_available, buf.remaining());
-
-        // Write the data to the buf
-        buf.put_slice(&this.buffer[this.position..this.position + to_read]);
-
-        // Update the position
-        this.position += to_read;
-
-        // Indicate how many bytes were read
-        Poll::Ready(Ok(()))
     }
 }

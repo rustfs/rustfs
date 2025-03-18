@@ -14,6 +14,7 @@ use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
 
+use super::rpc::RPC_PREFIX;
 use super::ADMIN_PREFIX;
 
 pub struct S3Router<T> {
@@ -63,7 +64,7 @@ where
             }
         }
 
-        uri.path().starts_with(ADMIN_PREFIX)
+        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX)
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -81,6 +82,10 @@ where
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        // TODO: check access by req.credentials
+        if req.uri.path().starts_with(RPC_PREFIX) {
+            return Ok(());
+        }
         match req.credentials {
             Some(_) => Ok(()),
             None => Err(s3_error!(AccessDenied, "Signature is required")),

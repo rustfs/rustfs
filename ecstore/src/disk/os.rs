@@ -141,13 +141,15 @@ pub async fn reliable_rename(
     }
     // need remove dst path
     if let Err(err) = utils::fs::remove_all(dst_file_path.as_ref()).await {
-        info!(
-            "reliable_rename rm dst failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
-            src_file_path.as_ref(),
-            dst_file_path.as_ref(),
-            base_dir.as_ref(),
-            err
-        );
+        if err.kind() != io::ErrorKind::NotFound {
+            info!(
+                "reliable_rename rm dst failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
+                src_file_path.as_ref(),
+                dst_file_path.as_ref(),
+                base_dir.as_ref(),
+                err
+            );
+        }
     }
     let mut i = 0;
     loop {

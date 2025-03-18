@@ -4,7 +4,7 @@ ENV LANG C.UTF-8
 
 RUN sed -i s@http://.*archive.ubuntu.com@http://repo.huaweicloud.com@g /etc/apt/sources.list
 
-RUN apt-get clean && apt-get update && apt-get install wget git curl unzip gcc pkg-config libssl-dev -y
+RUN apt-get clean && apt-get update && apt-get install wget git curl unzip gcc pkg-config libssl-dev lld libdbus-1-dev libwayland-dev libwebkit2gtk-4.1-dev libxdo-dev -y
 
 # install protoc
 RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip \

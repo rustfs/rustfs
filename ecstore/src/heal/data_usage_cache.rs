@@ -458,9 +458,9 @@ impl DataUsageCache {
 
         let name_clone = name.clone();
         tokio::spawn(async move {
-            let _ = save_config(store_clone, &format!("{}{}", &name_clone, ".bkp"), &buf_clone).await;
+            let _ = save_config(store_clone, &format!("{}{}", &name_clone, ".bkp"), buf_clone).await;
         });
-        save_config(store, &name, &buf).await
+        save_config(store, &name, buf).await
     }
 
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
