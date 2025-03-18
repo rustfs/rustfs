@@ -40,6 +40,7 @@ export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS="0.0.0.0:9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9001"
+export RUSTFS_OBS_CONFIG="config/obs.toml"
 ```
 
 You need replace your real data folder:
@@ -47,3 +48,47 @@ You need replace your real data folder:
 ```
 ./rustfs /data/rustfs
 ```
+
+## How to deploy the observability stack
+
+The OpenTelemetry Collector offers a vendor-agnostic implementation on how to receive, process, and export telemetry
+data. It removes the need to run, operate, and maintain multiple agents/collectors in order to support open-source
+observability data formats (e.g. Jaeger, Prometheus, etc.) sending to one or more open-source or commercial back-ends.
+
+1. Enter the `.docker/observability` directory,
+2. Run the following command:
+
+```bash
+docker-compose -f docker-compose.yml up -d
+```
+
+3. Access the Grafana dashboard by navigating to `http://localhost:3000` in your browser. The default username and
+   password are `admin` and `admin`, respectively.
+
+4. Access the Jaeger dashboard by navigating to `http://localhost:16686` in your browser.
+
+5. Access the Prometheus dashboard by navigating to `http://localhost:9090` in your browser.
+
+## Create a new Observability configuration file
+
+#### 1. Enter the `config` directory,
+
+#### 2. Copy `obs.toml.example` to `obs.toml`
+
+#### 3. Modify the `obs.toml` configuration file
+
+##### 3.1. Modify the `endpoint` value to the address of the OpenTelemetry Collector
+
+##### 3.2. Modify the `service_name` value to the name of the service
+
+##### 3.3. Modify the `service_version` value to the version of the service
+
+##### 3.4. Modify the `deployment_environment` value to the environment of the service
+
+##### 3.5. Modify the `meter_interval` value to export interval
+
+##### 3.6. Modify the `sample_ratio` value to the sample ratio
+
+##### 3.7. Modify the `use_stdout` value to export to stdout
+
+

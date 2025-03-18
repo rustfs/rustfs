@@ -92,9 +92,7 @@ fn main() -> Result<()> {
 
     //设置 trace
     // setup_tracing();
-    let config = load_config(Some("packages/obs/examples/config".to_string()));
-    // Initialize the logger asynchronously
-    let (_logger, _guard) = tokio::runtime::Runtime::new()?.block_on(async { init_obs(config).await });
+
     //运行参数
     run(opt)
 }
@@ -102,6 +100,9 @@ fn main() -> Result<()> {
 #[tokio::main]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
+    let config = load_config(Some(opt.clone().obs_config));
+    // Initialize Observability
+    init_obs(config).await;
 
     let mut server_addr = net::check_local_server_addr(opt.address.as_str()).unwrap();
 
@@ -277,7 +278,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_iam_sys(store.clone()).await.unwrap();
 
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
-        error!("new_global_notification_sys faild {:?}", &err);
+        error!("new_global_notification_sys failed {:?}", &err);
         Error::from_string(err.to_string())
     })?;
 
