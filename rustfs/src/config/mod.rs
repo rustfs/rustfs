@@ -1,11 +1,32 @@
 use clap::Parser;
 use const_str::concat;
 use ecstore::global::DEFAULT_PORT;
+use std::string::ToString;
 
 shadow_rs::shadow!(build);
 
+/// Default Access Key
+/// Default value: rustfsadmin
+/// Environment variable: RUSTFS_ACCESS_KEY
+/// Command line argument: --access-key
+/// Example: RUSTFS_ACCESS_KEY=rustfsadmin
+/// Example: --access-key rustfsadmin
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
+/// Default Secret Key
+/// Default value: rustfsadmin
+/// Environment variable: RUSTFS_SECRET_KEY
+/// Command line argument: --secret-key
+/// Example: RUSTFS_SECRET_KEY=rustfsadmin
+/// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+/// Default configuration file for observability
+/// Default value: config/obs.toml
+/// Environment variable: RUSTFS_OBS_CONFIG
+/// Command line argument: --obs-config
+/// Example: RUSTFS_OBS_CONFIG=config/obs.toml
+/// Example: --obs-config config/obs.toml
+/// Example: --obs-config /etc/rustfs/obs.toml
+pub const DEFAULT_OBS_CONFIG: &str = "config/obs.toml";
 
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
@@ -31,7 +52,7 @@ const LONG_VERSION: &str = concat!(
     concat!("git status   :\n", build::GIT_STATUS_FILE),
 );
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 #[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
@@ -62,4 +83,9 @@ pub struct Opt {
 
     #[arg(long, default_value_t = format!("127.0.0.1:{}", 9002), env = "RUSTFS_CONSOLE_ADDRESS")]
     pub console_address: String,
+
+    /// Observability configuration file
+    /// Default value: config/obs.toml
+    #[arg(long, default_value_t = DEFAULT_OBS_CONFIG.to_string(), env = "RUSTFS_OBS_CONFIG")]
+    pub obs_config: String,
 }
