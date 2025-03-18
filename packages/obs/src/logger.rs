@@ -1,4 +1,4 @@
-use crate::{AppConfig, LogEntry, SerializableLevel, Sink};
+use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, ServerLogEntry, Sink, UnifiedLogEntry};
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{Mutex, OnceCell};
@@ -10,14 +10,14 @@ static GLOBAL_LOGGER: OnceCell<Arc<Mutex<Logger>>> = OnceCell::const_new();
 /// Server log processor
 #[derive(Debug)]
 pub struct Logger {
-    sender: Sender<LogEntry>, // Log sending channel
+    sender: Sender<UnifiedLogEntry>, // Log sending channel
     queue_capacity: usize,
 }
 
 impl Logger {
     /// Create a new Logger instance
     /// Returns Logger and corresponding Receiver
-    pub fn new(config: &AppConfig) -> (Self, Receiver<LogEntry>) {
+    pub fn new(config: &AppConfig) -> (Self, Receiver<UnifiedLogEntry>) {
         // Get queue capacity from configuration, or use default values 10000
         let queue_capacity = config.logger.queue_capacity.unwrap_or(10000);
         let (sender, receiver) = mpsc::channel(queue_capacity);
@@ -39,83 +39,80 @@ impl Logger {
         self.queue_capacity
     }
 
-    /// Asynchronous logging of server logs
-    /// Attach the log to the current Span and generate a separate Tracing Event
-    #[tracing::instrument(skip(self), fields(log_source = "logger"))]
-    pub async fn log(&self, entry: LogEntry) -> Result<(), LogError> {
-        // Log messages to the current Span
-        tracing::Span::current()
-            .record("log_message", &entry.message)
-            .record("source", &entry.source);
-        println!("target start is {:?}", &entry.target);
-        let target = if let Some(target) = &entry.target {
-            target.clone()
-        } else {
-            "server_logs".to_string()
-        };
+    /// Log a server entry
+    #[tracing::instrument(skip(self), fields(log_source = "logger_server"))]
+    pub async fn log_server_entry(&self, entry: ServerLogEntry) -> Result<(), LogError> {
+        self.log_entry(UnifiedLogEntry::Server(entry)).await
+    }
 
-        println!("target end is {:?}", target);
-        // Generate independent Tracing Events with full LogEntry information
-        // Generate corresponding events according to level
-        match entry.level {
-            SerializableLevel(Level::ERROR) => {
-                tracing::error!(
-                    target = %target.clone(),
-                    timestamp = %entry.timestamp,
-                    message = %entry.message,
-                    source = %entry.source,
-                    request_id = ?entry.request_id,
-                    user_id = ?entry.user_id,
-                    fields = ?entry.fields
-                );
+    /// Log an audit entry
+    #[tracing::instrument(skip(self), fields(log_source = "logger_audit"))]
+    pub async fn log_audit_entry(&self, entry: AuditLogEntry) -> Result<(), LogError> {
+        self.log_entry(UnifiedLogEntry::Audit(entry)).await
+    }
+
+    /// Log a console entry
+    #[tracing::instrument(skip(self), fields(log_source = "logger_console"))]
+    pub async fn log_console_entry(&self, entry: ConsoleLogEntry) -> Result<(), LogError> {
+        self.log_entry(UnifiedLogEntry::Console(entry)).await
+    }
+
+    /// Asynchronous logging of unified log entries
+    #[tracing::instrument(skip(self), fields(log_source = "logger"))]
+    pub async fn log_entry(&self, entry: UnifiedLogEntry) -> Result<(), LogError> {
+        // Extract information for tracing based on entry type
+        match &entry {
+            UnifiedLogEntry::Server(server) => {
+                tracing::Span::current()
+                    .record("log_level", &server.level.0.as_str())
+                    .record("log_message", &server.base.message.as_deref().unwrap_or(""))
+                    .record("source", &server.source);
+
+                // Generate tracing event based on log level
+                match server.level.0 {
+                    Level::ERROR => {
+                        tracing::error!(target: "server_logs", message = %server.base.message.as_deref().unwrap_or(""));
+                    }
+                    Level::WARN => {
+                        tracing::warn!(target: "server_logs", message = %server.base.message.as_deref().unwrap_or(""));
+                    }
+                    Level::INFO => {
+                        tracing::info!(target: "server_logs", message = %server.base.message.as_deref().unwrap_or(""));
+                    }
+                    Level::DEBUG => {
+                        tracing::debug!(target: "server_logs", message = %server.base.message.as_deref().unwrap_or(""));
+                    }
+                    Level::TRACE => {
+                        tracing::trace!(target: "server_logs", message = %server.base.message.as_deref().unwrap_or(""));
+                    }
+                }
             }
-            SerializableLevel(Level::WARN) => {
-                tracing::warn!(
-                    target = %target.clone(),
-                    timestamp = %entry.timestamp,
-                    message = %entry.message,
-                    source = %entry.source,
-                    request_id = ?entry.request_id,
-                    user_id = ?entry.user_id,
-                    fields = ?entry.fields
-                );
-            }
-            SerializableLevel(Level::INFO) => {
+            UnifiedLogEntry::Audit(audit) => {
                 tracing::info!(
-                    target = %target.clone(),
-                    timestamp = %entry.timestamp,
-                    message = %entry.message,
-                    source = %entry.source,
-                    request_id = ?entry.request_id,
-                    user_id = ?entry.user_id,
-                    fields = ?entry.fields
+                    target: "audit_logs",
+                    event = %audit.event,
+                    api = %audit.api.name.as_deref().unwrap_or("unknown"),
+                    message = %audit.base.message.as_deref().unwrap_or("")
                 );
             }
-            SerializableLevel(Level::DEBUG) => {
-                tracing::debug!(
-                    target = %target.clone(),
-                    timestamp = %entry.timestamp,
-                    message = %entry.message,
-                    source = %entry.source,
-                    request_id = ?entry.request_id,
-                    user_id = ?entry.user_id,
-                    fields = ?entry.fields
-                );
-            }
-            SerializableLevel(Level::TRACE) => {
-                tracing::trace!(
-                    target = %target.clone(),
-                    timestamp = %entry.timestamp,
-                    message = %entry.message,
-                    source = %entry.source,
-                    request_id = ?entry.request_id,
-                    user_id = ?entry.user_id,
-                    fields = ?entry.fields
+            UnifiedLogEntry::Console(console) => {
+                let level_str = match console.level {
+                    crate::LogKind::Info => "INFO",
+                    crate::LogKind::Warning => "WARN",
+                    crate::LogKind::Error => "ERROR",
+                    crate::LogKind::Fatal => "FATAL",
+                };
+
+                tracing::info!(
+                    target: "console_logs",
+                    level = %level_str,
+                    node = %console.node_name,
+                    message = %console.console_msg
                 );
             }
         }
 
-        // Send logs to asynchronous queues to improve error handling
+        // Send logs to async queue with improved error handling
         match self.sender.try_send(entry) {
             Ok(_) => Ok(()),
             Err(mpsc::error::TrySendError::Full(entry)) => {
@@ -150,28 +147,25 @@ impl Logger {
     /// use rustfs_obs::Logger;
     ///
     /// async fn example(logger: &Logger) {
-    ///    let _ = logger.write_with_context("This is an information message", "example",Level::INFO, Some("target".to_string()),Some("req-12345".to_string()), Some("user-6789".to_string()), vec![("endpoint".to_string(), "/api/v1/data".to_string())]).await;
+    ///    let _ = logger.write_with_context("This is an information message", "example",Level::INFO, Some("req-12345".to_string()), Some("user-6789".to_string()), vec![("endpoint".to_string(), "/api/v1/data".to_string())]).await;
     /// }
     pub async fn write_with_context(
         &self,
         message: &str,
         source: &str,
         level: Level,
-        target: Option<String>,
         request_id: Option<String>,
         user_id: Option<String>,
         fields: Vec<(String, String)>,
     ) -> Result<(), LogError> {
-        self.log(LogEntry::new(
-            level,
-            message.to_string(),
-            source.to_string(),
-            target,
-            request_id,
-            user_id,
-            fields,
-        ))
-        .await
+        let base = BaseLogEntry::new().message(Some(message.to_string())).request_id(request_id);
+
+        let server_entry = ServerLogEntry::new(level, source.to_string())
+            .user_id(user_id)
+            .fields(fields)
+            .with_base(base);
+
+        self.log_server_entry(server_entry).await
     }
 
     /// Write log
@@ -194,16 +188,7 @@ impl Logger {
     /// }
     /// ```
     pub async fn write(&self, message: &str, source: &str, level: Level) -> Result<(), LogError> {
-        self.log(LogEntry::new(
-            level,
-            message.to_string(),
-            source.to_string(),
-            None,
-            None,
-            None,
-            Vec::new(),
-        ))
-        .await
+        self.write_with_context(message, source, level, None, None, Vec::new()).await
     }
 
     /// Shutdown the logger
@@ -458,7 +443,6 @@ pub async fn log_trace(message: &str, source: &str) -> Result<(), LogError> {
 /// - `message`: Message to be logged
 /// - `source`: Source of the log
 /// - `level`: Log level
-/// - `target`: Log target
 /// - `request_id`: Request ID
 /// - `user_id`: User ID
 /// - `fields`: Additional fields
@@ -470,14 +454,13 @@ pub async fn log_trace(message: &str, source: &str) -> Result<(), LogError> {
 /// use rustfs_obs::log_with_context;
 ///
 /// async fn example() {
-///    let _ = log_with_context("This is an information message", "example", Level::INFO, Some("target".to_string()), Some("req-12345".to_string()), Some("user-6789".to_string()), vec![("endpoint".to_string(), "/api/v1/data".to_string())]).await;
+///    let _ = log_with_context("This is an information message", "example", Level::INFO, Some("req-12345".to_string()), Some("user-6789".to_string()), vec![("endpoint".to_string(), "/api/v1/data".to_string())]).await;
 /// }
 /// ```
 pub async fn log_with_context(
     message: &str,
     source: &str,
     level: Level,
-    target: Option<String>,
     request_id: Option<String>,
     user_id: Option<String>,
     fields: Vec<(String, String)>,
@@ -485,6 +468,6 @@ pub async fn log_with_context(
     get_global_logger()
         .lock()
         .await
-        .write_with_context(message, source, level, target, request_id, user_id, fields)
+        .write_with_context(message, source, level, request_id, user_id, fields)
         .await
 }

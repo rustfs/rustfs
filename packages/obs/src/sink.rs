@@ -1,4 +1,4 @@
-use crate::{AppConfig, LogEntry};
+use crate::{AppConfig, LogRecord, UnifiedLogEntry};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 /// Sink Trait definition, asynchronously write logs
 #[async_trait]
 pub trait Sink: Send + Sync {
-    async fn write(&self, entry: &LogEntry);
+    async fn write(&self, entry: &UnifiedLogEntry);
 }
 
 #[cfg(feature = "kafka")]
@@ -18,7 +18,7 @@ pub struct KafkaSink {
     topic: String,
     batch_size: usize,
     batch_timeout_ms: u64,
-    entries: Arc<tokio::sync::Mutex<Vec<LogEntry>>>,
+    entries: Arc<tokio::sync::Mutex<Vec<UnifiedLogEntry>>>,
     last_flush: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -64,7 +64,7 @@ impl KafkaSink {
     async fn periodic_flush(
         producer: rdkafka::producer::FutureProducer,
         topic: String,
-        entries: Arc<tokio::sync::Mutex<Vec<LogEntry>>>,
+        entries: Arc<tokio::sync::Mutex<Vec<UnifiedLogEntry>>>,
         last_flush: Arc<std::sync::atomic::AtomicU64>,
         timeout_ms: u64,
     ) {
@@ -88,7 +88,7 @@ impl KafkaSink {
         }
     }
 
-    async fn send_batch(producer: &rdkafka::producer::FutureProducer, topic: &str, entries: Vec<LogEntry>) {
+    async fn send_batch(producer: &rdkafka::producer::FutureProducer, topic: &str, entries: Vec<UnifiedLogEntry>) {
         for entry in entries {
             let payload = match serde_json::to_string(&entry) {
                 Ok(p) => p,
@@ -98,7 +98,7 @@ impl KafkaSink {
                 }
             };
 
-            let span_id = entry.timestamp.to_rfc3339();
+            let span_id = entry.get_timestamp().to_rfc3339();
 
             let _ = producer
                 .send(
@@ -113,7 +113,7 @@ impl KafkaSink {
 #[cfg(feature = "kafka")]
 #[async_trait]
 impl Sink for KafkaSink {
-    async fn write(&self, entry: &LogEntry) {
+    async fn write(&self, entry: &UnifiedLogEntry) {
         let mut batch = self.entries.lock().await;
         batch.push(entry.clone());
 
@@ -129,7 +129,7 @@ impl Sink for KafkaSink {
 
         if should_flush_by_size || should_flush_by_time {
             // Existing flush logic
-            let entries_to_send: Vec<LogEntry> = batch.drain(..).collect();
+            let entries_to_send: Vec<UnifiedLogEntry> = batch.drain(..).collect();
             let producer = self.producer.clone();
             let topic = self.topic.clone();
 
@@ -203,7 +203,7 @@ impl WebhookSink {
 #[cfg(feature = "webhook")]
 #[async_trait]
 impl Sink for WebhookSink {
-    async fn write(&self, entry: &LogEntry) {
+    async fn write(&self, entry: &UnifiedLogEntry) {
         let mut retries = 0;
         let url = self.url.clone();
         let entry_clone = entry.clone();
@@ -327,12 +327,17 @@ impl FileSink {
 #[cfg(feature = "file")]
 #[async_trait]
 impl Sink for FileSink {
-    async fn write(&self, entry: &LogEntry) {
+    async fn write(&self, entry: &UnifiedLogEntry) {
         let line = format!("{:?}\n", entry);
         let mut writer = self.writer.lock().await;
 
         if let Err(e) = writer.write_all(line.as_bytes()).await {
-            eprintln!("Failed to write log to file {}: {}", self.path, e);
+            eprintln!(
+                "Failed to write log to file {}: {},entry timestamp:{:?}",
+                self.path,
+                e,
+                entry.get_timestamp()
+            );
             return;
         }
 

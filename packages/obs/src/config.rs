@@ -3,6 +3,11 @@ use serde::Deserialize;
 use std::env;
 
 /// OpenTelemetry Configuration
+/// Add service name, service version, deployment environment
+/// Add interval time for metric collection
+/// Add sample ratio for trace sampling
+/// Add endpoint for metric collection
+/// Add use_stdout for output to stdout
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct OtelConfig {
     pub endpoint: String,
@@ -58,6 +63,19 @@ pub struct LoggerConfig {
 }
 
 /// Overall application configuration
+/// Add observability, sinks, and logger configuration
+///
+/// Observability: OpenTelemetry configuration
+/// Sinks: Kafka, Webhook, File sink configuration
+/// Logger: Logger configuration
+///
+/// # Example
+/// ```
+/// use rustfs_obs::AppConfig;
+/// use rustfs_obs::load_config;
+///
+/// let config = load_config(None);
+/// ```
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct AppConfig {
     pub observability: OtelConfig,
@@ -65,19 +83,48 @@ pub struct AppConfig {
     pub logger: LoggerConfig,
 }
 
+const DEFAULT_CONFIG_FILE: &str = "obs";
+
 /// Loading the configuration file
 /// Supports TOML, YAML and .env formats, read in order by priority
+///
+/// # Parameters
+/// - `config_dir`: Configuration file path
+///
+/// # Returns
+/// Configuration information
+///
+/// # Example
+/// ```
+/// use rustfs_obs::AppConfig;
+/// use rustfs_obs::load_config;
+///
+/// let config = load_config(None);
+/// ```
 pub fn load_config(config_dir: Option<String>) -> AppConfig {
-    let config_dir = config_dir.unwrap_or_else(|| {
-        env::current_dir()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|_| {
-                eprintln!("Warning: Failed to get current directory, using empty path");
-                String::new()
-            })
-    });
+    let config_dir = if let Some(path) = config_dir {
+        // Use the provided path
+        let path = std::path::Path::new(&path);
+        if path.extension().is_some() {
+            // If path has extension, use it as is (extension will be added by Config::builder)
+            path.with_extension("").to_string_lossy().into_owned()
+        } else {
+            // If path is a directory, append the default config file name
+            path.to_string_lossy().into_owned()
+        }
+    } else {
+        // If no path provided, use current directory + default config file
+        match env::current_dir() {
+            Ok(dir) => dir.join(DEFAULT_CONFIG_FILE).to_string_lossy().into_owned(),
+            Err(_) => {
+                eprintln!("Warning: Failed to get current directory, using default config file");
+                DEFAULT_CONFIG_FILE.to_string()
+            }
+        }
+    };
 
-    println!("config_dir: {}", config_dir);
+    // Log using proper logging instead of println when possible
+    println!("Using config file base: {}", config_dir);
 
     let config = Config::builder()
         .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml))
