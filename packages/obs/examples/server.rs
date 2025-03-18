@@ -1,5 +1,6 @@
 use opentelemetry::global;
-use rustfs_obs::{get_logger, init_obs, load_config, log_info, ServerLogEntry};
+use rustfs_obs::{get_logger, init_obs, load_config, log_info, BaseLogEntry, ServerLogEntry};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use tracing::{info, instrument};
 use tracing_core::Level;
@@ -34,7 +35,14 @@ async fn run(bucket: String, object: String, user: String, service_name: String)
         &[opentelemetry::KeyValue::new("operation", "run")],
     );
 
+    let base_entry = BaseLogEntry::new()
+        .message(Some("run logger api_handler info".to_string()))
+        .request_id(Some("request_id".to_string()))
+        .timestamp(chrono::DateTime::from(start_time))
+        .tags(Some(HashMap::default()));
+
     let server_entry = ServerLogEntry::new(Level::INFO, "api_handler".to_string())
+        .with_base(base_entry)
         .user_id(Some(user.clone()))
         .add_field("operation".to_string(), "login".to_string())
         .add_field("bucket".to_string(), bucket.clone())

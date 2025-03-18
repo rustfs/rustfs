@@ -33,6 +33,7 @@ http-body.workspace = true
 lock.workspace = true
 mime.workspace = true
 netif.workspace = true
+once_cell.workspace = true
 pin-project-lite.workspace = true
 prost.workspace = true
 prost-types.workspace = true
