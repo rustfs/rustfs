@@ -1,12 +1,13 @@
 use opentelemetry::global;
-use rustfs_obs::{get_logger, init_obs, load_config, log_info, LogEntry};
+use rustfs_obs::{get_logger, init_obs, load_config, log_info, ServerLogEntry};
 use std::time::{Duration, SystemTime};
 use tracing::{info, instrument};
 use tracing_core::Level;
 
 #[tokio::main]
 async fn main() {
-    let config = load_config(Some("packages/obs/examples/config".to_string()));
+    let obs_conf = Some("packages/obs/examples/config.toml".to_string());
+    let config = load_config(obs_conf);
     let (_logger, _guard) = init_obs(config.clone()).await;
     // Simulate the operation
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -33,24 +34,13 @@ async fn run(bucket: String, object: String, user: String, service_name: String)
         &[opentelemetry::KeyValue::new("operation", "run")],
     );
 
-    let result = get_logger()
-        .lock()
-        .await
-        .log(LogEntry::new(
-            Level::INFO,
-            "Process user requests".to_string(),
-            "api_handler".to_string(),
-            Some("demo-audit".to_string()),
-            Some("req-12345".to_string()),
-            Some(user),
-            vec![
-                ("endpoint".to_string(), "/api/v1/data".to_string()),
-                ("method".to_string(), "GET".to_string()),
-                ("bucket".to_string(), bucket),
-                ("object-length".to_string(), object.len().to_string()),
-            ],
-        ))
-        .await;
+    let server_entry = ServerLogEntry::new(Level::INFO, "api_handler".to_string())
+        .user_id(Some(user.clone()))
+        .add_field("operation".to_string(), "login".to_string())
+        .add_field("bucket".to_string(), bucket.clone())
+        .add_field("object".to_string(), object.clone());
+
+    let result = get_logger().lock().await.log_server_entry(server_entry).await;
     info!("Logging is completed {:?}", result);
     put_object("bucket".to_string(), "object".to_string(), "user".to_string()).await;
     info!("Logging is completed");

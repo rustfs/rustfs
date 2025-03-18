@@ -1,0 +1,88 @@
+
+service:
+  extensions: [jaeger_storage, jaeger_query, remote_sampling, healthcheckv2]
+  pipelines:
+    traces:
+      receivers: [otlp, jaeger, zipkin]
+      processors: [batch, adaptive_sampling]
+      exporters: [jaeger_storage_exporter]
+  telemetry:
+    resource:
+      service.name: jaeger
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+    logs:
+      level: debug
+    # TODO Initialize telemetry tracer once OTEL released new feature.
+    # https://github.com/open-telemetry/opentelemetry-collector/issues/10663
+
+extensions:
+  healthcheckv2:
+    use_v2: true
+    http:
+
+  # pprof:
+  #   endpoint: 0.0.0.0:1777
+  # zpages:
+  #   endpoint: 0.0.0.0:55679
+
+  jaeger_query:
+    storage:
+      traces: some_store
+      traces_archive: another_store
+    ui:
+      config_file: ./cmd/jaeger/config-ui.json
+    # The maximum duration that is considered for clock skew adjustments.
+    # Defaults to 0 seconds, which means it's disabled.
+    max_clock_skew_adjust: 0s
+
+  jaeger_storage:
+    backends:
+      some_store:
+        memory:
+          max_traces: 100000
+      another_store:
+        memory:
+          max_traces: 100000
+
+  remote_sampling:
+    # You can either use file or adaptive sampling strategy in remote_sampling
+    # file:
+    #   path: ./cmd/jaeger/sampling-strategies.json
+    adaptive:
+      sampling_store: some_store
+      initial_sampling_probability: 0.1
+    http:
+    grpc:
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+  jaeger:
+    protocols:
+      grpc:
+      thrift_binary:
+      thrift_compact:
+      thrift_http:
+
+  zipkin:
+
+processors:
+  batch:
+  # Adaptive Sampling Processor is required to support adaptive sampling.
+  # It expects remote_sampling extension with `adaptive:` config to be enabled.
+  adaptive_sampling:
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: some_store
+

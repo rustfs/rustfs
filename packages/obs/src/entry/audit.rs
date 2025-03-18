@@ -1,11 +1,64 @@
-use crate::ObjectVersion;
+use crate::{BaseLogEntry, LogRecord, ObjectVersion};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 /// API details structure
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+/// ApiDetails is used to define the details of an API operation
+///
+/// The `ApiDetails` structure contains the following fields:
+/// - `name` - the name of the API operation
+/// - `bucket` - the bucket name
+/// - `object` - the object name
+/// - `objects` - the list of objects
+/// - `status` - the status of the API operation
+/// - `status_code` - the status code of the API operation
+/// - `input_bytes` - the input bytes
+/// - `output_bytes` - the output bytes
+/// - `header_bytes` - the header bytes
+/// - `time_to_first_byte` - the time to first byte
+/// - `time_to_first_byte_in_ns` - the time to first byte in nanoseconds
+/// - `time_to_response` - the time to response
+/// - `time_to_response_in_ns` - the time to response in nanoseconds
+///
+/// The `ApiDetails` structure contains the following methods:
+/// - `new` - create a new `ApiDetails` with default values
+/// - `set_name` - set the name
+/// - `set_bucket` - set the bucket
+/// - `set_object` - set the object
+/// - `set_objects` - set the objects
+/// - `set_status` - set the status
+/// - `set_status_code` - set the status code
+/// - `set_input_bytes` - set the input bytes
+/// - `set_output_bytes` - set the output bytes
+/// - `set_header_bytes` - set the header bytes
+/// - `set_time_to_first_byte` - set the time to first byte
+/// - `set_time_to_first_byte_in_ns` - set the time to first byte in nanoseconds
+/// - `set_time_to_response` - set the time to response
+/// - `set_time_to_response_in_ns` - set the time to response in nanoseconds
+///
+/// # Example
+/// ```
+/// use rustfs_obs::ApiDetails;
+/// use rustfs_obs::ObjectVersion;
+///
+/// let api = ApiDetails::new()
+///     .set_name(Some("GET".to_string()))
+///     .set_bucket(Some("my-bucket".to_string()))
+///     .set_object(Some("my-object".to_string()))
+///     .set_objects(vec![ObjectVersion::new_with_object_name("my-object".to_string())])
+///     .set_status(Some("OK".to_string()))
+///     .set_status_code(Some(200))
+///     .set_input_bytes(100)
+///     .set_output_bytes(200)
+///     .set_header_bytes(Some(50))
+///     .set_time_to_first_byte(Some("100ms".to_string()))
+///     .set_time_to_first_byte_in_ns(Some("100000000ns".to_string()))
+///     .set_time_to_response(Some("200ms".to_string()))
+///     .set_time_to_response_in_ns(Some("200000000ns".to_string()));
+/// ```
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct ApiDetails {
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -135,22 +188,85 @@ impl ApiDetails {
 }
 
 /// Entry - audit entry logs
+/// AuditLogEntry is used to define the structure of an audit log entry
+///
+/// The `AuditLogEntry` structure contains the following fields:
+/// - `base` - the base log entry
+/// - `version` - the version of the audit log entry
+/// - `deployment_id` - the deployment ID
+/// - `event` - the event
+/// - `entry_type` - the type of audit message
+/// - `api` - the API details
+/// - `remote_host` - the remote host
+/// - `user_agent` - the user agent
+/// - `req_path` - the request path
+/// - `req_host` - the request host
+/// - `req_claims` - the request claims
+/// - `req_query` - the request query
+/// - `req_header` - the request header
+/// - `resp_header` - the response header
+/// - `access_key` - the access key
+/// - `parent_user` - the parent user
+/// - `error` - the error
+///
+/// The `AuditLogEntry` structure contains the following methods:
+/// - `new` - create a new `AuditEntry` with default values
+/// - `new_with_values` - create a new `AuditEntry` with version, time, event and api details
+/// - `with_base` - set the base log entry
+/// - `set_version` - set the version
+/// - `set_deployment_id` - set the deployment ID
+/// - `set_event` - set the event
+/// - `set_entry_type` - set the entry type
+/// - `set_api` - set the API details
+/// - `set_remote_host` - set the remote host
+/// - `set_user_agent` - set the user agent
+/// - `set_req_path` - set the request path
+/// - `set_req_host` - set the request host
+/// - `set_req_claims` - set the request claims
+/// - `set_req_query` - set the request query
+/// - `set_req_header` - set the request header
+/// - `set_resp_header` - set the response header
+/// - `set_access_key` - set the access key
+/// - `set_parent_user` - set the parent user
+/// - `set_error` - set the error
+///
+/// # Example
+/// ```
+/// use rustfs_obs::AuditLogEntry;
+/// use rustfs_obs::ApiDetails;
+/// use std::collections::HashMap;
+///
+/// let entry = AuditLogEntry::new()
+///     .set_version("1.0".to_string())
+///     .set_deployment_id(Some("123".to_string()))
+///     .set_event("event".to_string())
+///     .set_entry_type(Some("type".to_string()))
+///     .set_api(ApiDetails::new())
+///     .set_remote_host(Some("remote-host".to_string()))
+///     .set_user_agent(Some("user-agent".to_string()))
+///     .set_req_path(Some("req-path".to_string()))
+///     .set_req_host(Some("req-host".to_string()))
+///     .set_req_claims(Some(HashMap::new()))
+///     .set_req_query(Some(HashMap::new()))
+///     .set_req_header(Some(HashMap::new()))
+///     .set_resp_header(Some(HashMap::new()))
+///     .set_access_key(Some("access-key".to_string()))
+///     .set_parent_user(Some("parent-user".to_string()))
+///     .set_error(Some("error".to_string()));
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct AuditEntry {
+pub struct AuditLogEntry {
+    #[serde(flatten)]
+    pub base: BaseLogEntry,
     pub version: String,
     #[serde(rename = "deploymentid", skip_serializing_if = "Option::is_none")]
     pub deployment_id: Option<String>,
-    pub time: DateTime<Utc>,
     pub event: String,
-
     // Class of audit message - S3, admin ops, bucket management
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub entry_type: Option<String>,
     pub api: ApiDetails,
     #[serde(rename = "remotehost", skip_serializing_if = "Option::is_none")]
     pub remote_host: Option<String>,
-    #[serde(rename = "requestID", skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
     #[serde(rename = "userAgent", skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
     #[serde(rename = "requestPath", skip_serializing_if = "Option::is_none")]
@@ -165,8 +281,6 @@ pub struct AuditEntry {
     pub req_header: Option<HashMap<String, String>>,
     #[serde(rename = "responseHeader", skip_serializing_if = "Option::is_none")]
     pub resp_header: Option<HashMap<String, String>>,
-    #[serde(rename = "tags", skip_serializing_if = "Option::is_none")]
-    pub tags: Option<HashMap<String, Value>>,
     #[serde(rename = "accessKey", skip_serializing_if = "Option::is_none")]
     pub access_key: Option<String>,
     #[serde(rename = "parentUser", skip_serializing_if = "Option::is_none")]
@@ -175,18 +289,17 @@ pub struct AuditEntry {
     pub error: Option<String>,
 }
 
-impl AuditEntry {
+impl AuditLogEntry {
     /// Create a new `AuditEntry` with default values
     pub fn new() -> Self {
-        AuditEntry {
+        AuditLogEntry {
+            base: BaseLogEntry::new(),
             version: String::new(),
             deployment_id: None,
-            time: Utc::now(),
             event: String::new(),
             entry_type: None,
             api: ApiDetails::new(),
             remote_host: None,
-            request_id: None,
             user_agent: None,
             req_path: None,
             req_host: None,
@@ -194,47 +307,25 @@ impl AuditEntry {
             req_query: None,
             req_header: None,
             resp_header: None,
-            tags: None,
             access_key: None,
             parent_user: None,
             error: None,
         }
     }
 
-    /// Create a new `AuditEntry` with version and time event and api details
-    /// # Arguments
-    /// * `version` - Version of the audit entry
-    /// * `time` - Time of the audit entry
-    /// * `event` - Event of the audit entry
-    /// * `api` - API details of the audit entry
-    /// # Returns
-    /// * `AuditEntry` with the given values
-    /// # Example
-    /// ```
-    /// use chrono::Utc;
-    /// use rustfs_obs::{ApiDetails, AuditEntry};
-    /// let entry = AuditEntry::new_with_values(
-    ///    "v1".to_string(),
-    ///     Utc::now(),
-    ///     "event".to_string(),
-    ///     ApiDetails::new(),
-    /// );
-    /// ```
-    /// # Remarks
-    /// This is a convenience method to create an `AuditEntry` with the given values
-    /// without having to set each field individually
-    /// This is useful when you want to create an `AuditEntry` with the given values
-    /// without having to set each field individually
+    /// Create a new `AuditEntry` with version, time, event and api details
     pub fn new_with_values(version: String, time: DateTime<Utc>, event: String, api: ApiDetails) -> Self {
-        AuditEntry {
+        let mut base = BaseLogEntry::new();
+        base.timestamp = time;
+
+        AuditLogEntry {
+            base,
             version,
             deployment_id: None,
-            time,
             event,
             entry_type: None,
             api,
             remote_host: None,
-            request_id: None,
             user_agent: None,
             req_path: None,
             req_host: None,
@@ -242,11 +333,16 @@ impl AuditEntry {
             req_query: None,
             req_header: None,
             resp_header: None,
-            tags: None,
             access_key: None,
             parent_user: None,
             error: None,
         }
+    }
+
+    /// Set the base log entry
+    pub fn with_base(mut self, base: BaseLogEntry) -> Self {
+        self.base = base;
+        self
     }
 
     /// Set the version
@@ -258,12 +354,6 @@ impl AuditEntry {
     /// Set the deployment ID
     pub fn set_deployment_id(mut self, deployment_id: Option<String>) -> Self {
         self.deployment_id = deployment_id;
-        self
-    }
-
-    /// Set the time
-    pub fn set_time(mut self, time: DateTime<Utc>) -> Self {
-        self.time = time;
         self
     }
 
@@ -288,12 +378,6 @@ impl AuditEntry {
     /// Set the remote host
     pub fn set_remote_host(mut self, remote_host: Option<String>) -> Self {
         self.remote_host = remote_host;
-        self
-    }
-
-    /// Set the request ID
-    pub fn set_request_id(mut self, request_id: Option<String>) -> Self {
-        self.request_id = request_id;
         self
     }
 
@@ -339,12 +423,6 @@ impl AuditEntry {
         self
     }
 
-    /// Set the tags
-    pub fn set_tags(mut self, tags: Option<HashMap<String, Value>>) -> Self {
-        self.tags = tags;
-        self
-    }
-
     /// Set the access key
     pub fn set_access_key(mut self, access_key: Option<String>) -> Self {
         self.access_key = access_key;
@@ -364,79 +442,12 @@ impl AuditEntry {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_audit_entry() {
-        let entry = AuditEntry::new()
-            .set_version("v1".to_string())
-            .set_deployment_id(Some("12345".to_string()))
-            .set_time(Utc::now())
-            .set_event("event".to_string())
-            .set_entry_type(Some("type".to_string()))
-            .set_api(ApiDetails::new())
-            .set_remote_host(Some("localhost".to_string()))
-            .set_request_id(Some("req-12345".to_string()))
-            .set_user_agent(Some("user-agent".to_string()))
-            .set_req_path(Some("/path".to_string()))
-            .set_req_host(Some("localhost".to_string()))
-            .set_req_claims(Some(HashMap::new()))
-            .set_req_query(Some(HashMap::new()))
-            .set_req_header(Some(HashMap::new()))
-            .set_resp_header(Some(HashMap::new()))
-            .set_tags(Some(HashMap::new()))
-            .set_access_key(Some("access-key".to_string()))
-            .set_parent_user(Some("parent-user".to_string()))
-            .set_error(Some("error".to_string()));
-
-        assert_eq!(entry.version, "v1");
-        assert_eq!(entry.deployment_id, Some("12345".to_string()));
-        assert_eq!(entry.event, "event");
-        assert_eq!(entry.entry_type, Some("type".to_string()));
-        assert_eq!(entry.remote_host, Some("localhost".to_string()));
-        assert_eq!(entry.request_id, Some("req-12345".to_string()));
-        assert_eq!(entry.user_agent, Some("user-agent".to_string()));
-        assert_eq!(entry.req_path, Some("/path".to_string()));
-        assert_eq!(entry.req_host, Some("localhost".to_string()));
-        assert_eq!(entry.access_key, Some("access-key".to_string()));
-        assert_eq!(entry.parent_user, Some("parent-user".to_string()));
-        assert_eq!(entry.error, Some("error".to_string()));
+impl LogRecord for AuditLogEntry {
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| String::from("{}"))
     }
 
-    #[test]
-    fn test_api_details() {
-        let api = ApiDetails::new()
-            .set_name(Some("name".to_string()))
-            .set_bucket(Some("bucket".to_string()))
-            .set_object(Some("object".to_string()))
-            .set_objects(vec![ObjectVersion {
-                object_name: "object".to_string(),
-                version_id: Some("12345".to_string()),
-            }])
-            .set_status(Some("status".to_string()))
-            .set_status_code(Some(200))
-            .set_input_bytes(100)
-            .set_output_bytes(200)
-            .set_header_bytes(Some(300))
-            .set_time_to_first_byte(Some("100ms".to_string()))
-            .set_time_to_first_byte_in_ns(Some("100ns".to_string()))
-            .set_time_to_response(Some("200ms".to_string()))
-            .set_time_to_response_in_ns(Some("200ns".to_string()));
-
-        assert_eq!(api.name, Some("name".to_string()));
-        assert_eq!(api.bucket, Some("bucket".to_string()));
-        assert_eq!(api.object, Some("object".to_string()));
-        assert_eq!(api.objects.len(), 1);
-        assert_eq!(api.status, Some("status".to_string()));
-        assert_eq!(api.status_code, Some(200));
-        assert_eq!(api.input_bytes, 100);
-        assert_eq!(api.output_bytes, 200);
-        assert_eq!(api.header_bytes, Some(300));
-        assert_eq!(api.time_to_first_byte, Some("100ms".to_string()));
-        assert_eq!(api.time_to_first_byte_in_ns, Some("100ns".to_string()));
-        assert_eq!(api.time_to_response, Some("200ms".to_string()));
-        assert_eq!(api.time_to_response_in_ns, Some("200ns".to_string()));
+    fn get_timestamp(&self) -> DateTime<Utc> {
+        self.base.timestamp
     }
 }

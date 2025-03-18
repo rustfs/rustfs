@@ -3,6 +3,30 @@
 /// `obs` is a logging and observability library for Rust.
 /// It provides a simple and easy-to-use interface for logging and observability.
 /// It is built on top of the `log` crate and `opentelemetry` crate.
+///
+/// ## Features
+/// - Structured logging
+/// - Distributed tracing
+/// - Metrics collection
+/// - Log processing worker
+/// - Multiple sinks
+/// - Configuration-based setup
+/// - Telemetry guard
+/// - Global logger
+/// - Log levels
+/// - Log entry types
+/// - Log record
+/// - Object version
+/// - Local IP address
+///
+/// ## Usage
+///
+/// ```rust
+/// use rustfs_obs::{AppConfig, init_obs};
+///
+/// let config = AppConfig::default();
+/// let (logger, guard) = init_obs(config);
+/// ```
 mod config;
 mod entry;
 mod logger;
@@ -13,9 +37,11 @@ mod worker;
 
 pub use config::load_config;
 pub use config::{AppConfig, OtelConfig};
-pub use entry::audit::{ApiDetails, AuditEntry};
-pub use entry::base::{Args, Entry, Info, LogKind, ObjectVersion, Trace, API};
-pub use entry::log::{LogEntry, SerializableLevel};
+pub use entry::args::Args;
+pub use entry::audit::{ApiDetails, AuditLogEntry};
+pub use entry::base::BaseLogEntry;
+pub use entry::unified::{ConsoleLogEntry, ServerLogEntry, UnifiedLogEntry};
+pub use entry::{LogKind, LogRecord, ObjectVersion, SerializableLevel};
 pub use logger::start_logger;
 pub use logger::{
     ensure_logger_initialized, get_global_logger, init_global_logger, locked_logger, log_debug, log_error, log_info, log_trace,
