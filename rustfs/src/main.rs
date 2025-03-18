@@ -93,6 +93,10 @@ fn main() -> Result<()> {
     //设置 trace
     // setup_tracing();
 
+    let config = load_config(Some(opt.clone().obs_config));
+    // Initialize Observability
+    let (_logger, _guard) = tokio::runtime::Runtime::new()?.block_on(async { init_obs(config).await });
+
     //运行参数
     run(opt)
 }
@@ -100,9 +104,9 @@ fn main() -> Result<()> {
 #[tokio::main]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
-    let config = load_config(Some(opt.clone().obs_config));
+    // let config = load_config(Some(opt.clone().obs_config));
     // Initialize Observability
-    init_obs(config).await;
+    // let (_logger, _guard) = init_obs(config).await;
 
     let mut server_addr = net::check_local_server_addr(opt.address.as_str()).unwrap();
 
