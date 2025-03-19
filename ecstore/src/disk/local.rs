@@ -1,6 +1,6 @@
 use super::error::{
-    is_err_file_not_found, is_err_file_version_not_found, is_sys_err_io, is_sys_err_not_empty, is_sys_err_too_many_files,
-    os_is_not_exist, os_is_permission,
+    is_err_file_not_found, is_err_file_version_not_found, is_err_os_disk_full, is_sys_err_io, is_sys_err_not_empty,
+    is_sys_err_too_many_files, os_is_not_exist, os_is_permission,
 };
 use super::os::{is_root_disk, rename_all};
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
@@ -35,11 +35,11 @@ use crate::set_disk::{
     CHECK_PART_VOLUME_NOT_FOUND,
 };
 use crate::store_api::{BitrotAlgorithm, StorageAPI};
-use crate::utils::fs::{access, lstat, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
+use crate::utils::fs::{access, lstat, remove, remove_all, rename, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
 use crate::utils::os::get_info;
 use crate::utils::path::{
-    self, clean, decode_dir_object, has_suffix, path_join, path_join_buf, GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH,
-    SLASH_SEPARATOR,
+    self, clean, decode_dir_object, encode_dir_object, has_suffix, path_join, path_join_buf, GLOBAL_DIR_SUFFIX,
+    GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR,
 };
 use crate::{
     file_meta::FileMeta,
@@ -308,44 +308,46 @@ impl LocalDisk {
     //     })
     // }
 
-    pub async fn move_to_trash(&self, delete_path: &PathBuf, _recursive: bool, _immediate_purge: bool) -> Result<()> {
+    pub async fn move_to_trash(&self, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
         let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
         if let Some(parent) = trash_path.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent).await?;
             }
         }
-        // debug!("move_to_trash from:{:?} to {:?}", &delete_path, &trash_path);
-        // TODO: 清空回收站
-        if let Err(err) = fs::rename(&delete_path, &trash_path).await {
-            match err.kind() {
-                ErrorKind::NotFound => (),
-                _ => {
-                    warn!("delete_file rename {:?} err {:?}", &delete_path, &err);
-                    return Err(Error::from(err));
-                }
-            }
+
+        let err = if recursive {
+            rename_all(delete_path, trash_path, self.get_bucket_path(super::RUSTFS_META_TMP_DELETED_BUCKET)?)
+                .await
+                .err()
+        } else {
+            rename(&delete_path, &trash_path).await.map_err(Error::new).err()
+        };
+
+        if immediate_purge || delete_path.to_string_lossy().ends_with(path::SLASH_SEPARATOR) {
+            warn!("move_to_trash immediate_purge {:?}", &delete_path.to_string_lossy());
+            let trash_path2 = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+            let _ = rename_all(
+                encode_dir_object(delete_path.to_string_lossy().as_ref()),
+                trash_path2,
+                self.get_bucket_path(super::RUSTFS_META_TMP_DELETED_BUCKET)?,
+            )
+            .await;
         }
 
-        // TODO: 优化 FIXME: 先清空回收站吧，有时间再添加判断逻辑
-
-        if let Err(err) = {
-            if trash_path.is_dir() {
-                fs::remove_dir_all(&trash_path).await
-            } else {
-                fs::remove_file(&trash_path).await
-            }
-        } {
-            match err.kind() {
-                ErrorKind::NotFound => (),
-                _ => {
-                    warn!("delete_file remove trash {:?} err {:?}", &trash_path, &err);
-                    return Err(Error::from(err));
+        if let Some(err) = err {
+            if is_err_os_disk_full(&err) {
+                if recursive {
+                    remove_all(delete_path).await?;
+                } else {
+                    remove(delete_path).await?;
                 }
             }
+
+            return Ok(());
         }
 
-        // TODO: immediate
+        // TODO: 异步通知 检测硬盘空间 清空回收站
         Ok(())
     }
 
@@ -1971,7 +1973,7 @@ impl DiskAPI for LocalDisk {
             created: modtime,
         })
     }
-    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             utils::fs::access(&volume_dir)
