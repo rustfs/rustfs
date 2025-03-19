@@ -565,3 +565,13 @@ pub fn is_err_os_not_exist(err: &Error) -> bool {
         false
     }
 }
+
+pub fn is_err_os_disk_full(err: &Error) -> bool {
+    if let Some(os_err) = err.downcast_ref::<io::Error>() {
+        is_sys_err_no_space(os_err)
+    } else if let Some(e) = err.downcast_ref::<DiskError>() {
+        e == &DiskError::DiskFull
+    } else {
+        false
+    }
+}

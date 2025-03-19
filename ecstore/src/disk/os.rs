@@ -137,20 +137,12 @@ pub async fn reliable_rename(
     base_dir: impl AsRef<Path>,
 ) -> io::Result<()> {
     if let Some(parent) = dst_file_path.as_ref().parent() {
-        reliable_mkdir_all(parent, base_dir.as_ref()).await?;
-    }
-    // need remove dst path
-    if let Err(err) = utils::fs::remove_all(dst_file_path.as_ref()).await {
-        if err.kind() != io::ErrorKind::NotFound {
-            info!(
-                "reliable_rename rm dst failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
-                src_file_path.as_ref(),
-                dst_file_path.as_ref(),
-                base_dir.as_ref(),
-                err
-            );
+        if !file_exists(parent).await {
+            info!("reliable_rename reliable_mkdir_all parent: {:?}", parent);
+            reliable_mkdir_all(parent, base_dir.as_ref()).await?;
         }
     }
+
     let mut i = 0;
     loop {
         if let Err(e) = utils::fs::rename(src_file_path.as_ref(), dst_file_path.as_ref()).await {
@@ -158,13 +150,13 @@ pub async fn reliable_rename(
                 i += 1;
                 continue;
             }
-            info!(
-                "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
-                src_file_path.as_ref(),
-                dst_file_path.as_ref(),
-                base_dir.as_ref(),
-                e
-            );
+            // info!(
+            //     "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
+            //     src_file_path.as_ref(),
+            //     dst_file_path.as_ref(),
+            //     base_dir.as_ref(),
+            //     e
+            // );
             return Err(e);
         }
 
@@ -228,4 +220,8 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
     }
 
     Ok(())
+}
+
+pub async fn file_exists(path: impl AsRef<Path>) -> bool {
+    fs::metadata(path.as_ref()).await.map(|_| true).unwrap_or(false)
 }

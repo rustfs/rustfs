@@ -63,5 +63,6 @@
 ## 性能优化
 - [ ] bitrot impl AsyncRead/AsyncWrite
 - [ ] erasure 并发读写
-- [ ] 完善删除逻辑, 并发处理,先移动到回收站,空间不足时清空回收站
+- [x] 完善删除逻辑, 并发处理,先移动到回收站,
+- [ ] 空间不足时清空回收站
 - [ ] list_object 使用reader传输

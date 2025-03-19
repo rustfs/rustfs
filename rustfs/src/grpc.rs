@@ -1073,8 +1073,7 @@ impl Node for NodeService {
     async fn delete_paths(&self, request: Request<DeletePathsRequest>) -> Result<Response<DeletePathsResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let paths = request.paths.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-            match disk.delete_paths(&request.volume, &paths).await {
+            match disk.delete_paths(&request.volume, &request.paths).await {
                 Ok(_) => Ok(tonic::Response::new(DeletePathsResponse {
                     success: true,
                     error: None,

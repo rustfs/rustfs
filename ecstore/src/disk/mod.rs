@@ -250,7 +250,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.delete_paths(volume, paths).await,
             Disk::Remote(remote_disk) => remote_disk.delete_paths(volume, paths).await,
@@ -412,7 +412,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         versions: Vec<FileInfoVersions>,
         opts: DeleteOptions,
     ) -> Result<Vec<Option<Error>>>;
-    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()>;
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()>;
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()>;
     async fn read_version(
