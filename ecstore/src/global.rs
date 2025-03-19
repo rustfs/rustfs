@@ -61,7 +61,7 @@ pub fn get_global_deployment_id() -> Option<String> {
 pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
     GLOBAL_Endpoints
         .set(EndpointServerPools::from(eps))
-        .expect("GLOBAL_Endpoints set faild")
+        .expect("GLOBAL_Endpoints set failed")
 }
 
 pub fn get_global_endpoints() -> EndpointServerPools {

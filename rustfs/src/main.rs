@@ -36,14 +36,16 @@ use hyper_util::{
 use iam::init_iam_sys;
 use once_cell::sync::OnceCell;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
-use rustfs_obs::{init_obs, load_config};
+use rustfs_obs::{init_obs, load_config, BaseLogEntry, ServerLogEntry};
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
+use std::time::SystemTime;
 use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn};
+use tracing_core::Level;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -101,28 +103,43 @@ fn print_server_info() {
     info!("Docs: {}", cfg.doc());
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Parse the obtained parameters
     let opt = config::Opt::parse();
-
+    println!("config: {:?}", &opt);
     // 设置 trace
     // setup_tracing();
 
     let config = load_config(Some(opt.clone().obs_config));
     // Initialize Observability
-    let (_logger, guard) = tokio::runtime::Runtime::new()?.block_on(async { init_obs(config).await });
-
+    let (logger, guard) = init_obs(config).await;
+    // let (logger, guard) = tokio::runtime::Runtime::new()?.block_on(async { init_obs(config).await });
+    // let _rr = tokio::runtime::Runtime::new()?.block_on(async {
+    let start_time = SystemTime::now();
+    let base_entry = BaseLogEntry::new()
+        .timestamp(chrono::DateTime::from(start_time))
+        .message(Some("main init obs end".to_string()))
+        .request_id(Some("main".to_string()));
+    let server_entry = ServerLogEntry::new(Level::INFO, "main_server_entry".to_string())
+        .with_base(base_entry)
+        .user_id(Some("user_id".to_string()));
+    let _r = logger.lock().await.log_server_entry(server_entry).await;
+    // });
     // Pack and store the guard
     GLOBAL_GUARD.set(TracingGuard(Box::new(guard))).unwrap_or_else(|_| {
         error!("Unable to set global tracing guard");
     });
 
     // Run parameters
-    run(opt)
+    run(opt).await
 }
-
-#[tokio::main]
+//
+// #[tokio::main]
 async fn run(opt: config::Opt) -> Result<()> {
+    let span = info_span!("trace-main-run");
+    let _enter = span.enter();
+
     debug!("opt: {:?}", &opt);
 
     let mut server_addr = net::check_local_server_addr(opt.address.as_str()).unwrap();
@@ -259,7 +276,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                     match res {
                         Ok(conn) => conn,
                         Err(err) => {
-                            tracing::error!("error accepting connection: {err}");
+                            error!("error accepting connection: {err}");
                             continue;
                         }
                     }
@@ -278,10 +295,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         tokio::select! {
             () = graceful.shutdown() => {
-                 tracing::debug!("Gracefully shutdown!");
+                 debug!("Gracefully shutdown!");
             },
             () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                 tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
+                 debug!("Waited 10 seconds for graceful shutdown, aborting...");
             }
         }
     });

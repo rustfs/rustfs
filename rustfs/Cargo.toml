@@ -16,7 +16,7 @@ workspace = true
 
 [dependencies]
 madmin.workspace = true
-log.workspace = true
+#log.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
@@ -25,7 +25,7 @@ ecstore.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
-h2 = "0.4.7"
+#h2 = "0.4.7"
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
@@ -57,6 +57,7 @@ tokio-stream.workspace = true
 tonic = { version = "0.12.3", features = ["gzip"] }
 tonic-reflection.workspace = true
 tower.workspace = true
+tracing-core = { workspace = true }
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
 transform-stream.workspace = true

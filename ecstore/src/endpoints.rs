@@ -1,4 +1,4 @@
-use tracing::warn;
+use tracing::{instrument, warn};
 
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
@@ -407,7 +407,7 @@ pub struct PoolEndpoints {
     pub platform: String,
 }
 
-/// list of list of endpoints
+/// list of endpoints
 #[derive(Debug, Clone, Default)]
 pub struct EndpointServerPools(pub Vec<PoolEndpoints>);
 
@@ -532,6 +532,8 @@ impl EndpointServerPools {
 
         nodes
     }
+
+    #[instrument]
     pub fn hosts_sorted(&self) -> Vec<Option<XHost>> {
         let (mut peers, local) = self.peers();
 
@@ -604,7 +606,6 @@ impl EndpointServerPools {
 
 #[cfg(test)]
 mod test {
-
     use super::*;
     use std::path::Path;
 
