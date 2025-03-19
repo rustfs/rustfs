@@ -129,7 +129,7 @@ fn init_tracer_provider(config: &OtelConfig) -> SdkTracerProvider {
 
     let tracer_provider = if config.endpoint.is_empty() {
         builder
-            .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
+            .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
             .build()
     } else {
         let exporter = opentelemetry_otlp::SpanExporter::builder()

@@ -23,14 +23,14 @@ opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-stdout = { workspace = true }
-opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "metrics"] }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 serde = { workspace = true }
-tracing = { workspace = true }
+tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-core = { workspace = true }
 tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
+tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 rdkafka = { workspace = true, features = ["tokio"], optional = true }
 reqwest = { workspace = true, optional = true, default-features = false }
@@ -41,10 +41,10 @@ local-ip-address = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
-opentelemetry = { workspace = true, features = ["trace", "metrics"] }
-opentelemetry_sdk = { workspace = true, features = ["trace", "rt-tokio"] }
-opentelemetry-stdout = { workspace = true, features = ["trace", "metrics"] }
-opentelemetry-otlp = { workspace = true, features = ["metrics", "grpc-tonic"] }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-stdout = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true, features = ["std", "attributes"] }

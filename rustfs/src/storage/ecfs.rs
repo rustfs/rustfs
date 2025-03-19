@@ -42,7 +42,6 @@ use http::HeaderMap;
 use iam::policy::action::Action;
 use iam::policy::action::S3Action;
 use lazy_static::lazy_static;
-use log::warn;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -57,6 +56,7 @@ use tokio_util::io::StreamReader;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
@@ -217,7 +217,7 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
-        // TODO: DeleteBucketInput 没有force参数？
+        // TODO: DeleteBucketInput 没有 force 参数？
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
