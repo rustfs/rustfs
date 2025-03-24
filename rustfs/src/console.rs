@@ -11,7 +11,7 @@ use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
-use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::OnceLock;
 use tracing::info;
 
@@ -159,7 +159,15 @@ async fn config_handler(Host(host): Host) -> impl IntoResponse {
 
     let is_addr = host_with_port
         .to_socket_addrs()
-        .map(|addrs| addrs.into_iter().find(|v| v.is_ipv4()))
+        .map(|addrs| {
+            addrs.into_iter().find(|v| {
+                if let SocketAddr::V4(ipv4) = v {
+                    !ipv4.ip().is_private() && !ipv4.ip().is_loopback() && !ipv4.ip().is_unspecified()
+                } else {
+                    false
+                }
+            })
+        })
         .unwrap_or_default();
 
     let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
