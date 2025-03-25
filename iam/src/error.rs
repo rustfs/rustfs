@@ -1,3 +1,6 @@
+use ecstore::disk::error::clone_disk_err;
+use ecstore::disk::error::DiskError;
+
 use crate::policy;
 
 #[derive(thiserror::Error, Debug)]
@@ -6,7 +9,7 @@ pub enum Error {
     PolicyError(#[from] policy::Error),
 
     #[error("ecsotre error: {0}")]
-    EcstoreError(ecstore::error::Error),
+    EcstoreError(common::error::Error),
 
     #[error("{0}")]
     StringError(String),
@@ -96,7 +99,7 @@ pub enum Error {
 //     matches!(e, Error::NoSuchUser(_))
 // }
 
-pub fn is_err_no_such_policy(err: &ecstore::error::Error) -> bool {
+pub fn is_err_no_such_policy(err: &common::error::Error) -> bool {
     if let Some(e) = err.downcast_ref::<Error>() {
         matches!(e, Error::NoSuchPolicy)
     } else {
@@ -104,7 +107,7 @@ pub fn is_err_no_such_policy(err: &ecstore::error::Error) -> bool {
     }
 }
 
-pub fn is_err_no_such_user(err: &ecstore::error::Error) -> bool {
+pub fn is_err_no_such_user(err: &common::error::Error) -> bool {
     if let Some(e) = err.downcast_ref::<Error>() {
         matches!(e, Error::NoSuchUser(_))
     } else {
@@ -112,7 +115,7 @@ pub fn is_err_no_such_user(err: &ecstore::error::Error) -> bool {
     }
 }
 
-pub fn is_err_no_such_account(err: &ecstore::error::Error) -> bool {
+pub fn is_err_no_such_account(err: &common::error::Error) -> bool {
     if let Some(e) = err.downcast_ref::<Error>() {
         matches!(e, Error::NoSuchAccount(_))
     } else {
@@ -120,7 +123,7 @@ pub fn is_err_no_such_account(err: &ecstore::error::Error) -> bool {
     }
 }
 
-pub fn is_err_no_such_temp_account(err: &ecstore::error::Error) -> bool {
+pub fn is_err_no_such_temp_account(err: &common::error::Error) -> bool {
     if let Some(e) = err.downcast_ref::<Error>() {
         matches!(e, Error::NoSuchTempAccount(_))
     } else {
@@ -128,7 +131,7 @@ pub fn is_err_no_such_temp_account(err: &ecstore::error::Error) -> bool {
     }
 }
 
-pub fn is_err_no_such_group(err: &ecstore::error::Error) -> bool {
+pub fn is_err_no_such_group(err: &common::error::Error) -> bool {
     if let Some(e) = err.downcast_ref::<Error>() {
         matches!(e, Error::NoSuchGroup(_))
     } else {
@@ -136,10 +139,25 @@ pub fn is_err_no_such_group(err: &ecstore::error::Error) -> bool {
     }
 }
 
-pub fn is_err_no_such_service_account(err: &ecstore::error::Error) -> bool {
+pub fn is_err_no_such_service_account(err: &common::error::Error) -> bool {
     if let Some(e) = err.downcast_ref::<Error>() {
         matches!(e, Error::NoSuchServiceAccount(_))
     } else {
         false
+    }
+}
+
+pub fn clone_err(e: &common::error::Error) -> common::error::Error {
+    if let Some(e) = e.downcast_ref::<DiskError>() {
+        clone_disk_err(e)
+    } else if let Some(e) = e.downcast_ref::<std::io::Error>() {
+        if let Some(code) = e.raw_os_error() {
+            common::error::Error::new(std::io::Error::from_raw_os_error(code))
+        } else {
+            common::error::Error::new(std::io::Error::new(e.kind(), e.to_string()))
+        }
+    } else {
+        //TODO: 优化其他类型
+        common::error::Error::msg(e.to_string())
     }
 }

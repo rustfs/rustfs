@@ -1,12 +1,12 @@
-pub mod common;
+pub mod com;
 pub mod error;
 #[allow(dead_code)]
 pub mod heal;
 pub mod storageclass;
 
-use crate::error::Result;
 use crate::store::ECStore;
-use common::{lookup_configs, read_config_without_migrate, STORAGE_CLASS_SUB_SYS};
+use com::{lookup_configs, read_config_without_migrate, STORAGE_CLASS_SUB_SYS};
+use common::error::Result;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

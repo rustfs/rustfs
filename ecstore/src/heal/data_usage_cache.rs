@@ -1,11 +1,11 @@
-use crate::config::common::save_config;
+use crate::config::com::save_config;
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
 use crate::set_disk::SetDisks;
 use crate::store_api::{BucketInfo, ObjectIO, ObjectOptions};
 use bytesize::ByteSize;
+use common::error::{Error, Result};
 use http::HeaderMap;
 use path_clean::PathClean;
 use rand::Rng;

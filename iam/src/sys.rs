@@ -24,7 +24,7 @@ use crate::policy::PolicyDoc;
 use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use ecstore::utils::crypto::base64_decode;
 use ecstore::utils::crypto::base64_encode;
 use madmin::AddOrUpdateUserReq;

@@ -1,4 +1,4 @@
-use crate::error::Error;
+use common::error::Error;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BucketMetadataError {

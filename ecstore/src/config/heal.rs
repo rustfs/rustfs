@@ -1,9 +1,7 @@
 use std::time::Duration;
 
-use crate::{
-    error::{Error, Result},
-    utils::bool_flag::parse_bool,
-};
+use crate::utils::bool_flag::parse_bool;
+use common::error::{Error, Result};
 
 #[derive(Debug, Default)]
 pub struct Config {

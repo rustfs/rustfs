@@ -1,7 +1,7 @@
 pub mod object;
 
 use crate::{auth::UserIdentity, cache::Cache, policy::PolicyDoc};
-use ecstore::error::Result;
+use common::error::Result;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;

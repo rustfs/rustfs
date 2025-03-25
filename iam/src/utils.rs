@@ -1,4 +1,4 @@
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngCore};
 use serde::{de::DeserializeOwned, Serialize};

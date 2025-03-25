@@ -12,11 +12,9 @@ use crate::{
         MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
     },
 };
+use common::error::{Error, Result};
+use ecstore::config::error::is_err_config_not_found;
 use ecstore::utils::{crypto::base64_encode, path::path_join_buf};
-use ecstore::{
-    config::error::is_err_config_not_found,
-    error::{Error, Result},
-};
 use log::{debug, warn};
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use serde::{Deserialize, Serialize};

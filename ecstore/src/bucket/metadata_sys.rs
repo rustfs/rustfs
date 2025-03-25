@@ -8,10 +8,10 @@ use crate::bucket::utils::is_meta_bucketname;
 use crate::config;
 use crate::config::error::ConfigError;
 use crate::disk::error::DiskError;
-use crate::error::{Error, Result};
 use crate::global::{is_dist_erasure, is_erasure, new_object_layer_fn, GLOBAL_Endpoints};
 use crate::store::ECStore;
 use crate::utils::xml::deserialize;
+use common::error::{Error, Result};
 use futures::future::join_all;
 use s3s::dto::{
     BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,

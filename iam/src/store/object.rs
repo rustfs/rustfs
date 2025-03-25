@@ -7,13 +7,13 @@ use crate::{
     manager::{extract_jwt_claims, get_default_policyes},
     policy::PolicyDoc,
 };
+use common::error::{Error, Result};
 use ecstore::{
     config::{
-        common::{delete_config, read_config, read_config_with_metadata, save_config},
+        com::{delete_config, read_config, read_config_with_metadata, save_config},
         error::is_err_config_not_found,
         RUSTFS_CONFIG_PREFIX,
     },
-    error::{Error, Result},
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
     store_list_objects::{ObjectInfoOrErr, WalkOptions},

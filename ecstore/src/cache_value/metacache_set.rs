@@ -1,11 +1,9 @@
+use crate::disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions};
 use crate::{
     disk::error::{is_err_eof, is_err_file_not_found, is_err_volume_not_found, DiskError},
     metacache::writer::MetacacheReader,
 };
-use crate::{
-    disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions},
-    error::{Error, Result},
-};
+use common::error::{Error, Result};
 use futures::future::join_all;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::{spawn, sync::broadcast::Receiver as B_Receiver};
@@ -140,7 +138,11 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
     }
 
     let revjob = spawn(async move {
-        let mut errs: Vec<Option<Error>> = vec![None; readers.len()];
+        let mut errs: Vec<Option<Error>> = Vec::with_capacity(readers.len());
+        for _ in 0..readers.len() {
+            errs.push(None);
+        }
+
         loop {
             let mut current = MetaCacheEntry::default();
 

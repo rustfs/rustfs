@@ -1,6 +1,6 @@
 use super::{Effect, Error as IamError, Statement, ID};
 use crate::sys::{Args, Validator, DEFAULT_VERSION};
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -323,7 +323,7 @@ pub mod default {
 #[cfg(test)]
 mod test {
     use super::*;
-    use ecstore::error::Result;
+    use common::error::{Error, Result};
 
     #[tokio::test]
     async fn test_parse_policy() -> Result<()> {

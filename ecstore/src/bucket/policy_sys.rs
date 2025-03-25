@@ -3,7 +3,7 @@ use super::{
     metadata_sys::get_bucket_metadata_sys,
     policy::bucket_policy::{BucketPolicy, BucketPolicyArgs},
 };
-use crate::error::Result;
+use common::error::Result;
 use tracing::warn;
 
 pub struct PolicySys {}
