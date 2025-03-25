@@ -1,5 +1,5 @@
 use super::keyname::{KeyName, ALL_SUPPORT_KEYS};
-use crate::error::Error;
+use common::error::Error;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt, str::FromStr};
 

@@ -6,7 +6,7 @@ use super::{
 };
 use crate::store_api::StorageAPI;
 use crate::{
-    config::common::CONFIG_PREFIX,
+    config::com::CONFIG_PREFIX,
     disk::RUSTFS_META_BUCKET,
     global::GLOBAL_BackgroundHealRoutine,
     heal::{error::ERR_HEAL_STOP_SIGNALLED, heal_commands::DRIVE_STATE_OK},
@@ -14,7 +14,6 @@ use crate::{
 use crate::{
     disk::{endpoint::Endpoint, MetaCacheEntry},
     endpoints::Endpoints,
-    error::{Error, Result},
     global::GLOBAL_IsDistErasure,
     heal::heal_commands::{HealStartSuccess, HEAL_UNKNOWN_SCAN},
     new_object_layer_fn,
@@ -25,6 +24,7 @@ use crate::{
     utils::path::path_join,
 };
 use chrono::Utc;
+use common::error::{Error, Result};
 use futures::join;
 use lazy_static::lazy_static;
 use madmin::heal_commands::{HealDriveInfo, HealItemType, HealResultItem};

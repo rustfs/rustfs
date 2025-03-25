@@ -1,4 +1,4 @@
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, ops::Deref};
 use strum::{EnumString, IntoStaticStr};

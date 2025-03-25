@@ -28,7 +28,6 @@ use super::{
 };
 use crate::{
     disk::error::DiskError,
-    error::{Error, Result},
     heal::{
         data_scanner::ShouldSleepFn,
         data_usage_cache::{DataUsageCache, DataUsageEntry},
@@ -41,6 +40,7 @@ use crate::{
     io::{FileReader, FileWriter, HttpFileReader, HttpFileWriter},
     utils::proto_err_to_err,
 };
+use common::error::{Error, Result};
 use protos::proto_gen::node_service::RenamePartRequst;
 
 #[derive(Debug)]

@@ -1,9 +1,7 @@
 use std::env;
 
-use crate::{
-    config::KV,
-    error::{Error, Result},
-};
+use crate::config::KV;
+use common::error::{Error, Result};
 
 use super::KVS;
 use lazy_static::lazy_static;

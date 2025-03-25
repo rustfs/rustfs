@@ -1,5 +1,5 @@
 use auth::Credentials;
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use ecstore::store::ECStore;
 use error::Error as IamError;
 use log::debug;

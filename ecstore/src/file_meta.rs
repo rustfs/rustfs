@@ -1,4 +1,13 @@
+use crate::disk::FileInfoVersions;
+use crate::file_meta_inline::InlineData;
+use crate::store_api::RawFileInfo;
+use crate::store_err::StorageError;
+use crate::{
+    disk::error::DiskError,
+    store_api::{ErasureInfo, FileInfo, ObjectPartInfo, ERASURE_ALGORITHM},
+};
 use byteorder::ByteOrder;
+use common::error::{Error, Result};
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -10,16 +19,6 @@ use tokio::io::AsyncRead;
 use tracing::{error, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
-
-use crate::disk::FileInfoVersions;
-use crate::file_meta_inline::InlineData;
-use crate::store_api::RawFileInfo;
-use crate::store_err::StorageError;
-use crate::{
-    disk::error::DiskError,
-    error::{Error, Result},
-    store_api::{ErasureInfo, FileInfo, ObjectPartInfo, ERASURE_ALGORITHM},
-};
 
 // XL header specifies the format
 pub static XL_FILE_HEADER: [u8; 4] = [b'X', b'L', b'2', b' '];

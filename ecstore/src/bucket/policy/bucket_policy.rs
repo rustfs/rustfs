@@ -1,4 +1,4 @@
-use crate::error::{Error, Result};
+use common::error::{Error, Result};
 // use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

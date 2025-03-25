@@ -3,7 +3,7 @@ use crate::policy::Policy;
 use crate::sys::{iam_policy_claim_name_sa, Validator, INHERITED_POLICY_TYPE};
 use crate::utils;
 use crate::utils::extract_claims;
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

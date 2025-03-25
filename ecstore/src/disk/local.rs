@@ -18,7 +18,6 @@ use crate::disk::error::{
 };
 use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::STORAGE_FORMAT_FILE;
-use crate::error::{Error, Result};
 use crate::file_meta::{get_file_info, read_xl_meta_no_data, FileInfoOpts};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, ShouldSleepFn, SizeSummary};
@@ -47,6 +46,7 @@ use crate::{
     utils,
 };
 use common::defer;
+use common::error::{Error, Result};
 use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;

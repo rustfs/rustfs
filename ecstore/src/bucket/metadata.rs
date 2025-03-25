@@ -16,9 +16,9 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::error;
 
-use crate::config::common::{read_config, save_config};
-use crate::error::{Error, Result};
+use crate::config::com::{read_config, save_config};
 use crate::{config, new_object_layer_fn};
+use common::error::{Error, Result};
 
 use crate::disk::BUCKET_META_PREFIX;
 use crate::store::ECStore;

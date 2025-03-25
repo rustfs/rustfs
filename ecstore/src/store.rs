@@ -6,6 +6,7 @@ use crate::config::GLOBAL_StorageClass;
 use crate::config::{self, storageclass, GLOBAL_ConfigSys};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
+use crate::error::clone_err;
 use crate::global::{
     is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION,
     DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
@@ -30,7 +31,6 @@ use crate::{
     bucket::metadata::BucketMetadata,
     disk::{error::DiskError, new_disk, DiskOption, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     endpoints::EndpointServerPools,
-    error::{Error, Result},
     peer::S3PeerSys,
     sets::Sets,
     store_api::{
@@ -40,6 +40,7 @@ use crate::{
     },
     store_init, utils,
 };
+use common::error::{Error, Result};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
 use glob::Pattern;
@@ -664,7 +665,7 @@ impl ECStore {
             has_def_pool = true;
 
             if !is_err_object_not_found(err) && !is_err_version_not_found(err) {
-                return Err(err.clone());
+                return Err(clone_err(&err));
             }
 
             if pinfo.object_info.delete_marker && !pinfo.object_info.name.is_empty() {
@@ -802,7 +803,7 @@ impl ECStore {
         }
         let _ = task.await;
         if let Some(err) = first_err.read().await.as_ref() {
-            return Err(err.clone());
+            return Err(clone_err(&err));
         }
         Ok(())
     }
@@ -932,8 +933,8 @@ impl ECStore {
             }
         }
 
-        if derrs[0].is_some() {
-            return Err(derrs[0].as_ref().unwrap().clone());
+        if let Some(e) = &derrs[0] {
+            return Err(clone_err(e));
         }
 
         Ok(objs[0].as_ref().unwrap().clone())
@@ -1056,11 +1057,21 @@ struct PoolErr {
     err: Option<Error>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct PoolObjInfo {
     pub index: usize,
     pub object_info: ObjectInfo,
     pub err: Option<Error>,
+}
+
+impl Clone for PoolObjInfo {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index,
+            object_info: self.object_info.clone(),
+            err: self.err.as_ref().map(|e| clone_err(e)),
+        }
+    }
 }
 
 // #[derive(Debug, Default, Clone)]
@@ -2037,45 +2048,59 @@ impl StorageAPI for ECStore {
     ) -> Result<(HealResultItem, Option<Error>)> {
         info!("ECStore heal_object");
         let object = utils::path::encode_dir_object(object);
-        let errs = Arc::new(RwLock::new(vec![None; self.pools.len()]));
-        let results = Arc::new(RwLock::new(vec![HealResultItem::default(); self.pools.len()]));
-        let mut futures = Vec::with_capacity(self.pools.len());
-        for (idx, pool) in self.pools.iter().enumerate() {
-            //TODO: IsSuspended
-            let object = object.clone();
-            let results = results.clone();
-            let errs = errs.clone();
-            futures.push(async move {
-                match pool.heal_object(bucket, &object, version_id, opts).await {
-                    Ok((mut result, err)) => {
-                        result.object = utils::path::decode_dir_object(&result.object);
-                        results.write().await.insert(idx, result);
-                        errs.write().await[idx] = err;
-                    }
-                    Err(err) => {
-                        errs.write().await[idx] = Some(err);
-                    }
-                }
-            });
-        }
-        let _ = join_all(futures).await;
 
-        // Return the first nil error
-        for (index, err) in errs.read().await.iter().enumerate() {
+        let mut futures = Vec::with_capacity(self.pools.len());
+        for pool in self.pools.iter() {
+            //TODO: IsSuspended
+            futures.push(pool.heal_object(bucket, &object, version_id, opts));
+            // futures.push(async move {
+            // match pool.heal_object(bucket, &object, version_id, opts).await {
+            //     Ok((mut result, err)) => {
+            //         result.object = utils::path::decode_dir_object(&result.object);
+            //         results.write().await.insert(idx, result);
+            //         errs.write().await[idx] = err;
+            //     }
+            //     Err(err) => {
+            //         errs.write().await[idx] = Some(err);
+            //     }
+            // }
+            // });
+        }
+        let results = join_all(futures).await;
+
+        let mut errs = Vec::with_capacity(self.pools.len());
+        let mut ress = Vec::with_capacity(self.pools.len());
+
+        for res in results.into_iter() {
+            match res {
+                Ok((result, err)) => {
+                    let mut result = result;
+                    result.object = utils::path::decode_dir_object(&result.object);
+                    ress.push(result);
+                    errs.push(err);
+                }
+                Err(err) => {
+                    errs.push(Some(err));
+                    ress.push(HealResultItem::default());
+                }
+            }
+        }
+
+        for (idx, err) in errs.iter().enumerate() {
             if err.is_none() {
-                return Ok((results.write().await.remove(index), None));
+                return Ok((ress.remove(idx), None));
             }
         }
 
         // No pool returned a nil error, return the first non 'not found' error
-        for (index, err) in errs.read().await.iter().enumerate() {
+        for (index, err) in errs.iter().enumerate() {
             match err {
                 Some(err) => match err.downcast_ref::<DiskError>() {
                     Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
-                    _ => return Ok((results.write().await.remove(index), Some(err.clone()))),
+                    _ => return Ok((ress.remove(index), Some(clone_err(err)))),
                 },
                 None => {
-                    return Ok((results.write().await.remove(index), None));
+                    return Ok((ress.remove(index), None));
                 }
             }
         }
@@ -2227,7 +2252,7 @@ impl StorageAPI for ECStore {
         }
 
         if !errs.is_empty() {
-            return Err(errs[0].clone());
+            return Err(clone_err(&errs[0]));
         }
 
         Ok(())

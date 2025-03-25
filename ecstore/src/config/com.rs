@@ -1,10 +1,10 @@
 use super::error::{is_err_config_not_found, ConfigError};
 use super::{storageclass, Config, GLOBAL_StorageClass, KVS};
 use crate::disk::RUSTFS_META_BUCKET;
-use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use crate::store_err::is_err_object_not_found;
 use crate::utils::path::SLASH_SEPARATOR;
+use common::error::{Error, Result};
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use std::collections::HashSet;

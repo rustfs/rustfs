@@ -1,5 +1,5 @@
+use common::error::{Error, Result};
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
-use ecstore::error::{Error, Result};
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_err::StorageError;
 use ecstore::utils::path::is_dir_object;

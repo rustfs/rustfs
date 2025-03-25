@@ -1,4 +1,5 @@
-use crate::{disk, error::Error, store_err::is_err_object_not_found};
+use crate::{disk, store_err::is_err_object_not_found};
+use common::error::Error;
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum ConfigError {

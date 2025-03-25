@@ -3,7 +3,7 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-use crate::error::Error;
+use common::error::Error;
 
 use super::key::Key;
 

@@ -1872,6 +1872,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "e2e_test"
 version = "0.0.1"
 dependencies = [
+ "common",
  "ecstore",
  "flatbuffers",
  "futures",
@@ -2933,6 +2934,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64-simd",
+ "common",
  "crypto",
  "ecstore",
  "futures",
