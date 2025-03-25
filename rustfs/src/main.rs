@@ -107,29 +107,29 @@ fn print_server_info() {
 async fn main() -> Result<()> {
     // Parse the obtained parameters
     let opt = config::Opt::parse();
-    println!("config: {:?}", &opt);
-    // 设置 trace
-    // setup_tracing();
+    // println!("config: {:?}", &opt);
 
+    // Load the configuration file
     let config = load_config(Some(opt.clone().obs_config));
+
     // Initialize Observability
     let (logger, guard) = init_obs(config).await;
-    // let (logger, guard) = tokio::runtime::Runtime::new()?.block_on(async { init_obs(config).await });
-    // let _rr = tokio::runtime::Runtime::new()?.block_on(async {
+
+    // Pack and store the guard
+    GLOBAL_GUARD.set(TracingGuard(Box::new(guard))).unwrap_or_else(|_| {
+        error!("Unable to set global tracing guard");
+    });
+
+    // Initialize the logger
     let start_time = SystemTime::now();
     let base_entry = BaseLogEntry::new()
         .timestamp(chrono::DateTime::from(start_time))
-        .message(Some("main init obs end".to_string()))
+        .message(Some("main init obs start".to_string()))
         .request_id(Some("main".to_string()));
     let server_entry = ServerLogEntry::new(Level::INFO, "main_server_entry".to_string())
         .with_base(base_entry)
         .user_id(Some("user_id".to_string()));
     let _r = logger.lock().await.log_server_entry(server_entry).await;
-    // });
-    // Pack and store the guard
-    GLOBAL_GUARD.set(TracingGuard(Box::new(guard))).unwrap_or_else(|_| {
-        error!("Unable to set global tracing guard");
-    });
 
     // Run parameters
     run(opt).await
