@@ -1,11 +1,10 @@
-
 service:
-  extensions: [jaeger_storage, jaeger_query, remote_sampling, healthcheckv2]
+  extensions: [ jaeger_storage, jaeger_query, remote_sampling, healthcheckv2 ]
   pipelines:
     traces:
-      receivers: [otlp, jaeger, zipkin]
-      processors: [batch, adaptive_sampling]
-      exporters: [jaeger_storage_exporter]
+      receivers: [ otlp, jaeger, zipkin ]
+      processors: [ batch, adaptive_sampling ]
+      exporters: [ jaeger_storage_exporter ]
   telemetry:
     resource:
       service.name: jaeger

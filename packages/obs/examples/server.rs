@@ -10,6 +10,9 @@ async fn main() {
     let obs_conf = Some("packages/obs/examples/config.toml".to_string());
     let config = load_config(obs_conf);
     let (_logger, _guard) = init_obs(config.clone()).await;
+    let span = tracing::span!(Level::INFO, "main");
+    let _enter = span.enter();
+    info!("Program starts");
     // Simulate the operation
     tokio::time::sleep(Duration::from_millis(100)).await;
     run(
@@ -28,7 +31,7 @@ async fn run(bucket: String, object: String, user: String, service_name: String)
     info!("Log module initialization is completed service_name: {:?}", service_name);
 
     // Record Metrics
-    let meter = global::meter("rustfs.rs");
+    let meter = global::meter("rustfs");
     let request_duration = meter.f64_histogram("s3_request_duration_seconds").build();
     request_duration.record(
         start_time.elapsed().unwrap().as_secs_f64(),
@@ -59,9 +62,9 @@ async fn run(bucket: String, object: String, user: String, service_name: String)
 #[instrument(fields(bucket, object, user))]
 async fn put_object(bucket: String, object: String, user: String) {
     let start_time = SystemTime::now();
-    info!("Starting put_object operation");
+    info!("Starting put_object operation time: {:?}", start_time);
 
-    let meter = global::meter("rustfs.rs");
+    let meter = global::meter("rustfs");
     let request_duration = meter.f64_histogram("s3_request_duration_seconds").build();
     request_duration.record(
         start_time.elapsed().unwrap().as_secs_f64(),

@@ -1,13 +1,13 @@
 receivers:
   otlp:
     protocols:
-      grpc:  # OTLP gRPC 接收器
+      grpc: # OTLP gRPC 接收器
         endpoint: 0.0.0.0:4317
-      http:  # OTLP HTTP 接收器
+      http: # OTLP HTTP 接收器
         endpoint: 0.0.0.0:4318
 
 processors:
-  batch:  # 批处理处理器，提升吞吐量
+  batch: # 批处理处理器，提升吞吐量
     timeout: 5s
     send_batch_size: 1000
   memory_limiter:
@@ -15,16 +15,16 @@ processors:
     limit_mib: 512
 
 exporters:
-  otlp/traces:  # OTLP 导出器，用于跟踪数据
+  otlp/traces: # OTLP 导出器，用于跟踪数据
     endpoint: "jaeger:4317"  # Jaeger 的 OTLP gRPC 端点
     tls:
       insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
-  prometheus:  # Prometheus 导出器，用于指标数据
+  prometheus: # Prometheus 导出器，用于指标数据
     endpoint: "0.0.0.0:8889"  # Prometheus 刮取端点
-    namespace: "otel"  # 指标前缀
+    namespace: "rustfs"  # 指标前缀
     send_timestamps: true  # 发送时间戳
     # enable_open_metrics: true
-  loki:  # Loki 导出器，用于日志数据
+  loki: # Loki 导出器，用于日志数据
     # endpoint: "http://loki:3100/otlp/v1/logs"
     endpoint: "http://loki:3100/loki/api/v1/push"
     tls:
@@ -34,20 +34,20 @@ extensions:
   pprof:
   zpages:
 service:
-  extensions: [health_check, pprof, zpages]  # 启用扩展
+  extensions: [ health_check, pprof, zpages ]  # 启用扩展
   pipelines:
     traces:
-      receivers: [otlp]
-      processors: [memory_limiter,batch]
-      exporters: [otlp/traces]
+      receivers: [ otlp ]
+      processors: [ memory_limiter,batch ]
+      exporters: [ otlp/traces ]
     metrics:
-      receivers: [otlp]
-      processors: [batch]
-      exporters: [prometheus]
+      receivers: [ otlp ]
+      processors: [ batch ]
+      exporters: [ prometheus ]
     logs:
-      receivers: [otlp]
-      processors: [batch]
-      exporters: [loki]
+      receivers: [ otlp ]
+      processors: [ batch ]
+      exporters: [ loki ]
   telemetry:
     logs:
       level: "info"  # Collector 日志级别
