@@ -1,6 +1,7 @@
 use crate::bitrot::{BitrotReader, BitrotWriter};
-use crate::error::{Error, Result};
+use crate::error::clone_err;
 use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
+use common::error::{Error, Result};
 use futures::future::join_all;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::any::Any;
@@ -487,7 +488,7 @@ impl Erasure {
             }
         }
         if !errs.is_empty() {
-            return Err(errs[0].clone());
+            return Err(clone_err(&errs[0]));
         }
 
         Ok(())

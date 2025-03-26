@@ -2,11 +2,9 @@ use std::io::{self, ErrorKind};
 
 use tracing::error;
 
+use crate::quorum::CheckErrorFn;
 use crate::utils::ERROR_TYPE_MASK;
-use crate::{
-    error::{Error, Result},
-    quorum::CheckErrorFn,
-};
+use common::error::{Error, Result};
 
 // DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
@@ -561,6 +559,16 @@ pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
 pub fn is_err_os_not_exist(err: &Error) -> bool {
     if let Some(os_err) = err.downcast_ref::<io::Error>() {
         os_is_not_exist(os_err)
+    } else {
+        false
+    }
+}
+
+pub fn is_err_os_disk_full(err: &Error) -> bool {
+    if let Some(os_err) = err.downcast_ref::<io::Error>() {
+        is_sys_err_no_space(os_err)
+    } else if let Some(e) = err.downcast_ref::<DiskError>() {
+        e == &DiskError::DiskFull
     } else {
         false
     }

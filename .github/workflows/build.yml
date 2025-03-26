@@ -28,7 +28,7 @@ jobs:
 
       - name: Download and Extract Static Assets
         run: |
-          url="https://dl.rustfs.com/console/rustfs-console-latest.zip"
+          url="https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip"
           mkdir -p static
           curl -L -o static_assets.zip "$url"
           unzip -o static_assets.zip -d ./rustfs/static

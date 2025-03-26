@@ -1,8 +1,7 @@
+use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use crate::error::{Error, Result};
 use std::io::{Cursor, Read};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InlineData(Vec<u8>);

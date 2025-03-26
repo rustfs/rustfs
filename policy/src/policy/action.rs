@@ -1,11 +1,9 @@
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, ops::Deref};
 use strum::{EnumString, IntoStaticStr};
 
-use crate::sys::Validator;
-
-use super::{utils::wildcard, Error as IamError};
+use super::{utils::wildcard, Error as IamError, Validator};
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ActionSet(pub HashSet<Action>);
@@ -49,7 +47,7 @@ impl PartialEq for ActionSet {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug, Copy)]
 #[serde(try_from = "&str", untagged)]
 pub enum Action {
     S3Action(S3Action),
@@ -107,7 +105,7 @@ impl TryFrom<&str> for Action {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
 #[cfg_attr(test, derive(Default))]
 #[serde(try_from = "&str", into = "&str")]
 pub enum S3Action {
@@ -234,7 +232,7 @@ pub enum S3Action {
     PutObjectFanOutAction,
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum AdminAction {
     #[strum(serialize = "admin:*")]
@@ -265,11 +263,11 @@ pub enum AdminAction {
     CreateServiceAccountAdminAction,
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum StsAction {}
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum KmsAction {
     #[strum(serialize = "kms:*")]

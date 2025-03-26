@@ -2,7 +2,6 @@ pub mod error;
 pub mod metadata;
 pub mod metadata_sys;
 pub mod object_lock;
-pub mod policy;
 pub mod policy_sys;
 mod quota;
 pub mod tagging;

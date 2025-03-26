@@ -1,12 +1,3 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io::{Cursor, Write},
-    mem::replace,
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
-
 use crate::{
     bitrot::{bitrot_verify, close_bitrot_writers, new_bitrot_filereader, new_bitrot_filewriter, BitrotFileWriter},
     cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
@@ -20,7 +11,7 @@ use crate::{
         UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
     },
     erasure::Erasure,
-    error::{Error, Result},
+    error::clone_err,
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
     global::{
         get_global_deployment_id, is_dist_erasure, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP,
@@ -64,6 +55,7 @@ use crate::{
 };
 use bytesize::ByteSize;
 use chrono::Utc;
+use common::error::{Error, Result};
 use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
@@ -82,6 +74,14 @@ use rand::{
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::time::SystemTime;
+use std::{
+    collections::{HashMap, HashSet},
+    io::{Cursor, Write},
+    mem::replace,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::{
     io::{empty, AsyncWrite},
@@ -320,7 +320,7 @@ impl SetDisks {
                 }
                 Err(e) => {
                     // ress.push(None);
-                    errs.push(Some(e.clone()));
+                    errs.push(Some(clone_err(e)));
                 }
             }
         }
@@ -453,7 +453,7 @@ impl SetDisks {
         Ok(())
     }
 
-    async fn cleanup_multipart_path(disks: &[Option<DiskStore>], paths: &[&str]) {
+    async fn cleanup_multipart_path(disks: &[Option<DiskStore>], paths: &[String]) {
         let mut futures = Vec::with_capacity(disks.len());
 
         let mut errs = Vec::with_capacity(disks.len());
@@ -478,6 +478,10 @@ impl SetDisks {
                     errs.push(Some(e));
                 }
             }
+        }
+
+        if errs.iter().any(|e| e.is_some()) {
+            warn!("cleanup_multipart_path errs {:?}", &errs);
         }
     }
     async fn rename_part(
@@ -518,7 +522,7 @@ impl SetDisks {
 
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
             warn!("rename_part errs {:?}", &errs);
-            Self::cleanup_multipart_path(disks, vec![dst_object, format!("{}.meta", dst_object).as_str()].as_slice()).await;
+            Self::cleanup_multipart_path(disks, &[dst_object.to_owned(), format!("{}.meta", dst_object)]).await;
             return Err(err);
         }
 
@@ -1238,7 +1242,7 @@ impl SetDisks {
             Err(err) => {
                 for item in errs.iter_mut() {
                     if item.is_none() {
-                        *item = Some(err.clone())
+                        *item = Some(clone_err(&err));
                     }
                 }
 
@@ -1490,92 +1494,92 @@ impl SetDisks {
     //     (ress, errs)
     // }
 
-    async fn remove_object_part(
-        &self,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        data_dir: &str,
-        part_num: usize,
-    ) -> Result<()> {
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
-        let disks = self.disks.read().await;
+    // async fn remove_object_part(
+    //     &self,
+    //     bucket: &str,
+    //     object: &str,
+    //     upload_id: &str,
+    //     data_dir: &str,
+    //     part_num: usize,
+    // ) -> Result<()> {
+    //     let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+    //     let disks = self.disks.read().await;
 
-        let disks = disks.clone();
+    //     let disks = disks.clone();
 
-        let file_path = format!("{}/{}/part.{}", upload_id_path, data_dir, part_num);
+    //     let file_path = format!("{}/{}/part.{}", upload_id_path, data_dir, part_num);
 
-        let mut futures = Vec::with_capacity(disks.len());
-        let mut errors = Vec::with_capacity(disks.len());
+    //     let mut futures = Vec::with_capacity(disks.len());
+    //     let mut errors = Vec::with_capacity(disks.len());
 
-        for disk in disks.iter() {
-            let file_path = file_path.clone();
-            let meta_file_path = format!("{}.meta", file_path);
+    //     for disk in disks.iter() {
+    //         let file_path = file_path.clone();
+    //         let meta_file_path = format!("{}.meta", file_path);
 
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.delete(RUSTFS_META_MULTIPART_BUCKET, &file_path, DeleteOptions::default())
-                        .await?;
-                    disk.delete(RUSTFS_META_MULTIPART_BUCKET, &meta_file_path, DeleteOptions::default())
-                        .await
-                } else {
-                    Err(Error::new(DiskError::DiskNotFound))
-                }
-            });
-        }
+    //         futures.push(async move {
+    //             if let Some(disk) = disk {
+    //                 disk.delete(RUSTFS_META_MULTIPART_BUCKET, &file_path, DeleteOptions::default())
+    //                     .await?;
+    //                 disk.delete(RUSTFS_META_MULTIPART_BUCKET, &meta_file_path, DeleteOptions::default())
+    //                     .await
+    //             } else {
+    //                 Err(Error::new(DiskError::DiskNotFound))
+    //             }
+    //         });
+    //     }
 
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(_) => {
-                    errors.push(None);
-                }
-                Err(e) => {
-                    errors.push(Some(e));
-                }
-            }
-        }
+    //     let results = join_all(futures).await;
+    //     for result in results {
+    //         match result {
+    //             Ok(_) => {
+    //                 errors.push(None);
+    //             }
+    //             Err(e) => {
+    //                 errors.push(Some(e));
+    //             }
+    //         }
+    //     }
 
-        Ok(())
-    }
-    async fn remove_part_meta(&self, bucket: &str, object: &str, upload_id: &str, data_dir: &str, part_num: usize) -> Result<()> {
-        let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
-        let disks = self.disks.read().await;
+    //     Ok(())
+    // }
+    // async fn remove_part_meta(&self, bucket: &str, object: &str, upload_id: &str, data_dir: &str, part_num: usize) -> Result<()> {
+    //     let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
+    //     let disks = self.disks.read().await;
 
-        let disks = disks.clone();
-        // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
+    //     let disks = disks.clone();
+    //     // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
-        let file_path = format!("{}/{}/part.{}.meta", upload_id_path, data_dir, part_num);
+    //     let file_path = format!("{}/{}/part.{}.meta", upload_id_path, data_dir, part_num);
 
-        let mut futures = Vec::with_capacity(disks.len());
-        let mut errors = Vec::with_capacity(disks.len());
+    //     let mut futures = Vec::with_capacity(disks.len());
+    //     let mut errors = Vec::with_capacity(disks.len());
 
-        for disk in disks.iter() {
-            let file_path = file_path.clone();
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.delete(RUSTFS_META_MULTIPART_BUCKET, &file_path, DeleteOptions::default())
-                        .await
-                } else {
-                    Err(Error::new(DiskError::DiskNotFound))
-                }
-            });
-        }
+    //     for disk in disks.iter() {
+    //         let file_path = file_path.clone();
+    //         futures.push(async move {
+    //             if let Some(disk) = disk {
+    //                 disk.delete(RUSTFS_META_MULTIPART_BUCKET, &file_path, DeleteOptions::default())
+    //                     .await
+    //             } else {
+    //                 Err(Error::new(DiskError::DiskNotFound))
+    //             }
+    //         });
+    //     }
 
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(_) => {
-                    errors.push(None);
-                }
-                Err(e) => {
-                    errors.push(Some(e));
-                }
-            }
-        }
+    //     let results = join_all(futures).await;
+    //     for result in results {
+    //         match result {
+    //             Ok(_) => {
+    //                 errors.push(None);
+    //             }
+    //             Err(e) => {
+    //                 errors.push(Some(e));
+    //             }
+    //         }
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     // #[tracing::instrument(skip(self))]
     pub async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
@@ -2288,7 +2292,7 @@ impl SetDisks {
                                 "file({} : {}) part corrupt too much, can not to fix, disks_to_heal_count: {}, parity_blocks: {}",
                                 bucket, object, disks_to_heal_count, lastest_meta.erasure.parity_blocks
                             );
-                            let mut t_errs = vec![None; errs.len()];
+
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
                             match self
@@ -2311,13 +2315,22 @@ impl SetDisks {
                                     } else {
                                         Error::new(DiskError::FileNotFound)
                                     };
+                                    let mut t_errs = Vec::with_capacity(errs.len());
+                                    for _ in 0..errs.len() {
+                                        t_errs.push(None);
+                                    }
                                     return Ok((
                                         self.default_heal_result(m, &t_errs, bucket, object, version_id).await,
                                         Some(derr),
                                     ));
                                 }
                                 Err(err) => {
-                                    t_errs = vec![Some(err.clone()); errs.len()];
+                                    // t_errs = vec![Some(err.clone()); errs.len()];
+                                    let mut t_errs = Vec::with_capacity(errs.len());
+                                    for _ in 0..errs.len() {
+                                        t_errs.push(Some(clone_err(&err)));
+                                    }
+
                                     return Ok((
                                         self.default_heal_result(FileInfo::default(), &t_errs, bucket, object, version_id)
                                             .await,
@@ -3517,7 +3530,7 @@ impl SetDisks {
         }
 
         if let Some(err) = ret_err.as_ref() {
-            return Err(err.clone());
+            return Err(clone_err(err));
         }
         if !tracker.read().await.queue_buckets.is_empty() {
             return Err(Error::from_string(format!(
@@ -4434,7 +4447,7 @@ impl StorageAPI for SetDisks {
             }
         };
 
-        let mut upload_ids = Vec::new();
+        let mut upload_ids: Vec<String> = Vec::new();
 
         for disk in disks.iter().flatten() {
             if !disk.is_online().await {
@@ -4847,29 +4860,49 @@ impl StorageAPI for SetDisks {
             }
         }
 
+        let mut parts = Vec::with_capacity(curr_fi.parts.len());
         // TODO: 优化 cleanupMultipartPath
         for p in curr_fi.parts.iter() {
-            let _ = self
-                .remove_part_meta(
-                    bucket,
-                    object,
-                    upload_id,
-                    curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
-                    p.number,
-                )
-                .await;
+            parts.push(path_join_buf(&[
+                &upload_id_path,
+                curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
+                format!("part.{}.meta", p.number).as_str(),
+            ]));
 
             if !fi.parts.iter().any(|v| v.number == p.number) {
-                let _ = self
-                    .remove_object_part(
-                        bucket,
-                        object,
-                        upload_id,
-                        curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
-                        p.number,
-                    )
-                    .await;
+                parts.push(path_join_buf(&[
+                    &upload_id_path,
+                    curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
+                    format!("part.{}", p.number).as_str(),
+                ]));
             }
+
+            // let _ = self
+            //     .remove_part_meta(
+            //         bucket,
+            //         object,
+            //         upload_id,
+            //         curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
+            //         p.number,
+            //     )
+            //     .await;
+
+            // if !fi.parts.iter().any(|v| v.number == p.number) {
+            //     let _ = self
+            //         .remove_object_part(
+            //             bucket,
+            //             object,
+            //             upload_id,
+            //             curr_fi.data_dir.unwrap_or(Uuid::nil()).to_string().as_str(),
+            //             p.number,
+            //         )
+            //         .await;
+            // }
+        }
+
+        {
+            let disks = self.get_disks_internal().await;
+            Self::cleanup_multipart_path(&disks, &parts).await;
         }
 
         let (online_disks, versions, op_old_dir) = Self::rename_data(
@@ -5203,7 +5236,10 @@ async fn disks_with_all_parts(
 
     let erasure_distribution_reliable = inconsistent <= parts_metadata.len() / 2;
 
-    let mut meta_errs = vec![None; errs.len()];
+    let mut meta_errs = Vec::with_capacity(errs.len());
+    for _ in 0..errs.len() {
+        meta_errs.push(None);
+    }
 
     for (index, disk) in online_disks.iter().enumerate() {
         let disk = if let Some(disk) = disk {
@@ -5213,8 +5249,8 @@ async fn disks_with_all_parts(
             continue;
         };
 
-        if let Some(err) = errs[index].clone() {
-            meta_errs[index] = Some(err);
+        if let Some(err) = &errs[index] {
+            meta_errs[index] = Some(clone_err(err));
             continue;
         }
         if !disk.is_online().await {
@@ -5370,7 +5406,7 @@ pub fn should_heal_object_on_disk(
     match err {
         Some(err) => match err.downcast_ref::<DiskError>() {
             Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) | Some(DiskError::FileCorrupt) => {
-                return (true, Some(err.clone()));
+                return (true, Some(clone_err(err)));
             }
             _ => {}
         },
@@ -5393,7 +5429,7 @@ pub fn should_heal_object_on_disk(
             }
         }
     }
-    (false, err.clone())
+    (false, err.as_ref().map(clone_err))
 }
 
 async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<madmin::Disk> {

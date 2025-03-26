@@ -1,8 +1,7 @@
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::config::common::{read_config, save_config, CONFIG_PREFIX};
+use crate::config::com::{read_config, save_config, CONFIG_PREFIX};
 use crate::config::error::ConfigError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use crate::error::{Error, Result};
 use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
@@ -11,6 +10,7 @@ use crate::store_err::{is_err_bucket_exists, StorageError};
 use crate::utils::path::{path_join, SLASH_SEPARATOR};
 use crate::{sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use common::error::{Error, Result};
 use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;

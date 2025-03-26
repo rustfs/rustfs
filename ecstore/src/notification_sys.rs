@@ -1,8 +1,8 @@
 use crate::endpoints::EndpointServerPools;
-use crate::error::{Error, Result};
 use crate::global::get_global_endpoints;
 use crate::peer_rest_client::PeerRestClient;
 use crate::StorageAPI;
+use common::error::{Error, Result};
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use madmin::{ItemState, ServerProperties};

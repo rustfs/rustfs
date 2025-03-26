@@ -1,10 +1,10 @@
 use crate::bucket::error::BucketMetadataError;
 use crate::config::error::ConfigError;
 use crate::disk::error::DiskError;
-use crate::error::Error;
 use crate::quorum::QuorumError;
 use crate::store_err::StorageError;
 use crate::store_init::ErasureError;
+use common::error::Error;
 use protos::proto_gen::node_service::Error as Proto_Error;
 
 pub mod bool_flag;

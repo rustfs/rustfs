@@ -1,6 +1,6 @@
 use super::{metadata_sys::get_bucket_metadata_sys, versioning::VersioningApi};
 use crate::disk::RUSTFS_META_BUCKET;
-use crate::error::Result;
+use common::error::Result;
 use s3s::dto::VersioningConfiguration;
 use tracing::warn;
 
@@ -61,7 +61,7 @@ impl BucketVersioningSys {
             return Ok(VersioningConfiguration::default());
         }
 
-        let bucket_meta_sys_lock = get_bucket_metadata_sys();
+        let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
         let bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
         let (cfg, _) = bucket_meta_sys.get_versioning_config(bucket).await?;
