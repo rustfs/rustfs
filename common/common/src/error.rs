@@ -61,6 +61,11 @@ impl Error {
     pub fn downcast_mut<T: std::error::Error + 'static>(&mut self) -> Option<&mut T> {
         self.inner.downcast_mut()
     }
+
+    pub fn to_io_err(&self) -> Option<std::io::Error> {
+        self.downcast_ref::<std::io::Error>()
+            .map(|e| std::io::Error::new(e.kind(), e.to_string()))
+    }
 }
 
 impl<T: std::error::Error + Send + Sync + 'static> From<T> for Error {

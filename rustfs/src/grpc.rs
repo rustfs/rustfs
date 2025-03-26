@@ -1,12 +1,12 @@
 use std::{collections::HashMap, io::Cursor, pin::Pin};
 
+use common::error::Error as EcsError;
 use ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
     disk::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
     },
-    error::Error as EcsError,
     heal::{
         data_usage_cache::DataUsageCache,
         heal_commands::{get_local_background_heal_status, HealOpts},
@@ -2078,7 +2078,12 @@ impl Node for NodeService {
 
         match load_bucket_metadata(store, &bucket).await {
             Ok(meta) => {
-                metadata_sys::set_bucket_metadata(bucket, meta).await;
+                if let Err(err) = metadata_sys::set_bucket_metadata(bucket, meta).await {
+                    return Ok(tonic::Response::new(LoadBucketMetadataResponse {
+                        success: false,
+                        error_info: Some(err.to_string()),
+                    }));
+                };
                 Ok(tonic::Response::new(LoadBucketMetadataResponse {
                     success: true,
                     error_info: None,

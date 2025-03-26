@@ -1,12 +1,3 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io::{Cursor, Write},
-    mem::replace,
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
-
 use crate::{
     bitrot::{bitrot_verify, close_bitrot_writers, new_bitrot_filereader, new_bitrot_filewriter, BitrotFileWriter},
     cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
@@ -20,7 +11,7 @@ use crate::{
         UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
     },
     erasure::Erasure,
-    error::{Error, Result},
+    error::clone_err,
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion},
     global::{
         get_global_deployment_id, is_dist_erasure, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP,
@@ -64,6 +55,7 @@ use crate::{
 };
 use bytesize::ByteSize;
 use chrono::Utc;
+use common::error::{Error, Result};
 use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
@@ -82,6 +74,14 @@ use rand::{
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::time::SystemTime;
+use std::{
+    collections::{HashMap, HashSet},
+    io::{Cursor, Write},
+    mem::replace,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::{
     io::{empty, AsyncWrite},
@@ -320,7 +320,7 @@ impl SetDisks {
                 }
                 Err(e) => {
                     // ress.push(None);
-                    errs.push(Some(e.clone()));
+                    errs.push(Some(clone_err(e)));
                 }
             }
         }
@@ -1242,7 +1242,7 @@ impl SetDisks {
             Err(err) => {
                 for item in errs.iter_mut() {
                     if item.is_none() {
-                        *item = Some(err.clone())
+                        *item = Some(clone_err(&err));
                     }
                 }
 
@@ -2292,7 +2292,7 @@ impl SetDisks {
                                 "file({} : {}) part corrupt too much, can not to fix, disks_to_heal_count: {}, parity_blocks: {}",
                                 bucket, object, disks_to_heal_count, lastest_meta.erasure.parity_blocks
                             );
-                            let mut t_errs = vec![None; errs.len()];
+
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
                             match self
@@ -2315,13 +2315,22 @@ impl SetDisks {
                                     } else {
                                         Error::new(DiskError::FileNotFound)
                                     };
+                                    let mut t_errs = Vec::with_capacity(errs.len());
+                                    for _ in 0..errs.len() {
+                                        t_errs.push(None);
+                                    }
                                     return Ok((
                                         self.default_heal_result(m, &t_errs, bucket, object, version_id).await,
                                         Some(derr),
                                     ));
                                 }
                                 Err(err) => {
-                                    t_errs = vec![Some(err.clone()); errs.len()];
+                                    // t_errs = vec![Some(err.clone()); errs.len()];
+                                    let mut t_errs = Vec::with_capacity(errs.len());
+                                    for _ in 0..errs.len() {
+                                        t_errs.push(Some(clone_err(&err)));
+                                    }
+
                                     return Ok((
                                         self.default_heal_result(FileInfo::default(), &t_errs, bucket, object, version_id)
                                             .await,
@@ -3521,7 +3530,7 @@ impl SetDisks {
         }
 
         if let Some(err) = ret_err.as_ref() {
-            return Err(err.clone());
+            return Err(clone_err(err));
         }
         if !tracker.read().await.queue_buckets.is_empty() {
             return Err(Error::from_string(format!(
@@ -4438,7 +4447,7 @@ impl StorageAPI for SetDisks {
             }
         };
 
-        let mut upload_ids = Vec::new();
+        let mut upload_ids: Vec<String> = Vec::new();
 
         for disk in disks.iter().flatten() {
             if !disk.is_online().await {
@@ -5227,7 +5236,10 @@ async fn disks_with_all_parts(
 
     let erasure_distribution_reliable = inconsistent <= parts_metadata.len() / 2;
 
-    let mut meta_errs = vec![None; errs.len()];
+    let mut meta_errs = Vec::with_capacity(errs.len());
+    for _ in 0..errs.len() {
+        meta_errs.push(None);
+    }
 
     for (index, disk) in online_disks.iter().enumerate() {
         let disk = if let Some(disk) = disk {
@@ -5237,8 +5249,8 @@ async fn disks_with_all_parts(
             continue;
         };
 
-        if let Some(err) = errs[index].clone() {
-            meta_errs[index] = Some(err);
+        if let Some(err) = &errs[index] {
+            meta_errs[index] = Some(clone_err(err));
             continue;
         }
         if !disk.is_online().await {
@@ -5394,7 +5406,7 @@ pub fn should_heal_object_on_disk(
     match err {
         Some(err) => match err.downcast_ref::<DiskError>() {
             Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) | Some(DiskError::FileCorrupt) => {
-                return (true, Some(err.clone()));
+                return (true, Some(clone_err(err)));
             }
             _ => {}
         },
@@ -5417,7 +5429,7 @@ pub fn should_heal_object_on_disk(
             }
         }
     }
-    (false, err.clone())
+    (false, err.as_ref().map(clone_err))
 }
 
 async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<madmin::Disk> {

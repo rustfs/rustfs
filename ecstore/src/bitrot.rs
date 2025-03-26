@@ -1,12 +1,12 @@
 use crate::{
     disk::{error::DiskError, Disk, DiskAPI},
     erasure::{ReadAt, Writer},
-    error::{Error, Result},
     io::{FileReader, FileWriter},
     store_api::BitrotAlgorithm,
 };
 use blake2::Blake2b512;
 use blake2::Digest as _;
+use common::error::{Error, Result};
 use highway::{HighwayHash, HighwayHasher, Key};
 use lazy_static::lazy_static;
 use sha2::{digest::core_api::BlockSizeUser, Digest, Sha256};
@@ -731,13 +731,9 @@ pub fn new_bitrot_filereader(
 mod test {
     use std::collections::HashMap;
 
+    use crate::{disk::error::DiskError, store_api::BitrotAlgorithm};
+    use common::error::{Error, Result};
     use hex_simd::decode_to_vec;
-
-    use crate::{
-        disk::error::DiskError,
-        error::{Error, Result},
-        store_api::BitrotAlgorithm,
-    };
 
     // use super::{bitrot_writer_sum, new_bitrot_reader};
 

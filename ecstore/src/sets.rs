@@ -1,14 +1,6 @@
 #![allow(clippy::map_entry)]
 use std::{collections::HashMap, sync::Arc};
 
-use common::globals::GLOBAL_Local_Node_Name;
-use futures::future::join_all;
-use http::HeaderMap;
-use lock::{namespace_lock::NsLockMap, new_lock_api, LockApi};
-use madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use tokio::sync::RwLock;
-use uuid::Uuid;
-
 use crate::{
     disk::{
         error::{is_unformatted_disk, DiskError},
@@ -16,7 +8,6 @@ use crate::{
         new_disk, DiskAPI, DiskInfo, DiskOption, DiskStore,
     },
     endpoints::{Endpoints, PoolEndpoints},
-    error::{Error, Result},
     global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
     heal::heal_commands::{
         HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_METADATA,
@@ -31,6 +22,14 @@ use crate::{
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
     utils::{hash, path::path_join_buf},
 };
+use common::error::{Error, Result};
+use common::globals::GLOBAL_Local_Node_Name;
+use futures::future::join_all;
+use http::HeaderMap;
+use lock::{namespace_lock::NsLockMap, new_lock_api, LockApi};
+use madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::heal::heal_ops::HealSequence;
 use tokio::time::Duration;
@@ -767,30 +766,50 @@ async fn init_storage_disks_with_errors(
     opts: &DiskOption,
 ) -> (Vec<Option<DiskStore>>, Vec<Option<Error>>) {
     // Bootstrap disks.
-    let disks = Arc::new(RwLock::new(vec![None; endpoints.as_ref().len()]));
-    let errs = Arc::new(RwLock::new(vec![None; endpoints.as_ref().len()]));
+    // let disks = Arc::new(RwLock::new(vec![None; endpoints.as_ref().len()]));
+    // let errs = Arc::new(RwLock::new(vec![None; endpoints.as_ref().len()]));
     let mut futures = Vec::with_capacity(endpoints.as_ref().len());
-    for (index, endpoint) in endpoints.as_ref().iter().enumerate() {
-        let ep = endpoint.clone();
-        let opt = opts.clone();
-        let disks_clone = disks.clone();
-        let errs_clone = errs.clone();
-        futures.push(tokio::spawn(async move {
-            match new_disk(&ep, &opt).await {
-                Ok(disk) => {
-                    disks_clone.write().await[index] = Some(disk);
-                    errs_clone.write().await[index] = None;
-                }
-                Err(err) => {
-                    disks_clone.write().await[index] = None;
-                    errs_clone.write().await[index] = Some(err);
-                }
-            }
-        }));
+    for endpoint in endpoints.as_ref().iter() {
+        futures.push(new_disk(endpoint, opts));
+
+        // let ep = endpoint.clone();
+        // let opt = opts.clone();
+        // let disks_clone = disks.clone();
+        // let errs_clone = errs.clone();
+        // futures.push(tokio::spawn(async move {
+        //     match new_disk(&ep, &opt).await {
+        //         Ok(disk) => {
+        //             disks_clone.write().await[index] = Some(disk);
+        //             errs_clone.write().await[index] = None;
+        //         }
+        //         Err(err) => {
+        //             disks_clone.write().await[index] = None;
+        //             errs_clone.write().await[index] = Some(err);
+        //         }
+        //     }
+        // }));
     }
-    let _ = join_all(futures).await;
-    let disks = disks.read().await.clone();
-    let errs = errs.read().await.clone();
+    // let _ = join_all(futures).await;
+    // let disks = disks.read().await.clone();
+    // let errs = errs.read().await.clone();
+
+    let mut disks = Vec::with_capacity(endpoints.as_ref().len());
+    let mut errs = Vec::with_capacity(endpoints.as_ref().len());
+
+    let results = join_all(futures).await;
+    for result in results {
+        match result {
+            Ok(disk) => {
+                disks.push(Some(disk));
+                errs.push(None);
+            }
+            Err(err) => {
+                disks.push(None);
+                errs.push(Some(err));
+            }
+        }
+    }
+
     (disks, errs)
 }
 

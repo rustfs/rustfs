@@ -1,4 +1,4 @@
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use regex::Regex;
 
 const ARN_PREFIX_ARN: &str = "arn";

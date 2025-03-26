@@ -1872,6 +1872,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "e2e_test"
 version = "0.0.1"
 dependencies = [
+ "common",
  "ecstore",
  "flatbuffers",
  "futures",
@@ -1919,6 +1920,7 @@ dependencies = [
  "path-absolutize",
  "path-clean",
  "pin-project-lite",
+ "policy",
  "protos",
  "rand 0.8.5",
  "reed-solomon-erasure",
@@ -2933,6 +2935,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64-simd",
+ "common",
  "crypto",
  "ecstore",
  "futures",
@@ -2942,6 +2945,7 @@ dependencies = [
  "lazy_static",
  "log",
  "madmin",
+ "policy",
  "rand 0.8.5",
  "regex",
  "serde",
@@ -4540,6 +4544,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "policy"
+version = "0.0.1"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64-simd",
+ "common",
+ "crypto",
+ "futures",
+ "ipnetwork",
+ "itertools",
+ "jsonwebtoken",
+ "lazy_static",
+ "log",
+ "madmin",
+ "rand 0.8.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum",
+ "test-case",
+ "thiserror 2.0.11",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "polling"
 version = "3.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5308,6 +5340,7 @@ dependencies = [
  "mime_guess",
  "netif",
  "pin-project-lite",
+ "policy",
  "prost",
  "prost-build",
  "prost-types",

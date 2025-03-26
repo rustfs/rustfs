@@ -1,13 +1,8 @@
 use crate::heal::heal_ops::HealSequence;
 use crate::io::FileReader;
 use crate::store_utils::clean_metadata;
-use crate::{
-    disk::DiskStore,
-    error::{Error, Result},
-    heal::heal_commands::HealOpts,
-    utils::path::decode_dir_object,
-    xhttp,
-};
+use crate::{disk::DiskStore, heal::heal_commands::HealOpts, utils::path::decode_dir_object, xhttp};
+use common::error::{Error, Result};
 use http::{HeaderMap, HeaderValue};
 use madmin::heal_commands::HealResultItem;
 use rmp_serde::Serializer;

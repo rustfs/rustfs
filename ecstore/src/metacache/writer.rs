@@ -1,6 +1,6 @@
 use crate::disk::MetaCacheEntry;
-use crate::error::Error;
-use crate::error::Result;
+use crate::error::clone_err;
+use common::error::{Error, Result};
 use rmp::Marker;
 use std::str::from_utf8;
 use tokio::io::AsyncRead;
@@ -246,7 +246,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         self.check_init().await?;
 
         if let Some(err) = &self.err {
-            return Err(err.clone());
+            return Err(clone_err(err));
         }
 
         let mut n = size;
@@ -285,7 +285,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         self.check_init().await?;
 
         if let Some(err) = &self.err {
-            return Err(err.clone());
+            return Err(clone_err(err));
         }
 
         match rmp::decode::read_bool(&mut self.read_more(1).await?) {
