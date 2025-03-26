@@ -1,5 +1,5 @@
 [package]
-name = "iam"
+name = "policy"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,8 +14,6 @@ tokio.workspace = true
 log.workspace = true
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }
-ecstore = { path = "../ecstore" }
-policy.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true

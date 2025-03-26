@@ -1,5 +1,5 @@
 use super::key_name::KeyName;
-use crate::{policy::Error as PolicyError, sys::Validator};
+use crate::policy::{Error as PolicyError, Validator};
 use common::error::Error;
 use serde::{Deserialize, Serialize};
 

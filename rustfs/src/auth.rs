@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use http::HeaderMap;
-use iam::auth;
-use iam::auth::get_claims_from_token_with_secret;
 use iam::error::Error as IamError;
 use iam::get_global_action_cred;
 use iam::sys::SESSION_POLICY_NAME;
+use policy::auth;
+use policy::auth::get_claims_from_token_with_secret;
 use s3s::auth::S3Auth;
 use s3s::auth::SecretKey;
 use s3s::auth::SimpleAuth;

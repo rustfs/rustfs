@@ -1,15 +1,11 @@
 use crate::{
-    arn::ARN,
-    auth::{self, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign, Credentials, UserIdentity},
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
-    format::Format,
     get_global_action_cred,
-    policy::{Policy, PolicyDoc, DEFAULT_POLICIES},
     store::{object::IAM_CONFIG_PREFIX, GroupInfo, MappedPolicy, Store, UserType},
     sys::{
-        iam_policy_claim_name_sa, UpdateServiceAccountOpts, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE,
-        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
+        UpdateServiceAccountOpts, MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED,
+        STATUS_DISABLED, STATUS_ENABLED,
     },
 };
 use common::error::{Error, Result};
@@ -17,6 +13,12 @@ use ecstore::config::error::is_err_config_not_found;
 use ecstore::utils::{crypto::base64_encode, path::path_join_buf};
 use log::{debug, warn};
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
+use policy::{
+    arn::ARN,
+    auth::{self, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign, Credentials, UserIdentity},
+    format::Format,
+    policy::{iam_policy_claim_name_sa, Policy, PolicyDoc, DEFAULT_POLICIES, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -486,7 +488,6 @@ where
             if !is_secret_key_valid(&secret) {
                 return Err(IamError::InvalidSecretKeyLength.into());
             }
-
             cr.secret_key = secret;
         }
 

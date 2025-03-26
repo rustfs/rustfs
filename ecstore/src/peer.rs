@@ -95,7 +95,7 @@ impl S3PeerSys {
             for (i, client) in self.clients.iter().enumerate() {
                 if let Some(v) = client.get_pools() {
                     if v.contains(&pool_idx) {
-                        per_pool_errs.push(errs[i].as_ref().map(|e| clone_err(e)));
+                        per_pool_errs.push(errs[i].as_ref().map(clone_err));
                     }
                 }
             }
@@ -130,7 +130,7 @@ impl S3PeerSys {
             for (i, client) in self.clients.iter().enumerate() {
                 if let Some(v) = client.get_pools() {
                     if v.contains(&pool_idx) {
-                        per_pool_errs.push(errs[i].as_ref().map(|e| clone_err(e)));
+                        per_pool_errs.push(errs[i].as_ref().map(clone_err));
                     }
                 }
             }
@@ -781,7 +781,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let bucket = bucket.to_string();
             let bs_clone = before_state.clone();
             let as_clone = after_state.clone();
-            let errs_clone = errs.iter().map(|e| e.as_ref().map(|e| clone_err(e))).collect::<Vec<_>>();
+            let errs_clone = errs.iter().map(|e| e.as_ref().map(clone_err)).collect::<Vec<_>>();
             futures.push(async move {
                 if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
                     info!("bucket not find, will recreate");
@@ -795,7 +795,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
                         }
                     }
                 }
-                errs_clone[idx].as_ref().map(|e| clone_err(e))
+                errs_clone[idx].as_ref().map(clone_err)
             });
         }
 

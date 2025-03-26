@@ -7,14 +7,13 @@ use std::{
 
 use arc_swap::{ArcSwap, AsRaw, Guard};
 use log::warn;
+use policy::{
+    auth::UserIdentity,
+    policy::{Args, PolicyDoc},
+};
 use time::OffsetDateTime;
 
-use crate::{
-    auth::UserIdentity,
-    policy::PolicyDoc,
-    store::{GroupInfo, MappedPolicy},
-    sys::Args,
-};
+use crate::store::{GroupInfo, MappedPolicy};
 
 pub struct Cache {
     pub policy_docs: ArcSwap<CacheEntity<PolicyDoc>>,
