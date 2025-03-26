@@ -13,8 +13,11 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_NAME, SERVICE_VERSION},
     SCHEMA_URL,
 };
-use prometheus::Registry;
+use prometheus::{Encoder, Registry, TextEncoder};
 use std::io::IsTerminal;
+use std::sync::Arc;
+use tokio::sync::{Mutex, OnceCell};
+use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -46,13 +49,6 @@ pub struct OtelGuard {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
     logger_provider: SdkLoggerProvider,
-    registry: Registry,
-}
-
-impl OtelGuard {
-    pub fn get_registry(&self) -> &Registry {
-        &self.registry
-    }
 }
 
 impl Drop for OtelGuard {
@@ -67,6 +63,57 @@ impl Drop for OtelGuard {
             eprintln!("Logger shutdown error: {:?}", err);
         }
     }
+}
+
+/// Global registry for Prometheus metrics
+static GLOBAL_REGISTRY: OnceCell<Arc<Mutex<Registry>>> = OnceCell::const_new();
+
+/// Get the global registry instance
+/// This function returns a reference to the global registry instance.
+///
+/// # Returns
+/// A reference to the global registry instance
+///
+/// # Example
+/// ```
+/// use rustfs_obs::get_global_registry;
+///
+/// let registry = get_global_registry();
+/// ```
+pub fn get_global_registry() -> Arc<Mutex<Registry>> {
+    GLOBAL_REGISTRY.get().unwrap().clone()
+}
+
+/// Prometheus metric endpoints
+/// This function returns a string containing the Prometheus metrics.
+/// The metrics are collected from the global registry.
+/// The function is used to expose the metrics via an HTTP endpoint.
+///
+/// # Returns
+/// A string containing the Prometheus metrics
+///
+/// # Example
+/// ```
+/// use rustfs_obs::metrics_handler;
+///
+/// async fn main() {
+///    let metrics = metrics_handler().await;
+///   println!("{}", metrics);
+/// }
+/// ```
+pub async fn metrics_handler() -> String {
+    let encoder = TextEncoder::new();
+    // Get a reference to the registry for reading metrics
+    let registry = get_global_registry().lock().await.to_owned();
+    let metric_families = registry.gather();
+    if metric_families.is_empty() {
+        warn!("No metrics available in Prometheus registry");
+    } else {
+        info!("Metrics collected: {} families", metric_families.len());
+    }
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap_or_else(|_| "Error encoding metrics".to_string())
 }
 
 /// create OpenTelemetry Resource
@@ -86,7 +133,7 @@ fn resource(config: &OtelConfig) -> Resource {
 }
 
 /// Initialize Meter Provider
-fn init_meter_provider(config: &OtelConfig) -> (SdkMeterProvider, Registry) {
+fn init_meter_provider(config: &OtelConfig) -> SdkMeterProvider {
     let mut builder = MeterProviderBuilder::default().with_resource(resource(config));
     // If endpoint is empty, use stdout output
     if config.endpoint.is_empty() {
@@ -118,14 +165,14 @@ fn init_meter_provider(config: &OtelConfig) -> (SdkMeterProvider, Registry) {
         }
     }
     let registry = Registry::new();
-    let prometheus_exporter = opentelemetry_prometheus::exporter()
-        .with_registry(registry.clone())
-        .build()
-        .unwrap();
-
+    // Set global registry
+    GLOBAL_REGISTRY.set(Arc::new(Mutex::new(registry.clone()))).unwrap();
+    // Create Prometheus exporter
+    let prometheus_exporter = opentelemetry_prometheus::exporter().with_registry(registry).build().unwrap();
+    // Build meter provider
     let meter_provider = builder.with_reader(prometheus_exporter).build();
     global::set_meter_provider(meter_provider.clone());
-    (meter_provider, registry)
+    meter_provider
 }
 
 /// Initialize Tracer Provider
@@ -167,7 +214,7 @@ fn init_tracer_provider(config: &OtelConfig) -> SdkTracerProvider {
 /// Initialize Telemetry
 pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     let tracer_provider = init_tracer_provider(config);
-    let (meter_provider, prometheus_registry) = init_meter_provider(config);
+    let meter_provider = init_meter_provider(config);
     let tracer = tracer_provider.tracer(config.service_name.clone());
 
     // Initialize logger provider based on configuration
@@ -235,13 +282,12 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
     registry.with(ErrorLayer::default()).with(fmt_layer).init();
     if !config.endpoint.is_empty() {
-        tracing::info!("OpenTelemetry telemetry initialized with OTLP endpoint: {}", config.endpoint);
+        info!("OpenTelemetry telemetry initialized with OTLP endpoint: {}", config.endpoint);
     }
 
     OtelGuard {
         tracer_provider,
         meter_provider,
         logger_provider,
-        registry: prometheus_registry,
     }
 }

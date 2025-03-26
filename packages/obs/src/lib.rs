@@ -50,7 +50,7 @@ pub use logger::{
 pub use logger::{LogError, Logger};
 pub use sink::Sink;
 use std::sync::Arc;
-pub use telemetry::init_telemetry;
+pub use telemetry::{get_global_registry, init_telemetry, metrics_handler};
 use tokio::sync::Mutex;
 pub use utils::{get_local_ip, get_local_ip_with_default};
 pub use worker::start_worker;
@@ -86,6 +86,7 @@ pub async fn init_obs(config: AppConfig) -> (Arc<Mutex<Logger>>, telemetry::Otel
 /// # Example
 /// ```
 /// use rustfs_obs::get_logger;
+///
 /// let logger = get_logger();
 /// ```
 pub fn get_logger() -> &'static Arc<Mutex<Logger>> {
