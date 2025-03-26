@@ -1920,6 +1920,7 @@ dependencies = [
  "path-absolutize",
  "path-clean",
  "pin-project-lite",
+ "policy",
  "protos",
  "rand 0.8.5",
  "reed-solomon-erasure",
