@@ -2078,7 +2078,12 @@ impl Node for NodeService {
 
         match load_bucket_metadata(store, &bucket).await {
             Ok(meta) => {
-                metadata_sys::set_bucket_metadata(bucket, meta).await;
+                if let Err(err) = metadata_sys::set_bucket_metadata(bucket, meta).await {
+                    return Ok(tonic::Response::new(LoadBucketMetadataResponse {
+                        success: false,
+                        error_info: Some(err.to_string()),
+                    }));
+                };
                 Ok(tonic::Response::new(LoadBucketMetadataResponse {
                     success: true,
                     error_info: None,

@@ -1,12 +1,12 @@
 use super::router::Operation;
 use crate::storage::error::to_s3_error;
+use ::policy::policy::action::{Action, S3Action};
+use ::policy::policy::resource::Resource;
+use ::policy::policy::statement::BPStatement;
+use ::policy::policy::{ActionSet, BucketPolicy, Effect, ResourceSet};
 use bytes::Bytes;
 use common::error::Error as ec_Error;
 use ecstore::admin_server_info::get_server_info;
-use ecstore::bucket::policy::action::{Action, ActionSet};
-use ecstore::bucket::policy::bucket_policy::{BPStatement, BucketPolicy};
-use ecstore::bucket::policy::effect::Effect;
-use ecstore::bucket::policy::resource::{Resource, ResourceSet};
 use ecstore::global::GLOBAL_ALlHealState;
 use ecstore::heal::data_usage::load_data_usage_from_backend;
 use ecstore::heal::heal_commands::HealOpts;
@@ -74,16 +74,16 @@ impl Operation for AccountInfoHandler {
         // test policy
 
         let mut s3_all_act = HashSet::with_capacity(1);
-        s3_all_act.insert(Action::AllActions);
+        s3_all_act.insert(Action::S3Action(S3Action::AllActions));
 
         let mut all_res = HashSet::with_capacity(1);
-        all_res.insert(Resource::new("*"));
+        all_res.insert(Resource::S3("*".to_string()));
 
         let bucket_policy = BucketPolicy {
-            id: "".to_owned(),
+            id: "".into(),
             version: "2012-10-17".to_owned(),
             statements: vec![BPStatement {
-                sid: "".to_owned(),
+                sid: "".into(),
                 effect: Effect::Allow,
                 actions: ActionSet(s3_all_act.clone()),
                 resources: ResourceSet(all_res),

@@ -15,7 +15,6 @@ use ecstore::bucket::metadata::BUCKET_TAGGING_CONFIG;
 use ecstore::bucket::metadata::BUCKET_VERSIONING_CONFIG;
 use ecstore::bucket::metadata::OBJECT_LOCK_CONFIG;
 use ecstore::bucket::metadata_sys;
-use ecstore::bucket::policy::bucket_policy::BucketPolicy;
 use ecstore::bucket::policy_sys::PolicySys;
 use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
@@ -43,6 +42,8 @@ use lazy_static::lazy_static;
 use log::warn;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
+use policy::policy::BucketPolicy;
+use policy::policy::Validator;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -559,7 +560,7 @@ impl S3 for FS {
 
         let mut req = req;
 
-        if authorize_request(&mut req, vec![Action::S3Action(S3Action::ListAllMyBucketsAction)])
+        if authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction))
             .await
             .is_err()
         {
@@ -569,10 +570,10 @@ impl S3 for FS {
                 req_info.bucket = Some(info.name.clone());
 
                 futures::executor::block_on(async {
-                    authorize_request(&mut req, vec![Action::S3Action(S3Action::ListBucketAction)])
+                    authorize_request(&mut req, Action::S3Action(S3Action::ListBucketAction))
                         .await
                         .is_ok()
-                        || authorize_request(&mut req, vec![Action::S3Action(S3Action::GetBucketLocationAction)])
+                        || authorize_request(&mut req, Action::S3Action(S3Action::GetBucketLocationAction))
                             .await
                             .is_ok()
                 })
@@ -1265,18 +1266,17 @@ impl S3 for FS {
 
         // warn!("input policy {}", &policy);
 
-        let cfg = BucketPolicy::unmarshal(policy.as_bytes()).map_err(to_s3_error)?;
+        let cfg: BucketPolicy =
+            serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy faild {:?}", e))?;
 
-        // warn!("parse policy {:?}", &cfg);
-
-        if let Err(err) = cfg.validate(&bucket) {
+        if let Err(err) = cfg.is_valid() {
             warn!("put_bucket_policy err input {:?}, {:?}", &policy, err);
             return Err(s3_error!(InvalidPolicyDocument));
         }
 
-        let data = cfg.marshal_msg().map_err(to_s3_error)?;
+        let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy faild {:?}", e))?;
 
-        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data.into())
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
             .await
             .map_err(to_s3_error)?;
 

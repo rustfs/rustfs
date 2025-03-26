@@ -42,94 +42,99 @@ pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
 }
 
 // panic if not init
-pub(super) fn get_bucket_metadata_sys() -> Arc<RwLock<BucketMetadataSys>> {
-    GLOBAL_BucketMetadataSys.get().unwrap().clone()
+pub(super) fn get_bucket_metadata_sys() -> Result<Arc<RwLock<BucketMetadataSys>>> {
+    if let Some(sys) = GLOBAL_BucketMetadataSys.get() {
+        Ok(sys.clone())
+    } else {
+        Err(Error::msg("GLOBAL_BucketMetadataSys not init"))
+    }
 }
 
-pub async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) {
-    let sys = get_bucket_metadata_sys();
+pub async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
+    let sys = get_bucket_metadata_sys()?;
     let lock = sys.write().await;
     lock.set(bucket, Arc::new(bm)).await;
+    Ok(())
 }
 
 pub(crate) async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
-    let sys = get_bucket_metadata_sys();
+    let sys = get_bucket_metadata_sys()?;
     let lock = sys.read().await;
     lock.get(bucket).await
 }
 
 pub async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
     bucket_meta_sys.update(bucket, config_file, data).await
 }
 
 pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
     bucket_meta_sys.delete(bucket, config_file).await
 }
 
 pub async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_tagging_config(bucket).await
 }
 
 pub async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_lifecycle_config(bucket).await
 }
 
 pub async fn get_sse_config(bucket: &str) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime)> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_sse_config(bucket).await
 }
 
 pub async fn get_object_lock_config(bucket: &str) -> Result<(ObjectLockConfiguration, OffsetDateTime)> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_object_lock_config(bucket).await
 }
 
 pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_replication_config(bucket).await
 }
 
 pub async fn get_notification_config(bucket: &str) -> Result<Option<NotificationConfiguration>> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_notification_config(bucket).await
 }
 
 pub async fn get_versioning_config(bucket: &str) -> Result<(VersioningConfiguration, OffsetDateTime)> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_versioning_config(bucket).await
 }
 
 pub async fn get_config_from_disk(bucket: &str) -> Result<BucketMetadata> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_config_from_disk(bucket).await
 }
 
 pub async fn created_at(bucket: &str) -> Result<OffsetDateTime> {
-    let bucket_meta_sys_lock = get_bucket_metadata_sys();
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.created_at(bucket).await
