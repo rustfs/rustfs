@@ -1323,7 +1323,7 @@ impl StorageAPI for ECStore {
 
         meta.save().await.map_err(|e| to_object_err(e, vec![bucket]))?;
 
-        set_bucket_metadata(bucket.to_string(), meta).await;
+        set_bucket_metadata(bucket.to_string(), meta).await?;
 
         Ok(())
     }
