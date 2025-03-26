@@ -2,6 +2,7 @@ use super::access::authorize_request;
 use super::options::del_opts;
 use super::options::extract_metadata;
 use super::options::put_opts;
+use crate::auth::get_condition_values;
 use crate::storage::access::ReqInfo;
 use bytes::Bytes;
 use common::error::Result;
@@ -40,9 +41,11 @@ use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use log::warn;
+use policy::auth;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
 use policy::policy::BucketPolicy;
+use policy::policy::BucketPolicyArgs;
 use policy::policy::Validator;
 use s3s::dto::*;
 use s3s::s3_error;
@@ -1220,9 +1223,52 @@ impl S3 for FS {
 
     async fn get_bucket_policy_status(
         &self,
-        _req: S3Request<GetBucketPolicyStatusInput>,
+        req: S3Request<GetBucketPolicyStatusInput>,
     ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
-        Err(s3_error!(NotImplemented, "GetBucketPolicyStatus is not implemented yet"))
+        let GetBucketPolicyStatusInput { bucket, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
+
+        let conditions = get_condition_values(&req.headers, &auth::Credentials::default());
+
+        let read_olny = PolicySys::is_allowed(&BucketPolicyArgs {
+            bucket: &bucket,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            is_owner: false,
+            account: "",
+            groups: &None,
+            conditions: &conditions,
+            object: "",
+        })
+        .await;
+
+        let write_olny = PolicySys::is_allowed(&BucketPolicyArgs {
+            bucket: &bucket,
+            action: Action::S3Action(S3Action::PutObjectAction),
+            is_owner: false,
+            account: "",
+            groups: &None,
+            conditions: &conditions,
+            object: "",
+        })
+        .await;
+
+        let is_public = read_olny && write_olny;
+
+        let output = GetBucketPolicyStatusOutput {
+            policy_status: Some(PolicyStatus {
+                is_public: Some(is_public),
+            }),
+        };
+
+        Ok(S3Response::new(output))
     }
 
     async fn get_bucket_policy(&self, req: S3Request<GetBucketPolicyInput>) -> S3Result<S3Response<GetBucketPolicyOutput>> {
