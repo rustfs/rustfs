@@ -1,4 +1,7 @@
-use super::{action::Action, ActionSet, Args, Effect, Error as IamError, Functions, ResourceSet, Validator, ID};
+use super::{
+    action::Action, ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, Principal, ResourceSet, Validator,
+    ID,
+};
 use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
@@ -113,5 +116,88 @@ impl PartialEq for Statement {
             && self.not_actions == other.not_actions
             && self.resources == other.resources
             && self.conditions == other.conditions
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct BPStatement {
+    #[serde(rename = "Sid", default)]
+    pub sid: ID,
+    #[serde(rename = "Effect")]
+    pub effect: Effect,
+    #[serde(rename = "Principal")]
+    pub principal: Principal,
+    #[serde(rename = "Action")]
+    pub actions: ActionSet,
+    #[serde(rename = "NotAction", default)]
+    pub not_actions: ActionSet,
+    #[serde(rename = "Resource", default)]
+    pub resources: ResourceSet,
+    #[serde(rename = "NotResource", default)]
+    pub not_resources: ResourceSet,
+    #[serde(rename = "Condition", default)]
+    pub conditions: Functions,
+}
+
+impl BPStatement {
+    pub fn is_allowed(&self, args: &BucketPolicyArgs) -> bool {
+        let check = 'c: {
+            if !self.principal.is_match(args.account) {
+                break 'c false;
+            }
+
+            if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+                break 'c false;
+            }
+
+            let mut resource = String::from(args.bucket);
+            if !args.object.is_empty() {
+                if !args.object.starts_with('/') {
+                    resource.push('/');
+                }
+
+                resource.push_str(args.object);
+            } else {
+                resource.push('/');
+            }
+
+            if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions) {
+                break 'c false;
+            }
+
+            if !self.not_resources.is_empty() && self.not_resources.is_match(&resource, args.conditions) {
+                break 'c false;
+            }
+
+            self.conditions.evaluate(args.conditions)
+        };
+
+        self.effect.is_allowed(check)
+    }
+}
+
+impl Validator for BPStatement {
+    type Error = Error;
+    fn is_valid(&self) -> Result<()> {
+        self.effect.is_valid()?;
+        // check sid
+        self.sid.is_valid()?;
+
+        self.principal.is_valid()?;
+
+        if self.actions.is_empty() && self.not_actions.is_empty() {
+            return Err(IamError::NonAction.into());
+        }
+
+        if self.resources.is_empty() {
+            return Err(IamError::NonResource.into());
+        }
+
+        self.actions.is_valid()?;
+        self.not_actions.is_valid()?;
+        self.resources.is_valid()?;
+
+        Ok(())
     }
 }

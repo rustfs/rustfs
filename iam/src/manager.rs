@@ -17,7 +17,9 @@ use policy::{
     arn::ARN,
     auth::{self, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign, Credentials, UserIdentity},
     format::Format,
-    policy::{iam_policy_claim_name_sa, Policy, PolicyDoc, DEFAULT_POLICIES, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE},
+    policy::{
+        default::DEFAULT_POLICIES, iam_policy_claim_name_sa, Policy, PolicyDoc, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
