@@ -1,9 +1,9 @@
 use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values};
-use iam::auth;
 use iam::error::Error as IamError;
-use iam::policy::action::{Action, S3Action};
-use iam::sys::Args;
+use policy::auth;
+use policy::policy::action::{Action, S3Action};
+use policy::policy::Args;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Result};
 use std::collections::HashMap;

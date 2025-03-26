@@ -2,7 +2,7 @@ use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
-use crate::sys::Validator;
+use super::Validator;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ID(pub String);

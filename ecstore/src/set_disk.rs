@@ -5429,7 +5429,7 @@ pub fn should_heal_object_on_disk(
             }
         }
     }
-    (false, err.as_ref().map(|e| clone_err(e)))
+    (false, err.as_ref().map(clone_err))
 }
 
 async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<madmin::Disk> {

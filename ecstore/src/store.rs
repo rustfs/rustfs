@@ -665,7 +665,7 @@ impl ECStore {
             has_def_pool = true;
 
             if !is_err_object_not_found(err) && !is_err_version_not_found(err) {
-                return Err(clone_err(&err));
+                return Err(clone_err(err));
             }
 
             if pinfo.object_info.delete_marker && !pinfo.object_info.name.is_empty() {
@@ -803,7 +803,7 @@ impl ECStore {
         }
         let _ = task.await;
         if let Some(err) = first_err.read().await.as_ref() {
-            return Err(clone_err(&err));
+            return Err(clone_err(err));
         }
         Ok(())
     }
@@ -1069,7 +1069,7 @@ impl Clone for PoolObjInfo {
         Self {
             index: self.index,
             object_info: self.object_info.clone(),
-            err: self.err.as_ref().map(|e| clone_err(e)),
+            err: self.err.as_ref().map(clone_err),
         }
     }
 }

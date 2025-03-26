@@ -6,8 +6,9 @@ use crate::{
 };
 use ecstore::utils::{crypto::base64_encode, xml};
 use http::StatusCode;
-use iam::{auth::get_new_credentials_with_metadata, manager::get_token_signing_key, policy::Policy, sys::SESSION_POLICY_NAME};
+use iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use matchit::Params;
+use policy::{auth::get_new_credentials_with_metadata, policy::Policy};
 use s3s::{
     dto::{AssumeRoleOutput, Credentials, Timestamp},
     s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,

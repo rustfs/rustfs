@@ -1,5 +1,4 @@
-use super::{Effect, Error as IamError, Statement, ID};
-use crate::sys::{Args, Validator, DEFAULT_VERSION};
+use super::{Args, Effect, Error as IamError, Statement, Validator, DEFAULT_VERSION, ID};
 use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -122,13 +121,10 @@ impl Validator for Policy {
 pub mod default {
     use std::{collections::HashSet, sync::LazyLock};
 
-    use crate::{
-        policy::{
-            action::{Action, AdminAction, KmsAction, S3Action},
-            resource::Resource,
-            ActionSet, Effect, Functions, ResourceSet, Statement,
-        },
-        sys::DEFAULT_VERSION,
+    use crate::policy::{
+        action::{Action, AdminAction, KmsAction, S3Action},
+        resource::Resource,
+        ActionSet, Effect, Functions, ResourceSet, Statement, DEFAULT_VERSION,
     };
 
     use super::Policy;
@@ -323,7 +319,7 @@ pub mod default {
 #[cfg(test)]
 mod test {
     use super::*;
-    use common::error::{Error, Result};
+    use common::error::Result;
 
     #[tokio::test]
     async fn test_parse_policy() -> Result<()> {

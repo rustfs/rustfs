@@ -2,7 +2,7 @@ use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use strum::{EnumString, IntoStaticStr};
 
-use crate::sys::Validator;
+use super::Validator;
 
 #[derive(Serialize, Clone, Deserialize, EnumString, IntoStaticStr, Default, Debug, PartialEq)]
 #[serde(try_from = "&str", into = "&str")]

@@ -107,7 +107,7 @@ fn reduce_errs(errs: &[Option<Error>], ignored_errs: &[Box<dyn CheckErrorFn>]) -
 
     if let Some(&c) = error_counts.get(&max_err) {
         if let Some(&err_idx) = error_map.get(&max_err) {
-            let err = errs[err_idx].as_ref().map(|e| clone_err(e));
+            let err = errs[err_idx].as_ref().map(clone_err);
 
             return (c, err);
         }

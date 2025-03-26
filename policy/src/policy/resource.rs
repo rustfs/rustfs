@@ -6,12 +6,10 @@ use std::{
     ops::Deref,
 };
 
-use crate::sys::Validator;
-
 use super::{
     function::key_name::KeyName,
     utils::{path, wildcard},
-    Error as IamError,
+    Error as IamError, Validator,
 };
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]

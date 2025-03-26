@@ -1,11 +1,9 @@
 use super::{GroupInfo, MappedPolicy, Store, UserType};
 use crate::{
-    auth::UserIdentity,
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
     get_global_action_cred,
     manager::{extract_jwt_claims, get_default_policyes},
-    policy::PolicyDoc,
 };
 use common::error::{Error, Result};
 use ecstore::{
@@ -21,6 +19,7 @@ use ecstore::{
 };
 use futures::future::join_all;
 use lazy_static::lazy_static;
+use policy::{auth::UserIdentity, policy::PolicyDoc};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
