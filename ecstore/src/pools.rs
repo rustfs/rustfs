@@ -26,9 +26,13 @@ pub const POOL_META_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolStatus {
+    #[serde(rename = "id")]
     pub id: usize,
+    #[serde(rename = "cmdline")]
     pub cmd_line: String,
+    #[serde(rename = "lastUpdate", with = "time::serde::rfc3339")]
     pub last_update: OffsetDateTime,
+    #[serde(rename = "decommissionInfo")]
     pub decommission: Option<PoolDecommissionInfo>,
 }
 
@@ -294,22 +298,39 @@ fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, S
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PoolDecommissionInfo {
+    #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
     pub start_time: Option<OffsetDateTime>,
+    #[serde(rename = "startSize")]
     pub start_size: usize,
+    #[serde(rename = "totalSize")]
     pub total_size: usize,
+    #[serde(rename = "currentSize")]
     pub current_size: usize,
+    #[serde(rename = "complete")]
     pub complete: bool,
+    #[serde(rename = "failed")]
     pub failed: bool,
+    #[serde(rename = "canceled")]
     pub canceled: bool,
+
+    #[serde(skip)]
     pub queued_buckets: Vec<String>,
+    #[serde(skip)]
     pub decommissioned_buckets: Vec<String>,
+    #[serde(skip)]
     pub bucket: String,
+    #[serde(skip)]
     pub prefix: String,
+    #[serde(skip)]
     pub object: String,
 
+    #[serde(rename = "objectsDecommissioned")]
     pub items_decommissioned: usize,
+    #[serde(rename = "objectsDecommissionedFailed")]
     pub items_decommission_failed: usize,
+    #[serde(rename = "bytesDecommissioned")]
     pub bytes_done: usize,
+    #[serde(rename = "bytesDecommissionedFailed")]
     pub bytes_failed: usize,
 }
 
