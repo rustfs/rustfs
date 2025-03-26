@@ -503,13 +503,18 @@ impl ECStore {
         Ok(())
     }
 
-    async fn decommission_pool<S: StorageAPI>(&self, _idx: usize, _pool: Arc<S>, bi: DecomBucketInfo) -> Result<()> {
-        let mut _vc = None;
+    async fn decommission_pool(&self, _idx: usize, pool: Arc<Sets>, bi: DecomBucketInfo) -> Result<()> {
+        let mut vc = None;
 
-        if bi.name == RUSTFS_META_BUCKET {
+        if bi.name != RUSTFS_META_BUCKET {
             let versioning = BucketVersioningSys::get(&bi.name).await?;
-            _vc = Some(versioning);
+            vc = Some(versioning);
+            // TODO: LifecycleSys
+            // TODO: BucketObjectLockSys
+            // TODO: ReplicationConfig
         }
+
+        for (idx, set) in pool.disk_set.iter().enumerate() {}
 
         // FIXME:
         unimplemented!()
