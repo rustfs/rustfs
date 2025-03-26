@@ -66,8 +66,10 @@ opentelemetry-appender-tracing = { version = "0.29.1", features = ["experimental
 opentelemetry_sdk = { version = "0.29" }
 opentelemetry-stdout = { version = "0.29.0" }
 opentelemetry-otlp = { version = "0.29" }
+opentelemetry-prometheus = { version = "0.29" }
 opentelemetry-semantic-conventions = { version = "0.29.0", features = ["semconv_experimental"] }
 pin-project-lite = "0.2"
+prometheus = "0.13.4"
 # pin-utils = "0.1.0"
 prost = "0.13.4"
 prost-build = "0.13.4"
