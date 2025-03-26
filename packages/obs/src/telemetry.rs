@@ -13,6 +13,7 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_NAME, SERVICE_VERSION},
     SCHEMA_URL,
 };
+use prometheus::Registry;
 use std::io::IsTerminal;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
@@ -45,6 +46,13 @@ pub struct OtelGuard {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
     logger_provider: SdkLoggerProvider,
+    registry: Registry,
+}
+
+impl OtelGuard {
+    pub fn get_registry(&self) -> &Registry {
+        &self.registry
+    }
 }
 
 impl Drop for OtelGuard {
@@ -78,7 +86,7 @@ fn resource(config: &OtelConfig) -> Resource {
 }
 
 /// Initialize Meter Provider
-fn init_meter_provider(config: &OtelConfig) -> SdkMeterProvider {
+fn init_meter_provider(config: &OtelConfig) -> (SdkMeterProvider, Registry) {
     let mut builder = MeterProviderBuilder::default().with_resource(resource(config));
     // If endpoint is empty, use stdout output
     if config.endpoint.is_empty() {
@@ -109,10 +117,15 @@ fn init_meter_provider(config: &OtelConfig) -> SdkMeterProvider {
             );
         }
     }
+    let registry = Registry::new();
+    let prometheus_exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .build()
+        .unwrap();
 
-    let meter_provider = builder.build();
+    let meter_provider = builder.with_reader(prometheus_exporter).build();
     global::set_meter_provider(meter_provider.clone());
-    meter_provider
+    (meter_provider, registry)
 }
 
 /// Initialize Tracer Provider
@@ -154,7 +167,7 @@ fn init_tracer_provider(config: &OtelConfig) -> SdkTracerProvider {
 /// Initialize Telemetry
 pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     let tracer_provider = init_tracer_provider(config);
-    let meter_provider = init_meter_provider(config);
+    let (meter_provider, prometheus_registry) = init_meter_provider(config);
     let tracer = tracer_provider.tracer(config.service_name.clone());
 
     // Initialize logger provider based on configuration
@@ -229,5 +242,6 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         tracer_provider,
         meter_provider,
         logger_provider,
+        registry: prometheus_registry,
     }
 }

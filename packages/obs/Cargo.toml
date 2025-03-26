@@ -24,7 +24,9 @@ opentelemetry-appender-tracing = { workspace = true, features = ["experimental_u
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic"] }
+opentelemetry-prometheus = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
+prometheus = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-core = { workspace = true }
