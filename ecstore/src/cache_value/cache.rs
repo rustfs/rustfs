@@ -14,7 +14,7 @@ use std::{
 
 use tokio::{spawn, sync::Mutex};
 
-use crate::error::Result;
+use common::error::Result;
 
 pub type UpdateFn<T> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<T>> + Send>> + Send + Sync + 'static>;
 

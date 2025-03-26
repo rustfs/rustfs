@@ -1,16 +1,3 @@
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use crate::arn::ARN;
-use crate::auth::contains_reserved_chars;
-use crate::auth::create_new_credentials_with_metadata;
-use crate::auth::generate_credentials;
-use crate::auth::is_access_key_valid;
-use crate::auth::is_secret_key_valid;
-use crate::auth::Credentials;
-use crate::auth::UserIdentity;
-use crate::auth::ACCOUNT_ON;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
 use crate::error::Error as IamError;
@@ -18,19 +5,33 @@ use crate::get_global_action_cred;
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
 use crate::manager::IamCache;
-use crate::policy::action::Action;
-use crate::policy::Policy;
-use crate::policy::PolicyDoc;
 use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use ecstore::utils::crypto::base64_decode;
 use ecstore::utils::crypto::base64_encode;
 use madmin::AddOrUpdateUserReq;
 use madmin::GroupDesc;
+use policy::arn::ARN;
+use policy::auth::contains_reserved_chars;
+use policy::auth::create_new_credentials_with_metadata;
+use policy::auth::generate_credentials;
+use policy::auth::is_access_key_valid;
+use policy::auth::is_secret_key_valid;
+use policy::auth::Credentials;
+use policy::auth::UserIdentity;
+use policy::auth::ACCOUNT_ON;
+use policy::policy::iam_policy_claim_name_sa;
+use policy::policy::Args;
+use policy::policy::Policy;
+use policy::policy::PolicyDoc;
+use policy::policy::EMBEDDED_POLICY_TYPE;
+use policy::policy::INHERITED_POLICY_TYPE;
 use serde_json::json;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 pub const MAX_SVCSESSION_POLICY_SIZE: usize = 4096;
@@ -41,9 +42,6 @@ pub const STATUS_DISABLED: &str = "disabled";
 pub const POLICYNAME: &str = "policy";
 pub const SESSION_POLICY_NAME: &str = "sessionPolicy";
 pub const SESSION_POLICY_NAME_EXTRACTED: &str = "sessionPolicy-extracted";
-
-pub const EMBEDDED_POLICY_TYPE: &str = "embedded-policy";
-pub const INHERITED_POLICY_TYPE: &str = "inherited-policy";
 
 pub struct IamSys<T> {
     store: Arc<IamCache<T>>,
@@ -696,74 +694,4 @@ pub struct UpdateServiceAccountOpts {
     pub description: Option<String>,
     pub expiration: Option<OffsetDateTime>,
     pub status: Option<String>,
-}
-
-pub fn iam_policy_claim_name_sa() -> String {
-    "sa-policy".to_string()
-}
-
-/// DEFAULT_VERSION is the default version.
-/// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_version.html
-pub const DEFAULT_VERSION: &str = "2012-10-17";
-
-/// check the data is Validator
-pub trait Validator {
-    type Error;
-    fn is_valid(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Args<'a> {
-    pub account: &'a str,
-    pub groups: &'a Option<Vec<String>>,
-    pub action: Action,
-    pub bucket: &'a str,
-    pub conditions: &'a HashMap<String, Vec<String>>,
-    pub is_owner: bool,
-    pub object: &'a str,
-    pub claims: &'a HashMap<String, Value>,
-    pub deny_only: bool,
-}
-
-impl Args<'_> {
-    pub fn get_role_arn(&self) -> Option<&str> {
-        self.claims.get("roleArn").and_then(|x| x.as_str())
-    }
-    pub fn get_policies(&self, policy_claim_name: &str) -> (HashSet<String>, bool) {
-        get_policies_from_claims(self.claims, policy_claim_name)
-    }
-}
-
-fn get_values_from_claims(claims: &HashMap<String, Value>, claim_name: &str) -> (HashSet<String>, bool) {
-    let mut s = HashSet::new();
-    if let Some(pname) = claims.get(claim_name) {
-        if let Some(pnames) = pname.as_array() {
-            for pname in pnames {
-                if let Some(pname_str) = pname.as_str() {
-                    for pname in pname_str.split(',') {
-                        let pname = pname.trim();
-                        if !pname.is_empty() {
-                            s.insert(pname.to_string());
-                        }
-                    }
-                }
-            }
-            return (s, true);
-        } else if let Some(pname_str) = pname.as_str() {
-            for pname in pname_str.split(',') {
-                let pname = pname.trim();
-                if !pname.is_empty() {
-                    s.insert(pname.to_string());
-                }
-            }
-            return (s, true);
-        }
-    }
-    (s, false)
-}
-
-fn get_policies_from_claims(claims: &HashMap<String, Value>, policy_claim_name: &str) -> (HashSet<String>, bool) {
-    get_values_from_claims(claims, policy_claim_name)
 }

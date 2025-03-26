@@ -16,7 +16,6 @@ pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::{
     bucket::{metadata_sys::get_versioning_config, versioning::VersioningApi},
-    error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion, VersionType},
     heal::{
         data_scanner::ShouldSleepFn,
@@ -27,6 +26,7 @@ use crate::{
     store_api::{FileInfo, ObjectInfo, RawFileInfo},
     utils::path::SLASH_SEPARATOR,
 };
+use common::error::{Error, Result};
 use endpoint::Endpoint;
 use error::DiskError;
 use local::LocalDisk;

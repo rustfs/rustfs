@@ -1,11 +1,8 @@
-use iam::policy::action::Action;
-use iam::policy::action::ActionSet;
-use iam::policy::action::S3Action::*;
-use iam::policy::resource::ResourceSet;
-use iam::policy::Effect::*;
-use iam::policy::{Policy, Statement};
-use iam::sys::Args;
-use iam::sys::DEFAULT_VERSION;
+use policy::policy::action::Action;
+use policy::policy::action::S3Action::*;
+use policy::policy::ActionSet;
+use policy::policy::Effect::*;
+use policy::policy::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use test_case::test_case;
@@ -24,10 +21,10 @@ struct ArgsBuilder {
 }
 
 #[test_case(
-    Policy{
-        version: DEFAULT_VERSION.into(),
+    policy::policy::Policy{
+        version: policy::policy::DEFAULT_VERSION.into(),
         statements: vec![
-            Statement{
+            policy::policy::Statement{
                     effect: Allow,
                     actions: ActionSet(vec![Action::S3Action(PutObjectAction), Action::S3Action(GetBucketLocationAction)].into_iter().collect()),
                     resources: ResourceSet(vec!["arn:aws:s3:::*".try_into().unwrap()].into_iter().collect()),
@@ -46,7 +43,7 @@ struct ArgsBuilder {
 )]
 #[test_case(
     Policy{
-        version: iam::sys::DEFAULT_VERSION.into(),
+        version: DEFAULT_VERSION.into(),
         statements: vec![
             Statement{
                     effect: Allow,
@@ -581,7 +578,7 @@ struct ArgsBuilder {
 )]
 #[test_case(
     Policy{
-        version: iam::sys::DEFAULT_VERSION.into(),
+        version: DEFAULT_VERSION.into(),
         statements: vec![
             Statement{
                     effect: Deny,

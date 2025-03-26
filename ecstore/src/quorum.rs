@@ -1,4 +1,5 @@
-use crate::{disk::error::DiskError, error::Error};
+use crate::{disk::error::DiskError, error::clone_err};
+use common::error::Error;
 use std::{collections::HashMap, fmt::Debug};
 // pub type CheckErrorFn = fn(e: &Error) -> bool;
 
@@ -106,7 +107,7 @@ fn reduce_errs(errs: &[Option<Error>], ignored_errs: &[Box<dyn CheckErrorFn>]) -
 
     if let Some(&c) = error_counts.get(&max_err) {
         if let Some(&err_idx) = error_map.get(&max_err) {
-            let err = errs[err_idx].clone();
+            let err = errs[err_idx].as_ref().map(clone_err);
 
             return (c, err);
         }

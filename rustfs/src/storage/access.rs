@@ -1,9 +1,10 @@
 use super::ecfs::FS;
 use crate::auth::{check_key_valid, get_condition_values};
-use iam::auth;
+use ecstore::bucket::policy_sys::PolicySys;
 use iam::error::Error as IamError;
-use iam::policy::action::{Action, S3Action};
-use iam::sys::Args;
+use policy::auth;
+use policy::policy::action::{Action, S3Action};
+use policy::policy::{Args, BucketPolicyArgs};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Result};
 use std::collections::HashMap;
@@ -11,45 +12,117 @@ use std::collections::HashMap;
 #[allow(dead_code)]
 #[derive(Default, Clone)]
 pub(crate) struct ReqInfo {
-    pub cred: auth::Credentials,
+    pub cred: Option<auth::Credentials>,
     pub is_owner: bool,
     pub bucket: Option<String>,
     pub object: Option<String>,
     pub version_id: Option<String>,
 }
 
-pub async fn authorize_request<T>(req: &mut S3Request<T>, actions: Vec<Action>) -> S3Result<()> {
-    let Ok(iam_store) = iam::get() else {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
-        ));
-    };
-
+pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 
-    let default_claims = HashMap::new();
-    let claims = req_info.cred.claims.as_ref().unwrap_or(&default_claims);
-    let conditions = get_condition_values(&req.headers, &req_info.cred);
-
-    for action in actions {
-        let args = &Args {
-            account: &req_info.cred.access_key,
-            groups: &req_info.cred.groups,
-            action,
-            bucket: req_info.bucket.as_deref().unwrap_or(""),
-            conditions: &conditions,
-            is_owner: req_info.is_owner,
-            object: req_info.object.as_deref().unwrap_or(""),
-            claims,
-            deny_only: false,
+    if let Some(cred) = &req_info.cred {
+        let Ok(iam_store) = iam::get() else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("authorize_request {:?}", IamError::IamSysNotInitialized),
+            ));
         };
-        if !iam_store.is_allowed(args).await {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
+
+        let default_claims = HashMap::new();
+        let claims = cred.claims.as_ref().unwrap_or(&default_claims);
+        let conditions = get_condition_values(&req.headers, cred);
+
+        if action != Action::S3Action(S3Action::DeleteObjectAction)
+            && req_info.version_id.is_some()
+            && iam_store
+                .is_allowed(&Args {
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+                    bucket: req_info.bucket.as_deref().unwrap_or(""),
+                    conditions: &conditions,
+                    is_owner: req_info.is_owner,
+                    object: req_info.object.as_deref().unwrap_or(""),
+                    claims,
+                    deny_only: false,
+                })
+                .await
+        {
+            return Ok(());
+        }
+
+        if iam_store
+            .is_allowed(&Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action,
+                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                conditions: &conditions,
+                is_owner: req_info.is_owner,
+                object: req_info.object.as_deref().unwrap_or(""),
+                claims,
+                deny_only: false,
+            })
+            .await
+        {
+            return Ok(());
+        }
+
+        if action == Action::S3Action(S3Action::ListBucketVersionsAction)
+            && iam_store
+                .is_allowed(&Args {
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    action: Action::S3Action(S3Action::ListBucketAction),
+                    bucket: req_info.bucket.as_deref().unwrap_or(""),
+                    conditions: &conditions,
+                    is_owner: req_info.is_owner,
+                    object: req_info.object.as_deref().unwrap_or(""),
+                    claims,
+                    deny_only: false,
+                })
+                .await
+        {
+            return Ok(());
+        }
+    } else {
+        let conditions = get_condition_values(&req.headers, &auth::Credentials::default());
+
+        if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
+            if PolicySys::is_allowed(&BucketPolicyArgs {
+                bucket: req_info.bucket.as_deref().unwrap_or(""),
+                action,
+                is_owner: false,
+                account: "",
+                groups: &None,
+                conditions: &conditions,
+                object: req_info.object.as_deref().unwrap_or(""),
+            })
+            .await
+            {
+                return Ok(());
+            }
+
+            if action == Action::S3Action(S3Action::ListBucketVersionsAction)
+                && PolicySys::is_allowed(&BucketPolicyArgs {
+                    bucket: req_info.bucket.as_deref().unwrap_or(""),
+                    action: Action::S3Action(S3Action::ListBucketAction),
+                    is_owner: false,
+                    account: "",
+                    groups: &None,
+                    conditions: &conditions,
+                    object: "",
+                })
+                .await
+            {
+                return Ok(());
+            }
         }
     }
 
-    Ok(())
+    Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
 #[async_trait::async_trait]
@@ -81,11 +154,12 @@ impl S3Access for FS {
         //     // cx.extensions_mut(),
         // );
 
-        let Some(input_cred) = cx.credentials() else {
-            return Err(s3_error!(UnauthorizedAccess, "Signature is required"));
+        let (cred, is_owner) = if let Some(input_cred) = cx.credentials() {
+            let (cred, is_owner) = check_key_valid(cx.headers(), &input_cred.access_key).await?;
+            (Some(cred), is_owner)
+        } else {
+            (None, false)
         };
-
-        let (cred, is_owner) = check_key_valid(cx.headers(), &input_cred.access_key).await?;
 
         let req_info = ReqInfo {
             cred,
@@ -108,17 +182,11 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::CreateBucketAction)]).await?;
+        authorize_request(req, Action::S3Action(S3Action::CreateBucketAction)).await?;
 
         if req.input.object_lock_enabled_for_bucket.is_some_and(|v| v) {
-            authorize_request(
-                req,
-                vec![
-                    Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction),
-                    Action::S3Action(S3Action::PutBucketVersioningAction),
-                ],
-            )
-            .await?;
+            authorize_request(req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await?;
+            authorize_request(req, Action::S3Action(S3Action::PutBucketVersioningAction)).await?;
         }
 
         Ok(())
@@ -156,7 +224,7 @@ impl S3Access for FS {
             req_info.object = Some(src_key);
             req_info.version_id = version_id;
 
-            authorize_request(req, vec![Action::S3Action(S3Action::GetObjectAction)]).await?;
+            authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
         }
 
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
@@ -165,7 +233,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
     }
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
@@ -182,10 +250,10 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::DeleteBucketAction)]).await?;
+        authorize_request(req, Action::S3Action(S3Action::DeleteBucketAction)).await?;
 
         if req.input.force_delete.is_some_and(|v| v) {
-            authorize_request(req, vec![Action::S3Action(S3Action::ForceDeleteBucketAction)]).await?;
+            authorize_request(req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
         Ok(())
     }
@@ -207,7 +275,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketCorsAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketCorsAction)).await
     }
 
     /// Checks whether the DeleteBucketEncryption request has accesses to the resources.
@@ -217,7 +285,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketEncryptionAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
     }
 
     /// Checks whether the DeleteBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -247,7 +315,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketLifecycleAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
     }
 
     /// Checks whether the DeleteBucketMetricsConfiguration request has accesses to the resources.
@@ -274,7 +342,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::DeleteBucketPolicyAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::DeleteBucketPolicyAction)).await
     }
 
     /// Checks whether the DeleteBucketReplication request has accesses to the resources.
@@ -284,7 +352,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutReplicationConfigurationAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
     }
 
     /// Checks whether the DeleteBucketTagging request has accesses to the resources.
@@ -294,7 +362,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketTaggingAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
     }
 
     /// Checks whether the DeleteBucketWebsite request has accesses to the resources.
@@ -313,7 +381,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::DeleteObjectAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await
     }
 
     /// Checks whether the DeleteObjectTagging request has accesses to the resources.
@@ -325,7 +393,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::DeleteObjectTaggingAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::DeleteObjectTaggingAction)).await
     }
 
     /// Checks whether the DeleteObjects request has accesses to the resources.
@@ -359,7 +427,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketPolicyAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketAnalyticsConfiguration request has accesses to the resources.
@@ -379,7 +447,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketCorsAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketCorsAction)).await
     }
 
     /// Checks whether the GetBucketEncryption request has accesses to the resources.
@@ -389,7 +457,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketEncryptionAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketEncryptionAction)).await
     }
 
     /// Checks whether the GetBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -422,7 +490,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketLifecycleAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketLifecycleAction)).await
     }
 
     /// Checks whether the GetBucketLocation request has accesses to the resources.
@@ -432,7 +500,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketLocationAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketLocationAction)).await
     }
 
     /// Checks whether the GetBucketLogging request has accesses to the resources.
@@ -459,7 +527,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketNotificationAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketNotificationAction)).await
     }
 
     /// Checks whether the GetBucketOwnershipControls request has accesses to the resources.
@@ -476,7 +544,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketPolicyAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketPolicyStatus request has accesses to the resources.
@@ -486,7 +554,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketPolicyStatusAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyStatusAction)).await
     }
 
     /// Checks whether the GetBucketReplication request has accesses to the resources.
@@ -496,7 +564,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetReplicationConfigurationAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetReplicationConfigurationAction)).await
     }
 
     /// Checks whether the GetBucketRequestPayment request has accesses to the resources.
@@ -513,7 +581,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketTaggingAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketTaggingAction)).await
     }
 
     /// Checks whether the GetBucketVersioning request has accesses to the resources.
@@ -523,7 +591,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketVersioningAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketVersioningAction)).await
     }
 
     /// Checks whether the GetBucketWebsite request has accesses to the resources.
@@ -542,7 +610,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
     }
 
     /// Checks whether the GetObjectAcl request has accesses to the resources.
@@ -554,7 +622,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketPolicyAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetObjectAttributes request has accesses to the resources.
@@ -566,16 +634,15 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        let mut actions = Vec::new();
         if req.input.version_id.is_some() {
-            actions.push(Action::S3Action(S3Action::GetObjectVersionAttributesAction));
-            actions.push(Action::S3Action(S3Action::GetObjectVersionAction));
+            authorize_request(req, Action::S3Action(S3Action::GetObjectVersionAttributesAction)).await?;
+            authorize_request(req, Action::S3Action(S3Action::GetObjectVersionAction)).await?;
         } else {
-            actions.push(Action::S3Action(S3Action::GetObjectAttributesAction));
-            actions.push(Action::S3Action(S3Action::GetObjectAction));
+            authorize_request(req, Action::S3Action(S3Action::GetObjectAttributesAction)).await?;
+            authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
         }
 
-        authorize_request(req, actions).await
+        Ok(())
     }
 
     /// Checks whether the GetObjectLegalHold request has accesses to the resources.
@@ -587,7 +654,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectLegalHoldAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectLegalHoldAction)).await
     }
 
     /// Checks whether the GetObjectLockConfiguration request has accesses to the resources.
@@ -597,7 +664,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetBucketObjectLockConfigurationAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetBucketObjectLockConfigurationAction)).await
     }
 
     /// Checks whether the GetObjectRetention request has accesses to the resources.
@@ -609,7 +676,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectRetentionAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectRetentionAction)).await
     }
 
     /// Checks whether the GetObjectTagging request has accesses to the resources.
@@ -621,7 +688,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectTaggingAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectTaggingAction)).await
     }
 
     /// Checks whether the GetObjectTorrent request has accesses to the resources.
@@ -645,7 +712,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::ListBucketAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
     }
 
     /// Checks whether the HeadObject request has accesses to the resources.
@@ -657,7 +724,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
     }
 
     /// Checks whether the ListBucketAnalyticsConfigurations request has accesses to the resources.
@@ -715,7 +782,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::ListBucketMultipartUploadsAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await
     }
 
     /// Checks whether the ListObjectVersions request has accesses to the resources.
@@ -732,7 +799,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::ListBucketAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
     }
 
     /// Checks whether the ListObjectsV2 request has accesses to the resources.
@@ -742,7 +809,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::ListBucketAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
     }
 
     /// Checks whether the ListParts request has accesses to the resources.
@@ -769,7 +836,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketPolicyAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketAnalyticsConfiguration request has accesses to the resources.
@@ -789,7 +856,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketCorsAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketCorsAction)).await
     }
 
     /// Checks whether the PutBucketEncryption request has accesses to the resources.
@@ -799,7 +866,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketEncryptionAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
     }
 
     /// Checks whether the PutBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -832,7 +899,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketLifecycleAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
     }
 
     /// Checks whether the PutBucketLogging request has accesses to the resources.
@@ -859,7 +926,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketNotificationAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketNotificationAction)).await
     }
 
     /// Checks whether the PutBucketOwnershipControls request has accesses to the resources.
@@ -876,7 +943,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketPolicyAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketReplication request has accesses to the resources.
@@ -886,7 +953,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutReplicationConfigurationAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
     }
 
     /// Checks whether the PutBucketRequestPayment request has accesses to the resources.
@@ -903,7 +970,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketTaggingAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
     }
 
     /// Checks whether the PutBucketVersioning request has accesses to the resources.
@@ -913,7 +980,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketVersioningAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketVersioningAction)).await
     }
 
     /// Checks whether the PutBucketWebsite request has accesses to the resources.
@@ -932,7 +999,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
@@ -944,7 +1011,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketPolicyAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutObjectLegalHold request has accesses to the resources.
@@ -956,7 +1023,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectLegalHoldAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await
     }
 
     /// Checks whether the PutObjectLockConfiguration request has accesses to the resources.
@@ -966,7 +1033,7 @@ impl S3Access for FS {
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await
     }
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
@@ -978,7 +1045,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectRetentionAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await
     }
 
     /// Checks whether the PutObjectTagging request has accesses to the resources.
@@ -990,7 +1057,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectTaggingAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectTaggingAction)).await
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.
@@ -1009,7 +1076,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, vec![Action::S3Action(S3Action::RestoreObjectAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::RestoreObjectAction)).await
     }
 
     /// Checks whether the SelectObjectContent request has accesses to the resources.
@@ -1020,7 +1087,7 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::GetObjectAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
     }
 
     /// Checks whether the UploadPart request has accesses to the resources.
@@ -1031,7 +1098,7 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
-        authorize_request(req, vec![Action::S3Action(S3Action::PutObjectAction)]).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
     }
 
     /// Checks whether the UploadPartCopy request has accesses to the resources.

@@ -2,11 +2,9 @@ use std::io::{self, ErrorKind};
 
 use tracing::error;
 
+use crate::quorum::CheckErrorFn;
 use crate::utils::ERROR_TYPE_MASK;
-use crate::{
-    error::{Error, Result},
-    quorum::CheckErrorFn,
-};
+use common::error::{Error, Result};
 
 // DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
