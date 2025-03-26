@@ -1,9 +1,9 @@
-use super::policy::bucket_policy::BucketPolicy;
 use super::{quota::BucketQuota, target::BucketTargets};
 
 use super::object_lock::ObjectLockApi;
 use super::versioning::VersioningApi;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use policy::policy::BucketPolicy;
 use rmp_serde::Serializer as rmpSerializer;
 use s3s::dto::{
     BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
@@ -16,9 +16,9 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::error;
 
-use crate::config::common::{read_config, save_config};
-use crate::error::{Error, Result};
+use crate::config::com::{read_config, save_config};
 use crate::{config, new_object_layer_fn};
+use common::error::{Error, Result};
 
 use crate::disk::BUCKET_META_PREFIX;
 use crate::store::ECStore;

@@ -1,23 +1,16 @@
-use auth::Credentials;
-use ecstore::error::{Error, Result};
+use common::error::{Error, Result};
 use ecstore::store::ECStore;
 use error::Error as IamError;
 use manager::IamCache;
+use policy::auth::Credentials;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
 use tracing::{debug, instrument};
 
 pub mod cache;
-mod format;
-mod handler;
-
-pub mod arn;
-pub mod auth;
 pub mod error;
 pub mod manager;
-pub mod policy;
-pub mod service_type;
 pub mod store;
 pub mod utils;
 

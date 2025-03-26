@@ -1,4 +1,4 @@
-use crate::error::Result;
+use common::error::Result;
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 

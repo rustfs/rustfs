@@ -1,4 +1,4 @@
-use crate::error::{Error, Result};
+use common::error::{Error, Result};
 
 pub fn parse_bool(str: &str) -> Result<bool> {
     match str {

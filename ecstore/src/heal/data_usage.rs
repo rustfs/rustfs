@@ -1,22 +1,21 @@
-use lazy_static::lazy_static;
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
-use tokio::sync::mpsc::Receiver;
-use tracing::{error, warn};
-
 use crate::{
     bucket::metadata_sys::get_replication_config,
     config::{
-        common::{read_config, save_config},
+        com::{read_config, save_config},
         error::is_err_config_not_found,
     },
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
-    error::Result,
     new_object_layer_fn,
     store::ECStore,
     store_err::to_object_err,
     utils::path::SLASH_SEPARATOR,
 };
+use common::error::Result;
+use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use tokio::sync::mpsc::Receiver;
+use tracing::{error, warn};
 
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";

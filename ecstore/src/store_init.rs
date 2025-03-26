@@ -7,9 +7,9 @@ use crate::{
         new_disk, DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
     },
     endpoints::Endpoints,
-    error::{Error, Result},
     heal::heal_commands::init_healing_tracker,
 };
+use common::error::{Error, Result};
 use futures::future::join_all;
 use std::{
     collections::{hash_map::Entry, HashMap},

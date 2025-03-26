@@ -5,7 +5,6 @@ use hyper::StatusCode;
 use iam::{
     error::is_err_no_such_service_account,
     get_global_action_cred,
-    policy::Policy,
     sys::{NewServiceAccountOpts, UpdateServiceAccountOpts},
 };
 use madmin::{
@@ -13,6 +12,7 @@ use madmin::{
     ServiceAccountInfo, UpdateServiceAccountReq,
 };
 use matchit::Params;
+use policy::policy::Policy;
 use s3s::S3ErrorCode::InvalidRequest;
 use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::Deserialize;

@@ -6,7 +6,7 @@ use crate::disk::{
     DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
     MetadataResolutionParams,
 };
-use crate::error::{Error, Result};
+use crate::error::clone_err;
 use crate::file_meta::merge_file_meta_versions;
 use crate::peer::is_reserved_or_invalid_bucket;
 use crate::set_disk::SetDisks;
@@ -16,6 +16,7 @@ use crate::store_err::{is_err_bucket_not_found, to_object_err, StorageError};
 use crate::utils::path::{self, base_dir_from_prefix, SLASH_SEPARATOR};
 use crate::StorageAPI;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
+use common::error::{Error, Result};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -508,7 +509,7 @@ impl ECStore {
 
         // cancel channel
         let (cancel_tx, cancel_rx) = broadcast::channel(1);
-        let (err_tx, mut err_rx) = broadcast::channel::<Error>(1);
+        let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
 
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
@@ -521,7 +522,7 @@ impl ECStore {
             opts.stop_disk_at_limit = true;
             if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await {
                 error!("list_merged err {:?}", err);
-                let _ = err_tx1.send(err);
+                let _ = err_tx1.send(Arc::new(err));
             }
         });
 
@@ -533,7 +534,7 @@ impl ECStore {
         let job2 = tokio::spawn(async move {
             if let Err(err) = gather_results(cancel_rx2, opts, recv, result_tx).await {
                 error!("gather_results err {:?}", err);
-                let _ = err_tx2.send(err);
+                let _ = err_tx2.send(Arc::new(err));
             }
         });
 
@@ -545,7 +546,7 @@ impl ECStore {
                 match res{
                     Ok(o) => {
                         error!("list_path err_rx.recv() ok {:?}", &o);
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(o) }
+                        MetaCacheEntriesSortedResult{ entries: None, err: Some(clone_err(o.as_ref())) }
                     },
                     Err(err) => {
                         error!("list_path err_rx.recv() err {:?}", &err);
@@ -659,7 +660,7 @@ impl ECStore {
                     continue;
                 }
 
-                return Err(err.clone());
+                return Err(clone_err(err));
             } else {
                 all_at_eof = false;
                 continue;

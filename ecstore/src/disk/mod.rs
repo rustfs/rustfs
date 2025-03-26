@@ -16,7 +16,6 @@ pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::{
     bucket::{metadata_sys::get_versioning_config, versioning::VersioningApi},
-    error::{Error, Result},
     file_meta::{merge_file_meta_versions, FileMeta, FileMetaShallowVersion, VersionType},
     heal::{
         data_scanner::ShouldSleepFn,
@@ -27,6 +26,7 @@ use crate::{
     store_api::{FileInfo, ObjectInfo, RawFileInfo},
     utils::path::SLASH_SEPARATOR,
 };
+use common::error::{Error, Result};
 use endpoint::Endpoint;
 use error::DiskError;
 use local::LocalDisk;
@@ -250,7 +250,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.delete_paths(volume, paths).await,
             Disk::Remote(remote_disk) => remote_disk.delete_paths(volume, paths).await,
@@ -412,7 +412,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         versions: Vec<FileInfoVersions>,
         opts: DeleteOptions,
     ) -> Result<Vec<Option<Error>>>;
-    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()>;
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()>;
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()>;
     async fn read_version(

@@ -4,10 +4,8 @@ use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind};
 use std::path::Path;
 
-use crate::{
-    disk::Info,
-    error::{Error as e_Error, Result},
-};
+use crate::disk::Info;
+use common::error::{Error as e_Error, Result};
 
 use super::IOStats;
 

@@ -28,7 +28,6 @@ use super::{
 };
 use crate::{
     disk::error::DiskError,
-    error::{Error, Result},
     heal::{
         data_scanner::ShouldSleepFn,
         data_usage_cache::{DataUsageCache, DataUsageEntry},
@@ -41,6 +40,7 @@ use crate::{
     io::{FileReader, FileWriter, HttpFileReader, HttpFileWriter},
     utils::proto_err_to_err,
 };
+use common::error::{Error, Result};
 use protos::proto_gen::node_service::RenamePartRequst;
 
 #[derive(Debug)]
@@ -565,9 +565,9 @@ impl DiskAPI for RemoteDisk {
         Ok(volume_info)
     }
 
-    async fn delete_paths(&self, volume: &str, paths: &[&str]) -> Result<()> {
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         info!("delete_paths");
-        let paths = paths.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let paths = paths.to_owned();
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;

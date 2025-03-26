@@ -1,8 +1,8 @@
 use crate::{
     disk::error::{is_err_file_not_found, DiskError},
-    error::Error,
     utils::path::decode_dir_object,
 };
+use common::error::Error;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StorageError {

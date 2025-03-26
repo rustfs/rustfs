@@ -1,18 +1,6 @@
-use async_trait::async_trait;
-use futures::future::join_all;
-use madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use protos::node_service_time_out_client;
-use protos::proto_gen::node_service::{
-    DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
-};
-use regex::Regex;
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
-use tokio::sync::RwLock;
-use tonic::Request;
-use tracing::info;
-
 use crate::disk::error::is_all_buckets_not_found;
 use crate::disk::{DiskAPI, DiskStore};
+use crate::error::clone_err;
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
 use crate::heal::heal_commands::{
     HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET,
@@ -25,9 +13,21 @@ use crate::utils::wildcard::is_rustfs_meta_bucket_name;
 use crate::{
     disk::{self, error::DiskError, VolumeInfo},
     endpoints::{EndpointServerPools, Node},
-    error::{Error, Result},
     store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
 };
+use async_trait::async_trait;
+use common::error::{Error, Result};
+use futures::future::join_all;
+use madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use protos::node_service_time_out_client;
+use protos::proto_gen::node_service::{
+    DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
+};
+use regex::Regex;
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use tokio::sync::RwLock;
+use tonic::Request;
+use tracing::info;
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
@@ -95,7 +95,7 @@ impl S3PeerSys {
             for (i, client) in self.clients.iter().enumerate() {
                 if let Some(v) = client.get_pools() {
                     if v.contains(&pool_idx) {
-                        per_pool_errs.push(errs[i].clone());
+                        per_pool_errs.push(errs[i].as_ref().map(clone_err));
                     }
                 }
             }
@@ -130,7 +130,7 @@ impl S3PeerSys {
             for (i, client) in self.clients.iter().enumerate() {
                 if let Some(v) = client.get_pools() {
                     if v.contains(&pool_idx) {
-                        per_pool_errs.push(errs[i].clone());
+                        per_pool_errs.push(errs[i].as_ref().map(clone_err));
                     }
                 }
             }
@@ -781,7 +781,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let bucket = bucket.to_string();
             let bs_clone = before_state.clone();
             let as_clone = after_state.clone();
-            let errs_clone = errs.clone();
+            let errs_clone = errs.iter().map(|e| e.as_ref().map(clone_err)).collect::<Vec<_>>();
             futures.push(async move {
                 if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
                     info!("bucket not find, will recreate");
@@ -795,7 +795,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
                         }
                     }
                 }
-                errs_clone[idx].clone()
+                errs_clone[idx].as_ref().map(clone_err)
             });
         }
 

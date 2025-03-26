@@ -1,6 +1,6 @@
-use ecstore::{disk::error::is_err_file_not_found, error::Error, store_err::StorageError};
+use common::error::Error;
+use ecstore::{disk::error::is_err_file_not_found, store_err::StorageError};
 use s3s::{s3_error, S3Error, S3ErrorCode};
-
 pub fn to_s3_error(err: Error) -> S3Error {
     if let Some(storage_err) = err.downcast_ref::<StorageError>() {
         return match storage_err {
