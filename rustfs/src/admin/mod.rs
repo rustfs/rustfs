@@ -6,7 +6,7 @@ pub mod utils;
 use common::error::Result;
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    group, policy,
+    group, policy, pools,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, user,
 };
@@ -69,25 +69,25 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/list").as_str(),
-        AdminOperation(&handlers::ListPools {}),
+        AdminOperation(&pools::ListPools {}),
     )?;
     // 1
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/status").as_str(),
-        AdminOperation(&handlers::StatusPool {}),
+        AdminOperation(&pools::StatusPool {}),
     )?;
     // todo
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/decommission").as_str(),
-        AdminOperation(&handlers::StartDecommission {}),
+        AdminOperation(&pools::StartDecommission {}),
     )?;
     // todo
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/cancel").as_str(),
-        AdminOperation(&handlers::CancelDecommission {}),
+        AdminOperation(&pools::CancelDecommission {}),
     )?;
 
     r.insert(
