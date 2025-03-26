@@ -1,9 +1,9 @@
-use super::policy::bucket_policy::BucketPolicy;
 use super::{quota::BucketQuota, target::BucketTargets};
 
 use super::object_lock::ObjectLockApi;
 use super::versioning::VersioningApi;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use policy::policy::BucketPolicy;
 use rmp_serde::Serializer as rmpSerializer;
 use s3s::dto::{
     BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,

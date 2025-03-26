@@ -13,6 +13,7 @@ use crate::store::ECStore;
 use crate::utils::xml::deserialize;
 use common::error::{Error, Result};
 use futures::future::join_all;
+use policy::policy::BucketPolicy;
 use s3s::dto::{
     BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
     ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
@@ -22,7 +23,6 @@ use tokio::sync::RwLock;
 use tracing::{error, warn};
 
 use super::metadata::{load_bucket_metadata, BucketMetadata};
-use super::policy::bucket_policy::BucketPolicy;
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
 
