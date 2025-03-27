@@ -2,11 +2,11 @@
 
 This directory contains the observability stack for the application. The stack is composed of the following components:
 
-- Prometheus
-- Grafana
-- Loki
-- Jaeger
-- Otel Collector
+- Prometheus v3.2.1
+- Grafana 11.6.0
+- Loki 3.4.2
+- Jaeger 2.4.0
+- Otel Collector 0.120.0 #0.121.0 remove loki
 
 ## Prometheus
 
