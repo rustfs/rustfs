@@ -51,7 +51,8 @@ pub struct KafkaSinkConfig {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WebhookSinkConfig {
     pub enabled: bool,
-    pub url: String,
+    pub endpoint: String,
+    pub auth_token: String,
     pub max_retries: Option<usize>,  // Maximum number of retry times, default 3
     pub retry_delay_ms: Option<u64>, // Retry the delay cardinality, default 100ms
 }

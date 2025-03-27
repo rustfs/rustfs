@@ -18,7 +18,8 @@ batch_timeout_ms = 1000 # Default is 1000ms if not specified
 
 [sinks.webhook]
 enabled = false
-url = "http://localhost:8080/webhook"
+endpoint = "http://localhost:8080/webhook"
+auth_token = ""
 batch_size = 100 # Default is 3 if not specified
 batch_timeout_ms = 1000 # Default is 100ms if not specified
 
