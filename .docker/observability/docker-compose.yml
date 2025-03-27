@@ -16,7 +16,7 @@ services:
     networks:
       - otel-network
   jaeger:
-    image: jaegertracing/jaeger:2.3.0
+    image: jaegertracing/jaeger:2.4.0
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -26,7 +26,7 @@ services:
     networks:
       - otel-network
   prometheus:
-    image: prom/prometheus:v3.2.0
+    image: prom/prometheus:v3.2.1
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -42,12 +42,12 @@ services:
     volumes:
       - ./loki-config.yaml:/etc/loki/local-config.yaml
     ports:
-      - "3100:3100"  
-    command: -config.file=/etc/loki/local-config.yaml  
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
     networks:
       - otel-network
   grafana:
-    image: grafana/grafana:11.5.2
+    image: grafana/grafana:11.6.0
     ports:
       - "3000:3000"  # Web UI
     environment:
