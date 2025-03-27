@@ -179,7 +179,8 @@ impl Drop for KafkaSink {
 #[cfg(feature = "webhook")]
 /// Webhook Sink Implementation
 pub struct WebhookSink {
-    url: String,
+    endpoint: String,
+    auth_token: String,
     client: reqwest::Client,
     max_retries: usize,
     retry_delay_ms: u64,
@@ -187,9 +188,10 @@ pub struct WebhookSink {
 
 #[cfg(feature = "webhook")]
 impl WebhookSink {
-    pub fn new(url: String, max_retries: usize, retry_delay_ms: u64) -> Self {
+    pub fn new(endpoint: String, auth_token: String, max_retries: usize, retry_delay_ms: u64) -> Self {
         WebhookSink {
-            url,
+            endpoint,
+            auth_token,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -205,11 +207,18 @@ impl WebhookSink {
 impl Sink for WebhookSink {
     async fn write(&self, entry: &UnifiedLogEntry) {
         let mut retries = 0;
-        let url = self.url.clone();
+        let url = self.endpoint.clone();
         let entry_clone = entry.clone();
-
+        let auth_value = reqwest::header::HeaderValue::from_str(format!("Bearer {}", self.auth_token.clone()).as_str()).unwrap();
         while retries < self.max_retries {
-            match self.client.post(&url).json(&entry_clone).send().await {
+            match self
+                .client
+                .post(&url)
+                .header(reqwest::header::AUTHORIZATION, auth_value.clone())
+                .json(&entry_clone)
+                .send()
+                .await
+            {
                 Ok(response) if response.status().is_success() => {
                     return;
                 }
@@ -234,7 +243,7 @@ impl Drop for WebhookSink {
     fn drop(&mut self) {
         // Perform any necessary cleanup here
         // For example, you might want to log that the sink is being dropped
-        eprintln!("Dropping WebhookSink with URL: {}", self.url);
+        eprintln!("Dropping WebhookSink with URL: {}", self.endpoint);
     }
 }
 
@@ -410,7 +419,8 @@ pub fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
     #[cfg(feature = "webhook")]
     if config.sinks.webhook.enabled {
         sinks.push(Arc::new(WebhookSink::new(
-            config.sinks.webhook.url.clone(),
+            config.sinks.webhook.endpoint.clone(),
+            config.sinks.webhook.auth_token.clone(),
             config.sinks.webhook.max_retries.unwrap_or(3),
             config.sinks.webhook.retry_delay_ms.unwrap_or(100),
         )));
