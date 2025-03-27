@@ -1,22 +1,40 @@
+use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION};
 use config::{Config, File, FileFormat};
 use serde::Deserialize;
 use std::env;
 
 /// OpenTelemetry Configuration
-/// Add service name, service version, deployment environment
+/// Add service name, service version, environment
 /// Add interval time for metric collection
 /// Add sample ratio for trace sampling
 /// Add endpoint for metric collection
 /// Add use_stdout for output to stdout
-#[derive(Debug, Deserialize, Clone, Default)]
+/// Add logger level for log level
+#[derive(Debug, Deserialize, Clone)]
 pub struct OtelConfig {
     pub endpoint: String,
-    pub use_stdout: bool,
-    pub sample_ratio: f64,
-    pub meter_interval: u64,
-    pub service_name: String,
-    pub service_version: String,
-    pub deployment_environment: String,
+    pub use_stdout: Option<bool>,
+    pub sample_ratio: Option<f64>,
+    pub meter_interval: Option<u64>,
+    pub service_name: Option<String>,
+    pub service_version: Option<String>,
+    pub environment: Option<String>,
+    pub logger_level: Option<String>,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        OtelConfig {
+            endpoint: "".to_string(),
+            use_stdout: Some(true),
+            sample_ratio: Some(SAMPLE_RATIO),
+            meter_interval: Some(METER_INTERVAL),
+            service_name: Some(SERVICE_NAME.to_string()),
+            service_version: Some(SERVICE_VERSION.to_string()),
+            environment: Some(ENVIRONMENT.to_string()),
+            logger_level: Some(LOGGER_LEVEL.to_string()),
+        }
+    }
 }
 
 /// Kafka Sink Configuration - Add batch parameters
@@ -39,13 +57,25 @@ pub struct WebhookSinkConfig {
 }
 
 /// File Sink Configuration - Add buffering parameters
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct FileSinkConfig {
     pub enabled: bool,
     pub path: String,
     pub buffer_size: Option<usize>,     // Write buffer size, default 8192
     pub flush_interval_ms: Option<u64>, // Refresh interval time, default 1000ms
     pub flush_threshold: Option<usize>, // Refresh threshold, default 100 logs
+}
+
+impl Default for FileSinkConfig {
+    fn default() -> Self {
+        FileSinkConfig {
+            enabled: true,
+            path: "logs/app.log".to_string(),
+            buffer_size: Some(8192),
+            flush_interval_ms: Some(1000),
+            flush_threshold: Some(100),
+        }
+    }
 }
 
 /// Sink configuration collection
@@ -57,9 +87,17 @@ pub struct SinkConfig {
 }
 
 ///Logger Configuration
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct LoggerConfig {
     pub queue_capacity: Option<usize>,
+}
+
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        LoggerConfig {
+            queue_capacity: Some(1000),
+        }
+    }
 }
 
 /// Overall application configuration

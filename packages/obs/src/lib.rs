@@ -29,12 +29,12 @@
 /// ```
 mod config;
 mod entry;
+mod global;
 mod logger;
 mod sink;
 mod telemetry;
 mod utils;
 mod worker;
-
 pub use config::load_config;
 pub use config::{AppConfig, OtelConfig};
 pub use entry::args::Args;
@@ -42,15 +42,15 @@ pub use entry::audit::{ApiDetails, AuditLogEntry};
 pub use entry::base::BaseLogEntry;
 pub use entry::unified::{ConsoleLogEntry, ServerLogEntry, UnifiedLogEntry};
 pub use entry::{LogKind, LogRecord, ObjectVersion, SerializableLevel};
-pub use logger::start_logger;
-pub use logger::{
-    ensure_logger_initialized, get_global_logger, init_global_logger, locked_logger, log_debug, log_error, log_info, log_trace,
-    log_warn, log_with_context,
-};
+pub use global::{get_global_guard, set_global_guard, try_get_global_guard, GuardError};
+pub use logger::{ensure_logger_initialized, log_debug, log_error, log_info, log_trace, log_warn, log_with_context};
+pub use logger::{get_global_logger, init_global_logger, locked_logger, start_logger};
+pub use logger::{log_init_state, InitLogStatus};
 pub use logger::{LogError, Logger};
 pub use sink::Sink;
 use std::sync::Arc;
-pub use telemetry::{get_global_registry, init_telemetry, metrics_handler};
+pub use telemetry::init_telemetry;
+pub use telemetry::{get_global_registry, metrics};
 use tokio::sync::Mutex;
 pub use utils::{get_local_ip, get_local_ip_with_default};
 pub use worker::start_worker;

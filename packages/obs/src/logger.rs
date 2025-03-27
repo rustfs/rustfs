@@ -1,5 +1,7 @@
-use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, ServerLogEntry, Sink, UnifiedLogEntry};
+use crate::global::{ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION};
+use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, OtelConfig, ServerLogEntry, Sink, UnifiedLogEntry};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{Mutex, OnceCell};
 use tracing_core::Level;
@@ -470,4 +472,63 @@ pub async fn log_with_context(
         .await
         .write_with_context(message, source, level, request_id, user_id, fields)
         .await
+}
+
+/// Log initialization status
+#[derive(Debug)]
+pub struct InitLogStatus {
+    pub timestamp: SystemTime,
+    pub service_name: String,
+    pub version: String,
+    pub environment: String,
+}
+
+impl Default for InitLogStatus {
+    fn default() -> Self {
+        Self {
+            timestamp: SystemTime::now(),
+            service_name: String::from(SERVICE_NAME),
+            version: SERVICE_VERSION.to_string(),
+            environment: ENVIRONMENT.to_string(),
+        }
+    }
+}
+
+impl InitLogStatus {
+    pub fn new_config(config: &OtelConfig) -> Self {
+        let config = config.clone();
+        let environment = config.environment.unwrap_or(ENVIRONMENT.to_string());
+        let version = config.service_version.unwrap_or(SERVICE_VERSION.to_string());
+        Self {
+            timestamp: SystemTime::now(),
+            service_name: String::from(SERVICE_NAME),
+            version,
+            environment,
+        }
+    }
+
+    pub async fn init_start_log(config: &OtelConfig) -> Result<(), LogError> {
+        let status = Self::new_config(config);
+        log_init_state(Some(status)).await
+    }
+}
+
+/// Log initialization details during system startup
+pub async fn log_init_state(status: Option<InitLogStatus>) -> Result<(), LogError> {
+    let status = status.unwrap_or_default();
+
+    let base_entry = BaseLogEntry::new()
+        .timestamp(chrono::DateTime::from(status.timestamp))
+        .message(Some(format!(
+            "Service initialization started - {} v{} in {}",
+            status.service_name, status.version, status.environment
+        )))
+        .request_id(Some("system_init".to_string()));
+
+    let server_entry = ServerLogEntry::new(Level::INFO, "system_initialization".to_string())
+        .with_base(base_entry)
+        .user_id(Some("system".to_string()));
+
+    get_global_logger().lock().await.log_server_entry(server_entry).await?;
+    Ok(())
 }
