@@ -142,14 +142,20 @@ const DEFAULT_CONFIG_FILE: &str = "obs";
 /// ```
 pub fn load_config(config_dir: Option<String>) -> AppConfig {
     let config_dir = if let Some(path) = config_dir {
-        // Use the provided path
-        let path = std::path::Path::new(&path);
-        if path.extension().is_some() {
-            // If path has extension, use it as is (extension will be added by Config::builder)
-            path.with_extension("").to_string_lossy().into_owned()
+        // If a path is provided, check if it's empty
+        if path.is_empty() {
+            // If empty, use the default config file name
+            DEFAULT_CONFIG_FILE.to_string()
         } else {
-            // If path is a directory, append the default config file name
-            path.to_string_lossy().into_owned()
+            // Use the provided path
+            let path = std::path::Path::new(&path);
+            if path.extension().is_some() {
+                // If path has extension, use it as is (extension will be added by Config::builder)
+                path.with_extension("").to_string_lossy().into_owned()
+            } else {
+                // If path is a directory, append the default config file name
+                path.to_string_lossy().into_owned()
+            }
         }
     } else {
         // If no path provided, use current directory + default config file
@@ -166,11 +172,11 @@ pub fn load_config(config_dir: Option<String>) -> AppConfig {
     println!("Using config file base: {}", config_dir);
 
     let config = Config::builder()
-        .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml))
+        .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml).required(false))
         .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Yaml).required(false))
         .add_source(config::Environment::with_prefix(""))
         .build()
-        .unwrap();
+        .unwrap_or_default();
 
-    config.try_deserialize().unwrap()
+    config.try_deserialize().unwrap_or_default()
 }
