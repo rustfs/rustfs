@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io;
 use tokio::io::AsyncWriteExt;
+use tracing::debug;
 
 /// Sink Trait definition, asynchronously write logs
 #[async_trait]
@@ -268,8 +269,19 @@ impl FileSink {
         flush_interval_ms: u64,
         flush_threshold: usize,
     ) -> Result<Self, io::Error> {
-        let file = OpenOptions::new().append(true).create(true).open(&path).await?;
-
+        // check if the file exists
+        let file_exists = tokio::fs::metadata(&path).await.is_ok();
+        let file = if file_exists {
+            // If the file exists, open it in append mode
+            debug!("FileSink: File exists, opening in append mode.");
+            OpenOptions::new().append(true).create(true).open(&path).await?
+        } else {
+            // If the file does not exist, create it
+            debug!("FileSink: File does not exist, creating a new file.");
+            // Create the file and write a header or initial content if needed
+            OpenOptions::new().create(true).write(true).open(&path).await?
+        };
+        // let file = OpenOptions::new().append(true).create(true).open(&path).await?;
         let writer = io::BufWriter::with_capacity(buffer_size, file);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
