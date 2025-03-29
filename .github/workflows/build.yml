@@ -85,7 +85,7 @@ jobs:
           region: oss-cn-beijing
           bucket: rustfs-artifacts
           assets: |
-            ${{ steps.package.outputs.artifact_name }}.zip:/artifacts/rustfs/
+            ${{ steps.package.outputs.artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}
 
   build-rustfs-gui:
     runs-on: ubuntu-latest
@@ -184,7 +184,7 @@ jobs:
           region: oss-cn-beijing
           bucket: rustfs-artifacts
           assets: |
-            ${{ steps.package.outputs.gui_artifact_name }}.zip:/artifacts/rustfs/
+            ${{ steps.package.outputs.gui_artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.gui_artifact_name }}.zip
 
   merge:
     runs-on: ubuntu-latest
