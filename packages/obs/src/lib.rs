@@ -72,7 +72,7 @@ pub use worker::start_worker;
 /// ```
 pub async fn init_obs(config: AppConfig) -> (Arc<Mutex<Logger>>, telemetry::OtelGuard) {
     let guard = init_telemetry(&config.observability);
-    let sinks = sink::create_sinks(&config);
+    let sinks = sink::create_sinks(&config).await;
     let logger = init_global_logger(&config, sinks).await;
     (logger, guard)
 }
