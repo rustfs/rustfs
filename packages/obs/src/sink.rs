@@ -262,7 +262,7 @@ pub struct FileSink {
 
 #[cfg(feature = "file")]
 impl FileSink {
-    #[allow(dead_code)]
+    /// Create a new FileSink instance
     pub async fn new(
         path: String,
         buffer_size: usize,
@@ -271,6 +271,11 @@ impl FileSink {
     ) -> Result<Self, io::Error> {
         // check if the file exists
         let file_exists = tokio::fs::metadata(&path).await.is_ok();
+        // if the file not exists, create it
+        if !file_exists {
+            tokio::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap()).await?;
+            debug!("the file not exists,create if. path: {:?}", path)
+        }
         let file = if file_exists {
             // If the file exists, open it in append mode
             debug!("FileSink: File exists, opening in append mode.");
@@ -281,7 +286,6 @@ impl FileSink {
             // Create the file and write a header or initial content if needed
             OpenOptions::new().create(true).write(true).open(&path).await?
         };
-        // let file = OpenOptions::new().append(true).create(true).open(&path).await?;
         let writer = io::BufWriter::with_capacity(buffer_size, file);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -406,7 +410,7 @@ impl Drop for FileSink {
 }
 
 /// Create a list of Sink instances
-pub fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
+pub async fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
     let mut sinks: Vec<Arc<dyn Sink>> = Vec::new();
 
     #[cfg(feature = "kafka")]
@@ -445,31 +449,17 @@ pub fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
         } else {
             "default.log".to_string()
         };
-
-        // Use synchronous file operations
-        let file_result = std::fs::OpenOptions::new().append(true).create(true).open(&path);
-        match file_result {
-            Ok(file) => {
-                let buffer_size = config.sinks.file.buffer_size.unwrap_or(8192);
-                let writer = io::BufWriter::with_capacity(buffer_size, tokio::fs::File::from_std(file));
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-
-                sinks.push(Arc::new(FileSink {
-                    path: path.clone(),
-                    buffer_size,
-                    writer: Arc::new(tokio::sync::Mutex::new(writer)),
-                    entry_count: std::sync::atomic::AtomicUsize::new(0),
-                    last_flush: std::sync::atomic::AtomicU64::new(now),
-                    flush_interval_ms: config.sinks.file.flush_interval_ms.unwrap_or(1000),
-                    flush_threshold: config.sinks.file.flush_threshold.unwrap_or(100),
-                }));
-            }
-            Err(e) => eprintln!("Failed to create file sink: {}", e),
-        }
+        debug!("FileSink: Using path: {}", path);
+        sinks.push(Arc::new(
+            FileSink::new(
+                path.clone(),
+                config.sinks.file.buffer_size.unwrap_or(8192),
+                config.sinks.file.flush_interval_ms.unwrap_or(1000),
+                config.sinks.file.flush_threshold.unwrap_or(100),
+            )
+            .await
+            .unwrap(),
+        ));
     }
 
     sinks

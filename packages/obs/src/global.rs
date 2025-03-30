@@ -8,7 +8,7 @@ pub(crate) const SERVICE_NAME: &str = "RustFS";
 pub(crate) const SAMPLE_RATIO: f64 = 1.0;
 pub(crate) const METER_INTERVAL: u64 = 60;
 pub(crate) const SERVICE_VERSION: &str = "0.1.0";
-pub(crate) const ENVIRONMENT: &str = "development";
+pub(crate) const ENVIRONMENT: &str = "production";
 pub(crate) const LOGGER_LEVEL: &str = "info";
 
 /// Global guard for OpenTelemetry tracing
