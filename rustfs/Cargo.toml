@@ -47,7 +47,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
-tokio-util = { version = "0.7.13", features = ["io", "compat"] }
+tokio-util.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
