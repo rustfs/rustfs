@@ -113,15 +113,15 @@ pub fn check_claims_from_token(header: &HeaderMap, cred: &auth::Credentials) -> 
     }
 
     if token.is_empty() && cred.is_temp() && !cred.is_service_account() {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
+        return Err(s3_error!(InvalidRequest, "invalid token1"));
     }
 
     if !token.is_empty() && !cred.is_temp() {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
+        return Err(s3_error!(InvalidRequest, "invalid token2"));
     }
 
     if !cred.is_service_account() && cred.is_temp() && token != cred.session_token {
-        return Err(s3_error!(InvalidRequest, "invalid token"));
+        return Err(s3_error!(InvalidRequest, "invalid token3"));
     }
 
     if cred.is_temp() && cred.is_expired() {
