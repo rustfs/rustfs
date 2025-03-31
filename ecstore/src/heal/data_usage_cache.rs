@@ -588,7 +588,7 @@ impl DataUsageCache {
             Some(e) => e,
             None => return,
         };
-        if top_e.children.len() > DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS.try_into().unwrap() {
+        if top_e.children.len() > <u64 as TryInto<usize>>::try_into(DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS).unwrap() {
             self.reduce_children_of(&hash_path(&self.info.name), limit, true);
         }
         if self.cache.len() <= limit {

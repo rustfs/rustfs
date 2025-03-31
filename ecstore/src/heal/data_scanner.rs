@@ -352,7 +352,7 @@ impl CurrentScannerCycle {
 
             let str_len = rmp::decode::read_str_len(&mut cur)?;
 
-            // ！！！ Vec::with_capacity(str_len) 失败，vec!正常
+            // ！！！Vec::with_capacity(str_len) 失败，vec! 正常
             let mut field_buff = vec![0u8; str_len as usize];
 
             cur.read_exact(&mut field_buff)?;
@@ -435,7 +435,7 @@ impl ScannerItem {
 
     pub async fn apply_versions_actions(&self, fivs: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
         let obj_infos = self.apply_newer_noncurrent_version_limit(fivs).await?;
-        if obj_infos.len() >= SCANNER_EXCESS_OBJECT_VERSIONS.load(Ordering::SeqCst).try_into().unwrap() {
+        if obj_infos.len() >= <u64 as TryInto<usize>>::try_into(SCANNER_EXCESS_OBJECT_VERSIONS.load(Ordering::SeqCst)).unwrap() {
             // todo
         }
 
@@ -445,10 +445,7 @@ impl ScannerItem {
         }
 
         if cumulative_size
-            >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE
-                .load(Ordering::SeqCst)
-                .try_into()
-                .unwrap()
+            >= <u64 as TryInto<usize>>::try_into(SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst)).unwrap()
         {
             //todo
         }
@@ -684,16 +681,13 @@ impl FolderScanner {
             }
 
             let should_compact = self.new_cache.info.name != folder.name
-                && existing_folders.len() + new_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS.try_into().unwrap()
-                || existing_folders.len() + new_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS.try_into().unwrap();
+                && existing_folders.len() + new_folders.len()
+                    >= <u64 as TryInto<usize>>::try_into(DATA_SCANNER_COMPACT_AT_FOLDERS).unwrap()
+                || existing_folders.len() + new_folders.len()
+                    >= <u64 as TryInto<usize>>::try_into(DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS).unwrap();
 
             let total_folders = existing_folders.len() + new_folders.len();
-            if total_folders
-                > SCANNER_EXCESS_FOLDERS
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    .try_into()
-                    .unwrap()
-            {
+            if total_folders > <u64 as TryInto<usize>>::try_into(SCANNER_EXCESS_FOLDERS.load(Ordering::SeqCst)).unwrap() {
                 let _prefix_name = format!("{}/", folder.name.trim_end_matches('/'));
                 // todo: notification
             }
@@ -957,7 +951,7 @@ impl FolderScanner {
         if !into.compacted && self.new_cache.info.name != folder.name {
             let mut flat = self.new_cache.size_recursive(&this_hash.key()).unwrap_or_default();
             flat.compacted = true;
-            let compact = if flat.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT.try_into().unwrap() {
+            let compact = if flat.objects < <u64 as TryInto<usize>>::try_into(DATA_SCANNER_COMPACT_LEAST_OBJECT).unwrap() {
                 true
             } else {
                 // Compact if we only have objects as children...

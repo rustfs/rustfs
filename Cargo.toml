@@ -100,7 +100,7 @@ serde_json = "1.0.138"
 sha2 = "0.10.8"
 tempfile = "3.16.0"
 thiserror = "2.0.12"
-time = { version = "0.3.37", features = [
+time = { version = "0.3.41", features = [
     "std",
     "parsing",
     "formatting",
