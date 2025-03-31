@@ -45,8 +45,6 @@ use ecstore::xhttp;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
-use iam::policy::action::Action;
-use iam::policy::action::S3Action;
 use lazy_static::lazy_static;
 use log::warn;
 use policy::auth;

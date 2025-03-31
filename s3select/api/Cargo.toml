@@ -16,5 +16,7 @@ object_store = "0.11.2"
 s3s.workspace = true
 snafu = { workspace = true, features = ["backtrace"] }
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+transform-stream.workspace = true
 url.workspace = true

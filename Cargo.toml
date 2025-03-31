@@ -99,6 +99,7 @@ tonic = { version = "0.12.3", features = ["gzip"] }
 tonic-build = "0.12.3"
 tonic-reflection = "0.12"
 tokio-stream = "0.1.17"
+tokio-util = { version = "0.7.13", features = ["io", "compat"] }
 tower = { version = "0.5.2", features = ["timeout"] }
 tracing = "0.1.41"
 tracing-error = "0.2.1"

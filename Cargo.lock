@@ -194,7 +194,9 @@ dependencies = [
  "s3s",
  "snafu",
  "tokio",
+ "tokio-util",
  "tracing",
+ "transform-stream",
  "url",
 ]
 
