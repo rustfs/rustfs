@@ -63,7 +63,7 @@ where
     }
 }
 
-pub async fn make_cnosdbms(input: SelectObjectContentInput, is_test: bool) -> QueryResult<impl DatabaseManagerSystem> {
+pub async fn make_rustfsms(input: SelectObjectContentInput, is_test: bool) -> QueryResult<impl DatabaseManagerSystem> {
     // init Function Manager, we can define some UDF if need
     let func_manager = SimpleFunctionMetadataManager::default();
     // TODO session config need load global system config
@@ -105,7 +105,7 @@ mod tests {
         SelectObjectContentRequest,
     };
 
-    use crate::instance::make_cnosdbms;
+    use crate::instance::make_rustfsms;
 
     #[tokio::test]
     #[ignore]
@@ -133,7 +133,7 @@ mod tests {
                 scan_range: None,
             },
         };
-        let db = make_cnosdbms(input.clone(), true).await.unwrap();
+        let db = make_rustfsms(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input }, sql.to_string());
 
         let result = db.execute(&query).await.unwrap();

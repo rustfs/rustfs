@@ -53,7 +53,7 @@ use policy::policy::action::S3Action;
 use policy::policy::BucketPolicy;
 use policy::policy::BucketPolicyArgs;
 use policy::policy::Validator;
-use query::instance::make_cnosdbms;
+use query::instance::make_rustfsms;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -1878,7 +1878,7 @@ impl S3 for FS {
         let input = req.input;
         info!("{:?}", input);
 
-        let db = make_cnosdbms(input.clone(), false).await.map_err(|e| {
+        let db = make_rustfsms(input.clone(), false).await.map_err(|e| {
             error!("make db failed, {}", e.to_string());
             s3_error!(InternalError)
         })?;
