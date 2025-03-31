@@ -1,1 +1,1 @@
-curl -L "https://dl.rustfs.com/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -o tempfile.zip -d ./rustfs/static && rm tempfile.zip
+curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -o tempfile.zip -d ./rustfs/static && rm tempfile.zip

@@ -3,11 +3,11 @@ name: Build
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 0' # at midnight of each sunday
+    - cron: "0 0 * * 0" # at midnight of each sunday
   push:
     branches:
       - main
-    tags: [ 'v*', '*' ]
+    tags: ["v*", "*"]
 
 jobs:
   build-rustfs:
@@ -16,9 +16,17 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { profile: dev,     target: x86_64-unknown-linux-gnu, glibc: "default" }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
+          - { profile: dev, target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - {
+              profile: release,
+              target: x86_64-unknown-linux-gnu,
+              glibc: "default",
+            }
+          - {
+              profile: release,
+              target: x86_64-unknown-linux-gnu,
+              glibc: "2.31",
+            }
 
     steps:
       - uses: actions/checkout@v4
@@ -51,13 +59,13 @@ jobs:
             ARTIFACT_NAME="${ARTIFACT_NAME}-glibc${{ matrix.variant.glibc }}"
           fi
           echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
-          
+
           # Determine binary path
           bin_path="target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.bin"
           if [ -f "target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin" ]; then
             bin_path="target/artifacts/rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.glibc${{ matrix.variant.glibc }}.bin"
           fi
-          
+
           # Create package
           mkdir -p ${ARTIFACT_NAME}
           cp "$bin_path" ${ARTIFACT_NAME}/rustfs
@@ -69,6 +77,16 @@ jobs:
           name: ${{ steps.package.outputs.artifact_name }}
           path: ${{ steps.package.outputs.artifact_name }}.zip
           retention-days: 7
+      - name: Upload to Aliyun OSS
+        uses: JohnGuan/oss-upload-action@main
+        with:
+          key-id: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          key-secret: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          region: oss-cn-beijing
+          bucket: rustfs-artifacts
+          assets: |
+            ${{ steps.package.outputs.artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.zip
+            ${{ steps.package.outputs.artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.latest.zip
 
   build-rustfs-gui:
     runs-on: ubuntu-latest
@@ -88,7 +106,7 @@ jobs:
           name: "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}"
       - name: Display structure of downloaded files
         run: |
-          ls -R 
+          ls -R
           unzip -o -j "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}.zip" -d ./cli/rustfs-gui/embedded-rustfs/
           ls -la cli/rustfs-gui/embedded-rustfs
       - name: Cache dioxus-cli
@@ -108,12 +126,12 @@ jobs:
       - name: Build and Bundle rustfs-gui
         run: |
           ls -la
-          
+
           release_path="target/${{ matrix.variant.target }}"
           mkdir -p ${release_path}
           cd cli/rustfs-gui
           ls -la embedded-rustfs
-          
+
           # Configure the linker based on the target
           case "${{ matrix.target }}" in
           "x86_64-unknown-linux-gnu")
@@ -140,7 +158,7 @@ jobs:
           # Validating Environment Variables (for Debugging)
           echo "CC for ${{ matrix.target }}: $CC_${{ matrix.target }}"
           echo "Linker for ${{ matrix.target }}: $CARGO_TARGET_${{ matrix.target }}_LINKER"
-          
+
           if [[ "${{ matrix.variant.target }}" == *"apple-darwin"* ]]; then
             dx bundle --platform macos --package-types "macos" --package-types "dmg" --package-types "ios" --release --profile release --out-dir ../../${release_path}
           elif [[ "${{ matrix.variant.target }}" == *"windows-msvc"* ]]; then
@@ -159,13 +177,23 @@ jobs:
           name: ${{ steps.package.outputs.gui_artifact_name }}
           path: ${{ steps.package.outputs.gui_artifact_name }}.zip
           retention-days: 7
+      - name: Upload to Aliyun OSS
+        uses: JohnGuan/oss-upload-action@main
+        with:
+          key-id: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          key-secret: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          region: oss-cn-beijing
+          bucket: rustfs-artifacts
+          assets: |
+            ${{ steps.package.outputs.gui_artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.gui_artifact_name }}.zip
+            ${{ steps.package.outputs.gui_artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.gui_artifact_name }}.latest.zip
 
   merge:
     runs-on: ubuntu-latest
-    needs: [ build-rustfs, build-rustfs-gui ]
+    needs: [build-rustfs, build-rustfs-gui]
     steps:
       - uses: actions/upload-artifact/merge@v4
         with:
           name: rustfs-packages
-          pattern: 'rustfs-*'
+          pattern: "rustfs-*"
           delete-merged: true
