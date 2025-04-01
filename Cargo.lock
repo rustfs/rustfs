@@ -6680,7 +6680,6 @@ dependencies = [
  "lazy_static",
  "local-ip-address",
  "lock",
- "log",
  "madmin",
  "matchit 0.8.6",
  "mime",
