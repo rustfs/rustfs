@@ -18,7 +18,8 @@ pub(crate) fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'stati
     let mut reader = io::BufReader::new(cert_file);
 
     // Load and return certificate.
-    certs(&mut reader).collect()
+    let certs = certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    Ok(certs)
 }
 
 /// Load private key from file.
