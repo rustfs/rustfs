@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF, WindowUDF};
@@ -7,11 +6,11 @@ use crate::QueryResult;
 
 pub type FuncMetaManagerRef = Arc<dyn FunctionMetadataManager + Send + Sync>;
 pub trait FunctionMetadataManager {
-    fn register_udf(&mut self, udf: ScalarUDF) -> QueryResult<()>;
+    fn register_udf(&mut self, udf: Arc<ScalarUDF>) -> QueryResult<()>;
 
-    fn register_udaf(&mut self, udaf: AggregateUDF) -> QueryResult<()>;
+    fn register_udaf(&mut self, udaf: Arc<AggregateUDF>) -> QueryResult<()>;
 
-    fn register_udwf(&mut self, udwf: WindowUDF) -> QueryResult<()>;
+    fn register_udwf(&mut self, udwf: Arc<WindowUDF>) -> QueryResult<()>;
 
     fn udf(&self, name: &str) -> QueryResult<Arc<ScalarUDF>>;
 
@@ -19,5 +18,7 @@ pub trait FunctionMetadataManager {
 
     fn udwf(&self, name: &str) -> QueryResult<Arc<WindowUDF>>;
 
-    fn udfs(&self) -> HashSet<String>;
+    fn udfs(&self) -> Vec<String>;
+    fn udafs(&self) -> Vec<String>;
+    fn udwfs(&self) -> Vec<String>;
 }
