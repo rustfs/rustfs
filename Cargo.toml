@@ -47,9 +47,10 @@ flatbuffers = "24.12.23"
 futures = "0.3.31"
 futures-util = "0.3.31"
 common = { path = "./common/common" }
-policy = {path = "./policy"}
+policy = { path = "./policy" }
 hex = "0.4.3"
 hyper = "1.6.0"
+#hyper-rustls = { version = "0.27.5", features = ["http2"] }
 hyper-util = { version = "0.1.10", features = [
     "tokio",
     "server-auto",
@@ -72,11 +73,14 @@ prost-types = "0.13.4"
 protobuf = "3.7"
 protos = { path = "./common/protos" }
 rand = "0.8.5"
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration", "stream","blocking"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration", "stream", "blocking"] }
 rfd = { version = "0.15.2", default-features = false, features = ["xdg-portal", "tokio"] }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rust-embed = "8.6.0"
+rustls = { version = "0.23" }
+rustls-pki-types = "1.11.0"
+rustls-pemfile = "2.2.0"
 s3s = { git = "https://github.com/Nugine/s3s.git", rev = "ab139f72fe768fb9d8cecfe36269451da1ca9779", default-features = true, features = [
     "tower",
 ] }
@@ -98,9 +102,11 @@ tokio = { version = "1.43.0", features = ["fs", "rt-multi-thread"] }
 tonic = { version = "0.12.3", features = ["gzip"] }
 tonic-build = "0.12.3"
 tonic-reflection = "0.12"
+tokio-rustls = { version = "0.26", default-features = false }
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.13", features = ["io", "compat"] }
 tower = { version = "0.5.2", features = ["timeout"] }
+tower-http = { version = "0.6.2", features = ["cors"] }
 tracing = "0.1.41"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
@@ -112,12 +118,11 @@ uuid = { version = "1.15.1", features = [
     "fast-rng",
     "macro-diagnostics",
 ] }
-log = "0.4.25"
 axum = "0.7.9"
+axum-server = { version = "0.6", features = ["tls-rustls"] }
 md-5 = "0.10.6"
 workers = { path = "./common/workers" }
 test-case = "3.3.1"
-zip = "2.2.3"
 snafu = "0.8.5"
 
 

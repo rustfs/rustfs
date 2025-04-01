@@ -7,6 +7,14 @@ shadow_rs::shadow!(build);
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
+/// Default TLS key for rustfs
+/// This is the default key for TLS.
+pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_tls_key.pem";
+
+/// Default TLS cert for rustfs
+/// This is the default cert for TLS.
+pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_tls_cert.pem";
+
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
     if !build::TAG.is_empty() {
@@ -62,4 +70,8 @@ pub struct Opt {
 
     #[arg(long, default_value_t = format!("127.0.0.1:{}", 9002), env = "RUSTFS_CONSOLE_ADDRESS")]
     pub console_address: String,
+
+    /// tls path for rustfs api and console.
+    #[arg(long, env = "RUSTFS_TLS_PATH")]
+    pub tls_path: Option<String>,
 }

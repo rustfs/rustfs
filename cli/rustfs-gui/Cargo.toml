@@ -10,7 +10,6 @@ version.workspace = true
 chrono = { workspace = true }
 dioxus = { workspace = true, features = ["router"] }
 dirs = { workspace = true }
-futures-util = { workspace = true }
 hex = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }

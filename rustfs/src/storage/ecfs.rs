@@ -46,7 +46,6 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use log::warn;
 use policy::auth;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
@@ -70,6 +69,7 @@ use tokio_util::io::StreamReader;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
@@ -230,7 +230,7 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
-        // TODO: DeleteBucketInput 没有force参数？
+        // TODO: DeleteBucketInput 没有 force 参数？
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -586,8 +586,8 @@ impl S3 for FS {
                         .await
                         .is_ok()
                         || authorize_request(&mut req, Action::S3Action(S3Action::GetBucketLocationAction))
-                            .await
-                            .is_ok()
+                        .await
+                        .is_ok()
                 })
             });
         }
@@ -1256,7 +1256,7 @@ impl S3 for FS {
             conditions: &conditions,
             object: "",
         })
-        .await;
+            .await;
 
         let write_olny = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
@@ -1267,7 +1267,7 @@ impl S3 for FS {
             conditions: &conditions,
             object: "",
         })
-        .await;
+            .await;
 
         let is_public = read_olny && write_olny;
 
@@ -1680,11 +1680,11 @@ impl S3 for FS {
         // TODO: valid target list
 
         if let Some(NotificationConfiguration {
-            event_bridge_configuration,
-            lambda_function_configurations,
-            queue_configurations,
-            topic_configurations,
-        }) = has_notification_config
+                        event_bridge_configuration,
+                        lambda_function_configurations,
+                        queue_configurations,
+                        topic_configurations,
+                    }) = has_notification_config
         {
             Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
                 event_bridge_configuration,
@@ -1785,10 +1785,10 @@ impl S3 for FS {
                     //
                     !gs.is_empty()
                         && gs.first().is_some_and(|g| {
-                            g.to_owned()
-                                .permission
-                                .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
-                        })
+                        g.to_owned()
+                            .permission
+                            .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
+                    })
                 })
             });
 
@@ -1855,10 +1855,10 @@ impl S3 for FS {
                     //
                     !gs.is_empty()
                         && gs.first().is_some_and(|g| {
-                            g.to_owned()
-                                .permission
-                                .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
-                        })
+                        g.to_owned()
+                            .permission
+                            .is_some_and(|p| p.as_str() == Permission::FULL_CONTROL)
+                    })
                 })
             });
 
@@ -1934,9 +1934,9 @@ impl S3 for FS {
 }
 
 #[allow(dead_code)]
-pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
+pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item=Result<Bytes, E>> + Send + 'static
 where
-    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    S: Stream<Item=Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
     AsyncTryStream::<Bytes, E, _>::new(|mut y| async move {

@@ -9,13 +9,14 @@ mod utils;
 
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
+use crate::utils::error;
 use chrono::Datelike;
 use clap::Parser;
 use common::{
     error::{Error, Result},
     globals::set_global_addr,
 };
-use config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
+use config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::utils::net::{self, get_available_port};
 use ecstore::{
@@ -34,10 +35,13 @@ use hyper_util::{
 };
 use iam::init_iam_sys;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
+use std::sync::Arc;
 use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
@@ -87,7 +91,7 @@ fn main() -> Result<()> {
     //解析获得到的参数
     let opt = config::Opt::parse();
 
-    //设置trace
+    //设置 trace
     setup_tracing();
 
     //运行参数
@@ -110,18 +114,17 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     debug!("server_address {}", &server_address);
 
-    //设置AK和SK
-
+    //设置 AK 和 SK
     iam::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone())).unwrap();
     set_global_rustfs_port(server_port);
 
-    //监听地址,端口从参数中获取
+    //监听地址，端口从参数中获取
     let listener = TcpListener::bind(server_address.clone()).await?;
     //获取监听地址
     let local_addr: SocketAddr = listener.local_addr()?;
     let local_ip = utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
-    // 用于rpc
+    // 用于 rpc
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
 
@@ -172,7 +175,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         .map_err(|err| Error::from_string(err.to_string()))?;
 
     // Setup S3 service
-    // 本项目使用s3s库来实现s3服务
+    // 本项目使用 s3s 库来实现 s3 服务
     let service = {
         let store = storage::ecfs::FS::new();
         // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(server_address.clone(), endpoint_pools).await?);
@@ -180,7 +183,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         let access_key = opt.access_key.clone();
         let secret_key = opt.secret_key.clone();
-        //显示info信息
+        //显示 info 信息
         debug!("authentication is enabled {}, {}", &access_key, &secret_key);
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
@@ -213,9 +216,28 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
+    let tls_path = opt.tls_path.clone().unwrap_or_default();
+    let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
+    let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+    let has_tls_certs = tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
+    let tls_acceptor = if has_tls_certs {
+        debug!("Found TLS certificates, starting with HTTPS");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certs = utils::load_certs(cert_path.as_str()).map_err(|e| error(e.to_string()))?;
+        let key = utils::load_private_key(key_path.as_str()).map_err(|e| error(e.to_string()))?;
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| error(e.to_string()))?;
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+        Some(TlsAcceptor::from(Arc::new(server_config)))
+    } else {
+        debug!("TLS certificates not found, starting with HTTP");
+        None
+    };
+
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
-
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
                 .layer(CorsLayer::permissive())
@@ -225,8 +247,10 @@ async fn run(opt: config::Opt) -> Result<()> {
         let http_server = ConnBuilder::new(TokioExecutor::new());
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-
+        debug!("graceful initiated");
         loop {
+            debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
+            // Wait for a connection
             let (socket, _) = tokio::select! {
                 res = listener.accept() => {
                     match res {
@@ -241,20 +265,46 @@ async fn run(opt: config::Opt) -> Result<()> {
                     break;
                 }
             };
-
-            let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
-            let conn = graceful.watch(conn.into_owned());
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
+            if has_tls_certs {
+                debug!("TLS certificates found, starting with SIGINT");
+                let tls_socket = match tls_acceptor.as_ref().ok_or_else(|| error("TLS not configured".to_string())).unwrap().accept(socket).await {
+                    Ok(tls_socket) => tls_socket,
+                    Err(err) => {
+                        error!("TLS handshake failed {}", err);
+                        continue;
+                    }
+                };
+                let conn = http_server.serve_connection(TokioIo::new(tls_socket), hybrid_service.clone());
+                let conn = graceful.watch(conn.into_owned());
+                tokio::task::spawn_blocking(move || {
+                    tokio::runtime::Runtime::new()
+                        .expect("Failed to create runtime")
+                        .block_on(async move {
+                            if let Err(err) = conn.await {
+                                error!("Https Connection error: {}", err);
+                            }
+                        });
+                });
+                debug!("TLS handshake success");
+            } else {
+                debug!("Http handshake start");
+                let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
+                let conn = graceful.watch(conn.into_owned());
+                tokio::spawn(async move {
+                    if let Err(err) = conn.await {
+                        error!("Http Connection error: {}", err);
+                    }
+                });
+                debug!("Http handshake success");
+            }
         }
 
         tokio::select! {
             () = graceful.shutdown() => {
-                 tracing::debug!("Gracefully shutdown!");
+                 debug!("Gracefully shutdown!");
             },
             () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                 tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
+                 debug!("Waited 10 seconds for graceful shutdown, aborting...");
             }
         }
     });
@@ -268,7 +318,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         })?;
 
     ECStore::init(store.clone()).await.map_err(|err| {
-        error!("ECStore init faild {:?}", &err);
+        error!("ECStore init failed {:?}", &err);
         Error::from_string(err.to_string())
     })?;
     debug!("init store success!");
@@ -276,7 +326,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_iam_sys(store.clone()).await.unwrap();
 
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
-        error!("new_global_notification_sys faild {:?}", &err);
+        error!("new_global_notification_sys failed {:?}", &err);
         Error::from_string(err.to_string())
     })?;
 
@@ -294,8 +344,15 @@ async fn run(opt: config::Opt) -> Result<()> {
         let access_key = opt.access_key.clone();
         let secret_key = opt.secret_key.clone();
         let console_address = opt.console_address.clone();
+        let tls_path = opt.tls_path.clone();
+
+        if console_address.is_empty() {
+            error!("console_address is empty");
+            return Err(Error::from_string("console_address is empty".to_string()));
+        }
+
         tokio::spawn(async move {
-            console::start_static_file_server(&console_address, local_ip, &access_key, &secret_key).await;
+            console::start_static_file_server(&console_address, local_ip, &access_key, &secret_key, tls_path).await;
         });
     }
 
