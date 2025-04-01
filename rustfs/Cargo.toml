@@ -16,7 +16,7 @@ workspace = true
 
 [dependencies]
 madmin.workspace = true
-log.workspace = true
+#log.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
