@@ -1,12 +1,12 @@
 use common::error::{Error, Result};
 use ecstore::store::ECStore;
 use error::Error as IamError;
-use log::debug;
 use manager::IamCache;
 use policy::auth::Credentials;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
+use tracing::debug;
 
 pub mod cache;
 pub mod error;

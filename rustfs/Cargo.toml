@@ -16,7 +16,6 @@ workspace = true
 
 [dependencies]
 madmin.workspace = true
-#log.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
@@ -30,7 +29,6 @@ futures.workspace = true
 futures-util.workspace = true
 h2 = "0.4.7"
 hyper.workspace = true
-#hyper-rustls.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
@@ -61,7 +59,7 @@ tokio = { workspace = true, features = [
 tokio-rustls.workspace = true
 lazy_static.workspace = true
 tokio-stream.workspace = true
-tonic = { version = "0.12.3", features = ["gzip"] }
+tonic.workspace = true
 tonic-reflection.workspace = true
 tower.workspace = true
 tracing-error.workspace = true
@@ -81,7 +79,7 @@ query = { path = "../s3select/query" }
 api = { path = "../s3select/api" }
 iam = { path = "../iam" }
 jsonwebtoken = "9.3.0"
-tower-http = { version = "0.6.2", features = ["cors"] }
+tower-http.workspace = true
 mime_guess = "2.0.5"
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 local-ip-address = { workspace = true }
