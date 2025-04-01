@@ -106,6 +106,7 @@ tokio-rustls = { version = "0.26", default-features = false }
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.13", features = ["io", "compat"] }
 tower = { version = "0.5.2", features = ["timeout"] }
+tower-http = { version = "0.6.2", features = ["cors"] }
 tracing = "0.1.41"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
@@ -117,13 +118,11 @@ uuid = { version = "1.15.1", features = [
     "fast-rng",
     "macro-diagnostics",
 ] }
-log = "0.4.25"
 axum = "0.7.9"
 axum-server = { version = "0.6", features = ["tls-rustls"] }
 md-5 = "0.10.6"
 workers = { path = "./common/workers" }
 test-case = "3.3.1"
-zip = "2.2.3"
 snafu = "0.8.5"
 
 
