@@ -27,7 +27,6 @@ use ecstore::{
     update_erasure_type,
 };
 use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
-use futures_util::TryFutureExt;
 use grpc::make_server;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -216,13 +215,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     };
 
     let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
+
     let tls_path = opt.tls_path.clone().unwrap_or_default();
     let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
     let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
-
     let has_tls_certs = tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
-
-    if has_tls_certs {
+    let tls_acceptor = if has_tls_certs {
+        debug!("Found TLS certificates, starting with HTTPS");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certs = utils::load_certs(cert_path.as_str()).map_err(|e| error(e.to_string()))?;
         let key = utils::load_private_key(key_path.as_str()).map_err(|e| error(e.to_string()))?;
         let mut server_config = ServerConfig::builder()
@@ -230,12 +230,14 @@ async fn run(opt: config::Opt) -> Result<()> {
             .with_single_cert(certs, key)
             .map_err(|e| error(e.to_string()))?;
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+        Some(TlsAcceptor::from(Arc::new(server_config)))
+    } else {
+        debug!("TLS certificates not found, starting with HTTP");
+        None
     };
 
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
-
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
                 .layer(CorsLayer::permissive())
@@ -245,8 +247,10 @@ async fn run(opt: config::Opt) -> Result<()> {
         let http_server = ConnBuilder::new(TokioExecutor::new());
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-
+        debug!("graceful initiated");
         loop {
+            debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
+            // Wait for a connection
             let (socket, _) = tokio::select! {
                 res = listener.accept() => {
                     match res {
@@ -261,12 +265,38 @@ async fn run(opt: config::Opt) -> Result<()> {
                     break;
                 }
             };
-
-            let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
-            let conn = graceful.watch(conn.into_owned());
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
+            if has_tls_certs {
+                debug!("TLS certificates found, starting with SIGINT");
+                let tls_socket = match tls_acceptor.as_ref().ok_or_else(|| error("TLS not configured".to_string())).unwrap().accept(socket).await {
+                    Ok(tls_socket) => tls_socket,
+                    Err(err) => {
+                        error!("TLS handshake failed {}", err);
+                        continue;
+                    }
+                };
+                let conn = http_server.serve_connection(TokioIo::new(tls_socket), hybrid_service.clone());
+                let conn = graceful.watch(conn.into_owned());
+                tokio::task::spawn_blocking(move || {
+                    tokio::runtime::Runtime::new()
+                        .expect("Failed to create runtime")
+                        .block_on(async move {
+                            if let Err(err) = conn.await {
+                                error!("Https Connection error: {}", err);
+                            }
+                        });
+                });
+                debug!("TLS handshake success");
+            } else {
+                debug!("Http handshake start");
+                let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
+                let conn = graceful.watch(conn.into_owned());
+                tokio::spawn(async move {
+                    if let Err(err) = conn.await {
+                        error!("Http Connection error: {}", err);
+                    }
+                });
+                debug!("Http handshake success");
+            }
         }
 
         tokio::select! {

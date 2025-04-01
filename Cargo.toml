@@ -50,7 +50,7 @@ common = { path = "./common/common" }
 policy = { path = "./policy" }
 hex = "0.4.3"
 hyper = "1.6.0"
-hyper-rustls = { version = "0.27.5", features = ["http2"] }
+#hyper-rustls = { version = "0.27.5", features = ["http2"] }
 hyper-util = { version = "0.1.10", features = [
     "tokio",
     "server-auto",
