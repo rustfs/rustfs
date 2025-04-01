@@ -28,7 +28,10 @@ pub(crate) fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'stat
     let mut reader = io::BufReader::new(keyfile);
 
     // Load and return a single private key.
-    private_key(&mut reader).map(|key| key.unwrap())
+    match private_key(&mut reader) {
+        Some(key) => Ok(key),
+        None => Err(error(format!("no private key found in {}", filename))),
+    }
 }
 
 pub(crate) fn error(err: String) -> io::Error {
