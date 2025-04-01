@@ -6,18 +6,23 @@ use axum::{
     routing::get,
     Router,
 };
-
+use axum_server::tls_rustls::RustlsConfig;
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::OnceLock;
-use tracing::info;
+use std::time::Duration;
+use tokio::signal;
+use tracing::{debug, error, info};
 
 shadow!(build);
 
 const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
+
+const RUSTFS_CONSOLE_TLS_KEY: &str = "rustfs_console_tls_key.pem";
+const RUSTFS_CONSOLE_TLS_CERT: &str = "rustfs_console_tls_cert.pem";
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/static"]
@@ -189,18 +194,104 @@ async fn config_handler(Host(host): Host) -> impl IntoResponse {
         .unwrap()
 }
 
-pub async fn start_static_file_server(addrs: &str, local_ip: Ipv4Addr, access_key: &str, secret_key: &str) {
-    // 创建路由
+pub async fn start_static_file_server(
+    addrs: &str,
+    local_ip: Ipv4Addr,
+    access_key: &str,
+    secret_key: &str,
+    tls_path: Option<String>,
+) {
+    // Create a route
     let app = Router::new()
         .route("/config.json", get(config_handler))
         .nest_service("/", get(static_handler));
-
-    let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
-
+    let local_addr: SocketAddr = addrs.parse().expect("Failed to parse socket address");
     info!("WebUI: http://{}:{} http://127.0.0.1:{}", local_ip, local_addr.port(), local_addr.port());
     info!("   RootUser: {}", access_key);
     info!("   RootPass: {}", secret_key);
 
-    axum::serve(listener, app).await.unwrap();
+    let tls_path = tls_path.unwrap_or_default();
+    let key_path = format!("{}/{}", tls_path, RUSTFS_CONSOLE_TLS_KEY);
+    let cert_path = format!("{}/{}", tls_path, RUSTFS_CONSOLE_TLS_CERT);
+    // Check and start the HTTPS/HTTP server
+    match start_server(addrs, local_addr, &key_path, &cert_path, app.clone()).await {
+        Ok(_) => info!("Server shutdown gracefully"),
+        Err(e) => error!("Server error: {}", e),
+    }
+}
+async fn start_server(addrs: &str, local_addr: SocketAddr, key_path: &str, cert_path: &str, app: Router) -> std::io::Result<()> {
+    let has_tls_certs = tokio::try_join!(tokio::fs::metadata(key_path), tokio::fs::metadata(cert_path)).is_ok();
+
+    if has_tls_certs {
+        debug!("Found TLS certificates, starting with HTTPS");
+        match tokio::try_join!(tokio::fs::read(key_path), tokio::fs::read(cert_path)) {
+            Ok((key_data, cert_data)) => {
+                match RustlsConfig::from_pem(cert_data, key_data).await {
+                    Ok(config) => {
+                        let handle = axum_server::Handle::new();
+                        // create a signal off listening task
+                        let handle_clone = handle.clone();
+                        tokio::spawn(async move {
+                            shutdown_signal().await;
+                            handle_clone.graceful_shutdown(Some(Duration::from_secs(10)));
+                        });
+                        debug!("Starting HTTPS server...");
+                        axum_server::bind_rustls(local_addr, config)
+                            .handle(handle.clone())
+                            .serve(app.into_make_service())
+                            .await
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("Failed to create TLS config: {}", e);
+                        start_http_server(addrs, app).await
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read TLS certificates: {}", e);
+                start_http_server(addrs, app).await
+            }
+        }
+    } else {
+        debug!("TLS certificates not found at {} and {}", key_path, cert_path);
+        start_http_server(addrs, app).await
+    }
+}
+
+async fn start_http_server(addrs: &str, app: Router) -> std::io::Result<()> {
+    debug!("Starting HTTP server...");
+    let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("shutdown_signal ctrl_c")
+        },
+        _ = terminate => {
+            info!("shutdown_signal terminate")
+        },
+    }
 }

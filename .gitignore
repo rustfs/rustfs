@@ -9,3 +9,6 @@
 rustfs/static/*
 vendor
 cli/rustfs-gui/embedded-rustfs/rustfs
+.log
+config/obs.toml
+config/certs/*
