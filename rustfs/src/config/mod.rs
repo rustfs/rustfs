@@ -9,11 +9,11 @@ pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
 /// Default TLS key for rustfs
 /// This is the default key for TLS.
-pub const RUSTFS_TLS_KEY: &str = "rustfs_tls_key.pem";
+pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_tls_key.pem";
 
 /// Default TLS cert for rustfs
 /// This is the default cert for TLS.
-pub const RUSTFS_TLS_CERT: &str = "rustfs_tls_cert.pem";
+pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_tls_cert.pem";
 
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {

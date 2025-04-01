@@ -9,13 +9,14 @@ mod utils;
 
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
+use crate::utils::error;
 use chrono::Datelike;
 use clap::Parser;
 use common::{
     error::{Error, Result},
     globals::set_global_addr,
 };
-use config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
+use config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::utils::net::{self, get_available_port};
 use ecstore::{
@@ -26,6 +27,7 @@ use ecstore::{
     update_erasure_type,
 };
 use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
+use futures_util::TryFutureExt;
 use grpc::make_server;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -34,10 +36,13 @@ use hyper_util::{
 };
 use iam::init_iam_sys;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
+use std::sync::Arc;
 use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
@@ -211,6 +216,22 @@ async fn run(opt: config::Opt) -> Result<()> {
     };
 
     let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
+    let tls_path = opt.tls_path.clone().unwrap_or_default();
+    let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
+    let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+
+    let has_tls_certs = tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
+
+    if has_tls_certs {
+        let certs = utils::load_certs(cert_path.as_str()).map_err(|e| error(e.to_string()))?;
+        let key = utils::load_private_key(key_path.as_str()).map_err(|e| error(e.to_string()))?;
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| error(e.to_string()))?;
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+    };
 
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
@@ -250,10 +271,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         tokio::select! {
             () = graceful.shutdown() => {
-                 tracing::debug!("Gracefully shutdown!");
+                 debug!("Gracefully shutdown!");
             },
             () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                 tracing::debug!("Waited 10 seconds for graceful shutdown, aborting...");
+                 debug!("Waited 10 seconds for graceful shutdown, aborting...");
             }
         }
     });
@@ -267,7 +288,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         })?;
 
     ECStore::init(store.clone()).await.map_err(|err| {
-        error!("ECStore init faild {:?}", &err);
+        error!("ECStore init failed {:?}", &err);
         Error::from_string(err.to_string())
     })?;
     debug!("init store success!");
@@ -275,7 +296,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_iam_sys(store.clone()).await.unwrap();
 
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
-        error!("new_global_notification_sys faild {:?}", &err);
+        error!("new_global_notification_sys failed {:?}", &err);
         Error::from_string(err.to_string())
     })?;
 
