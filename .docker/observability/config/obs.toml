@@ -1,11 +1,11 @@
 [observability]
 endpoint = "http://localhost:4317" # Default is "http://localhost:4317" if not specified
-use_stdout = true
+use_stdout = false # Output with stdout, true output, false no output
 sample_ratio = 2.0
 meter_interval = 30
 service_name = "rustfs"
 service_version = "0.1.0"
-environments = "develop"
+environments = "production"
 logger_level = "info"
 
 [sinks]
@@ -25,7 +25,7 @@ batch_timeout_ms = 1000 # Default is 100ms if not specified
 
 [sinks.file]
 enabled = true
-path = "/Users/qun/Documents/rust/rustfs/s3-rustfs/logs/app.log"
+path = "/root/data/logs/app.log"
 batch_size = 10
 batch_timeout_ms = 1000 # Default is 8192 bytes if not specified
 

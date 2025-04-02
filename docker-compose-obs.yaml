@@ -62,7 +62,7 @@ services:
       dockerfile: Dockerfile.obs
     container_name: node1
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
+      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
@@ -83,7 +83,7 @@ services:
       dockerfile: Dockerfile.obs
     container_name: node2
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
+      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
@@ -104,7 +104,7 @@ services:
       dockerfile: Dockerfile.obs
     container_name: node3
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
+      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
@@ -125,7 +125,7 @@ services:
       dockerfile: Dockerfile.obs
     container_name: node4
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
+      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
