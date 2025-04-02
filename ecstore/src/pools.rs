@@ -1,11 +1,13 @@
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::cache_value::metacache_set::{list_path_raw, AgreedFn, ListPathRawOptions, PartialFn};
 use crate::config::com::{read_config, save_config, CONFIG_PREFIX};
 use crate::config::error::ConfigError;
-use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::disk::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
-use crate::store_api::{BucketOptions, MakeBucketOptions, StorageAPI};
+use crate::set_disk::SetDisks;
+use crate::store_api::{BucketOptions, GetObjectReader, MakeBucketOptions, StorageAPI};
 use crate::store_err::{is_err_bucket_exists, StorageError};
 use crate::utils::path::{path_join, SLASH_SEPARATOR};
 use crate::{sets::Sets, store::ECStore};
@@ -18,6 +20,7 @@ use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
+use tokio::sync::broadcast::Receiver as B_Receiver;
 use tracing::{error, info, warn};
 
 pub const POOL_META_NAME: &str = "pool.bin";
@@ -703,6 +706,58 @@ impl ECStore {
         });
 
         Ok(ret)
+    }
+
+    fn decommission_object(&self, id: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+impl SetDisks {
+    //
+    async fn list_objects_to_decommission(
+        self: &Arc<Self>,
+        rx: B_Receiver<bool>,
+        bucket_info: DecomBucketInfo,
+        func: Arc<dyn Fn(MetaCacheEntry) + Send + Sync>,
+    ) -> Result<()> {
+        let (disks, _) = self.get_online_disks_with_healing(false).await;
+        if disks.is_empty() {
+            return Err(Error::msg("errNoDiskAvailable"));
+        }
+
+        let listing_quorum = (self.set_drive_count + 1) / 2;
+
+        let resolver = MetadataResolutionParams {
+            dir_quorum: listing_quorum,
+            obj_quorum: listing_quorum,
+            bucket: bucket_info.name.clone(),
+            ..Default::default()
+        };
+
+        list_path_raw(
+            rx,
+            ListPathRawOptions {
+                disks: disks.iter().cloned().map(Some).collect(),
+                bucket: bucket_info.name.clone(),
+                path: bucket_info.prefix.clone(),
+                recursice: true,
+                min_disks: listing_quorum,
+                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                    let resolver = resolver.clone();
+                    let func = func.clone();
+                    Box::pin(async move {
+                        if let Ok(Some(entry)) = entries.resolve(resolver) {
+                            func(entry);
+                        }
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        Ok(())
     }
 }
 
