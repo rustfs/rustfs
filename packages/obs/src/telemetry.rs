@@ -258,7 +258,7 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             }
             _ => {
                 let mut filter = EnvFilter::new(logger_level);
-                for directive in ["hyper", "opentelemetry", "tonic", "h2", "reqwest"] {
+                for directive in ["hyper", "tonic", "h2", "reqwest"] {
                     filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
                 }
                 filter

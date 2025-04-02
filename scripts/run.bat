@@ -24,6 +24,8 @@ set RUSTFS_ADDRESS=0.0.0.0:9000
 set RUSTFS_CONSOLE_ENABLE=true
 set RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
 rem set RUSTFS_SERVER_DOMAINS=localhost:9000
+rem 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考
+set RUSTFS_OBS_CONFIG=.\config\obs.example.toml"
 
 if not "%~1"=="" (
     set RUSTFS_VOLUMES=%~1
