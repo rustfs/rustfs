@@ -1,11 +1,12 @@
 [observability]
-endpoint = "http://localhost:4317"
-use_stdout = true
+endpoint = "http://localhost:4317" # Default is "http://localhost:4317" if not specified
+use_stdout = false # Output with stdout, true output, false no output
 sample_ratio = 1
 meter_interval = 30
 service_name = "rustfs_obs"
 service_version = "0.1.0"
-deployment_environment = "develop"
+environments = "develop"
+logger_levela = "debug"
 
 [sinks]
 [sinks.kafka]
@@ -17,7 +18,8 @@ batch_timeout_ms = 1000 # Default is 1000ms if not specified
 
 [sinks.webhook]
 enabled = false
-url = "http://localhost:8080/webhook"
+endpoint = "http://localhost:8080/webhook"
+auth_token = ""
 batch_size = 100 # Default is 3 if not specified
 batch_timeout_ms = 1000 # Default is 100ms if not specified
 
