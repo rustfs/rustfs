@@ -1,0 +1,182 @@
+use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION};
+use config::{Config, File, FileFormat};
+use serde::Deserialize;
+use std::env;
+
+/// OpenTelemetry Configuration
+/// Add service name, service version, environment
+/// Add interval time for metric collection
+/// Add sample ratio for trace sampling
+/// Add endpoint for metric collection
+/// Add use_stdout for output to stdout
+/// Add logger level for log level
+#[derive(Debug, Deserialize, Clone)]
+pub struct OtelConfig {
+    pub endpoint: String,
+    pub use_stdout: Option<bool>,
+    pub sample_ratio: Option<f64>,
+    pub meter_interval: Option<u64>,
+    pub service_name: Option<String>,
+    pub service_version: Option<String>,
+    pub environment: Option<String>,
+    pub logger_level: Option<String>,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        OtelConfig {
+            endpoint: "".to_string(),
+            use_stdout: Some(true),
+            sample_ratio: Some(SAMPLE_RATIO),
+            meter_interval: Some(METER_INTERVAL),
+            service_name: Some(SERVICE_NAME.to_string()),
+            service_version: Some(SERVICE_VERSION.to_string()),
+            environment: Some(ENVIRONMENT.to_string()),
+            logger_level: Some(LOGGER_LEVEL.to_string()),
+        }
+    }
+}
+
+/// Kafka Sink Configuration - Add batch parameters
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct KafkaSinkConfig {
+    pub enabled: bool,
+    pub bootstrap_servers: String,
+    pub topic: String,
+    pub batch_size: Option<usize>,     // Batch size, default 100
+    pub batch_timeout_ms: Option<u64>, // Batch timeout time, default 1000ms
+}
+
+/// Webhook Sink Configuration - Add Retry Parameters
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WebhookSinkConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub auth_token: String,
+    pub max_retries: Option<usize>,  // Maximum number of retry times, default 3
+    pub retry_delay_ms: Option<u64>, // Retry the delay cardinality, default 100ms
+}
+
+/// File Sink Configuration - Add buffering parameters
+#[derive(Debug, Deserialize, Clone)]
+pub struct FileSinkConfig {
+    pub enabled: bool,
+    pub path: String,
+    pub buffer_size: Option<usize>,     // Write buffer size, default 8192
+    pub flush_interval_ms: Option<u64>, // Refresh interval time, default 1000ms
+    pub flush_threshold: Option<usize>, // Refresh threshold, default 100 logs
+}
+
+impl Default for FileSinkConfig {
+    fn default() -> Self {
+        FileSinkConfig {
+            enabled: true,
+            path: "logs/app.log".to_string(),
+            buffer_size: Some(8192),
+            flush_interval_ms: Some(1000),
+            flush_threshold: Some(100),
+        }
+    }
+}
+
+/// Sink configuration collection
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SinkConfig {
+    pub kafka: KafkaSinkConfig,
+    pub webhook: WebhookSinkConfig,
+    pub file: FileSinkConfig,
+}
+
+///Logger Configuration
+#[derive(Debug, Deserialize, Clone)]
+pub struct LoggerConfig {
+    pub queue_capacity: Option<usize>,
+}
+
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        LoggerConfig {
+            queue_capacity: Some(1000),
+        }
+    }
+}
+
+/// Overall application configuration
+/// Add observability, sinks, and logger configuration
+///
+/// Observability: OpenTelemetry configuration
+/// Sinks: Kafka, Webhook, File sink configuration
+/// Logger: Logger configuration
+///
+/// # Example
+/// ```
+/// use rustfs_obs::AppConfig;
+/// use rustfs_obs::load_config;
+///
+/// let config = load_config(None);
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AppConfig {
+    pub observability: OtelConfig,
+    pub sinks: SinkConfig,
+    pub logger: LoggerConfig,
+}
+
+const DEFAULT_CONFIG_FILE: &str = "obs";
+
+/// Loading the configuration file
+/// Supports TOML, YAML and .env formats, read in order by priority
+///
+/// # Parameters
+/// - `config_dir`: Configuration file path
+///
+/// # Returns
+/// Configuration information
+///
+/// # Example
+/// ```
+/// use rustfs_obs::AppConfig;
+/// use rustfs_obs::load_config;
+///
+/// let config = load_config(None);
+/// ```
+pub fn load_config(config_dir: Option<String>) -> AppConfig {
+    let config_dir = if let Some(path) = config_dir {
+        // If a path is provided, check if it's empty
+        if path.is_empty() {
+            // If empty, use the default config file name
+            DEFAULT_CONFIG_FILE.to_string()
+        } else {
+            // Use the provided path
+            let path = std::path::Path::new(&path);
+            if path.extension().is_some() {
+                // If path has extension, use it as is (extension will be added by Config::builder)
+                path.with_extension("").to_string_lossy().into_owned()
+            } else {
+                // If path is a directory, append the default config file name
+                path.to_string_lossy().into_owned()
+            }
+        }
+    } else {
+        // If no path provided, use current directory + default config file
+        match env::current_dir() {
+            Ok(dir) => dir.join(DEFAULT_CONFIG_FILE).to_string_lossy().into_owned(),
+            Err(_) => {
+                eprintln!("Warning: Failed to get current directory, using default config file");
+                DEFAULT_CONFIG_FILE.to_string()
+            }
+        }
+    };
+
+    // Log using proper logging instead of println when possible
+    println!("Using config file base: {}", config_dir);
+
+    let config = Config::builder()
+        .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml).required(false))
+        .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Yaml).required(false))
+        .add_source(config::Environment::with_prefix(""))
+        .build()
+        .unwrap_or_default();
+
+    config.try_deserialize().unwrap_or_default()
+}

@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod console;
 mod grpc;
+mod logging;
 mod service;
 mod storage;
 mod utils;
@@ -35,6 +36,7 @@ use hyper_util::{
 };
 use iam::init_iam_sys;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustfs_obs::{init_obs, load_config, set_global_guard, InitLogStatus};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
@@ -44,10 +46,11 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[allow(dead_code)]
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
 
@@ -87,22 +90,35 @@ fn print_server_info() {
     info!("Docs: {}", cfg.doc());
 }
 
-fn main() -> Result<()> {
-    //解析获得到的参数
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Parse the obtained parameters
     let opt = config::Opt::parse();
 
-    //设置 trace
-    setup_tracing();
+    // Load the configuration file
+    let config = load_config(Some(opt.clone().obs_config));
 
-    //运行参数
-    run(opt)
+    // Initialize Observability
+    let (_logger, guard) = init_obs(config.clone()).await;
+
+    // Store in global storage
+    set_global_guard(guard)?;
+
+    // Log initialization status
+    InitLogStatus::init_start_log(&config.observability).await?;
+
+    // Run parameters
+    run(opt).await
 }
 
-#[tokio::main]
+// #[tokio::main]
 async fn run(opt: config::Opt) -> Result<()> {
+    let span = info_span!("trace-main-run");
+    let _enter = span.enter();
+
     debug!("opt: {:?}", &opt);
 
-    let mut server_addr = net::check_local_server_addr(opt.address.as_str()).unwrap();
+    let mut server_addr = net::check_local_server_addr(opt.address.as_str())?;
 
     if server_addr.port() == 0 {
         server_addr.set_port(get_available_port());
@@ -115,7 +131,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     debug!("server_address {}", &server_address);
 
     //设置 AK 和 SK
-    iam::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone())).unwrap();
+    iam::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()))?;
+
     set_global_rustfs_port(server_port);
 
     //监听地址，端口从参数中获取
@@ -256,7 +273,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                     match res {
                         Ok(conn) => conn,
                         Err(err) => {
-                            tracing::error!("error accepting connection: {err}");
+                            error!("error accepting connection: {err}");
                             continue;
                         }
                     }
@@ -267,7 +284,13 @@ async fn run(opt: config::Opt) -> Result<()> {
             };
             if has_tls_certs {
                 debug!("TLS certificates found, starting with SIGINT");
-                let tls_socket = match tls_acceptor.as_ref().ok_or_else(|| error("TLS not configured".to_string())).unwrap().accept(socket).await {
+                let tls_socket = match tls_acceptor
+                    .as_ref()
+                    .ok_or_else(|| error("TLS not configured".to_string()))
+                    .unwrap()
+                    .accept(socket)
+                    .await
+                {
                     Ok(tls_socket) => tls_socket,
                     Err(err) => {
                         error!("TLS handshake failed {}", err);
