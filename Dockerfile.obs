@@ -1,0 +1,19 @@
+FROM alpine:latest
+
+# RUN apk add --no-cache <package-name>
+# 如果 rustfs 有依赖，可以在这里添加，例如：
+# RUN apk add --no-cache openssl
+
+WORKDIR /app
+
+# 创建与 RUSTFS_VOLUMES 一致的目录
+RUN mkdir -p /root/data/target/volume/test1 /root/data/target/volume/test2 /root/data/target/volume/test3 /root/data/target/volume/test4
+
+COPY ./target/x86_64-unknown-linux-musl/release/rustfs /app/rustfs
+
+RUN chmod +x /app/rustfs
+
+EXPOSE 9000
+EXPOSE 9002
+
+CMD ["/app/rustfs"]
