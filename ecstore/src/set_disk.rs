@@ -163,6 +163,11 @@ impl SetDisks {
         disks
     }
 
+    pub async fn get_online_disks_with_healing(&self, incl_healing: bool) -> (Vec<DiskStore>, bool) {
+        let (disks, _, healing) = self.get_online_disks_with_healing_and_info(incl_healing).await;
+        (disks, healing > 0)
+    }
+
     pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
         let mut disks = self.get_disks_internal().await;
 
