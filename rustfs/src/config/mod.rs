@@ -28,6 +28,14 @@ pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 /// Example: --obs-config /etc/rustfs/obs.toml
 pub const DEFAULT_OBS_CONFIG: &str = "config/obs.toml";
 
+/// Default TLS key for rustfs
+/// This is the default key for TLS.
+pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_tls_key.pem";
+
+/// Default TLS cert for rustfs
+/// This is the default cert for TLS.
+pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_tls_cert.pem";
+
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
     if !build::TAG.is_empty() {
@@ -88,4 +96,8 @@ pub struct Opt {
     /// Default value: config/obs.toml
     #[arg(long, default_value_t = DEFAULT_OBS_CONFIG.to_string(), env = "RUSTFS_OBS_CONFIG")]
     pub obs_config: String,
+
+    /// tls path for rustfs api and console.
+    #[arg(long, env = "RUSTFS_TLS_PATH")]
+    pub tls_path: Option<String>,
 }

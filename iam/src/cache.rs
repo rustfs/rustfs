@@ -6,12 +6,12 @@ use std::{
 };
 
 use arc_swap::{ArcSwap, AsRaw, Guard};
-use log::warn;
 use policy::{
     auth::UserIdentity,
     policy::{Args, PolicyDoc},
 };
 use time::OffsetDateTime;
+use tracing::warn;
 
 use crate::store::{GroupInfo, MappedPolicy};
 
@@ -63,7 +63,7 @@ impl Cache {
             let mut new = CacheEntity::clone(&cur);
             op(&mut new);
 
-            // 使用cas原子替换内容
+            // 使用 cas 原子替换内容
             let prev = target.compare_and_swap(&*cur, Arc::new(new));
             let swapped = Self::ptr_eq(&*cur, &*prev);
             if swapped {
@@ -112,8 +112,8 @@ impl CacheInner {
     //     todo!()
     // }
 
-    // /// 如果是临时用户，返回Ok(Some(partent_name)))
-    // /// 如果不是临时用户，返回Ok(None)
+    // /// 如果是临时用户，返回 Ok(Some(partent_name)))
+    // /// 如果不是临时用户，返回 Ok(None)
     // fn is_temp_user(&self, user_name: &str) -> crate::Result<Option<&str>> {
     //     let user = self
     //         .get_user(user_name)
@@ -126,8 +126,8 @@ impl CacheInner {
     //     }
     // }
 
-    // /// 如果是临时用户，返回Ok(Some(partent_name)))
-    // /// 如果不是临时用户，返回Ok(None)
+    // /// 如果是临时用户，返回 Ok(Some(partent_name)))
+    // /// 如果不是临时用户，返回 Ok(None)
     // fn is_service_account(&self, user_name: &str) -> crate::Result<Option<&str>> {
     //     let user = self
     //         .get_user(user_name)

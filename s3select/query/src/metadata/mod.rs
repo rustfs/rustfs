@@ -113,14 +113,14 @@ impl ContextProvider for MetadataProvider {
     }
 
     fn udf_names(&self) -> Vec<String> {
-        todo!()
+        self.func_manager.udfs()
     }
 
     fn udaf_names(&self) -> Vec<String> {
-        todo!()
+        self.func_manager.udafs()
     }
 
     fn udwf_names(&self) -> Vec<String> {
-        todo!()
+        self.func_manager.udwfs()
     }
 }

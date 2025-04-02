@@ -11,3 +11,4 @@ vendor
 cli/rustfs-gui/embedded-rustfs/rustfs
 config/obs.toml
 *.log
+config/certs/*
