@@ -27,7 +27,7 @@ policy.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
-h2 = "0.4.7"
+#h2 = "0.4.7"
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
@@ -35,6 +35,7 @@ http-body.workspace = true
 lock.workspace = true
 mime.workspace = true
 netif.workspace = true
+once_cell.workspace = true
 pin-project-lite.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -62,6 +63,7 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tonic-reflection.workspace = true
 tower.workspace = true
+tracing-core = { workspace = true }
 tracing-error.workspace = true
 tracing-subscriber.workspace = true
 transform-stream.workspace = true
@@ -84,6 +86,7 @@ mime_guess = "2.0.5"
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 local-ip-address = { workspace = true }
 chrono = { workspace = true }
+rustfs-obs = { workspace = true }
 
 [build-dependencies]
 prost-build.workspace = true

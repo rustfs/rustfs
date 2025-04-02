@@ -1,0 +1,65 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+    ports:
+      - 1888:1888
+      - 8888:8888
+      - 8889:8889
+      - 13133:13133
+      - 4317:4317
+      - 4318:4318
+      - 55679:55679
+    networks:
+      - otel-network
+  jaeger:
+    image: jaegertracing/jaeger:2.4.0
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "16686:16686"
+      - "14317:4317"
+      - "14318:4318"
+    networks:
+      - otel-network
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - otel-network
+  loki:
+    image: grafana/loki:3.4.2
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - otel-network
+  grafana:
+    image: grafana/grafana:11.6.0
+    ports:
+      - "3000:3000"  # Web UI
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - TZ=Asia/Shanghai
+    networks:
+      - otel-network
+
+
+networks:
+  otel-network:
+    driver: bridge
+    name: "network_otel_config"
+    driver_opts:
+      com.docker.network.enable_ipv6: "true"    

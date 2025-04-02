@@ -6,7 +6,7 @@ use policy::auth::Credentials;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
-use tracing::debug;
+use tracing::{debug, instrument};
 
 pub mod cache;
 pub mod error;
@@ -51,6 +51,7 @@ pub fn get_global_action_cred() -> Option<Credentials> {
     GLOBAL_ACTIVE_CRED.get().cloned()
 }
 
+#[instrument]
 pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
     debug!("init iam system");
     let s = IamCache::new(ObjectStore::new(ecstore)).await;

@@ -1,0 +1,53 @@
+[package]
+name = "rustfs-obs"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["file"]
+kafka = ["dep:rdkafka"]
+webhook = ["dep:reqwest"]
+file = []
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+config = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-stdout = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic"] }
+opentelemetry-prometheus = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
+prometheus = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true, features = ["std", "attributes"] }
+tracing-core = { workspace = true }
+tracing-error = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
+rdkafka = { workspace = true, features = ["tokio"], optional = true }
+reqwest = { workspace = true, optional = true, default-features = false }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+local-ip-address = { workspace = true }
+
+
+[dev-dependencies]
+chrono = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-stdout = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic"] }
+opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true, features = ["std", "attributes"] }
+tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt"] }
