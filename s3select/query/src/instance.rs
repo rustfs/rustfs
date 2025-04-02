@@ -141,24 +141,58 @@ mod tests {
         let results = result.result().chunk_result().await.unwrap().to_vec();
 
         let expected = [
-            "+----------------+----------+----------+------------+----------+",
-            "| column_1       | column_2 | column_3 | column_4   | column_5 |",
-            "+----------------+----------+----------+------------+----------+",
-            "| id             | name     | age      | department | salary   |",
-            "|             1  | Alice    | 25       | HR         | 5000     |",
-            "|             2  | Bob      | 30       | IT         | 6000     |",
-            "|             3  | Charlie  | 35       | Finance    | 7000     |",
-            "|             4  | Diana    | 22       | Marketing  | 4500     |",
-            "|             5  | Eve      | 28       | IT         | 5500     |",
-            "|             6  | Frank    | 40       | Finance    | 8000     |",
-            "|             7  | Grace    | 26       | HR         | 5200     |",
-            "|             8  | Henry    | 32       | IT         | 6200     |",
-            "|             9  | Ivy      | 24       | Marketing  | 4800     |",
-            "|             10 | Jack     | 38       | Finance    | 7500     |",
-            "+----------------+----------+----------+------------+----------+",
+            "+----------------+---------+-----+------------+--------+",
+            "| id             | name    | age | department | salary |",
+            "+----------------+---------+-----+------------+--------+",
+            "|             1  | Alice   | 25  | HR         | 5000   |",
+            "|             2  | Bob     | 30  | IT         | 6000   |",
+            "|             3  | Charlie | 35  | Finance    | 7000   |",
+            "|             4  | Diana   | 22  | Marketing  | 4500   |",
+            "|             5  | Eve     | 28  | IT         | 5500   |",
+            "|             6  | Frank   | 40  | Finance    | 8000   |",
+            "|             7  | Grace   | 26  | HR         | 5200   |",
+            "|             8  | Henry   | 32  | IT         | 6200   |",
+            "|             9  | Ivy     | 24  | Marketing  | 4800   |",
+            "|             10 | Jack    | 38  | Finance    | 7500   |",
+            "+----------------+---------+-----+------------+--------+",
         ];
 
         assert_batches_eq!(expected, &results);
+        pretty::print_batches(&results).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_func_sql() {
+        let sql = "select count(s.id) from S3Object as s";
+        let input = SelectObjectContentInput {
+            bucket: "dandan".to_string(),
+            expected_bucket_owner: None,
+            key: "test.csv".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: sql.to_string(),
+                expression_type: ExpressionType::from_static("SQL"),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput::default()),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        };
+        let db = make_rustfsms(input.clone(), true).await.unwrap();
+        let query = Query::new(Context { input }, sql.to_string());
+
+        let result = db.execute(&query).await.unwrap();
+
+        let results = result.result().chunk_result().await.unwrap().to_vec();
         pretty::print_batches(&results).unwrap();
     }
 }

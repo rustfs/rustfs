@@ -139,7 +139,7 @@ impl SimpleQueryDispatcher {
         let path = format!("s3://{}/{}", self.input.bucket, self.input.key);
         let table_path = ListingTableUrl::parse(path)?;
         let listing_options = if self.input.request.input_serialization.csv.is_some() {
-            let file_format = CsvFormat::default().with_options(CsvOptions::default().with_has_header(false));
+            let file_format = CsvFormat::default().with_options(CsvOptions::default().with_has_header(true));
             ListingOptions::new(Arc::new(file_format)).with_file_extension(".csv")
         } else if self.input.request.input_serialization.parquet.is_some() {
             let file_format = ParquetFormat::new();
