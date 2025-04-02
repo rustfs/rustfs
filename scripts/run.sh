@@ -26,6 +26,9 @@ export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9002"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 
+# 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考
+export RUSTFS_OBS_CONFIG="./config/obs.example.toml"
+
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
