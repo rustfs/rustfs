@@ -143,6 +143,6 @@ services:
 networks:
   rustfs-network:
     driver: bridge
-    name: "network_otel_config"
+    name: "network_rustfs_config"
     driver_opts:
       com.docker.network.enable_ipv6: "true"
