@@ -81,6 +81,9 @@ uuid = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [build-dependencies]
 prost-build.workspace = true
 tonic-build.workspace = true
