@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod console;
 mod grpc;
+pub mod license;
 mod logging;
 mod service;
 mod storage;
@@ -11,6 +12,7 @@ mod utils;
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 use crate::utils::error;
+// Ensure the correct path for parse_license is imported
 use chrono::Datelike;
 use clap::Parser;
 use common::{
@@ -92,6 +94,8 @@ fn print_server_info() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    config::init_config();
+
     // Parse the obtained parameters
     let opt = config::Opt::parse();
 

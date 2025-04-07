@@ -2,6 +2,7 @@ use clap::Parser;
 use const_str::concat;
 use ecstore::global::DEFAULT_PORT;
 use std::string::ToString;
+use std::sync::OnceLock;
 
 shadow_rs::shadow!(build);
 
@@ -100,4 +101,20 @@ pub struct Opt {
     /// tls path for rustfs api and console.
     #[arg(long, env = "RUSTFS_TLS_PATH")]
     pub tls_path: Option<String>,
+
+    #[arg(long, env = "RUSTFS_LICENSE")]
+    pub license: Option<String>,
+}
+
+lazy_static::lazy_static! {
+    pub static ref OPT: OnceLock<Opt> = OnceLock::new();
+}
+
+pub fn init_config() {
+    let opt = Opt::parse();
+    OPT.set(opt).expect("Failed to set global config");
+}
+
+pub fn get_config() -> &'static Opt {
+    OPT.get().expect("Global config not initialized")
 }

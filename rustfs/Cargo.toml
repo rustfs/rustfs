@@ -87,6 +87,7 @@ rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 local-ip-address = { workspace = true }
 chrono = { workspace = true }
 rustfs-obs = { workspace = true }
+appauth = { version = "0.0.1", path = "../appauth" }
 
 [build-dependencies]
 prost-build.workspace = true

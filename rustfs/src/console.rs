@@ -1,3 +1,4 @@
+use crate::config;
 use axum::{
     body::Body,
     extract::Host,
@@ -158,6 +159,28 @@ pub(crate) fn init_console_cfg(local_ip: Ipv4Addr, port: u16) {
 //     host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
 // }
 
+async fn license_handler() -> impl IntoResponse {
+    let license = config::get_config()
+        .license
+        .as_ref()
+        .map(|license| {
+            if license.is_empty() {
+                return None;
+            }
+            match appauth::token::parse_license(license) {
+                Ok(token) => Some(token),
+                Err(_) => None,
+            }
+        })
+        .unwrap_or_default();
+
+    Response::builder()
+        .header("content-type", "application/json")
+        .status(StatusCode::OK)
+        .body(Body::from(serde_json::to_string(&license).unwrap_or_default()))
+        .unwrap()
+}
+
 #[allow(clippy::const_is_empty)]
 async fn config_handler(Host(host): Host) -> impl IntoResponse {
     let host_with_port = if host.contains(':') { host } else { format!("{}:80", host) };
@@ -203,6 +226,7 @@ pub async fn start_static_file_server(
 ) {
     // Create a route
     let app = Router::new()
+        .route("/license", get(license_handler))
         .route("/config.json", get(config_handler))
         .nest_service("/", get(static_handler));
     let local_addr: SocketAddr = addrs.parse().expect("Failed to parse socket address");
