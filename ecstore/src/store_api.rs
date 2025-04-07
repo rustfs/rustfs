@@ -725,6 +725,10 @@ impl ObjectInfo {
         }
     }
 
+    pub fn is_multipart(&self) -> bool {
+        self.etag.as_ref().is_some_and(|v| v.len() != 32)
+    }
+
     pub fn get_actual_size(&self) -> Result<usize> {
         if let Some(actual_size) = self.actual_size {
             return Ok(actual_size);
