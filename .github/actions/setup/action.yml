@@ -20,16 +20,7 @@ runs:
       shell: bash
       run: |
         sudo apt update
-        apt list --upgradable
-        sudo apt upgrade -y
-        sudo apt install -y \
-          musl-tools \
-          build-essential \        
-          lld \
-          libdbus-1-dev \
-          libwayland-dev \
-          libwebkit2gtk-4.1-dev \
-          libxdo-dev
+        sudo apt install -y musl-tools build-essential lld libdbus-1-dev libwayland-dev libwebkit2gtk-4.1-dev libxdo-dev
 
     - uses: arduino/setup-protoc@v3
       with:
