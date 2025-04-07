@@ -709,6 +709,11 @@ impl ECStore {
     }
 
     fn decommission_object(&self, id: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
+        let object_info = rd.object_info;
+        let actual_size = object_info.get_actual_size()?;
+
+        if object_info.is_multipart() {}
+
         unimplemented!()
     }
 }
