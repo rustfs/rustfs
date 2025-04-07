@@ -17,16 +17,9 @@ jobs:
       matrix:
         variant:
           - { profile: dev, target: x86_64-unknown-linux-musl, glibc: "default" }
-          - {
-            profile: release,
-            target: x86_64-unknown-linux-musl,
-            glibc: "default",
-          }
-          - {
-            profile: release,
-            target: x86_64-unknown-linux-musl,
-            glibc: "2.31",
-          }
+          - { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
 
     steps:
       - uses: actions/checkout@v4
