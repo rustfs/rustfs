@@ -13,7 +13,7 @@ members = [
     "cli/rustfs-gui", # Graphical user interface client
     "packages/obs", # Observability utilities
     "s3select/api",
-    "s3select/query",
+    "s3select/query", "appauth",
 ]
 resolver = "2"
 
