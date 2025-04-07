@@ -20,6 +20,8 @@ runs:
       shell: bash
       run: |
         sudo apt update
+        apt list --upgradable
+        sudo apt upgrade -y
         sudo apt install -y \
           musl-tools \
           build-essential \        
