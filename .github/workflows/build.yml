@@ -7,7 +7,7 @@ on:
   push:
     branches:
       - main
-    tags: ["v*", "*"]
+    tags: [ "v*", "*" ]
 
 jobs:
   build-rustfs:
@@ -16,17 +16,17 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { profile: dev, target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - { profile: dev, target: x86_64-unknown-linux-musl, glibc: "default" }
           - {
-              profile: release,
-              target: x86_64-unknown-linux-gnu,
-              glibc: "default",
-            }
+            profile: release,
+            target: x86_64-unknown-linux-musl,
+            glibc: "default",
+          }
           - {
-              profile: release,
-              target: x86_64-unknown-linux-gnu,
-              glibc: "2.31",
-            }
+            profile: release,
+            target: x86_64-unknown-linux-musl,
+            glibc: "2.31",
+          }
 
     steps:
       - uses: actions/checkout@v4
@@ -190,7 +190,7 @@ jobs:
 
   merge:
     runs-on: ubuntu-latest
-    needs: [build-rustfs, build-rustfs-gui]
+    needs: [ build-rustfs, build-rustfs-gui ]
     steps:
       - uses: actions/upload-artifact/merge@v4
         with:

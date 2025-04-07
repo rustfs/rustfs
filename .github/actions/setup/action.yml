@@ -21,6 +21,8 @@ runs:
       run: |
         sudo apt update
         sudo apt install -y \
+          musl-tools \
+          build-essential \        
           lld \
           libdbus-1-dev \
           libwayland-dev \
@@ -38,6 +40,7 @@ runs:
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ inputs.rust-version }}
+        targets: x86_64-unknown-linux-musl
         components: rustfmt, clippy
 
     - uses: Swatinem/rust-cache@v2
