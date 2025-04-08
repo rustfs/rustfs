@@ -37,6 +37,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use iam::init_iam_sys;
+use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_obs::{init_obs, load_config, set_global_guard, InitLogStatus};
 use rustls::ServerConfig;
@@ -94,10 +95,12 @@ fn print_server_info() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    config::init_config();
+    // config::init_config();
 
     // Parse the obtained parameters
     let opt = config::Opt::parse();
+
+    init_license(opt.license.clone());
 
     // Load the configuration file
     let config = load_config(Some(opt.clone().obs_config));

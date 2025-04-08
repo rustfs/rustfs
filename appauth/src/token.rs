@@ -6,7 +6,7 @@ use rsa::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Token {
     pub name: String, // 应用ID
     pub expired: u64, // 到期时间 (UNIX时间戳)

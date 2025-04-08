@@ -1,4 +1,4 @@
-use crate::config;
+use crate::license::get_license;
 use axum::{
     body::Body,
     extract::Host,
@@ -160,19 +160,7 @@ pub(crate) fn init_console_cfg(local_ip: Ipv4Addr, port: u16) {
 // }
 
 async fn license_handler() -> impl IntoResponse {
-    let license = config::get_config()
-        .license
-        .as_ref()
-        .map(|license| {
-            if license.is_empty() {
-                return None;
-            }
-            match appauth::token::parse_license(license) {
-                Ok(token) => Some(token),
-                Err(_) => None,
-            }
-        })
-        .unwrap_or_default();
+    let license = get_license().unwrap_or_default();
 
     Response::builder()
         .header("content-type", "application/json")
