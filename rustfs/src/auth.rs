@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use http::HeaderMap;
+use http::Uri;
 use iam::error::Error as IamError;
 use iam::get_global_action_cred;
 use iam::sys::SESSION_POLICY_NAME;
@@ -48,7 +49,7 @@ impl S3Auth for IAMAuth {
 }
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
-pub async fn check_key_valid(header: &HeaderMap, access_key: &str) -> S3Result<(auth::Credentials, bool)> {
+pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(auth::Credentials, bool)> {
     let Some(mut cred) = get_global_action_cred() else {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,
@@ -88,7 +89,7 @@ pub async fn check_key_valid(header: &HeaderMap, access_key: &str) -> S3Result<(
         cred = u.credentials;
     }
 
-    let claims = check_claims_from_token(header, &cred)
+    let claims = check_claims_from_token(session_token, &cred)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {}", e)))?;
 
     cred.claims = if !claims.is_empty() { Some(claims) } else { None };
@@ -105,9 +106,7 @@ pub async fn check_key_valid(header: &HeaderMap, access_key: &str) -> S3Result<(
     Ok((cred, owner))
 }
 
-pub fn check_claims_from_token(header: &HeaderMap, cred: &auth::Credentials) -> S3Result<HashMap<String, Value>> {
-    let token = get_session_token(header).unwrap_or_default();
-
+pub fn check_claims_from_token(token: &str, cred: &auth::Credentials) -> S3Result<HashMap<String, Value>> {
     if !token.is_empty() && cred.access_key.is_empty() {
         return Err(s3_error!(InvalidRequest, "no access key"));
     }
@@ -149,8 +148,10 @@ pub fn check_claims_from_token(header: &HeaderMap, cred: &auth::Credentials) -> 
     Ok(HashMap::new())
 }
 
-pub fn get_session_token(hds: &HeaderMap) -> Option<&str> {
-    hds.get("x-amz-security-token").map(|v| v.to_str().unwrap_or_default())
+pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str> {
+    hds.get("x-amz-security-token")
+        .map(|v| v.to_str().unwrap_or_default())
+        .or_else(|| get_query_param(uri.query().unwrap_or_default(), "x-amz-security-token"))
 }
 
 pub fn get_condition_values(header: &HeaderMap, cred: &auth::Credentials) -> HashMap<String, Vec<String>> {
@@ -294,4 +295,18 @@ pub fn get_condition_values(header: &HeaderMap, cred: &auth::Credentials) -> Has
     }
 
     args
+}
+
+pub fn get_query_param<'a>(url: &'a str, param_name: &str) -> Option<&'a str> {
+    let query_start = url.find('?')?;
+    let query = &url[query_start + 1..];
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+            if key.to_lowercase() == param_name {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
