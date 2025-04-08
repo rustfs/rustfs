@@ -297,9 +297,9 @@ pub fn get_condition_values(header: &HeaderMap, cred: &auth::Credentials) -> Has
     args
 }
 
-pub fn get_query_param<'a>(url: &'a str, param_name: &str) -> Option<&'a str> {
-    let query_start = url.find('?')?;
-    let query = &url[query_start + 1..];
+pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> {
+    let param_name = param_name.to_lowercase();
+
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
