@@ -190,7 +190,7 @@ dependencies = [
  "futures",
  "futures-core",
  "http",
- "object_store",
+ "object_store 0.12.0",
  "s3s",
  "snafu",
  "tokio",
@@ -207,7 +207,7 @@ dependencies = [
  "base64-simd",
  "common",
  "hex-simd",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rsa",
  "serde",
  "serde_json",
@@ -1677,7 +1677,7 @@ dependencies = [
  "chacha20poly1305",
  "jsonwebtoken",
  "pbkdf2",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde_json",
  "sha2 0.10.8",
  "test-case",
@@ -1867,7 +1867,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.11.2",
  "parking_lot 0.12.3",
  "parquet",
  "rand 0.8.5",
@@ -1919,7 +1919,7 @@ dependencies = [
  "datafusion-physical-plan",
  "futures",
  "log",
- "object_store",
+ "object_store 0.11.2",
  "tokio",
 ]
 
@@ -1938,7 +1938,7 @@ dependencies = [
  "indexmap 2.8.0",
  "libc",
  "log",
- "object_store",
+ "object_store 0.11.2",
  "parquet",
  "paste",
  "recursive",
@@ -1982,7 +1982,7 @@ dependencies = [
  "glob",
  "itertools 0.14.0",
  "log",
- "object_store",
+ "object_store 0.11.2",
  "rand 0.8.5",
  "tokio",
  "tokio-util",
@@ -2009,7 +2009,7 @@ dependencies = [
  "datafusion-expr",
  "futures",
  "log",
- "object_store",
+ "object_store 0.11.2",
  "parking_lot 0.12.3",
  "rand 0.8.5",
  "tempfile",
@@ -3045,7 +3045,7 @@ dependencies = [
  "pin-project-lite",
  "policy",
  "protos",
- "rand 0.8.5",
+ "rand 0.9.0",
  "reed-solomon-erasure",
  "regex",
  "reqwest",
@@ -4100,7 +4100,7 @@ dependencies = [
  "lazy_static",
  "madmin",
  "policy",
- "rand 0.8.5",
+ "rand 0.9.0",
  "regex",
  "serde",
  "serde_json",
@@ -4760,7 +4760,7 @@ dependencies = [
  "common",
  "lazy_static",
  "protos",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "serde_json",
  "tokio",
@@ -5525,6 +5525,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "object_store"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9ce831b09395f933addbc56d894d889e4b226eba304d4e7adbab591e26daf1e"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "http",
+ "humantime",
+ "itertools 0.14.0",
+ "parking_lot 0.12.3",
+ "percent-encoding",
+ "thiserror 2.0.12",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5813,7 +5835,7 @@ dependencies = [
  "lz4_flex",
  "num",
  "num-bigint",
- "object_store",
+ "object_store 0.11.2",
  "paste",
  "seq-macro",
  "simdutf8",
@@ -6198,7 +6220,7 @@ dependencies = [
  "jsonwebtoken",
  "lazy_static",
  "madmin",
- "rand 0.8.5",
+ "rand 0.9.0",
  "regex",
  "serde",
  "serde_json",
@@ -8362,9 +8384,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.44.1"
+version = "1.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f382da615b842244d4b8738c82ed1275e6c5dd90c459a30941cd07080b06c91a"
+checksum = "e6b88822cbe49de4185e3a4cbf8321dd487cf5fe0c5c65695fef6346371e9c48"
 dependencies = [
  "backtrace",
  "bytes",
