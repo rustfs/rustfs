@@ -1,5 +1,5 @@
 use super::ecfs::FS;
-use crate::auth::{check_key_valid, get_condition_values};
+use crate::auth::{check_key_valid, get_condition_values, get_session_token};
 use ecstore::bucket::policy_sys::PolicySys;
 use iam::error::Error as IamError;
 use policy::auth;
@@ -8,6 +8,7 @@ use policy::policy::{Args, BucketPolicyArgs};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Result};
 use std::collections::HashMap;
+use tracing::info;
 
 #[allow(dead_code)]
 #[derive(Default, Clone)]
@@ -143,19 +144,20 @@ impl S3Access for FS {
     // /// + [`cx.extensions_mut()`](S3AccessContext::extensions_mut)
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // 上层验证了 ak/sk
-        // info!(
-        //     "s3 check uri: {:?}, method: {:?} path: {:?}, s3_op: {:?}, cred: {:?}, headers:{:?}",
-        //     cx.uri(),
-        //     cx.method(),
-        //     cx.s3_path(),
-        //     cx.s3_op().name(),
-        //     cx.credentials(),
-        //     cx.headers(),
-        //     // cx.extensions_mut(),
-        // );
+        info!(
+            "s3 check uri: {:?}, method: {:?} path: {:?}, s3_op: {:?}, cred: {:?}, headers:{:?}",
+            cx.uri(),
+            cx.method(),
+            cx.s3_path(),
+            cx.s3_op().name(),
+            cx.credentials(),
+            cx.headers(),
+            // cx.extensions_mut(),
+        );
 
         let (cred, is_owner) = if let Some(input_cred) = cx.credentials() {
-            let (cred, is_owner) = check_key_valid(cx.headers(), &input_cred.access_key).await?;
+            let (cred, is_owner) =
+                check_key_valid(get_session_token(cx.uri(), cx.headers()).unwrap_or_default(), &input_cred.access_key).await?;
             (Some(cred), is_owner)
         } else {
             (None, false)
