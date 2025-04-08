@@ -51,6 +51,7 @@ use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::io::SeekFrom;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -383,7 +384,7 @@ impl LocalDisk {
                     kind => {
                         if kind.to_string() != "directory not empty" {
                             warn!("delete_file remove_dir {:?} err {}", &delete_path, kind.to_string());
-                            return Err(Error::from(err));
+                            return Err(Error::new(DiskError::FileAccessDenied));
                         }
                     }
                 }
@@ -395,7 +396,7 @@ impl LocalDisk {
                 ErrorKind::NotFound => (),
                 _ => {
                     warn!("delete_file remove_file {:?}  err {:?}", &delete_path, &err);
-                    return Err(Error::from(err));
+                    return Err(Error::new(DiskError::FileAccessDenied));
                 }
             }
         }
@@ -743,12 +744,10 @@ impl LocalDisk {
             .await
             .map_err(os_err_to_file_err)?;
 
-        // let mut data = Vec::new();
-        // let n = file.read_to_end(&mut data).await?;
-
         let meta = file.metadata().await?;
+        let file_size = meta.len() as usize;
 
-        bitrot_verify(Box::new(file), meta.size() as usize, part_size, algo, sum.to_vec(), shard_size).await
+        bitrot_verify(Box::new(file), file_size, part_size, algo, sum.to_vec(), shard_size).await
     }
 
     async fn scan_dir<W: AsyncWrite + Unpin>(
