@@ -396,7 +396,10 @@ impl LocalDisk {
                 ErrorKind::NotFound => (),
                 _ => {
                     warn!("delete_file remove_file {:?}  err {:?}", &delete_path, &err);
-                    return Err(Error::new(DiskError::FileAccessDenied));
+                    return Err(Error::new(FileAccessDeniedWithContext {
+                        path: delete_path.clone(),
+                        source: err,
+                    }));
                 }
             }
         }
