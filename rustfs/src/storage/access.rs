@@ -8,7 +8,6 @@ use policy::policy::{Args, BucketPolicyArgs};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Result};
 use std::collections::HashMap;
-use tracing::info;
 
 #[allow(dead_code)]
 #[derive(Default, Clone)]
@@ -144,16 +143,16 @@ impl S3Access for FS {
     // /// + [`cx.extensions_mut()`](S3AccessContext::extensions_mut)
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // 上层验证了 ak/sk
-        info!(
-            "s3 check uri: {:?}, method: {:?} path: {:?}, s3_op: {:?}, cred: {:?}, headers:{:?}",
-            cx.uri(),
-            cx.method(),
-            cx.s3_path(),
-            cx.s3_op().name(),
-            cx.credentials(),
-            cx.headers(),
-            // cx.extensions_mut(),
-        );
+        // info!(
+        //     "s3 check uri: {:?}, method: {:?} path: {:?}, s3_op: {:?}, cred: {:?}, headers:{:?}",
+        //     cx.uri(),
+        //     cx.method(),
+        //     cx.s3_path(),
+        //     cx.s3_op().name(),
+        //     cx.credentials(),
+        //     cx.headers(),
+        //     // cx.extensions_mut(),
+        // );
 
         let (cred, is_owner) = if let Some(input_cred) = cx.credentials() {
             let (cred, is_owner) =

@@ -380,7 +380,7 @@ impl DataUsageCache {
         let mut retries = 0;
         while retries < 5 {
             let path = Path::new(BUCKET_META_PREFIX).join(name);
-            warn!("Loading data usage cache from backend: {}", path.display());
+            // warn!("Loading data usage cache from backend: {}", path.display());
             match store
                 .get_object_reader(
                     RUSTFS_META_BUCKET,
