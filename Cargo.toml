@@ -82,7 +82,7 @@ prost-build = "0.13.4"
 prost-types = "0.13.4"
 protobuf = "3.7"
 protos = { path = "./common/protos" }
-rand = "0.8.5"
+rand = "0.9.0"
 rdkafka = { version = "0.37", features = ["tokio"] }
 reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration", "stream", "json", "blocking"] }
 rfd = { version = "0.15.2", default-features = false, features = ["xdg-portal", "tokio"] }
@@ -110,7 +110,7 @@ time = { version = "0.3.41", features = [
     "macros",
     "serde",
 ] }
-tokio = { version = "1.44.0", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.44.2", features = ["fs", "rt-multi-thread"] }
 tonic = { version = "0.12.3", features = ["gzip"] }
 tonic-build = "0.12.3"
 tonic-reflection = "0.12"
