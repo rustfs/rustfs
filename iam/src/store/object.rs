@@ -24,7 +24,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Sender};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 lazy_static! {
     pub static ref IAM_CONFIG_PREFIX: String = format!("{}/iam", RUSTFS_CONFIG_PREFIX);

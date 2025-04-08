@@ -39,7 +39,7 @@ use tokio::{
     },
 };
 use tracing::error;
-use tracing::{debug, warn};
+use tracing::warn;
 
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
