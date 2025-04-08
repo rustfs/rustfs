@@ -135,7 +135,7 @@ where
     }
 
     async fn load(self: Arc<Self>) -> Result<()> {
-        debug!("load iam to cache");
+        // debug!("load iam to cache");
         self.api.load_all(&self.cache).await?;
         self.last_timestamp
             .store(OffsetDateTime::now_utc().unix_timestamp(), Ordering::Relaxed);
