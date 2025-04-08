@@ -67,7 +67,7 @@ local-ip-address = "0.6.3"
 mime = "0.3.17"
 netif = "0.1.6"
 once_cell = "1.21.1"
-opentelemetry = { version = "0.29" }
+opentelemetry = { version = "0.29.1" }
 opentelemetry-appender-tracing = { version = "0.29.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
 opentelemetry_sdk = { version = "0.29" }
 opentelemetry-stdout = { version = "0.29.0" }
