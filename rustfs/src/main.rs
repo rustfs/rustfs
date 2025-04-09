@@ -53,6 +53,30 @@ use tracing::{debug, error, info, info_span, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[cfg(target_os = "linux")]
+fn notify_systemd(state: &str) {
+    use libsystemd::daemon::{notify, NotifyState};
+    let notify_state = match state {
+        "ready" => NotifyState::Ready,
+        "stopping" => NotifyState::Stopping,
+        _ => {
+            warn!("Unsupported state passed to notify_systemd: {}", state);
+            return;
+        },
+    };
+
+    if let Err(e) = notify(false, &[notify_state]) {
+        error!("Failed to notify systemd: {}", e);
+    } else {
+        debug!("Successfully notified systemd: {}", state);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn notify_systemd(state: &str) {
+    debug!("Systemd notifications are not available on this platform (state: {})", state);
+}
+
 #[allow(dead_code)]
 fn setup_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -260,6 +284,9 @@ async fn run(opt: config::Opt) -> Result<()> {
         None
     };
 
+    // Create a oneshot channel to wait for the service to start
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
     tokio::spawn(async move {
         let hyper_service = service.into_shared();
         let hybrid_service = TowerToHyperService::new(
@@ -272,6 +299,10 @@ async fn run(opt: config::Opt) -> Result<()> {
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
         debug!("graceful initiated");
+
+        // Send a message to the main thread to indicate that the server has started
+        let _ = tx.send(());
+
         loop {
             debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
             // Wait for a connection
@@ -286,9 +317,12 @@ async fn run(opt: config::Opt) -> Result<()> {
                     }
                 }
                 _ = ctrl_c.as_mut() => {
+                    drop(listener);
+                    eprintln!("Ctrl-C received, starting shutdown");
                     break;
                 }
             };
+
             if has_tls_certs {
                 debug!("TLS certificates found, starting with SIGINT");
                 let tls_socket = match tls_acceptor
@@ -353,7 +387,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     })?;
     debug!("init store success!");
 
-    init_iam_sys(store.clone()).await.unwrap();
+    init_iam_sys(store.clone()).await?;
 
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
         error!("new_global_notification_sys failed {:?}", &err);
@@ -386,9 +420,15 @@ async fn run(opt: config::Opt) -> Result<()> {
         });
     }
 
+    // Wait for the HTTP service to finish starting
+    if rx.await.is_ok() {
+        notify_systemd("ready");
+    }
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-
+            eprintln!("Ctrl-C received, starting shutdown");
+            notify_systemd("stopping");
         }
     }
 

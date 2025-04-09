@@ -1,0 +1,102 @@
+[Unit]
+Description=RustFS Object Storage Server
+# 定义服务的描述，说明这是一个 RustFS 对象存储服务器，显示在 systemctl status 中。
+Documentation=https://rustfs.com/docs/
+# 提供服务的官方文档链接，方便管理员查阅，占位符需替换为实际 URL。
+After=network-online.target
+# 指定服务在 network-online.target（网络就绪）之后启动，确保网络可用。
+Wants=network-online.target
+# 表示服务希望依赖 network-online.target，但不是强依赖，即使网络未就绪也尝试启动。
+# If you're using a database, you'll need to add the corresponding dependencies
+# 如果服务依赖数据库，可以添加数据库相关的依赖项（当前为注释，未启用）。
+# After=postgresql.service
+# 示例：若依赖 PostgreSQL，则在 PostgreSQL 服务后启动（当前未启用）。
+# Requires=postgresql.service
+# 示例：若强制依赖 PostgreSQL，则要求其启动成功（当前未启用）。
+
+[Service]
+Type=notify
+# 服务类型为 notify，表示服务通过 sd_notify 通知 systemd 其状态（如就绪）。
+NotifyAccess=main
+# 指定只有主进程可以发送通知给 systemd，避免子进程干扰。
+User=rustfs
+# 以 rustfs 用户身份运行服务，需预先创建此用户，提升安全性。
+Group=rustfs
+# 以 rustfs 组身份运行服务，与 User 配合使用。
+
+# environment variable configuration
+# 定义环境变量配置，用于传递给服务程序。
+Environment=RUST_LOG=info
+# 设置日志级别为 info，控制服务日志输出（需服务支持此变量）。
+Environment=RUSTFS_ACCESS_KEY=rustfsadmin
+# 设置访问密钥为 rustfsadmin，用于 RustFS 的认证。
+Environment=RUSTFS_SECRET_KEY=rustfsadmin
+# 设置秘密密钥为 rustfsadmin，与访问密钥配套使用。
+
+# working directory
+WorkingDirectory=/opt/rustfs
+# 设置服务的工作目录为 /opt/rustfs，影响相对路径的解析。
+
+# main program
+ExecStart=/usr/local/bin/rustfs \
+    --address 0.0.0.0:9000 \
+    --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
+    --obs-config /etc/rustfs/obs.yaml \
+    --console-enable \
+    --console-address 0.0.0.0:9002
+# 定义启动命令，运行 /usr/local/bin/rustfs，带参数：
+# --address 0.0.0.0:9000：服务监听所有接口的 9000 端口。
+# --volumes：指定存储卷路径为 /data/rustfs/vol1 和 /data/rustfs/vol2。
+# --obs-config：指定配置文件路径为 /etc/rustfs/obs.yaml。
+# --console-enable：启用控制台功能。
+# --console-address 0.0.0.0:9002：控制台监听所有接口的 9002 端口。
+
+# resource constraints
+LimitNOFILE=1048576
+# 设置文件描述符上限为 1048576，支持高并发连接。
+LimitNPROC=32768
+# 设置进程数上限为 32768，限制子进程数量。
+TasksMax=infinity
+# 允许服务创建无限数量的线程（谨慎使用，可能耗尽资源）。
+
+# restart the policy
+Restart=always
+# 服务异常退出时总是重启，提高可用性。
+RestartSec=10s
+# 重启前等待 10 秒，避免频繁重启导致资源浪费。
+
+# graceful exit configuration
+TimeoutStartSec=30s
+# 启动超时时间为 30 秒，若超时则认为启动失败。
+TimeoutStopSec=30s
+# 停止超时时间为 30 秒，若超时则强制停止。
+
+# security settings
+NoNewPrivileges=true
+# 禁止服务提升权限，增强安全性。
+ProtectSystem=full
+# 保护系统目录（如 /usr、/boot、/etc）为只读，防止服务修改。
+ProtectHome=true
+# 保护用户主目录（如 /home、/root），禁止服务访问。
+PrivateTmp=true
+# 为服务提供私有 /tmp 目录，隔离临时文件。
+PrivateDevices=true
+# 禁止服务访问硬件设备（如 /dev），提升安全性。
+ProtectClock=true
+# 保护系统时钟，禁止服务修改时间。
+ProtectKernelTunables=true
+# 保护内核参数（/proc/sys），禁止服务修改。
+ProtectKernelModules=true
+# 禁止服务加载或卸载内核模块。
+ProtectControlGroups=true
+# 保护控制组（cgroups），禁止服务修改。
+RestrictSUIDSGID=true
+# 禁止服务使用 SUID/SGID 文件，提升安全性。
+RestrictRealtime=true
+# 禁止服务使用实时调度，防止资源滥用。
+ReadWritePaths=/data/rustfs
+# 允许服务对 /data/rustfs 目录读写，限制其他路径访问。
+
+[Install]
+WantedBy=multi-user.target
+# 服务在多用户模式下自动启动，配合 systemctl enable 使用。
