@@ -60,7 +60,7 @@ tokio = { workspace = true, features = [
 tokio-rustls.workspace = true
 lazy_static.workspace = true
 tokio-stream.workspace = true
-tonic.workspace = true
+tonic = { workspace = true }
 tonic-reflection.workspace = true
 tower.workspace = true
 tracing-core = { workspace = true }
@@ -71,7 +71,7 @@ uuid = "1.15.1"
 url.workspace = true
 axum.workspace = true
 axum-server = { workspace = true }
-matchit = "0.8.6"
+matchit = "0.8.4"
 shadow-rs.workspace = true
 const-str = { version = "0.6.1", features = ["std", "proc"] }
 atoi = "2.0.0"
