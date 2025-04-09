@@ -39,7 +39,7 @@ fi
 if [ ! -f ./rustfs/static/index.html ]; then
     echo "Downloading rustfs-console-latest.zip"
     # download rustfs-console-latest.zip do not show log
-    curl -s -L "https://dl.rustfs.com/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -q -o tempfile.zip -d ./rustfs/static && rm tempfile.zip
+    curl -s -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -q -o tempfile.zip -d ./rustfs/static && rm tempfile.zip
 fi
 
 cargo run --bin rustfs

@@ -1,1 +1,0 @@
-console static path, do not delete
