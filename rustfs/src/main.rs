@@ -62,7 +62,7 @@ fn notify_systemd(state: &str) {
         _ => {
             warn!("Unsupported state passed to notify_systemd: {}", state);
             return;
-        },
+        }
     };
 
     if let Err(e) = notify(false, &[notify_state]) {
@@ -70,11 +70,12 @@ fn notify_systemd(state: &str) {
     } else {
         debug!("Successfully notified systemd: {}", state);
     }
+    info!("Systemd notifications are enabled on linux (state: {})", state);
 }
 
 #[cfg(not(target_os = "linux"))]
 fn notify_systemd(state: &str) {
-    debug!("Systemd notifications are not available on this platform (state: {})", state);
+    info!("Systemd notifications are not available on this platform not linux (state: {})", state);
 }
 
 #[allow(dead_code)]
@@ -284,7 +285,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         None
     };
 
-    // Create a oneshot channel to wait for the service to start
+    // Create an oneshot channel to wait for the service to start
     let (tx, rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
@@ -420,9 +421,13 @@ async fn run(opt: config::Opt) -> Result<()> {
         });
     }
 
+    // 执行休眠 1 秒钟
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     // Wait for the HTTP service to finish starting
     if rx.await.is_ok() {
         notify_systemd("ready");
+    } else {
+        info!("Failed to start the server");
     }
 
     tokio::select! {
