@@ -14,7 +14,7 @@ use crate::bucket::metadata_sys::{self};
 use crate::cache_value::cache::{Cache, Opts, UpdateFn};
 use crate::disk::error::{
     convert_access_error, is_err_os_not_exist, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir,
-    is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err,
+    is_sys_err_not_dir, map_err_not_exists, os_err_to_file_err, FileAccessDeniedWithContext
 };
 use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::STORAGE_FORMAT_FILE;
