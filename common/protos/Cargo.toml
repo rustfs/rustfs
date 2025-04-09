@@ -13,7 +13,7 @@ flatbuffers = { workspace = true }
 prost = { workspace = true }
 protobuf = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true, features = ["transport", "tls"] }
+tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true }
 
 [build-dependencies]
