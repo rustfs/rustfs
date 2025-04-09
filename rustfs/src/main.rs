@@ -46,6 +46,7 @@ use service::hybrid;
 use std::sync::Arc;
 use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
@@ -287,8 +288,27 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Create an oneshot channel to wait for the service to start
     let (tx, rx) = tokio::sync::oneshot::channel();
-
+    // 启动服务
+    notify_service_state(ServiceState::Starting);
     tokio::spawn(async move {
+        // 错误处理改进
+        let sigterm_inner = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(e) => {
+                error!("Failed to create SIGTERM signal handler: {}", e);
+                return;
+            }
+        };
+        let sigint_inner = match signal(SignalKind::interrupt()) {
+            Ok(signal) => signal,
+            Err(e) => {
+                error!("Failed to create SIGINT signal handler: {}", e);
+                return;
+            }
+        };
+
+        let mut sigterm_inner = sigterm_inner;
+        let mut sigint_inner = sigint_inner;
         let hyper_service = service.into_shared();
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
@@ -320,6 +340,15 @@ async fn run(opt: config::Opt) -> Result<()> {
                 _ = ctrl_c.as_mut() => {
                     drop(listener);
                     eprintln!("Ctrl-C received, starting shutdown");
+                    break;
+                }
+
+                _ = sigint_inner.recv() => {
+                    info!("SIGINT received in worker thread");
+                    break;
+                }
+                _ = sigterm_inner.recv() => {
+                    info!("SIGTERM received in worker thread");
                     break;
                 }
             };
@@ -430,13 +459,88 @@ async fn run(opt: config::Opt) -> Result<()> {
         info!("Failed to start the server");
     }
 
+    // 主线程中监听信号
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             eprintln!("Ctrl-C received, starting shutdown");
+            notify_systemd("stopping");
+        }
+
+        _ = sigint.recv() => {
+            info!("SIGINT received, starting shutdown");
+            notify_systemd("stopping");
+        }
+        _ = sigterm.recv() => {
+            info!("SIGTERM received, starting shutdown");
             notify_systemd("stopping");
         }
     }
 
     info!("server is stopped");
     Ok(())
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum ShutdownSignal {
+    CtrlC,
+    Sigterm,
+    Sigint,
+}
+#[allow(dead_code)]
+async fn wait_for_shutdown() -> ShutdownSignal {
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl-C signal");
+            ShutdownSignal::CtrlC
+        }
+        _ = sigint.recv() => {
+            info!("Received SIGINT signal");
+            ShutdownSignal::Sigint
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM signal");
+            ShutdownSignal::Sigterm
+        }
+    }
+}
+#[allow(dead_code)]
+#[derive(Debug)]
+enum ServiceState {
+    Starting,
+    Ready,
+    Stopping,
+    Stopped,
+}
+#[allow(dead_code)]
+fn notify_service_state(state: ServiceState) {
+    match state {
+        ServiceState::Starting => {
+            info!("Service is starting...");
+            #[cfg(target_os = "linux")]
+            if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Starting...")]) {
+                error!("Failed to notify systemd of starting state: {}", e);
+            }
+        }
+        ServiceState::Ready => {
+            info!("Service is ready");
+            notify_systemd("ready");
+        }
+        ServiceState::Stopping => {
+            info!("Service is stopping...");
+            notify_systemd("stopping");
+        }
+        ServiceState::Stopped => {
+            info!("Service has stopped");
+            #[cfg(target_os = "linux")]
+            if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Stopped")]) {
+                error!("Failed to notify systemd of stopped state: {}", e);
+            }
+        }
+    }
 }
