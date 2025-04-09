@@ -1,0 +1,60 @@
+[Unit]
+Description=RustFS Object Storage Server
+Documentation=https://rustfs.com/docs/
+After=network-online.target
+Wants=network-online.target
+# If you're using a database, you'll need to add the corresponding dependencies
+# After=postgresql.service
+# Requires=postgresql.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=rustfs
+Group=rustfs
+
+# environment variable configuration
+Environment=RUST_LOG=info
+Environment=RUSTFS_ACCESS_KEY=minioadmin
+Environment=RUSTFS_SECRET_KEY=minioadmin
+
+# working directory
+WorkingDirectory=/opt/rustfs
+
+# main program
+ExecStart=/usr/local/bin/rustfs \
+    --address 0.0.0.0:9000 \
+    --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
+    --obs-config /etc/rustfs/obs.yaml \
+    --console-enable \
+    --console-address 0.0.0.0:9002
+
+# resource constraints
+LimitNOFILE=1048576
+LimitNPROC=32768
+TasksMax=infinity
+
+# restart the policy
+Restart=always
+RestartSec=10s
+
+# graceful exit configuration
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+# security settings
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+ReadWritePaths=/data/rustfs
+
+[Install]
+WantedBy=multi-user.target

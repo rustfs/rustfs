@@ -216,7 +216,7 @@ pub async fn start_static_file_server(
     let app = Router::new()
         .route("/license", get(license_handler))
         .route("/config.json", get(config_handler))
-        .nest_service("/", get(static_handler));
+        .fallback_service(get(static_handler));
     let local_addr: SocketAddr = addrs.parse().expect("Failed to parse socket address");
     info!("WebUI: http://{}:{} http://127.0.0.1:{}", local_ip, local_addr.port(), local_addr.port());
     info!("   RootUser: {}", access_key);
