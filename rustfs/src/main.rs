@@ -288,8 +288,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Create an oneshot channel to wait for the service to start
     let (tx, rx) = tokio::sync::oneshot::channel();
-    // 启动服务
-    notify_service_state(ServiceState::Starting);
+
     tokio::spawn(async move {
         // 错误处理改进
         let sigterm_inner = match signal(SignalKind::terminate()) {
@@ -482,65 +481,65 @@ async fn run(opt: config::Opt) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
-enum ShutdownSignal {
-    CtrlC,
-    Sigterm,
-    Sigint,
-}
-#[allow(dead_code)]
-async fn wait_for_shutdown() -> ShutdownSignal {
-    let mut sigterm = signal(SignalKind::terminate()).unwrap();
-    let mut sigint = signal(SignalKind::interrupt()).unwrap();
-
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl-C signal");
-            ShutdownSignal::CtrlC
-        }
-        _ = sigint.recv() => {
-            info!("Received SIGINT signal");
-            ShutdownSignal::Sigint
-        }
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM signal");
-            ShutdownSignal::Sigterm
-        }
-    }
-}
-#[allow(dead_code)]
-#[derive(Debug)]
-enum ServiceState {
-    Starting,
-    Ready,
-    Stopping,
-    Stopped,
-}
-#[allow(dead_code)]
-fn notify_service_state(state: ServiceState) {
-    match state {
-        ServiceState::Starting => {
-            info!("Service is starting...");
-            #[cfg(target_os = "linux")]
-            if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Starting...")]) {
-                error!("Failed to notify systemd of starting state: {}", e);
-            }
-        }
-        ServiceState::Ready => {
-            info!("Service is ready");
-            notify_systemd("ready");
-        }
-        ServiceState::Stopping => {
-            info!("Service is stopping...");
-            notify_systemd("stopping");
-        }
-        ServiceState::Stopped => {
-            info!("Service has stopped");
-            #[cfg(target_os = "linux")]
-            if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Stopped")]) {
-                error!("Failed to notify systemd of stopped state: {}", e);
-            }
-        }
-    }
-}
+// #[allow(dead_code)]
+// #[derive(Debug)]
+// enum ShutdownSignal {
+//     CtrlC,
+//     Sigterm,
+//     Sigint,
+// }
+// #[allow(dead_code)]
+// async fn wait_for_shutdown() -> ShutdownSignal {
+//     let mut sigterm = signal(SignalKind::terminate()).unwrap();
+//     let mut sigint = signal(SignalKind::interrupt()).unwrap();
+//
+//     tokio::select! {
+//         _ = tokio::signal::ctrl_c() => {
+//             info!("Received Ctrl-C signal");
+//             ShutdownSignal::CtrlC
+//         }
+//         _ = sigint.recv() => {
+//             info!("Received SIGINT signal");
+//             ShutdownSignal::Sigint
+//         }
+//         _ = sigterm.recv() => {
+//             info!("Received SIGTERM signal");
+//             ShutdownSignal::Sigterm
+//         }
+//     }
+// }
+// #[allow(dead_code)]
+// #[derive(Debug)]
+// enum ServiceState {
+//     Starting,
+//     Ready,
+//     Stopping,
+//     Stopped,
+// }
+// #[allow(dead_code)]
+// fn notify_service_state(state: ServiceState) {
+//     match state {
+//         ServiceState::Starting => {
+//             info!("Service is starting...");
+//             #[cfg(target_os = "linux")]
+//             if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Starting...")]) {
+//                 error!("Failed to notify systemd of starting state: {}", e);
+//             }
+//         }
+//         ServiceState::Ready => {
+//             info!("Service is ready");
+//             notify_systemd("ready");
+//         }
+//         ServiceState::Stopping => {
+//             info!("Service is stopping...");
+//             notify_systemd("stopping");
+//         }
+//         ServiceState::Stopped => {
+//             info!("Service has stopped");
+//             #[cfg(target_os = "linux")]
+//             if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Stopped")]) {
+//                 error!("Failed to notify systemd of stopped state: {}", e);
+//             }
+//         }
+//     }
+// }
