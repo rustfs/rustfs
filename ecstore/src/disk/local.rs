@@ -384,7 +384,10 @@ impl LocalDisk {
                     kind => {
                         if kind.to_string() != "directory not empty" {
                             warn!("delete_file remove_dir {:?} err {}", &delete_path, kind.to_string());
-                            return Err(Error::new(DiskError::FileAccessDenied));
+                            return Err(Error::new(FileAccessDeniedWithContext {
+                                path: delete_path.clone(),
+                                source: err,
+                            }));
                         }
                     }
                 }
