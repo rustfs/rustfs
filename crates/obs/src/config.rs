@@ -67,11 +67,24 @@ pub struct FileSinkConfig {
     pub flush_threshold: Option<usize>, // Refresh threshold, default 100 logs
 }
 
+impl FileSinkConfig {
+    pub fn get_default_log_path() -> String {
+        let temp_dir = env::temp_dir().join("rustfs").join("logs");
+
+        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+            eprintln!("Failed to create log directory: {}", e);
+            return "logs/app.log".to_string();
+        }
+
+        temp_dir.join("app.log").to_str().unwrap_or("logs/app.log").to_string()
+    }
+}
+
 impl Default for FileSinkConfig {
     fn default() -> Self {
         FileSinkConfig {
             enabled: true,
-            path: "logs/app.log".to_string(),
+            path: Self::get_default_log_path(),
             buffer_size: Some(8192),
             flush_interval_ms: Some(1000),
             flush_threshold: Some(100),

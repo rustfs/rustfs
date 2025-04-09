@@ -7,7 +7,7 @@ use tracing_core::Level;
 
 #[tokio::main]
 async fn main() {
-    let obs_conf = Some("packages/obs/examples/config.toml".to_string());
+    let obs_conf = Some("crates/obs/examples/config.toml".to_string());
     let config = load_config(obs_conf);
     let (_logger, _guard) = init_obs(config.clone()).await;
     let span = tracing::span!(Level::INFO, "main");
