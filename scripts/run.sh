@@ -1,5 +1,12 @@
 #!/bin/bash -e
 
+# check ./rustfs/static/index.html not exists
+if [ ! -f ./rustfs/static/index.html ]; then
+    echo "Downloading rustfs-console-latest.zip"
+    # download rustfs-console-latest.zip do not show log
+    curl -s -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -q -o tempfile.zip -d ./rustfs/static && rm tempfile.zip
+fi
+
 if [ -z "$SKIP_BUILD" ]; then
     cargo build -p rustfs --bins
 fi
@@ -33,13 +40,5 @@ if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
 
-
-
-# check ./rustfs/static/index.html not exists
-if [ ! -f ./rustfs/static/index.html ]; then
-    echo "Downloading rustfs-console-latest.zip"
-    # download rustfs-console-latest.zip do not show log
-    curl -s -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o tempfile.zip && unzip -q -o tempfile.zip -d ./rustfs/static && rm tempfile.zip
-fi
 
 cargo run --bin rustfs
