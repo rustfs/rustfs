@@ -43,7 +43,7 @@ http.workspace = true
 http-body.workspace = true
 iam = { path = "../iam" }
 jsonwebtoken = "9.3.0"
-libsystemd = { workspace = true }
+libsystemd = { workspace = true, optional = true }
 lock.workspace = true
 local-ip-address = { workspace = true }
 matchit = { workspace = true }
@@ -85,6 +85,9 @@ transform-stream.workspace = true
 tower-http.workspace = true
 url.workspace = true
 uuid = "1.15.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libsystemd = "0.7"
 
 [build-dependencies]
 prost-build.workspace = true

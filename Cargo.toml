@@ -68,7 +68,7 @@ humantime = "2.1.0"
 keyring = { version = "3.6.1", features = ["apple-native", "windows-native", "sync-secret-service"] }
 lock = { path = "./common/lock" }
 lazy_static = "1.5.0"
-libsystemd = "0.7.0"
+libsystemd = { version = "0.7" }
 local-ip-address = "0.6.3"
 matchit = "0.8.4"
 md-5 = "0.10.6"
