@@ -59,7 +59,10 @@ fn notify_systemd(state: &str) {
     let notify_state = match state {
         "ready" => NotifyState::Ready,
         "stopping" => NotifyState::Stopping,
-        _ => return,
+        _ => {
+            warn!("Unsupported state passed to notify_systemd: {}", state);
+            return;
+        },
     };
 
     if let Err(e) = notify(false, &[notify_state]) {
