@@ -11,9 +11,10 @@ members = [
     "iam", # Identity and Access Management
     "crypto", # Cryptography and security features
     "cli/rustfs-gui", # Graphical user interface client
-    "packages/obs", # Observability utilities
+    "crates/obs", # Observability utilities
     "s3select/api",
-    "s3select/query", "appauth",
+    "s3select/query",
+    "appauth",
 ]
 resolver = "2"
 
@@ -88,7 +89,7 @@ reqwest = { version = "0.12.15", default-features = false, features = ["rustls-t
 rfd = { version = "0.15.2", default-features = false, features = ["xdg-portal", "tokio"] }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
-rustfs-obs = { path = "packages/obs", version = "0.0.1" }
+rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rust-embed = "8.6.0"
 rustls = { version = "0.23" }
 rustls-pki-types = "1.11.0"

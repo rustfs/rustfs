@@ -46,10 +46,17 @@ impl ObjectVersion {
     }
 }
 
+impl Default for ObjectVersion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Log kind/level enum
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum LogKind {
     #[serde(rename = "INFO")]
+    #[default]
     Info,
     #[serde(rename = "WARNING")]
     Warning,
@@ -57,12 +64,6 @@ pub enum LogKind {
     Error,
     #[serde(rename = "FATAL")]
     Fatal,
-}
-
-impl Default for LogKind {
-    fn default() -> Self {
-        LogKind::Info
-    }
 }
 
 /// Trait for types that can be serialized to JSON and have a timestamp

@@ -284,7 +284,7 @@ impl FileSink {
             // If the file does not exist, create it
             debug!("FileSink: File does not exist, creating a new file.");
             // Create the file and write a header or initial content if needed
-            OpenOptions::new().create(true).write(true).open(&path).await?
+            OpenOptions::new().create(true).truncate(true).write(true).open(&path).await?
         };
         let writer = io::BufWriter::with_capacity(buffer_size, file);
         let now = std::time::SystemTime::now()
