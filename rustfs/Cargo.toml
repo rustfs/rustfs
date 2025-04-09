@@ -70,6 +70,7 @@ transform-stream.workspace = true
 uuid = "1.15.1"
 url.workspace = true
 axum.workspace = true
+axum-extra = { workspace = true }
 axum-server = { workspace = true }
 matchit = "0.8.4"
 shadow-rs.workspace = true
