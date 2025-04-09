@@ -1,12 +1,12 @@
 use crate::license::get_license;
 use axum::{
     body::Body,
-    extract::Host,
     http::{Response, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
 };
+use axum_extra::extract::Host;
 use axum_server::tls_rustls::RustlsConfig;
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
