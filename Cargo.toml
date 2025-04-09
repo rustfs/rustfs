@@ -82,7 +82,7 @@ prost-build = "0.13.4"
 prost-types = "0.13.4"
 protobuf = "3.7"
 protos = { path = "./common/protos" }
-rand = "0.9.0"
+rand = "0.8.5"
 rdkafka = { version = "0.37", features = ["tokio"] }
 reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration", "stream", "json", "blocking"] }
 rfd = { version = "0.15.2", default-features = false, features = ["xdg-portal", "tokio"] }
