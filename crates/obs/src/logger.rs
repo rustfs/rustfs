@@ -50,7 +50,7 @@ impl Logger {
     /// Log an audit entry
     #[tracing::instrument(skip(self), fields(log_source = "logger_audit"))]
     pub async fn log_audit_entry(&self, entry: AuditLogEntry) -> Result<(), LogError> {
-        self.log_entry(UnifiedLogEntry::Audit(entry)).await
+        self.log_entry(UnifiedLogEntry::Audit(Box::new(entry))).await
     }
 
     /// Log a console entry
@@ -61,13 +61,14 @@ impl Logger {
 
     /// Asynchronous logging of unified log entries
     #[tracing::instrument(skip(self), fields(log_source = "logger"))]
+    #[tracing::instrument(level = "error", skip_all)]
     pub async fn log_entry(&self, entry: UnifiedLogEntry) -> Result<(), LogError> {
         // Extract information for tracing based on entry type
         match &entry {
             UnifiedLogEntry::Server(server) => {
                 tracing::Span::current()
-                    .record("log_level", &server.level.0.as_str())
-                    .record("log_message", &server.base.message.as_deref().unwrap_or(""))
+                    .record("log_level", server.level.0.as_str())
+                    .record("log_message", server.base.message.as_deref().unwrap_or("log message not set"))
                     .record("source", &server.source);
 
                 // Generate tracing event based on log level

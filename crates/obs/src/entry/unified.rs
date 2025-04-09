@@ -99,6 +99,7 @@ impl LogRecord for ServerLogEntry {
 /// - `console_msg` - the console message
 /// - `node_name` - the node name
 /// - `err` - the error message
+///
 /// The `ConsoleLogEntry` structure contains the following methods:
 /// - `new` - create a new `ConsoleLogEntry`
 /// - `new_with_console_msg` - create a new `ConsoleLogEntry` with console message and node name
@@ -107,6 +108,7 @@ impl LogRecord for ServerLogEntry {
 /// - `set_node_name` - set the node name
 /// - `set_console_msg` - set the console message
 /// - `set_err` - set the error message
+///
 /// # Example
 /// ```
 /// use rustfs_obs::ConsoleLogEntry;
@@ -180,6 +182,12 @@ impl ConsoleLogEntry {
     }
 }
 
+impl Default for ConsoleLogEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogRecord for ConsoleLogEntry {
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| String::from("{}"))
@@ -217,7 +225,7 @@ pub enum UnifiedLogEntry {
     Server(ServerLogEntry),
 
     #[serde(rename = "audit")]
-    Audit(AuditLogEntry),
+    Audit(Box<AuditLogEntry>),
 
     #[serde(rename = "console")]
     Console(ConsoleLogEntry),
