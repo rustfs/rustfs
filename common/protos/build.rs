@@ -8,7 +8,7 @@ use std::{
 type AnyError = Box<dyn std::error::Error>;
 
 const ENV_OUT_DIR: &str = "OUT_DIR";
-const VERSION_PROTOBUF: Version = Version(27, 0, 0); // 27.0
+const VERSION_PROTOBUF: Version = Version(30, 2, 0); // 30.2.0
 const VERSION_FLATBUFFERS: Version = Version(24, 3, 25); // 24.3.25
 /// Build protos if the major version of `flatc` or `protoc` is greater
 /// or lesser than the expected version.

@@ -22,7 +22,7 @@ protos.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tonic = { version = "0.12.3", features = ["gzip"] }
+tonic = { workspace = true }
 tokio = { workspace = true }
 tower.workspace = true
 url.workspace = true
