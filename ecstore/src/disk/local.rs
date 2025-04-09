@@ -479,13 +479,14 @@ impl LocalDisk {
         let meta = f.metadata().await?;
 
         if meta.is_dir() {
-            return Err(Error::new(DiskError::FileNotFound));
+            // fix use io::Error
+            return Err(std::io::Error::new(ErrorKind::NotFound, "is dir").into());
         }
 
         let meta = f.metadata().await.map_err(os_err_to_file_err)?;
 
         if meta.is_dir() {
-            return Err(Error::new(DiskError::FileNotFound));
+            return Err(std::io::Error::new(ErrorKind::NotFound, "is dir").into());
         }
 
         let size = meta.len() as usize;
@@ -821,8 +822,6 @@ impl LocalDisk {
 
         // 第一层过滤
         for item in entries.iter_mut() {
-            // warn!("walk_dir  get entry {:?}", &entry);
-
             let entry = item.clone();
             // check limit
             if opts.limit > 0 && *objs_returned >= opts.limit {
@@ -862,7 +861,10 @@ impl LocalDisk {
                 let metadata = self
                     .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
                     .await?;
-                let name = entry.trim_end_matches(STORAGE_FORMAT_FILE).trim_end_matches(SLASH_SEPARATOR);
+
+                // 用strip_suffix只删除一次
+                let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
+                let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
                 out.write_obj(&MetaCacheEntry {
@@ -892,7 +894,6 @@ impl LocalDisk {
         let mut dir_stack: Vec<String> = Vec::with_capacity(5);
 
         for entry in entries.iter() {
-            //
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
             }
