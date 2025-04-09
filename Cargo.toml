@@ -52,7 +52,7 @@ common = { path = "./common/common" }
 policy = { path = "./policy" }
 hex = "0.4.3"
 hyper = "1.6.0"
-hyper-util = { version = "0.1.10", features = [
+hyper-util = { version = "0.1.11", features = [
     "tokio",
     "server-auto",
     "server-graceful",
@@ -133,6 +133,7 @@ uuid = { version = "1.15.1", features = [
     "macro-diagnostics",
 ] }
 axum = "0.8.3"
+axum-extra = "0.10.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 md-5 = "0.10.6"
 workers = { path = "./common/workers" }
