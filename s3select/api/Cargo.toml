@@ -12,7 +12,7 @@ ecstore.workspace = true
 futures = { workspace = true }
 futures-core = "0.3.31"
 http.workspace = true
-object_store = "0.12.0"
+object_store = "0.11.2"
 s3s.workspace = true
 snafu = { workspace = true, features = ["backtrace"] }
 tokio.workspace = true
