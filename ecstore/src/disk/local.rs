@@ -51,8 +51,6 @@ use path_absolutize::Absolutize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::io::SeekFrom;
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -309,7 +307,19 @@ impl LocalDisk {
     //     })
     // }
 
+    #[allow(unreachable_code)]
+    #[allow(unused_variables)]
     pub async fn move_to_trash(&self, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
+        if recursive {
+            remove_all(delete_path).await?;
+        } else {
+            remove(delete_path).await?;
+        }
+
+        return Ok(());
+
+        // TODO: 异步通知 检测硬盘空间 清空回收站
+
         let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
         if let Some(parent) = trash_path.parent() {
             if !parent.exists() {
@@ -348,7 +358,6 @@ impl LocalDisk {
             return Ok(());
         }
 
-        // TODO: 异步通知 检测硬盘空间 清空回收站
         Ok(())
     }
 
