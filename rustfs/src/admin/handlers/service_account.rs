@@ -1,5 +1,5 @@
 use crate::admin::utils::has_space_be;
-use crate::auth::get_session_token;
+use crate::auth::{get_condition_values, get_session_token};
 use crate::{admin::router::Operation, auth::check_key_valid};
 use http::HeaderMap;
 use hyper::StatusCode;
@@ -13,7 +13,8 @@ use madmin::{
     ServiceAccountInfo, UpdateServiceAccountReq,
 };
 use matchit::Params;
-use policy::policy::Policy;
+use policy::policy::action::{Action, AdminAction};
+use policy::policy::{Args, Policy};
 use s3s::S3ErrorCode::InvalidRequest;
 use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::Deserialize;
@@ -30,7 +31,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &req_cred.access_key).await?;
 
         let mut input = req.input;
@@ -90,6 +91,25 @@ impl Operation for AddServiceAccount {
         }
 
         let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+
+        let deny_only = cred.access_key == target_user || cred.parent_user == target_user;
+
+        if !iam_store
+            .is_allowed(&Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::AdminAction(AdminAction::CreateServiceAccountAdminAction),
+                bucket: "",
+                conditions: &get_condition_values(&req.headers, &cred),
+                is_owner: owner,
+                object: "",
+                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                deny_only,
+            })
+            .await
+        {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
 
         if target_user != cred.access_key {
             let has_user = iam_store.get_user(&target_user).await;
@@ -212,7 +232,31 @@ impl Operation for UpdateServiceAccount {
         update_req
             .validate()
             .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
-        // TODO: is_allowed
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        if !iam_store
+            .is_allowed(&Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
+                bucket: "",
+                conditions: &get_condition_values(&req.headers, &cred),
+                is_owner: owner,
+                object: "",
+                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                deny_only: false,
+            })
+            .await
+        {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
+
         let sp = {
             if let Some(policy) = update_req.new_policy {
                 let sp = Policy::parse_config(policy.as_bytes()).map_err(|e| {
@@ -280,7 +324,36 @@ impl Operation for InfoServiceAccount {
             s3_error!(InternalError, "get service account failed")
         })?;
 
-        // TODO: is_allowed
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        if !iam_store
+            .is_allowed(&Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
+                bucket: "",
+                conditions: &get_condition_values(&req.headers, &cred),
+                is_owner: owner,
+                object: "",
+                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                deny_only: false,
+            })
+            .await
+        {
+            let user = if cred.parent_user.is_empty() {
+                &cred.access_key
+            } else {
+                &cred.parent_user
+            };
+            if user != &svc_account.parent_user {
+                return Err(s3_error!(AccessDenied, "access denied"));
+            }
+        }
 
         let implied_policy = if let Some(policy) = session_policy.as_ref() {
             policy.version.is_empty() && policy.statements.is_empty()
@@ -359,7 +432,7 @@ impl Operation for ListServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
                 .await
                 .map_err(|e| {
@@ -367,21 +440,46 @@ impl Operation for ListServiceAccount {
                     s3_error!(InternalError, "check key failed")
                 })?;
 
-        let target_account = if let Some(user) = query.user {
-            if user != input_cred.access_key {
-                user
-            } else if cred.parent_user.is_empty() {
-                input_cred.access_key
-            } else {
-                cred.parent_user
+        // let target_account = if let Some(user) = query.user {
+        //     if user != input_cred.access_key {
+        //         user
+        //     } else if cred.parent_user.is_empty() {
+        //         input_cred.access_key
+        //     } else {
+        //         cred.parent_user
+        //     }
+        // } else if cred.parent_user.is_empty() {
+        //     input_cred.access_key
+        // } else {
+        //     cred.parent_user
+        // };
+
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+
+        let target_account = if query.user.as_ref().is_some_and(|v| v != &cred.access_key) {
+            if !iam_store
+                .is_allowed(&Args {
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
+                    bucket: "",
+                    conditions: &get_condition_values(&req.headers, &cred),
+                    is_owner: owner,
+                    object: "",
+                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    deny_only: false,
+                })
+                .await
+            {
+                return Err(s3_error!(AccessDenied, "access denied"));
             }
+
+            query.user.unwrap_or_default()
         } else if cred.parent_user.is_empty() {
-            input_cred.access_key
+            cred.access_key
         } else {
             cred.parent_user
         };
-
-        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
 
         let service_accounts = iam_store.list_service_accounts(&target_account).await.map_err(|e| {
             debug!("list service account failed: {e:?}");
@@ -420,7 +518,7 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (_cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
                 .await
                 .map_err(|e| {
@@ -444,7 +542,7 @@ impl Operation for DeleteServiceAccount {
 
         let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
 
-        let _svc_account = match iam_store.get_service_account(&query.access_key).await {
+        let svc_account = match iam_store.get_service_account(&query.access_key).await {
             Ok((res, _)) => Some(res),
             Err(err) => {
                 if is_err_no_such_service_account(&err) {
@@ -455,7 +553,30 @@ impl Operation for DeleteServiceAccount {
             }
         };
 
-        // TODO: is_allowed
+        if !iam_store
+            .is_allowed(&Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::AdminAction(AdminAction::RemoveServiceAccountAdminAction),
+                bucket: "",
+                conditions: &get_condition_values(&req.headers, &cred),
+                is_owner: owner,
+                object: "",
+                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                deny_only: false,
+            })
+            .await
+        {
+            let user = if cred.parent_user.is_empty() {
+                &cred.access_key
+            } else {
+                &cred.parent_user
+            };
+
+            if svc_account.is_some_and(|v| &v.parent_user != user) {
+                return Err(s3_error!(InvalidRequest, "service account not exist"));
+            }
+        }
 
         iam_store.delete_service_account(&query.access_key).await.map_err(|e| {
             debug!("delete service account failed, e: {:?}", e);

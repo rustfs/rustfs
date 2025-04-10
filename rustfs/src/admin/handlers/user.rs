@@ -1,9 +1,13 @@
-use std::str::from_utf8;
+use std::{collections::HashMap, str::from_utf8};
 
 use http::{HeaderMap, StatusCode};
 use iam::get_global_action_cred;
 use madmin::{AccountStatus, AddOrUpdateUserReq};
 use matchit::Params;
+use policy::policy::{
+    action::{Action, AdminAction},
+    Args,
+};
 use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
@@ -11,7 +15,7 @@ use tracing::warn;
 
 use crate::{
     admin::{router::Operation, utils::has_space_be},
-    auth::{check_key_valid, get_session_token},
+    auth::{check_key_valid, get_condition_values, get_session_token},
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -39,7 +43,7 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, _owner) =
+        let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         let ak = query.access_key.as_deref().unwrap_or_default();
@@ -62,8 +66,6 @@ impl Operation for AddUser {
 
         let args: AddOrUpdateUserReq = serde_json::from_slice(&body)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {}", e)))?;
-
-        warn!("add user args {:?}", args);
 
         if args.secret_key.is_empty() {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
@@ -89,13 +91,24 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is not utf8"));
         }
 
-        // let check_deny_only = if ak == cred.access_key {
-        //     true
-        // } else {
-        //     false
-        // };
-
-        // TODO: is_allowed
+        let deny_only = ak == cred.access_key;
+        let conditions = get_condition_values(&req.headers, &cred);
+        if !iam_store
+            .is_allowed(&Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::AdminAction(AdminAction::CreateUserAdminAction),
+                bucket: "",
+                conditions: &conditions,
+                is_owner: owner,
+                object: "",
+                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                deny_only,
+            })
+            .await
+        {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
 
         iam_store
             .create_user(ak, &args)
@@ -113,8 +126,6 @@ pub struct SetUserStatus {}
 #[async_trait::async_trait]
 impl Operation for SetUserStatus {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle SetUserStatus");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
@@ -165,8 +176,6 @@ pub struct ListUsers {}
 #[async_trait::async_trait]
 impl Operation for ListUsers {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ListUsers");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: BucketQuery =
@@ -214,8 +223,6 @@ pub struct RemoveUser {}
 #[async_trait::async_trait]
 impl Operation for RemoveUser {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RemoveUser");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
@@ -277,8 +284,6 @@ pub struct GetUserInfo {}
 #[async_trait::async_trait]
 impl Operation for GetUserInfo {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle GetUserInfo");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddUserQuery =
@@ -296,6 +301,32 @@ impl Operation for GetUserInfo {
         }
 
         let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
+
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        let deny_only = ak == cred.access_key;
+        let conditions = get_condition_values(&req.headers, &cred);
+        if !iam_store
+            .is_allowed(&Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::AdminAction(AdminAction::GetUserAdminAction),
+                bucket: "",
+                conditions: &conditions,
+                is_owner: owner,
+                object: "",
+                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                deny_only,
+            })
+            .await
+        {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
 
         let info = iam_store
             .get_user_info(ak)

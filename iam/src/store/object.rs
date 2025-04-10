@@ -675,10 +675,10 @@ impl Store for ObjectStore {
     async fn load_all(&self, cache: &Cache) -> Result<()> {
         let listed_config_items = self.list_all_iamconfig_items().await?;
 
+        let mut policy_docs_cache = CacheEntity::new(get_default_policyes());
+
         if let Some(policies_list) = listed_config_items.get(POLICIES_LIST_KEY) {
             let mut policies_list = policies_list.clone();
-
-            let mut policy_docs_cache = CacheEntity::new(get_default_policyes());
 
             loop {
                 if policies_list.len() < 32 {
@@ -712,9 +712,9 @@ impl Store for ObjectStore {
 
                 policies_list = policies_list.split_off(32);
             }
-
-            cache.policy_docs.store(Arc::new(policy_docs_cache.update_load_time()));
         }
+
+        cache.policy_docs.store(Arc::new(policy_docs_cache.update_load_time()));
 
         let mut user_items_cache = CacheEntity::default();
 

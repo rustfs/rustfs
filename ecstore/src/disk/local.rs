@@ -1232,7 +1232,7 @@ impl DiskAPI for LocalDisk {
                 .join(path)
                 .join(fi.data_dir.map_or("".to_string(), |dir| dir.to_string()))
                 .join(format!("part.{}", part.number));
-            let err = match self
+            let err = (self
                 .bitrot_verify(
                     &part_path,
                     erasure.shard_file_size(part.size),
@@ -1240,11 +1240,8 @@ impl DiskAPI for LocalDisk {
                     &checksum_info.hash,
                     erasure.shard_size(erasure.block_size),
                 )
-                .await
-            {
-                Ok(_) => None,
-                Err(err) => Some(err),
-            };
+                .await)
+                .err();
             resp.results[i] = conv_part_err_to_int(&err);
             if resp.results[i] == CHECK_PART_UNKNOWN {
                 if let Some(err) = err {

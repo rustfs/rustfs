@@ -54,6 +54,7 @@ pub enum Action {
     AdminAction(AdminAction),
     StsAction(StsAction),
     KmsAction(KmsAction),
+    None,
 }
 
 impl Action {
@@ -69,6 +70,7 @@ impl From<&Action> for &str {
             Action::AdminAction(s) => s.into(),
             Action::StsAction(s) => s.into(),
             Action::KmsAction(s) => s.into(),
+            Action::None => "",
         }
     }
 }
@@ -232,35 +234,254 @@ pub enum S3Action {
     PutObjectFanOutAction,
 }
 
+// #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+// #[serde(try_from = "&str", into = "&str")]
+// pub enum AdminAction {
+//     #[strum(serialize = "admin:*")]
+//     AllActions,
+//     #[strum(serialize = "admin:Profiling")]
+//     ProfilingAdminAction,
+//     #[strum(serialize = "admin:ServerTrace")]
+//     TraceAdminAction,
+//     #[strum(serialize = "admin:ConsoleLog")]
+//     ConsoleLogAdminAction,
+//     #[strum(serialize = "admin:ServerInfo")]
+//     ServerInfoAdminAction,
+//     #[strum(serialize = "admin:OBDInfo")]
+//     HealthInfoAdminAction,
+//     #[strum(serialize = "admin:TopLocksInfo")]
+//     TopLocksAdminAction,
+//     #[strum(serialize = "admin:LicenseInfo")]
+//     LicenseInfoAdminAction,
+//     #[strum(serialize = "admin:BandwidthMonitor")]
+//     BandwidthMonitorAction,
+//     #[strum(serialize = "admin:InspectData")]
+//     InspectDataAction,
+//     #[strum(serialize = "admin:Prometheus")]
+//     PrometheusAdminAction,
+//     #[strum(serialize = "admin:ListServiceAccounts")]
+//     ListServiceAccountsAdminAction,
+//     #[strum(serialize = "admin:CreateServiceAccount")]
+//     CreateServiceAccountAdminAction,
+// }
+
+// AdminAction - admin policy action.
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum AdminAction {
-    #[strum(serialize = "admin:*")]
-    AllActions,
+    #[strum(serialize = "admin:Heal")]
+    HealAdminAction,
+    #[strum(serialize = "admin:Decommission")]
+    DecommissionAdminAction,
+    #[strum(serialize = "admin:Rebalance")]
+    RebalanceAdminAction,
+    #[strum(serialize = "admin:StorageInfo")]
+    StorageInfoAdminAction,
+    #[strum(serialize = "admin:Prometheus")]
+    PrometheusAdminAction,
+    #[strum(serialize = "admin:DataUsageInfo")]
+    DataUsageInfoAdminAction,
+    #[strum(serialize = "admin:ForceUnlock")]
+    ForceUnlockAdminAction,
+    #[strum(serialize = "admin:TopLocksInfo")]
+    TopLocksAdminAction,
     #[strum(serialize = "admin:Profiling")]
     ProfilingAdminAction,
     #[strum(serialize = "admin:ServerTrace")]
     TraceAdminAction,
     #[strum(serialize = "admin:ConsoleLog")]
     ConsoleLogAdminAction,
+    #[strum(serialize = "admin:KMSCreateKey")]
+    KMSCreateKeyAdminAction,
+    #[strum(serialize = "admin:KMSKeyStatus")]
+    KMSKeyStatusAdminAction,
     #[strum(serialize = "admin:ServerInfo")]
     ServerInfoAdminAction,
     #[strum(serialize = "admin:OBDInfo")]
     HealthInfoAdminAction,
-    #[strum(serialize = "admin:TopLocksInfo")]
-    TopLocksAdminAction,
     #[strum(serialize = "admin:LicenseInfo")]
     LicenseInfoAdminAction,
     #[strum(serialize = "admin:BandwidthMonitor")]
     BandwidthMonitorAction,
     #[strum(serialize = "admin:InspectData")]
     InspectDataAction,
-    #[strum(serialize = "admin:Prometheus")]
-    PrometheusAdminAction,
-    #[strum(serialize = "admin:ListServiceAccounts")]
-    ListServiceAccountsAdminAction,
+    #[strum(serialize = "admin:ServerUpdate")]
+    ServerUpdateAdminAction,
+    #[strum(serialize = "admin:ServiceRestart")]
+    ServiceRestartAdminAction,
+    #[strum(serialize = "admin:ServiceStop")]
+    ServiceStopAdminAction,
+    #[strum(serialize = "admin:ServiceFreeze")]
+    ServiceFreezeAdminAction,
+    #[strum(serialize = "admin:ConfigUpdate")]
+    ConfigUpdateAdminAction,
+    #[strum(serialize = "admin:CreateUser")]
+    CreateUserAdminAction,
+    #[strum(serialize = "admin:DeleteUser")]
+    DeleteUserAdminAction,
+    #[strum(serialize = "admin:ListUsers")]
+    ListUsersAdminAction,
+    #[strum(serialize = "admin:EnableUser")]
+    EnableUserAdminAction,
+    #[strum(serialize = "admin:DisableUser")]
+    DisableUserAdminAction,
+    #[strum(serialize = "admin:GetUser")]
+    GetUserAdminAction,
+    #[strum(serialize = "admin:SiteReplicationAdd")]
+    SiteReplicationAddAction,
+    #[strum(serialize = "admin:SiteReplicationDisable")]
+    SiteReplicationDisableAction,
+    #[strum(serialize = "admin:SiteReplicationRemove")]
+    SiteReplicationRemoveAction,
+    #[strum(serialize = "admin:SiteReplicationResync")]
+    SiteReplicationResyncAction,
+    #[strum(serialize = "admin:SiteReplicationInfo")]
+    SiteReplicationInfoAction,
+    #[strum(serialize = "admin:SiteReplicationOperation")]
+    SiteReplicationOperationAction,
     #[strum(serialize = "admin:CreateServiceAccount")]
     CreateServiceAccountAdminAction,
+    #[strum(serialize = "admin:UpdateServiceAccount")]
+    UpdateServiceAccountAdminAction,
+    #[strum(serialize = "admin:RemoveServiceAccount")]
+    RemoveServiceAccountAdminAction,
+    #[strum(serialize = "admin:ListServiceAccounts")]
+    ListServiceAccountsAdminAction,
+    #[strum(serialize = "admin:ListTemporaryAccounts")]
+    ListTemporaryAccountsAdminAction,
+    #[strum(serialize = "admin:AddUserToGroup")]
+    AddUserToGroupAdminAction,
+    #[strum(serialize = "admin:RemoveUserFromGroup")]
+    RemoveUserFromGroupAdminAction,
+    #[strum(serialize = "admin:GetGroup")]
+    GetGroupAdminAction,
+    #[strum(serialize = "admin:ListGroups")]
+    ListGroupsAdminAction,
+    #[strum(serialize = "admin:EnableGroup")]
+    EnableGroupAdminAction,
+    #[strum(serialize = "admin:DisableGroup")]
+    DisableGroupAdminAction,
+    #[strum(serialize = "admin:CreatePolicy")]
+    CreatePolicyAdminAction,
+    #[strum(serialize = "admin:DeletePolicy")]
+    DeletePolicyAdminAction,
+    #[strum(serialize = "admin:GetPolicy")]
+    GetPolicyAdminAction,
+    #[strum(serialize = "admin:AttachUserOrGroupPolicy")]
+    AttachPolicyAdminAction,
+    #[strum(serialize = "admin:UpdatePolicyAssociation")]
+    UpdatePolicyAssociationAction,
+    #[strum(serialize = "admin:ListUserPolicies")]
+    ListUserPoliciesAdminAction,
+    #[strum(serialize = "admin:SetBucketQuota")]
+    SetBucketQuotaAdminAction,
+    #[strum(serialize = "admin:GetBucketQuota")]
+    GetBucketQuotaAdminAction,
+    #[strum(serialize = "admin:SetBucketTarget")]
+    SetBucketTargetAction,
+    #[strum(serialize = "admin:GetBucketTarget")]
+    GetBucketTargetAction,
+    #[strum(serialize = "admin:ReplicationDiff")]
+    ReplicationDiff,
+    #[strum(serialize = "admin:ImportBucketMetadata")]
+    ImportBucketMetadataAction,
+    #[strum(serialize = "admin:ExportBucketMetadata")]
+    ExportBucketMetadataAction,
+    #[strum(serialize = "admin:SetTier")]
+    SetTierAction,
+    #[strum(serialize = "admin:ListTier")]
+    ListTierAction,
+    #[strum(serialize = "admin:ExportIAM")]
+    ExportIAMAction,
+    #[strum(serialize = "admin:ImportIAM")]
+    ImportIAMAction,
+    #[strum(serialize = "admin:ListBatchJobs")]
+    ListBatchJobsAction,
+    #[strum(serialize = "admin:DescribeBatchJob")]
+    DescribeBatchJobAction,
+    #[strum(serialize = "admin:StartBatchJob")]
+    StartBatchJobAction,
+    #[strum(serialize = "admin:CancelBatchJob")]
+    CancelBatchJobAction,
+    #[strum(serialize = "admin:*")]
+    AllAdminActions,
+}
+
+impl AdminAction {
+    // IsValid - checks if action is valid or not.
+    pub fn is_valid(&self) -> bool {
+        matches!(
+            self,
+            AdminAction::HealAdminAction
+                | AdminAction::DecommissionAdminAction
+                | AdminAction::RebalanceAdminAction
+                | AdminAction::StorageInfoAdminAction
+                | AdminAction::PrometheusAdminAction
+                | AdminAction::DataUsageInfoAdminAction
+                | AdminAction::ForceUnlockAdminAction
+                | AdminAction::TopLocksAdminAction
+                | AdminAction::ProfilingAdminAction
+                | AdminAction::TraceAdminAction
+                | AdminAction::ConsoleLogAdminAction
+                | AdminAction::KMSCreateKeyAdminAction
+                | AdminAction::KMSKeyStatusAdminAction
+                | AdminAction::ServerInfoAdminAction
+                | AdminAction::HealthInfoAdminAction
+                | AdminAction::LicenseInfoAdminAction
+                | AdminAction::BandwidthMonitorAction
+                | AdminAction::InspectDataAction
+                | AdminAction::ServerUpdateAdminAction
+                | AdminAction::ServiceRestartAdminAction
+                | AdminAction::ServiceStopAdminAction
+                | AdminAction::ServiceFreezeAdminAction
+                | AdminAction::ConfigUpdateAdminAction
+                | AdminAction::CreateUserAdminAction
+                | AdminAction::DeleteUserAdminAction
+                | AdminAction::ListUsersAdminAction
+                | AdminAction::EnableUserAdminAction
+                | AdminAction::DisableUserAdminAction
+                | AdminAction::GetUserAdminAction
+                | AdminAction::SiteReplicationAddAction
+                | AdminAction::SiteReplicationDisableAction
+                | AdminAction::SiteReplicationRemoveAction
+                | AdminAction::SiteReplicationResyncAction
+                | AdminAction::SiteReplicationInfoAction
+                | AdminAction::SiteReplicationOperationAction
+                | AdminAction::CreateServiceAccountAdminAction
+                | AdminAction::UpdateServiceAccountAdminAction
+                | AdminAction::RemoveServiceAccountAdminAction
+                | AdminAction::ListServiceAccountsAdminAction
+                | AdminAction::ListTemporaryAccountsAdminAction
+                | AdminAction::AddUserToGroupAdminAction
+                | AdminAction::RemoveUserFromGroupAdminAction
+                | AdminAction::GetGroupAdminAction
+                | AdminAction::ListGroupsAdminAction
+                | AdminAction::EnableGroupAdminAction
+                | AdminAction::DisableGroupAdminAction
+                | AdminAction::CreatePolicyAdminAction
+                | AdminAction::DeletePolicyAdminAction
+                | AdminAction::GetPolicyAdminAction
+                | AdminAction::AttachPolicyAdminAction
+                | AdminAction::UpdatePolicyAssociationAction
+                | AdminAction::ListUserPoliciesAdminAction
+                | AdminAction::SetBucketQuotaAdminAction
+                | AdminAction::GetBucketQuotaAdminAction
+                | AdminAction::SetBucketTargetAction
+                | AdminAction::GetBucketTargetAction
+                | AdminAction::ReplicationDiff
+                | AdminAction::ImportBucketMetadataAction
+                | AdminAction::ExportBucketMetadataAction
+                | AdminAction::SetTierAction
+                | AdminAction::ListTierAction
+                | AdminAction::ExportIAMAction
+                | AdminAction::ImportIAMAction
+                | AdminAction::ListBatchJobsAction
+                | AdminAction::DescribeBatchJobAction
+                | AdminAction::StartBatchJobAction
+                | AdminAction::CancelBatchJobAction
+                | AdminAction::AllAdminActions
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]

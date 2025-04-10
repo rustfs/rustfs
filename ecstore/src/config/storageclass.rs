@@ -189,13 +189,7 @@ pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
 
     validate_parity_inner(standard.parity, rrs.parity, set_drive_count)?;
 
-    let optimize = {
-        if let Ok(ev) = env::var(OPTIMIZE_ENV) {
-            Some(ev)
-        } else {
-            None
-        }
-    };
+    let optimize = { env::var(OPTIMIZE_ENV).ok() };
 
     let inline_block = {
         if let Ok(ev) = env::var(INLINE_BLOCK_ENV) {
