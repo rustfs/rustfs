@@ -43,7 +43,7 @@ http.workspace = true
 http-body.workspace = true
 iam = { path = "../iam" }
 jsonwebtoken = "9.3.0"
-libsystemd = { workspace = true, optional = true }
+
 lock.workspace = true
 local-ip-address = { workspace = true }
 matchit = { workspace = true }
@@ -71,7 +71,12 @@ shadow-rs.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 tokio-util.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+] }
 tokio-rustls.workspace = true
 lazy_static.workspace = true
 tokio-stream.workspace = true
@@ -101,7 +106,11 @@ ecstore = { path = "../ecstore" }
 s3s.workspace = true
 clap = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
-hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful"] }
+hyper-util = { workspace = true, features = [
+    "tokio",
+    "server-auto",
+    "server-graceful",
+] }
 transform-stream = { workspace = true }
 netif = "0.1.6"
 shadow-rs.workspace = true
