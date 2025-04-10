@@ -24,20 +24,15 @@ User=rustfs
 Group=rustfs
 # 以 rustfs 组身份运行服务，与 User 配合使用。
 
-# environment variable configuration
-# 定义环境变量配置，用于传递给服务程序。
-Environment=RUST_LOG=info
-# 设置日志级别为 info，控制服务日志输出（需服务支持此变量）。
-Environment=RUSTFS_ACCESS_KEY=minioadmin
-# 设置访问密钥为 minioadmin，用于 RustFS 的认证。
-Environment=RUSTFS_SECRET_KEY=minioadmin
-# 设置秘密密钥为 minioadmin，与访问密钥配套使用。
-
 # working directory
 WorkingDirectory=/opt/rustfs
 # 设置服务的工作目录为 /opt/rustfs，影响相对路径的解析。
 
-# main program
+# 定义环境变量配置，用于传递给服务程序。
+Environment=RUSTFS_ACCESS_KEY=minioadmin
+# 设置访问密钥为 minioadmin，用于 RustFS 的认证。
+Environment=RUSTFS_SECRET_KEY=minioadmin
+# 设置秘密密钥为 minioadmin，与访问密钥配套使用。
 ExecStart=/usr/local/bin/rustfs \
     --address 0.0.0.0:9000 \
     --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
@@ -50,6 +45,10 @@ ExecStart=/usr/local/bin/rustfs \
 # --obs-config：指定配置文件路径为 /etc/rustfs/obs.yaml。
 # --console-enable：启用控制台功能。
 # --console-address 0.0.0.0:9002：控制台监听所有接口的 9002 端口。
+
+# 定义环境变量配置，用于传递给服务程序，推荐使用且简洁
+EnvironmentFile=-/etc/default/rustfs
+ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
 
 # resource constraints
 LimitNOFILE=1048576
