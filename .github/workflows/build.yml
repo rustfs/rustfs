@@ -16,10 +16,10 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { profile: dev, target: x86_64-unknown-linux-musl, glibc: "default" }
+          # - { profile: dev, target: x86_64-unknown-linux-musl, glibc: "default" }
           - { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
           - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
+          # - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
 
     steps:
       - uses: actions/checkout@v4
@@ -102,20 +102,22 @@ jobs:
           ls -R
           unzip -o -j "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}.zip" -d ./cli/rustfs-gui/embedded-rustfs/
           ls -la cli/rustfs-gui/embedded-rustfs
-      - name: Cache dioxus-cli
-        uses: actions/cache@v4
+      #      - name: Cache dioxus-cli
+      #        uses: actions/cache@v4
+      #        with:
+      #          path: ~/.cargo/bin/dx
+      #          key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('**/Cargo.lock') }}
+      #          restore-keys: |
+      #            ${{ runner.os }}-dioxus-cli-
+      #
+      #      - name: Install dioxus-cli
+      #        run: |
+      #          if [ ! -f ~/.cargo/bin/dx ]; then
+      #            cargo install dioxus-cli
+      #          fi
+      - uses: taiki-e/cache-cargo-install-action@v2
         with:
-          path: ~/.cargo/bin/dx
-          key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-dioxus-cli-
-
-      - name: Install dioxus-cli
-        run: |
-          if [ ! -f ~/.cargo/bin/dx ]; then
-            cargo install dioxus-cli
-          fi
-
+          tool: dioxus-cli
       - name: Build and Bundle rustfs-gui
         run: |
           ls -la
