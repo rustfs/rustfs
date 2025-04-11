@@ -96,7 +96,7 @@ impl ServiceStateManager {
             ServiceState::Starting => {
                 info!("Service is starting...");
                 #[cfg(target_os = "linux")]
-                if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Starting...")]) {
+                if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Starting...".to_string())]) {
                     tracing::error!("Failed to notify systemd of starting state: {}", e);
                 }
             }
@@ -111,7 +111,7 @@ impl ServiceStateManager {
             ServiceState::Stopped => {
                 info!("Service has stopped");
                 #[cfg(target_os = "linux")]
-                if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Stopped")]) {
+                if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Stopped".to_string())]) {
                     tracing::error!("Failed to notify systemd of stopped state: {}", e);
                 }
             }
