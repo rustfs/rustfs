@@ -261,14 +261,7 @@ impl S3 for FS {
             .await
             .map_err(to_s3_error)?;
 
-        let version_id = opts
-            .version_id
-            .as_ref()
-            .map(|v| match Uuid::parse_str(v) {
-                Ok(id) => Some(id),
-                Err(_) => None,
-            })
-            .unwrap_or_default();
+        let version_id = opts.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
         let dobj = ObjectToDelete {
             object_name: key,
             version_id,
@@ -325,14 +318,7 @@ impl S3 for FS {
             .objects
             .iter()
             .map(|v| {
-                let version_id = v
-                    .version_id
-                    .as_ref()
-                    .map(|v| match Uuid::parse_str(v) {
-                        Ok(id) => Some(id),
-                        Err(_) => None,
-                    })
-                    .unwrap_or_default();
+                let version_id = v.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
                 ObjectToDelete {
                     object_name: v.key.clone(),
                     version_id,
@@ -407,8 +393,6 @@ impl S3 for FS {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         // mc get 3
 
-        // warn!("get_object input {:?}, vid {:?}", &req.input, req.input.version_id);
-
         let GetObjectInput {
             bucket,
             key,
@@ -446,8 +430,6 @@ impl S3 for FS {
         if rs.is_some() && part_number.is_some() {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
         }
-
-        // let metadata = extract_metadata(&req.headers);
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
@@ -516,16 +498,49 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         // mc get 2
-        let HeadObjectInput { bucket, key, .. } = req.input;
+        let HeadObjectInput {
+            bucket,
+            key,
+            version_id,
+            part_number,
+            range,
+            ..
+        } = req.input;
+
+        let part_number = part_number.map(|v| v as usize);
+
+        if let Some(part_num) = part_number {
+            if part_num == 0 {
+                return Err(s3_error!(InvalidArgument, "part_numer invalid"));
+            }
+        }
+
+        let rs = range.map(|v| match v {
+            Range::Int { first, last } => HTTPRangeSpec {
+                is_suffix_length: false,
+                start: first as usize,
+                end: last.map(|v| v as usize),
+            },
+            Range::Suffix { length } => HTTPRangeSpec {
+                is_suffix_length: true,
+                start: length as usize,
+                end: None,
+            },
+        });
+
+        if rs.is_some() && part_number.is_some() {
+            return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
+        }
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
+            .await
+            .map_err(to_s3_error)?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let info = store
-            .get_object_info(&bucket, &key, &ObjectOptions::default())
-            .await
-            .map_err(to_s3_error)?;
+        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(to_s3_error)?;
 
         // warn!("head_object info {:?}", &info);
 
