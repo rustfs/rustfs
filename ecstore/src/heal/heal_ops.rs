@@ -406,10 +406,7 @@ impl HealSequence {
 
     async fn traverse_and_heal(h: Arc<HealSequence>) {
         let buckets_only = false;
-        let result = match Self::heal_items(h.clone(), buckets_only).await {
-            Ok(_) => None,
-            Err(err) => Some(err),
-        };
+        let result = (Self::heal_items(h.clone(), buckets_only).await).err();
         let _ = h.traverse_and_heal_done_tx.read().await.send(result).await;
     }
 
