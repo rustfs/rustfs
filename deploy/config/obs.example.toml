@@ -25,7 +25,7 @@ batch_timeout_ms = 1000 # Default is 100ms if not specified
 
 [sinks.file]
 enabled = true
-path = "logs/app.log"
+path = "./deploy/logs/app.log"
 batch_size = 100
 batch_timeout_ms = 1000 # Default is 8192 bytes if not specified
 

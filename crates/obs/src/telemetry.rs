@@ -293,7 +293,10 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
     registry.with(ErrorLayer::default()).with(fmt_layer).init();
     if !config.endpoint.is_empty() {
-        info!("OpenTelemetry telemetry initialized with OTLP endpoint: {}", config.endpoint);
+        info!(
+            "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {}",
+            config.endpoint, logger_level
+        );
     }
 
     OtelGuard {

@@ -9,6 +9,6 @@
 rustfs/static/*
 vendor
 cli/rustfs-gui/embedded-rustfs/rustfs
-config/obs.toml
+deploy/config/obs.toml
 *.log
-config/certs/*
+deploy/certs/*

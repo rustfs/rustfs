@@ -5,14 +5,15 @@ mod console;
 mod grpc;
 pub mod license;
 mod logging;
+mod server;
 mod service;
 mod storage;
 mod utils;
-
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
-use crate::utils::error;
 // Ensure the correct path for parse_license is imported
+use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
+use crate::utils::error;
 use chrono::Datelike;
 use clap::Parser;
 use common::{
@@ -31,6 +32,7 @@ use ecstore::{
 };
 use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
 use grpc::make_server;
+use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
@@ -43,60 +45,14 @@ use rustfs_obs::{init_obs, load_config, set_global_guard, InitLogStatus};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, info_span, warn};
-use tracing_error::ErrorLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-#[cfg(target_os = "linux")]
-fn notify_systemd(state: &str) {
-    use libsystemd::daemon::{notify, NotifyState};
-    let notify_state = match state {
-        "ready" => NotifyState::Ready,
-        "stopping" => NotifyState::Stopping,
-        _ => {
-            warn!("Unsupported state passed to notify_systemd: {}", state);
-            return;
-        }
-    };
-
-    if let Err(e) = notify(false, &[notify_state]) {
-        error!("Failed to notify systemd: {}", e);
-    } else {
-        debug!("Successfully notified systemd: {}", state);
-    }
-    info!("Systemd notifications are enabled on linux (state: {})", state);
-}
-
-#[cfg(not(target_os = "linux"))]
-fn notify_systemd(state: &str) {
-    info!("Systemd notifications are not available on this platform not linux (state: {})", state);
-}
-
-#[allow(dead_code)]
-fn setup_tracing() {
-    use tracing_subscriber::EnvFilter;
-
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let enable_color = std::io::stdout().is_terminal();
-
-    let subscriber = tracing_subscriber::fmt::fmt()
-        .pretty()
-        .with_env_filter(env_filter)
-        .with_ansi(enable_color)
-        .with_file(true)
-        .with_line_number(true)
-        .finish()
-        .with(ErrorLayer::default());
-
-    subscriber.try_init().expect("failed to set global default subscriber");
-}
 
 fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
@@ -286,8 +242,14 @@ async fn run(opt: config::Opt) -> Result<()> {
         None
     };
 
-    // Create an oneshot channel to wait for the service to start
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let state_manager = ServiceStateManager::new();
+    let worker_state_manager = state_manager.clone();
+    // 更新服务状态为启动中
+    state_manager.update(ServiceState::Starting);
+
+    // Create shutdown channel
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let shutdown_tx_clone = shutdown_tx.clone();
 
     tokio::spawn(async move {
         // 错误处理改进
@@ -316,11 +278,11 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         let http_server = ConnBuilder::new(TokioExecutor::new());
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
-        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+        let graceful = GracefulShutdown::new();
         debug!("graceful initiated");
 
-        // Send a message to the main thread to indicate that the server has started
-        let _ = tx.send(());
+        // 服务准备就绪
+        worker_state_manager.update(ServiceState::Ready);
 
         loop {
             debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
@@ -336,17 +298,23 @@ async fn run(opt: config::Opt) -> Result<()> {
                     }
                 }
                 _ = ctrl_c.as_mut() => {
-                    drop(listener);
-                    eprintln!("Ctrl-C received, starting shutdown");
+                    info!("Ctrl-C received in worker thread");
+                    let _ = shutdown_tx_clone.send(());
                     break;
                 }
 
                 _ = sigint_inner.recv() => {
                     info!("SIGINT received in worker thread");
+                    let _ = shutdown_tx_clone.send(());
                     break;
                 }
                 _ = sigterm_inner.recv() => {
                     info!("SIGTERM received in worker thread");
+                    let _ = shutdown_tx_clone.send(());
+                    break;
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received in worker thread");
                     break;
                 }
             };
@@ -390,7 +358,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 debug!("Http handshake success");
             }
         }
-
+        worker_state_manager.update(ServiceState::Stopping);
         tokio::select! {
             () = graceful.shutdown() => {
                  debug!("Gracefully shutdown!");
@@ -399,6 +367,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                  debug!("Waited 10 seconds for graceful shutdown, aborting...");
             }
         }
+        worker_state_manager.update(ServiceState::Stopped);
     });
 
     // init store
@@ -448,97 +417,24 @@ async fn run(opt: config::Opt) -> Result<()> {
         });
     }
 
-    // 执行休眠 1 秒钟
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    // Wait for the HTTP service to finish starting
-    if rx.await.is_ok() {
-        notify_systemd("ready");
-    } else {
-        info!("Failed to start the server");
-    }
-
-    // 主线程中监听信号
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("Ctrl-C received, starting shutdown");
-            notify_systemd("stopping");
-        }
-
-        _ = sigint.recv() => {
-            info!("SIGINT received, starting shutdown");
-            notify_systemd("stopping");
-        }
-        _ = sigterm.recv() => {
-            info!("SIGTERM received, starting shutdown");
-            notify_systemd("stopping");
+    // Perform hibernation for 1 second
+    tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+    // listen to the shutdown signal
+    match wait_for_shutdown().await {
+        ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
+            info!("Shutdown signal received in main thread");
+            // update the status to stopping first
+            state_manager.update(ServiceState::Stopping);
+            info!("Server is stopping...");
+            let _ = shutdown_tx.send(());
+            // Wait for the worker thread to complete the cleaning work
+            tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+            // the last updated status is stopped
+            state_manager.update(ServiceState::Stopped);
+            info!("Server stopped current ");
         }
     }
 
-    info!("server is stopped");
+    info!("server is stopped state: {:?}", state_manager.current_state());
     Ok(())
 }
-
-// #[allow(dead_code)]
-// #[derive(Debug)]
-// enum ShutdownSignal {
-//     CtrlC,
-//     Sigterm,
-//     Sigint,
-// }
-// #[allow(dead_code)]
-// async fn wait_for_shutdown() -> ShutdownSignal {
-//     let mut sigterm = signal(SignalKind::terminate()).unwrap();
-//     let mut sigint = signal(SignalKind::interrupt()).unwrap();
-//
-//     tokio::select! {
-//         _ = tokio::signal::ctrl_c() => {
-//             info!("Received Ctrl-C signal");
-//             ShutdownSignal::CtrlC
-//         }
-//         _ = sigint.recv() => {
-//             info!("Received SIGINT signal");
-//             ShutdownSignal::Sigint
-//         }
-//         _ = sigterm.recv() => {
-//             info!("Received SIGTERM signal");
-//             ShutdownSignal::Sigterm
-//         }
-//     }
-// }
-// #[allow(dead_code)]
-// #[derive(Debug)]
-// enum ServiceState {
-//     Starting,
-//     Ready,
-//     Stopping,
-//     Stopped,
-// }
-// #[allow(dead_code)]
-// fn notify_service_state(state: ServiceState) {
-//     match state {
-//         ServiceState::Starting => {
-//             info!("Service is starting...");
-//             #[cfg(target_os = "linux")]
-//             if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Starting...")]) {
-//                 error!("Failed to notify systemd of starting state: {}", e);
-//             }
-//         }
-//         ServiceState::Ready => {
-//             info!("Service is ready");
-//             notify_systemd("ready");
-//         }
-//         ServiceState::Stopping => {
-//             info!("Service is stopping...");
-//             notify_systemd("stopping");
-//         }
-//         ServiceState::Stopped => {
-//             info!("Service has stopped");
-//             #[cfg(target_os = "linux")]
-//             if let Err(e) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Status("Stopped")]) {
-//                 error!("Failed to notify systemd of stopped state: {}", e);
-//             }
-//         }
-//     }
-// }

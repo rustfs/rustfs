@@ -13,21 +13,22 @@ NotifyAccess=main
 User=rustfs
 Group=rustfs
 
-# environment variable configuration
-Environment=RUST_LOG=info
-Environment=RUSTFS_ACCESS_KEY=rustfsadmin
-Environment=RUSTFS_SECRET_KEY=rustfsadmin
-
 # working directory
 WorkingDirectory=/opt/rustfs
 
-# main program
+# environment variable configuration and main program (Option 1: Directly specify arguments)
+Environment=RUSTFS_ACCESS_KEY=rustfsadmin
+Environment=RUSTFS_SECRET_KEY=rustfsadmin
 ExecStart=/usr/local/bin/rustfs \
     --address 0.0.0.0:9000 \
     --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
     --obs-config /etc/rustfs/obs.yaml \
     --console-enable \
     --console-address 0.0.0.0:9002
+
+# environment variable configuration (Option 2: Use environment variables)
+EnvironmentFile=-/etc/default/rustfs
+ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
 
 # resource constraints
 LimitNOFILE=1048576
