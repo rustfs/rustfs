@@ -25,7 +25,7 @@ batch_timeout_ms = 1000           # 批处理超时时间，单位为毫秒
 
 [sinks.file]                       # 文件接收器配置
 enabled = true                     # 是否启用文件接收器
-path = "/Users/qun/Documents/rust/rustfs/s3-rustfs/logs/app.log" # 日志文件路径
+path = "./deploy/logs/rustfs.log" # 日志文件路径
 batch_size = 10                    # 批处理大小
 batch_timeout_ms = 1000           # 批处理超时时间，单位为毫秒
 

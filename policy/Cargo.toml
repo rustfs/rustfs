@@ -24,7 +24,7 @@ itertools = "0.14.0"
 futures.workspace = true
 rand.workspace = true
 base64-simd = "0.8.0"
-jsonwebtoken = "9.3.0"
+jsonwebtoken = { workspace = true }
 tracing.workspace = true
 madmin.workspace = true
 lazy_static.workspace = true
