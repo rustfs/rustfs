@@ -21,7 +21,7 @@ impl Logger {
     /// Returns Logger and corresponding Receiver
     pub fn new(config: &AppConfig) -> (Self, Receiver<UnifiedLogEntry>) {
         // Get queue capacity from configuration, or use default values 10000
-        let queue_capacity = config.logger.queue_capacity.unwrap_or(10000);
+        let queue_capacity = config.logger.as_ref().and_then(|l| l.queue_capacity).unwrap_or(10000);
         let (sender, receiver) = mpsc::channel(queue_capacity);
         (Logger { sender, queue_capacity }, receiver)
     }

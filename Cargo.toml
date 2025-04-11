@@ -36,6 +36,7 @@ madmin = { path = "./madmin" }
 atoi = "2.0.0"
 async-recursion = "1.0.5"
 async-trait = "0.1.87"
+atomic_enum = "0.3.0"
 axum = "0.8.3"
 axum-extra = "0.10.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
@@ -98,7 +99,7 @@ rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rust-embed = "8.6.0"
-rustls = { version = "0.23" }
+rustls = { version = "0.23.26" }
 rustls-pki-types = "1.11.0"
 rustls-pemfile = "2.2.0"
 s3s = { git = "https://github.com/Nugine/s3s.git", rev = "ab139f72fe768fb9d8cecfe36269451da1ca9779", default-features = true, features = [
