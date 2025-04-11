@@ -40,7 +40,7 @@ $env:RUSTFS_CONSOLE_ENABLE = "true"
 $env:RUSTFS_CONSOLE_ADDRESS = "127.0.0.1:9002"
 # $env:RUSTFS_SERVER_DOMAINS = "localhost:9000"
 # Change to the actual configuration file path, obs.example.toml is for reference only
-$env:RUSTFS_OBS_CONFIG = ".\config\obs.example.toml"
+$env:RUSTFS_OBS_CONFIG = ".\deploy\config\obs.example.toml"
 
 # Check command line arguments
 if ($args.Count -gt 0) {
