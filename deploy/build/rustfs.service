@@ -27,6 +27,7 @@ ExecStart=/usr/local/bin/rustfs \
     --console-address 0.0.0.0:9002
 
 # environment variable configuration (Option 2: Use environment variables)
+# rustfs example file see: `../config/rustfs.env`
 EnvironmentFile=-/etc/default/rustfs
 ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
 

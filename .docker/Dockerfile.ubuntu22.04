@@ -7,12 +7,12 @@ RUN sed -i s@http://.*archive.ubuntu.com@http://repo.huaweicloud.com@g /etc/apt/
 RUN apt-get clean && apt-get update && apt-get install wget git curl unzip gcc pkg-config libssl-dev lld libdbus-1-dev libwayland-dev libwebkit2gtk-4.1-dev libxdo-dev -y
 
 # install protoc
-RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v27.0/protoc-27.0-linux-x86_64.zip \
-    && unzip protoc-27.0-linux-x86_64.zip -d protoc3 \
-    && mv protoc3/bin/* /usr/local/bin/ && chmod +x /usr/local/bin/protoc && mv protoc3/include/* /usr/local/include/ && rm -rf protoc-27.0-linux-x86_64.zip protoc3
+RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip \
+    && unzip protoc-30.2-linux-x86_64.zip -d protoc3 \
+    && mv protoc3/bin/* /usr/local/bin/ && chmod +x /usr/local/bin/protoc && mv protoc3/include/* /usr/local/include/ && rm -rf protoc-30.2-linux-x86_64.zip protoc3
 
 # install flatc
-RUN wget https://github.com/google/flatbuffers/releases/download/v24.3.25/Linux.flatc.binary.g++-13.zip \
+RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.flatc.binary.g++-13.zip \
     && unzip Linux.flatc.binary.g++-13.zip \
     && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc && rm -rf Linux.flatc.binary.g++-13.zip
 

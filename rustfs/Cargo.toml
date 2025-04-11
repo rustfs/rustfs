@@ -76,7 +76,7 @@ tonic = { workspace = true }
 tower.workspace = true
 transform-stream.workspace = true
 tower-http.workspace = true
-uuid = "1.15.1"
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
