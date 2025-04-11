@@ -32,7 +32,7 @@ s3s.workspace = true
 http.workspace = true
 highway = "1.3.0"
 url.workspace = true
-uuid = { version = "1.15.1", features = ["v4", "fast-rng", "serde"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 transform-stream = "0.3.1"
 lazy_static.workspace = true
@@ -44,7 +44,7 @@ path-absolutize = "3.1.1"
 protos.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
-tokio-util = { version = "0.7.13", features = ["io", "compat"] }
+tokio-util = { workspace = true, features = ["io", "compat"] }
 crc32fast = "1.4.2"
 siphasher = "1.0.1"
 base64-simd = "0.8.0"
