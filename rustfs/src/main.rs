@@ -205,7 +205,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Setup S3 service
     // 本项目使用 s3s 库来实现 s3 服务
-    let service = {
+    let s3_service = {
         let store = storage::ecfs::FS::new();
         // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(server_address.clone(), endpoint_pools).await?);
         let mut b = S3ServiceBuilder::new(store.clone());
@@ -293,11 +293,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         let mut sigterm_inner = sigterm_inner;
         let mut sigint_inner = sigint_inner;
-        let hyper_service = service.into_shared();
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
                 .layer(CorsLayer::permissive())
-                .service(hybrid(hyper_service, rpc_service)),
+                .service(hybrid(s3_service, rpc_service)),
         );
 
         let http_server = ConnBuilder::new(TokioExecutor::new());
