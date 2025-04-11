@@ -14,13 +14,15 @@ https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-
 
 Or use Docker:
 
+```yml
 - uses: arduino/setup-protoc@v3
   with:
-  version: "27.0"
+  version: "30.2"
 
 - uses: Nugine/setup-flatc@v1
   with:
-  version: "24.3.25"
+  version: "25.2.10"
+```
 
 # How to add Console web
 
@@ -32,7 +34,7 @@ Or use Docker:
 
 # Star RustFS
 
-Add Env infomation:
+Add Env Information:
 
 ```
 export RUSTFS_VOLUMES="./target/volume/test"
