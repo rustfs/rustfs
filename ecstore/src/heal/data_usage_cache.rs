@@ -10,7 +10,7 @@ use http::HeaderMap;
 use path_clean::PathClean;
 use rand::Rng;
 use rmp_serde::Serializer;
-use s3s::dto::ReplicationConfiguration;
+use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -347,7 +347,8 @@ pub struct DataUsageCacheInfo {
     pub next_cycle: u32,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
-    // todo: life_cycle
+    #[serde(skip)]
+    pub life_cycle: Option<BucketLifecycleConfiguration>,
     // pub life_cycle:
     #[serde(skip)]
     pub updates: Option<Sender<DataUsageEntry>>,

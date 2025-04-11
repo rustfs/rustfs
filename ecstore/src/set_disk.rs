@@ -3015,7 +3015,7 @@ impl SetDisks {
                             });
                             // Calc usage
                             let before = cache.info.last_update;
-                            let cache = match disk.clone().ns_scanner(&cache, tx, heal_scan_mode, None).await {
+                            let mut cache = match disk.clone().ns_scanner(&cache, tx, heal_scan_mode, None).await {
                                 Ok(cache) => cache,
                                 Err(_) => {
                                     if cache.info.last_update > before {
@@ -3025,6 +3025,9 @@ impl SetDisks {
                                     continue;
                                 }
                             };
+
+                            cache.info.updates = None;
+                            let _ = task.await;
                             let mut root = DataUsageEntry::default();
                             if let Some(r) = cache.root() {
                                 root = cache.flatten(&r);
@@ -3041,7 +3044,6 @@ impl SetDisks {
                                     entry: root,
                                 })
                                 .await;
-                            let _ = task.await;
                             let _ = cache.save(&cache_name.to_string_lossy()).await;
                         }
                     }

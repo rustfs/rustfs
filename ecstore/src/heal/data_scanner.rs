@@ -18,7 +18,10 @@ use super::{
     data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
     heal_commands::{HealScanMode, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
 };
-use crate::heal::data_usage::DATA_USAGE_ROOT;
+use crate::{
+    bucket::{versioning::VersioningApi, versioning_sys::BucketVersioningSys},
+    heal::data_usage::DATA_USAGE_ROOT,
+};
 use crate::{
     cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
     config::{
@@ -49,7 +52,7 @@ use common::error::{Error, Result};
 use lazy_static::lazy_static;
 use rand::Rng;
 use rmp_serde::{Deserializer, Serializer};
-use s3s::dto::{ReplicationConfiguration, ReplicationRuleStatus};
+use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, ReplicationConfiguration, ReplicationRuleStatus};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{
@@ -412,7 +415,7 @@ pub struct ScannerItem {
     pub prefix: String,
     pub object_name: String,
     pub replication: Option<ReplicationConfiguration>,
-    // todo: lifecycle
+    pub lifecycle: Option<BucketLifecycleConfiguration>,
     // typ: fs::Permissions,
     pub heal: Heal,
     pub debug: bool,
@@ -435,7 +438,7 @@ impl ScannerItem {
 
     pub async fn apply_versions_actions(&self, fivs: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
         let obj_infos = self.apply_newer_noncurrent_version_limit(fivs).await?;
-        if obj_infos.len() >= <u64 as TryInto<usize>>::try_into(SCANNER_EXCESS_OBJECT_VERSIONS.load(Ordering::SeqCst)).unwrap() {
+        if obj_infos.len() >= SCANNER_EXCESS_OBJECT_VERSIONS.load(Ordering::SeqCst) as usize {
             // todo
         }
 
@@ -444,9 +447,7 @@ impl ScannerItem {
             cumulative_size += obj_info.size;
         }
 
-        if cumulative_size
-            >= <u64 as TryInto<usize>>::try_into(SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst)).unwrap()
-        {
+        if cumulative_size >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst) as usize {
             //todo
         }
 
@@ -454,22 +455,31 @@ impl ScannerItem {
     }
 
     pub async fn apply_newer_noncurrent_version_limit(&self, fivs: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
-        let done = ScannerMetrics::time(ScannerMetric::ApplyNonCurrent);
-        let mut object_infos = Vec::new();
-        for info in fivs.iter() {
-            object_infos.push(info.to_object_info(&self.bucket, &self.object_path().to_string_lossy(), false));
+        // let done = ScannerMetrics::time(ScannerMetric::ApplyNonCurrent);
+        let versioned = match BucketVersioningSys::get(&self.bucket).await {
+            Ok(vcfg) => vcfg.versioned(self.object_path().to_str().unwrap_or_default()),
+            Err(_) => false,
+        };
+        let mut object_infos = Vec::with_capacity(fivs.len());
+
+        if self.lifecycle.is_none() {
+            for info in fivs.iter() {
+                object_infos.push(info.to_object_info(&self.bucket, &self.object_path().to_string_lossy(), versioned));
+            }
+            return Ok(object_infos);
         }
-        done().await;
+
+        // done().await;
 
         Ok(object_infos)
     }
 
-    pub async fn apply_actions(&self, _oi: &ObjectInfo, _size_s: &SizeSummary) -> (bool, usize) {
+    pub async fn apply_actions(&self, oi: &ObjectInfo, _size_s: &SizeSummary) -> (bool, usize) {
         let done = ScannerMetrics::time(ScannerMetric::Ilm);
         //todo: lifecycle
         done().await;
 
-        (false, 0)
+        (false, oi.size)
     }
 }
 
@@ -548,6 +558,7 @@ impl FolderScanner {
         true
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     async fn scan_folder(&mut self, folder: &CachedFolder, into: &mut DataUsageEntry) -> Result<()> {
         let this_hash = hash_path(&folder.name);
         let was_compacted = into.compacted;
@@ -561,8 +572,18 @@ impl FolderScanner {
 
             let (_, prefix) = path_to_bucket_object_with_base_path(&self.root, &folder.name);
             // Todo: lifeCycle
+            let active_life_cycle = if let Some(lc) = self.old_cache.info.life_cycle.as_ref() {
+                if lc_has_active_rules(lc, &prefix) {
+                    self.old_cache.info.life_cycle.clone()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let replication_cfg = if self.old_cache.info.replication.is_some()
-                && has_active_rules(self.old_cache.info.replication.as_ref().unwrap(), &prefix, true)
+                && rep_has_active_rules(self.old_cache.info.replication.as_ref().unwrap(), &prefix, true)
             {
                 self.old_cache.info.replication.clone()
             } else {
@@ -593,7 +614,7 @@ impl FolderScanner {
                         continue;
                     }
 
-                    if !sub_path.is_dir() {
+                    if sub_path.is_dir() {
                         let h = hash_path(ent_name.to_str().unwrap());
                         if h == this_hash {
                             continue;
@@ -638,6 +659,7 @@ impl FolderScanner {
                             .unwrap_or_default(),
                         debug: self.data_usage_scanner_debug,
                         replication: replication_cfg.clone(),
+                        lifecycle: active_life_cycle.clone(),
                         heal: Heal::default(),
                     };
 
@@ -681,13 +703,11 @@ impl FolderScanner {
             }
 
             let should_compact = self.new_cache.info.name != folder.name
-                && existing_folders.len() + new_folders.len()
-                    >= <u64 as TryInto<usize>>::try_into(DATA_SCANNER_COMPACT_AT_FOLDERS).unwrap()
-                || existing_folders.len() + new_folders.len()
-                    >= <u64 as TryInto<usize>>::try_into(DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS).unwrap();
+                && (existing_folders.len() + new_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS as usize
+                    || existing_folders.len() + new_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS as usize);
 
             let total_folders = existing_folders.len() + new_folders.len();
-            if total_folders > <u64 as TryInto<usize>>::try_into(SCANNER_EXCESS_FOLDERS.load(Ordering::SeqCst)).unwrap() {
+            if total_folders > SCANNER_EXCESS_FOLDERS.load(Ordering::SeqCst) as usize {
                 let _prefix_name = format!("{}/", folder.name.trim_end_matches('/'));
                 // todo: notification
             }
@@ -935,7 +955,7 @@ impl FolderScanner {
                 let _ = list_path_raw(rx, lopts).await;
 
                 if *found_objs.read().await {
-                    let this = CachedFolder {
+                    let this: CachedFolder = CachedFolder {
                         name: k.clone(),
                         parent: this_hash.clone(),
                         object_heal_prob_div: 1,
@@ -951,7 +971,7 @@ impl FolderScanner {
         if !into.compacted && self.new_cache.info.name != folder.name {
             let mut flat = self.new_cache.size_recursive(&this_hash.key()).unwrap_or_default();
             flat.compacted = true;
-            let compact = if flat.objects < <u64 as TryInto<usize>>::try_into(DATA_SCANNER_COMPACT_LEAST_OBJECT).unwrap() {
+            let compact = if flat.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT as usize {
                 true
             } else {
                 // Compact if we only have objects as children...
@@ -996,6 +1016,7 @@ impl FolderScanner {
         Ok(())
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     async fn send_update(&mut self) {
         if SystemTime::now().duration_since(self.last_update).unwrap() < Duration::from_secs(60) {
             return;
@@ -1007,8 +1028,9 @@ impl FolderScanner {
     }
 }
 
+#[tracing::instrument(level = "info", skip(into, folder_scanner))]
 async fn scan(folder: &CachedFolder, into: &mut DataUsageEntry, folder_scanner: &mut FolderScanner) {
-    let mut dst = if !into.compacted {
+    let mut dst = if into.compacted {
         DataUsageEntry::default()
     } else {
         into.clone()
@@ -1028,7 +1050,74 @@ async fn scan(folder: &CachedFolder, into: &mut DataUsageEntry, folder_scanner: 
     }
 }
 
-pub fn has_active_rules(config: &ReplicationConfiguration, prefix: &str, recursive: bool) -> bool {
+fn lc_get_prefix(rule: &LifecycleRule) -> String {
+    if let Some(p) = &rule.prefix {
+        return p.to_string();
+    } else if let Some(filter) = &rule.filter {
+        if let Some(p) = &filter.prefix {
+            return p.to_string();
+        } else if let Some(and) = &filter.and {
+            if let Some(p) = &and.prefix {
+                return p.to_string();
+            }
+        }
+    }
+
+    "".into()
+}
+
+pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) -> bool {
+    if config.rules.is_empty() {
+        return false;
+    }
+
+    for rule in config.rules.iter() {
+        if rule.status == ExpirationStatus::from_static(ExpirationStatus::DISABLED) {
+            continue;
+        }
+        let rule_prefix = lc_get_prefix(rule);
+        if !prefix.is_empty() && !rule_prefix.is_empty() {
+            if !prefix.starts_with(&rule_prefix) && !rule_prefix.starts_with(prefix) {
+                continue;
+            }
+        }
+
+        if let Some(e) = &rule.noncurrent_version_expiration {
+            if let Some(true) = e.noncurrent_days.map(|d| d > 0) {
+                return true;
+            }
+            if let Some(true) = e.newer_noncurrent_versions.map(|d| d > 0) {
+                return true;
+            }
+        }
+
+        if rule.noncurrent_version_transitions.is_some() {
+            return true;
+        }
+        if let Some(true) = rule.expiration.as_ref().map(|e| e.date.is_some()) {
+            return true;
+        }
+
+        if let Some(true) = rule.expiration.as_ref().map(|e| e.days.is_some()) {
+            return true;
+        }
+
+        if let Some(Some(true)) = rule.expiration.as_ref().map(|e| e.expired_object_delete_marker.map(|m| m)) {
+            return true;
+        }
+
+        if let Some(true) = rule.transitions.as_ref().map(|t| !t.is_empty()) {
+            return true;
+        }
+
+        if rule.transitions.is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn rep_has_active_rules(config: &ReplicationConfiguration, prefix: &str, recursive: bool) -> bool {
     if config.rules.is_empty() {
         return false;
     }
@@ -1086,8 +1175,14 @@ pub async fn scan_data_folder(
         root: base_path,
         get_size: get_size_fn,
         old_cache: cache.clone(),
-        new_cache: DataUsageCache::default(),
-        update_cache: DataUsageCache::default(),
+        new_cache: DataUsageCache {
+            info: cache.info.clone(),
+            ..Default::default()
+        },
+        update_cache: DataUsageCache {
+            info: cache.info.clone(),
+            ..Default::default()
+        },
         data_usage_scanner_debug: false,
         heal_object_select: 0,
         scan_mode: heal_scan_mode,
@@ -1115,8 +1210,7 @@ pub async fn scan_data_folder(
     if s.scan_folder(&folder, &mut root).await.is_err() {
         close_disk().await;
     }
-    s.new_cache
-        .force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN.try_into().unwrap());
+    s.new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN as usize);
     s.new_cache.info.last_update = Some(SystemTime::now());
     s.new_cache.info.next_cycle = cache.info.next_cycle;
     close_disk().await;
