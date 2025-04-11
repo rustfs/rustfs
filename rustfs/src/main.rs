@@ -45,37 +45,14 @@ use rustfs_obs::{init_obs, load_config, set_global_guard, InitLogStatus};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
-use std::{io::IsTerminal, net::SocketAddr};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
-use tracing::log::warn;
-use tracing::{debug, error, info, info_span};
-use tracing_error::ErrorLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-#[allow(dead_code)]
-fn setup_tracing() {
-    use tracing_subscriber::EnvFilter;
-
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let enable_color = std::io::stdout().is_terminal();
-
-    let subscriber = tracing_subscriber::fmt::fmt()
-        .pretty()
-        .with_env_filter(env_filter)
-        .with_ansi(enable_color)
-        .with_file(true)
-        .with_line_number(true)
-        .finish()
-        .with(ErrorLayer::default());
-
-    subscriber.try_init().expect("failed to set global default subscriber");
-}
+use tracing::{debug, error, info, info_span, warn};
 
 fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();

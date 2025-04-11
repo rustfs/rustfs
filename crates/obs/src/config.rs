@@ -117,7 +117,7 @@ impl Default for FileSinkConfig {
             path: env::var("RUSTFS_SINKS_FILE_PATH")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| Self::get_default_log_path()),
+                .unwrap_or_else(Self::get_default_log_path),
             buffer_size: Some(8192),
             flush_interval_ms: Some(1000),
             flush_threshold: Some(100),
@@ -244,7 +244,7 @@ pub fn load_config(config_dir: Option<String>) -> AppConfig {
     // Log using proper logging instead of println when possible
     println!("Using config file base: {}", config_dir);
 
-    let config = Config::builder()
+    let app_config = Config::builder()
         .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml).required(false))
         .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Yaml).required(false))
         .add_source(
@@ -258,7 +258,7 @@ pub fn load_config(config_dir: Option<String>) -> AppConfig {
         .build()
         .unwrap_or_default();
 
-    match config.try_deserialize::<AppConfig>() {
+    match app_config.try_deserialize::<AppConfig>() {
         Ok(app_config) => {
             println!("Parsed AppConfig: {:?}", app_config);
             app_config
