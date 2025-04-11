@@ -19,6 +19,7 @@ madmin.workspace = true
 api = { path = "../s3select/api" }
 appauth = { version = "0.0.1", path = "../appauth" }
 atoi = { workspace = true }
+atomic_enum = { workspace = true }
 axum.workspace = true
 axum-extra = { workspace = true }
 axum-server = { workspace = true }
@@ -87,7 +88,7 @@ url.workspace = true
 uuid = "1.15.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libsystemd = "0.7"
+libsystemd.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

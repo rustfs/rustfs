@@ -6,7 +6,7 @@ meter_interval = 30
 service_name = "rustfs"
 service_version = "0.1.0"
 environment = "develop"
-looger_level = "info"
+logger_level = "info"
 
 [sinks]
 [sinks.kafka] # Kafka sink is disabled by default
@@ -25,7 +25,7 @@ batch_timeout_ms = 1000 # Default is 100ms if not specified
 
 [sinks.file]
 enabled = true
-path = "logs/app.log"
+path = "./deploy/logs/app.log"
 batch_size = 100
 batch_timeout_ms = 1000 # Default is 8192 bytes if not specified
 
