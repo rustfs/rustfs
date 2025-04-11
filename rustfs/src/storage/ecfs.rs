@@ -1069,11 +1069,11 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-        let GetBucketTaggingInput { bucket, .. } = req.input;
+        let bucket = req.input.bucket.clone();
         // check bucket exists.
         let _bucket = self
-            .head_bucket(S3Request::new(HeadBucketInput {
-                bucket: bucket.clone(),
+            .head_bucket(req.map_input(|input| HeadBucketInput {
+                bucket: input.bucket,
                 expected_bucket_owner: None,
             }))
             .await?;
