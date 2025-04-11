@@ -121,6 +121,18 @@ impl<T: Store> IamSys<T> {
         // TODO: notification
     }
 
+    pub async fn get_role_policy(&self, arn_str: &str) -> Result<(ARN, String)> {
+        let Some(arn) = ARN::parse(arn_str).ok() else {
+            return Err(Error::msg("Invalid ARN"));
+        };
+
+        let Some(policy) = self.roles_map.get(&arn) else {
+            return Err(Error::msg("No such role"));
+        };
+
+        Ok((arn, policy.clone()))
+    }
+
     pub async fn delete_user(&self, name: &str, _notify: bool) -> Result<()> {
         self.store.delete_user(name, UserType::Reg).await
         // TODO: notification

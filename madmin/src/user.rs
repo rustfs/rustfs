@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
+
+use crate::BackendInfo;
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum AccountStatus {
@@ -220,4 +223,41 @@ impl UpdateServiceAccountReq {
         // TODO: validate
         Ok(())
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct AccountInfo {
+    pub account_name: String,
+    pub server: BackendInfo,
+    pub policy: serde_json::Value, // Use iam/policy::parse to parse the result, to be done by the caller.
+    pub buckets: Vec<BucketAccessInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct BucketAccessInfo {
+    pub name: String,
+    pub size: u64,
+    pub objects: u64,
+    pub object_sizes_histogram: HashMap<String, u64>,
+    pub object_versions_histogram: HashMap<String, u64>,
+    pub details: Option<BucketDetails>,
+    pub prefix_usage: HashMap<String, u64>,
+    #[serde(rename = "expiration", with = "time::serde::rfc3339::option")]
+    pub created: Option<OffsetDateTime>,
+    pub access: AccountAccess,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct BucketDetails {
+    pub versioning: bool,
+    pub versioning_suspended: bool,
+    pub locking: bool,
+    pub replication: bool,
+    // pub tagging: Option<Tagging>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct AccountAccess {
+    pub read: bool,
+    pub write: bool,
 }
