@@ -273,7 +273,7 @@ impl FileSink {
         // if the file not exists, create it
         if !file_exists {
             tokio::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap()).await?;
-            tracing::debug!("the file not exists,create if. path: {:?}", path)
+            tracing::debug!("File does not exist, creating it. Path: {:?}", path)
         }
         let file = if file_exists {
             // If the file exists, open it in append mode
