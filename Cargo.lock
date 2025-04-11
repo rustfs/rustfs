@@ -7179,7 +7179,6 @@ dependencies = [
  "common",
  "const-str",
  "crypto",
- "csv",
  "datafusion",
  "ecstore",
  "flatbuffers",
@@ -7190,7 +7189,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iam",
- "jsonwebtoken",
  "lazy_static",
  "libsystemd",
  "local-ip-address",
@@ -7200,13 +7198,9 @@ dependencies = [
  "mime",
  "mime_guess",
  "netif",
- "once_cell",
  "pin-project-lite",
  "policy",
- "prost",
  "prost-build",
- "prost-types",
- "protobuf 3.7.2",
  "protos",
  "query",
  "rmp-serde",
@@ -7227,15 +7221,10 @@ dependencies = [
  "tokio-util",
  "tonic 0.13.0",
  "tonic-build",
- "tonic-reflection",
  "tower 0.5.2",
  "tower-http",
  "tracing",
- "tracing-core",
- "tracing-error",
- "tracing-subscriber",
  "transform-stream",
- "url",
  "uuid",
 ]
 
@@ -8592,19 +8581,6 @@ dependencies = [
  "prost-types",
  "quote",
  "syn 2.0.100",
-]
-
-[[package]]
-name = "tonic-reflection"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88fa815be858816dad226a49439ee90b7bcf81ab55bee72fdb217f1e6778c3ca"
-dependencies = [
- "prost",
- "prost-types",
- "tokio",
- "tokio-stream",
- "tonic 0.13.0",
 ]
 
 [[package]]
