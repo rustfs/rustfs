@@ -4,7 +4,6 @@ use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io;
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
 
 /// Sink Trait definition, asynchronously write logs
 #[async_trait]
@@ -274,15 +273,15 @@ impl FileSink {
         // if the file not exists, create it
         if !file_exists {
             tokio::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap()).await?;
-            debug!("the file not exists,create if. path: {:?}", path)
+            tracing::debug!("File does not exist, creating it. Path: {:?}", path)
         }
         let file = if file_exists {
             // If the file exists, open it in append mode
-            debug!("FileSink: File exists, opening in append mode.");
+            tracing::debug!("FileSink: File exists, opening in append mode.");
             OpenOptions::new().append(true).create(true).open(&path).await?
         } else {
             // If the file does not exist, create it
-            debug!("FileSink: File does not exist, creating a new file.");
+            tracing::debug!("FileSink: File does not exist, creating a new file.");
             // Create the file and write a header or initial content if needed
             OpenOptions::new().create(true).truncate(true).write(true).open(&path).await?
         };
@@ -414,52 +413,84 @@ pub async fn create_sinks(config: &AppConfig) -> Vec<Arc<dyn Sink>> {
     let mut sinks: Vec<Arc<dyn Sink>> = Vec::new();
 
     #[cfg(feature = "kafka")]
-    if config.sinks.kafka.enabled {
-        match rdkafka::config::ClientConfig::new()
-            .set("bootstrap.servers", &config.sinks.kafka.bootstrap_servers)
-            .set("message.timeout.ms", "5000")
-            .create()
-        {
-            Ok(producer) => {
-                sinks.push(Arc::new(KafkaSink::new(
-                    producer,
-                    config.sinks.kafka.topic.clone(),
-                    config.sinks.kafka.batch_size.unwrap_or(100),
-                    config.sinks.kafka.batch_timeout_ms.unwrap_or(1000),
-                )));
+    {
+        match &config.sinks.kafka {
+            Some(sink_kafka) => {
+                if sink_kafka.enabled {
+                    match rdkafka::config::ClientConfig::new()
+                        .set("bootstrap.servers", &sink_kafka.bootstrap_servers)
+                        .set("message.timeout.ms", "5000")
+                        .create()
+                    {
+                        Ok(producer) => {
+                            sinks.push(Arc::new(KafkaSink::new(
+                                producer,
+                                sink_kafka.topic.clone(),
+                                sink_kafka.batch_size.unwrap_or(100),
+                                sink_kafka.batch_timeout_ms.unwrap_or(1000),
+                            )));
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create Kafka producer: {}", e);
+                        }
+                    }
+                } else {
+                    tracing::info!("Kafka sink is disabled in the configuration");
+                }
             }
-            Err(e) => eprintln!("Failed to create Kafka producer: {}", e),
+            _ => {
+                tracing::info!("Kafka sink is not configured or disabled");
+            }
         }
     }
-
     #[cfg(feature = "webhook")]
-    if config.sinks.webhook.enabled {
-        sinks.push(Arc::new(WebhookSink::new(
-            config.sinks.webhook.endpoint.clone(),
-            config.sinks.webhook.auth_token.clone(),
-            config.sinks.webhook.max_retries.unwrap_or(3),
-            config.sinks.webhook.retry_delay_ms.unwrap_or(100),
-        )));
+    {
+        match &config.sinks.webhook {
+            Some(sink_webhook) => {
+                if sink_webhook.enabled {
+                    sinks.push(Arc::new(WebhookSink::new(
+                        sink_webhook.endpoint.clone(),
+                        sink_webhook.auth_token.clone(),
+                        sink_webhook.max_retries.unwrap_or(3),
+                        sink_webhook.retry_delay_ms.unwrap_or(100),
+                    )));
+                } else {
+                    tracing::info!("Webhook sink is disabled in the configuration");
+                }
+            }
+            _ => {
+                tracing::info!("Webhook sink is not configured or disabled");
+            }
+        }
     }
 
     #[cfg(feature = "file")]
     {
-        let path = if config.sinks.file.enabled {
-            config.sinks.file.path.clone()
-        } else {
-            "default.log".to_string()
-        };
-        debug!("FileSink: Using path: {}", path);
-        sinks.push(Arc::new(
-            FileSink::new(
-                path.clone(),
-                config.sinks.file.buffer_size.unwrap_or(8192),
-                config.sinks.file.flush_interval_ms.unwrap_or(1000),
-                config.sinks.file.flush_threshold.unwrap_or(100),
-            )
-            .await
-            .unwrap(),
-        ));
+        // let config = config.clone();
+        match &config.sinks.file {
+            Some(sink_file) => {
+                tracing::info!("File sink is enabled in the configuration");
+                let path = if sink_file.enabled {
+                    sink_file.path.clone()
+                } else {
+                    "rustfs.log".to_string()
+                };
+                tracing::debug!("FileSink: Using path: {}", path);
+                sinks.push(Arc::new(
+                    FileSink::new(
+                        path.clone(),
+                        sink_file.buffer_size.unwrap_or(8192),
+                        sink_file.flush_interval_ms.unwrap_or(1000),
+                        sink_file.flush_threshold.unwrap_or(100),
+                    )
+                    .await
+                    .unwrap(),
+                ));
+            }
+            _ => {
+                tracing::info!("File sink is not configured or disabled");
+            }
+        }
     }
 
     sinks

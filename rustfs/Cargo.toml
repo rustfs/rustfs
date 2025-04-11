@@ -19,6 +19,7 @@ madmin.workspace = true
 api = { path = "../s3select/api" }
 appauth = { version = "0.0.1", path = "../appauth" }
 atoi = { workspace = true }
+atomic_enum = { workspace = true }
 axum.workspace = true
 axum-extra = { workspace = true }
 axum-server = { workspace = true }
@@ -26,7 +27,6 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono = { workspace = true }
 clap.workspace = true
-csv = "1.3.1"
 crypto = { path = "../crypto" }
 datafusion = { workspace = true }
 common.workspace = true
@@ -36,26 +36,18 @@ policy.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
-#h2 = "0.4.7"
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
 iam = { path = "../iam" }
-jsonwebtoken = "9.3.0"
-
 lock.workspace = true
 local-ip-address = { workspace = true }
 matchit = { workspace = true }
 mime.workspace = true
 mime_guess = "2.0.5"
-netif.workspace = true
-once_cell.workspace = true
 pin-project-lite.workspace = true
-prost.workspace = true
-prost-types.workspace = true
 protos.workspace = true
-protobuf.workspace = true
 query = { path = "../s3select/query" }
 rmp-serde.workspace = true
 rustfs-obs = { workspace = true }
@@ -81,18 +73,13 @@ tokio-rustls.workspace = true
 lazy_static.workspace = true
 tokio-stream.workspace = true
 tonic = { workspace = true }
-tonic-reflection.workspace = true
 tower.workspace = true
-tracing-core = { workspace = true }
-tracing-error.workspace = true
-tracing-subscriber.workspace = true
 transform-stream.workspace = true
 tower-http.workspace = true
-url.workspace = true
 uuid = "1.15.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libsystemd = "0.7"
+libsystemd.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
@@ -105,7 +92,6 @@ futures-util.workspace = true
 ecstore = { path = "../ecstore" }
 s3s.workspace = true
 clap = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 hyper-util = { workspace = true, features = [
     "tokio",
     "server-auto",

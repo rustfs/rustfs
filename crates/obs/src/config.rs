@@ -1,5 +1,5 @@
-use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION};
-use config::{Config, File, FileFormat};
+use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION, USE_STDOUT};
+use config::{Config, Environment, File, FileFormat};
 use serde::Deserialize;
 use std::env;
 
@@ -22,18 +22,44 @@ pub struct OtelConfig {
     pub logger_level: Option<String>,
 }
 
+// 辅助函数：从环境变量中提取可观测性配置
+fn extract_otel_config_from_env() -> OtelConfig {
+    OtelConfig {
+        endpoint: env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string()),
+        use_stdout: env::var("RUSTFS_OBSERVABILITY_USE_STDOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(USE_STDOUT)),
+        sample_ratio: env::var("RUSTFS_OBSERVABILITY_SAMPLE_RATIO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(SAMPLE_RATIO)),
+        meter_interval: env::var("RUSTFS_OBSERVABILITY_METER_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(METER_INTERVAL)),
+        service_name: env::var("RUSTFS_OBSERVABILITY_SERVICE_NAME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(SERVICE_NAME.to_string())),
+        service_version: env::var("RUSTFS_OBSERVABILITY_SERVICE_VERSION")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(SERVICE_VERSION.to_string())),
+        environment: env::var("RUSTFS_OBSERVABILITY_ENVIRONMENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(ENVIRONMENT.to_string())),
+        logger_level: env::var("RUSTFS_OBSERVABILITY_LOGGER_LEVEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(LOGGER_LEVEL.to_string())),
+    }
+}
+
 impl Default for OtelConfig {
     fn default() -> Self {
-        OtelConfig {
-            endpoint: "".to_string(),
-            use_stdout: Some(true),
-            sample_ratio: Some(SAMPLE_RATIO),
-            meter_interval: Some(METER_INTERVAL),
-            service_name: Some(SERVICE_NAME.to_string()),
-            service_version: Some(SERVICE_VERSION.to_string()),
-            environment: Some(ENVIRONMENT.to_string()),
-            logger_level: Some(LOGGER_LEVEL.to_string()),
-        }
+        extract_otel_config_from_env()
     }
 }
 
@@ -69,14 +95,18 @@ pub struct FileSinkConfig {
 
 impl FileSinkConfig {
     pub fn get_default_log_path() -> String {
-        let temp_dir = env::temp_dir().join("rustfs").join("logs");
+        let temp_dir = env::temp_dir().join("rustfs");
 
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
             eprintln!("Failed to create log directory: {}", e);
-            return "logs/app.log".to_string();
+            return "rustfs/rustfs.log".to_string();
         }
 
-        temp_dir.join("app.log").to_str().unwrap_or("logs/app.log").to_string()
+        temp_dir
+            .join("rustfs.log")
+            .to_str()
+            .unwrap_or("rustfs/rustfs.log")
+            .to_string()
     }
 }
 
@@ -84,7 +114,10 @@ impl Default for FileSinkConfig {
     fn default() -> Self {
         FileSinkConfig {
             enabled: true,
-            path: Self::get_default_log_path(),
+            path: env::var("RUSTFS_SINKS_FILE_PATH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(Self::get_default_log_path),
             buffer_size: Some(8192),
             flush_interval_ms: Some(1000),
             flush_threshold: Some(100),
@@ -93,11 +126,21 @@ impl Default for FileSinkConfig {
 }
 
 /// Sink configuration collection
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SinkConfig {
-    pub kafka: KafkaSinkConfig,
-    pub webhook: WebhookSinkConfig,
-    pub file: FileSinkConfig,
+    pub kafka: Option<KafkaSinkConfig>,
+    pub webhook: Option<WebhookSinkConfig>,
+    pub file: Option<FileSinkConfig>,
+}
+
+impl Default for SinkConfig {
+    fn default() -> Self {
+        SinkConfig {
+            kafka: None,
+            webhook: None,
+            file: Some(FileSinkConfig::default()),
+        }
+    }
 }
 
 ///Logger Configuration
@@ -109,7 +152,7 @@ pub struct LoggerConfig {
 impl Default for LoggerConfig {
     fn default() -> Self {
         LoggerConfig {
-            queue_capacity: Some(1000),
+            queue_capacity: Some(10000),
         }
     }
 }
@@ -128,11 +171,28 @@ impl Default for LoggerConfig {
 ///
 /// let config = load_config(None);
 /// ```
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub observability: OtelConfig,
     pub sinks: SinkConfig,
-    pub logger: LoggerConfig,
+    pub logger: Option<LoggerConfig>,
+}
+
+// 为 AppConfig 实现 Default
+impl AppConfig {
+    pub fn new() -> Self {
+        Self {
+            observability: OtelConfig::default(),
+            sinks: SinkConfig::default(),
+            logger: Some(LoggerConfig::default()),
+        }
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 const DEFAULT_CONFIG_FILE: &str = "obs";
@@ -184,12 +244,28 @@ pub fn load_config(config_dir: Option<String>) -> AppConfig {
     // Log using proper logging instead of println when possible
     println!("Using config file base: {}", config_dir);
 
-    let config = Config::builder()
+    let app_config = Config::builder()
         .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml).required(false))
         .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Yaml).required(false))
-        .add_source(config::Environment::with_prefix(""))
+        .add_source(
+            Environment::default()
+                .prefix("RUSTFS")
+                .prefix_separator("__")
+                .separator("__")
+                .with_list_parse_key("volumes")
+                .try_parsing(true),
+        )
         .build()
         .unwrap_or_default();
 
-    config.try_deserialize().unwrap_or_default()
+    match app_config.try_deserialize::<AppConfig>() {
+        Ok(app_config) => {
+            println!("Parsed AppConfig: {:?}", app_config);
+            app_config
+        }
+        Err(e) => {
+            println!("Failed to deserialize config: {}", e);
+            AppConfig::default()
+        }
+    }
 }
