@@ -67,14 +67,16 @@ where
         uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX)
     }
 
-    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         let uri = format!("{}|{}", &req.method, req.uri.path());
 
         // warn!("get uri {}", &uri);
 
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
-            return op.call(req, mat.params).await;
+            let mut resp = op.call(req, mat.params).await?;
+            resp.status = Some(resp.output.0);
+            return Ok(resp.map_output(|x| x.1));
         }
 
         return Err(s3_error!(NotImplemented));
