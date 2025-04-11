@@ -4862,6 +4862,7 @@ dependencies = [
  "common",
  "humantime",
  "hyper",
+ "s3s",
  "serde",
  "serde_json",
  "time",

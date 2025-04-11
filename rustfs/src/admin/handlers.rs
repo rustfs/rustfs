@@ -1,12 +1,12 @@
 use super::router::Operation;
+use crate::auth::check_key_valid;
+use crate::auth::get_condition_values;
+use crate::auth::get_session_token;
 use crate::storage::error::to_s3_error;
-use ::policy::policy::action::{Action, S3Action};
-use ::policy::policy::resource::Resource;
-use ::policy::policy::statement::BPStatement;
-use ::policy::policy::{ActionSet, BucketPolicy, Effect, ResourceSet};
 use bytes::Bytes;
 use common::error::Error as ec_Error;
 use ecstore::admin_server_info::get_server_info;
+use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::global::GLOBAL_ALlHealState;
 use ecstore::heal::data_usage::load_data_usage_from_backend;
 use ecstore::heal::heal_commands::HealOpts;
@@ -15,15 +15,23 @@ use ecstore::metrics_realtime::{collect_local_metrics, CollectMetricsOpts, Metri
 use ecstore::new_object_layer_fn;
 use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::store::is_valid_object_prefix;
+use ecstore::store_api::BucketOptions;
 use ecstore::store_api::StorageAPI;
 use ecstore::utils::path::path_join;
 use ecstore::GLOBAL_Endpoints;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
 use hyper::StatusCode;
+use iam::get_global_action_cred;
+use iam::store::MappedPolicy;
 use madmin::metrics::RealtimeMetrics;
 use madmin::utils::parse_duration;
 use matchit::Params;
+use policy::policy::action::Action;
+use policy::policy::action::S3Action;
+use policy::policy::default::DEFAULT_POLICIES;
+use policy::policy::Args;
+use policy::policy::BucketPolicy;
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{s3_error, Body, S3Error, S3Request, S3Response, S3Result};
@@ -43,7 +51,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 pub mod group;
-pub mod policy;
+pub mod policys;
 pub mod service_account;
 pub mod sts;
 pub mod trace;
@@ -61,49 +69,187 @@ pub struct AccountInfoHandler {}
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle AccountInfoHandler");
-
-        let Some(cred) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
-
-        warn!("AccountInfoHandler cread {:?}", &cred);
-
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // test policy
+        let Some(input_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
 
-        let mut s3_all_act = HashSet::with_capacity(1);
-        s3_all_act.insert(Action::S3Action(S3Action::AllActions));
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let mut all_res = HashSet::with_capacity(1);
-        all_res.insert(Resource::S3("*".to_string()));
+        let Ok(iam_store) = iam::get() else { return Err(s3_error!(InvalidRequest, "iam not init")) };
 
-        let bucket_policy = BucketPolicy {
-            id: "".into(),
-            version: "2012-10-17".to_owned(),
-            statements: vec![BPStatement {
-                sid: "".into(),
-                effect: Effect::Allow,
-                actions: ActionSet(s3_all_act.clone()),
-                resources: ResourceSet(all_res),
+        let default_claims = HashMap::new();
+        let claims = cred.claims.as_ref().unwrap_or(&default_claims);
+
+        let cred_clone = cred.clone();
+        let conditions = get_condition_values(&req.headers, &cred_clone);
+        let cred_clone = Arc::new(cred_clone);
+        let conditions = Arc::new(conditions);
+
+        let is_allow = Box::new({
+            let iam_clone = Arc::clone(&iam_store);
+            let cred_clone = Arc::clone(&cred_clone);
+            let conditions = Arc::clone(&conditions);
+            move |name: String| {
+                let iam_clone = Arc::clone(&iam_clone);
+                let cred_clone = Arc::clone(&cred_clone);
+                let conditions = Arc::clone(&conditions);
+                async move {
+                    let (mut rd, mut wr) = (false, false);
+                    if !iam_clone
+                        .is_allowed(&Args {
+                            account: &cred_clone.access_key,
+                            groups: &cred_clone.groups,
+                            action: Action::S3Action(S3Action::ListBucketAction),
+                            bucket: &name,
+                            conditions: &conditions,
+                            is_owner: owner,
+                            object: "",
+                            claims,
+                            deny_only: false,
+                        })
+                        .await
+                    {
+                        rd = true
+                    }
+
+                    if !iam_clone
+                        .is_allowed(&Args {
+                            account: &cred_clone.access_key,
+                            groups: &cred_clone.groups,
+                            action: Action::S3Action(S3Action::GetBucketLocationAction),
+                            bucket: &name,
+                            conditions: &conditions,
+                            is_owner: owner,
+                            object: "",
+                            claims,
+                            deny_only: false,
+                        })
+                        .await
+                    {
+                        rd = true
+                    }
+
+                    if !iam_clone
+                        .is_allowed(&Args {
+                            account: &cred_clone.access_key,
+                            groups: &cred_clone.groups,
+                            action: Action::S3Action(S3Action::PutObjectAction),
+                            bucket: &name,
+                            conditions: &conditions,
+                            is_owner: owner,
+                            object: "",
+                            claims,
+                            deny_only: false,
+                        })
+                        .await
+                    {
+                        wr = true
+                    }
+
+                    (rd, wr)
+                }
+            }
+        });
+
+        let account_name = if cred.is_temp() || cred.is_service_account() {
+            cred.parent_user.clone()
+        } else {
+            cred.access_key.clone()
+        };
+
+        let claims_args = Args {
+            account: "",
+            groups: &None,
+            action: Action::None,
+            bucket: "",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims,
+            deny_only: false,
+        };
+
+        let role_arn = claims_args.get_role_arn();
+
+        // TODO: get_policies_from_claims(claims);
+
+        let Some(admin_cred) = get_global_action_cred() else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "get_global_action_cred failed".to_string(),
+            ));
+        };
+
+        let mut effective_policy: policy::policy::Policy = Default::default();
+
+        if account_name == admin_cred.access_key {
+            for (name, p) in DEFAULT_POLICIES.iter() {
+                if *name == "consoleAdmin" {
+                    effective_policy = p.clone();
+                    break;
+                }
+            }
+        } else if let Some(arn) = role_arn {
+            let (_, policy_name) = iam_store
+                .get_role_policy(arn)
+                .await
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+
+            let policies = MappedPolicy::new(&policy_name).to_slice();
+            effective_policy = iam_store.get_combined_policy(&policies).await;
+        } else {
+            let policies = iam_store
+                .policy_db_get(&account_name, &cred.groups)
+                .await
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get policy failed: {}", e)))?;
+
+            effective_policy = iam_store.get_combined_policy(&policies).await;
+        };
+
+        let policy_str = serde_json::to_string(&effective_policy)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse policy failed"))?;
+
+        let mut account_info = madmin::AccountInfo {
+            account_name,
+            server: store.backend_info().await,
+            policy: serde_json::Value::String(policy_str),
+            ..Default::default()
+        };
+
+        // TODO: bucket policy
+        let buckets = store
+            .list_bucket(&BucketOptions {
+                cached: true,
                 ..Default::default()
-            }],
-        };
+            })
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        // let policy = bucket_policy
-        //     .marshal_msg()
-        //     .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse policy failed"))?;
+        for bucket in buckets.iter() {
+            let (rd, wr) = is_allow(bucket.name.clone()).await;
+            if rd || wr {
+                // TODO: BucketQuotaSys
+                // TODO: other attributes
+                account_info.buckets.push(madmin::BucketAccessInfo {
+                    name: bucket.name.clone(),
+                    details: Some(madmin::BucketDetails {
+                        versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
+                        versioning_suspended: BucketVersioningSys::suspended(bucket.name.as_str()).await,
+                        ..Default::default()
+                    }),
+                    created: bucket.created,
+                    access: madmin::AccountAccess { read: rd, write: wr },
+                    ..Default::default()
+                });
+            }
+        }
 
-        let backend_info = store.backend_info().await;
-
-        let info = AccountInfo {
-            account_name: cred.access_key,
-            server: backend_info,
-            policy: bucket_policy,
-        };
-
-        let data = serde_json::to_vec(&info)
+        let data = serde_json::to_vec(&account_info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
         let mut header = HeaderMap::new();
@@ -128,8 +274,6 @@ pub struct ServerInfoHandler {}
 #[async_trait::async_trait]
 impl Operation for ServerInfoHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ServerInfoHandler");
-
         let info = get_server_info(true).await;
 
         let data = serde_json::to_vec(&info)
