@@ -226,6 +226,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
     let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
     let has_tls_certs = tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
+    debug!("Main TLS certs: {:?}", has_tls_certs);
     let tls_acceptor = if has_tls_certs {
         debug!("Found TLS certificates, starting with HTTPS");
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

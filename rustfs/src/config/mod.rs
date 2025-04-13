@@ -29,11 +29,11 @@ pub const DEFAULT_OBS_CONFIG: &str = "config/obs.toml";
 
 /// Default TLS key for rustfs
 /// This is the default key for TLS.
-pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_tls_key.pem";
+pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_private.key";
 
 /// Default TLS cert for rustfs
 /// This is the default cert for TLS.
-pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_tls_cert.pem";
+pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_public.crt";
 
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
@@ -47,16 +47,16 @@ const SHORT_VERSION: &str = {
 };
 
 const LONG_VERSION: &str = concat!(
-    concat!(SHORT_VERSION, "\n"),
-    concat!("build time   : ", build::BUILD_TIME, "\n"),
-    concat!("build profile: ", build::BUILD_RUST_CHANNEL, "\n"),
-    concat!("build os     : ", build::BUILD_OS, "\n"),
-    concat!("rust version : ", build::RUST_VERSION, "\n"),
-    concat!("rust channel : ", build::RUST_CHANNEL, "\n"),
-    concat!("git branch   : ", build::BRANCH, "\n"),
-    concat!("git commit   : ", build::COMMIT_HASH, "\n"),
-    concat!("git tag      : ", build::TAG, "\n"),
-    concat!("git status   :\n", build::GIT_STATUS_FILE),
+concat!(SHORT_VERSION, "\n"),
+concat!("build time   : ", build::BUILD_TIME, "\n"),
+concat!("build profile: ", build::BUILD_RUST_CHANNEL, "\n"),
+concat!("build os     : ", build::BUILD_OS, "\n"),
+concat!("rust version : ", build::RUST_VERSION, "\n"),
+concat!("rust channel : ", build::RUST_CHANNEL, "\n"),
+concat!("git branch   : ", build::BRANCH, "\n"),
+concat!("git commit   : ", build::COMMIT_HASH, "\n"),
+concat!("git tag      : ", build::TAG, "\n"),
+concat!("git status   :\n", build::GIT_STATUS_FILE),
 );
 
 #[derive(Debug, Parser, Clone)]
