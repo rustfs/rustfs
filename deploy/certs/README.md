@@ -32,13 +32,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 ### TLS File
 
 ```text
+ rustfs_public.crt  #api cert.pem
 
- rustfs_tls_cert.pem api cert.pem
-
- rustfs_tls_key.pem api key.pem
-
- rustfs_console_tls_cert.pem console cert.pem
-
- rustfs_console_tls_key.pem console key.pem
-
+ rustfs_private.key #api key.pem
 ```

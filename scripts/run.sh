@@ -32,6 +32,8 @@ export RUSTFS_ADDRESS="0.0.0.0:9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9002"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
+# HTTPS 证书目录
+# export RUSTFS_TLS_PATH="./deploy/certs"
 
 # 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考 其中`RUSTFS_OBS_CONFIG` 和下面变量二选一
 export RUSTFS_OBS_CONFIG="./deploy/config/obs.example.toml"
