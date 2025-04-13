@@ -77,10 +77,10 @@ fn print_server_info() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // config::init_config();
-
     // Parse the obtained parameters
     let opt = config::Opt::parse();
+
+    // config::init_config(opt.clone());
 
     init_license(opt.license.clone());
 
