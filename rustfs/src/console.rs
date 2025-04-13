@@ -1,4 +1,4 @@
-use crate::config::{self, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use crate::config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use crate::license::get_license;
 use axum::{
     body::Body,
@@ -8,12 +8,14 @@ use axum::{
     Router,
 };
 use axum_extra::extract::Host;
+
 use axum_server::tls_rustls::RustlsConfig;
+use http::Uri;
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::signal;
@@ -167,7 +169,7 @@ async fn license_handler() -> impl IntoResponse {
         .unwrap()
 }
 
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
+fn _is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
             let octets = ip.octets();
@@ -184,44 +186,58 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
 
 #[allow(clippy::const_is_empty)]
 #[instrument(fields(host))]
-async fn config_handler(Host(host): Host) -> impl IntoResponse {
+async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
+    let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or("http");
+
+    // 从 uri 中获取 host，如果没有则使用 Host extractor 的值
+    let host = uri.host().unwrap_or(host.as_str());
+
+    let host = if host.contains(':') {
+        let (host, _) = host.split_once(':').unwrap_or((host, "80"));
+        host
+    } else {
+        host
+    };
+
     // 将当前配置复制一份
     let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
 
-    // 如果指定入口, 直接使用
-    let url = if let Some(endpoint) = &config::get_config().console_fs_endpoint {
-        debug!("axum Using rustfs endpoint address: {}", endpoint);
-        endpoint.clone()
-    } else {
-        let host_with_port = if host.contains(':') {
-            host.clone()
-        } else {
-            format!("{}:80", host)
-        };
-        // 尝试解析为 socket address，但不强制要求一定要是 IP 地址
-        let socket_addr = host_with_port.to_socket_addrs().ok().and_then(|mut addrs| addrs.next());
-        debug!("axum Using host with port: {}, Socket address: {:?}", host_with_port, socket_addr);
-        match socket_addr {
-            Some(addr) if addr.ip().is_ipv4() => {
-                let ipv4 = addr.ip().to_string();
-                // 如果是私有 IP、环回地址或未指定地址，保留原始域名
-                if is_private_ip(addr.ip()) || addr.ip().is_loopback() || addr.ip().is_unspecified() {
-                    let (host, _) = host_with_port.split_once(':').unwrap_or((&host, "80"));
-                    debug!("axum Using private IPv4 address: {}", host);
-                    format!("http://{}:{}", host, cfg.port)
-                } else {
-                    debug!("axum Using public IPv4 address");
-                    format!("http://{}:{}", ipv4, cfg.port)
-                }
-            }
-            _ => {
-                // 如果不是有效的 IPv4 地址，保留原始域名
-                let (host, _) = host_with_port.split_once(':').unwrap_or((&host, "80"));
-                debug!("axum Using domain address: {}", host);
-                format!("http://{}:{}", host, cfg.port)
-            }
-        }
-    };
+    let url = format!("{}://{}:{}", scheme, host, cfg.port);
+
+    // // 如果指定入口, 直接使用
+    // let url = if let Some(endpoint) = &config::get_config().console_fs_endpoint {
+    //     debug!("axum Using rustfs endpoint address: {}", endpoint);
+    //     endpoint.clone()
+    // } else {
+    //     let host_with_port = if host.contains(':') {
+    //         host.clone()
+    //     } else {
+    //         format!("{}:80", host)
+    //     };
+    //     // 尝试解析为 socket address，但不强制要求一定要是 IP 地址
+    //     let socket_addr = host_with_port.to_socket_addrs().ok().and_then(|mut addrs| addrs.next());
+    //     debug!("axum Using host with port: {}, Socket address: {:?}", host_with_port, socket_addr);
+    //     match socket_addr {
+    //         Some(addr) if addr.ip().is_ipv4() => {
+    //             let ipv4 = addr.ip().to_string();
+    //             // 如果是私有 IP、环回地址或未指定地址，保留原始域名
+    //             if is_private_ip(addr.ip()) || addr.ip().is_loopback() || addr.ip().is_unspecified() {
+    //                 let (host, _) = host_with_port.split_once(':').unwrap_or((&host, "80"));
+    //                 debug!("axum Using private IPv4 address: {}", host);
+    //                 format!("http://{}:{}", host, cfg.port)
+    //             } else {
+    //                 debug!("axum Using public IPv4 address");
+    //                 format!("http://{}:{}", ipv4, cfg.port)
+    //             }
+    //         }
+    //         _ => {
+    //             // 如果不是有效的 IPv4 地址，保留原始域名
+    //             let (host, _) = host_with_port.split_once(':').unwrap_or((&host, "80"));
+    //             debug!("axum Using domain address: {}", host);
+    //             format!("http://{}:{}", host, cfg.port)
+    //         }
+    //     }
+    // };
 
     cfg.api.base_url = format!("{}{}", url, RUSTFS_ADMIN_PREFIX);
     cfg.s3.endpoint = url;
@@ -335,4 +351,3 @@ async fn shutdown_signal() {
         },
     }
 }
-

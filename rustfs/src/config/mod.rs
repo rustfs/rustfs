@@ -2,7 +2,6 @@ use clap::Parser;
 use const_str::concat;
 use ecstore::global::DEFAULT_PORT;
 use std::string::ToString;
-use std::sync::OnceLock;
 shadow_rs::shadow!(build);
 
 /// Default Access Key
@@ -106,15 +105,14 @@ pub struct Opt {
     pub license: Option<String>,
 }
 
-lazy_static::lazy_static! {
-    pub(crate)  static ref OPT: OnceLock<Opt> = OnceLock::new();
-}
+// lazy_static::lazy_static! {
+//     pub(crate)  static ref OPT: OnceLock<Opt> = OnceLock::new();
+// }
 
-pub fn init_config(opt: Opt) {
-    OPT.set(opt).expect("Failed to set global config");
-}
+// pub fn init_config(opt: Opt) {
+//     OPT.set(opt).expect("Failed to set global config");
+// }
 
-pub fn get_config() -> &'static Opt {
-    OPT.get().expect("Global config not initialized")
-}
-
+// pub fn get_config() -> &'static Opt {
+//     OPT.get().expect("Global config not initialized")
+// }
