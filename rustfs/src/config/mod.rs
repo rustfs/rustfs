@@ -2,6 +2,7 @@ use clap::Parser;
 use const_str::concat;
 use ecstore::global::DEFAULT_PORT;
 use std::string::ToString;
+use std::sync::OnceLock;
 shadow_rs::shadow!(build);
 
 /// Default Access Key
@@ -47,16 +48,16 @@ const SHORT_VERSION: &str = {
 };
 
 const LONG_VERSION: &str = concat!(
-concat!(SHORT_VERSION, "\n"),
-concat!("build time   : ", build::BUILD_TIME, "\n"),
-concat!("build profile: ", build::BUILD_RUST_CHANNEL, "\n"),
-concat!("build os     : ", build::BUILD_OS, "\n"),
-concat!("rust version : ", build::RUST_VERSION, "\n"),
-concat!("rust channel : ", build::RUST_CHANNEL, "\n"),
-concat!("git branch   : ", build::BRANCH, "\n"),
-concat!("git commit   : ", build::COMMIT_HASH, "\n"),
-concat!("git tag      : ", build::TAG, "\n"),
-concat!("git status   :\n", build::GIT_STATUS_FILE),
+    concat!(SHORT_VERSION, "\n"),
+    concat!("build time   : ", build::BUILD_TIME, "\n"),
+    concat!("build profile: ", build::BUILD_RUST_CHANNEL, "\n"),
+    concat!("build os     : ", build::BUILD_OS, "\n"),
+    concat!("rust version : ", build::RUST_VERSION, "\n"),
+    concat!("rust channel : ", build::RUST_CHANNEL, "\n"),
+    concat!("git branch   : ", build::BRANCH, "\n"),
+    concat!("git commit   : ", build::COMMIT_HASH, "\n"),
+    concat!("git tag      : ", build::TAG, "\n"),
+    concat!("git status   :\n", build::GIT_STATUS_FILE),
 );
 
 #[derive(Debug, Parser, Clone)]
@@ -70,6 +71,7 @@ pub struct Opt {
     #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_PORT), env = "RUSTFS_ADDRESS")]
     pub address: String,
 
+    /// Domain name used for virtual-hosted-style requests.
     #[arg(long, env = "RUSTFS_SERVER_DOMAINS")]
     pub server_domains: Vec<String>,
 
@@ -81,15 +83,15 @@ pub struct Opt {
     #[arg(long, default_value_t = DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
     pub secret_key: String,
 
-    /// Domain name used for virtual-hosted-style requests.
-    #[arg(long, env = "RUSTFS_DOMAIN_NAME")]
-    pub domain_name: Option<String>,
-
     #[arg(long, default_value_t = false, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
     #[arg(long, default_value_t = format!("127.0.0.1:{}", 9002), env = "RUSTFS_CONSOLE_ADDRESS")]
     pub console_address: String,
+
+    /// rustfs endpoint for console
+    #[arg(long, env = "RUSTFS_CONSOLE_FS_ENDPOINT")]
+    pub console_fs_endpoint: Option<String>,
 
     /// Observability configuration file
     /// Default value: config/obs.toml
@@ -104,15 +106,15 @@ pub struct Opt {
     pub license: Option<String>,
 }
 
-// lazy_static::lazy_static! {
-//     pub static ref OPT: OnceLock<Opt> = OnceLock::new();
-// }
+lazy_static::lazy_static! {
+    pub(crate)  static ref OPT: OnceLock<Opt> = OnceLock::new();
+}
 
-// pub fn init_config() {
-//     let opt = Opt::parse();
-//     OPT.set(opt).expect("Failed to set global config");
-// }
+pub fn init_config(opt: Opt) {
+    OPT.set(opt).expect("Failed to set global config");
+}
 
-// pub fn get_config() -> &'static Opt {
-//     OPT.get().expect("Global config not initialized")
-// }
+pub fn get_config() -> &'static Opt {
+    OPT.get().expect("Global config not initialized")
+}
+
