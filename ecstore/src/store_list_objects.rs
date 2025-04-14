@@ -25,7 +25,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{error, warn};
+use tracing::error;
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -248,7 +248,7 @@ impl ECStore {
             ..Default::default()
         };
 
-        warn!("list_objects_generic opts {:?}", &opts);
+        // warn!("list_objects_generic opts {:?}", &opts);
 
         // use get
         if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_none() {
@@ -698,7 +698,7 @@ impl ECStore {
                 futures.push(async move {
                     let mut ask_disks = get_list_quorum(&opts.ask_disks, set.set_drive_count as i32);
                     if ask_disks == -1 {
-                        let new_disks = get_quorum_disks(&disks, &infos, (disks.len() + 1) / 2);
+                        let new_disks = get_quorum_disks(&disks, &infos, disks.len().div_ceil(2));
                         if !new_disks.is_empty() {
                             disks = new_disks;
                         } else {
@@ -1156,13 +1156,7 @@ async fn merge_entry_channels(
             if let Some(entry) = &best {
                 let mut versions = Vec::with_capacity(to_merge.len() + 1);
 
-                let mut has_xl = {
-                    if let Ok(meta) = entry.clone().xl_meta() {
-                        Some(meta)
-                    } else {
-                        None
-                    }
-                };
+                let mut has_xl = { entry.clone().xl_meta().ok() };
 
                 if let Some(x) = &has_xl {
                     versions.push(x.versions.clone());
@@ -1229,7 +1223,7 @@ impl SetDisks {
 
         let mut ask_disks = get_list_quorum(&opts.ask_disks, self.set_drive_count as i32);
         if ask_disks == -1 {
-            let new_disks = get_quorum_disks(&disks, &infos, (disks.len() + 1) / 2);
+            let new_disks = get_quorum_disks(&disks, &infos, disks.len().div_ceil(2));
             if !new_disks.is_empty() {
                 disks = new_disks;
                 ask_disks = 1;

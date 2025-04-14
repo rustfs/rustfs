@@ -1235,7 +1235,7 @@ impl SetDisks {
 
         let shallow_versions: Vec<Vec<FileMetaShallowVersion>> = metadata_shallow_versions.iter().flatten().cloned().collect();
 
-        let read_quorum = (fileinfos.len() + 1) / 2;
+        let read_quorum = fileinfos.len().div_ceil(2);
         let versions = merge_file_meta_versions(read_quorum, false, 1, &shallow_versions);
         let meta = FileMeta {
             versions,
@@ -3020,7 +3020,7 @@ impl SetDisks {
                             });
                             // Calc usage
                             let before = cache.info.last_update;
-                            let cache = match disk.clone().ns_scanner(&cache, tx, heal_scan_mode, None).await {
+                            let mut cache = match disk.clone().ns_scanner(&cache, tx, heal_scan_mode, None).await {
                                 Ok(cache) => cache,
                                 Err(_) => {
                                     if cache.info.last_update > before {
@@ -3030,6 +3030,9 @@ impl SetDisks {
                                     continue;
                                 }
                             };
+
+                            cache.info.updates = None;
+                            let _ = task.await;
                             let mut root = DataUsageEntry::default();
                             if let Some(r) = cache.root() {
                                 root = cache.flatten(&r);
@@ -3046,7 +3049,6 @@ impl SetDisks {
                                     entry: root,
                                 })
                                 .await;
-                            let _ = task.await;
                             let _ = cache.save(&cache_name.to_string_lossy()).await;
                         }
                     }
@@ -5090,7 +5092,7 @@ fn is_object_dang_ling(
     });
 
     if !valid_meta.is_valid() {
-        let data_blocks = (meta_arr.len() + 1) / 2;
+        let data_blocks = meta_arr.len().div_ceil(2);
         if not_found_parts_errs > data_blocks {
             return Ok(valid_meta);
         }
@@ -5103,7 +5105,7 @@ fn is_object_dang_ling(
     }
 
     if valid_meta.deleted {
-        let data_blocks = (errs.len() + 1) / 2;
+        let data_blocks = errs.len().div_ceil(2);
         if not_found_meta_errs > data_blocks {
             return Ok(valid_meta);
         }
@@ -5318,7 +5320,7 @@ async fn disks_with_all_parts(
             if let Some(data) = &meta.data {
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
                 let data_len = data.len();
-                let verify_err = match bitrot_verify(
+                let verify_err = (bitrot_verify(
                     Box::new(Cursor::new(data.clone())),
                     data_len,
                     meta.erasure.shard_file_size(meta.size),
@@ -5326,11 +5328,8 @@ async fn disks_with_all_parts(
                     checksum_info.hash,
                     meta.erasure.shard_size(meta.erasure.block_size),
                 )
-                .await
-                {
-                    Ok(_) => None,
-                    Err(err) => Some(err),
-                };
+                .await)
+                    .err();
 
                 if let Some(vec) = data_errs_by_part.get_mut(&0) {
                     if index < vec.len() {

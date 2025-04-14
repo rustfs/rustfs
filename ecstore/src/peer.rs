@@ -80,12 +80,7 @@ impl S3PeerSys {
         let mut futures = Vec::with_capacity(self.clients.len());
         for client in self.clients.iter() {
             // client_clon
-            futures.push(async move {
-                match client.get_bucket_info(bucket, &BucketOptions::default()).await {
-                    Ok(_) => None,
-                    Err(err) => Some(err),
-                }
-            });
+            futures.push(async move { (client.get_bucket_info(bucket, &BucketOptions::default()).await).err() });
         }
         let errs = join_all(futures).await;
 

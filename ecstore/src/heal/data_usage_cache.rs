@@ -10,7 +10,7 @@ use http::HeaderMap;
 use path_clean::PathClean;
 use rand::Rng;
 use rmp_serde::Serializer;
-use s3s::dto::ReplicationConfiguration;
+use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -347,7 +347,8 @@ pub struct DataUsageCacheInfo {
     pub next_cycle: u32,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
-    // todo: life_cycle
+    #[serde(skip)]
+    pub life_cycle: Option<BucketLifecycleConfiguration>,
     // pub life_cycle:
     #[serde(skip)]
     pub updates: Option<Sender<DataUsageEntry>>,
@@ -380,7 +381,7 @@ impl DataUsageCache {
         let mut retries = 0;
         while retries < 5 {
             let path = Path::new(BUCKET_META_PREFIX).join(name);
-            warn!("Loading data usage cache from backend: {}", path.display());
+            // warn!("Loading data usage cache from backend: {}", path.display());
             match store
                 .get_object_reader(
                     RUSTFS_META_BUCKET,
@@ -588,7 +589,7 @@ impl DataUsageCache {
             Some(e) => e,
             None => return,
         };
-        if top_e.children.len() > DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS.try_into().unwrap() {
+        if top_e.children.len() > <u64 as TryInto<usize>>::try_into(DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS).unwrap() {
             self.reduce_children_of(&hash_path(&self.info.name), limit, true);
         }
         if self.cache.len() <= limit {

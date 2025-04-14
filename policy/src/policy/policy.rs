@@ -240,7 +240,7 @@ fn get_values_from_claims(claims: &HashMap<String, Value>, claim_name: &str) -> 
     (s, false)
 }
 
-fn get_policies_from_claims(claims: &HashMap<String, Value>, policy_claim_name: &str) -> (HashSet<String>, bool) {
+pub fn get_policies_from_claims(claims: &HashMap<String, Value>, policy_claim_name: &str) -> (HashSet<String>, bool) {
     get_values_from_claims(claims, policy_claim_name)
 }
 
@@ -401,7 +401,7 @@ pub mod default {
                             effect: Effect::Allow,
                             actions: ActionSet({
                                 let mut hash_set = HashSet::new();
-                                hash_set.insert(Action::AdminAction(AdminAction::AllActions));
+                                hash_set.insert(Action::AdminAction(AdminAction::AllAdminActions));
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),

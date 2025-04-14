@@ -16,66 +16,70 @@ workspace = true
 
 [dependencies]
 madmin.workspace = true
-log.workspace = true
+api = { path = "../s3select/api" }
+appauth = { version = "0.0.1", path = "../appauth" }
+atoi = { workspace = true }
+atomic_enum = { workspace = true }
+axum.workspace = true
+axum-extra = { workspace = true }
+axum-server = { workspace = true }
 async-trait.workspace = true
 bytes.workspace = true
+chrono = { workspace = true }
 clap.workspace = true
+crypto = { path = "../crypto" }
+datafusion = { workspace = true }
 common.workspace = true
+const-str = { version = "0.6.1", features = ["std", "proc"] }
 ecstore.workspace = true
-policy.workspace =true
+policy.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
-h2 = "0.4.7"
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
+iam = { path = "../iam" }
 lock.workspace = true
+local-ip-address = { workspace = true }
+matchit = { workspace = true }
 mime.workspace = true
-netif.workspace = true
+mime_guess = "2.0.5"
 pin-project-lite.workspace = true
-prost.workspace = true
-prost-types.workspace = true
 protos.workspace = true
-protobuf.workspace = true
+query = { path = "../s3select/query" }
 rmp-serde.workspace = true
+rustfs-obs = { workspace = true }
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_urlencoded = { workspace = true }
+shadow-rs.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
-tokio-util = { version = "0.7.13", features = ["io", "compat"] }
+tokio-util.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "net",
     "signal",
 ] }
+tokio-rustls.workspace = true
 lazy_static.workspace = true
 tokio-stream.workspace = true
-tonic = { version = "0.12.3", features = ["gzip"] }
-tonic-reflection.workspace = true
+tonic = { workspace = true }
 tower.workspace = true
-tracing-error.workspace = true
-tracing-subscriber.workspace = true
 transform-stream.workspace = true
-uuid = "1.15.1"
-url.workspace = true
-axum.workspace = true
-matchit = "0.8.6"
-shadow-rs.workspace = true
-const-str = { version = "0.6.1", features = ["std", "proc"] }
-atoi = "2.0.0"
-serde_urlencoded = "0.7.1"
-crypto = { path = "../crypto" }
-iam = { path = "../iam" }
-jsonwebtoken = "9.3.0"
-tower-http = { version = "0.6.2", features = ["cors"] }
-mime_guess = "2.0.5"
-rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
-local-ip-address = { workspace = true }
-chrono = { workspace = true }
+tower-http.workspace = true
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libsystemd.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
@@ -87,14 +91,13 @@ futures-util.workspace = true
 # uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
 ecstore = { path = "../ecstore" }
 s3s.workspace = true
-clap = { version = "4.5.31", features = ["derive", "env"] }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
-hyper-util = { version = "0.1.10", features = [
+clap = { workspace = true }
+hyper-util = { workspace = true, features = [
     "tokio",
     "server-auto",
     "server-graceful",
 ] }
-transform-stream = "0.3.1"
+transform-stream = { workspace = true }
 netif = "0.1.6"
 shadow-rs.workspace = true
 # pin-utils = "0.1.0"

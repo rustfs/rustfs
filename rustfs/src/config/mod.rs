@@ -1,11 +1,39 @@
 use clap::Parser;
 use const_str::concat;
 use ecstore::global::DEFAULT_PORT;
-
+use std::string::ToString;
 shadow_rs::shadow!(build);
 
+/// Default Access Key
+/// Default value: rustfsadmin
+/// Environment variable: RUSTFS_ACCESS_KEY
+/// Command line argument: --access-key
+/// Example: RUSTFS_ACCESS_KEY=rustfsadmin
+/// Example: --access-key rustfsadmin
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
+/// Default Secret Key
+/// Default value: rustfsadmin
+/// Environment variable: RUSTFS_SECRET_KEY
+/// Command line argument: --secret-key
+/// Example: RUSTFS_SECRET_KEY=rustfsadmin
+/// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+/// Default configuration file for observability
+/// Default value: config/obs.toml
+/// Environment variable: RUSTFS_OBS_CONFIG
+/// Command line argument: --obs-config
+/// Example: RUSTFS_OBS_CONFIG=config/obs.toml
+/// Example: --obs-config config/obs.toml
+/// Example: --obs-config /etc/rustfs/obs.toml
+pub const DEFAULT_OBS_CONFIG: &str = "config/obs.toml";
+
+/// Default TLS key for rustfs
+/// This is the default key for TLS.
+pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_private.key";
+
+/// Default TLS cert for rustfs
+/// This is the default cert for TLS.
+pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_public.crt";
 
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
@@ -31,7 +59,7 @@ const LONG_VERSION: &str = concat!(
     concat!("git status   :\n", build::GIT_STATUS_FILE),
 );
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 #[command(version = SHORT_VERSION, long_version = LONG_VERSION)]
 pub struct Opt {
     /// DIR points to a directory on a filesystem.
@@ -42,6 +70,7 @@ pub struct Opt {
     #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_PORT), env = "RUSTFS_ADDRESS")]
     pub address: String,
 
+    /// Domain name used for virtual-hosted-style requests.
     #[arg(long, env = "RUSTFS_SERVER_DOMAINS")]
     pub server_domains: Vec<String>,
 
@@ -53,13 +82,37 @@ pub struct Opt {
     #[arg(long, default_value_t = DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
     pub secret_key: String,
 
-    /// Domain name used for virtual-hosted-style requests.
-    #[arg(long, env = "RUSTFS_DOMAIN_NAME")]
-    pub domain_name: Option<String>,
-
     #[arg(long, default_value_t = false, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
     #[arg(long, default_value_t = format!("127.0.0.1:{}", 9002), env = "RUSTFS_CONSOLE_ADDRESS")]
     pub console_address: String,
+
+    /// rustfs endpoint for console
+    #[arg(long, env = "RUSTFS_CONSOLE_FS_ENDPOINT")]
+    pub console_fs_endpoint: Option<String>,
+
+    /// Observability configuration file
+    /// Default value: config/obs.toml
+    #[arg(long, default_value_t = DEFAULT_OBS_CONFIG.to_string(), env = "RUSTFS_OBS_CONFIG")]
+    pub obs_config: String,
+
+    /// tls path for rustfs api and console.
+    #[arg(long, env = "RUSTFS_TLS_PATH")]
+    pub tls_path: Option<String>,
+
+    #[arg(long, env = "RUSTFS_LICENSE")]
+    pub license: Option<String>,
 }
+
+// lazy_static::lazy_static! {
+//     pub(crate)  static ref OPT: OnceLock<Opt> = OnceLock::new();
+// }
+
+// pub fn init_config(opt: Opt) {
+//     OPT.set(opt).expect("Failed to set global config");
+// }
+
+// pub fn get_config() -> &'static Opt {
+//     OPT.get().expect("Global config not initialized")
+// }

@@ -1,19 +1,25 @@
+use crate::config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use crate::license::get_license;
 use axum::{
     body::Body,
-    extract::Host,
     http::{Response, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
 };
+use axum_extra::extract::Host;
 
+use axum_server::tls_rustls::RustlsConfig;
+use http::Uri;
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::OnceLock;
-use tracing::info;
+use std::time::Duration;
+use tokio::signal;
+use tracing::{debug, error, info, instrument};
 
 shadow!(build);
 
@@ -153,31 +159,85 @@ pub(crate) fn init_console_cfg(local_ip: Ipv4Addr, port: u16) {
 //     host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
 // }
 
+async fn license_handler() -> impl IntoResponse {
+    let license = get_license().unwrap_or_default();
+
+    Response::builder()
+        .header("content-type", "application/json")
+        .status(StatusCode::OK)
+        .body(Body::from(serde_json::to_string(&license).unwrap_or_default()))
+        .unwrap()
+}
+
+fn _is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            // 10.0.0.0/8
+            octets[0] == 10 ||
+                // 172.16.0.0/12
+                (octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31)) ||
+                // 192.168.0.0/16
+                (octets[0] == 192 && octets[1] == 168)
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
 #[allow(clippy::const_is_empty)]
-async fn config_handler(Host(host): Host) -> impl IntoResponse {
-    let host_with_port = if host.contains(':') { host } else { format!("{}:80", host) };
+#[instrument(fields(host))]
+async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
+    let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or("http");
 
-    let is_addr = host_with_port
-        .to_socket_addrs()
-        .map(|addrs| {
-            addrs.into_iter().find(|v| {
-                if let SocketAddr::V4(ipv4) = v {
-                    !ipv4.ip().is_private() && !ipv4.ip().is_loopback() && !ipv4.ip().is_unspecified()
-                } else {
-                    false
-                }
-            })
-        })
-        .unwrap_or_default();
+    // 从 uri 中获取 host，如果没有则使用 Host extractor 的值
+    let host = uri.host().unwrap_or(host.as_str());
 
+    let host = if host.contains(':') {
+        let (host, _) = host.split_once(':').unwrap_or((host, "80"));
+        host
+    } else {
+        host
+    };
+
+    // 将当前配置复制一份
     let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
 
-    let url = if let Some(addr) = is_addr {
-        format!("http://{}:{}", addr.ip(), cfg.port)
-    } else {
-        let (host, _) = host_with_port.split_once(':').unwrap_or_default();
-        format!("http://{}:{}", host, cfg.port)
-    };
+    let url = format!("{}://{}:{}", scheme, host, cfg.port);
+
+    // // 如果指定入口, 直接使用
+    // let url = if let Some(endpoint) = &config::get_config().console_fs_endpoint {
+    //     debug!("axum Using rustfs endpoint address: {}", endpoint);
+    //     endpoint.clone()
+    // } else {
+    //     let host_with_port = if host.contains(':') {
+    //         host.clone()
+    //     } else {
+    //         format!("{}:80", host)
+    //     };
+    //     // 尝试解析为 socket address，但不强制要求一定要是 IP 地址
+    //     let socket_addr = host_with_port.to_socket_addrs().ok().and_then(|mut addrs| addrs.next());
+    //     debug!("axum Using host with port: {}, Socket address: {:?}", host_with_port, socket_addr);
+    //     match socket_addr {
+    //         Some(addr) if addr.ip().is_ipv4() => {
+    //             let ipv4 = addr.ip().to_string();
+    //             // 如果是私有 IP、环回地址或未指定地址，保留原始域名
+    //             if is_private_ip(addr.ip()) || addr.ip().is_loopback() || addr.ip().is_unspecified() {
+    //                 let (host, _) = host_with_port.split_once(':').unwrap_or((&host, "80"));
+    //                 debug!("axum Using private IPv4 address: {}", host);
+    //                 format!("http://{}:{}", host, cfg.port)
+    //             } else {
+    //                 debug!("axum Using public IPv4 address");
+    //                 format!("http://{}:{}", ipv4, cfg.port)
+    //             }
+    //         }
+    //         _ => {
+    //             // 如果不是有效的 IPv4 地址，保留原始域名
+    //             let (host, _) = host_with_port.split_once(':').unwrap_or((&host, "80"));
+    //             debug!("axum Using domain address: {}", host);
+    //             format!("http://{}:{}", host, cfg.port)
+    //         }
+    //     }
+    // };
 
     cfg.api.base_url = format!("{}{}", url, RUSTFS_ADMIN_PREFIX);
     cfg.s3.endpoint = url;
@@ -189,18 +249,105 @@ async fn config_handler(Host(host): Host) -> impl IntoResponse {
         .unwrap()
 }
 
-pub async fn start_static_file_server(addrs: &str, local_ip: Ipv4Addr, access_key: &str, secret_key: &str) {
-    // 创建路由
+pub async fn start_static_file_server(
+    addrs: &str,
+    local_ip: Ipv4Addr,
+    access_key: &str,
+    secret_key: &str,
+    tls_path: Option<String>,
+) {
+    // Create a route
     let app = Router::new()
+        .route("/license", get(license_handler))
         .route("/config.json", get(config_handler))
-        .nest_service("/", get(static_handler));
-
-    let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
-
+        .fallback_service(get(static_handler));
+    let local_addr: SocketAddr = addrs.parse().expect("Failed to parse socket address");
     info!("WebUI: http://{}:{} http://127.0.0.1:{}", local_ip, local_addr.port(), local_addr.port());
     info!("   RootUser: {}", access_key);
     info!("   RootPass: {}", secret_key);
 
-    axum::serve(listener, app).await.unwrap();
+    // Check and start the HTTPS/HTTP server
+    match start_server(addrs, local_addr, tls_path, app.clone()).await {
+        Ok(_) => info!("Server shutdown gracefully"),
+        Err(e) => error!("Server error: {}", e),
+    }
+}
+async fn start_server(addrs: &str, local_addr: SocketAddr, tls_path: Option<String>, app: Router) -> std::io::Result<()> {
+    let tls_path = tls_path.unwrap_or_default();
+    let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
+    let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+    let has_tls_certs = tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok();
+    debug!("Console TLS certs: {:?}", has_tls_certs);
+    if has_tls_certs {
+        debug!("Found TLS certificates, starting with HTTPS");
+        match tokio::try_join!(tokio::fs::read(&key_path), tokio::fs::read(&cert_path)) {
+            Ok((key_data, cert_data)) => {
+                match RustlsConfig::from_pem(cert_data, key_data).await {
+                    Ok(config) => {
+                        let handle = axum_server::Handle::new();
+                        // create a signal off listening task
+                        let handle_clone = handle.clone();
+                        tokio::spawn(async move {
+                            shutdown_signal().await;
+                            handle_clone.graceful_shutdown(Some(Duration::from_secs(10)));
+                        });
+                        info!("Starting HTTPS server...");
+                        axum_server::bind_rustls(local_addr, config)
+                            .handle(handle.clone())
+                            .serve(app.into_make_service())
+                            .await
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("Failed to create TLS config: {}", e);
+                        start_http_server(addrs, app).await
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read TLS certificates: {}", e);
+                start_http_server(addrs, app).await
+            }
+        }
+    } else {
+        debug!("TLS certificates not found at {} and {}", key_path, cert_path);
+        start_http_server(addrs, app).await
+    }
+}
+
+async fn start_http_server(addrs: &str, app: Router) -> std::io::Result<()> {
+    debug!("Starting HTTP server...");
+    let listener = tokio::net::TcpListener::bind(addrs).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("shutdown_signal ctrl_c")
+        },
+        _ = terminate => {
+            info!("shutdown_signal terminate")
+        },
+    }
 }

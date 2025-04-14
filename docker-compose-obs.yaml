@@ -1,0 +1,148 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./.docker/observability/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+    ports:
+      - 1888:1888
+      - 8888:8888
+      - 8889:8889
+      - 13133:13133
+      - 4317:4317
+      - 4318:4318
+      - 55679:55679
+    networks:
+      - rustfs-network
+  jaeger:
+    image: jaegertracing/jaeger:2.4.0
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "16686:16686"
+      - "14317:4317"
+      - "14318:4318"
+    networks:
+      - rustfs-network
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./.docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - rustfs-network
+  loki:
+    image: grafana/loki:3.4.2
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./.docker/observability/loki-config.yaml:/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - rustfs-network
+  grafana:
+    image: grafana/grafana:11.6.0
+    ports:
+      - "3000:3000"  # Web UI
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - TZ=Asia/Shanghai
+    networks:
+      - rustfs-network
+
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile.obs
+    container_name: node1
+    environment:
+      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      - RUSTFS_OBS_CONFIG=/etc/observability/config.obs.toml
+    platform: linux/amd64
+    ports:
+      - "9001:9000"  # 映射宿主机的 9001 端口到容器的 9000 端口
+      - "9101:9002"
+    volumes:
+      - ./data:/root/data  # 将当前路径挂载到容器内的 /root/data
+      - ./.docker/observability/config/obs.toml:/etc/observability/config.obs.toml
+    networks:
+      - rustfs-network
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile.obs
+    container_name: node2
+    environment:
+      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      - RUSTFS_OBS_CONFIG=/etc/observability/config.obs.toml
+    platform: linux/amd64
+    ports:
+      - "9002:9000"  # 映射宿主机的 9002 端口到容器的 9000 端口
+      - "9102:9002"
+    volumes:
+      - ./data:/root/data
+      - ./.docker/observability/config/obs.toml:/etc/observability/config.obs.toml
+    networks:
+      - rustfs-network
+
+  node3:
+    build:
+      context: .
+      dockerfile: Dockerfile.obs
+    container_name: node3
+    environment:
+      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      - RUSTFS_OBS_CONFIG=/etc/observability/config.obs.toml
+    platform: linux/amd64
+    ports:
+      - "9003:9000"  # 映射宿主机的 9003 端口到容器的 9000 端口
+      - "9103:9002"
+    volumes:
+      - ./data:/root/data
+      - ./.docker/observability/config/obs.toml:/etc/observability/config.obs.toml
+    networks:
+      - rustfs-network
+
+  node4:
+    build:
+      context: .
+      dockerfile: Dockerfile.obs
+    container_name: node4
+    environment:
+      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      - RUSTFS_OBS_CONFIG=/etc/observability/config.obs.toml
+    platform: linux/amd64
+    ports:
+      - "9004:9000"  # 映射宿主机的 9004 端口到容器的 9000 端口
+      - "9104:9002"
+    volumes:
+      - ./data:/root/data
+      - ./.docker/observability/config/obs.toml:/etc/observability/config.obs.toml
+    networks:
+      - rustfs-network
+
+networks:
+  rustfs-network:
+    driver: bridge
+    name: "network_rustfs_config"
+    driver_opts:
+      com.docker.network.enable_ipv6: "true"

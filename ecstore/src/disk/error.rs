@@ -1,4 +1,5 @@
 use std::io::{self, ErrorKind};
+use std::path::PathBuf;
 
 use tracing::error;
 
@@ -342,6 +343,19 @@ pub fn os_err_to_file_err(e: io::Error) -> Error {
         // io::ErrorKind::Other => todo!(),
         // TODO: 把不支持的king用字符串处理
         _ => Error::new(e),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub struct FileAccessDeniedWithContext {
+    pub path: PathBuf,
+    #[source]
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for FileAccessDeniedWithContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "访问文件 '{}' 被拒绝: {}", self.path.display(), self.source)
     }
 }
 

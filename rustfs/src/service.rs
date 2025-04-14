@@ -80,8 +80,7 @@ pin_project! {
 impl<RestBody, GrpcBody> Default for HybridBody<RestBody, GrpcBody>
 where
     RestBody: Default,
-
-    GrpcBody: Default,
+    // GrpcBody: Default,
 {
     fn default() -> Self {
         Self::Rest {
