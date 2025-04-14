@@ -11,6 +11,8 @@ use super::{
 };
 use crate::bitrot::bitrot_verify;
 use crate::bucket::metadata_sys::{self};
+use crate::bucket::versioning::VersioningApi;
+use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::cache_value::cache::{Cache, Opts, UpdateFn};
 use crate::disk::error::{
     convert_access_error, is_err_os_not_exist, is_sys_err_handle_invalid, is_sys_err_invalid_arg, is_sys_err_is_dir,
@@ -20,7 +22,9 @@ use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::STORAGE_FORMAT_FILE;
 use crate::file_meta::{get_file_info, read_xl_meta_no_data, FileInfoOpts};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
-use crate::heal::data_scanner::{has_active_rules, scan_data_folder, ScannerItem, ShouldSleepFn, SizeSummary};
+use crate::heal::data_scanner::{
+    lc_has_active_rules, rep_has_active_rules, scan_data_folder, ScannerItem, ShouldSleepFn, SizeSummary,
+};
 use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
@@ -2295,6 +2299,7 @@ impl DiskAPI for LocalDisk {
         Ok(info)
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     async fn ns_scanner(
         &self,
         cache: &DataUsageCache,
@@ -2308,18 +2313,30 @@ impl DiskAPI for LocalDisk {
         // must befor metadata_sys
         let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
 
+        let mut cache = cache.clone();
+        // Check if the current bucket has a configured lifecycle policy
+        if let Ok((lc, _)) = metadata_sys::get_lifecycle_config(&cache.info.name).await {
+            if lc_has_active_rules(&lc, "") {
+                cache.info.life_cycle = Some(lc);
+            }
+        }
+
         // Check if the current bucket has replication configuration
         if let Ok((rcfg, _)) = metadata_sys::get_replication_config(&cache.info.name).await {
-            if has_active_rules(&rcfg, "", true) {
+            if rep_has_active_rules(&rcfg, "", true) {
                 // TODO: globalBucketTargetSys
             }
         }
+
+        let vcfg = match BucketVersioningSys::get(&cache.info.name).await {
+            Ok(vcfg) => Some(vcfg),
+            Err(_) => None,
+        };
 
         let loc = self.get_disk_location();
         let disks = store.get_disks(loc.pool_idx.unwrap(), loc.disk_idx.unwrap()).await?;
         let disk = Arc::new(LocalDisk::new(&self.endpoint(), false).await?);
         let disk_clone = disk.clone();
-        let mut cache = cache.clone();
         cache.info.updates = Some(updates.clone());
         let mut data_usage_info = scan_data_folder(
             &disks,
@@ -2328,8 +2345,9 @@ impl DiskAPI for LocalDisk {
             Box::new(move |item: &ScannerItem| {
                 let mut item = item.clone();
                 let disk = disk_clone.clone();
+                let vcfg = vcfg.clone();
                 Box::pin(async move {
-                    if item.path.ends_with(&format!("{}{}", SLASH_SEPARATOR, STORAGE_FORMAT_FILE)) {
+                    if !item.path.ends_with(&format!("{}{}", SLASH_SEPARATOR, STORAGE_FORMAT_FILE)) {
                         return Err(Error::from_string(ERR_SKIP_FILE));
                     }
                     let stop_fn = ScannerMetrics::log(ScannerMetric::ScanObject);
@@ -2370,7 +2388,12 @@ impl DiskAPI for LocalDisk {
                         }
                     };
 
-                    let versioned = false;
+                    let versioned = if let Some(vcfg) = vcfg.as_ref() {
+                        vcfg.versioned(item.object_path().to_str().unwrap_or_default())
+                    } else {
+                        false
+                    };
+
                     let mut obj_deleted = false;
                     for info in obj_infos.iter() {
                         let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);

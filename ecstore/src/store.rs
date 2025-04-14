@@ -740,7 +740,7 @@ impl ECStore {
                 let cancel_clone = cancel.clone();
                 let all_buckets_clone = all_buckets.clone();
                 futures.push(async move {
-                    let (tx, mut rx) = mpsc::channel(100);
+                    let (tx, mut rx) = mpsc::channel(1);
                     let task = tokio::spawn(async move {
                         loop {
                             match rx.recv().await {
@@ -951,6 +951,7 @@ impl ECStore {
     }
 }
 
+#[tracing::instrument(level = "info", skip(all_buckets, updates))]
 async fn update_scan(
     all_merged: Arc<RwLock<DataUsageCache>>,
     results: Arc<RwLock<Vec<DataUsageCache>>>,
@@ -972,7 +973,7 @@ async fn update_scan(
         }
         w.merge(info);
     }
-    if w.info.last_update > *last_update && w.root().is_none() {
+    if (last_update.is_none() || w.info.last_update > *last_update) && w.root().is_some() {
         let _ = updates.send(w.dui(&w.info.name, &all_buckets)).await;
         *last_update = w.info.last_update;
     }
