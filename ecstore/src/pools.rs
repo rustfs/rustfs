@@ -3,25 +3,35 @@ use crate::cache_value::metacache_set::{list_path_raw, AgreedFn, ListPathRawOpti
 use crate::config::com::{read_config, save_config, CONFIG_PREFIX};
 use crate::config::error::ConfigError;
 use crate::disk::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::heal::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::set_disk::SetDisks;
-use crate::store_api::{BucketOptions, GetObjectReader, MakeBucketOptions, StorageAPI};
-use crate::store_err::{is_err_bucket_exists, StorageError};
-use crate::utils::path::{path_join, SLASH_SEPARATOR};
+use crate::store_api::{BucketOptions, GetObjectReader, MakeBucketOptions, ObjectIO, ObjectOptions, StorageAPI};
+use crate::store_err::{
+    is_err_bucket_exists, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found, StorageError,
+};
+use crate::utils::path::{encode_dir_object, path_join, SLASH_SEPARATOR};
 use crate::{sets::Sets, store::ECStore};
+use ::workers::workers::Workers;
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use common::error::{Error, Result};
+use http::HeaderMap;
 use rmp_serde::{Deserializer, Serializer};
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use std::fmt::Display;
+use std::future::Future;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::rc;
 use std::sync::Arc;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::broadcast::Receiver as B_Receiver;
 use tracing::{error, info, warn};
+use uuid::Uuid;
+use workers::workers;
 
 pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
@@ -277,6 +287,33 @@ impl PoolMeta {
             }
         }
     }
+
+    pub fn track_current_bucket_object(&mut self, idx: usize, bucket: String, object: String) {
+        self.pools.get(idx).is_some_and(|v| v.decommission.is_some());
+        if let Some(pool) = self.pools.get_mut(idx) {
+            if let Some(info) = pool.decommission.as_mut() {
+                info.object = object;
+                info.bucket = bucket;
+            }
+        }
+    }
+
+    pub async fn update_after(&mut self, idx: usize, pools: Vec<Arc<Sets>>, duration: Duration) -> Result<bool> {
+        if !self.pools.get(idx).is_some_and(|v| v.decommission.is_some()) {
+            return Err(Error::msg("InvalidArgument"));
+        }
+
+        let now = OffsetDateTime::now_utc();
+
+        if now.unix_timestamp() - self.pools[idx].last_update.unix_timestamp() > duration.whole_seconds() as i64 {
+            self.pools[idx].last_update = now;
+            self.save(pools).await?;
+
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 fn path2_bucket_object(name: &str) -> (String, String) {
@@ -482,7 +519,7 @@ impl ECStore {
         false
     }
 
-    pub async fn decommission(&self, indices: Vec<usize>) -> Result<()> {
+    pub async fn decommission(&self, rx: B_Receiver<bool>, indices: Vec<usize>) -> Result<()> {
         if indices.is_empty() {
             return Err(Error::msg("errInvalidArgument"));
         }
@@ -499,32 +536,257 @@ impl ECStore {
                 return;
             };
             for idx in indices.iter() {
-                store.do_decommission_in_routine(*idx).await;
+                store.do_decommission_in_routine(rx.resubscribe(), *idx).await;
             }
         });
 
         Ok(())
     }
 
-    async fn decommission_pool(&self, _idx: usize, pool: Arc<Sets>, bi: DecomBucketInfo) -> Result<()> {
-        let mut vc = None;
+    async fn decommission_pool(&self, rx: B_Receiver<bool>, idx: usize, pool: Arc<Sets>, bi: DecomBucketInfo) -> Result<()> {
+        let wk = Workers::new(pool.disk_set.len() * 2).map_err(|v| Error::from_string(v))?;
+
+        // let mut vc = None;
+        // replication
+        let rcfg: Option<String> = None;
 
         if bi.name != RUSTFS_META_BUCKET {
-            let versioning = BucketVersioningSys::get(&bi.name).await?;
-            vc = Some(versioning);
+            let _versioning = BucketVersioningSys::get(&bi.name).await?;
+            // vc = Some(versioning);
             // TODO: LifecycleSys
             // TODO: BucketObjectLockSys
             // TODO: ReplicationConfig
         }
 
-        for (idx, set) in pool.disk_set.iter().enumerate() {}
+        for (idx, set) in pool.disk_set.iter().enumerate() {
+            let set = set.clone();
+            let wk_clone = wk.clone();
+            let bucket = bi.name.clone();
+            let rcfg = rcfg.clone();
 
-        // FIXME:
-        unimplemented!()
+            let decommission_entry = |entry: MetaCacheEntry| async move {
+                wk_clone.give().await;
+                if entry.is_dir() {
+                    return;
+                }
+
+                let mut fivs = match entry.file_info_versions(&bucket) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        error!("decommission_pool: file_info_versions err {:?}", &err);
+                        return;
+                    }
+                };
+
+                fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+
+                let mut decommissioned: usize = 0;
+                let mut expired: usize = 0;
+
+                for version in fivs.versions.iter() {
+                    // TODO: filterLifecycle
+                    let remaining_versions = fivs.versions.len() - expired;
+                    if version.deleted && remaining_versions == 1 && rcfg.is_none() {
+                        //
+                        decommissioned += 1;
+                        info!("decommission_pool: DELETE marked object with no other non-current versions will be skipped");
+                        continue;
+                    }
+
+                    let version_id = version.version_id.map(|v| v.to_string());
+
+                    let mut ignore = false;
+                    let mut failure = false;
+                    let mut error = None;
+                    if version.deleted {
+                        // TODO: other params
+                        if let Err(err) = self
+                            .delete_object(
+                                bucket.as_str(),
+                                &version.name,
+                                ObjectOptions {
+                                    versioned: true,
+                                    version_id: version_id.clone(),
+                                    mod_time: version.mod_time,
+                                    src_pool_idx: idx,
+                                    data_movement: true,
+                                    delete_marker: true,
+                                    skip_decommissioned: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            if is_err_object_not_found(&err)
+                                || is_err_version_not_found(&err)
+                                || is_err_data_movement_overwrite(&err)
+                            {
+                                //
+                                ignore = true;
+                                continue;
+                            }
+
+                            failure = true;
+
+                            error = Some(err)
+                        }
+
+                        {
+                            self.pool_meta.write().await.count_item(idx, 0, failure);
+                        }
+
+                        if !failure {
+                            decommissioned += 1;
+                        }
+
+                        info!(
+                            "decommission_pool: DecomCopyDeleteMarker  {} {} {:?} {:?}",
+                            &bucket, &version.name, &version_id, error
+                        );
+                        continue;
+                    }
+
+                    for _i in 0..3 {
+                        if version.is_remote() {
+                            // TODO: DecomTieredObject
+                        }
+
+                        let bucket = bucket.clone();
+
+                        let rd = match set
+                            .get_object_reader(
+                                bucket.as_str(),
+                                &encode_dir_object(&version.name),
+                                None,
+                                HeaderMap::new(),
+                                &ObjectOptions {
+                                    version_id: version_id.clone(),
+                                    no_lock: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            Ok(rd) => rd,
+                            Err(err) => {
+                                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                                    ignore = true;
+                                    break;
+                                }
+
+                                if !ignore {
+                                    //
+                                    if bucket == RUSTFS_META_BUCKET && version.name.contains(DATA_USAGE_CACHE_NAME) {
+                                        ignore = true;
+                                        error!("decommission_pool: ignore data usage cache {}", &version.name);
+                                        break;
+                                    }
+                                }
+
+                                failure = true;
+                                error!("decommission_pool: get_object_reader err {:?}", &err);
+                                continue;
+                            }
+                        };
+
+                        if let Err(err) = self.decommission_object(idx, bucket, rd).await {
+                            if is_err_object_not_found(&err)
+                                || is_err_version_not_found(&err)
+                                || is_err_data_movement_overwrite(&err)
+                            {
+                                ignore = true;
+                                break;
+                            }
+
+                            failure = true;
+
+                            error!("decommission_pool: decommission_object err {:?}", &err);
+                            continue;
+                        }
+
+                        failure = false;
+                        break;
+                    }
+
+                    if ignore {
+                        info!("decommission_pool: ignore {}", &version.name);
+                        continue;
+                    }
+
+                    {
+                        self.pool_meta.write().await.count_item(idx, decommissioned, failure);
+                    }
+
+                    if failure {
+                        break;
+                    }
+
+                    decommissioned += 1;
+                }
+
+                if decommissioned == fivs.versions.len() {
+                    if let Err(err) = set
+                        .delete_object(
+                            bucket.as_str(),
+                            &encode_dir_object(&entry.name),
+                            ObjectOptions {
+                                delete_prefix: true,
+                                delete_prefix_object: true,
+
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        error!("decommission_pool: delete_object err {:?}", &err);
+                    }
+                }
+
+                {
+                    let mut pool_meta = self.pool_meta.write().await;
+
+                    pool_meta.track_current_bucket_object(idx, bucket.clone(), entry.name.clone());
+
+                    let ok = pool_meta
+                        .update_after(idx, self.pools.clone(), Duration::seconds(30))
+                        .await
+                        .unwrap_or_default();
+                    if ok {
+                        // TODO: ReloadPoolMeta
+                    }
+                }
+            };
+
+            wk.clone().take().await;
+
+            // let set = set.clone();
+            // let mutrx = rx.resubscribe();
+            // tokio::spawn(async move {
+            //     loop {
+            //         if rx.try_recv().is_ok() {
+            //             break;
+            //         }
+
+            //         let decommission_entry = Arc::new(move |entry: MetaCacheEntry| {
+            //             let decommission_entry = decommission_entry.clone();
+            //             Box::pin(async move {
+            //                 decommission_entry(entry).await;
+            //             }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            //         });
+            //         set.list_objects_to_decommission(rx, bi, decommission_entry).await.unwrap();
+            //     }
+
+            //     //
+            // });
+        }
+
+        wk.wait().await;
+
+        Ok(())
     }
 
-    async fn do_decommission_in_routine(&self, idx: usize) {
-        if let Err(err) = self.decommission_in_background(idx).await {
+    async fn do_decommission_in_routine(&self, rx: B_Receiver<bool>, idx: usize) {
+        if let Err(err) = self.decommission_in_background(rx, idx).await {
             error!("decom err {:?}", &err);
             if let Err(er) = self.decommission_failed(idx).await {
                 error!("decom failed err {:?}", &er);
@@ -588,7 +850,7 @@ impl ECStore {
         Ok(())
     }
 
-    async fn decommission_in_background(&self, idx: usize) -> Result<()> {
+    async fn decommission_in_background(&self, rx: B_Receiver<bool>, idx: usize) -> Result<()> {
         let pool = self.pools[idx].clone();
 
         let pending = {
@@ -618,7 +880,10 @@ impl ECStore {
 
             info!("decommission: currently on bucket {}", &bucket.name);
 
-            if let Err(err) = self.decommission_pool(idx, pool.clone(), bucket.clone()).await {
+            if let Err(err) = self
+                .decommission_pool(rx.resubscribe(), idx, pool.clone(), bucket.clone())
+                .await
+            {
                 error!("decommission: decommission_pool err {:?}", &err);
                 return Err(err);
             }
@@ -708,7 +973,7 @@ impl ECStore {
         Ok(ret)
     }
 
-    fn decommission_object(&self, id: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
+    async fn decommission_object(&self, id: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
         let object_info = rd.object_info;
         let actual_size = object_info.get_actual_size()?;
 
@@ -718,13 +983,17 @@ impl ECStore {
     }
 }
 
+// impl Fn(MetaCacheEntry) -> impl Future<Output = Result<(), Error>>
+
+type Listcb = Arc<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+
 impl SetDisks {
     //
     async fn list_objects_to_decommission(
         self: &Arc<Self>,
-        rx: B_Receiver<bool>,
+        mut rx: B_Receiver<bool>,
         bucket_info: DecomBucketInfo,
-        func: Arc<dyn Fn(MetaCacheEntry) + Send + Sync>,
+        func: Listcb,
     ) -> Result<()> {
         let (disks, _) = self.get_online_disks_with_healing(false).await;
         if disks.is_empty() {
@@ -750,7 +1019,8 @@ impl SetDisks {
                 min_disks: listing_quorum,
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
                     let resolver = resolver.clone();
-                    let func = func.clone();
+                    let func =
+                        func.clone() as Arc<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
                     Box::pin(async move {
                         if let Ok(Some(entry)) = entries.resolve(resolver) {
                             func(entry);

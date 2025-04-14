@@ -241,6 +241,14 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
     err
 }
 
+pub fn is_err_data_movement_overwrite(err: &Error) -> bool {
+    if let Some(e) = err.downcast_ref::<StorageError>() {
+        matches!(e, StorageError::DataMovementOverwriteErr(_, _, _))
+    } else {
+        false
+    }
+}
+
 pub fn is_err_read_quorum(err: &Error) -> bool {
     if let Some(e) = err.downcast_ref::<StorageError>() {
         matches!(e, StorageError::InsufficientReadQuorum)
