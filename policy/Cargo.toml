@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 tokio.workspace = true
-log.workspace = true
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json.workspace = true
@@ -25,7 +24,7 @@ itertools = "0.14.0"
 futures.workspace = true
 rand.workspace = true
 base64-simd = "0.8.0"
-jsonwebtoken = "9.3.0"
+jsonwebtoken = { workspace = true }
 tracing.workspace = true
 madmin.workspace = true
 lazy_static.workspace = true

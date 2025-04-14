@@ -4,8 +4,14 @@ use super::options::extract_metadata;
 use super::options::put_opts;
 use crate::auth::get_condition_values;
 use crate::storage::access::ReqInfo;
+use api::query::Context;
+use api::query::Query;
+use api::server::dbms::DatabaseManagerSystem;
 use bytes::Bytes;
 use common::error::Result;
+use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
+use datafusion::arrow::json::writer::JsonArray;
+use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use ecstore::bucket::error::BucketMetadataError;
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
@@ -40,13 +46,13 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use log::warn;
 use policy::auth;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
 use policy::policy::BucketPolicy;
 use policy::policy::BucketPolicyArgs;
 use policy::policy::Validator;
+use query::instance::make_rustfsms;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -56,11 +62,14 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
@@ -221,7 +230,7 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
-        // TODO: DeleteBucketInput 没有force参数？
+        // TODO: DeleteBucketInput 没有 force 参数？
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -252,14 +261,7 @@ impl S3 for FS {
             .await
             .map_err(to_s3_error)?;
 
-        let version_id = opts
-            .version_id
-            .as_ref()
-            .map(|v| match Uuid::parse_str(v) {
-                Ok(id) => Some(id),
-                Err(_) => None,
-            })
-            .unwrap_or_default();
+        let version_id = opts.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
         let dobj = ObjectToDelete {
             object_name: key,
             version_id,
@@ -316,14 +318,7 @@ impl S3 for FS {
             .objects
             .iter()
             .map(|v| {
-                let version_id = v
-                    .version_id
-                    .as_ref()
-                    .map(|v| match Uuid::parse_str(v) {
-                        Ok(id) => Some(id),
-                        Err(_) => None,
-                    })
-                    .unwrap_or_default();
+                let version_id = v.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
                 ObjectToDelete {
                     object_name: v.key.clone(),
                     version_id,
@@ -398,8 +393,6 @@ impl S3 for FS {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         // mc get 3
 
-        // warn!("get_object input {:?}, vid {:?}", &req.input, req.input.version_id);
-
         let GetObjectInput {
             bucket,
             key,
@@ -437,8 +430,6 @@ impl S3 for FS {
         if rs.is_some() && part_number.is_some() {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
         }
-
-        // let metadata = extract_metadata(&req.headers);
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
@@ -507,16 +498,49 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         // mc get 2
-        let HeadObjectInput { bucket, key, .. } = req.input;
+        let HeadObjectInput {
+            bucket,
+            key,
+            version_id,
+            part_number,
+            range,
+            ..
+        } = req.input;
+
+        let part_number = part_number.map(|v| v as usize);
+
+        if let Some(part_num) = part_number {
+            if part_num == 0 {
+                return Err(s3_error!(InvalidArgument, "part_numer invalid"));
+            }
+        }
+
+        let rs = range.map(|v| match v {
+            Range::Int { first, last } => HTTPRangeSpec {
+                is_suffix_length: false,
+                start: first as usize,
+                end: last.map(|v| v as usize),
+            },
+            Range::Suffix { length } => HTTPRangeSpec {
+                is_suffix_length: true,
+                start: length as usize,
+                end: None,
+            },
+        });
+
+        if rs.is_some() && part_number.is_some() {
+            return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
+        }
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
+            .await
+            .map_err(to_s3_error)?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let info = store
-            .get_object_info(&bucket, &key, &ObjectOptions::default())
-            .await
-            .map_err(to_s3_error)?;
+        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(to_s3_error)?;
 
         // warn!("head_object info {:?}", &info);
 
@@ -1045,11 +1069,11 @@ impl S3 for FS {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-        let GetBucketTaggingInput { bucket, .. } = req.input;
+        let bucket = req.input.bucket.clone();
         // check bucket exists.
         let _bucket = self
-            .head_bucket(S3Request::new(HeadBucketInput {
-                bucket: bucket.clone(),
+            .head_bucket(req.map_input(|input| HeadBucketInput {
+                bucket: input.bucket,
                 expected_bucket_owner: None,
             }))
             .await?;
@@ -1858,6 +1882,69 @@ impl S3 for FS {
             }
         }
         Ok(S3Response::new(PutObjectAclOutput::default()))
+    }
+
+    async fn select_object_content(
+        &self,
+        req: S3Request<SelectObjectContentInput>,
+    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        info!("handle select_object_content");
+
+        let input = req.input;
+        info!("{:?}", input);
+
+        let db = make_rustfsms(input.clone(), false).await.map_err(|e| {
+            error!("make db failed, {}", e.to_string());
+            s3_error!(InternalError)
+        })?;
+        let query = Query::new(Context { input: input.clone() }, input.request.expression);
+        let result = db.execute(&query).await.map_err(|_| s3_error!(InternalError))?;
+
+        let results = result.result().chunk_result().await.unwrap().to_vec();
+
+        let mut buffer = Vec::new();
+        if input.request.output_serialization.csv.is_some() {
+            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
+            for batch in results {
+                csv_writer
+                    .write(&batch)
+                    .map_err(|e| s3_error!(InternalError, "cann't encode output to csv. e: {}", e.to_string()))?;
+            }
+        } else if input.request.output_serialization.json.is_some() {
+            let mut json_writer = JsonWriterBuilder::new()
+                .with_explicit_nulls(true)
+                .build::<_, JsonArray>(&mut buffer);
+            for batch in results {
+                json_writer
+                    .write(&batch)
+                    .map_err(|e| s3_error!(InternalError, "cann't encode output to json. e: {}", e.to_string()))?;
+            }
+            json_writer
+                .finish()
+                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
+        } else {
+            return Err(s3_error!(InvalidArgument, "unknow output format"));
+        }
+
+        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
+        let stream = ReceiverStream::new(rx);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
+                .await;
+            let _ = tx
+                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
+                    payload: Some(Bytes::from(buffer)),
+                })))
+                .await;
+            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
+
+            drop(tx);
+        });
+
+        Ok(S3Response::new(SelectObjectContentOutput {
+            payload: Some(SelectObjectContentEventStream::new(stream)),
+        }))
     }
 }
 

@@ -1,5 +1,6 @@
 use super::ecfs::FS;
-use crate::auth::{check_key_valid, get_condition_values};
+use crate::auth::{check_key_valid, get_condition_values, get_session_token};
+use crate::license::license_check;
 use ecstore::bucket::policy_sys::PolicySys;
 use iam::error::Error as IamError;
 use policy::auth;
@@ -155,7 +156,8 @@ impl S3Access for FS {
         // );
 
         let (cred, is_owner) = if let Some(input_cred) = cx.credentials() {
-            let (cred, is_owner) = check_key_valid(cx.headers(), &input_cred.access_key).await?;
+            let (cred, is_owner) =
+                check_key_valid(get_session_token(cx.uri(), cx.headers()).unwrap_or_default(), &input_cred.access_key).await?;
             (Some(cred), is_owner)
         } else {
             (None, false)
@@ -179,6 +181,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
+        license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
+
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
 
@@ -240,6 +244,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn create_multipart_upload(&self, _req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
+        license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
         Ok(())
     }
 
@@ -994,6 +999,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
+        license_check().map_err(|er| s3_error!(AccessDenied, "{:?}", er.to_string()))?;
+
         let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());

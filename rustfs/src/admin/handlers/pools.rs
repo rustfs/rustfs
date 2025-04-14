@@ -4,6 +4,7 @@ use matchit::Params;
 use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
+use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::{admin::router::Operation, storage::error::to_s3_error};
@@ -159,6 +160,9 @@ impl Operation for StartDecommission {
         let pools: Vec<&str> = query.pool.split(",").collect();
         let mut pools_indices = Vec::with_capacity(pools.len());
 
+        // TODO: ctx
+        let (_ctx_tx, ctx_rx) = broadcast::channel::<bool>(1);
+
         for pool in pools.iter() {
             let idx = {
                 if is_byid {
@@ -188,7 +192,7 @@ impl Operation for StartDecommission {
         }
 
         if !pools_indices.is_empty() {
-            store.decommission(pools_indices).await.map_err(to_s3_error)?;
+            store.decommission(ctx_rx, pools_indices).await.map_err(to_s3_error)?;
         }
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))

@@ -42,12 +42,13 @@ impl Operation for AssumeRoleHandle {
 
         let Some(user) = req.credentials else { return Err(s3_error!(InvalidRequest, "get cred failed")) };
 
-        let session_token = get_session_token(&req.headers);
+        let session_token = get_session_token(&req.uri, &req.headers);
         if session_token.is_some() {
             return Err(s3_error!(InvalidRequest, "AccessDenied1"));
         }
 
-        let (cred, _owner) = check_key_valid(&req.headers, &user.access_key).await?;
+        let (cred, _owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &user.access_key).await?;
 
         // // TODO: 判断权限, 不允许sts访问
         if cred.is_temp() || cred.is_service_account() {

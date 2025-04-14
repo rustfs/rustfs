@@ -1,0 +1,41 @@
+use s3s::dto::SelectObjectContentInput;
+
+pub mod analyzer;
+pub mod ast;
+pub mod datasource;
+pub mod dispatcher;
+pub mod execution;
+pub mod function;
+pub mod logical_planner;
+pub mod optimizer;
+pub mod parser;
+pub mod physical_planner;
+pub mod scheduler;
+pub mod session;
+
+#[derive(Clone)]
+pub struct Context {
+    // maybe we need transfer some info?
+    pub input: SelectObjectContentInput,
+}
+
+#[derive(Clone)]
+pub struct Query {
+    context: Context,
+    content: String,
+}
+
+impl Query {
+    #[inline(always)]
+    pub fn new(context: Context, content: String) -> Self {
+        Self { context, content }
+    }
+
+    pub fn context(&self) -> &Context {
+        &self.context
+    }
+
+    pub fn content(&self) -> &str {
+        self.content.as_str()
+    }
+}

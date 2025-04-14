@@ -6,10 +6,11 @@ pub mod utils;
 use common::error::Result;
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    group, policy, pools,
+    group, policys, pools,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, user,
 };
+
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::regist_rpc_route;
@@ -231,35 +232,35 @@ fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/list-canned-policies").as_str(),
-        AdminOperation(&policy::ListCannedPolicies {}),
+        AdminOperation(&policys::ListCannedPolicies {}),
     )?;
 
     // info-canned-policy?name=xxx
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info-canned-policy").as_str(),
-        AdminOperation(&policy::InfoCannedPolicy {}),
+        AdminOperation(&policys::InfoCannedPolicy {}),
     )?;
 
     // add-canned-policy?name=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-canned-policy").as_str(),
-        AdminOperation(&policy::AddCannedPolicy {}),
+        AdminOperation(&policys::AddCannedPolicy {}),
     )?;
 
     // remove-canned-policy?name=xxx
     r.insert(
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-canned-policy").as_str(),
-        AdminOperation(&policy::RemoveCannedPolicy {}),
+        AdminOperation(&policys::RemoveCannedPolicy {}),
     )?;
 
     // set-user-or-group-policy?policyName=xxx&userOrGroup=xxx&isGroup=xxx
     r.insert(
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
-        AdminOperation(&policy::SetPolicyForUserOrGroup {}),
+        AdminOperation(&policys::SetPolicyForUserOrGroup {}),
     )?;
 
     Ok(())

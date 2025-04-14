@@ -140,10 +140,14 @@ impl<R> EtagReader<R> {
 
 impl<R: AsyncRead + Unpin> AsyncRead for EtagReader<R> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
+        let befor_size = buf.filled().len();
+
         match Pin::new(&mut self.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
-                let bytes = buf.filled();
-                self.md5.update(bytes);
+                if buf.filled().len() > befor_size {
+                    let bytes = &buf.filled()[befor_size..];
+                    self.md5.update(bytes);
+                }
 
                 Poll::Ready(Ok(()))
             }

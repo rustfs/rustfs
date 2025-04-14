@@ -1,0 +1,17 @@
+FROM alpine:latest
+
+# RUN apk add --no-cache <package-name>
+# 如果 rustfs 有依赖，可以在这里添加，例如：
+# RUN apk add --no-cache openssl
+# RUN apk add --no-cache bash  # 安装 Bash
+
+WORKDIR /app
+
+COPY ./target/x86_64-unknown-linux-musl/release/rustfs /app/rustfs
+
+RUN chmod +x /app/rustfs
+
+EXPOSE 9000
+EXPOSE 9002
+
+CMD ["/app/rustfs"]

@@ -1,0 +1,19 @@
+[package]
+name = "appauth"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64-simd = "0.8.0"
+common.workspace = true
+hex-simd = "0.8.0"
+rand.workspace = true
+rsa = "0.9.8"
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

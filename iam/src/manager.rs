@@ -11,7 +11,6 @@ use crate::{
 use common::error::{Error, Result};
 use ecstore::config::error::is_err_config_not_found;
 use ecstore::utils::{crypto::base64_encode, path::path_join_buf};
-use log::{debug, warn};
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use policy::{
     arn::ARN,
@@ -40,6 +39,7 @@ use tokio::{
     },
 };
 use tracing::error;
+use tracing::warn;
 
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
@@ -135,7 +135,7 @@ where
     }
 
     async fn load(self: Arc<Self>) -> Result<()> {
-        debug!("load iam to cache");
+        // debug!("load iam to cache");
         self.api.load_all(&self.cache).await?;
         self.last_timestamp
             .store(OffsetDateTime::now_utc().unix_timestamp(), Ordering::Relaxed);

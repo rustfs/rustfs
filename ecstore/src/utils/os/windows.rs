@@ -1,7 +1,8 @@
 #![allow(unsafe_code)] // TODO: audit unsafe code
 
 use super::IOStats;
-use crate::{disk::Info, error::Result};
+use crate::disk::Info;
+use common::error::Result;
 use std::io::{Error, ErrorKind};
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
