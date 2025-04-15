@@ -320,6 +320,10 @@ async fn run(opt: config::Opt) -> Result<()> {
                 }
             };
 
+            if let Err(err) = socket.set_nodelay(true) {
+                warn!(?err, "Failed to set TCP_NODELAY");
+            }
+
             if has_tls_certs {
                 debug!("TLS certificates found, starting with SIGINT");
                 let tls_socket = match tls_acceptor
