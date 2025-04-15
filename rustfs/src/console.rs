@@ -8,17 +8,21 @@ use axum::{
     Router,
 };
 use axum_extra::extract::Host;
+use std::io;
 
+use axum::response::Redirect;
 use axum_server::tls_rustls::RustlsConfig;
-use http::Uri;
+use http::{header, Uri};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::signal;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument};
 
 shadow!(build);
@@ -204,7 +208,7 @@ async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
 
     let url = format!("{}://{}:{}", scheme, host, cfg.port);
 
-    // // 如果指定入口, 直接使用
+    // // 如果指定入口，直接使用
     // let url = if let Some(endpoint) = &config::get_config().console_fs_endpoint {
     //     debug!("axum Using rustfs endpoint address: {}", endpoint);
     //     endpoint.clone()
@@ -256,11 +260,20 @@ pub async fn start_static_file_server(
     secret_key: &str,
     tls_path: Option<String>,
 ) {
+    // 配置 CORS
+    let cors = CorsLayer::new()
+        .allow_origin(Any) // 生产环境建议指定具体域名
+        .allow_methods([http::Method::GET, http::Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
     // Create a route
     let app = Router::new()
         .route("/license", get(license_handler))
         .route("/config.json", get(config_handler))
-        .fallback_service(get(static_handler));
+        .fallback_service(get(static_handler))
+        .layer(cors)
+        .layer(tower_http::compression::CompressionLayer::new())
+        // .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024)) // 开启 limit feature
+        .layer(TraceLayer::new_for_http());
     let local_addr: SocketAddr = addrs.parse().expect("Failed to parse socket address");
     info!("WebUI: http://{}:{} http://127.0.0.1:{}", local_ip, local_addr.port(), local_addr.port());
     info!("   RootUser: {}", access_key);
@@ -272,58 +285,81 @@ pub async fn start_static_file_server(
         Err(e) => error!("Server error: {}", e),
     }
 }
-async fn start_server(addrs: &str, local_addr: SocketAddr, tls_path: Option<String>, app: Router) -> std::io::Result<()> {
+async fn start_server(addrs: &str, local_addr: SocketAddr, tls_path: Option<String>, app: Router) -> io::Result<()> {
     let tls_path = tls_path.unwrap_or_default();
     let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
     let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+
+    let addr = addrs
+        .parse::<SocketAddr>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid address: {}", e)))?;
+
+    let handle = axum_server::Handle::new();
+    // create a signal off listening task
+    let handle_clone = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("Initiating graceful shutdown...");
+        handle_clone.graceful_shutdown(Some(Duration::from_secs(10)));
+    });
+
     let has_tls_certs = tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok();
     debug!("Console TLS certs: {:?}", has_tls_certs);
     if has_tls_certs {
         debug!("Found TLS certificates, starting with HTTPS");
-        match tokio::try_join!(tokio::fs::read(&key_path), tokio::fs::read(&cert_path)) {
-            Ok((key_data, cert_data)) => {
-                match RustlsConfig::from_pem(cert_data, key_data).await {
-                    Ok(config) => {
-                        let handle = axum_server::Handle::new();
-                        // create a signal off listening task
-                        let handle_clone = handle.clone();
-                        tokio::spawn(async move {
-                            shutdown_signal().await;
-                            handle_clone.graceful_shutdown(Some(Duration::from_secs(10)));
-                        });
-                        info!("Starting HTTPS server...");
-                        axum_server::bind_rustls(local_addr, config)
-                            .handle(handle.clone())
-                            .serve(app.into_make_service())
-                            .await
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        match RustlsConfig::from_pem_file(cert_path, key_path).await {
+            Ok(config) => {
+                info!("Starting HTTPS server...");
+                let https_future = axum_server::bind_rustls(local_addr, config)
+                    .handle(handle.clone())
+                    .serve(app.into_make_service());
+                // 启动 HTTP 重定向服务器
+                let redirect_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), addr.port());
+                let redirect_future = axum_server::bind(redirect_addr).serve(redirect_to_https(addr.port()).into_make_service());
 
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("Failed to create TLS config: {}", e);
-                        start_http_server(addrs, app).await
-                    }
-                }
+                info!("HTTPS server running on https://{}", addr);
+                info!("HTTP redirect server running on http://{}", redirect_addr);
+
+                // 并发运行 HTTPS 和 HTTP 重定向
+                tokio::try_join!(https_future, redirect_future)?;
+                Ok(())
             }
             Err(e) => {
-                error!("Failed to read TLS certificates: {}", e);
-                start_http_server(addrs, app).await
+                error!("Failed to create TLS config: {}", e);
+                start_http_server(addr, app, handle).await
             }
         }
     } else {
         debug!("TLS certificates not found at {} and {}", key_path, cert_path);
-        start_http_server(addrs, app).await
+        start_http_server(addr, app, handle).await
     }
 }
 
-async fn start_http_server(addrs: &str, app: Router) -> std::io::Result<()> {
+// HTTP 到 HTTPS 的 301 重定向
+fn redirect_to_https(https_port: u16) -> Router {
+    Router::new().route(
+        "/*path",
+        get({
+            move |uri: Uri, req: http::Request<Body>| async move {
+                let host = req
+                    .headers()
+                    .get("host")
+                    .map_or("localhost", |h| h.to_str().unwrap_or("localhost"));
+                let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("");
+                let https_url = format!("https://{}:{}{}", host, https_port, path);
+                Redirect::permanent(&https_url)
+            }
+        }),
+    )
+}
+
+async fn start_http_server(addr: SocketAddr, app: Router, handle: axum_server::Handle) -> io::Result<()> {
     debug!("Starting HTTP server...");
-    let listener = tokio::net::TcpListener::bind(addrs).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    axum_server::bind(addr)
+        .handle(handle)
+        .serve(app.into_make_service())
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
 async fn shutdown_signal() {
