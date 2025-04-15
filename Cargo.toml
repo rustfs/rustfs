@@ -102,8 +102,8 @@ rust-embed = "8.7.0"
 rustls = { version = "0.23.26" }
 rustls-pki-types = "1.11.0"
 rustls-pemfile = "2.2.0"
-s3s = { git = "https://github.com/Nugine/s3s.git", rev = "3ad13ace7af703c3c8afc99cf19f4c18c82603a3" }
-s3s-policy = { git = "https://github.com/Nugine/s3s.git", rev = "3ad13ace7af703c3c8afc99cf19f4c18c82603a3" }
+s3s = { git = "https://github.com/Nugine/s3s.git", rev = "2ab81ef4ce066bc2644372ad033771eaab8398d0" }
+s3s-policy = { git = "https://github.com/Nugine/s3s.git", rev = "2ab81ef4ce066bc2644372ad033771eaab8398d0" }
 shadow-rs = { version = "0.38.1", default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
