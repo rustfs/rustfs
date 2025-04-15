@@ -21,6 +21,7 @@ pub mod peer;
 pub mod peer_rest_client;
 pub mod pools;
 mod quorum;
+pub mod rebalance;
 pub mod set_disk;
 mod sets;
 pub mod store;

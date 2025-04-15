@@ -1,15 +1,15 @@
 #![allow(clippy::map_entry)]
 
-use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, set_bucket_metadata};
+use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
+use crate::config::storageclass;
 use crate::config::GLOBAL_StorageClass;
-use crate::config::{self, storageclass, GLOBAL_ConfigSys};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
 use crate::error::clone_err;
 use crate::global::{
-    is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION,
-    DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
+    get_global_endpoints, is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE,
+    DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
 };
 use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
@@ -18,10 +18,11 @@ use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
+use crate::rebalance::RebalanceMeta;
 use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
 use crate::store_err::{
-    is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum, is_err_version_not_found,
-    to_object_err, StorageError,
+    is_err_bucket_exists, is_err_decommission_already_running, is_err_invalid_upload_id, is_err_object_not_found,
+    is_err_read_quorum, is_err_version_not_found, to_object_err, StorageError,
 };
 use crate::store_init::ec_drives_no_config;
 use crate::utils::crypto::base64_decode;
@@ -40,6 +41,7 @@ use crate::{
     },
     store_init, utils,
 };
+
 use common::error::{Error, Result};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
@@ -59,6 +61,7 @@ use tokio::select;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::{interval, sleep};
+use tracing::error;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -73,6 +76,7 @@ pub struct ECStore {
     pub peer_sys: S3PeerSys,
     // pub local_disks: Vec<DiskStore>,
     pub pool_meta: RwLock<PoolMeta>,
+    pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
     pub decommission_cancelers: Vec<Option<usize>>,
 }
 
@@ -209,7 +213,7 @@ impl ECStore {
         }
 
         let peer_sys = S3PeerSys::new(&endpoint_pools);
-        let mut pool_meta = PoolMeta::new(pools.clone());
+        let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
         pool_meta.dont_save = true;
 
         let decommission_cancelers = vec![None; pools.len()];
@@ -219,35 +223,96 @@ impl ECStore {
             pools,
             peer_sys,
             pool_meta: pool_meta.into(),
+            rebalance_meta: RwLock::new(None),
             decommission_cancelers,
         });
-
-        set_object_layer(ec.clone()).await;
 
         if let Some(dep_id) = deployment_id {
             set_global_deployment_id(dep_id);
         }
 
+        let wait_sec = 5;
+        loop {
+            if let Err(err) = ec.init().await {
+                error!("init err: {}", err);
+                error!("retry after  {} second", wait_sec);
+                sleep(Duration::from_secs(wait_sec)).await;
+                continue;
+            }
+
+            break;
+        }
+
+        set_object_layer(ec.clone()).await;
+
         Ok(ec)
     }
 
-    pub async fn init(api: Arc<ECStore>) -> Result<()> {
-        config::init();
-        GLOBAL_ConfigSys.init(api.clone()).await?;
+    pub async fn init(self: &Arc<Self>) -> Result<()> {
+        if self.load_rebalance_meta().await.is_ok() {
+            self.start_rebalance().await;
+        }
 
-        let buckets_list = api
-            .list_bucket(&BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|err| Error::from_string(err.to_string()))?;
+        let mut meta = PoolMeta::default();
+        meta.load(self.pools[0].clone(), self.pools.clone()).await?;
+        let update = meta.validate(self.pools.clone())?;
 
-        let buckets = buckets_list.iter().map(|v| v.name.clone()).collect();
+        if update {
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                *pool_meta = meta.clone();
+            }
+        } else {
+            let new_meta = PoolMeta::new(&self.pools, &meta);
+            new_meta.save(self.pools.clone()).await?;
+            {
+                let mut pool_meta = self.pool_meta.write().await;
+                *pool_meta = new_meta;
+            }
+        }
 
-        // FIXME:
+        let pools = meta.return_resumable_pools();
+        let mut pool_indeces = Vec::with_capacity(pools.len());
 
-        init_bucket_metadata_sys(api.clone(), buckets).await;
+        let endpoints = get_global_endpoints();
+
+        for p in pools.iter() {
+            if let Some(idx) = endpoints.get_pool_idx(&p.cmd_line) {
+                pool_indeces.push(idx);
+            } else {
+                return Err(Error::msg(format!(
+                    "unexpected state present for decommission status pool({}) not found",
+                    p.cmd_line
+                )));
+            }
+        }
+
+        if !pool_indeces.is_empty() {
+            let idx = pool_indeces[0];
+            if endpoints.as_ref()[idx].endpoints.as_ref()[0].is_local {
+                let (_tx, rx) = broadcast::channel(1);
+
+                let store = self.clone();
+
+                tokio::spawn(async move {
+                    // wait  3 minutes for cluster init
+                    tokio::time::sleep(Duration::from_secs(60 * 3)).await;
+
+                    if let Err(err) = store.decommission(rx.resubscribe(), pool_indeces.clone()).await {
+                        if is_err_decommission_already_running(&err) {
+                            for i in pool_indeces.iter() {
+                                store.do_decommission_in_routine(rx.resubscribe(), *i).await;
+                            }
+                            return;
+                        }
+
+                        error!("store init decommission err: {}", err);
+
+                        // TODO: check config err
+                    }
+                });
+            }
+        }
 
         Ok(())
     }
@@ -942,7 +1007,7 @@ impl ECStore {
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
         let mut meta = PoolMeta::default();
-        meta.load().await?;
+        meta.load(self.pools[0].clone(), self.pools.clone()).await?;
 
         let mut pool_meta = self.pool_meta.write().await;
         *pool_meta = meta;
@@ -1909,7 +1974,7 @@ impl StorageAPI for ECStore {
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
         check_abort_multipart_args(bucket, object, upload_id)?;
 
-        // TODO: defer
+        // TODO: defer DeleteUploadID
 
         if self.single_pool() {
             return self.pools[0].abort_multipart_upload(bucket, object, upload_id, opts).await;

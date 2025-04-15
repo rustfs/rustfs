@@ -80,6 +80,8 @@ pub enum StorageError {
 
     #[error("Decommission not started")]
     DecommissionNotStarted,
+    #[error("Decommission already running")]
+    DecommissionAlreadyRunning,
 
     #[error("DoneForNow")]
     DoneForNow,
@@ -115,6 +117,7 @@ impl StorageError {
             StorageError::InvalidPart(_, _, _) => 0x19,
             StorageError::VolumeNotFound(_) => 0x20,
             StorageError::DoneForNow => 0x21,
+            StorageError::DecommissionAlreadyRunning => 0x22,
         }
     }
 
@@ -151,6 +154,7 @@ impl StorageError {
             0x19 => Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default())),
             0x20 => Some(StorageError::VolumeNotFound(Default::default())),
             0x21 => Some(StorageError::DoneForNow),
+            0x22 => Some(StorageError::DecommissionAlreadyRunning),
             _ => None,
         }
     }
@@ -239,6 +243,14 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
     }
 
     err
+}
+
+pub fn is_err_decommission_already_running(err: &Error) -> bool {
+    if let Some(e) = err.downcast_ref::<StorageError>() {
+        matches!(e, StorageError::DecommissionAlreadyRunning)
+    } else {
+        false
+    }
 }
 
 pub fn is_err_data_movement_overwrite(err: &Error) -> bool {

@@ -2360,23 +2360,46 @@ impl Node for NodeService {
     }
 
     async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(store) = new_object_layer_fn() else {
             return Ok(tonic::Response::new(StopRebalanceResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
 
-        // todo
-        // store.stop_rebalance().await;
-        todo!()
+        let _ = store.stop_rebalance().await;
+        Ok(tonic::Response::new(StopRebalanceResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn load_rebalance_meta(
         &self,
-        _request: Request<LoadRebalanceMetaRequest>,
+        request: Request<LoadRebalanceMetaRequest>,
     ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
-        todo!()
+        let Some(store) = new_object_layer_fn() else {
+            return Ok(tonic::Response::new(LoadRebalanceMetaResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
+
+        store.load_rebalance_meta().await.map_err(|err| {
+            error!("load_rebalance_meta err {:?}", err);
+            Status::internal(err.to_string())
+        })?;
+
+        if start_rebalance {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store.start_rebalance().await;
+            });
+        }
+
+        unimplemented!()
     }
 
     async fn load_transition_tier_config(
