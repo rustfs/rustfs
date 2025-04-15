@@ -1,7 +1,7 @@
-use crate::endpoints::EndpointServerPools;
 use crate::global::get_global_endpoints;
 use crate::peer_rest_client::PeerRestClient;
 use crate::StorageAPI;
+use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use common::error::{Error, Result};
 use futures::future::join_all;
 use lazy_static::lazy_static;
@@ -131,6 +131,41 @@ impl NotificationSys {
                 error!("notification reload_pool_meta err {:?}", err);
             }
         }
+    }
+
+    pub async fn load_rebalance_meta(&self, start: bool) {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().flatten() {
+            futures.push(client.load_rebalance_meta(start));
+        }
+
+        let results = join_all(futures).await;
+        for result in results {
+            if let Err(err) = result {
+                error!("notification load_rebalance_meta err {:?}", err);
+            }
+        }
+    }
+
+    pub async fn stop_rebalance(&self) {
+        let Some(store) = new_object_layer_fn() else {
+            error!("stop_rebalance: not init");
+            return;
+        };
+
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().flatten() {
+            futures.push(client.stop_rebalance());
+        }
+
+        let results = join_all(futures).await;
+        for result in results {
+            if let Err(err) = result {
+                error!("notification stop_rebalance err {:?}", err);
+            }
+        }
+
+        let _ = store.stop_rebalance().await;
     }
 }
 

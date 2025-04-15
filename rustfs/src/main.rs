@@ -21,8 +21,13 @@ use common::{
     globals::set_global_addr,
 };
 use config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+use ecstore::config as ecconfig;
+use ecstore::config::GLOBAL_ConfigSys;
 use ecstore::heal::background_heal_ops::init_auto_heal;
+use ecstore::store_api::BucketOptions;
 use ecstore::utils::net::{self, get_available_port};
+use ecstore::StorageAPI;
 use ecstore::{
     endpoints::EndpointServerPools,
     heal::data_scanner::init_data_scanner,
@@ -379,11 +384,20 @@ async fn run(opt: config::Opt) -> Result<()> {
             Error::from_string(err.to_string())
         })?;
 
-    ECStore::init(store.clone()).await.map_err(|err| {
-        error!("ECStore init failed {:?}", &err);
-        Error::from_string(err.to_string())
-    })?;
-    debug!("init store success!");
+    ecconfig::init();
+    GLOBAL_ConfigSys.init(store.clone()).await?;
+
+    let buckets_list = store
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| Error::from_string(err.to_string()))?;
+
+    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
+
+    init_bucket_metadata_sys(store.clone(), buckets).await;
 
     init_iam_sys(store.clone()).await?;
 

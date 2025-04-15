@@ -287,7 +287,7 @@ pub struct ObjectPartInfo {
     pub size: usize,
     pub actual_size: usize, // 源数据大小
     pub mod_time: Option<OffsetDateTime>,
-    // pub index: Option<Vec<u8>>,
+    // pub index: Option<Vec<u8>>, // TODO: ???
     // pub checksums: Option<std::collections::HashMap<String, String>>,
 }
 
@@ -635,7 +635,7 @@ pub struct MultipartUploadResult {
     pub upload_id: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 pub struct PartInfo {
     pub part_num: usize,
     pub last_mod: Option<OffsetDateTime>,
@@ -643,7 +643,7 @@ pub struct PartInfo {
     pub etag: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletePart {
     pub part_num: usize,
     pub e_tag: Option<String>,

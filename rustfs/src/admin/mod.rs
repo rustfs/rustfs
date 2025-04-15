@@ -6,7 +6,7 @@ pub mod utils;
 use common::error::Result;
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    group, policys, pools,
+    group, policys, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, user,
 };
@@ -94,17 +94,17 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/start").as_str(),
-        AdminOperation(&handlers::RebalanceStart {}),
+        AdminOperation(&rebalance::RebalanceStart {}),
     )?;
     r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/status").as_str(),
-        AdminOperation(&handlers::RebalanceStatus {}),
+        AdminOperation(&rebalance::RebalanceStatus {}),
     )?;
     r.insert(
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/rebalance/stop").as_str(),
-        AdminOperation(&handlers::RebalanceStop {}),
+        AdminOperation(&rebalance::RebalanceStop {}),
     )?;
 
     // Some APIs are only available in EC mode

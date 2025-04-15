@@ -50,6 +50,7 @@ use tracing::{error, info, warn};
 pub mod group;
 pub mod policys;
 pub mod pools;
+pub mod rebalance;
 pub mod service_account;
 pub mod sts;
 pub mod trace;
@@ -730,40 +731,6 @@ pub struct BackgroundHealStatusHandler {}
 impl Operation for BackgroundHealStatusHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle BackgroundHealStatusHandler");
-
-        return Err(s3_error!(NotImplemented));
-    }
-}
-
-pub struct RebalanceStart {}
-
-#[async_trait::async_trait]
-impl Operation for RebalanceStart {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RebalanceStart");
-
-        return Err(s3_error!(NotImplemented));
-    }
-}
-
-// RebalanceStatus
-pub struct RebalanceStatus {}
-
-#[async_trait::async_trait]
-impl Operation for RebalanceStatus {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RebalanceStatus");
-
-        return Err(s3_error!(NotImplemented));
-    }
-}
-// RebalanceStop
-pub struct RebalanceStop {}
-
-#[async_trait::async_trait]
-impl Operation for RebalanceStop {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RebalanceStop");
 
         return Err(s3_error!(NotImplemented));
     }
