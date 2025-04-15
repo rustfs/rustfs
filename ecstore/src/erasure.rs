@@ -1,9 +1,11 @@
 use crate::bitrot::{BitrotReader, BitrotWriter};
 use crate::error::clone_err;
 use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
+use bytes::{Bytes, BytesMut};
 use common::error::{Error, Result};
 use futures::future::join_all;
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use smallvec::SmallVec;
 use std::any::Any;
 use std::io::ErrorKind;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -66,6 +68,7 @@ impl Erasure {
         // );
 
         let mut total: usize = 0;
+        let mut blocks = <SmallVec<[Bytes; 16]>>::new();
 
         loop {
             if total_size > 0 {
@@ -97,7 +100,7 @@ impl Erasure {
                 total += self.buf.len();
             }
 
-            let blocks = self.encode_data(&self.buf)?;
+            self.encode_data(&self.buf, &mut blocks)?;
             let mut errs = Vec::new();
 
             // TODO: 并发写入
@@ -355,20 +358,20 @@ impl Erasure {
         self.data_shards + self.parity_shards
     }
 
-    pub fn encode_data(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
+    pub fn encode_data(&self, data: &[u8], shards: &mut SmallVec<[Bytes; 16]>) -> Result<()> {
         let (shard_size, total_size) = self.need_size(data.len());
 
         // 生成一个新的 所需的所有分片数据长度
-        let mut data_buffer = vec![0u8; total_size];
-        {
-            // 复制源数据
-            let (left, _) = data_buffer.split_at_mut(data.len());
-            left.copy_from_slice(data);
-        }
+        let mut data_buffer = BytesMut::with_capacity(total_size);
+
+        // 复制源数据
+        data_buffer.extend_from_slice(data);
+        data_buffer.resize(total_size, 0u8);
 
         {
             // ec encode, 结果会写进 data_buffer
-            let data_slices: Vec<&mut [u8]> = data_buffer.chunks_mut(shard_size).collect();
+            let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(shard_size).collect();
 
             // partiy 数量大于0 才ec
             if self.parity_shards > 0 {
@@ -376,16 +379,16 @@ impl Erasure {
             }
         }
 
-        // 分片
-        let mut shards = Vec::with_capacity(self.total_shard_count());
-
-        let slices: Vec<&[u8]> = data_buffer.chunks(shard_size).collect();
-
-        for &d in slices.iter() {
-            shards.push(d.to_vec());
+        // 零拷贝分片，所有 shard 引用 data_buffer
+        let mut data_buffer = data_buffer.freeze();
+        shards.clear();
+        shards.reserve(self.total_shard_count());
+        for _ in 0..self.total_shard_count() {
+            let shard = data_buffer.split_to(shard_size);
+            shards.push(shard);
         }
 
-        Ok(shards)
+        Ok(())
     }
 
     pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> Result<()> {
@@ -625,12 +628,13 @@ mod test {
         let parity_shards = 2;
         let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let ec = Erasure::new(data_shards, parity_shards, 1);
-        let shards = ec.encode_data(data).unwrap();
+        let mut shards = SmallVec::new();
+        ec.encode_data(data, &mut shards).unwrap();
         println!("shards:{:?}", shards);
 
         let mut s: Vec<_> = shards
             .iter()
-            .map(|d| if d.is_empty() { None } else { Some(d.clone()) })
+            .map(|d| if d.is_empty() { None } else { Some(d.to_vec()) })
             .collect();
 
         // let mut s = shards_to_option_shards(&shards);
