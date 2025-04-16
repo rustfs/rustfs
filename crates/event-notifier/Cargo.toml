@@ -1,0 +1,21 @@
+[package]
+name = "rustfs-event-notifier"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+thiserror = { workspace = true }
+wildmatch = { workspace = true }
+serde_json = { workspace = true }
+
+
+[lints]
+workspace = true

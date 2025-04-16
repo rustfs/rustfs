@@ -15,6 +15,7 @@ members = [
     "s3select/api",
     "s3select/query",
     "appauth",
+    "crates/event-notifier",
 ]
 resolver = "2"
 
@@ -83,6 +84,7 @@ opentelemetry-stdout = { version = "0.29.0" }
 opentelemetry-otlp = { version = "0.29" }
 opentelemetry-prometheus = { version = "0.29.1" }
 opentelemetry-semantic-conventions = { version = "0.29.0", features = ["semconv_experimental"] }
+parking_lot = "0.12.3"
 pin-project-lite = "0.2"
 prometheus = "0.14.0"
 # pin-utils = "0.1.0"
@@ -98,6 +100,7 @@ rfd = { version = "0.15.3", default-features = false, features = ["xdg-portal", 
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
+rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
 rust-embed = "8.7.0"
 rustls = { version = "0.23.26" }
 rustls-pki-types = "1.11.0"
@@ -141,6 +144,7 @@ uuid = { version = "1.16.0", features = [
     "fast-rng",
     "macro-diagnostics",
 ] }
+wildmatch = "2.4.0"
 workers = { path = "./common/workers" }
 
 [profile.wasm-dev]

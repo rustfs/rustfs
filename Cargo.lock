@@ -7200,6 +7200,7 @@ dependencies = [
  "query",
  "rmp-serde",
  "rust-embed",
+ "rustfs-event-notifier",
  "rustfs-obs",
  "rustls",
  "rustls-pemfile",
@@ -7222,6 +7223,20 @@ dependencies = [
  "tracing",
  "transform-stream",
  "uuid",
+]
+
+[[package]]
+name = "rustfs-event-notifier"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "parking_lot 0.12.3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
+ "wildmatch",
 ]
 
 [[package]]
@@ -9316,6 +9331,12 @@ dependencies = [
  "once_cell",
  "rustix 0.38.44",
 ]
+
+[[package]]
+name = "wildmatch"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ce1ab1f8c62655ebe1350f589c61e505cf94d385bc6a12899442d9081e71fd"
 
 [[package]]
 name = "winapi"
