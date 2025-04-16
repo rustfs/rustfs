@@ -54,6 +54,10 @@ use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, info_span, warn};
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
 
