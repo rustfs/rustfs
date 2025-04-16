@@ -272,7 +272,6 @@ pub async fn start_static_file_server(
         .fallback_service(get(static_handler))
         .layer(cors)
         .layer(tower_http::compression::CompressionLayer::new())
-        // .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024)) // 开启 limit feature
         .layer(TraceLayer::new_for_http());
     let local_addr: SocketAddr = addrs.parse().expect("Failed to parse socket address");
     info!("WebUI: http://{}:{} http://127.0.0.1:{}", local_ip, local_addr.port(), local_addr.port());
@@ -304,24 +303,20 @@ async fn start_server(addrs: &str, local_addr: SocketAddr, tls_path: Option<Stri
     });
 
     let has_tls_certs = tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok();
-    debug!("Console TLS certs: {:?}", has_tls_certs);
+    info!("Console TLS certs: {:?}", has_tls_certs);
     if has_tls_certs {
-        debug!("Found TLS certificates, starting with HTTPS");
+        info!("Found TLS certificates, starting with HTTPS");
         match RustlsConfig::from_pem_file(cert_path, key_path).await {
             Ok(config) => {
                 info!("Starting HTTPS server...");
-                let https_future = axum_server::bind_rustls(local_addr, config)
+                axum_server::bind_rustls(local_addr, config)
                     .handle(handle.clone())
-                    .serve(app.into_make_service());
-                // 启动 HTTP 重定向服务器
-                let redirect_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), addr.port());
-                let redirect_future = axum_server::bind(redirect_addr).serve(redirect_to_https(addr.port()).into_make_service());
+                    .serve(app.into_make_service())
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
                 info!("HTTPS server running on https://{}", addr);
-                info!("HTTP redirect server running on http://{}", redirect_addr);
 
-                // 并发运行 HTTPS 和 HTTP 重定向
-                tokio::try_join!(https_future, redirect_future)?;
                 Ok(())
             }
             Err(e) => {
@@ -330,12 +325,13 @@ async fn start_server(addrs: &str, local_addr: SocketAddr, tls_path: Option<Stri
             }
         }
     } else {
-        debug!("TLS certificates not found at {} and {}", key_path, cert_path);
+        info!("TLS certificates not found at {} and {}", key_path, cert_path);
         start_http_server(addr, app, handle).await
     }
 }
 
-// HTTP 到 HTTPS 的 301 重定向
+#[allow(dead_code)]
+/// HTTP 到 HTTPS 的 308 重定向
 fn redirect_to_https(https_port: u16) -> Router {
     Router::new().route(
         "/*path",
