@@ -50,6 +50,7 @@ pin-project-lite.workspace = true
 protos.workspace = true
 query = { path = "../s3select/query" }
 rmp-serde.workspace = true
+rustfs-event-notifier = { workspace = true }
 rustfs-obs = { workspace = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
