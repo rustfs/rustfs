@@ -99,7 +99,7 @@ impl FileMeta {
 
         Ok((bin_len, &buf[5..]))
     }
-    #[tracing::instrument]
+
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let i = buf.len() as u64;
 
@@ -711,7 +711,6 @@ impl FileMetaVersion {
         Ok(data_dir)
     }
 
-    #[tracing::instrument]
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let mut cur = Cursor::new(buf);
 
@@ -998,7 +997,7 @@ impl FileMetaVersionHeader {
 
         Ok(wr)
     }
-    #[tracing::instrument]
+
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let mut cur = Cursor::new(buf);
         let alen = rmp::decode::read_array_len(&mut cur)?;
@@ -1144,7 +1143,6 @@ pub struct MetaObject {
 }
 
 impl MetaObject {
-    #[tracing::instrument]
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let mut cur = Cursor::new(buf);
 

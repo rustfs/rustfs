@@ -285,6 +285,7 @@ impl DiskAPI for Disk {
         }
     }
 
+    #[tracing::instrument]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         match self {
             Disk::Local(local_disk) => local_disk.read_xl(volume, path, read_data).await,
