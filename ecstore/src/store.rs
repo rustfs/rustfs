@@ -521,28 +521,24 @@ impl ECStore {
             }
         }
 
-        let mut server_pools = Vec::new();
+        let mut server_pools = vec![PoolAvailableSpace::default(); self.pools.len()];
         for (i, zinfo) in infos.iter().enumerate() {
             if zinfo.is_empty() {
-                server_pools.push(PoolAvailableSpace {
+                server_pools[i] = PoolAvailableSpace {
                     index: i,
                     ..Default::default()
-                });
+                };
 
                 continue;
             }
 
-            if !is_meta_bucketname(bucket) {
-                let avail = has_space_for(zinfo, size).await.unwrap_or_default();
+            if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
+                server_pools[i] = PoolAvailableSpace {
+                    index: i,
+                    ..Default::default()
+                };
 
-                if !avail {
-                    server_pools.push(PoolAvailableSpace {
-                        index: i,
-                        ..Default::default()
-                    });
-
-                    continue;
-                }
+                continue;
             }
 
             let mut available = 0;
@@ -2530,7 +2526,7 @@ async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
     res
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PoolAvailableSpace {
     pub index: usize,
     pub available: u64,    // in bytes
