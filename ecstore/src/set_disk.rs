@@ -59,12 +59,7 @@ use common::error::{Error, Result};
 use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
-use lock::{
-    // drwmutex::Options,
-    drwmutex::Options,
-    namespace_lock::{new_nslock, NsLockMap},
-    LockApi,
-};
+use lock::{namespace_lock::NsLockMap, LockApi};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use md5::{Digest as Md5Digest, Md5};
 use rand::{
@@ -407,6 +402,7 @@ impl SetDisks {
     }
 
     #[allow(dead_code)]
+    #[tracing::instrument(level = "debug", skip(self, disks))]
     async fn commit_rename_data_dir(
         &self,
         disks: &[Option<DiskStore>],
@@ -852,6 +848,7 @@ impl SetDisks {
     // Returns per object readQuorum and writeQuorum
     // readQuorum is the min required disks to read data.
     // writeQuorum is the min required disks to write data.
+    #[tracing::instrument(level = "debug", skip(parts_metadata))]
     fn object_quorum_from_meta(
         parts_metadata: &[FileInfo],
         errs: &[Option<Error>],
@@ -864,7 +861,7 @@ impl SetDisks {
         };
 
         if let Some(err) = reduce_read_quorum_errs(errs, object_op_ignored_errs().as_ref(), expected_rquorum) {
-            // warn!("object_quorum_from_meta err {:?}", &err);
+            warn!("object_quorum_from_meta err {:?}", &err);
             return Err(err);
         }
 
@@ -1586,7 +1583,7 @@ impl SetDisks {
     //     Ok(())
     // }
 
-    // #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self))]
     pub async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
         let disks = self.disks.read().await;
 
@@ -1749,7 +1746,7 @@ impl SetDisks {
         // TODO: 优化并发 可用数量中断
         let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
-        // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
+        warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
@@ -3672,33 +3669,33 @@ impl ObjectIO for SetDisks {
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let disks = self.disks.read().await;
 
-        let mut _ns = None;
-        if !opts.no_lock {
-            let paths = vec![object.to_string()];
-            let ns_lock = new_nslock(
-                Arc::clone(&self.ns_mutex),
-                self.locker_owner.clone(),
-                bucket.to_string(),
-                paths,
-                self.lockers.clone(),
-            )
-            .await;
-            if !ns_lock
-                .0
-                .write()
-                .await
-                .get_lock(&Options {
-                    timeout: Duration::from_secs(5),
-                    retry_interval: Duration::from_secs(1),
-                })
-                .await
-                .map_err(|err| Error::from_string(err.to_string()))?
-            {
-                return Err(Error::from_string("can not get lock. please retry".to_string()));
-            }
+        // let mut _ns = None;
+        // if !opts.no_lock {
+        //     let paths = vec![object.to_string()];
+        //     let ns_lock = new_nslock(
+        //         Arc::clone(&self.ns_mutex),
+        //         self.locker_owner.clone(),
+        //         bucket.to_string(),
+        //         paths,
+        //         self.lockers.clone(),
+        //     )
+        //     .await;
+        //     if !ns_lock
+        //         .0
+        //         .write()
+        //         .await
+        //         .get_lock(&Options {
+        //             timeout: Duration::from_secs(5),
+        //             retry_interval: Duration::from_secs(1),
+        //         })
+        //         .await
+        //         .map_err(|err| Error::from_string(err.to_string()))?
+        //     {
+        //         return Err(Error::from_string("can not get lock. please retry".to_string()));
+        //     }
 
-            _ns = Some(ns_lock);
-        }
+        //     _ns = Some(ns_lock);
+        // }
 
         let mut user_defined = opts.user_defined.clone().unwrap_or_default();
 
@@ -4165,34 +4162,37 @@ impl StorageAPI for SetDisks {
         unimplemented!()
     }
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let mut _ns = None;
-        if !opts.no_lock {
-            let paths = vec![object.to_string()];
-            let ns_lock = new_nslock(
-                Arc::clone(&self.ns_mutex),
-                self.locker_owner.clone(),
-                bucket.to_string(),
-                paths,
-                self.lockers.clone(),
-            )
-            .await;
-            if !ns_lock
-                .0
-                .write()
-                .await
-                .get_lock(&Options {
-                    timeout: Duration::from_secs(5),
-                    retry_interval: Duration::from_secs(1),
-                })
-                .await
-                .map_err(|err| Error::from_string(err.to_string()))?
-            {
-                return Err(Error::from_string("can not get lock. please retry".to_string()));
-            }
+        // let mut _ns = None;
+        // if !opts.no_lock {
+        //     let paths = vec![object.to_string()];
+        //     let ns_lock = new_nslock(
+        //         Arc::clone(&self.ns_mutex),
+        //         self.locker_owner.clone(),
+        //         bucket.to_string(),
+        //         paths,
+        //         self.lockers.clone(),
+        //     )
+        //     .await;
+        //     if !ns_lock
+        //         .0
+        //         .write()
+        //         .await
+        //         .get_lock(&Options {
+        //             timeout: Duration::from_secs(5),
+        //             retry_interval: Duration::from_secs(1),
+        //         })
+        //         .await
+        //         .map_err(|err| Error::from_string(err.to_string()))?
+        //     {
+        //         return Err(Error::from_string("can not get lock. please retry".to_string()));
+        //     }
 
-            _ns = Some(ns_lock);
-        }
-        let (fi, _, _) = self.get_object_fileinfo(bucket, object, opts, false).await?;
+        //     _ns = Some(ns_lock);
+        // }
+        let (fi, _, _) = self
+            .get_object_fileinfo(bucket, object, opts, false)
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
         // warn!("get object_info fi {:?}", &fi);
 

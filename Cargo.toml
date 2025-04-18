@@ -1,17 +1,17 @@
 [workspace]
 members = [
-    "madmin", # Management dashboard and admin API interface
-    "rustfs", # Core file system implementation
-    "ecstore", # Erasure coding storage implementation
-    "e2e_test", # End-to-end test suite
-    "common/common", # Shared utilities and data structures
-    "common/lock", # Distributed locking implementation
-    "common/protos", # Protocol buffer definitions
+    "madmin",         # Management dashboard and admin API interface
+    "rustfs",         # Core file system implementation
+    "ecstore",        # Erasure coding storage implementation
+    "e2e_test",       # End-to-end test suite
+    "common/common",  # Shared utilities and data structures
+    "common/lock",    # Distributed locking implementation
+    "common/protos",  # Protocol buffer definitions
     "common/workers", # Worker thread pools and task scheduling
-    "iam", # Identity and Access Management
-    "crypto", # Cryptography and security features
+    "iam",            # Identity and Access Management
+    "crypto",         # Cryptography and security features
     "cli/rustfs-gui", # Graphical user interface client
-    "crates/obs", # Observability utilities
+    "crates/obs",     # Observability utilities
     "s3select/api",
     "s3select/query",
     "appauth",
@@ -67,7 +67,11 @@ http = "1.3.1"
 http-body = "1.0.1"
 humantime = "2.2.0"
 jsonwebtoken = "9.3.1"
-keyring = { version = "3.6.2", features = ["apple-native", "windows-native", "sync-secret-service"] }
+keyring = { version = "3.6.2", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
 lock = { path = "./common/lock" }
 lazy_static = "1.5.0"
 libsystemd = { version = "0.7" }
@@ -77,12 +81,17 @@ md-5 = "0.10.6"
 mime = "0.3.17"
 netif = "0.1.6"
 opentelemetry = { version = "0.29.1" }
-opentelemetry-appender-tracing = { version = "0.29.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
+opentelemetry-appender-tracing = { version = "0.29.1", features = [
+    "experimental_use_tracing_span_context",
+    "experimental_metadata_attributes",
+] }
 opentelemetry_sdk = { version = "0.29" }
 opentelemetry-stdout = { version = "0.29.0" }
 opentelemetry-otlp = { version = "0.29" }
 opentelemetry-prometheus = { version = "0.29.1" }
-opentelemetry-semantic-conventions = { version = "0.29.0", features = ["semconv_experimental"] }
+opentelemetry-semantic-conventions = { version = "0.29.0", features = [
+    "semconv_experimental",
+] }
 pin-project-lite = "0.2"
 prometheus = "0.14.0"
 # pin-utils = "0.1.0"
@@ -93,8 +102,19 @@ protobuf = "3.7"
 protos = { path = "./common/protos" }
 rand = "0.8.5"
 rdkafka = { version = "0.37", features = ["tokio"] }
-reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration", "stream", "json", "blocking"] }
-rfd = { version = "0.15.3", default-features = false, features = ["xdg-portal", "tokio"] }
+reqwest = { version = "0.12.15", default-features = false, features = [
+    "rustls-tls",
+    "charset",
+    "http2",
+    "macos-system-configuration",
+    "stream",
+    "json",
+    "blocking",
+] }
+rfd = { version = "0.15.3", default-features = false, features = [
+    "xdg-portal",
+    "tokio",
+] }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
@@ -154,6 +174,10 @@ inherits = "dev"
 inherits = "dev"
 
 [profile.release]
-opt-level = 3  # Optimization Level (0-3)
-lto = true     # Optimize when linking
-codegen-units = 1  # Reduce code generation units to improve optimization
+opt-level = 3
+lto = "thin"
+
+[profile.production]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

@@ -14,7 +14,7 @@ pub use unix::{get_drive_stats, get_info, same_disk};
 #[cfg(target_os = "windows")]
 pub use windows::{get_drive_stats, get_info, same_disk};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct IOStats {
     pub read_ios: u64,
     pub read_merges: u64,
@@ -33,4 +33,60 @@ pub struct IOStats {
     pub discard_ticks: u64,
     pub flush_ios: u64,
     pub flush_ticks: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_get_info_valid_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let info = get_info(temp_dir.path()).unwrap();
+
+        println!("Disk Info: {:?}", info);
+
+        assert!(info.total > 0);
+        assert!(info.free > 0);
+        assert!(info.used > 0);
+        assert!(info.files > 0);
+        assert!(info.ffree > 0);
+        assert!(!info.fstype.is_empty());
+    }
+
+    #[test]
+    fn test_get_info_invalid_path() {
+        let invalid_path = PathBuf::from("/invalid/path");
+        let result = get_info(&invalid_path);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_same_disk_same_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+
+        let result = same_disk(path, path).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_same_disk_different_paths() {
+        let temp_dir1 = tempfile::tempdir().unwrap();
+        let temp_dir2 = tempfile::tempdir().unwrap();
+
+        let path1 = temp_dir1.path().to_str().unwrap();
+        let path2 = temp_dir2.path().to_str().unwrap();
+
+        let result = same_disk(path1, path2).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_get_drive_stats_default() {
+        let stats = get_drive_stats(0, 0).unwrap();
+        assert_eq!(stats, IOStats::default());
+    }
 }

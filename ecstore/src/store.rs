@@ -232,11 +232,19 @@ impl ECStore {
         }
 
         let wait_sec = 5;
+        let mut exit_count = 0;
         loop {
             if let Err(err) = ec.init().await {
                 error!("init err: {}", err);
                 error!("retry after  {} second", wait_sec);
                 sleep(Duration::from_secs(wait_sec)).await;
+
+                if exit_count > 10 {
+                    return Err(Error::msg("ec init faild"));
+                }
+
+                exit_count += 1;
+
                 continue;
             }
 
@@ -481,6 +489,8 @@ impl ECStore {
     }
 
     async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
+        // // 先随机返回一个
+
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
         server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
         let total = server_pools.total_available();
@@ -521,28 +531,24 @@ impl ECStore {
             }
         }
 
-        let mut server_pools = Vec::new();
+        let mut server_pools = vec![PoolAvailableSpace::default(); self.pools.len()];
         for (i, zinfo) in infos.iter().enumerate() {
             if zinfo.is_empty() {
-                server_pools.push(PoolAvailableSpace {
+                server_pools[i] = PoolAvailableSpace {
                     index: i,
                     ..Default::default()
-                });
+                };
 
                 continue;
             }
 
-            if !is_meta_bucketname(bucket) {
-                let avail = has_space_for(zinfo, size).await.unwrap_or_default();
+            if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
+                server_pools[i] = PoolAvailableSpace {
+                    index: i,
+                    ..Default::default()
+                };
 
-                if !avail {
-                    server_pools.push(PoolAvailableSpace {
-                        index: i,
-                        ..Default::default()
-                    });
-
-                    continue;
-                }
+                continue;
             }
 
             let mut available = 0;
@@ -699,7 +705,7 @@ impl ECStore {
             let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
             let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
 
-            at.cmp(&bt)
+            bt.cmp(&at)
         });
 
         let mut def_pool = PoolObjInfo::default();
@@ -915,29 +921,30 @@ impl ECStore {
 
         // TODO: test order
         idx_res.sort_by(|a, b| {
-            if let Some(obj1) = &a.res {
-                if let Some(obj2) = &b.res {
-                    let cmp = obj1.mod_time.cmp(&obj2.mod_time);
-                    match cmp {
-                        // eq use lowest
-                        Ordering::Equal => {
-                            if a.idx < b.idx {
-                                Ordering::Greater
-                            } else {
-                                Ordering::Less
-                            }
-                        }
-                        _ => cmp,
-                    }
-                } else {
-                    Ordering::Greater
-                }
+            let a_mod = if let Some(o1) = &a.res {
+                o1.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
             } else {
-                Ordering::Less
+                OffsetDateTime::UNIX_EPOCH
+            };
+
+            let b_mod = if let Some(o2) = &b.res {
+                o2.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            } else {
+                OffsetDateTime::UNIX_EPOCH
+            };
+
+            if a_mod == b_mod {
+                if a.idx < b.idx {
+                    return Ordering::Greater;
+                } else {
+                    return Ordering::Less;
+                }
             }
+
+            b_mod.cmp(&a_mod)
         });
 
-        for res in idx_res {
+        for res in idx_res.into_iter() {
             if let Some(obj) = res.res {
                 return Ok((obj, res.idx));
             }
@@ -2516,7 +2523,7 @@ fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
     Ok(())
 }
 
-async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
+pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
     let opts = &DiskInfoOptions::default();
     let mut res = vec![None; disks.len()];
     for (idx, disk_op) in disks.iter().enumerate() {
@@ -2530,21 +2537,22 @@ async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
     res
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PoolAvailableSpace {
     pub index: usize,
     pub available: u64,    // in bytes
     pub max_used_pct: u64, // Used disk percentage of most filled disk, rounded down.
 }
 
+#[derive(Debug, Default, Clone)]
 pub struct ServerPoolsAvailableSpace(Vec<PoolAvailableSpace>);
 
 impl ServerPoolsAvailableSpace {
-    fn iter(&self) -> Iter<'_, PoolAvailableSpace> {
+    pub fn iter(&self) -> Iter<'_, PoolAvailableSpace> {
         self.0.iter()
     }
     // TotalAvailable - total available space
-    fn total_available(&self) -> u64 {
+    pub fn total_available(&self) -> u64 {
         let mut total = 0;
         for pool in &self.0 {
             total += pool.available;
@@ -2554,7 +2562,7 @@ impl ServerPoolsAvailableSpace {
 
     // FilterMaxUsed will filter out any pools that has used percent bigger than max,
     // unless all have that, in which case all are preserved.
-    fn filter_max_used(&mut self, max: u64) {
+    pub fn filter_max_used(&mut self, max: u64) {
         if self.0.len() <= 1 {
             // Nothing to do.
             return;
@@ -2575,13 +2583,14 @@ impl ServerPoolsAvailableSpace {
         // Remove entries that are above.
         for pool in self.0.iter_mut() {
             if pool.available > 0 && pool.max_used_pct < max {
-                pool.available = 0
+                continue;
             }
+            pool.available = 0
         }
     }
 }
 
-async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> {
+pub async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> {
     let size = {
         if size < 0 {
             DISK_ASSUME_UNKNOWN_SIZE
