@@ -133,6 +133,7 @@ impl NotificationSys {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn load_rebalance_meta(&self, start: bool) {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().flatten() {

@@ -211,6 +211,7 @@ impl RebalanceMeta {
 }
 
 impl ECStore {
+    #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
         let mut meta = RebalanceMeta::new();
         match meta.load(self.pools[0].clone()).await {
@@ -233,6 +234,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all)]
     pub async fn update_rebalance_stats(&self) -> Result<()> {
         let mut ok = false;
         let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -263,6 +265,7 @@ impl ECStore {
         None
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn init_rebalance_meta(&self, bucktes: Vec<String>) -> Result<String> {
         let si = self.storage_info().await;
 
@@ -326,6 +329,7 @@ impl ECStore {
         Ok(id)
     }
 
+    #[tracing::instrument(skip(self, fi))]
     pub async fn update_pool_stats(&self, pool_index: usize, bucket: String, fi: &FileInfo) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
         if let Some(meta) = rebalance_meta.as_mut() {
@@ -337,6 +341,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn next_rebal_bucket(&self, pool_index: usize) -> Result<Option<String>> {
         let rebalance_meta = self.rebalance_meta.read().await;
         if let Some(meta) = rebalance_meta.as_ref() {
@@ -355,6 +360,7 @@ impl ECStore {
         Ok(None)
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn bucket_rebalance_done(&self, pool_index: usize, bucket: String) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
         if let Some(meta) = rebalance_meta.as_mut() {
@@ -404,6 +410,7 @@ impl ECStore {
         false
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
         let rebalance_meta = self.rebalance_meta.read().await;
         if let Some(meta) = rebalance_meta.as_ref() {
@@ -415,6 +422,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) {
         // let rebalance_meta = self.rebalance_meta.read().await;
 
@@ -473,6 +481,7 @@ impl ECStore {
         }
     }
 
+    #[tracing::instrument(skip(self, rx))]
     async fn rebalance_buckets(self: &Arc<Self>, rx: B_Receiver<bool>, pool_index: usize) -> Result<()> {
         let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<Result<()>>(1);
 
@@ -589,6 +598,7 @@ impl ECStore {
     }
 
     #[allow(unused_assignments)]
+    #[tracing::instrument(skip(self, wk, set))]
     async fn rebalance_entry(
         &self,
         bucket: String,
@@ -763,6 +773,8 @@ impl ECStore {
             }
         }
     }
+
+    #[tracing::instrument(skip(self, rd))]
     async fn rebalance_object(&self, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
         let object_info = rd.object_info.clone();
 
@@ -889,6 +901,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, rx))]
     async fn rebalance_bucket(self: &Arc<Self>, rx: B_Receiver<bool>, bucket: String, pool_index: usize) -> Result<()> {
         // Placeholder for actual bucket rebalance logic
         tracing::info!("Rebalancing bucket {} in pool {}", bucket, pool_index);
@@ -944,6 +957,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn save_rebalance_stats(&self, pool_idx: usize, opt: RebalSaveOpt) -> Result<()> {
         // TODO: NSLOOK
 
@@ -989,6 +1003,7 @@ impl ECStore {
 }
 
 impl SetDisks {
+    #[tracing::instrument(skip(self, rx, cb))]
     pub async fn list_objects_to_rebalance(
         self: &Arc<Self>,
         rx: B_Receiver<bool>,

@@ -17,7 +17,7 @@ use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::signal;

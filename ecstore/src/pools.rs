@@ -592,6 +592,7 @@ impl ECStore {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
         if self.single_pool() {
             return Err(Error::msg("InvalidArgument"));
@@ -625,6 +626,7 @@ impl ECStore {
         false
     }
 
+    #[tracing::instrument(skip(self, rx))]
     pub async fn decommission(&self, rx: B_Receiver<bool>, indices: Vec<usize>) -> Result<()> {
         if indices.is_empty() {
             return Err(Error::msg("errInvalidArgument"));
@@ -650,6 +652,7 @@ impl ECStore {
     }
 
     #[allow(unused_assignments)]
+    #[tracing::instrument(skip(self, set, wk, rcfg))]
     async fn decommission_entry(
         self: &Arc<Self>,
         idx: usize,
@@ -844,6 +847,7 @@ impl ECStore {
         }
     }
 
+    #[tracing::instrument(skip(self, rx))]
     async fn decommission_pool(
         self: &Arc<Self>,
         rx: B_Receiver<bool>,
@@ -908,6 +912,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, rx))]
     pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: B_Receiver<bool>, idx: usize) {
         if let Err(err) = self.decommission_in_background(rx, idx).await {
             error!("decom err {:?}", &err);
@@ -941,6 +946,7 @@ impl ECStore {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn decommission_failed(&self, idx: usize) -> Result<()> {
         if self.single_pool() {
             return Err(Error::msg("errInvalidArgument"));
@@ -957,6 +963,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn complete_decommission(&self, idx: usize) -> Result<()> {
         if self.single_pool() {
             return Err(Error::msg("errInvalidArgument"));
@@ -973,6 +980,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, rx))]
     async fn decommission_in_background(self: &Arc<Self>, rx: B_Receiver<bool>, idx: usize) -> Result<()> {
         let pool = self.pools[idx].clone();
 
@@ -1024,6 +1032,7 @@ impl ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn start_decommission(&self, indices: Vec<usize>) -> Result<()> {
         if indices.is_empty() {
             return Err(Error::msg("errInvalidArgument"));
@@ -1096,6 +1105,7 @@ impl ECStore {
         Ok(ret)
     }
 
+    #[tracing::instrument(skip(self, rd))]
     async fn decommission_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
         let object_info = rd.object_info.clone();
 
@@ -1228,12 +1238,12 @@ impl ECStore {
 pub type ListCallback = Arc<dyn Fn(MetaCacheEntry) -> BoxFuture<'static, ()> + Send + Sync + 'static>;
 
 impl SetDisks {
-    //
+    #[tracing::instrument(skip(self, rx, cb_func))]
     async fn list_objects_to_decommission(
         self: &Arc<Self>,
         rx: B_Receiver<bool>,
         bucket_info: DecomBucketInfo,
-        func: ListCallback,
+        cb_func: ListCallback,
     ) -> Result<()> {
         let (disks, _) = self.get_online_disks_with_healing(false).await;
         if disks.is_empty() {
@@ -1260,7 +1270,7 @@ impl SetDisks {
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
                     let resolver = resolver.clone();
                     if let Ok(Some(entry)) = entries.resolve(resolver) {
-                        func(entry)
+                        cb_func(entry)
                     } else {
                         Box::pin(async {})
                     }
