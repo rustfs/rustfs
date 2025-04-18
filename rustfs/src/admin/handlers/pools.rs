@@ -14,6 +14,7 @@ pub struct ListPools {}
 #[async_trait::async_trait]
 impl Operation for ListPools {
     // GET <endpoint>/<admin-API>/pools/list
+    #[tracing::instrument(skip_all)]
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ListPools");
 
@@ -60,6 +61,7 @@ pub struct StatusPool {}
 #[async_trait::async_trait]
 impl Operation for StatusPool {
     // GET <endpoint>/<admin-API>/pools/status?pool=http://server{1...4}/disk{1...4}
+    #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StatusPool");
 
@@ -122,6 +124,7 @@ pub struct StartDecommission {}
 #[async_trait::async_trait]
 impl Operation for StartDecommission {
     // POST <endpoint>/<admin-API>/pools/decommission?pool=http://server{1...4}/disk{1...4}
+    #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle StartDecommission");
 
@@ -204,6 +207,7 @@ pub struct CancelDecommission {}
 #[async_trait::async_trait]
 impl Operation for CancelDecommission {
     // POST <endpoint>/<admin-API>/pools/cancel?pool=http://server{1...4}/disk{1...4}
+    #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle CancelDecommission");
 

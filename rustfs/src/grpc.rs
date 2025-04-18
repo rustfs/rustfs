@@ -2374,6 +2374,7 @@ impl Node for NodeService {
         }))
     }
 
+    #[tracing::instrument(skip_all)]
     async fn load_rebalance_meta(
         &self,
         request: Request<LoadRebalanceMetaRequest>,

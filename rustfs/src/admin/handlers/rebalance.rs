@@ -63,6 +63,7 @@ pub struct RebalanceStart {}
 
 #[async_trait::async_trait]
 impl Operation for RebalanceStart {
+    #[tracing::instrument(skip_all)]
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle RebalanceStart");
 
@@ -118,6 +119,7 @@ pub struct RebalanceStatus {}
 
 #[async_trait::async_trait]
 impl Operation for RebalanceStatus {
+    #[tracing::instrument(skip_all)]
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle RebalanceStatus");
 
@@ -213,6 +215,7 @@ pub struct RebalanceStop {}
 
 #[async_trait::async_trait]
 impl Operation for RebalanceStop {
+    #[tracing::instrument(skip_all)]
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle RebalanceStop");
 
