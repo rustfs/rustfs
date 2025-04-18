@@ -59,6 +59,10 @@ use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, info_span, warn};
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
 
@@ -324,6 +328,10 @@ async fn run(opt: config::Opt) -> Result<()> {
                     break;
                 }
             };
+
+            if let Err(err) = socket.set_nodelay(true) {
+                warn!(?err, "Failed to set TCP_NODELAY");
+            }
 
             if has_tls_certs {
                 debug!("TLS certificates found, starting with SIGINT");
