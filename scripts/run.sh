@@ -28,9 +28,9 @@ fi
 
 export RUSTFS_VOLUMES="./target/volume/test{0...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"
-export RUSTFS_ADDRESS="0.0.0.0:9000"
+export RUSTFS_ADDRESS="[::]:9000"
 export RUSTFS_CONSOLE_ENABLE=true
-export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9002"
+export RUSTFS_CONSOLE_ADDRESS="[::]:9002"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS 证书目录
 # export RUSTFS_TLS_PATH="./deploy/certs"
