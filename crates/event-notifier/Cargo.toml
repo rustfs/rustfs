@@ -6,16 +6,36 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = ["webhook"]
+webhook = ["dep:reqwest"]
+kafka = ["rdkafka"]
+mqtt = ["rumqttc"]
+http-producer = ["dep:axum"]
+
 [dependencies]
 async-trait = { workspace = true }
-parking_lot = { workspace = true }
-reqwest = { workspace = true }
+axum = { workspace = true, optional = true }
+chrono = { workspace = true, features = ["serde"] }
+dotenv = { workspace = true }
+figment = { workspace = true, features = ["toml", "yaml", "env"] }
+rdkafka = { workspace = true, features = ["tokio"], optional = true }
+reqwest = { workspace = true, optional = true }
+rumqttc = { workspace = true, optional = true }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-thiserror = { workspace = true }
-wildmatch = { workspace = true }
 serde_json = { workspace = true }
+serde_with = { workspace = true }
+smallvec = { workspace = true, features = ["serde"] }
+strum = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "net", "macros", "signal", "rt-multi-thread"] }
+tokio-util = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

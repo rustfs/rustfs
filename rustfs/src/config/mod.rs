@@ -103,6 +103,10 @@ pub struct Opt {
 
     #[arg(long, env = "RUSTFS_LICENSE")]
     pub license: Option<String>,
+
+    /// event notifier config file
+    #[arg(long, env = "RUSTFS_EVENT_CONFIG")]
+    pub event_config: Option<String>,
 }
 
 // lazy_static::lazy_static! {

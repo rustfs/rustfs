@@ -1,0 +1,28 @@
+# config.toml
+store_path = "/var/log/event-notification"
+channel_capacity = 5000
+
+[[adapters]]
+type = "Webhook"
+endpoint = "https://api.example.com/webhook"
+auth_token = "your-auth-token"
+max_retries = 3
+timeout = 5000
+
+[[adapters]]
+type = "Kafka"
+brokers = "localhost:9092"
+topic = "notifications"
+max_retries = 3
+timeout = 5000
+
+[[adapters]]
+type = "Mqtt"
+broker = "mqtt.example.com"
+port = 1883
+client_id = "event-notifier"
+topic = "events"
+max_retries = 3
+
+[http]
+port = 8080
