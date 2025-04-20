@@ -51,8 +51,10 @@ datafusion = "46.0.0"
 derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
+dotenv = "0.15.0"
 ecstore = { path = "./ecstore" }
-flatbuffers = "24.12.23"
+figment = { version = "0.10.19", features = ["toml", "yaml", "env"] }
+flatbuffers = "25.2.10"
 futures = "0.3.31"
 futures-util = "0.3.31"
 common = { path = "./common/common" }
@@ -71,7 +73,7 @@ jsonwebtoken = "9.3.1"
 keyring = { version = "3.6.2", features = ["apple-native", "windows-native", "sync-secret-service"] }
 lock = { path = "./common/lock" }
 lazy_static = "1.5.0"
-libsystemd = { version = "0.7" }
+libsystemd = { version = "0.7.1" }
 local-ip-address = "0.6.3"
 matchit = "0.8.4"
 md-5 = "0.10.6"
@@ -79,13 +81,13 @@ mime = "0.3.17"
 netif = "0.1.6"
 opentelemetry = { version = "0.29.1" }
 opentelemetry-appender-tracing = { version = "0.29.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
-opentelemetry_sdk = { version = "0.29" }
+opentelemetry_sdk = { version = "0.29.0" }
 opentelemetry-stdout = { version = "0.29.0" }
-opentelemetry-otlp = { version = "0.29" }
+opentelemetry-otlp = { version = "0.29.0" }
 opentelemetry-prometheus = { version = "0.29.1" }
 opentelemetry-semantic-conventions = { version = "0.29.0", features = ["semconv_experimental"] }
 parking_lot = "0.12.3"
-pin-project-lite = "0.2"
+pin-project-lite = "0.2.16"
 prometheus = "0.14.0"
 # pin-utils = "0.1.0"
 prost = "0.13.5"
@@ -94,11 +96,12 @@ prost-types = "0.13.5"
 protobuf = "3.7"
 protos = { path = "./common/protos" }
 rand = "0.8.5"
-rdkafka = { version = "0.37", features = ["tokio"] }
+rdkafka = { version = "0.37.0", features = ["tokio"] }
 reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration", "stream", "json", "blocking"] }
 rfd = { version = "0.15.3", default-features = false, features = ["xdg-portal", "tokio"] }
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
+rumqttc = { version = "0.24" }
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
 rust-embed = "8.7.0"
@@ -107,10 +110,13 @@ rustls-pki-types = "1.11.0"
 rustls-pemfile = "2.2.0"
 s3s = { git = "https://github.com/Nugine/s3s.git", rev = "4733cdfb27b2713e832967232cbff413bb768c10" }
 s3s-policy = { git = "https://github.com/Nugine/s3s.git", rev = "4733cdfb27b2713e832967232cbff413bb768c10" }
-shadow-rs = { version = "0.38.1", default-features = false }
+shadow-rs = { version = "1.1.1", default-features = false, features = ["metadata"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 serde_urlencoded = "0.7.1"
+serde_with = "3.12.0"
+smallvec = { version = "1.15.0", features = ["serde"] }
+strum = { version = "0.27.1", features = ["derive"] }
 sha2 = "0.10.8"
 snafu = "0.8.5"
 tempfile = "3.19.1"
@@ -126,7 +132,7 @@ time = { version = "0.3.41", features = [
 tokio = { version = "1.44.2", features = ["fs", "rt-multi-thread"] }
 tonic = { version = "0.13.0", features = ["gzip"] }
 tonic-build = "0.13.0"
-tokio-rustls = { version = "0.26", default-features = false }
+tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.14", features = ["io", "compat"] }
 tower = { version = "0.5.2", features = ["timeout"] }
@@ -136,7 +142,7 @@ tracing-core = "0.1.33"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
 tracing-appender = "0.2.3"
-tracing-opentelemetry = "0.30"
+tracing-opentelemetry = "0.30.0"
 transform-stream = "0.3.1"
 url = "2.5.4"
 uuid = { version = "1.16.0", features = [
@@ -144,7 +150,6 @@ uuid = { version = "1.16.0", features = [
     "fast-rng",
     "macro-diagnostics",
 ] }
-wildmatch = "2.4.0"
 workers = { path = "./common/workers" }
 
 [profile.wasm-dev]

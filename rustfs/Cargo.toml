@@ -60,7 +60,7 @@ s3s.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded = { workspace = true }
-shadow-rs.workspace = true
+shadow-rs = { workspace = true, features = ["build"] }
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 tokio-util.workspace = true
@@ -103,5 +103,5 @@ hyper-util = { workspace = true, features = [
 ] }
 transform-stream = { workspace = true }
 netif = "0.1.6"
-shadow-rs.workspace = true
+shadow-rs = { workspace = true, features = ["build"] }
 # pin-utils = "0.1.0"
