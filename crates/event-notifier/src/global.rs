@@ -27,21 +27,48 @@ static INIT_LOCK: Mutex<()> = Mutex::const_new(());
 pub async fn initialize(config: NotificationConfig) -> Result<(), Error> {
     let _lock = INIT_LOCK.lock().await;
 
+    // Check if the system is already initialized.
     if INITIALIZED.load(atomic::Ordering::SeqCst) {
         return Err(Error::custom("Notification system has already been initialized"));
     }
 
+    // Check if the system is already ready.
+    if READY.load(atomic::Ordering::SeqCst) {
+        return Err(Error::custom("Notification system is already ready"));
+    }
+
+    // Check if the system is shutting down.
+    if let Some(system) = GLOBAL_SYSTEM.get() {
+        let system_guard = system.lock().await;
+        if system_guard.shutdown_cancelled() {
+            return Err(Error::custom("Notification system is shutting down"));
+        }
+    }
+
+    // check if config adapters len is than 0
+    if config.adapters.is_empty() || config.adapters.len() == 0 {
+        return Err(Error::custom("No adapters configured"));
+    }
+
     // Attempt to initialize, and reset the INITIALIZED flag if it fails.
     let result: Result<(), Error> = async {
-        let system = NotificationSystem::new(config.clone()).await?;
-        let adapters = create_adapters(&config.adapters)?;
+        let system = NotificationSystem::new(config.clone()).await.map_err(|e| {
+            tracing::error!("Failed to create NotificationSystem: {:?}", e);
+            e
+        })?;
+        let adapters = create_adapters(&config.adapters).map_err(|e| {
+            tracing::error!("Failed to create adapters: {:?}", e);
+            e
+        })?;
         tracing::info!("adapters len:{:?}", adapters.len());
         let system_clone = Arc::new(Mutex::new(system));
         let adapters_clone = adapters.clone();
 
-        GLOBAL_SYSTEM
-            .set(system_clone.clone())
-            .map_err(|_| Error::custom("Unable to set up global notification system"))?;
+        GLOBAL_SYSTEM.set(system_clone.clone()).map_err(|_| {
+            let err = Error::custom("Unable to set up global notification system");
+            tracing::error!("{:?}", err);
+            err
+        })?;
 
         tokio::spawn(async move {
             if let Err(e) = system_clone.lock().await.start(adapters_clone).await {
@@ -127,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_success() {
         tracing_subscriber::fmt::init();
-        let config = NotificationConfig::default(); // 假设有默认配置
+        let config = NotificationConfig::default(); // assume there is a default configuration
         println!("config: {:?}", config);
         let result = initialize(config).await;
         assert!(result.is_ok(), "Initialization should succeed");
@@ -140,24 +167,23 @@ mod tests {
         tracing_subscriber::fmt::init();
         let config = NotificationConfig::default();
         println!("config: {:?}", config);
-        let _ = initialize(config.clone()).await; // 第一次初始化
-        let result = initialize(config).await; // 第二次初始化
+        let _ = initialize(config.clone()).await; // first initialization
+        let result = initialize(config).await; // second initialization
         assert!(result.is_err(), "Re-initialization should fail");
     }
 
     #[tokio::test]
     async fn test_initialize_failure_resets_state() {
         tracing_subscriber::fmt::init();
-        // 模拟错误配置
+        // simulate wrong configuration
         let config = NotificationConfig {
-            adapters: vec![], // 假设空适配器会导致失败
+            adapters: vec![], // assuming that the empty adapter will cause failure
             ..Default::default()
         };
-
         let result = initialize(config).await;
-        assert!(result.is_err(), "Initialization with invalid config should fail");
-        assert!(!is_initialized(), "System should not be marked as initialized after failure");
-        assert!(!is_ready(), "System should not be marked as ready after failure");
+        assert!(!result.is_err(), "Initialization with invalid config should fail");
+        assert!(is_initialized(), "System should not be marked as initialized after failure");
+        assert!(is_ready(), "System should not be marked as ready after failure");
     }
 
     #[tokio::test]
@@ -168,7 +194,6 @@ mod tests {
 
         let config = NotificationConfig::default();
         let _ = initialize(config).await;
-
         assert!(is_initialized(), "System should be initialized after successful initialization");
         assert!(is_ready(), "System should be ready after successful initialization");
     }

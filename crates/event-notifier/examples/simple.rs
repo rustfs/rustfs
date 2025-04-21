@@ -11,10 +11,9 @@ use tokio::signal;
 async fn main() -> Result<(), Box<dyn error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let mut config = NotificationConfig {
+    let config = NotificationConfig {
         store_path: "./events".to_string(),
         channel_capacity: 100,
-        timeout: 50,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
             endpoint: "http://localhost:8080/webhook".to_string(),
             auth_token: Some("secret-token".to_string()),
@@ -22,9 +21,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
             max_retries: 3,
             timeout: 10,
         })],
-        http: Default::default(),
     };
-    config.http.port = 8080;
 
     // loading configuration from specific env files
     let _config = NotificationConfig::from_env_file(".env.example")?;
