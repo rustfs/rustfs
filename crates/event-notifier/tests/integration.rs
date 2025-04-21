@@ -70,7 +70,6 @@ async fn test_notification_system() {
     let config = rustfs_event_notifier::NotificationConfig {
         store_path: "./test_events".to_string(),
         channel_capacity: 100,
-        timeout: 50,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
             endpoint: "http://localhost:8080/webhook".to_string(),
             auth_token: None,
@@ -78,7 +77,6 @@ async fn test_notification_system() {
             max_retries: 1,
             timeout: 5,
         })],
-        http: Default::default(),
     };
     let system = Arc::new(tokio::sync::Mutex::new(NotificationSystem::new(config.clone()).await.unwrap()));
     let adapters: Vec<Arc<dyn ChannelAdapter>> = vec![Arc::new(WebhookAdapter::new(WebhookConfig {

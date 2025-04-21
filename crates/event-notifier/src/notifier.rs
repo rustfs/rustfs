@@ -66,4 +66,9 @@ impl NotificationSystem {
         tracing::info!("Shutting down the notification system");
         self.shutdown.cancel();
     }
+
+    /// shutdown state  
+    pub fn shutdown_cancelled(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
 }
