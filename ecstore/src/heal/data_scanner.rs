@@ -344,7 +344,6 @@ impl CurrentScannerCycle {
         Ok(result)
     }
 
-    #[tracing::instrument]
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let mut cur = Cursor::new(buf);
 
