@@ -101,8 +101,8 @@ mod tests {
     };
     use datafusion::{arrow::util::pretty, assert_batches_eq};
     use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
-        SelectObjectContentRequest,
+        CSVInput, CSVOutput, ExpressionType, FieldDelimiter, FileHeaderInfo, InputSerialization, OutputSerialization,
+        RecordDelimiter, SelectObjectContentInput, SelectObjectContentRequest,
     };
 
     use crate::instance::make_rustfsms;
@@ -122,7 +122,10 @@ mod tests {
                 expression: sql.to_string(),
                 expression_type: ExpressionType::from_static("SQL"),
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput::default()),
+                    csv: Some(CSVInput {
+                        file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
@@ -164,7 +167,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_func_sql() {
-        let sql = "select count(s.id) from S3Object as s";
+        let sql = "SELECT s._1 FROM S3Object s";
         let input = SelectObjectContentInput {
             bucket: "dandan".to_string(),
             expected_bucket_owner: None,
@@ -176,7 +179,12 @@ mod tests {
                 expression: sql.to_string(),
                 expression_type: ExpressionType::from_static("SQL"),
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput::default()),
+                    csv: Some(CSVInput {
+                        file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::IGNORE)),
+                        field_delimiter: Some(FieldDelimiter::from("╦")),
+                        record_delimiter: Some(RecordDelimiter::from("\n")),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {

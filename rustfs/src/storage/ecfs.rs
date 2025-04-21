@@ -1895,10 +1895,13 @@ impl S3 for FS {
 
         let db = make_rustfsms(input.clone(), false).await.map_err(|e| {
             error!("make db failed, {}", e.to_string());
-            s3_error!(InternalError)
+            s3_error!(InternalError, "{}", e.to_string())
         })?;
         let query = Query::new(Context { input: input.clone() }, input.request.expression);
-        let result = db.execute(&query).await.map_err(|_| s3_error!(InternalError))?;
+        let result = db
+            .execute(&query)
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
 
         let results = result.result().chunk_result().await.unwrap().to_vec();
 
