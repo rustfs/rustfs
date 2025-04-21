@@ -695,7 +695,7 @@ impl ECStore {
             let at = a.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
             let bt = b.object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
 
-            at.cmp(&bt)
+            bt.cmp(&at)
         });
 
         let mut def_pool = PoolObjInfo::default();
@@ -911,29 +911,30 @@ impl ECStore {
 
         // TODO: test order
         idx_res.sort_by(|a, b| {
-            if let Some(obj1) = &a.res {
-                if let Some(obj2) = &b.res {
-                    let cmp = obj1.mod_time.cmp(&obj2.mod_time);
-                    match cmp {
-                        // eq use lowest
-                        Ordering::Equal => {
-                            if a.idx < b.idx {
-                                Ordering::Greater
-                            } else {
-                                Ordering::Less
-                            }
-                        }
-                        _ => cmp,
-                    }
-                } else {
-                    Ordering::Greater
-                }
+            let a_mod = if let Some(o1) = &a.res {
+                o1.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
             } else {
-                Ordering::Less
+                OffsetDateTime::UNIX_EPOCH
+            };
+
+            let b_mod = if let Some(o2) = &b.res {
+                o2.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
+            } else {
+                OffsetDateTime::UNIX_EPOCH
+            };
+
+            if a_mod == b_mod {
+                if a.idx < b.idx {
+                    return Ordering::Greater;
+                } else {
+                    return Ordering::Less;
+                }
             }
+
+            b_mod.cmp(&a_mod)
         });
 
-        for res in idx_res {
+        for res in idx_res.into_iter() {
             if let Some(obj) = res.res {
                 return Ok((obj, res.idx));
             }
