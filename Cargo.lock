@@ -3046,10 +3046,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "dotenv"
-version = "0.15.0"
+name = "dotenvy"
+version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dpi"
@@ -7372,8 +7372,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
- "chrono",
- "dotenv",
+ "dotenvy",
  "figment",
  "rdkafka",
  "reqwest",
@@ -7389,7 +7388,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "wildmatch",
 ]
 
 [[package]]
@@ -9638,12 +9636,6 @@ dependencies = [
  "once_cell",
  "rustix 0.38.44",
 ]
-
-[[package]]
-name = "wildmatch"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ce1ab1f8c62655ebe1350f589c61e505cf94d385bc6a12899442d9081e71fd"
 
 [[package]]
 name = "winapi"

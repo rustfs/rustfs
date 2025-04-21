@@ -16,8 +16,7 @@ http-producer = ["dep:axum"]
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true, optional = true }
-chrono = { workspace = true, features = ["serde"] }
-dotenv = { workspace = true }
+dotenvy = { workspace = true }
 figment = { workspace = true, features = ["toml", "yaml", "env"] }
 rdkafka = { workspace = true, features = ["tokio"], optional = true }
 reqwest = { workspace = true, optional = true }

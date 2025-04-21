@@ -1,19 +1,21 @@
 use crate::Error;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use smallvec::{smallvec, SmallVec};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use strum::{Display, EnumString};
 use uuid::Uuid;
 
+/// A struct representing the identity of the user
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Identity {
     #[serde(rename = "principalId")]
     pub principal_id: String,
 }
 
+/// A struct representing the bucket information
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Bucket {
     pub name: String,
@@ -22,6 +24,7 @@ pub struct Bucket {
     pub arn: String,
 }
 
+/// A struct representing the object information
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Object {
     pub key: String,
@@ -38,6 +41,7 @@ pub struct Object {
     pub sequencer: String,
 }
 
+/// A struct representing the metadata of the event
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Metadata {
     #[serde(rename = "s3SchemaVersion")]
@@ -48,6 +52,7 @@ pub struct Metadata {
     pub object: Object,
 }
 
+/// A struct representing the source of the event
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Source {
     pub host: String,
@@ -82,7 +87,7 @@ impl EventBuilder {
             event_version: Some(Cow::Borrowed("2.0").to_string()),
             event_source: Some(Cow::Borrowed("aws:s3").to_string()),
             aws_region: Some("us-east-1".to_string()),
-            event_time: Some(Utc::now().to_rfc3339()),
+            event_time: Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string()),
             event_name: None,
             user_identity: Some(Identity {
                 principal_id: "anonymous".to_string(),
@@ -214,7 +219,7 @@ impl EventBuilder {
             s3,
             source,
             id: Uuid::new_v4(),
-            timestamp: Utc::now(),
+            timestamp: SystemTime::now(),
             channels,
         })
     }
@@ -241,7 +246,7 @@ pub struct Event {
     pub s3: Metadata,
     pub source: Source,
     pub id: Uuid,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: SystemTime,
     pub channels: SmallVec<[String; 2]>,
 }
 
