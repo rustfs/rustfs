@@ -10,9 +10,9 @@ chrono.workspace = true
 datafusion = { workspace = true }
 ecstore.workspace = true
 futures = { workspace = true }
-futures-core = "0.3.31"
+futures-core = { workspace = true }
 http.workspace = true
-object_store = "0.11.2"
+object_store = { workspace = true }
 s3s.workspace = true
 snafu = { workspace = true, features = ["backtrace"] }
 tokio.workspace = true

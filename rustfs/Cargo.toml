@@ -1,6 +1,6 @@
 [package]
 name = "rustfs"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,9 +15,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-madmin.workspace = true
-api = { path = "../s3select/api" }
-appauth = { version = "0.0.1", path = "../appauth" }
+madmin = { workspace = true }
+api = { workspace = true }
+appauth = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 axum.workspace = true
@@ -27,7 +27,7 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono = { workspace = true }
 clap.workspace = true
-crypto = { path = "../crypto" }
+crypto = { workspace = true }
 datafusion = { workspace = true }
 common.workspace = true
 const-str = { version = "0.6.1", features = ["std", "proc"] }
@@ -40,15 +40,15 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
-iam = { path = "../iam" }
+iam = { workspace = true }
 lock.workspace = true
 local-ip-address = { workspace = true }
 matchit = { workspace = true }
 mime.workspace = true
-mime_guess = "2.0.5"
+mime_guess = { workspace = true }
 pin-project-lite.workspace = true
 protos.workspace = true
-query = { path = "../s3select/query" }
+query = { workspace = true }
 rmp-serde.workspace = true
 rustfs-event-notifier = { workspace = true }
 rustfs-obs = { workspace = true }
@@ -60,7 +60,7 @@ s3s.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded = { workspace = true }
-shadow-rs = { workspace = true, features = ["build"] }
+shadow-rs = { workspace = true, features = ["build", "metadata"] }
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 tokio-util.workspace = true
@@ -93,7 +93,7 @@ bytes.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 # uuid = { version = "1.8.0", features = ["v4", "fast-rng", "serde"] }
-ecstore = { path = "../ecstore" }
+ecstore = { workspace = true }
 s3s.workspace = true
 clap = { workspace = true }
 hyper-util = { workspace = true, features = [

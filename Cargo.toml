@@ -12,10 +12,10 @@ members = [
     "crypto", # Cryptography and security features
     "cli/rustfs-gui", # Graphical user interface client
     "crates/obs", # Observability utilities
-    "s3select/api",
-    "s3select/query",
-    "appauth",
-    "crates/event-notifier",
+    "crates/event-notifier", # Event notification system
+    "s3select/api", # S3 Select API interface
+    "s3select/query", # S3 Select query engine
+    "appauth", # Application authentication and authorization
 ]
 resolver = "2"
 
@@ -33,7 +33,21 @@ unsafe_code = "deny"
 all = "warn"
 
 [workspace.dependencies]
-madmin = { path = "./madmin" }
+api = { path = "./s3select/api", version = "0.0.1" }
+appauth = { path = "./appauth", version = "0.0.1" }
+common = { path = "./common/common", version = "0.0.1" }
+crypto = { path = "./crypto", version = "0.0.1" }
+ecstore = { path = "./ecstore", version = "0.0.1" }
+iam = { path = "./iam", version = "0.0.1" }
+lock = { path = "./common/lock", version = "0.0.1" }
+madmin = { path = "./madmin", version = "0.0.1" }
+policy = { path = "./policy", version = "0.0.1" }
+protos = { path = "./common/protos", version = "0.0.1" }
+query = { path = "./s3select/query", version = "0.0.1" }
+rustfs = { path = "./rustfs", version = "0.0.1" }
+rustfs-obs = { path = "crates/obs", version = "0.0.1" }
+rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
+workers = { path = "./common/workers", version = "0.0.1" }
 atoi = "2.0.0"
 async-recursion = "1.1.1"
 async-trait = "0.1.88"
@@ -43,22 +57,20 @@ axum-extra = "0.10.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 backon = "1.5.0"
 bytes = "1.10.1"
-bytesize = "1.3.3"
+bytesize = "2.0.1"
 chrono = { version = "0.4.40", features = ["serde"] }
-clap = { version = "4.5.35", features = ["derive", "env"] }
+clap = { version = "4.5.37", features = ["derive", "env"] }
 config = "0.15.11"
-datafusion = "46.0.0"
+datafusion = "46.0.1"
 derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
 dotenvy = "0.15.7"
-ecstore = { path = "./ecstore" }
 figment = { version = "0.10.19", features = ["toml", "yaml", "env"] }
 flatbuffers = "25.2.10"
 futures = "0.3.31"
+futures-core = "0.3.31"
 futures-util = "0.3.31"
-common = { path = "./common/common" }
-policy = { path = "./policy" }
 hex = "0.4.3"
 hyper = "1.6.0"
 hyper-util = { version = "0.1.11", features = [
@@ -71,14 +83,15 @@ http-body = "1.0.1"
 humantime = "2.2.0"
 jsonwebtoken = "9.3.1"
 keyring = { version = "3.6.2", features = ["apple-native", "windows-native", "sync-secret-service"] }
-lock = { path = "./common/lock" }
 lazy_static = "1.5.0"
 libsystemd = { version = "0.7.1" }
 local-ip-address = "0.6.3"
 matchit = "0.8.4"
 md-5 = "0.10.6"
 mime = "0.3.17"
+mime_guess = "2.0.5"
 netif = "0.1.6"
+object_store = "0.11.2"
 opentelemetry = { version = "0.29.1" }
 opentelemetry-appender-tracing = { version = "0.29.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
 opentelemetry_sdk = { version = "0.29.0" }
@@ -94,7 +107,6 @@ prost = "0.13.5"
 prost-build = "0.13.5"
 prost-types = "0.13.5"
 protobuf = "3.7"
-protos = { path = "./common/protos" }
 rand = "0.8.5"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
 reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration", "stream", "json", "blocking"] }
@@ -102,15 +114,13 @@ rfd = { version = "0.15.3", default-features = false, features = ["xdg-portal", 
 rmp = "0.8.14"
 rmp-serde = "1.3.0"
 rumqttc = { version = "0.24" }
-rustfs-obs = { path = "crates/obs", version = "0.0.1" }
-rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
 rust-embed = "8.7.0"
 rustls = { version = "0.23.26" }
 rustls-pki-types = "1.11.0"
 rustls-pemfile = "2.2.0"
 s3s = { git = "https://github.com/Nugine/s3s.git", rev = "4733cdfb27b2713e832967232cbff413bb768c10" }
 s3s-policy = { git = "https://github.com/Nugine/s3s.git", rev = "4733cdfb27b2713e832967232cbff413bb768c10" }
-shadow-rs = { version = "1.1.1", default-features = false, features = ["metadata"] }
+shadow-rs = { version = "1.1.1", default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 serde_urlencoded = "0.7.1"
@@ -150,7 +160,7 @@ uuid = { version = "1.16.0", features = [
     "fast-rng",
     "macro-diagnostics",
 ] }
-workers = { path = "./common/workers" }
+
 
 [profile.wasm-dev]
 inherits = "dev"
