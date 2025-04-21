@@ -1,10 +1,3 @@
-#[cfg(feature = "http-producer")]
-pub use crate::producer::http::HttpProducer;
-#[cfg(feature = "http-producer")]
-pub use crate::producer::EventProducer;
-
-#[cfg(feature = "http-producer")]
-pub use crate::config::HttpProducerConfig;
 use crate::{event_bus, ChannelAdapter, Error, Event, EventStore, NotificationConfig};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -19,8 +12,6 @@ pub struct NotificationSystem {
     rx: Option<mpsc::Receiver<Event>>,
     store: Arc<EventStore>,
     shutdown: CancellationToken,
-    #[cfg(feature = "http-producer")]
-    http_config: HttpProducerConfig,
 }
 
 impl NotificationSystem {
@@ -43,8 +34,6 @@ impl NotificationSystem {
             rx: Some(rx),
             store,
             shutdown,
-            #[cfg(feature = "http-producer")]
-            http_config: config.http,
         })
     }
 
@@ -55,28 +44,13 @@ impl NotificationSystem {
 
         let shutdown_clone = self.shutdown.clone();
         let store_clone = self.store.clone();
-        let bus_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = event_bus(rx, adapters, store_clone, shutdown_clone).await {
                 tracing::error!("Event bus failed: {}", e);
             }
         });
 
-        #[cfg(feature = "http-producer")]
-        {
-            let producer = crate::producer::http::HttpProducer::new(self.tx.clone(), self.http_config.port);
-            producer.start().await?;
-        }
-
-        tokio::select! {
-            result = bus_handle => {
-                result.map_err(Error::JoinError)?;
-                Ok(())
-            },
-            _ = self.shutdown.cancelled() => {
-                tracing::info!("System shutdown triggered");
-                Ok(())
-            }
-        }
+        Ok(())
     }
 
     /// Sends an event to the notification system.
@@ -89,13 +63,7 @@ impl NotificationSystem {
     /// Shuts down the notification system.
     /// This method is used to cancel the event bus and producer tasks.
     pub fn shutdown(&self) {
+        tracing::info!("Shutting down the notification system");
         self.shutdown.cancel();
-    }
-
-    /// Sets the HTTP port for the notification system.
-    /// This method is used to change the port for the HTTP producer.
-    #[cfg(feature = "http-producer")]
-    pub fn set_http_port(&mut self, port: u16) {
-        self.http_config.port = port;
     }
 }
