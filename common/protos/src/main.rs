@@ -1,13 +1,7 @@
-use std::{
-    cmp, env, fs,
-    io::Write,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{cmp, env, fs, io::Write, path::Path, process::Command};
 
 type AnyError = Box<dyn std::error::Error>;
 
-const ENV_OUT_DIR: &str = "OUT_DIR";
 const VERSION_PROTOBUF: Version = Version(30, 2, 0); // 30.2.0
 const VERSION_FLATBUFFERS: Version = Version(24, 3, 25); // 24.3.25
 /// Build protos if the major version of `flatc` or `protoc` is greater
@@ -37,16 +31,16 @@ fn main() -> Result<(), AnyError> {
     }
 
     // path of proto file
-    let project_root_dir = env::current_dir()?;
-    let proto_dir = project_root_dir.join("src");
+    let project_root_dir = env::current_dir()?.join("common/protos/src");
+    let proto_dir = project_root_dir.clone();
     let proto_files = &["node.proto"];
-    let proto_out_dir = project_root_dir.join("src").join("generated").join("proto_gen");
-    let flatbuffer_out_dir = project_root_dir.join("src").join("generated").join("flatbuffers_generated");
-    let descriptor_set_path = PathBuf::from(env::var(ENV_OUT_DIR).unwrap()).join("proto-descriptor.bin");
+    let proto_out_dir = project_root_dir.join("generated").join("proto_gen");
+    let flatbuffer_out_dir = project_root_dir.join("generated").join("flatbuffers_generated");
+    // let descriptor_set_path = PathBuf::from(env::var(ENV_OUT_DIR).unwrap()).join("proto-descriptor.bin");
 
     tonic_build::configure()
         .out_dir(proto_out_dir)
-        .file_descriptor_set_path(descriptor_set_path)
+        // .file_descriptor_set_path(descriptor_set_path)
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_well_known_types(true)
         .emit_rerun_if_changed(false)
@@ -54,17 +48,13 @@ fn main() -> Result<(), AnyError> {
         .map_err(|e| format!("Failed to generate protobuf file: {e}."))?;
 
     // protos/gen/mod.rs
-    let generated_mod_rs_path = project_root_dir
-        .join("src")
-        .join("generated")
-        .join("proto_gen")
-        .join("mod.rs");
+    let generated_mod_rs_path = project_root_dir.join("generated").join("proto_gen").join("mod.rs");
 
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
     writeln!(&mut generated_mod_rs, "pub mod node_service;")?;
     generated_mod_rs.flush()?;
 
-    let generated_mod_rs_path = project_root_dir.join("src").join("generated").join("mod.rs");
+    let generated_mod_rs_path = project_root_dir.join("generated").join("mod.rs");
 
     let mut generated_mod_rs = fs::File::create(generated_mod_rs_path)?;
     writeln!(&mut generated_mod_rs, "#![allow(unused_imports)]")?;
@@ -80,7 +70,6 @@ fn main() -> Result<(), AnyError> {
         Err(_) => "flatc".to_string(),
     };
 
-    // build src/protos/*.fbs files to src/protos/gen/
     compile_flatbuffers_models(
         &mut generated_mod_rs,
         &flatc_path,
@@ -88,6 +77,8 @@ fn main() -> Result<(), AnyError> {
         flatbuffer_out_dir.clone(),
         vec!["models"],
     )?;
+
+    fmt();
     Ok(())
 }
 
@@ -259,4 +250,21 @@ fn protobuf_compiler_version() -> Result<Version, String> {
             Err(format!("Failed to get protoc version: {output}"))
         }
     })
+}
+
+fn fmt() {
+    let output = Command::new("cargo").arg("fmt").arg("-p").arg("protos").status();
+
+    match output {
+        Ok(status) => {
+            if status.success() {
+                println!("cargo fmt executed successfully.");
+            } else {
+                eprintln!("cargo fmt failed with status: {:?}", status);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to execute cargo fmt: {}", e);
+        }
+    }
 }

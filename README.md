@@ -12,6 +12,10 @@ https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.flatc.bin
 
 https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip
 
+generate protobuf code:
+
+```cargo run --bin gproto```
+
 Or use Docker:
 
 ```yml
