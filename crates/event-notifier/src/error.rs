@@ -30,7 +30,7 @@ pub enum Error {
     MissingField(&'static str),
     #[error("field verification failed:{0}")]
     ValidationError(&'static str),
-    #[error("{0}")]
+    #[error("Custom error: {0}")]
     Custom(String),
     #[error("Configuration error: {0}")]
     ConfigError(String),

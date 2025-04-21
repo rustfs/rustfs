@@ -11,11 +11,9 @@ default = ["webhook"]
 webhook = ["dep:reqwest"]
 kafka = ["rdkafka"]
 mqtt = ["rumqttc"]
-http-producer = ["dep:axum"]
 
 [dependencies]
 async-trait = { workspace = true }
-axum = { workspace = true, optional = true }
 dotenvy = { workspace = true }
 figment = { workspace = true, features = ["toml", "yaml", "env"] }
 rdkafka = { workspace = true, features = ["tokio"], optional = true }

@@ -63,25 +63,6 @@ pub enum AdapterConfig {
     Mqtt(MqttConfig),
 }
 
-/// http producer configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpProducerConfig {
-    #[serde(default = "default_http_port")]
-    pub port: u16,
-}
-
-impl Default for HttpProducerConfig {
-    fn default() -> Self {
-        Self {
-            port: default_http_port(),
-        }
-    }
-}
-
-fn default_http_port() -> u16 {
-    3000
-}
-
 /// Configuration for the notification system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationConfig {
@@ -89,11 +70,7 @@ pub struct NotificationConfig {
     pub store_path: String,
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
-    #[serde(default = "default_timeout")]
-    pub timeout: u64,
     pub adapters: Vec<AdapterConfig>,
-    #[serde(default)]
-    pub http: HttpProducerConfig,
 }
 
 impl Default for NotificationConfig {
@@ -101,9 +78,7 @@ impl Default for NotificationConfig {
         Self {
             store_path: default_store_path(),
             channel_capacity: default_channel_capacity(),
-            timeout: default_timeout(),
             adapters: Vec::new(),
-            http: HttpProducerConfig::default(),
         }
     }
 }
@@ -156,9 +131,4 @@ fn default_store_path() -> String {
 /// Provides the recommended default channel capacity for high concurrency systems
 fn default_channel_capacity() -> usize {
     10000 // Reasonable default values for high concurrency systems
-}
-
-/// Provides the recommended default timeout for high concurrency systems
-fn default_timeout() -> u64 {
-    50 // Reasonable default values for high concurrency systems
 }
