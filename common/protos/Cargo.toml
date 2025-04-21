@@ -6,6 +6,10 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "gproto"
+path = "src/main.rs"
+
 [dependencies]
 #async-backtrace = { workspace = true, optional = true }
 common.workspace = true
@@ -15,7 +19,5 @@ protobuf = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true }
-
-[build-dependencies]
 prost-build = { workspace = true }
 tonic-build = { workspace = true }
