@@ -20,19 +20,33 @@
                 }
             },
             "env": {
-                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug"
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=debug",
+                "RUSTFS_VOLUMES": "./target/volume/test{0...3}",
+                "RUSTFS_ADDRESS": "[::]:9000",
+                "RUSTFS_CONSOLE_ENABLE": "true",
+                "RUSTFS_CONSOLE_ADDRESS": "[::]:9002",
+                "RUSTFS_SERVER_DOMAINS": "localhost:9000",
+                "RUSTFS_TLS_PATH": "./deploy/certs",
+                "RUSTFS_OBS_CONFIG": "./deploy/config/obs.example.toml",
+                "RUSTFS__OBSERVABILITY__ENDPOINT": "http://localhost:4317",
+                "RUSTFS__OBSERVABILITY__USE_STDOUT": "true",
+                "RUSTFS__OBSERVABILITY__SAMPLE_RATIO": "2.0",
+                "RUSTFS__OBSERVABILITY__METER_INTERVAL": "30",
+                "RUSTFS__OBSERVABILITY__SERVICE_NAME": "rustfs",
+                "RUSTFS__OBSERVABILITY__SERVICE_VERSION": "0.1.0",
+                "RUSTFS__OBSERVABILITY__ENVIRONMENT": "develop",
+                "RUSTFS__OBSERVABILITY__LOGGER_LEVEL": "info",
+                "RUSTFS__SINKS__FILE__ENABLED": "true",
+                "RUSTFS__SINKS__FILE__PATH": "./deploy/logs/rustfs.log",
+                "RUSTFS__SINKS__WEBHOOK__ENABLED": "false",
+                "RUSTFS__SINKS__WEBHOOK__ENDPOINT": "", 
+                "RUSTFS__SINKS__WEBHOOK__AUTH_TOKEN": "",
+                "RUSTFS__SINKS__KAFKA__ENABLED": "false",
+                "RUSTFS__SINKS__KAFKA__BOOTSTRAP_SERVERS": "",
+                "RUSTFS__SINKS__KAFKA__TOPIC": "",
+                "RUSTFS__LOGGER__QUEUE_CAPACITY": "10"
+
             },
-            "args": [
-                "--access-key",
-                "AKEXAMPLERUSTFS",
-                "--secret-key",
-                "SKEXAMPLERUSTFS",
-                "--address",
-                "0.0.0.0:9010",
-                "--domain-name",
-                "127.0.0.1:9010",
-                "./target/volume/test{0...4}"
-            ],
             "cwd": "${workspaceFolder}"
         },
         {
