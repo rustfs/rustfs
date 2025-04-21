@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use datafusion::{
     execution::{context::SessionState, runtime_env::RuntimeEnvBuilder, SessionStateBuilder},
+    parquet::data_type::AsBytes,
     prelude::SessionContext,
 };
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -65,7 +65,19 @@ impl SessionCtxFactory {
             8,Henry,32,IT,6200
             9,Ivy,24,Marketing,4800
             10,Jack,38,Finance,7500";
-            let data_bytes = Bytes::from(data.to_vec());
+            let data_bytes = data.as_bytes();
+            //             let data = r#""year"╦"gender"╦"ethnicity"╦"firstname"╦"count"╦"rank"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"SOPHIA"╦"119"╦"1"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"CHLOE"╦"106"╦"2"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"EMILY"╦"93"╦"3"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"OLIVIA"╦"89"╦"4"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"EMMA"╦"75"╦"5"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"ISABELLA"╦"67"╦"6"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"TIFFANY"╦"54"╦"7"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"ASHLEY"╦"52"╦"8"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"FIONA"╦"48"╦"9"
+            // "2011"╦"FEMALE"╦"ASIAN AND PACIFIC ISLANDER"╦"ANGELA"╦"47"╦"10""#;
+            // let data_bytes = Bytes::from(data);
             let path = Path::from(context.input.key.clone());
             store.put(&path, data_bytes.into()).await.map_err(|e| {
                 error!("put data into memory failed: {}", e.to_string());
