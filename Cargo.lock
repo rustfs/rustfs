@@ -6683,6 +6683,7 @@ dependencies = [
  "datafusion",
  "derive_builder",
  "futures",
+ "lazy_static",
  "parking_lot 0.12.3",
  "s3s",
  "snafu",

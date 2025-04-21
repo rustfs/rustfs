@@ -1,4 +1,5 @@
 use std::{
+    ops::Deref,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -19,8 +20,10 @@ use api::{
 };
 use async_trait::async_trait;
 use datafusion::{
-    arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
-    config::CsvOptions,
+    arrow::{
+        datatypes::{Schema, SchemaRef},
+        record_batch::RecordBatch,
+    },
     datasource::{
         file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat},
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
@@ -29,13 +32,20 @@ use datafusion::{
     execution::{RecordBatchStream, SendableRecordBatchStream},
 };
 use futures::{Stream, StreamExt};
-use s3s::dto::SelectObjectContentInput;
+use lazy_static::lazy_static;
+use s3s::dto::{FileHeaderInfo, SelectObjectContentInput};
 
 use crate::{
     execution::factory::QueryExecutionFactoryRef,
     metadata::{base_table::BaseTableProvider, ContextProviderExtension, MetadataProvider, TableHandleProviderRef},
     sql::logical::planner::DefaultLogicalPlanner,
 };
+
+lazy_static! {
+    static ref IGNORE: FileHeaderInfo = FileHeaderInfo::from_static(FileHeaderInfo::IGNORE);
+    static ref NONE: FileHeaderInfo = FileHeaderInfo::from_static(FileHeaderInfo::NONE);
+    static ref USE: FileHeaderInfo = FileHeaderInfo::from_static(FileHeaderInfo::USE);
+}
 
 #[derive(Clone)]
 pub struct SimpleQueryDispatcher {
@@ -138,25 +148,94 @@ impl SimpleQueryDispatcher {
     async fn build_scheme_provider(&self, session: &SessionCtx) -> QueryResult<MetadataProvider> {
         let path = format!("s3://{}/{}", self.input.bucket, self.input.key);
         let table_path = ListingTableUrl::parse(path)?;
-        let listing_options = if self.input.request.input_serialization.csv.is_some() {
-            let file_format = CsvFormat::default().with_options(CsvOptions::default().with_has_header(true));
-            ListingOptions::new(Arc::new(file_format)).with_file_extension(".csv")
-        } else if self.input.request.input_serialization.parquet.is_some() {
-            let file_format = ParquetFormat::new();
-            ListingOptions::new(Arc::new(file_format)).with_file_extension(".parquet")
-        } else if self.input.request.input_serialization.json.is_some() {
-            let file_format = JsonFormat::default();
-            ListingOptions::new(Arc::new(file_format)).with_file_extension(".json")
-        } else {
-            return Err(QueryError::NotImplemented {
-                err: "not support this file type".to_string(),
-            });
-        };
+        let (listing_options, need_rename_volume_name, need_ignore_volume_name) =
+            if let Some(csv) = self.input.request.input_serialization.csv.as_ref() {
+                let mut need_rename_volume_name = false;
+                let mut need_ignore_volume_name = false;
+                let mut file_format = CsvFormat::default()
+                    .with_comment(
+                        csv.comments
+                            .clone()
+                            .map(|c| c.as_bytes().first().copied().unwrap_or_default()),
+                    )
+                    .with_escape(
+                        csv.quote_escape_character
+                            .clone()
+                            .map(|e| e.as_bytes().first().copied().unwrap_or_default()),
+                    );
+                if let Some(delimiter) = csv.field_delimiter.as_ref() {
+                    file_format = file_format.with_delimiter(delimiter.as_bytes().first().copied().unwrap_or_default());
+                }
+                if csv.file_header_info.is_some() {}
+                match csv.file_header_info.as_ref() {
+                    Some(info) => {
+                        if *info == *NONE {
+                            file_format = file_format.with_has_header(false);
+                            need_rename_volume_name = true;
+                        } else if *info == *IGNORE {
+                            file_format = file_format.with_has_header(true);
+                            need_rename_volume_name = true;
+                            need_ignore_volume_name = true;
+                        } else if *info == *USE {
+                            file_format = file_format.with_has_header(true);
+                        } else {
+                            return Err(QueryError::NotImplemented {
+                                err: "unsupported FileHeaderInfo".to_string(),
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(QueryError::NotImplemented {
+                            err: "unsupported FileHeaderInfo".to_string(),
+                        });
+                    }
+                }
+                if let Some(quote) = csv.quote_character.as_ref() {
+                    file_format = file_format.with_quote(quote.as_bytes().first().copied().unwrap_or_default());
+                }
+                (
+                    ListingOptions::new(Arc::new(file_format)).with_file_extension(".csv"),
+                    need_rename_volume_name,
+                    need_ignore_volume_name,
+                )
+            } else if self.input.request.input_serialization.parquet.is_some() {
+                let file_format = ParquetFormat::new();
+                (ListingOptions::new(Arc::new(file_format)).with_file_extension(".parquet"), false, false)
+            } else if self.input.request.input_serialization.json.is_some() {
+                let file_format = JsonFormat::default();
+                (ListingOptions::new(Arc::new(file_format)).with_file_extension(".json"), false, false)
+            } else {
+                return Err(QueryError::NotImplemented {
+                    err: "not support this file type".to_string(),
+                });
+            };
 
         let resolve_schema = listing_options.infer_schema(session.inner(), &table_path).await?;
-        let config = ListingTableConfig::new(table_path)
-            .with_listing_options(listing_options)
-            .with_schema(resolve_schema);
+        let config = if need_rename_volume_name {
+            let mut new_fields = Vec::new();
+            for (i, field) in resolve_schema.fields().iter().enumerate() {
+                let f_name = field.name();
+                let mut_field = field.deref().clone();
+                if f_name.starts_with("column_") {
+                    let re_name = f_name.replace("column_", "_");
+                    new_fields.push(mut_field.with_name(re_name));
+                } else if need_ignore_volume_name {
+                    let re_name = format!("_{}", i + 1);
+                    new_fields.push(mut_field.with_name(re_name));
+                } else {
+                    new_fields.push(mut_field);
+                }
+            }
+            let new_schema = Arc::new(Schema::new(new_fields).with_metadata(resolve_schema.metadata().clone()));
+            ListingTableConfig::new(table_path)
+                .with_listing_options(listing_options)
+                .with_schema(new_schema)
+        } else {
+            ListingTableConfig::new(table_path)
+                .with_listing_options(listing_options)
+                .with_schema(resolve_schema)
+        };
+        // rename default
         let provider = Arc::new(ListingTable::try_new(config)?);
         let current_session_table_provider = self.build_table_handle_provider()?;
         let metadata_provider =
