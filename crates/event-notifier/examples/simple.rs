@@ -14,6 +14,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     let mut config = NotificationConfig {
         store_path: "./events".to_string(),
         channel_capacity: 100,
+        timeout: 50,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
             endpoint: "http://localhost:8080/webhook".to_string(),
             auth_token: Some("secret-token".to_string()),

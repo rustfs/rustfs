@@ -2,8 +2,8 @@ use crate::ChannelAdapter;
 use crate::Error;
 use crate::EventStore;
 use crate::{Event, Log};
-use chrono::Utc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -20,7 +20,7 @@ pub async fn event_bus(
     let mut pending_logs = Vec::new();
     let mut current_log = Log {
         event_name: crate::event::Name::Everything,
-        key: Utc::now().timestamp().to_string(),
+        key: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(),
         records: Vec::new(),
     };
 

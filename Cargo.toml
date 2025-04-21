@@ -51,7 +51,7 @@ datafusion = "46.0.0"
 derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
-dotenv = "0.15.0"
+dotenvy = "0.15.7"
 ecstore = { path = "./ecstore" }
 figment = { version = "0.10.19", features = ["toml", "yaml", "env"] }
 flatbuffers = "25.2.10"

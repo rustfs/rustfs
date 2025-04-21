@@ -89,6 +89,8 @@ pub struct NotificationConfig {
     pub store_path: String,
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
+    #[serde(default = "default_timeout")]
+    pub timeout: u64,
     pub adapters: Vec<AdapterConfig>,
     #[serde(default)]
     pub http: HttpProducerConfig,
@@ -99,6 +101,7 @@ impl Default for NotificationConfig {
         Self {
             store_path: default_store_path(),
             channel_capacity: default_channel_capacity(),
+            timeout: default_timeout(),
             adapters: Vec::new(),
             http: HttpProducerConfig::default(),
         }
@@ -136,12 +139,10 @@ impl NotificationConfig {
     /// loading configuration from env file
     pub fn from_env_file(path: &str) -> Result<Self, Error> {
         // loading env files
-        dotenv::from_path(path)
-            .map_err(|e| Error::ConfigError(format!("unable to load env file: {}", e)))?;
+        dotenvy::from_path(path).map_err(|e| Error::ConfigError(format!("unable to load env file: {}", e)))?;
 
         // Extract configuration from environment variables using figurement
-        let figment =
-            figment::Figment::new().merge(figment::providers::Env::prefixed("EVENT_NOTIF_"));
+        let figment = figment::Figment::new().merge(figment::providers::Env::prefixed("EVENT_NOTIF_"));
 
         Ok(figment.extract()?)
     }
@@ -149,13 +150,15 @@ impl NotificationConfig {
 
 /// Provide temporary directories as default storage paths
 fn default_store_path() -> String {
-    std::env::temp_dir()
-        .join("event-notification")
-        .to_string_lossy()
-        .to_string()
+    std::env::temp_dir().join("event-notification").to_string_lossy().to_string()
 }
 
 /// Provides the recommended default channel capacity for high concurrency systems
 fn default_channel_capacity() -> usize {
     10000 // Reasonable default values for high concurrency systems
+}
+
+/// Provides the recommended default timeout for high concurrency systems
+fn default_timeout() -> u64 {
+    50 // Reasonable default values for high concurrency systems
 }

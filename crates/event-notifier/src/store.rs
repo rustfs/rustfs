@@ -1,7 +1,7 @@
 use crate::Error;
 use crate::Log;
-use chrono::Utc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::{create_dir_all, File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::RwLock;
@@ -23,7 +23,11 @@ impl EventStore {
 
     pub async fn save_logs(&self, logs: &[Log]) -> Result<(), Error> {
         let _guard = self.lock.write().await;
-        let file_path = format!("{}/events_{}.jsonl", self.path, Utc::now().timestamp());
+        let file_path = format!(
+            "{}/events_{}.jsonl",
+            self.path,
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
         let file = OpenOptions::new().create(true).append(true).open(&file_path).await?;
         let mut writer = BufWriter::new(file);
         for log in logs {
