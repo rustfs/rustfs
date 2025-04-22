@@ -4,7 +4,7 @@ channel_capacity = 5000
 
 [[adapters]]
 type = "Webhook"
-endpoint = "http://127.0.0.1:3000/webhook"
+endpoint = "http://127.0.0.1:3020/webhook"
 auth_token = "your-auth-token"
 max_retries = 3
 timeout = 50

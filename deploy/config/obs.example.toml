@@ -6,7 +6,7 @@ meter_interval = 30
 service_name = "rustfs"
 service_version = "0.1.0"
 environment = "develop"
-logger_level = "info"
+logger_level = "error"
 
 [sinks]
 [sinks.kafka] # Kafka sink is disabled by default
