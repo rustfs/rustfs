@@ -57,9 +57,14 @@ export RUSTFS__SINKS__KAFKA__BOOTSTRAP_SERVERS=""
 export RUSTFS__SINKS__KAFKA__TOPIC=""
 export RUSTFS__LOGGER__QUEUE_CAPACITY=10
 
+# 事件消息配置
+export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
+
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
 
-
+# 启动 webhook 服务器
+cargo run --example webhook -p rustfs-event-notifier &
+# 启动主服务
 cargo run --bin rustfs

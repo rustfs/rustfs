@@ -254,21 +254,16 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         let filter_otel = match logger_level {
             "trace" | "debug" => {
                 info!("OpenTelemetry tracing initialized with level: {}", logger_level);
+                EnvFilter::new(logger_level)
+            }
+            _ => {
                 let mut filter = EnvFilter::new(logger_level);
                 for directive in ["hyper", "tonic", "h2", "reqwest", "tower"] {
                     filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
                 }
                 filter
             }
-            _ => {
-                let mut filter = EnvFilter::new(logger_level);
-                for directive in ["hyper", "tonic", "h2", "reqwest"] {
-                    filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
-                }
-                filter
-            }
         };
-
         layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(filter_otel)
     };
 
@@ -277,7 +272,9 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         .with(switch_level(logger_level))
         .with(OpenTelemetryLayer::new(tracer))
         .with(MetricsLayer::new(meter_provider.clone()))
-        .with(otel_layer);
+        .with(otel_layer)
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(logger_level)));
+
     // Configure formatting layer
     let enable_color = std::io::stdout().is_terminal();
     let fmt_layer = tracing_subscriber::fmt::layer()
