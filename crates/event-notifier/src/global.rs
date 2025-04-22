@@ -178,9 +178,9 @@ mod tests {
         tracing_subscriber::fmt::init();
         let config = NotifierConfig::default(); // assume there is a default configuration
         let result = initialize(config).await;
-        assert!(!result.is_ok(), "Initialization should succeed");
-        assert!(!is_initialized(), "System should be marked as initialized");
-        assert!(!is_ready(), "System should be marked as ready");
+        assert!(result.is_err(), "Initialization should not succeed");
+        assert!(!is_initialized(), "System should not be marked as initialized");
+        assert!(!is_ready(), "System should not be marked as ready");
     }
 
     #[tokio::test]

@@ -7,8 +7,8 @@ async fn main() {
     // 构建应用
     let app = Router::new().route("/webhook", post(receive_webhook));
     // 启动服务器
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("Server running on http://0.0.0.0:3000");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3020").await.unwrap();
+    println!("Server running on http://0.0.0.0:3020");
 
     // 创建关闭信号处理
     tokio::select! {
