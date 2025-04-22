@@ -22,10 +22,10 @@ pub use config::KafkaConfig;
 pub use config::MqttConfig;
 #[cfg(feature = "webhook")]
 pub use config::WebhookConfig;
-pub use config::{AdapterConfig, NotificationConfig};
+pub use config::{AdapterConfig, NotifierConfig};
 pub use error::Error;
 
 pub use event::{Bucket, Event, EventBuilder, Identity, Log, Metadata, Name, Object, Source};
 pub use global::{initialize, is_initialized, is_ready, send_event, shutdown};
-pub use notifier::NotificationSystem;
+pub use notifier::NotifierSystem;
 pub use store::EventStore;

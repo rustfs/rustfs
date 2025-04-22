@@ -1,21 +1,27 @@
 use rustfs_event_notifier::create_adapters;
-use rustfs_event_notifier::NotificationSystem;
-use rustfs_event_notifier::{AdapterConfig, NotificationConfig, WebhookConfig};
+use rustfs_event_notifier::NotifierSystem;
+use rustfs_event_notifier::{AdapterConfig, NotifierConfig, WebhookConfig};
 use rustfs_event_notifier::{Bucket, Event, Identity, Metadata, Name, Object, Source};
 use std::collections::HashMap;
 use std::error;
 use std::sync::Arc;
 use tokio::signal;
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn error::Error>> {
-    tracing_subscriber::fmt::init();
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::DEBUG) // set to debug or lower level
+        .with_target(false) // simplify output
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("failed to set up log subscriber");
 
-    let config = NotificationConfig {
+    let config = NotifierConfig {
         store_path: "./events".to_string(),
         channel_capacity: 100,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
-            endpoint: "http://localhost:8080/webhook".to_string(),
+            endpoint: "http://127.0.0.1:3000/webhook".to_string(),
             auth_token: Some("secret-token".to_string()),
             custom_headers: Some(HashMap::from([("X-Custom".to_string(), "value".to_string())])),
             max_retries: 3,
@@ -23,16 +29,12 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         })],
     };
 
-    // loading configuration from specific env files
-    let _config = NotificationConfig::from_env_file(".env.example")?;
+    // load_config
+    // loading configuration from environment variables
+    let _config = NotifierConfig::load_config(Some("./crates/event-notifier/examples/event.toml".to_string()));
+    tracing::info!("load_config config: {:?} \n", _config);
 
-    // loading from a specific file
-    let _config = NotificationConfig::from_file("event.toml")?;
-
-    // Automatically load from multiple sources (Priority: Environment Variables > YAML > TOML)
-    let _config = NotificationConfig::load()?;
-
-    let system = Arc::new(tokio::sync::Mutex::new(NotificationSystem::new(config.clone()).await?));
+    let system = Arc::new(tokio::sync::Mutex::new(NotifierSystem::new(config.clone()).await?));
     let adapters = create_adapters(&config.adapters)?;
 
     // create an s3 metadata object
@@ -90,9 +92,15 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
     signal::ctrl_c().await?;
     tracing::info!("Received shutdown signal");
-    {
-        let system = system.lock().await;
-        system.shutdown();
+    let result = {
+        let mut system = system.lock().await;
+        system.shutdown().await
+    };
+
+    if let Err(e) = result {
+        tracing::error!("Failed to shut down the notification system: {}", e);
+    } else {
+        tracing::info!("Notification system shut down successfully");
     }
 
     system_handle.await??;

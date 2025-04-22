@@ -14,8 +14,7 @@ mqtt = ["rumqttc"]
 
 [dependencies]
 async-trait = { workspace = true }
-dotenvy = { workspace = true }
-figment = { workspace = true, features = ["toml", "yaml", "env"] }
+config = { workspace = true }
 rdkafka = { workspace = true, features = ["tokio"], optional = true }
 reqwest = { workspace = true, optional = true }
 rumqttc = { workspace = true, optional = true }

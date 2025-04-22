@@ -80,16 +80,20 @@ pub async fn event_bus(
                 } else {
                     tracing::info!("no unhandled events need to be saved");
                 }
-                 tracing::info!("shutdown_complete is Some: {}", shutdown_complete.is_some());
-                // send a completion signal
+                 tracing::debug!("shutdown_complete is Some: {}", shutdown_complete.is_some());
+
                 if let Some(complete_sender) = shutdown_complete {
-                    let _ = complete_sender.send(());
+                    // send a completion signal
+                    let result = complete_sender.send(());
+                    match result {
+                        Ok(_) => tracing::info!("Event bus shutdown signal sent"),
+                        Err(e) => tracing::error!("Failed to send event bus shutdown signal: {:?}", e),
+                    }
                     tracing::info!("Shutting down event bus");
                 }
                 tracing::info!("Event bus shutdown complete");
                 break;
             }
-            // else => break,
         }
     }
     Ok(())
