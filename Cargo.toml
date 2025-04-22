@@ -173,6 +173,10 @@ inherits = "dev"
 inherits = "dev"
 
 [profile.release]
-opt-level = 3  # Optimization Level (0-3)
-lto = true     # Optimize when linking
-codegen-units = 1  # Reduce code generation units to improve optimization
+opt-level = 3
+lto = "thin"
+
+[profile.production]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
