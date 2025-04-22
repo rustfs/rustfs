@@ -29,10 +29,10 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         })],
     };
 
-    // load_config
+    // event_load_config
     // loading configuration from environment variables
-    let _config = NotifierConfig::load_config(Some("./crates/event-notifier/examples/event.toml".to_string()));
-    tracing::info!("load_config config: {:?} \n", _config);
+    let _config = NotifierConfig::event_load_config(Some("./crates/event-notifier/examples/event.toml".to_string()));
+    tracing::info!("event_load_config config: {:?} \n", _config);
 
     let system = Arc::new(tokio::sync::Mutex::new(NotifierSystem::new(config.clone()).await?));
     let adapters = create_adapters(&config.adapters)?;

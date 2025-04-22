@@ -102,9 +102,9 @@ impl NotifierConfig {
     /// ```
     /// use rustfs_event_notifier::NotifierConfig;
     ///
-    /// let config = NotifierConfig::load_config(None);
+    /// let config = NotifierConfig::event_load_config(None);
     /// ```
-    pub fn load_config(config_dir: Option<String>) -> NotifierConfig {
+    pub fn event_load_config(config_dir: Option<String>) -> NotifierConfig {
         let config_dir = if let Some(path) = config_dir {
             // If a path is provided, check if it's empty
             if path.is_empty() {
