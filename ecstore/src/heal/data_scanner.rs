@@ -1101,7 +1101,7 @@ pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) 
             return true;
         }
 
-        if let Some(Some(true)) = rule.expiration.as_ref().map(|e| e.expired_object_delete_marker.map(|m| m)) {
+        if let Some(Some(true)) = rule.expiration.as_ref().map(|e| e.expired_object_delete_marker) {
             return true;
         }
 

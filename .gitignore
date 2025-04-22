@@ -12,3 +12,4 @@ cli/rustfs-gui/embedded-rustfs/rustfs
 deploy/config/obs.toml
 *.log
 deploy/certs/*
+*jsonl
