@@ -11,7 +11,7 @@ async fn setup_notification_system() -> Result<(), NotifierError> {
         store_path: "./deploy/logs/event_store".into(),
         channel_capacity: 100,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
-            endpoint: "http://127.0.0.1:3000/webhook".into(),
+            endpoint: "http://127.0.0.1:3020/webhook".into(),
             auth_token: Some("your-auth-token".into()),
             custom_headers: Some(HashMap::new()),
             max_retries: 3,

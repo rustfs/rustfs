@@ -59,7 +59,7 @@ export RUSTFS__LOGGER__QUEUE_CAPACITY=10
 
 # 事件消息配置
 export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
-
+export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi

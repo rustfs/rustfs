@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         store_path: "./events".to_string(),
         channel_capacity: 100,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
-            endpoint: "http://127.0.0.1:3000/webhook".to_string(),
+            endpoint: "http://127.0.0.1:3020/webhook".to_string(),
             auth_token: Some("secret-token".to_string()),
             custom_headers: Some(HashMap::from([("X-Custom".to_string(), "value".to_string())])),
             max_retries: 3,
