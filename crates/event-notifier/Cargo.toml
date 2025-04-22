@@ -30,9 +30,12 @@ tokio = { workspace = true, features = ["sync", "net", "macros", "signal", "rt-m
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+http = { workspace = true }
+axum = { workspace = true }
 
 [lints]
 workspace = true

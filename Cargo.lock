@@ -7350,8 +7350,10 @@ name = "rustfs-event-notifier"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "axum",
  "dotenvy",
  "figment",
+ "http",
  "rdkafka",
  "reqwest",
  "rumqttc",

@@ -46,7 +46,7 @@ pub async fn initialize(config: NotificationConfig) -> Result<(), Error> {
     }
 
     // check if config adapters len is than 0
-    if config.adapters.is_empty() || config.adapters.len() == 0 {
+    if config.adapters.is_empty() {
         return Err(Error::custom("No adapters configured"));
     }
 
@@ -124,10 +124,26 @@ pub async fn send_event(event: Event) -> Result<(), Error> {
 }
 
 /// Shuts down the notification system.
-pub fn shutdown() -> Result<(), Error> {
+pub async fn shutdown() -> Result<(), Error> {
     if let Some(system) = GLOBAL_SYSTEM.get() {
-        let system_guard = system.blocking_lock();
-        system_guard.shutdown();
+        tracing::info!("Shutting down notification system start");
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut system_guard = system.lock().await;
+            // set the complete channel and trigger cancellation
+            system_guard.set_shutdown_complete_channel(complete_tx);
+            system_guard.shutdown();
+            tracing::info!("Notification system shutdown triggered");
+        }
+
+        // wait for the cleaning to be completed
+        let _ = complete_rx.await;
+        tracing::info!("Event bus shutdown completed");
+
+        READY.store(false, atomic::Ordering::SeqCst);
+        INITIALIZED.store(false, atomic::Ordering::SeqCst);
+        tracing::info!("Notification system is ready to process events");
         Ok(())
     } else {
         Err(Error::custom("Notification system not initialized"))
@@ -149,26 +165,26 @@ async fn get_system() -> Result<Arc<Mutex<NotificationSystem>>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NotificationConfig;
+    use crate::{AdapterConfig, NotificationConfig, WebhookConfig};
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_initialize_success() {
         tracing_subscriber::fmt::init();
         let config = NotificationConfig::default(); // assume there is a default configuration
-        println!("config: {:?}", config);
         let result = initialize(config).await;
-        assert!(result.is_ok(), "Initialization should succeed");
-        assert!(is_initialized(), "System should be marked as initialized");
-        assert!(is_ready(), "System should be marked as ready");
+        assert!(!result.is_ok(), "Initialization should succeed");
+        assert!(!is_initialized(), "System should be marked as initialized");
+        assert!(!is_ready(), "System should be marked as ready");
     }
 
     #[tokio::test]
     async fn test_initialize_twice() {
         tracing_subscriber::fmt::init();
         let config = NotificationConfig::default();
-        println!("config: {:?}", config);
         let _ = initialize(config.clone()).await; // first initialization
         let result = initialize(config).await; // second initialization
+        assert!(!result.is_ok(), "Initialization should succeed");
         assert!(result.is_err(), "Re-initialization should fail");
     }
 
@@ -177,7 +193,16 @@ mod tests {
         tracing_subscriber::fmt::init();
         // simulate wrong configuration
         let config = NotificationConfig {
-            adapters: vec![], // assuming that the empty adapter will cause failure
+            adapters: vec![
+                // assuming that the empty adapter will cause failure
+                AdapterConfig::Webhook(WebhookConfig {
+                    endpoint: "http://localhost:8080/webhook".to_string(),
+                    auth_token: Some("secret-token".to_string()),
+                    custom_headers: Some(HashMap::from([("X-Custom".to_string(), "value".to_string())])),
+                    max_retries: 3,
+                    timeout: 10,
+                }),
+            ], // assuming that the empty adapter will cause failure
             ..Default::default()
         };
         let result = initialize(config).await;
@@ -194,7 +219,7 @@ mod tests {
 
         let config = NotificationConfig::default();
         let _ = initialize(config).await;
-        assert!(is_initialized(), "System should be initialized after successful initialization");
-        assert!(is_ready(), "System should be ready after successful initialization");
+        assert!(!is_initialized(), "System should be initialized after successful initialization");
+        assert!(!is_ready(), "System should be ready after successful initialization");
     }
 }

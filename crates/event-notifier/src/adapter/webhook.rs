@@ -45,6 +45,7 @@ impl ChannelAdapter for WebhookAdapter {
 
     async fn send(&self, event: &Event) -> Result<(), Error> {
         let mut attempt = 0;
+        tracing::info!("Attempting to send webhook request: {:?}", event);
         loop {
             match self.build_request(event).send().await {
                 Ok(response) => {

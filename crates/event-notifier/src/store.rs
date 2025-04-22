@@ -36,6 +36,7 @@ impl EventStore {
             writer.write_all(b"\n").await?;
         }
         writer.flush().await?;
+        tracing::info!("Saved logs to {} end", file_path);
         Ok(())
     }
 
