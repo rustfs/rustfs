@@ -1,8 +1,8 @@
-use crate::{create_adapters, Error, Event, NotificationConfig, NotificationSystem};
+use crate::{create_adapters, Error, Event, NotifierConfig, NotifierSystem};
 use std::sync::{atomic, Arc};
 use tokio::sync::{Mutex, OnceCell};
 
-static GLOBAL_SYSTEM: OnceCell<Arc<Mutex<NotificationSystem>>> = OnceCell::const_new();
+static GLOBAL_SYSTEM: OnceCell<Arc<Mutex<NotifierSystem>>> = OnceCell::const_new();
 static INITIALIZED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 static READY: atomic::AtomicBool = atomic::AtomicBool::new(false);
 static INIT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -24,7 +24,7 @@ static INIT_LOCK: Mutex<()> = Mutex::const_new(());
 /// - Creating adapters fails.
 /// - Starting the notification system fails.
 /// - Setting the global system instance fails.
-pub async fn initialize(config: NotificationConfig) -> Result<(), Error> {
+pub async fn initialize(config: NotifierConfig) -> Result<(), Error> {
     let _lock = INIT_LOCK.lock().await;
 
     // Check if the system is already initialized.
@@ -52,7 +52,7 @@ pub async fn initialize(config: NotificationConfig) -> Result<(), Error> {
 
     // Attempt to initialize, and reset the INITIALIZED flag if it fails.
     let result: Result<(), Error> = async {
-        let system = NotificationSystem::new(config.clone()).await.map_err(|e| {
+        let system = NotifierSystem::new(config.clone()).await.map_err(|e| {
             tracing::error!("Failed to create NotificationSystem: {:?}", e);
             e
         })?;
@@ -127,24 +127,29 @@ pub async fn send_event(event: Event) -> Result<(), Error> {
 pub async fn shutdown() -> Result<(), Error> {
     if let Some(system) = GLOBAL_SYSTEM.get() {
         tracing::info!("Shutting down notification system start");
-        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
-
-        {
+        let result = {
             let mut system_guard = system.lock().await;
-            // set the complete channel and trigger cancellation
-            system_guard.set_shutdown_complete_channel(complete_tx);
-            system_guard.shutdown();
-            tracing::info!("Notification system shutdown triggered");
+            system_guard.shutdown().await
+        };
+        if let Err(e) = &result {
+            tracing::error!("Notification system shutdown failed: {}", e);
+        } else {
+            tracing::info!("Event bus shutdown completed");
         }
 
-        // wait for the cleaning to be completed
-        let _ = complete_rx.await;
-        tracing::info!("Event bus shutdown completed");
-
+        tracing::info!(
+            "Shutdown method called set static value start, READY: {}, INITIALIZED: {}",
+            READY.load(atomic::Ordering::SeqCst),
+            INITIALIZED.load(atomic::Ordering::SeqCst)
+        );
         READY.store(false, atomic::Ordering::SeqCst);
         INITIALIZED.store(false, atomic::Ordering::SeqCst);
-        tracing::info!("Notification system is ready to process events");
-        Ok(())
+        tracing::info!(
+            "Shutdown method called  set static value end, READY: {}, INITIALIZED: {}",
+            READY.load(atomic::Ordering::SeqCst),
+            INITIALIZED.load(atomic::Ordering::SeqCst)
+        );
+        result
     } else {
         Err(Error::custom("Notification system not initialized"))
     }
@@ -155,7 +160,7 @@ pub async fn shutdown() -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns an error if the system is not initialized.
-async fn get_system() -> Result<Arc<Mutex<NotificationSystem>>, Error> {
+async fn get_system() -> Result<Arc<Mutex<NotifierSystem>>, Error> {
     GLOBAL_SYSTEM
         .get()
         .cloned()
@@ -165,13 +170,13 @@ async fn get_system() -> Result<Arc<Mutex<NotificationSystem>>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AdapterConfig, NotificationConfig, WebhookConfig};
+    use crate::{AdapterConfig, NotifierConfig, WebhookConfig};
     use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_initialize_success() {
         tracing_subscriber::fmt::init();
-        let config = NotificationConfig::default(); // assume there is a default configuration
+        let config = NotifierConfig::default(); // assume there is a default configuration
         let result = initialize(config).await;
         assert!(!result.is_ok(), "Initialization should succeed");
         assert!(!is_initialized(), "System should be marked as initialized");
@@ -181,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_twice() {
         tracing_subscriber::fmt::init();
-        let config = NotificationConfig::default();
+        let config = NotifierConfig::default();
         let _ = initialize(config.clone()).await; // first initialization
         let result = initialize(config).await; // second initialization
         assert!(!result.is_ok(), "Initialization should succeed");
@@ -192,7 +197,7 @@ mod tests {
     async fn test_initialize_failure_resets_state() {
         tracing_subscriber::fmt::init();
         // simulate wrong configuration
-        let config = NotificationConfig {
+        let config = NotifierConfig {
             adapters: vec![
                 // assuming that the empty adapter will cause failure
                 AdapterConfig::Webhook(WebhookConfig {
@@ -217,7 +222,7 @@ mod tests {
         assert!(!is_initialized(), "System should not be initialized initially");
         assert!(!is_ready(), "System should not be ready initially");
 
-        let config = NotificationConfig::default();
+        let config = NotifierConfig::default();
         let _ = initialize(config).await;
         assert!(!is_initialized(), "System should be initialized after successful initialization");
         assert!(!is_ready(), "System should be ready after successful initialization");

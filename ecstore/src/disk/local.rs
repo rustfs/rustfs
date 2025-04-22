@@ -122,7 +122,7 @@ impl LocalDisk {
         let root = fs::canonicalize(ep.get_file_path()).await?;
 
         if cleanup {
-            // TODO: 删除tmp数据
+            // TODO: 删除 tmp 数据
         }
 
         let format_path = Path::new(super::RUSTFS_META_BUCKET)
@@ -631,13 +631,13 @@ impl LocalDisk {
             }
         }
 
-        // 没有版本了，删除xl.meta
+        // 没有版本了，删除 xl.meta
         if fm.versions.is_empty() {
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
             return Ok(());
         }
 
-        // 更新xl.meta
+        // 更新 xl.meta
         let buf = fm.marshal_msg()?;
 
         let volume_dir = self.get_bucket_path(volume)?;
@@ -875,7 +875,7 @@ impl LocalDisk {
                     .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
                     .await?;
 
-                // 用strip_suffix只删除一次
+                // 用 strip_suffix 只删除一次
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
@@ -1723,7 +1723,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        // xl.meta路径
+        // xl.meta 路径
         let src_file_path = src_volume_dir.join(Path::new(format!("{}/{}", &src_path, super::STORAGE_FORMAT_FILE).as_str()));
         let dst_file_path = dst_volume_dir.join(Path::new(format!("{}/{}", &dst_path, super::STORAGE_FORMAT_FILE).as_str()));
 
@@ -1754,7 +1754,7 @@ impl DiskAPI for LocalDisk {
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
-        // 读旧xl.meta
+        // 读旧 xl.meta
 
         let has_dst_buf = match utils::fs::read_file(&dst_file_path).await {
             Ok(res) => Some(res),
@@ -2268,7 +2268,7 @@ impl DiskAPI for LocalDisk {
     async fn delete_volume(&self, volume: &str) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
-        // TODO: 不能用递归删除，如果目录下面有文件，返回errVolumeNotEmpty
+        // TODO: 不能用递归删除，如果目录下面有文件，返回 errVolumeNotEmpty
 
         if let Err(err) = fs::remove_dir_all(&p).await {
             match err.kind() {
@@ -2328,10 +2328,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let vcfg = match BucketVersioningSys::get(&cache.info.name).await {
-            Ok(vcfg) => Some(vcfg),
-            Err(_) => None,
-        };
+        let vcfg = (BucketVersioningSys::get(&cache.info.name).await).ok();
 
         let loc = self.get_disk_location();
         let disks = store.get_disks(loc.pool_idx.unwrap(), loc.disk_idx.unwrap()).await?;
@@ -2491,7 +2488,6 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
 
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     #[tokio::test]

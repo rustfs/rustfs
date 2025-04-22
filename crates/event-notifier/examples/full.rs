@@ -1,6 +1,5 @@
 use rustfs_event_notifier::{
-    AdapterConfig, Bucket, Error as NotifierError, Event, Identity, Metadata, Name, NotificationConfig, Object, Source,
-    WebhookConfig,
+    AdapterConfig, Bucket, Error as NotifierError, Event, Identity, Metadata, Name, NotifierConfig, Object, Source, WebhookConfig,
 };
 use std::collections::HashMap;
 use tokio::signal;
@@ -8,7 +7,7 @@ use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 async fn setup_notification_system() -> Result<(), NotifierError> {
-    let config = NotificationConfig {
+    let config = NotifierConfig {
         store_path: "./deploy/logs/event_store".into(),
         channel_capacity: 100,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
@@ -40,11 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tracing_subscriber::fmt::init();
 
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)  // set to debug or lower level
-        .with_target(false)  // simplify output
+        .with_max_level(Level::DEBUG) // set to debug or lower level
+        .with_target(false) // simplify output
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("failed to set up log subscriber");
+    tracing::subscriber::set_global_default(subscriber).expect("failed to set up log subscriber");
 
     // set up notification system
     if let Err(e) = setup_notification_system().await {

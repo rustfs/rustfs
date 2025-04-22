@@ -12,6 +12,71 @@ async fn main() {
 }
 
 async fn receive_webhook(Json(payload): Json<Value>) -> StatusCode {
-    println!("收到 webhook 请求 time: {}，内容：{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(), serde_json::to_string_pretty(&payload).unwrap());
+    let start = SystemTime::now();
+    let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
+
+    // get the number of seconds since the unix era
+    let seconds = since_the_epoch.as_secs();
+
+    // Manually calculate year, month, day, hour, minute, and second
+    let (year, month, day, hour, minute, second) = convert_seconds_to_date(seconds);
+
+    // output result
+    println!("current time:{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, minute, second);
+    println!(
+        "received a webhook request time:{} content:\n {}",
+        seconds.to_string(),
+        serde_json::to_string_pretty(&payload).unwrap()
+    );
     StatusCode::OK
+}
+
+fn convert_seconds_to_date(seconds: u64) -> (u32, u32, u32, u32, u32, u32) {
+    // assume that the time zone is utc
+    let seconds_per_minute = 60;
+    let seconds_per_hour = 3600;
+    let seconds_per_day = 86400;
+
+    // Calculate the year, month, day, hour, minute, and second corresponding to the number of seconds
+    let mut total_seconds = seconds;
+    let mut year = 1970;
+    let mut month = 1;
+    let mut day = 1;
+    let mut hour = 0;
+    let mut minute = 0;
+    let mut second = 0;
+
+    // calculate year
+    while total_seconds >= 31536000 {
+        year += 1;
+        total_seconds -= 31536000; // simplified processing no leap year considered
+    }
+
+    // calculate month
+    let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 0..12 {
+        if total_seconds >= days_in_month[m] * seconds_per_day {
+            month += 1;
+            total_seconds -= days_in_month[m] * seconds_per_day;
+        } else {
+            break;
+        }
+    }
+
+    // calculate the number of days
+    day += total_seconds / seconds_per_day;
+    total_seconds %= seconds_per_day;
+
+    // calculate hours
+    hour += total_seconds / seconds_per_hour;
+    total_seconds %= seconds_per_hour;
+
+    // calculate minutes
+    minute += total_seconds / seconds_per_minute;
+    total_seconds %= seconds_per_minute;
+
+    // calculate the number of seconds
+    second += total_seconds;
+
+    (year as u32, month as u32, day as u32, hour as u32, minute as u32, second as u32)
 }

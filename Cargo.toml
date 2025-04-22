@@ -65,8 +65,6 @@ datafusion = "46.0.1"
 derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
-dotenvy = "0.15.7"
-figment = { version = "0.10.19", features = ["toml", "yaml", "env"] }
 flatbuffers = "25.2.10"
 futures = "0.3.31"
 futures-core = "0.3.31"

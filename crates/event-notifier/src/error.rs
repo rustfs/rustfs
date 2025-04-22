@@ -1,3 +1,4 @@
+use config::ConfigError;
 use thiserror::Error;
 use tokio::sync::mpsc::error;
 use tokio::task::JoinError;
@@ -35,7 +36,7 @@ pub enum Error {
     #[error("Configuration error: {0}")]
     ConfigError(String),
     #[error("Configuration loading error: {0}")]
-    Figment(#[from] figment::Error),
+    Config(#[from] ConfigError),
 }
 
 impl Error {

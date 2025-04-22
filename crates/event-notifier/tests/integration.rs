@@ -1,4 +1,4 @@
-use rustfs_event_notifier::{AdapterConfig, NotificationSystem, WebhookConfig};
+use rustfs_event_notifier::{AdapterConfig, NotifierSystem, WebhookConfig};
 use rustfs_event_notifier::{Bucket, Event, EventBuilder, Identity, Metadata, Name, Object, Source};
 use rustfs_event_notifier::{ChannelAdapter, WebhookAdapter};
 use std::collections::HashMap;
@@ -67,7 +67,7 @@ async fn test_webhook_adapter() {
 
 #[tokio::test]
 async fn test_notification_system() {
-    let config = rustfs_event_notifier::NotificationConfig {
+    let config = rustfs_event_notifier::NotifierConfig {
         store_path: "./test_events".to_string(),
         channel_capacity: 100,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
@@ -78,7 +78,7 @@ async fn test_notification_system() {
             timeout: 5,
         })],
     };
-    let system = Arc::new(tokio::sync::Mutex::new(NotificationSystem::new(config.clone()).await.unwrap()));
+    let system = Arc::new(tokio::sync::Mutex::new(NotifierSystem::new(config.clone()).await.unwrap()));
     let adapters: Vec<Arc<dyn ChannelAdapter>> = vec![Arc::new(WebhookAdapter::new(WebhookConfig {
         endpoint: "http://localhost:8080/webhook".to_string(),
         auth_token: None,
@@ -148,8 +148,8 @@ async fn test_notification_system() {
             // create a new task to handle the timeout
             let system = Arc::clone(&system);
             tokio::spawn(async move {
-                if let Ok(guard) = system.try_lock() {
-                    guard.shutdown();
+                if let Ok(mut guard) = system.try_lock() {
+                    guard.shutdown().await.unwrap();
                 }
             });
             // give the system some time to clean up resources
