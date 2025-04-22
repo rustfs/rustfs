@@ -8,7 +8,19 @@ async fn main() {
     let app = Router::new().route("/webhook", post(receive_webhook));
     // 启动服务器
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    println!("Server running on http://0.0.0.0:3000");
+
+    // 创建关闭信号处理
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            if let Err(e) = result {
+                eprintln!("Server error: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!("Shutting down server...");
+        }
+    }
 }
 
 async fn receive_webhook(Json(payload): Json<Value>) -> StatusCode {
