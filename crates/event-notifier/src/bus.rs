@@ -5,6 +5,7 @@ use crate::{Event, Log};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Handles incoming events from the producer.
@@ -16,14 +17,15 @@ pub async fn event_bus(
     adapters: Vec<Arc<dyn ChannelAdapter>>,
     store: Arc<EventStore>,
     shutdown: CancellationToken,
+    shutdown_complete: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), Error> {
-    let mut pending_logs = Vec::new();
     let mut current_log = Log {
         event_name: crate::event::Name::Everything,
         key: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(),
         records: Vec::new(),
     };
 
+    let mut unprocessed_events = Vec::new();
     loop {
         tokio::select! {
             Some(event) = rx.recv() => {
@@ -45,23 +47,49 @@ pub async fn event_bus(
                 }
                 for task in send_tasks {
                     if task.await?.is_err() {
-                        current_log.records.retain(|e| e.id != event.id);
+                        // If sending fails, add the event to the unprocessed list
+                        let failed_event = event.clone();
+                        unprocessed_events.push(failed_event);
                     }
                 }
-                if !current_log.records.is_empty() {
-                    pending_logs.push(current_log.clone());
-                }
-                current_log.records.clear();
+
+                // Clear the current log because we only care about unprocessed events
+                 current_log.records.clear();
             }
             _ = shutdown.cancelled() => {
                 tracing::info!("Shutting down event bus, saving pending logs...");
-                if !current_log.records.is_empty() {
-                    pending_logs.push(current_log);
+                // Check if there are still unprocessed messages in the channel
+                while let Ok(Some(event)) = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    rx.recv()
+                ).await {
+                    unprocessed_events.push(event);
                 }
-                store.save_logs(&pending_logs).await?;
+
+                // save only if there are unprocessed events
+                if !unprocessed_events.is_empty() {
+                    tracing::info!("Save {} unhandled events", unprocessed_events.len());
+                    // create and save logging
+                    let shutdown_log = Log {
+                        event_name: crate::event::Name::Everything,
+                        key: format!("shutdown_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()),
+                        records: unprocessed_events,
+                    };
+
+                    store.save_logs(&[shutdown_log]).await?;
+                } else {
+                    tracing::info!("no unhandled events need to be saved");
+                }
+                 tracing::info!("shutdown_complete is Some: {}", shutdown_complete.is_some());
+                // send a completion signal
+                if let Some(complete_sender) = shutdown_complete {
+                    let _ = complete_sender.send(());
+                    tracing::info!("Shutting down event bus");
+                }
+                tracing::info!("Event bus shutdown complete");
                 break;
             }
-            else => break,
+            // else => break,
         }
     }
     Ok(())

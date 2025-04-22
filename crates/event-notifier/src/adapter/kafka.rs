@@ -38,17 +38,12 @@ impl KafkaAdapter {
         let payload = serde_json::to_string(&event)?;
 
         for attempt in 0..self.max_retries {
-            let record = FutureRecord::to(&self.topic)
-                .key(&event_id)
-                .payload(&payload);
+            let record = FutureRecord::to(&self.topic).key(&event_id).payload(&payload);
 
             match self.producer.send(record, Timeout::Never).await {
                 Ok(_) => return Ok(()),
                 Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _)) => {
-                    tracing::warn!(
-                        "Kafka attempt {} failed: Queue full. Retrying...",
-                        attempt + 1
-                    );
+                    tracing::warn!("Kafka attempt {} failed: Queue full. Retrying...", attempt + 1);
                     sleep(Duration::from_secs(2u64.pow(attempt))).await;
                 }
                 Err((e, _)) => {
@@ -58,9 +53,7 @@ impl KafkaAdapter {
             }
         }
 
-        Err(Error::Custom(
-            "Exceeded maximum retry attempts for Kafka message".to_string(),
-        ))
+        Err(Error::Custom("Exceeded maximum retry attempts for Kafka message".to_string()))
     }
 }
 

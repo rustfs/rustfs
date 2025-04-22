@@ -39,7 +39,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn custom(msg: &str) -> Error {
+    pub fn custom(msg: &str) -> Error {
         Self::Custom(msg.to_string())
     }
 }

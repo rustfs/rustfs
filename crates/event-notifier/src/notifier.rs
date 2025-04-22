@@ -12,6 +12,7 @@ pub struct NotificationSystem {
     rx: Option<mpsc::Receiver<Event>>,
     store: Arc<EventStore>,
     shutdown: CancellationToken,
+    shutdown_complete: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl NotificationSystem {
@@ -34,18 +35,23 @@ impl NotificationSystem {
             rx: Some(rx),
             store,
             shutdown,
+            shutdown_complete: None,
         })
     }
 
     /// Starts the notification system.
     /// It initializes the event bus and the producer.
     pub async fn start(&mut self, adapters: Vec<Arc<dyn ChannelAdapter>>) -> Result<(), Error> {
-        let rx = self.rx.take().ok_or_else(|| Error::EventBusStarted)?;
+        if self.shutdown.is_cancelled() {
+            return Err(Error::custom("System is shutting down"));
+        }
 
+        let rx = self.rx.take().ok_or_else(|| Error::EventBusStarted)?;
         let shutdown_clone = self.shutdown.clone();
         let store_clone = self.store.clone();
+        let shutdown_complete = self.shutdown_complete.take();
         tokio::spawn(async move {
-            if let Err(e) = event_bus(rx, adapters, store_clone, shutdown_clone).await {
+            if let Err(e) = event_bus(rx, adapters, store_clone, shutdown_clone, shutdown_complete).await {
                 tracing::error!("Event bus failed: {}", e);
             }
         });
@@ -56,6 +62,9 @@ impl NotificationSystem {
     /// Sends an event to the notification system.
     /// This method is used to send events to the event bus.
     pub async fn send_event(&self, event: Event) -> Result<(), Error> {
+        if self.shutdown.is_cancelled() {
+            return Err(Error::custom("System is shutting down"));
+        }
         self.tx.send(event).await.map_err(|e| Error::ChannelSend(Box::new(e)))?;
         Ok(())
     }
@@ -70,5 +79,11 @@ impl NotificationSystem {
     /// shutdown state  
     pub fn shutdown_cancelled(&self) -> bool {
         self.shutdown.is_cancelled()
+    }
+
+    pub fn set_shutdown_complete_channel(&mut self, tx: tokio::sync::oneshot::Sender<()>) {
+        // storage completion channel for use by event bus
+        tracing::info!("Shutting down the notification system set shutdown complete channel");
+        self.shutdown_complete = Some(tx);
     }
 }
