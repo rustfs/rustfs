@@ -46,6 +46,7 @@ use hyper_util::{
 use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustfs_event_notifier::NotifierConfig;
 use rustfs_obs::{init_obs, load_config, set_global_guard, InitLogStatus};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
@@ -104,6 +105,23 @@ async fn main() -> Result<()> {
 
     // Log initialization status
     InitLogStatus::init_start_log(&config.observability).await?;
+
+    // Initialize event notifier
+    let notifier_config = opt.clone().event_config;
+    if notifier_config.is_some() {
+        info!("event_config is not empty");
+        tokio::spawn(async move {
+            let config = NotifierConfig::event_load_config(notifier_config);
+            let result = rustfs_event_notifier::initialize(config).await;
+            if let Err(e) = result {
+                error!("Failed to initialize event notifier: {}", e);
+            } else {
+                info!("Event notifier initialized successfully");
+            }
+        });
+    } else {
+        info!("event_config is empty");
+    }
 
     // Run parameters
     run(opt).await
@@ -448,6 +466,16 @@ async fn run(opt: config::Opt) -> Result<()> {
             info!("Shutdown signal received in main thread");
             // update the status to stopping first
             state_manager.update(ServiceState::Stopping);
+
+            // Stop the notification system
+            if rustfs_event_notifier::is_ready() {
+                // stop event notifier
+                rustfs_event_notifier::shutdown().await.map_err(|err| {
+                    error!("Failed to shut down the notification system: {}", err);
+                    Error::from_string(err.to_string())
+                })?;
+            }
+
             info!("Server is stopping...");
             let _ = shutdown_tx.send(());
             // Wait for the worker thread to complete the cleaning work
