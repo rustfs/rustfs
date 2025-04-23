@@ -861,7 +861,6 @@ impl SetDisks {
         };
 
         if let Some(err) = reduce_read_quorum_errs(errs, object_op_ignored_errs().as_ref(), expected_rquorum) {
-            warn!("object_quorum_from_meta err {:?}", &err);
             return Err(err);
         }
 
@@ -874,7 +873,6 @@ impl SetDisks {
         let parity_blocks = Self::common_parity(&parities, default_parity_count as i32);
 
         if parity_blocks < 0 {
-            warn!("QuorumError::Read, common_parity < 0 ");
             return Err(Error::new(QuorumError::Read));
         }
 
@@ -1746,7 +1744,7 @@ impl SetDisks {
         // TODO: 优化并发 可用数量中断
         let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
-        warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
+        // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
@@ -1754,12 +1752,6 @@ impl SetDisks {
             .map_err(|err| to_object_err(err, vec![bucket, object]))?;
 
         if let Some(err) = reduce_read_quorum_errs(&errs, object_op_ignored_errs().as_ref(), read_quorum as usize) {
-            error!(
-                "reduce_read_quorum_errs disks: {} read_quorum {} \n {:?}",
-                disks.len(),
-                read_quorum,
-                &errs
-            );
             return Err(to_object_err(err, vec![bucket, object]));
         }
 
@@ -2587,7 +2579,6 @@ impl SetDisks {
                 }
             }
             Err(err) => {
-                warn!("object_quorum_from_meta failed, err: {}", err.to_string());
                 let data_errs_by_part = HashMap::new();
                 match self
                     .delete_if_dang_ling(
