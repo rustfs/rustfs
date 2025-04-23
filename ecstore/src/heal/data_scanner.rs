@@ -1030,13 +1030,11 @@ impl FolderScanner {
 
 #[tracing::instrument(level = "info", skip(into, folder_scanner))]
 async fn scan(folder: &CachedFolder, into: &mut DataUsageEntry, folder_scanner: &mut FolderScanner) {
-    let mut dst = if into.compacted {
-        DataUsageEntry::default()
-    } else {
-        into.clone()
-    };
+    if !into.compacted {
+        *into = DataUsageEntry::default();
+    }
 
-    if Box::pin(folder_scanner.scan_folder(folder, &mut dst)).await.is_err() {
+    if Box::pin(folder_scanner.scan_folder(folder, into)).await.is_err() {
         return;
     }
     if !into.compacted {
