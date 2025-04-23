@@ -78,22 +78,27 @@ fn reduce_errs(errs: &[Option<Error>], ignored_errs: &[Box<dyn CheckErrorFn>]) -
     let mut error_map: HashMap<String, usize> = HashMap::new(); // 存err位置
     let nil = "nil".to_string();
     for (i, operr) in errs.iter().enumerate() {
-        if operr.is_none() {
+        if let Some(err) = operr {
+            if is_err_ignored(err, ignored_errs) {
+                continue;
+            }
+
+            let errstr = err.inner_string();
+
+            let _ = *error_map.entry(errstr.clone()).or_insert(i);
+            *error_counts.entry(errstr.clone()).or_insert(0) += 1;
+        } else {
             *error_counts.entry(nil.clone()).or_insert(0) += 1;
             let _ = *error_map.entry(nil.clone()).or_insert(i);
             continue;
         }
 
-        let err = operr.as_ref().unwrap();
+        // let err = operr.as_ref().unwrap();
 
-        if is_err_ignored(err, ignored_errs) {
-            continue;
-        }
+        // let errstr = err.to_string();
 
-        let errstr = err.to_string();
-
-        let _ = *error_map.entry(errstr.clone()).or_insert(i);
-        *error_counts.entry(errstr.clone()).or_insert(0) += 1;
+        // let _ = *error_map.entry(errstr.clone()).or_insert(i);
+        // *error_counts.entry(errstr.clone()).or_insert(0) += 1;
     }
 
     let mut max = 0;
@@ -105,17 +110,14 @@ fn reduce_errs(errs: &[Option<Error>], ignored_errs: &[Box<dyn CheckErrorFn>]) -
         }
     }
 
-    if let Some(&c) = error_counts.get(&max_err) {
-        if let Some(&err_idx) = error_map.get(&max_err) {
-            let err = errs[err_idx].as_ref().map(clone_err);
-
-            return (c, err);
-        }
-
-        return (c, None);
+    if let Some(&err_idx) = error_map.get(&max_err) {
+        let err = errs[err_idx].as_ref().map(clone_err);
+        (max, err)
+    } else if max_err == nil {
+        (max, None)
+    } else {
+        (0, None)
     }
-
-    (0, None)
 }
 
 // 根据quorum验证错误数量
@@ -151,4 +153,115 @@ pub fn reduce_write_quorum_errs(
     write_quorum: usize,
 ) -> Option<Error> {
     reduce_quorum_errs(errs, ignored_errs, write_quorum, QuorumError::Write)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct MockErrorChecker {
+        target_error: String,
+    }
+
+    impl CheckErrorFn for MockErrorChecker {
+        fn is(&self, e: &Error) -> bool {
+            e.inner_string() == self.target_error
+        }
+    }
+
+    fn mock_error(message: &str) -> Error {
+        Error::msg(message.to_string())
+    }
+
+    #[test]
+    fn test_reduce_errs_with_no_errors() {
+        let errs: Vec<Option<Error>> = vec![];
+        let ignored_errs: Vec<Box<dyn CheckErrorFn>> = vec![];
+
+        let (count, err) = reduce_errs(&errs, &ignored_errs);
+
+        assert_eq!(count, 0);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn test_reduce_errs_with_ignored_errors() {
+        let errs = vec![Some(mock_error("ignored_error")), Some(mock_error("ignored_error"))];
+        let ignored_errs: Vec<Box<dyn CheckErrorFn>> = vec![Box::new(MockErrorChecker {
+            target_error: "ignored_error".to_string(),
+        })];
+
+        let (count, err) = reduce_errs(&errs, &ignored_errs);
+
+        assert_eq!(count, 0);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn test_reduce_errs_with_mixed_errors() {
+        let errs = vec![
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+        ];
+        let ignored_errs: Vec<Box<dyn CheckErrorFn>> = vec![Box::new(MockErrorChecker {
+            target_error: "error2".to_string(),
+        })];
+
+        let (count, err) = reduce_errs(&errs, &ignored_errs);
+        println!("count: {}, err: {:?}", count, err);
+        assert_eq!(count, 9);
+        assert_eq!(err.unwrap().to_string(), DiskError::FileNotFound.to_string());
+    }
+
+    #[test]
+    fn test_reduce_errs_with_nil_errors() {
+        let errs = vec![None, Some(mock_error("error1")), None];
+        let ignored_errs: Vec<Box<dyn CheckErrorFn>> = vec![];
+
+        let (count, err) = reduce_errs(&errs, &ignored_errs);
+
+        assert_eq!(count, 2);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn test_reduce_read_quorum_errs() {
+        let errs = vec![
+            Some(mock_error("error1")),
+            Some(mock_error("error1")),
+            Some(mock_error("error2")),
+            None,
+            None,
+        ];
+        let ignored_errs: Vec<Box<dyn CheckErrorFn>> = vec![];
+        let read_quorum = 2;
+
+        let result = reduce_read_quorum_errs(&errs, &ignored_errs, read_quorum);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_reduce_write_quorum_errs_with_quorum_error() {
+        let errs = vec![
+            Some(mock_error("error1")),
+            Some(mock_error("error2")),
+            Some(mock_error("error2")),
+        ];
+        let ignored_errs: Vec<Box<dyn CheckErrorFn>> = vec![];
+        let write_quorum = 3;
+
+        let result = reduce_write_quorum_errs(&errs, &ignored_errs, write_quorum);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to_string(), QuorumError::Write.to_string());
+    }
 }

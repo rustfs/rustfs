@@ -9,7 +9,8 @@ use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
 use crate::error::clone_err;
 use crate::global::{
     get_global_endpoints, is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE,
-    DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
+    DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP,
+    GLOBAL_LOCAL_DISK_SET_DRIVES,
 };
 use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
@@ -232,11 +233,19 @@ impl ECStore {
         }
 
         let wait_sec = 5;
+        let mut exit_count = 0;
         loop {
             if let Err(err) = ec.init().await {
                 error!("init err: {}", err);
                 error!("retry after  {} second", wait_sec);
                 sleep(Duration::from_secs(wait_sec)).await;
+
+                if exit_count > 10 {
+                    return Err(Error::msg("ec init faild"));
+                }
+
+                exit_count += 1;
+
                 continue;
             }
 
@@ -249,6 +258,8 @@ impl ECStore {
     }
 
     pub async fn init(self: &Arc<Self>) -> Result<()> {
+        GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
+
         if self.load_rebalance_meta().await.is_ok() {
             self.start_rebalance().await;
         }
@@ -481,6 +492,8 @@ impl ECStore {
     }
 
     async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
+        // // 先随机返回一个
+
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
         server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
         let total = server_pools.total_available();
@@ -2513,7 +2526,7 @@ fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
     Ok(())
 }
 
-async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
+pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
     let opts = &DiskInfoOptions::default();
     let mut res = vec![None; disks.len()];
     for (idx, disk_op) in disks.iter().enumerate() {
@@ -2534,14 +2547,15 @@ pub struct PoolAvailableSpace {
     pub max_used_pct: u64, // Used disk percentage of most filled disk, rounded down.
 }
 
+#[derive(Debug, Default, Clone)]
 pub struct ServerPoolsAvailableSpace(Vec<PoolAvailableSpace>);
 
 impl ServerPoolsAvailableSpace {
-    fn iter(&self) -> Iter<'_, PoolAvailableSpace> {
+    pub fn iter(&self) -> Iter<'_, PoolAvailableSpace> {
         self.0.iter()
     }
     // TotalAvailable - total available space
-    fn total_available(&self) -> u64 {
+    pub fn total_available(&self) -> u64 {
         let mut total = 0;
         for pool in &self.0 {
             total += pool.available;
@@ -2551,7 +2565,7 @@ impl ServerPoolsAvailableSpace {
 
     // FilterMaxUsed will filter out any pools that has used percent bigger than max,
     // unless all have that, in which case all are preserved.
-    fn filter_max_used(&mut self, max: u64) {
+    pub fn filter_max_used(&mut self, max: u64) {
         if self.0.len() <= 1 {
             // Nothing to do.
             return;
@@ -2572,13 +2586,14 @@ impl ServerPoolsAvailableSpace {
         // Remove entries that are above.
         for pool in self.0.iter_mut() {
             if pool.available > 0 && pool.max_used_pct < max {
-                pool.available = 0
+                continue;
             }
+            pool.available = 0
         }
     }
 }
 
-async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> {
+pub async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> {
     let size = {
         if size < 0 {
             DISK_ASSUME_UNKNOWN_SIZE

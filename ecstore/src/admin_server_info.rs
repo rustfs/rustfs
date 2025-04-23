@@ -1,6 +1,6 @@
 use crate::{
     disk::endpoint::Endpoint,
-    global::GLOBAL_Endpoints,
+    global::{GLOBAL_Endpoints, GLOBAL_BOOT_TIME},
     heal::{
         data_usage::{load_data_usage_from_backend, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT},
         data_usage_cache::DataUsageCache,
@@ -22,11 +22,15 @@ use protos::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 use time::OffsetDateTime;
 use tonic::Request;
 use tracing::warn;
+
+use shadow_rs::shadow;
+
+shadow!(build);
 
 // pub const ITEM_OFFLINE: &str = "offline";
 // pub const ITEM_INITIALIZING: &str = "initializing";
@@ -140,8 +144,12 @@ pub async fn get_local_server_property() -> ServerProperties {
 
     let mut props = ServerProperties {
         endpoint: addr,
-        uptime: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        uptime: SystemTime::now()
+            .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+            .unwrap_or_default()
+            .as_secs(),
         network,
+        version: get_commit_id(),
         ..Default::default()
     };
 
@@ -355,4 +363,15 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
         }
     }
     Ok(pools_info)
+}
+
+#[allow(clippy::const_is_empty)]
+pub fn get_commit_id() -> String {
+    if !build::TAG.is_empty() {
+        build::TAG.to_string()
+    } else if !build::SHORT_COMMIT.is_empty() {
+        format!("@{}", build::SHORT_COMMIT)
+    } else {
+        build::PKG_VERSION.to_string()
+    }
 }

@@ -455,6 +455,7 @@ impl LocalDisk {
                         {
                             if let Err(aerr) = access(volume_dir.as_ref()).await {
                                 if os_is_not_exist(&aerr) {
+                                    warn!("read_metadata_with_dmtime os err {:?}", &aerr);
                                     return Err(Error::new(DiskError::VolumeNotFound));
                                 }
                             }
@@ -534,6 +535,7 @@ impl LocalDisk {
                     if !skip_access_checks(volume) {
                         if let Err(er) = utils::fs::access(volume_dir.as_ref()).await {
                             if os_is_not_exist(&er) {
+                                warn!("read_all_data_with_dmtime os err {:?}", &er);
                                 return Err(Error::new(DiskError::VolumeNotFound));
                             }
                         }
@@ -2090,6 +2092,8 @@ impl DiskAPI for LocalDisk {
 
         Ok(fi)
     }
+
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         let file_path = self.get_object_path(volume, path)?;
         let file_dir = self.get_bucket_path(volume)?;
