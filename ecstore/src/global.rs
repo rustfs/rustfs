@@ -2,8 +2,9 @@ use lazy_static::lazy_static;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
+    time::SystemTime,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
 
 use crate::heal::mrf::MRFState;
@@ -37,6 +38,7 @@ lazy_static! {
     pub static ref GLOBAL_ALlHealState: Arc<AllHealState> = AllHealState::new(false);
     pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
     static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
+    pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
 }
 
 pub fn global_rustfs_port() -> u16 {
