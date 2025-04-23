@@ -14,11 +14,10 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
     SCHEMA_URL,
 };
-use prometheus::{Encoder, Registry, TextEncoder};
+use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::io::IsTerminal;
-use std::sync::Arc;
-use tokio::sync::{Mutex, OnceCell};
-use tracing::{info, warn};
+use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -67,66 +66,20 @@ impl Drop for OtelGuard {
     }
 }
 
-/// Global registry for Prometheus metrics
-static GLOBAL_REGISTRY: OnceCell<Arc<Mutex<Registry>>> = OnceCell::const_new();
-
-/// Get the global registry instance
-/// This function returns a reference to the global registry instance.
-///
-/// # Returns
-/// A reference to the global registry instance
-///
-/// # Example
-/// ```
-/// use rustfs_obs::get_global_registry;
-///
-/// let registry = get_global_registry();
-/// ```
-pub fn get_global_registry() -> Arc<Mutex<Registry>> {
-    GLOBAL_REGISTRY.get().unwrap().clone()
-}
-
-/// Prometheus metric endpoints
-/// This function returns a string containing the Prometheus metrics.
-/// The metrics are collected from the global registry.
-/// The function is used to expose the metrics via an HTTP endpoint.
-///
-/// # Returns
-/// A string containing the Prometheus metrics
-///
-/// # Example
-/// ```
-/// use rustfs_obs::metrics;
-///
-/// async fn main() {
-///    let metrics = metrics().await;
-///   println!("{}", metrics);
-/// }
-/// ```
-pub async fn metrics() -> String {
-    let encoder = TextEncoder::new();
-    // Get a reference to the registry for reading metrics
-    let registry = get_global_registry().lock().await.to_owned();
-    let metric_families = registry.gather();
-    if metric_families.is_empty() {
-        warn!("No metrics available in Prometheus registry");
-    } else {
-        info!("Metrics collected: {} families", metric_families.len());
-    }
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap_or_else(|_| "Error encoding metrics".to_string())
-}
-
 /// create OpenTelemetry Resource
 fn resource(config: &OtelConfig) -> Resource {
-    let config = config.clone();
     Resource::builder()
-        .with_service_name(config.service_name.unwrap_or(SERVICE_NAME.to_string()))
+        .with_service_name(Cow::Borrowed(config.service_name.as_deref().unwrap_or(SERVICE_NAME)).to_string())
         .with_schema_url(
             [
-                KeyValue::new(OTEL_SERVICE_VERSION, config.service_version.unwrap_or(SERVICE_VERSION.to_string())),
-                KeyValue::new(DEPLOYMENT_ENVIRONMENT_NAME, config.environment.unwrap_or(ENVIRONMENT.to_string())),
+                KeyValue::new(
+                    OTEL_SERVICE_VERSION,
+                    Cow::Borrowed(config.service_version.as_deref().unwrap_or(SERVICE_VERSION)).to_string(),
+                ),
+                KeyValue::new(
+                    DEPLOYMENT_ENVIRONMENT_NAME,
+                    Cow::Borrowed(config.environment.as_deref().unwrap_or(ENVIRONMENT)).to_string(),
+                ),
                 KeyValue::new(NETWORK_LOCAL_ADDRESS, get_local_ip_with_default()),
             ],
             SCHEMA_URL,
@@ -141,163 +94,169 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
         .build()
 }
 
-/// Initialize Meter Provider
-fn init_meter_provider(config: &OtelConfig) -> SdkMeterProvider {
-    let mut builder = MeterProviderBuilder::default().with_resource(resource(config));
-    // If endpoint is empty, use stdout output
-    if config.endpoint.is_empty() {
-        builder = builder.with_reader(create_periodic_reader(config.meter_interval.unwrap_or(METER_INTERVAL)));
-    } else {
-        // If endpoint is not empty, use otlp output
-        let exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_tonic()
-            .with_endpoint(&config.endpoint)
-            .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
-            .build()
-            .unwrap();
-        builder = builder.with_reader(
-            PeriodicReader::builder(exporter)
-                .with_interval(std::time::Duration::from_secs(config.meter_interval.unwrap_or(METER_INTERVAL)))
-                .build(),
-        );
-        // If use_stdout is true, output to stdout at the same time
-        if config.use_stdout.unwrap_or(USE_STDOUT) {
-            builder = builder.with_reader(create_periodic_reader(config.meter_interval.unwrap_or(METER_INTERVAL)));
-        }
-    }
-    let registry = Registry::new();
-    // Set global registry
-    GLOBAL_REGISTRY.set(Arc::new(Mutex::new(registry.clone()))).unwrap();
-    // Create Prometheus exporter
-    let prometheus_exporter = opentelemetry_prometheus::exporter().with_registry(registry).build().unwrap();
-    // Build meter provider
-    let meter_provider = builder.with_reader(prometheus_exporter).build();
-    global::set_meter_provider(meter_provider.clone());
-    meter_provider
-}
-
-/// Initialize Tracer Provider
-fn init_tracer_provider(config: &OtelConfig) -> SdkTracerProvider {
-    let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
-    let sampler = if sample_ratio > 0.0 && sample_ratio < 1.0 {
-        Sampler::TraceIdRatioBased(sample_ratio)
-    } else {
-        Sampler::AlwaysOn
-    };
-    let builder = SdkTracerProvider::builder()
-        .with_sampler(sampler)
-        .with_id_generator(RandomIdGenerator::default())
-        .with_resource(resource(config));
-
-    let tracer_provider = if config.endpoint.is_empty() {
-        builder
-            .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
-            .build()
-    } else {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(&config.endpoint)
-            .build()
-            .unwrap();
-        if config.use_stdout.unwrap_or(USE_STDOUT) {
-            builder
-                .with_batch_exporter(exporter)
-                .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
-        } else {
-            builder.with_batch_exporter(exporter)
-        }
-        .build()
-    };
-
-    global::set_tracer_provider(tracer_provider.clone());
-    tracer_provider
-}
-
 /// Initialize Telemetry
 pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
-    let tracer_provider = init_tracer_provider(config);
-    let meter_provider = init_meter_provider(config);
+    // avoid repeated access to configuration fields
+    let endpoint = &config.endpoint;
+    let use_stdout = config.use_stdout.unwrap_or(USE_STDOUT);
+    let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
+    let logger_level = config.logger_level.as_deref().unwrap_or(LOGGER_LEVEL);
+    let service_name = config.service_name.as_deref().unwrap_or(SERVICE_NAME);
 
-    // Initialize logger provider based on configuration
-    let logger_provider = {
-        let mut builder = SdkLoggerProvider::builder().with_resource(resource(config));
+    // Pre-create resource objects to avoid repeated construction
+    let res = resource(config);
 
-        if config.endpoint.is_empty() {
-            // Use stdout exporter when no endpoint is configured
-            builder = builder.with_simple_exporter(opentelemetry_stdout::LogExporter::default());
+    // initialize tracer provider
+    let tracer_provider = {
+        let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
+        let sampler = if sample_ratio > 0.0 && sample_ratio < 1.0 {
+            Sampler::TraceIdRatioBased(sample_ratio)
         } else {
-            // Configure OTLP exporter when endpoint is provided
+            Sampler::AlwaysOn
+        };
+
+        let builder = SdkTracerProvider::builder()
+            .with_sampler(sampler)
+            .with_id_generator(RandomIdGenerator::default())
+            .with_resource(res.clone());
+
+        let tracer_provider = if endpoint.is_empty() {
+            builder
+                .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
+                .build()
+        } else {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .unwrap();
+
+            let builder = if use_stdout {
+                builder
+                    .with_batch_exporter(exporter)
+                    .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
+            } else {
+                builder.with_batch_exporter(exporter)
+            };
+
+            builder.build()
+        };
+
+        global::set_tracer_provider(tracer_provider.clone());
+        tracer_provider
+    };
+
+    // initialize meter provider
+    let meter_provider = {
+        let mut builder = MeterProviderBuilder::default().with_resource(res.clone());
+
+        if endpoint.is_empty() {
+            builder = builder.with_reader(create_periodic_reader(meter_interval));
+        } else {
+            let exporter = opentelemetry_otlp::MetricExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
+                .build()
+                .unwrap();
+
+            builder = builder.with_reader(
+                PeriodicReader::builder(exporter)
+                    .with_interval(std::time::Duration::from_secs(meter_interval))
+                    .build(),
+            );
+
+            if use_stdout {
+                builder = builder.with_reader(create_periodic_reader(meter_interval));
+            }
+        }
+
+        let meter_provider = builder.build();
+        global::set_meter_provider(meter_provider.clone());
+        meter_provider
+    };
+
+    // initialize logger provider
+    let logger_provider = {
+        let mut builder = SdkLoggerProvider::builder().with_resource(res);
+
+        if endpoint.is_empty() {
+            builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
+        } else {
             let exporter = opentelemetry_otlp::LogExporter::builder()
                 .with_tonic()
-                .with_endpoint(&config.endpoint)
+                .with_endpoint(endpoint)
                 .build()
                 .unwrap();
 
             builder = builder.with_batch_exporter(exporter);
 
-            // Add stdout exporter if requested
-            if config.use_stdout.unwrap_or(USE_STDOUT) {
+            if use_stdout {
                 builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
             }
         }
 
         builder.build()
     };
-    let config = config.clone();
-    let logger_level = config.logger_level.unwrap_or(LOGGER_LEVEL.to_string());
-    let logger_level = logger_level.as_str();
-    // Setup OpenTelemetryTracingBridge layer
-    let otel_layer = {
-        // Filter to prevent infinite telemetry loops
-        // This blocks events from OpenTelemetry and its dependent libraries (tonic, reqwest, etc.)
-        // from being sent back to OpenTelemetry itself
-        let filter_otel = match logger_level {
-            "trace" | "debug" => {
-                info!("OpenTelemetry tracing initialized with level: {}", logger_level);
-                EnvFilter::new(logger_level)
-            }
-            _ => {
-                let mut filter = EnvFilter::new(logger_level);
-                for directive in ["hyper", "tonic", "h2", "reqwest", "tower"] {
-                    filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
+
+    // configuring tracing
+    {
+        // optimize filter configuration
+        let otel_layer = {
+            let filter_otel = match logger_level {
+                "trace" | "debug" => {
+                    info!("OpenTelemetry tracing initialized with level: {}", logger_level);
+                    EnvFilter::new(logger_level)
                 }
-                filter
-            }
+                _ => {
+                    let mut filter = EnvFilter::new(logger_level);
+
+                    // use smallvec to avoid heap allocation
+                    let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
+
+                    for directive in directives {
+                        filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
+                    }
+                    filter
+                }
+            };
+            layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(filter_otel)
         };
-        layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(filter_otel)
-    };
 
-    let tracer = tracer_provider.tracer(config.service_name.unwrap_or(SERVICE_NAME.to_string()));
-    let registry = tracing_subscriber::registry()
-        .with(switch_level(logger_level))
-        .with(OpenTelemetryLayer::new(tracer))
-        .with(MetricsLayer::new(meter_provider.clone()))
-        .with(otel_layer)
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(logger_level)));
+        let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
 
-    // Configure formatting layer
-    let enable_color = std::io::stdout().is_terminal();
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(enable_color)
-        .with_thread_names(true)
-        .with_file(true)
-        .with_line_number(true);
+        // Configure registry to avoid repeated calls to filter methods
+        let level_filter = switch_level(logger_level);
+        let registry = tracing_subscriber::registry()
+            .with(level_filter)
+            .with(OpenTelemetryLayer::new(tracer))
+            .with(MetricsLayer::new(meter_provider.clone()))
+            .with(otel_layer)
+            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(logger_level)));
 
-    // Creating a formatting layer with explicit type to avoid type mismatches
-    let fmt_layer = fmt_layer.with_filter(
-        EnvFilter::new(logger_level).add_directive(
-            format!("opentelemetry={}", if config.endpoint.is_empty() { logger_level } else { "off" })
-                .parse()
-                .unwrap(),
-        ),
-    );
+        // configure the formatting layer
+        let enable_color = std::io::stdout().is_terminal();
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(enable_color)
+            .with_thread_names(true)
+            .with_file(true)
+            .with_line_number(true)
+            .with_filter(
+                EnvFilter::new(logger_level).add_directive(
+                    format!("opentelemetry={}", if endpoint.is_empty() { logger_level } else { "off" })
+                        .parse()
+                        .unwrap(),
+                ),
+            );
 
-    registry.with(ErrorLayer::default()).with(fmt_layer).init();
-    if !config.endpoint.is_empty() {
-        info!(
-            "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {}",
-            config.endpoint, logger_level
-        );
+        registry.with(ErrorLayer::default()).with(fmt_layer).init();
+
+        if !endpoint.is_empty() {
+            info!(
+                "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {}",
+                endpoint, logger_level
+            );
+        }
     }
 
     OtelGuard {
@@ -309,12 +268,13 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
 /// Switch log level
 fn switch_level(logger_level: &str) -> tracing_subscriber::filter::LevelFilter {
+    use tracing_subscriber::filter::LevelFilter;
     match logger_level {
-        "error" => tracing_subscriber::filter::LevelFilter::ERROR,
-        "warn" => tracing_subscriber::filter::LevelFilter::WARN,
-        "info" => tracing_subscriber::filter::LevelFilter::INFO,
-        "debug" => tracing_subscriber::filter::LevelFilter::DEBUG,
-        "trace" => tracing_subscriber::filter::LevelFilter::TRACE,
-        _ => tracing_subscriber::filter::LevelFilter::OFF,
+        "error" => LevelFilter::ERROR,
+        "warn" => LevelFilter::WARN,
+        "info" => LevelFilter::INFO,
+        "debug" => LevelFilter::DEBUG,
+        "trace" => LevelFilter::TRACE,
+        _ => LevelFilter::OFF,
     }
 }

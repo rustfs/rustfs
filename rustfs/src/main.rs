@@ -47,7 +47,7 @@ use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_event_notifier::NotifierConfig;
-use rustfs_obs::{init_obs, load_config, set_global_guard, InitLogStatus};
+use rustfs_obs::{init_obs, init_system_metrics, load_config, set_global_guard, InitLogStatus};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
@@ -121,6 +121,16 @@ async fn main() -> Result<()> {
         });
     } else {
         info!("event_config is empty");
+    }
+
+    let meter = opentelemetry::global::meter("system");
+    let _ = init_system_metrics(meter).await;
+
+    // If GPU function is enabled, specific functions can be used
+    #[cfg(feature = "gpu")]
+    {
+        let gpu_meter = opentelemetry::global::meter("system.gpu");
+        let _ = rustfs_obs::init_gpu_metrics(gpu_meter).await;
     }
 
     // Run parameters

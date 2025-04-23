@@ -46,12 +46,13 @@ local-ip-address = { workspace = true }
 matchit = { workspace = true }
 mime.workspace = true
 mime_guess = { workspace = true }
+opentelemetry = { workspace = true }
 pin-project-lite.workspace = true
 protos.workspace = true
 query = { workspace = true }
 rmp-serde.workspace = true
 rustfs-event-notifier = { workspace = true }
-rustfs-obs = { workspace = true }
+rustfs-obs = { workspace = true, features = ["gpu"] }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true

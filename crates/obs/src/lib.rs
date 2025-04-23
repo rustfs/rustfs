@@ -1,23 +1,24 @@
-/// # obs
-///
-/// `obs` is a logging and observability library for Rust.
-/// It provides a simple and easy-to-use interface for logging and observability.
-/// It is built on top of the `log` crate and `opentelemetry` crate.
-///
-/// ## Features
-/// - Structured logging
-/// - Distributed tracing
-/// - Metrics collection
-/// - Log processing worker
-/// - Multiple sinks
-/// - Configuration-based setup
-/// - Telemetry guard
-/// - Global logger
-/// - Log levels
-/// - Log entry types
-/// - Log record
-/// - Object version
-/// - Local IP address
+//! # RustFS Observability
+//!
+//! provides tools for system and service monitoring
+//!
+//! ## feature mark
+//!
+//! - `file`: enable file logging enabled by default
+//! - `gpu`: gpu monitoring function
+//! - `kafka`: enable kafka metric output
+//! - `webhook`: enable webhook notifications
+//! - `full`: includes all functions
+//!
+//! to enable gpu monitoring add in cargo toml
+//!
+//! ```toml
+//! # using gpu monitoring
+//! rustfs-obs = { version = "0.1.0", features = ["gpu"] }
+//!
+//! # use all functions
+//! rustfs-obs = { version = "0.1.0", features = ["full"] }
+//! ```
 ///
 /// ## Usage
 ///
@@ -31,10 +32,15 @@ mod config;
 mod entry;
 mod global;
 mod logger;
+mod metrics;
 mod sink;
 mod telemetry;
 mod utils;
 mod worker;
+
+#[cfg(feature = "gpu")]
+pub use crate::metrics::init_gpu_metrics;
+
 pub use config::load_config;
 pub use config::{AppConfig, OtelConfig};
 pub use entry::args::Args;
@@ -42,15 +48,15 @@ pub use entry::audit::{ApiDetails, AuditLogEntry};
 pub use entry::base::BaseLogEntry;
 pub use entry::unified::{ConsoleLogEntry, ServerLogEntry, UnifiedLogEntry};
 pub use entry::{LogKind, LogRecord, ObjectVersion, SerializableLevel};
-pub use global::{get_global_guard, set_global_guard, try_get_global_guard, GuardError};
+pub use global::{get_global_guard, set_global_guard, try_get_global_guard, GlobalError};
 pub use logger::{ensure_logger_initialized, log_debug, log_error, log_info, log_trace, log_warn, log_with_context};
 pub use logger::{get_global_logger, init_global_logger, locked_logger, start_logger};
 pub use logger::{log_init_state, InitLogStatus};
 pub use logger::{LogError, Logger};
+pub use metrics::{init_system_metrics, init_system_metrics_for_pid};
 pub use sink::Sink;
 use std::sync::Arc;
 pub use telemetry::init_telemetry;
-pub use telemetry::{get_global_registry, metrics};
 use tokio::sync::Mutex;
 pub use utils::{get_local_ip, get_local_ip_with_default};
 pub use worker::start_worker;
