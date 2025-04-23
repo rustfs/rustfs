@@ -1,16 +1,18 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
+use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::bucket::error::BucketMetadataError;
 use crate::bucket::metadata::{load_bucket_metadata_parse, BUCKET_LIFECYCLE_CONFIG};
 use crate::bucket::utils::is_meta_bucketname;
-use crate::config;
 use crate::config::error::ConfigError;
 use crate::disk::error::DiskError;
 use crate::global::{is_dist_erasure, is_erasure, new_object_layer_fn, GLOBAL_Endpoints};
+use crate::heal::heal_commands::HealOpts;
 use crate::store::ECStore;
 use crate::utils::xml::deserialize;
+use crate::{config, StorageAPI};
 use common::error::{Error, Result};
 use futures::future::join_all;
 use policy::policy::BucketPolicy;
@@ -20,6 +22,7 @@ use s3s::dto::{
 };
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 use tracing::{error, warn};
 
 use super::metadata::{load_bucket_metadata, BucketMetadata};
@@ -196,7 +199,22 @@ impl BucketMetadataSys {
         let mut futures = Vec::new();
 
         for bucket in buckets.iter() {
-            futures.push(load_bucket_metadata(self.api.clone(), bucket.as_str()));
+            // TODO: HealBucket
+            let api = self.api.clone();
+            let bucket = bucket.clone();
+            futures.push(async move {
+                sleep(Duration::from_millis(30)).await;
+                let _ = api
+                    .heal_bucket(
+                        &bucket,
+                        &HealOpts {
+                            recreate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                load_bucket_metadata(self.api.clone(), bucket.as_str()).await
+            });
         }
 
         let results = join_all(futures).await;
@@ -205,6 +223,7 @@ impl BucketMetadataSys {
 
         let mut mp = self.metadata_map.write().await;
 
+        // TODO:EventNotifier,BucketTargetSys
         for res in results {
             match res {
                 Ok(res) => {

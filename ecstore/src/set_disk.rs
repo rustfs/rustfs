@@ -402,6 +402,7 @@ impl SetDisks {
     }
 
     #[allow(dead_code)]
+    #[tracing::instrument(level = "debug", skip(self, disks))]
     async fn commit_rename_data_dir(
         &self,
         disks: &[Option<DiskStore>],
@@ -847,6 +848,7 @@ impl SetDisks {
     // Returns per object readQuorum and writeQuorum
     // readQuorum is the min required disks to read data.
     // writeQuorum is the min required disks to write data.
+    #[tracing::instrument(level = "debug", skip(parts_metadata))]
     fn object_quorum_from_meta(
         parts_metadata: &[FileInfo],
         errs: &[Option<Error>],
@@ -859,7 +861,7 @@ impl SetDisks {
         };
 
         if let Some(err) = reduce_read_quorum_errs(errs, object_op_ignored_errs().as_ref(), expected_rquorum) {
-            // warn!("object_quorum_from_meta err {:?}", &err);
+            warn!("object_quorum_from_meta err {:?}", &err);
             return Err(err);
         }
 
@@ -1581,7 +1583,7 @@ impl SetDisks {
     //     Ok(())
     // }
 
-    // #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self))]
     pub async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
         let disks = self.disks.read().await;
 
@@ -1744,7 +1746,7 @@ impl SetDisks {
         // TODO: 优化并发 可用数量中断
         let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
-        // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
+        warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
@@ -4187,7 +4189,11 @@ impl StorageAPI for SetDisks {
 
         //     _ns = Some(ns_lock);
         // }
-        let (fi, _, _) = self.get_object_fileinfo(bucket, object, opts, false).await?;
+
+        let (fi, _, _) = self
+            .get_object_fileinfo(bucket, object, opts, false)
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
         // warn!("get object_info fi {:?}", &fi);
 

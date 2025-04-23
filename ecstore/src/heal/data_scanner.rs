@@ -1073,10 +1073,9 @@ pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) 
             continue;
         }
         let rule_prefix = lc_get_prefix(rule);
-        if !prefix.is_empty() && !rule_prefix.is_empty() {
-            if !prefix.starts_with(&rule_prefix) && !rule_prefix.starts_with(prefix) {
-                continue;
-            }
+        if !prefix.is_empty() && !rule_prefix.is_empty() && !prefix.starts_with(&rule_prefix) && !rule_prefix.starts_with(prefix)
+        {
+            continue;
         }
 
         if let Some(e) = &rule.noncurrent_version_expiration {

@@ -254,7 +254,11 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         let filter_otel = match logger_level {
             "trace" | "debug" => {
                 info!("OpenTelemetry tracing initialized with level: {}", logger_level);
-                EnvFilter::new(logger_level)
+                let mut filter = EnvFilter::new(logger_level);
+                for directive in ["hyper", "tonic", "h2", "reqwest", "tower"] {
+                    filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
+                }
+                filter
             }
             _ => {
                 let mut filter = EnvFilter::new(logger_level);

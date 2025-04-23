@@ -66,6 +66,10 @@ impl Error {
         self.downcast_ref::<std::io::Error>()
             .map(|e| std::io::Error::new(e.kind(), e.to_string()))
     }
+
+    pub fn inner_string(&self) -> String {
+        self.inner.to_string()
+    }
 }
 
 impl<T: std::error::Error + Send + Sync + 'static> From<T> for Error {
