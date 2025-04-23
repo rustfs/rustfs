@@ -9,7 +9,8 @@ use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
 use crate::error::clone_err;
 use crate::global::{
     get_global_endpoints, is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE,
-    DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
+    DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP,
+    GLOBAL_LOCAL_DISK_SET_DRIVES,
 };
 use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
@@ -257,6 +258,8 @@ impl ECStore {
     }
 
     pub async fn init(self: &Arc<Self>) -> Result<()> {
+        GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
+
         if self.load_rebalance_meta().await.is_ok() {
             self.start_rebalance().await;
         }
