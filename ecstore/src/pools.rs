@@ -1284,7 +1284,7 @@ impl SetDisks {
     }
 }
 
-fn get_total_usable_capacity(disks: &[madmin::Disk], info: &madmin::StorageInfo) -> usize {
+pub fn get_total_usable_capacity(disks: &[madmin::Disk], info: &madmin::StorageInfo) -> usize {
     let mut capacity = 0;
     for disk in disks.iter() {
         if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
@@ -1297,7 +1297,7 @@ fn get_total_usable_capacity(disks: &[madmin::Disk], info: &madmin::StorageInfo)
     capacity
 }
 
-fn get_total_usable_capacity_free(disks: &[madmin::Disk], info: &madmin::StorageInfo) -> usize {
+pub fn get_total_usable_capacity_free(disks: &[madmin::Disk], info: &madmin::StorageInfo) -> usize {
     let mut capacity = 0;
     for disk in disks.iter() {
         if disk.pool_index < 0 || info.backend.standard_sc_data.len() <= disk.pool_index as usize {
