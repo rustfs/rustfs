@@ -1,4 +1,5 @@
-use crate::global::get_global_endpoints;
+use crate::admin_server_info::get_commit_id;
+use crate::global::{get_global_endpoints, GLOBAL_BOOT_TIME};
 use crate::peer_rest_client::PeerRestClient;
 use crate::StorageAPI;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
@@ -7,6 +8,7 @@ use futures::future::join_all;
 use lazy_static::lazy_static;
 use madmin::{ItemState, ServerProperties};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 use tracing::error;
 
 lazy_static! {
@@ -104,6 +106,11 @@ impl NotificationSys {
                     match client.server_info().await {
                         Ok(info) => info,
                         Err(_) => ServerProperties {
+                            uptime: SystemTime::now()
+                                .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+                                .unwrap_or_default()
+                                .as_secs(),
+                            version: get_commit_id(),
                             endpoint: client.host.to_string(),
                             state: ItemState::Offline.to_string().to_owned(),
                             disks: get_offline_disks(&client.host.to_string(), &get_global_endpoints()),

@@ -1029,13 +1029,11 @@ impl FolderScanner {
 
 #[tracing::instrument(level = "info", skip(into, folder_scanner))]
 async fn scan(folder: &CachedFolder, into: &mut DataUsageEntry, folder_scanner: &mut FolderScanner) {
-    let mut dst = if into.compacted {
-        DataUsageEntry::default()
-    } else {
-        into.clone()
-    };
+    if !into.compacted {
+        *into = DataUsageEntry::default();
+    }
 
-    if Box::pin(folder_scanner.scan_folder(folder, &mut dst)).await.is_err() {
+    if Box::pin(folder_scanner.scan_folder(folder, into)).await.is_err() {
         return;
     }
     if !into.compacted {
@@ -1075,10 +1073,9 @@ pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) 
             continue;
         }
         let rule_prefix = lc_get_prefix(rule);
-        if !prefix.is_empty() && !rule_prefix.is_empty() {
-            if !prefix.starts_with(&rule_prefix) && !rule_prefix.starts_with(prefix) {
-                continue;
-            }
+        if !prefix.is_empty() && !rule_prefix.is_empty() && !prefix.starts_with(&rule_prefix) && !rule_prefix.starts_with(prefix)
+        {
+            continue;
         }
 
         if let Some(e) = &rule.noncurrent_version_expiration {

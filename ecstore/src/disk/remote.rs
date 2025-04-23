@@ -680,6 +680,7 @@ impl DiskAPI for RemoteDisk {
         Ok(file_info)
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         info!("read_xl {}/{}/{}", self.endpoint.to_string(), volume, path);
         let mut client = node_service_time_out_client(&self.addr)

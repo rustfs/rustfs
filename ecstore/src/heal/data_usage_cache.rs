@@ -541,7 +541,7 @@ impl DataUsageCache {
         match self.find(path) {
             Some(root) => {
                 if root.children.is_empty() {
-                    return None;
+                    return Some(root);
                 }
                 let mut flat = self.flatten(&root);
                 if flat.replication_stats.is_some() && flat.replication_stats.as_ref().unwrap().empty() {
