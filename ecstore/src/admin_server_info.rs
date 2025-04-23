@@ -367,11 +367,13 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
 
 #[allow(clippy::const_is_empty)]
 pub fn get_commit_id() -> String {
-    if !build::TAG.is_empty() {
+    let ver = if !build::TAG.is_empty() {
         build::TAG.to_string()
     } else if !build::SHORT_COMMIT.is_empty() {
-        format!("@{}", build::SHORT_COMMIT)
+        build::SHORT_COMMIT.to_string()
     } else {
         build::PKG_VERSION.to_string()
-    }
+    };
+
+    format!("{}@{}", build::COMMIT_DATE_3339, ver)
 }
