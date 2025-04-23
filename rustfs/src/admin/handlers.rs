@@ -13,6 +13,8 @@ use ecstore::heal::heal_ops::new_heal_sequence;
 use ecstore::metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType};
 use ecstore::new_object_layer_fn;
 use ecstore::peer::is_reserved_or_invalid_bucket;
+use ecstore::pools::get_total_usable_capacity;
+use ecstore::pools::get_total_usable_capacity_free;
 use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::StorageAPI;
@@ -332,10 +334,17 @@ impl Operation for DataUsageInfoHandler {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let info = load_data_usage_from_backend(store).await.map_err(|e| {
+        let mut info = load_data_usage_from_backend(store.clone()).await.map_err(|e| {
             error!("load_data_usage_from_backend failed {:?}", e);
             s3_error!(InternalError, "load_data_usage_from_backend failed")
         })?;
+
+        let sinfo = store.storage_info().await;
+        info.total_capacity = get_total_usable_capacity(&sinfo.disks, &sinfo) as u64;
+        info.total_free_capacity = get_total_usable_capacity_free(&sinfo.disks, &sinfo) as u64;
+        if info.total_capacity > info.total_free_capacity {
+            info.total_used_capacity = info.total_capacity - info.total_free_capacity;
+        }
 
         let data = serde_json::to_vec(&info)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse DataUsageInfo failed"))?;
