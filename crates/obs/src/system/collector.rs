@@ -54,22 +54,22 @@ impl Collector {
         self.system
             .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.pid]), true);
 
-        // 刷新网络接口列表和统计数据
-        self.networks.refresh(false); // 刷新网络统计数据
+        // refresh the network interface list and statistics
+        self.networks.refresh(false);
 
         let process = self
             .system
             .process(self.pid)
             .ok_or_else(|| GlobalError::ProcessNotFound(self.pid.as_u32()))?;
 
-        // CPU 指标
+        // CPU metrics
         let cpu_usage = process.cpu_usage();
         self.metrics.cpu_usage.record(cpu_usage as f64, &[]);
         self.metrics
             .cpu_utilization
             .record((cpu_usage / self.core_count as f32) as f64, &self.attributes.attributes);
 
-        // 内存指标
+        // Memory metrics
         self.metrics
             .memory_usage
             .record(process.memory() as i64, &self.attributes.attributes);
@@ -77,7 +77,7 @@ impl Collector {
             .memory_virtual
             .record(process.virtual_memory() as i64, &self.attributes.attributes);
 
-        // 磁盘I/O指标
+        // Disk I/O metrics
         let disk_io = process.disk_usage();
         self.metrics.disk_io.record(
             disk_io.read_bytes as i64,
@@ -88,11 +88,11 @@ impl Collector {
             &[&self.attributes.attributes[..], &[KeyValue::new(DIRECTION, "write")]].concat(),
         );
 
-        // 网络I/O指标（对应 /system/network/internode）
+        // Network I/O indicators (corresponding to /system/network/internode)
         let mut total_received: i64 = 0;
         let mut total_transmitted: i64 = 0;
 
-        // 按接口统计
+        // statistics by interface
         for (interface_name, data) in self.networks.iter() {
             total_received += data.total_received() as i64;
             total_transmitted += data.total_transmitted() as i64;
@@ -122,7 +122,7 @@ impl Collector {
                 .concat(),
             );
         }
-        // 全局统计
+        // global statistics
         self.metrics.network_io.record(
             total_received,
             &[&self.attributes.attributes[..], &[KeyValue::new(DIRECTION, "received")]].concat(),
@@ -132,12 +132,12 @@ impl Collector {
             &[&self.attributes.attributes[..], &[KeyValue::new(DIRECTION, "transmitted")]].concat(),
         );
 
-        // 进程状态指标（对应 /system/process）
+        // Process status indicator (corresponding to /system/process)
         let status_value = match process.status() {
             ProcessStatus::Run => 0,
             ProcessStatus::Sleep => 1,
             ProcessStatus::Zombie => 2,
-            _ => 3, // 其他状态
+            _ => 3, // other status
         };
         self.metrics.process_status.record(
             status_value,
@@ -148,7 +148,7 @@ impl Collector {
             .concat(),
         );
 
-        // GPU 指标（可选）
+        // GPU Metrics (Optional) Non-MacOS
         self.gpu_collector.collect(&self.metrics, &self.attributes)?;
 
         Ok(())

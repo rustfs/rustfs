@@ -451,17 +451,9 @@ async fn run(opt: config::Opt) -> Result<()> {
             }
         }
         worker_state_manager.update(ServiceState::Stopping);
-        // tokio::select! {
-        //     () = graceful.shutdown() => {
-        //          debug!("Gracefully shutdown!");
-        //     },
-        //     () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-        //          debug!("Waited 10 seconds for graceful shutdown, aborting...");
-        //     }
-        // }
         match Arc::try_unwrap(graceful) {
             Ok(g) => {
-                // 成功获取唯一所有权，可以调用 shutdown
+                // Successfully obtaining unique ownership, you can call shutdown
                 tokio::select! {
                     () = g.shutdown() => {
                         debug!("Gracefully shutdown!");
@@ -472,10 +464,9 @@ async fn run(opt: config::Opt) -> Result<()> {
                 }
             }
             Err(arc_graceful) => {
-                // 还有其他引用存在，无法获取唯一所有权
-                debug!("Cannot perform graceful shutdown, other references exist");
+                // There are other references that cannot be obtained for unique ownership
                 error!("Cannot perform graceful shutdown, other references exist err: {:?}", arc_graceful);
-                // 在这种情况下，我们只能等待超时
+                // In this case, we can only wait for the timeout
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 debug!("Timeout reached, forcing shutdown");
             }
