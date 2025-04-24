@@ -1232,7 +1232,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let mut resp = CheckPartsResp {
-            results: Vec::with_capacity(fi.parts.len()),
+            results: vec![0; fi.parts.len()],
         };
 
         let erasure = &fi.erasure;

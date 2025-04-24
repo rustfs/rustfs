@@ -1,4 +1,5 @@
 use ecstore::{
+    config::error::is_err_config_not_found,
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt},
@@ -128,9 +129,13 @@ impl Operation for RebalanceStatus {
         };
 
         let mut meta = RebalanceMeta::new();
-        meta.load(store.pools[0].clone())
-            .await
-            .map_err(|e| s3_error!(InternalError, "Failed to load rebalance meta: {}", e))?;
+        if let Err(err) = meta.load(store.pools[0].clone()).await {
+            if is_err_config_not_found(&err) {
+                return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
+            }
+
+            return Err(s3_error!(InternalError, "Failed to load rebalance meta: {}", err));
+        }
 
         // Compute disk usage percentage
         let si = store.storage_info().await;
