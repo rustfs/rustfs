@@ -629,7 +629,11 @@ impl LocalDisk {
                 let _ = fm.data.remove(vec![vid, dir]);
 
                 let dir_path = self.get_object_path(volume, format!("{}/{}", path, dir).as_str())?;
-                self.move_to_trash(&dir_path, true, false).await?;
+                if let Err(err) = self.move_to_trash(&dir_path, true, false).await {
+                    if !(is_err_file_not_found(&err) || is_err_os_not_exist(&err)) {
+                        return Err(err);
+                    }
+                };
             }
         }
 
