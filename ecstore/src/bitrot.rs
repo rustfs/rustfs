@@ -6,6 +6,7 @@ use crate::{
 };
 use blake2::Blake2b512;
 use blake2::Digest as _;
+use bytes::Bytes;
 use common::error::{Error, Result};
 use highway::{HighwayHash, HighwayHasher, Key};
 use lazy_static::lazy_static;
@@ -533,20 +534,26 @@ impl Writer for BitrotFileWriter {
         self
     }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<()> {
+    async fn write(&mut self, buf: Bytes) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
-        self.hasher.reset();
-        self.hasher.update(buf);
-        let hash_bytes = self.hasher.clone().finalize();
+        let mut hasher = self.hasher.clone();
+        let h_buf = buf.clone();
+        let hash_bytes = tokio::spawn(async move {
+            hasher.reset();
+            hasher.update(h_buf);
+            hasher.finalize()
+        })
+        .await
+        .unwrap();
 
         if let Some(f) = self.inner.as_mut() {
             f.write_all(&hash_bytes).await?;
-            f.write_all(buf).await?;
+            f.write_all(&buf).await?;
         } else {
             self.inline_data.extend_from_slice(&hash_bytes);
-            self.inline_data.extend_from_slice(buf);
+            self.inline_data.extend_from_slice(&buf);
         }
 
         Ok(())
