@@ -32,34 +32,35 @@ mod config;
 mod entry;
 mod global;
 mod logger;
-mod metrics;
 mod sink;
+mod system;
 mod telemetry;
 mod utils;
 mod worker;
 
-#[cfg(feature = "gpu")]
-pub use crate::metrics::init_gpu_metrics;
-
+use crate::logger::InitLogStatus;
 pub use config::load_config;
-pub use config::{AppConfig, OtelConfig};
+#[cfg(feature = "file")]
+pub use config::FileSinkConfig;
+#[cfg(feature = "kafka")]
+pub use config::KafkaSinkConfig;
+#[cfg(feature = "webhook")]
+pub use config::WebhookSinkConfig;
+pub use config::{AppConfig, LoggerConfig, OtelConfig, SinkConfig};
 pub use entry::args::Args;
 pub use entry::audit::{ApiDetails, AuditLogEntry};
 pub use entry::base::BaseLogEntry;
 pub use entry::unified::{ConsoleLogEntry, ServerLogEntry, UnifiedLogEntry};
 pub use entry::{LogKind, LogRecord, ObjectVersion, SerializableLevel};
 pub use global::{get_global_guard, set_global_guard, try_get_global_guard, GlobalError};
-pub use logger::{ensure_logger_initialized, log_debug, log_error, log_info, log_trace, log_warn, log_with_context};
-pub use logger::{get_global_logger, init_global_logger, locked_logger, start_logger};
-pub use logger::{log_init_state, InitLogStatus};
-pub use logger::{LogError, Logger};
-pub use metrics::{init_system_metrics, init_system_metrics_for_pid};
-pub use sink::Sink;
+pub use logger::Logger;
+pub use logger::{get_global_logger, init_global_logger, start_logger};
+pub use logger::{log_debug, log_error, log_info, log_trace, log_warn, log_with_context};
 use std::sync::Arc;
+pub use system::{init_process_observer, init_process_observer_for_pid};
 pub use telemetry::init_telemetry;
 use tokio::sync::Mutex;
-pub use utils::{get_local_ip, get_local_ip_with_default};
-pub use worker::start_worker;
+use tracing::{error, info};
 
 /// Initialize the observability module
 ///
@@ -80,6 +81,19 @@ pub async fn init_obs(config: AppConfig) -> (Arc<Mutex<Logger>>, telemetry::Otel
     let guard = init_telemetry(&config.observability);
     let sinks = sink::create_sinks(&config).await;
     let logger = init_global_logger(&config, sinks).await;
+    let obs_config = config.observability.clone();
+    tokio::spawn(async move {
+        let result = InitLogStatus::init_start_log(&obs_config).await;
+        match result {
+            Ok(_) => {
+                info!("Logger initialized successfully");
+            }
+            Err(e) => {
+                error!("Failed to initialize logger: {}", e);
+            }
+        }
+    });
+
     (logger, guard)
 }
 

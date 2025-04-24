@@ -166,7 +166,8 @@ impl SimpleQueryDispatcher {
                 if let Some(delimiter) = csv.field_delimiter.as_ref() {
                     file_format = file_format.with_delimiter(delimiter.as_bytes().first().copied().unwrap_or_default());
                 }
-                if csv.file_header_info.is_some() {}
+                // TODO waiting for processing @junxiang Mu
+                // if csv.file_header_info.is_some() {}
                 match csv.file_header_info.as_ref() {
                     Some(info) => {
                         if *info == *NONE {

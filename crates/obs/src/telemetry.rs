@@ -1,5 +1,6 @@
 use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION, USE_STDOUT};
-use crate::{get_local_ip_with_default, OtelConfig};
+use crate::utils::get_local_ip_with_default;
+use crate::OtelConfig;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer;

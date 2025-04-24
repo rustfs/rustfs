@@ -23,17 +23,20 @@ pub enum GlobalError {
     NotInitialized,
     #[error("Global system metrics err: {0}")]
     MetricsError(String),
-    #[error("Failed to get process ID: {0}")]
-    GetPidError(String),
-    #[error("Type conversion error: {0}")]
-    ConversionError(String),
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
-    #[error("System metrics error: {0}")]
-    SystemMetricsError(String),
-    #[cfg(feature = "gpu")]
-    #[error("GPU metrics error: {0}")]
-    GpuMetricsError(String),
+    #[error("Failed to get current PID: {0}")]
+    PidError(String),
+    #[error("Process with PID {0} not found")]
+    ProcessNotFound(u32),
+    #[error("Failed to get physical core count")]
+    CoreCountError,
+    #[error("GPU initialization failed: {0}")]
+    GpuInitError(String),
+    #[error("GPU device not found: {0}")]
+    GpuDeviceError(String),
+    #[error("Failed to send log: {0}")]
+    SendFailed(&'static str),
+    #[error("Operation timed out: {0}")]
+    Timeout(&'static str),
 }
 
 /// Set the global guard for OpenTelemetry

@@ -1,5 +1,6 @@
 use crate::global::{ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION};
-use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, OtelConfig, ServerLogEntry, Sink, UnifiedLogEntry};
+use crate::sink::Sink;
+use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -43,26 +44,26 @@ impl Logger {
 
     /// Log a server entry
     #[tracing::instrument(skip(self), fields(log_source = "logger_server"))]
-    pub async fn log_server_entry(&self, entry: ServerLogEntry) -> Result<(), LogError> {
+    pub async fn log_server_entry(&self, entry: ServerLogEntry) -> Result<(), GlobalError> {
         self.log_entry(UnifiedLogEntry::Server(entry)).await
     }
 
     /// Log an audit entry
     #[tracing::instrument(skip(self), fields(log_source = "logger_audit"))]
-    pub async fn log_audit_entry(&self, entry: AuditLogEntry) -> Result<(), LogError> {
+    pub async fn log_audit_entry(&self, entry: AuditLogEntry) -> Result<(), GlobalError> {
         self.log_entry(UnifiedLogEntry::Audit(Box::new(entry))).await
     }
 
     /// Log a console entry
     #[tracing::instrument(skip(self), fields(log_source = "logger_console"))]
-    pub async fn log_console_entry(&self, entry: ConsoleLogEntry) -> Result<(), LogError> {
+    pub async fn log_console_entry(&self, entry: ConsoleLogEntry) -> Result<(), GlobalError> {
         self.log_entry(UnifiedLogEntry::Console(entry)).await
     }
 
     /// Asynchronous logging of unified log entries
     #[tracing::instrument(skip(self), fields(log_source = "logger"))]
     #[tracing::instrument(level = "error", skip_all)]
-    pub async fn log_entry(&self, entry: UnifiedLogEntry) -> Result<(), LogError> {
+    pub async fn log_entry(&self, entry: UnifiedLogEntry) -> Result<(), GlobalError> {
         // Extract information for tracing based on entry type
         match &entry {
             UnifiedLogEntry::Server(server) => {
@@ -123,11 +124,11 @@ impl Logger {
                 tracing::warn!("Log queue full, applying backpressure");
                 match tokio::time::timeout(std::time::Duration::from_millis(500), self.sender.send(entry)).await {
                     Ok(Ok(_)) => Ok(()),
-                    Ok(Err(_)) => Err(LogError::SendFailed("Channel closed")),
-                    Err(_) => Err(LogError::Timeout("Queue backpressure timeout")),
+                    Ok(Err(_)) => Err(GlobalError::SendFailed("Channel closed")),
+                    Err(_) => Err(GlobalError::Timeout("Queue backpressure timeout")),
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(LogError::SendFailed("Logger channel closed")),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(GlobalError::SendFailed("Logger channel closed")),
         }
     }
 
@@ -160,7 +161,7 @@ impl Logger {
         request_id: Option<String>,
         user_id: Option<String>,
         fields: Vec<(String, String)>,
-    ) -> Result<(), LogError> {
+    ) -> Result<(), GlobalError> {
         let base = BaseLogEntry::new().message(Some(message.to_string())).request_id(request_id);
 
         let server_entry = ServerLogEntry::new(level, source.to_string())
@@ -190,7 +191,7 @@ impl Logger {
     ///   let _ = logger.write("This is an information message", "example", Level::INFO).await;
     /// }
     /// ```
-    pub async fn write(&self, message: &str, source: &str, level: Level) -> Result<(), LogError> {
+    pub async fn write(&self, message: &str, source: &str, level: Level) -> Result<(), GlobalError> {
         self.write_with_context(message, source, level, None, None, Vec::new()).await
     }
 
@@ -208,29 +209,10 @@ impl Logger {
     ///  let _ = logger.shutdown().await;
     /// }
     /// ```
-    pub async fn shutdown(self) -> Result<(), LogError> {
+    pub async fn shutdown(self) -> Result<(), GlobalError> {
         drop(self.sender); //Close the sending end so that the receiver knows that there is no new message
         Ok(())
     }
-}
-
-/// Log error type
-/// This enum defines the error types that can occur when logging.
-/// It is used to provide more detailed error information.
-/// # Example
-/// ```
-/// use rustfs_obs::LogError;
-/// use thiserror::Error;
-///
-/// LogError::SendFailed("Failed to send log");
-/// LogError::Timeout("Operation timed out");
-/// ```
-#[derive(Debug, thiserror::Error)]
-pub enum LogError {
-    #[error("Failed to send log: {0}")]
-    SendFailed(&'static str),
-    #[error("Operation timed out: {0}")]
-    Timeout(&'static str),
 }
 
 /// Start the log module
@@ -297,48 +279,6 @@ pub fn get_global_logger() -> &'static Arc<Mutex<Logger>> {
     GLOBAL_LOGGER.get().expect("Logger not initialized")
 }
 
-/// Get the global logger instance with a lock
-/// This function returns a reference to the global logger instance with a lock.
-/// It is used to ensure that the logger is thread-safe.
-///
-/// # Returns
-/// A reference to the global logger instance with a lock
-///
-/// # Example
-/// ```
-/// use rustfs_obs::locked_logger;
-///
-/// async fn example() {
-///     let logger = locked_logger().await;
-/// }
-/// ```
-pub async fn locked_logger() -> tokio::sync::MutexGuard<'static, Logger> {
-    get_global_logger().lock().await
-}
-
-/// Initialize with default empty logger if needed (optional)
-/// This function initializes the logger with a default empty logger if needed.
-/// It is used to ensure that the logger is initialized before logging.
-///
-/// # Returns
-/// A reference to the global logger instance
-///
-/// # Example
-/// ```
-/// use rustfs_obs::ensure_logger_initialized;
-///
-/// let logger = ensure_logger_initialized();
-/// ```
-pub fn ensure_logger_initialized() -> &'static Arc<Mutex<Logger>> {
-    if GLOBAL_LOGGER.get().is_none() {
-        let config = AppConfig::default();
-        let sinks = vec![];
-        let logger = Arc::new(Mutex::new(start_logger(&config, sinks)));
-        let _ = GLOBAL_LOGGER.set(logger);
-    }
-    GLOBAL_LOGGER.get().unwrap()
-}
-
 /// Log information
 /// This function logs information messages.
 ///
@@ -357,7 +297,7 @@ pub fn ensure_logger_initialized() -> &'static Arc<Mutex<Logger>> {
 ///    let _ = log_info("This is an information message", "example").await;
 /// }
 /// ```
-pub async fn log_info(message: &str, source: &str) -> Result<(), LogError> {
+pub async fn log_info(message: &str, source: &str) -> Result<(), GlobalError> {
     get_global_logger().lock().await.write(message, source, Level::INFO).await
 }
 
@@ -375,7 +315,7 @@ pub async fn log_info(message: &str, source: &str) -> Result<(), LogError> {
 /// async fn example() {
 ///     let _ = log_error("This is an error message", "example").await;
 /// }
-pub async fn log_error(message: &str, source: &str) -> Result<(), LogError> {
+pub async fn log_error(message: &str, source: &str) -> Result<(), GlobalError> {
     get_global_logger().lock().await.write(message, source, Level::ERROR).await
 }
 
@@ -395,7 +335,7 @@ pub async fn log_error(message: &str, source: &str) -> Result<(), LogError> {
 ///     let _ = log_warn("This is a warning message", "example").await;
 /// }
 /// ```
-pub async fn log_warn(message: &str, source: &str) -> Result<(), LogError> {
+pub async fn log_warn(message: &str, source: &str) -> Result<(), GlobalError> {
     get_global_logger().lock().await.write(message, source, Level::WARN).await
 }
 
@@ -415,7 +355,7 @@ pub async fn log_warn(message: &str, source: &str) -> Result<(), LogError> {
 ///     let _ = log_debug("This is a debug message", "example").await;
 /// }
 /// ```
-pub async fn log_debug(message: &str, source: &str) -> Result<(), LogError> {
+pub async fn log_debug(message: &str, source: &str) -> Result<(), GlobalError> {
     get_global_logger().lock().await.write(message, source, Level::DEBUG).await
 }
 
@@ -436,7 +376,7 @@ pub async fn log_debug(message: &str, source: &str) -> Result<(), LogError> {
 ///    let _ = log_trace("This is a trace message", "example").await;
 /// }
 /// ```
-pub async fn log_trace(message: &str, source: &str) -> Result<(), LogError> {
+pub async fn log_trace(message: &str, source: &str) -> Result<(), GlobalError> {
     get_global_logger().lock().await.write(message, source, Level::TRACE).await
 }
 
@@ -467,7 +407,7 @@ pub async fn log_with_context(
     request_id: Option<String>,
     user_id: Option<String>,
     fields: Vec<(String, String)>,
-) -> Result<(), LogError> {
+) -> Result<(), GlobalError> {
     get_global_logger()
         .lock()
         .await
@@ -477,7 +417,7 @@ pub async fn log_with_context(
 
 /// Log initialization status
 #[derive(Debug)]
-pub struct InitLogStatus {
+pub(crate) struct InitLogStatus {
     pub timestamp: SystemTime,
     pub service_name: String,
     pub version: String,
@@ -508,14 +448,14 @@ impl InitLogStatus {
         }
     }
 
-    pub async fn init_start_log(config: &OtelConfig) -> Result<(), LogError> {
+    pub async fn init_start_log(config: &OtelConfig) -> Result<(), GlobalError> {
         let status = Self::new_config(config);
         log_init_state(Some(status)).await
     }
 }
 
 /// Log initialization details during system startup
-pub async fn log_init_state(status: Option<InitLogStatus>) -> Result<(), LogError> {
+async fn log_init_state(status: Option<InitLogStatus>) -> Result<(), GlobalError> {
     let status = status.unwrap_or_default();
 
     let base_entry = BaseLogEntry::new()
