@@ -52,7 +52,7 @@ protos.workspace = true
 query = { workspace = true }
 rmp-serde.workspace = true
 rustfs-event-notifier = { workspace = true }
-rustfs-obs = { workspace = true, features = ["gpu"] }
+rustfs-obs = { workspace = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true

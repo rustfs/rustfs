@@ -249,17 +249,19 @@ async fn run(opt: config::Opt) -> Result<()> {
         b.build()
     };
 
-    // Record the PID-related metrics of the current process
-    let meter = opentelemetry::global::meter("system");
-    let obs_result = init_process_observer(meter).await;
-    match obs_result {
-        Ok(_) => {
-            info!("Process observer initialized successfully");
+    tokio::spawn(async move {
+        // Record the PID-related metrics of the current process
+        let meter = opentelemetry::global::meter("system");
+        let obs_result = init_process_observer(meter).await;
+        match obs_result {
+            Ok(_) => {
+                info!("Process observer initialized successfully");
+            }
+            Err(e) => {
+                error!("Failed to initialize process observer: {}", e);
+            }
         }
-        Err(e) => {
-            error!("Failed to initialize process observer: {}", e);
-        }
-    }
+    });
 
     let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
