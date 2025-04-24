@@ -1029,7 +1029,7 @@ impl FolderScanner {
 
 #[tracing::instrument(level = "info", skip(into, folder_scanner))]
 async fn scan(folder: &CachedFolder, into: &mut DataUsageEntry, folder_scanner: &mut FolderScanner) {
-    if !into.compacted {
+    if into.compacted {
         *into = DataUsageEntry::default();
     }
 
