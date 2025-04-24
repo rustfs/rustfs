@@ -14,6 +14,7 @@ use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 // Ensure the correct path for parse_license is imported
 use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
 use crate::utils::error;
+use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
 use common::{
@@ -37,6 +38,7 @@ use ecstore::{
 };
 use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
 use grpc::make_server;
+use http::{HeaderMap, Request as HttpRequest, Response};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -47,17 +49,20 @@ use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_event_notifier::NotifierConfig;
-use rustfs_obs::{init_obs, load_config, set_global_guard, InitLogStatus};
+use rustfs_obs::{init_obs, init_process_observer, load_config, set_global_guard};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+use tracing::Span;
 use tracing::{debug, error, info, info_span, warn};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -102,9 +107,6 @@ async fn main() -> Result<()> {
 
     // Store in global storage
     set_global_guard(guard)?;
-
-    // Log initialization status
-    InitLogStatus::init_start_log(&config.observability).await?;
 
     // Initialize event notifier
     let notifier_config = opt.clone().event_config;
@@ -247,6 +249,20 @@ async fn run(opt: config::Opt) -> Result<()> {
         b.build()
     };
 
+    tokio::spawn(async move {
+        // Record the PID-related metrics of the current process
+        let meter = opentelemetry::global::meter("system");
+        let obs_result = init_process_observer(meter).await;
+        match obs_result {
+            Ok(_) => {
+                info!("Process observer initialized successfully");
+            }
+            Err(e) => {
+                error!("Failed to initialize process observer: {}", e);
+            }
+        }
+    });
+
     let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
 
     let tls_path = opt.tls_path.clone().unwrap_or_default();
@@ -300,18 +316,53 @@ async fn run(opt: config::Opt) -> Result<()> {
         let mut sigint_inner = sigint_inner;
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(|request: &HttpRequest<_>| {
+                            let span = tracing::debug_span!("http-request",
+                                status_code = tracing::field::Empty,
+                                method = %request.method(),
+                                uri = %request.uri(),
+                                version = ?request.version(),
+                            );
+                            for (header_name, header_value) in request.headers() {
+                                if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length"
+                                {
+                                    span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
+                                }
+                            }
+
+                            span
+                        })
+                        .on_request(|request: &HttpRequest<_>, _span: &Span| {
+                            debug!("started method: {}, url path: {}", request.method(), request.uri().path())
+                        })
+                        .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
+                            _span.record("status_code", tracing::field::display(response.status()));
+                            debug!("response generated in {:?}", latency)
+                        })
+                        .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
+                            debug!("sending {} bytes in {:?}", chunk.len(), latency)
+                        })
+                        .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
+                            debug!("stream closed after {:?}", stream_duration)
+                        })
+                        .on_failure(|_error, latency: Duration, _span: &Span| {
+                            debug!("request error: {:?} in {:?}", _error, latency)
+                        }),
+                )
                 .layer(CorsLayer::permissive())
                 .service(hybrid(s3_service, rpc_service)),
         );
 
-        let http_server = ConnBuilder::new(TokioExecutor::new());
+        let http_server = Arc::new(ConnBuilder::new(TokioExecutor::new()));
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
-        let graceful = GracefulShutdown::new();
+        let graceful = Arc::new(GracefulShutdown::new());
         debug!("graceful initiated");
 
         // 服务准备就绪
         worker_state_manager.update(ServiceState::Ready);
-
+        let value = hybrid_service.clone();
         loop {
             debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
             // Wait for a connection
@@ -366,12 +417,17 @@ async fn run(opt: config::Opt) -> Result<()> {
                         continue;
                     }
                 };
-                let conn = http_server.serve_connection(TokioIo::new(tls_socket), hybrid_service.clone());
-                let conn = graceful.watch(conn.into_owned());
+
+                let http_server_clone = http_server.clone();
+                let value_clone = value.clone();
+                let graceful_clone = graceful.clone();
+
                 tokio::task::spawn_blocking(move || {
                     tokio::runtime::Runtime::new()
                         .expect("Failed to create runtime")
                         .block_on(async move {
+                            let conn = http_server_clone.serve_connection(TokioIo::new(tls_socket), value_clone);
+                            let conn = graceful_clone.watch(conn);
                             if let Err(err) = conn.await {
                                 error!("Https Connection error: {}", err);
                             }
@@ -380,9 +436,13 @@ async fn run(opt: config::Opt) -> Result<()> {
                 debug!("TLS handshake success");
             } else {
                 debug!("Http handshake start");
-                let conn = http_server.serve_connection(TokioIo::new(socket), hybrid_service.clone());
-                let conn = graceful.watch(conn.into_owned());
+
+                let http_server_clone = http_server.clone();
+                let value_clone = value.clone();
+                let graceful_clone = graceful.clone();
                 tokio::spawn(async move {
+                    let conn = http_server_clone.serve_connection(TokioIo::new(socket), value_clone);
+                    let conn = graceful_clone.watch(conn);
                     if let Err(err) = conn.await {
                         error!("Http Connection error: {}", err);
                     }
@@ -391,12 +451,24 @@ async fn run(opt: config::Opt) -> Result<()> {
             }
         }
         worker_state_manager.update(ServiceState::Stopping);
-        tokio::select! {
-            () = graceful.shutdown() => {
-                 debug!("Gracefully shutdown!");
-            },
-            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                 debug!("Waited 10 seconds for graceful shutdown, aborting...");
+        match Arc::try_unwrap(graceful) {
+            Ok(g) => {
+                // Successfully obtaining unique ownership, you can call shutdown
+                tokio::select! {
+                    () = g.shutdown() => {
+                        debug!("Gracefully shutdown!");
+                    },
+                    () = tokio::time::sleep(Duration::from_secs(10)) => {
+                        debug!("Waited 10 seconds for graceful shutdown, aborting...");
+                    }
+                }
+            }
+            Err(arc_graceful) => {
+                // There are other references that cannot be obtained for unique ownership
+                error!("Cannot perform graceful shutdown, other references exist err: {:?}", arc_graceful);
+                // In this case, we can only wait for the timeout
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                debug!("Timeout reached, forcing shutdown");
             }
         }
         worker_state_manager.update(ServiceState::Stopped);

@@ -16,11 +16,27 @@ static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
 
 /// Error type for global guard operations
 #[derive(Debug, thiserror::Error)]
-pub enum GuardError {
+pub enum GlobalError {
     #[error("Failed to set global guard: {0}")]
     SetError(#[from] SetError<Arc<Mutex<OtelGuard>>>),
     #[error("Global guard not initialized")]
     NotInitialized,
+    #[error("Global system metrics err: {0}")]
+    MetricsError(String),
+    #[error("Failed to get current PID: {0}")]
+    PidError(String),
+    #[error("Process with PID {0} not found")]
+    ProcessNotFound(u32),
+    #[error("Failed to get physical core count")]
+    CoreCountError,
+    #[error("GPU initialization failed: {0}")]
+    GpuInitError(String),
+    #[error("GPU device not found: {0}")]
+    GpuDeviceError(String),
+    #[error("Failed to send log: {0}")]
+    SendFailed(&'static str),
+    #[error("Operation timed out: {0}")]
+    Timeout(&'static str),
 }
 
 /// Set the global guard for OpenTelemetry
@@ -43,9 +59,9 @@ pub enum GuardError {
 ///     Ok(())
 /// }
 /// ```
-pub fn set_global_guard(guard: OtelGuard) -> Result<(), GuardError> {
+pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
     info!("Initializing global OpenTelemetry guard");
-    GLOBAL_GUARD.set(Arc::new(Mutex::new(guard))).map_err(GuardError::SetError)
+    GLOBAL_GUARD.set(Arc::new(Mutex::new(guard))).map_err(GlobalError::SetError)
 }
 
 /// Get the global guard for OpenTelemetry
@@ -65,8 +81,8 @@ pub fn set_global_guard(guard: OtelGuard) -> Result<(), GuardError> {
 ///     Ok(())
 /// }
 /// ```
-pub fn get_global_guard() -> Result<Arc<Mutex<OtelGuard>>, GuardError> {
-    GLOBAL_GUARD.get().cloned().ok_or(GuardError::NotInitialized)
+pub fn get_global_guard() -> Result<Arc<Mutex<OtelGuard>>, GlobalError> {
+    GLOBAL_GUARD.get().cloned().ok_or(GlobalError::NotInitialized)
 }
 
 /// Try to get the global guard for OpenTelemetry
@@ -84,6 +100,6 @@ mod tests {
     #[tokio::test]
     async fn test_get_uninitialized_guard() {
         let result = get_global_guard();
-        assert!(matches!(result, Err(GuardError::NotInitialized)));
+        assert!(matches!(result, Err(GlobalError::NotInitialized)));
     }
 }

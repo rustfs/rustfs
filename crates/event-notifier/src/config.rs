@@ -149,7 +149,6 @@ impl NotifierConfig {
             )
             .build()
             .unwrap_or_default();
-        println!("Loaded config: {:?}", app_config);
         match app_config.try_deserialize::<NotifierConfig>() {
             Ok(app_config) => {
                 println!("Parsed AppConfig: {:?} \n", app_config);
