@@ -223,7 +223,7 @@ impl ECStore {
             disk_map,
             pools,
             peer_sys,
-            pool_meta: pool_meta.into(),
+            pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
         });
@@ -268,7 +268,7 @@ impl ECStore {
         meta.load(self.pools[0].clone(), self.pools.clone()).await?;
         let update = meta.validate(self.pools.clone())?;
 
-        if update {
+        if !update {
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 *pool_meta = meta.clone();
