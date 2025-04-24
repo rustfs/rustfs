@@ -325,6 +325,7 @@ impl SetDisks {
             }
         }
 
+        let mut futures = Vec::with_capacity(disks.len());
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
             // TODO: 并发
             for (i, err) in errs.iter().enumerate() {
@@ -334,26 +335,30 @@ impl SetDisks {
 
                 if let Some(disk) = disks[i].as_ref() {
                     let fi = file_infos[i].clone();
-                    let _ = disk
-                        .delete_version(
-                            src_bucket,
-                            src_object,
-                            fi,
-                            false,
-                            DeleteOptions {
-                                undo_write: true,
-                                old_data_dir: data_dirs[i],
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(|e| {
-                            debug!("rename_data delete_version err {:?}", e);
-                            e
-                        });
+                    let old_data_dir = data_dirs[i];
+                    futures.push(async move {
+                        let _ = disk
+                            .delete_version(
+                                src_bucket,
+                                src_object,
+                                fi,
+                                false,
+                                DeleteOptions {
+                                    undo_write: true,
+                                    old_data_dir: old_data_dir,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .map_err(|e| {
+                                debug!("rename_data delete_version err {:?}", e);
+                                e
+                            });
+                    });
                 }
             }
 
+            let _ = join_all(futures).await;
             return Err(err);
         }
 
@@ -3793,7 +3798,7 @@ impl ObjectIO for SetDisks {
             error!("close_bitrot_writers err {:?}", err);
         }
 
-        let etag = etag_stream.etag();
+        let etag = etag_stream.etag().await;
         //TODO: userDefined
 
         user_defined.insert("etag".to_owned(), etag.clone());
@@ -4384,7 +4389,7 @@ impl StorageAPI for SetDisks {
             error!("close_bitrot_writers err {:?}", err);
         }
 
-        let mut etag = etag_stream.etag();
+        let mut etag = etag_stream.etag().await;
 
         if let Some(ref tag) = opts.preserve_etag {
             etag = tag.clone();

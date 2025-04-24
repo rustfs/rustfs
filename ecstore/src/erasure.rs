@@ -86,7 +86,6 @@ impl Erasure {
                 }
 
                 self.buf.resize(new_len, 0u8);
-
                 match reader.read_exact(&mut self.buf).await {
                     Ok(res) => res,
                     Err(e) => {
@@ -101,20 +100,22 @@ impl Erasure {
             }
 
             self.encode_data(&self.buf, &mut blocks)?;
-            let mut errs = Vec::new();
 
-            // TODO: 并发写入
-            for (i, w_op) in writers.iter_mut().enumerate() {
-                if let Some(w) = w_op {
-                    match w.write(blocks[i].as_ref()).await {
-                        Ok(_) => errs.push(None),
-                        Err(e) => errs.push(Some(e)),
+            let write_futures = writers.iter_mut().enumerate().map(|(i, w_op)| {
+                let i_inner = i.clone();
+                let blocks_inner = blocks.clone();
+                async move {
+                    if let Some(w) = w_op {
+                        match w.write(blocks_inner[i_inner].clone()).await {
+                            Ok(_) => None,
+                            Err(e) => Some(e),
+                        }
+                    } else {
+                        Some(Error::new(DiskError::DiskNotFound))
                     }
-                } else {
-                    errs.push(Some(Error::new(DiskError::DiskNotFound)));
                 }
-            }
-
+            });
+            let errs = join_all(write_futures).await;
             let none_count = errs.iter().filter(|&x| x.is_none()).count();
             if none_count >= write_quorum {
                 if total_size == 0 {
@@ -472,7 +473,7 @@ impl Erasure {
                 self.encoder.as_ref().unwrap().reconstruct(&mut bufs)?;
             }
 
-            let shards: Vec<Vec<u8>> = bufs.into_iter().flatten().collect::<Vec<_>>();
+            let shards = bufs.into_iter().flatten().collect::<Vec<_>>();
             if shards.len() != self.parity_shards + self.data_shards {
                 return Err(Error::from_string("can not reconstruct data"));
             }
@@ -481,7 +482,7 @@ impl Erasure {
                 if w.is_none() {
                     continue;
                 }
-                match w.as_mut().unwrap().write(shards[i].as_ref()).await {
+                match w.as_mut().unwrap().write(shards[i].clone().into()).await {
                     Ok(_) => {}
                     Err(e) => {
                         info!("write failed, err: {:?}", e);
@@ -501,7 +502,7 @@ impl Erasure {
 #[async_trait::async_trait]
 pub trait Writer {
     fn as_any(&self) -> &dyn Any;
-    async fn write(&mut self, buf: &[u8]) -> Result<()>;
+    async fn write(&mut self, buf: Bytes) -> Result<()>;
     async fn close(&mut self) -> Result<()> {
         Ok(())
     }
