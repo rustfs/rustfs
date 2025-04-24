@@ -1,6 +1,8 @@
+use bytes::Bytes;
 use futures::TryStreamExt;
 use md5::Digest;
 use md5::Md5;
+use tokio::sync::mpsc;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -125,33 +127,51 @@ impl AsyncRead for HttpFileReader {
 
 pub struct EtagReader<R> {
     inner: R,
-    md5: Md5,
+    bytes_tx: mpsc::Sender<Bytes>,
+    md5_rx: oneshot::Receiver<String>,
 }
 
 impl<R> EtagReader<R> {
     pub fn new(inner: R) -> Self {
-        EtagReader { inner, md5: Md5::new() }
+        let (bytes_tx, mut bytes_rx) = mpsc::channel::<Bytes>(8);
+        let (md5_tx, md5_rx) = oneshot::channel::<String>();
+
+        tokio::task::spawn_blocking(move || {
+            let mut md5 = Md5::new();
+            while let Some(bytes) = bytes_rx.blocking_recv() {
+                md5.update(&bytes);
+            }
+            let digest = md5.finalize();
+            let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
+            let _ = md5_tx.send(etag);
+        });
+
+        EtagReader { inner, bytes_tx, md5_rx }
     }
 
-    pub fn etag(self) -> String {
-        hex_simd::encode_to_string(self.md5.finalize(), hex_simd::AsciiCase::Lower)
+    pub async fn etag(self) -> String {
+        drop(self.inner);
+        drop(self.bytes_tx);
+        self.md5_rx.await.unwrap()
     }
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for EtagReader<R> {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
-        let befor_size = buf.filled().len();
-
-        match Pin::new(&mut self.inner).poll_read(cx, buf) {
-            Poll::Ready(Ok(())) => {
-                if buf.filled().len() > befor_size {
-                    let bytes = &buf.filled()[befor_size..];
-                    self.md5.update(bytes);
-                }
-
-                Poll::Ready(Ok(()))
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            if buf.remaining() == 0 {
+                let bytes = buf.filled();
+                let bytes = Bytes::copy_from_slice(bytes);
+                let tx = self.bytes_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send(bytes).await {
+                        warn!("EtagReader send error: {:?}", e);
+                    }
+                });
             }
-            other => other,
         }
+        poll
     }
 }

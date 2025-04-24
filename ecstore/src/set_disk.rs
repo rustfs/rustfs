@@ -3802,7 +3802,7 @@ impl ObjectIO for SetDisks {
             error!("close_bitrot_writers err {:?}", err);
         }
 
-        let etag = etag_stream.etag();
+        let etag = etag_stream.etag().await;
         //TODO: userDefined
 
         user_defined.insert("etag".to_owned(), etag.clone());
@@ -4393,7 +4393,7 @@ impl StorageAPI for SetDisks {
             error!("close_bitrot_writers err {:?}", err);
         }
 
-        let mut etag = etag_stream.etag();
+        let mut etag = etag_stream.etag().await;
 
         if let Some(ref tag) = opts.preserve_etag {
             etag = tag.clone();
