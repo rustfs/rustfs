@@ -178,7 +178,6 @@ pub struct AppConfig {
     pub logger: Option<LoggerConfig>,
 }
 
-// 为 AppConfig 实现 Default
 impl AppConfig {
     pub fn new() -> Self {
         Self {
@@ -189,6 +188,7 @@ impl AppConfig {
     }
 }
 
+// implement default for AppConfig
 impl Default for AppConfig {
     fn default() -> Self {
         Self::new()

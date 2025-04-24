@@ -271,7 +271,7 @@ pub async fn start_static_file_server(
         .route("/config.json", get(config_handler))
         .fallback_service(get(static_handler))
         .layer(cors)
-        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::compression::CompressionLayer::new().gzip(true).deflate(true))
         .layer(TraceLayer::new_for_http());
     let local_addr: SocketAddr = addrs.parse().expect("Failed to parse socket address");
     info!("WebUI: http://{}:{} http://127.0.0.1:{}", local_ip, local_addr.port(), local_addr.port());

@@ -46,6 +46,7 @@ local-ip-address = { workspace = true }
 matchit = { workspace = true }
 mime.workspace = true
 mime_guess = { workspace = true }
+opentelemetry = { workspace = true }
 pin-project-lite.workspace = true
 protos.workspace = true
 query = { workspace = true }
@@ -76,7 +77,7 @@ tokio-stream.workspace = true
 tonic = { workspace = true }
 tower.workspace = true
 transform-stream.workspace = true
-tower-http = { workspace = true, features = ["trace", "compression-full", "cors"] }
+tower-http = { workspace = true, features = ["trace", "compression-deflate", "compression-gzip", "cors"] }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

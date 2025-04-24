@@ -11,32 +11,35 @@ workspace = true
 
 [features]
 default = ["file"]
+file = []
+gpu = ["dep:nvml-wrapper"]
 kafka = ["dep:rdkafka"]
 webhook = ["dep:reqwest"]
-file = []
+full = ["file", "gpu", "kafka", "webhook"]
 
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
+nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic"] }
-opentelemetry-prometheus = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
-prometheus = { workspace = true }
 serde = { workspace = true }
+smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-core = { workspace = true }
 tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
-tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 rdkafka = { workspace = true, features = ["tokio"], optional = true }
 reqwest = { workspace = true, optional = true, default-features = false }
 serde_json = { workspace = true }
+sysinfo = { workspace = true }
 thiserror = { workspace = true }
 local-ip-address = { workspace = true }
 

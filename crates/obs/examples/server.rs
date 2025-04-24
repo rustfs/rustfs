@@ -1,8 +1,8 @@
 use opentelemetry::global;
-use rustfs_obs::{get_logger, init_obs, load_config, log_info, BaseLogEntry, ServerLogEntry};
+use rustfs_obs::{get_logger, init_obs, init_process_observer, load_config, log_info, BaseLogEntry, ServerLogEntry};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
-use tracing::{info, instrument};
+use tracing::{error, info, instrument};
 use tracing_core::Level;
 
 #[tokio::main]
@@ -37,6 +37,11 @@ async fn run(bucket: String, object: String, user: String, service_name: String)
         start_time.elapsed().unwrap().as_secs_f64(),
         &[opentelemetry::KeyValue::new("operation", "run")],
     );
+
+    match init_process_observer(meter).await {
+        Ok(_) => info!("Process observer initialized successfully"),
+        Err(e) => error!("Failed to initialize process observer: {:?}", e),
+    }
 
     let base_entry = BaseLogEntry::new()
         .message(Some("run logger api_handler info".to_string()))
