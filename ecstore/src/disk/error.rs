@@ -364,6 +364,10 @@ pub fn is_unformatted_disk(err: &Error) -> bool {
 }
 
 pub fn is_err_file_not_found(err: &Error) -> bool {
+    if let Some(ioerr) = err.downcast_ref::<io::Error>() {
+        return ioerr.kind() == ErrorKind::NotFound;
+    }
+
     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileNotFound))
 }
 

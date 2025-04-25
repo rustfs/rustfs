@@ -102,14 +102,11 @@ impl Erasure {
             self.encode_data(&self.buf, &mut blocks)?;
 
             let write_futures = writers.iter_mut().enumerate().map(|(i, w_op)| {
-                let i_inner = i.clone();
+                let i_inner = i;
                 let blocks_inner = blocks.clone();
                 async move {
                     if let Some(w) = w_op {
-                        match w.write(blocks_inner[i_inner].clone()).await {
-                            Ok(_) => None,
-                            Err(e) => Some(e),
-                        }
+                        (w.write(blocks_inner[i_inner].clone()).await).err()
                     } else {
                         Some(Error::new(DiskError::DiskNotFound))
                     }
