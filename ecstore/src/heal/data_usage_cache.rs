@@ -21,7 +21,7 @@ use tokio::time::sleep;
 use tracing::warn;
 
 use super::data_scanner::{SizeSummary, DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS};
-use super::data_usage::{BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo, DATA_USAGE_ROOT};
+use super::data_usage::{BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo};
 
 // DATA_USAGE_BUCKET_LEN must be length of ObjectsHistogramIntervals
 pub const DATA_USAGE_BUCKET_LEN: usize = 11;
@@ -858,9 +858,5 @@ impl DataUsageHash {
 }
 
 pub fn hash_path(data: &str) -> DataUsageHash {
-    let mut data = data;
-    if data != DATA_USAGE_ROOT {
-        data = data.trim_matches('/');
-    }
     DataUsageHash(Path::new(&data).clean().to_string_lossy().to_string())
 }
