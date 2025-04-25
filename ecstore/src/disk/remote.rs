@@ -70,17 +70,21 @@ impl RemoteDisk {
 // TODO: all api need to handle errors
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
+    #[tracing::instrument(skip(self))]
     fn to_string(&self) -> String {
         self.endpoint.to_string()
     }
 
+    #[tracing::instrument(skip(self))]
     fn is_local(&self) -> bool {
         false
     }
 
+    #[tracing::instrument(skip(self))]
     fn host_name(&self) -> String {
         self.endpoint.host_port()
     }
+    #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
         // TODO: 连接状态
         if (node_service_time_out_client(&self.addr).await).is_ok() {
@@ -88,16 +92,20 @@ impl DiskAPI for RemoteDisk {
         }
         false
     }
+    #[tracing::instrument(skip(self))]
     fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
     }
+    #[tracing::instrument(skip(self))]
     async fn close(&self) -> Result<()> {
         Ok(())
     }
+    #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
         self.root.clone()
     }
 
+    #[tracing::instrument(skip(self))]
     fn get_disk_location(&self) -> DiskLocation {
         DiskLocation {
             pool_idx: {
@@ -124,9 +132,12 @@ impl DiskAPI for RemoteDisk {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         Ok(*self.id.lock().await)
     }
+
+    #[tracing::instrument(skip(self))]
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         let mut lock = self.id.lock().await;
         *lock = id;
@@ -134,6 +145,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
         info!("read_all {}/{}", volume, path);
         let mut client = node_service_time_out_client(&self.addr)
@@ -154,6 +166,7 @@ impl DiskAPI for RemoteDisk {
         Ok(response.data)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
         info!("write_all");
         let mut client = node_service_time_out_client(&self.addr)
@@ -179,6 +192,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
         info!("delete {}/{}/{}", self.endpoint.to_string(), volume, path);
         let options = serde_json::to_string(&opt)?;
@@ -205,6 +219,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         info!("verify_file");
         let file_info = serde_json::to_string(&fi)?;
@@ -233,6 +248,7 @@ impl DiskAPI for RemoteDisk {
         Ok(check_parts_resp)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         info!("check_parts");
         let file_info = serde_json::to_string(&fi)?;
@@ -261,6 +277,7 @@ impl DiskAPI for RemoteDisk {
         Ok(check_parts_resp)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
         info!("rename_part {}/{}", src_volume, src_path);
         let mut client = node_service_time_out_client(&self.addr)
@@ -287,6 +304,7 @@ impl DiskAPI for RemoteDisk {
 
         Ok(())
     }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         info!("rename_file");
@@ -365,6 +383,7 @@ impl DiskAPI for RemoteDisk {
         ))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
         info!("list_dir {}/{}", volume, _dir_path);
         let mut client = node_service_time_out_client(&self.addr)
@@ -389,6 +408,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     // FIXME: TODO: use writer
+    #[tracing::instrument(skip(self, wr))]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         let now = std::time::SystemTime::now();
         info!("walk_dir {}/{}/{:?}", self.endpoint.to_string(), opts.bucket, opts.filter_prefix);
@@ -429,6 +449,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -466,6 +487,7 @@ impl DiskAPI for RemoteDisk {
         Ok(rename_data_resp)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
         info!("make_volumes");
         let mut client = node_service_time_out_client(&self.addr)
@@ -489,6 +511,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn make_volume(&self, volume: &str) -> Result<()> {
         info!("make_volume");
         let mut client = node_service_time_out_client(&self.addr)
@@ -512,6 +535,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
         info!("list_volumes");
         let mut client = node_service_time_out_client(&self.addr)
@@ -540,6 +564,7 @@ impl DiskAPI for RemoteDisk {
         Ok(infos)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         info!("stat_volume");
         let mut client = node_service_time_out_client(&self.addr)
@@ -565,6 +590,7 @@ impl DiskAPI for RemoteDisk {
         Ok(volume_info)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         info!("delete_paths");
         let paths = paths.to_owned();
@@ -589,6 +615,8 @@ impl DiskAPI for RemoteDisk {
 
         Ok(())
     }
+
+    #[tracing::instrument(skip(self))]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         info!("update_metadata");
         let file_info = serde_json::to_string(&fi)?;
@@ -618,6 +646,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         info!("write_metadata {}/{}", volume, path);
         let file_info = serde_json::to_string(&fi)?;
@@ -644,6 +673,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn read_version(
         &self,
         _org_volume: &str,
@@ -707,6 +737,8 @@ impl DiskAPI for RemoteDisk {
 
         Ok(raw_file_info)
     }
+
+    #[tracing::instrument(skip(self))]
     async fn delete_version(
         &self,
         volume: &str,
@@ -745,6 +777,8 @@ impl DiskAPI for RemoteDisk {
 
         Ok(())
     }
+
+    #[tracing::instrument(skip(self))]
     async fn delete_versions(
         &self,
         volume: &str,
@@ -790,6 +824,7 @@ impl DiskAPI for RemoteDisk {
         Ok(errors)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
         info!("read_multiple {}/{}/{}", self.endpoint.to_string(), req.bucket, req.prefix);
         let read_multiple_req = serde_json::to_string(&req)?;
@@ -820,6 +855,7 @@ impl DiskAPI for RemoteDisk {
         Ok(read_multiple_resps)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete_volume(&self, volume: &str) -> Result<()> {
         info!("delete_volume {}/{}", self.endpoint.to_string(), volume);
         let mut client = node_service_time_out_client(&self.addr)
@@ -843,6 +879,7 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
         let opts = serde_json::to_string(&opts)?;
         let mut client = node_service_time_out_client(&self.addr)
@@ -868,6 +905,7 @@ impl DiskAPI for RemoteDisk {
         Ok(disk_info)
     }
 
+    #[tracing::instrument(skip(self, cache, scan_mode, _we_sleep))]
     async fn ns_scanner(
         &self,
         cache: &DataUsageCache,
@@ -909,6 +947,7 @@ impl DiskAPI for RemoteDisk {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     async fn healing(&self) -> Option<HealingTracker> {
         None
     }
