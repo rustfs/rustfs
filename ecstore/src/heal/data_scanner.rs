@@ -696,8 +696,8 @@ impl FolderScanner {
                     }
                 }
             }
-            if found_objects && *GLOBAL_IsErasure.read().await {
-                // If we found an object in erasure mode, we skip subdirs (only datadirs)...
+            // if found_objects && *GLOBAL_IsErasure.read().await {
+            if found_objects {
                 break 'outer;
             }
 
@@ -1029,11 +1029,13 @@ impl FolderScanner {
 
 #[tracing::instrument(level = "info", skip(into, folder_scanner))]
 async fn scan(folder: &CachedFolder, into: &mut DataUsageEntry, folder_scanner: &mut FolderScanner) {
-    if into.compacted {
-        *into = DataUsageEntry::default();
-    }
+    let mut dst = if !into.compacted {
+        DataUsageEntry::default()
+    } else {
+        into.clone()
+    };
 
-    if Box::pin(folder_scanner.scan_folder(folder, into)).await.is_err() {
+    if Box::pin(folder_scanner.scan_folder(folder, &mut dst)).await.is_err() {
         return;
     }
     if !into.compacted {
