@@ -238,8 +238,10 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         // configure the formatting layer
         let enable_color = std::io::stdout().is_terminal();
         let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
             .with_ansi(enable_color)
             .with_thread_names(true)
+            .with_thread_ids(true)
             .with_file(true)
             .with_line_number(true)
             .with_filter(
