@@ -33,7 +33,7 @@ use crate::{
         ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectIO, ObjectInfo,
         ObjectOptions, ObjectPartInfo, ObjectToDelete, PartInfo, PutObjReader, RawFileInfo, StorageAPI, DEFAULT_BITROT_ALGO,
     },
-    store_err::{to_object_err, StorageError},
+    store_err::{is_err_object_not_found, to_object_err, StorageError},
     store_init::{load_format_erasure, ErasureError},
     utils::{
         self,
@@ -325,6 +325,7 @@ impl SetDisks {
             }
         }
 
+        let mut futures = Vec::with_capacity(disks.len());
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
             // TODO: 并发
             for (i, err) in errs.iter().enumerate() {
@@ -334,26 +335,30 @@ impl SetDisks {
 
                 if let Some(disk) = disks[i].as_ref() {
                     let fi = file_infos[i].clone();
-                    let _ = disk
-                        .delete_version(
-                            src_bucket,
-                            src_object,
-                            fi,
-                            false,
-                            DeleteOptions {
-                                undo_write: true,
-                                old_data_dir: data_dirs[i],
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(|e| {
-                            debug!("rename_data delete_version err {:?}", e);
-                            e
-                        });
+                    let old_data_dir = data_dirs[i];
+                    futures.push(async move {
+                        let _ = disk
+                            .delete_version(
+                                src_bucket,
+                                src_object,
+                                fi,
+                                false,
+                                DeleteOptions {
+                                    undo_write: true,
+                                    old_data_dir,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .map_err(|e| {
+                                debug!("rename_data delete_version err {:?}", e);
+                                e
+                            });
+                    });
                 }
             }
 
+            let _ = join_all(futures).await;
             return Err(err);
         }
 
@@ -454,6 +459,7 @@ impl SetDisks {
         Ok(())
     }
 
+    #[tracing::instrument(skip(disks))]
     async fn cleanup_multipart_path(disks: &[Option<DiskStore>], paths: &[String]) {
         let mut futures = Vec::with_capacity(disks.len());
 
@@ -485,6 +491,8 @@ impl SetDisks {
             warn!("cleanup_multipart_path errs {:?}", &errs);
         }
     }
+
+    #[tracing::instrument(skip(disks, meta))]
     async fn rename_part(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -575,6 +583,7 @@ impl SetDisks {
     //     errors
     // }
 
+    #[tracing::instrument(skip(disks, files))]
     async fn write_unique_file_info(
         disks: &[Option<DiskStore>],
         org_bucket: &str,
@@ -861,7 +870,6 @@ impl SetDisks {
         };
 
         if let Some(err) = reduce_read_quorum_errs(errs, object_op_ignored_errs().as_ref(), expected_rquorum) {
-            warn!("object_quorum_from_meta err {:?}", &err);
             return Err(err);
         }
 
@@ -874,7 +882,6 @@ impl SetDisks {
         let parity_blocks = Self::common_parity(&parities, default_parity_count as i32);
 
         if parity_blocks < 0 {
-            warn!("QuorumError::Read, common_parity < 0 ");
             return Err(Error::new(QuorumError::Read));
         }
 
@@ -928,7 +935,15 @@ impl SetDisks {
         let (parts_metadata, errs) =
             Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path, "", false, false).await;
 
-        let (read_quorum, write_quorum) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
+        let map_err_notfound = |err: Error| {
+            if is_err_object_not_found(&err) {
+                return Error::new(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()));
+            }
+            err
+        };
+
+        let (read_quorum, write_quorum) =
+            Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count).map_err(map_err_notfound)?;
 
         if read_quorum < 0 {
             return Err(Error::new(QuorumError::Read));
@@ -943,10 +958,10 @@ impl SetDisks {
             quorum = write_quorum as usize;
 
             if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), quorum) {
-                return Err(err);
+                return Err(map_err_notfound(err));
             }
         } else if let Some(err) = reduce_read_quorum_errs(&errs, object_op_ignored_errs().as_ref(), quorum) {
-            return Err(err);
+            return Err(map_err_notfound(err));
         }
 
         let (_, mod_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, quorum);
@@ -1746,7 +1761,7 @@ impl SetDisks {
         // TODO: 优化并发 可用数量中断
         let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
-        warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
+        // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
@@ -1754,12 +1769,6 @@ impl SetDisks {
             .map_err(|err| to_object_err(err, vec![bucket, object]))?;
 
         if let Some(err) = reduce_read_quorum_errs(&errs, object_op_ignored_errs().as_ref(), read_quorum as usize) {
-            error!(
-                "reduce_read_quorum_errs disks: {} read_quorum {} \n {:?}",
-                disks.len(),
-                read_quorum,
-                &errs
-            );
             return Err(to_object_err(err, vec![bucket, object]));
         }
 
@@ -2587,7 +2596,6 @@ impl SetDisks {
                 }
             }
             Err(err) => {
-                warn!("object_quorum_from_meta failed, err: {}", err.to_string());
                 let data_errs_by_part = HashMap::new();
                 match self
                     .delete_if_dang_ling(
@@ -3802,7 +3810,7 @@ impl ObjectIO for SetDisks {
             error!("close_bitrot_writers err {:?}", err);
         }
 
-        let etag = etag_stream.etag();
+        let etag = etag_stream.etag().await;
         //TODO: userDefined
 
         user_defined.insert("etag".to_owned(), etag.clone());
@@ -3879,14 +3887,17 @@ impl ObjectIO for SetDisks {
 
 #[async_trait::async_trait]
 impl StorageAPI for SetDisks {
+    #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> madmin::BackendInfo {
         unimplemented!()
     }
+    #[tracing::instrument(skip(self))]
     async fn storage_info(&self) -> madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
         get_storage_info(&disks, &self.set_endpoints).await
     }
+    #[tracing::instrument(skip(self))]
     async fn local_storage_info(&self) -> madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
@@ -3902,17 +3913,21 @@ impl StorageAPI for SetDisks {
 
         get_storage_info(&local_disks, &local_endpoints).await
     }
+    #[tracing::instrument(skip(self))]
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()
     }
+    #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()
     }
 
+    #[tracing::instrument(skip(self))]
     async fn copy_object(
         &self,
         src_bucket: &str,
@@ -4017,6 +4032,7 @@ impl StorageAPI for SetDisks {
 
         Ok(fi.to_object_info(src_bucket, src_object, src_opts.versioned || src_opts.version_suspended))
     }
+    #[tracing::instrument(skip(self))]
     async fn delete_objects(
         &self,
         bucket: &str,
@@ -4127,6 +4143,8 @@ impl StorageAPI for SetDisks {
 
         Ok((del_objects, del_errs))
     }
+
+    #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix {
             self.delete_prefix(bucket, object)
@@ -4138,6 +4156,7 @@ impl StorageAPI for SetDisks {
         unimplemented!()
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
         _bucket: &str,
@@ -4150,6 +4169,8 @@ impl StorageAPI for SetDisks {
     ) -> Result<ListObjectsV2Info> {
         unimplemented!()
     }
+
+    #[tracing::instrument(skip(self))]
     async fn list_object_versions(
         self: Arc<Self>,
         _bucket: &str,
@@ -4161,6 +4182,8 @@ impl StorageAPI for SetDisks {
     ) -> Result<ListObjectVersionsInfo> {
         unimplemented!()
     }
+
+    #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // let mut _ns = None;
         // if !opts.no_lock {
@@ -4202,6 +4225,7 @@ impl StorageAPI for SetDisks {
         Ok(oi)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // TODO: nslock
 
@@ -4284,6 +4308,7 @@ impl StorageAPI for SetDisks {
         Ok(fi.to_object_info(bucket, object, opts.versioned || opts.version_suspended))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
         let oi = self.get_object_info(bucket, object, opts).await?;
         Ok(oi.user_tags)
@@ -4310,10 +4335,13 @@ impl StorageAPI for SetDisks {
         // TODO: versioned
         Ok(fi.to_object_info(bucket, object, opts.versioned || opts.version_suspended))
     }
+
+    #[tracing::instrument(skip(self))]
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.put_object_tags(bucket, object, "", opts).await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
         _src_bucket: &str,
@@ -4393,7 +4421,7 @@ impl StorageAPI for SetDisks {
             error!("close_bitrot_writers err {:?}", err);
         }
 
-        let mut etag = etag_stream.etag();
+        let mut etag = etag_stream.etag().await;
 
         if let Some(ref tag) = opts.preserve_etag {
             etag = tag.clone();
@@ -4436,6 +4464,8 @@ impl StorageAPI for SetDisks {
 
         Ok(ret)
     }
+
+    #[tracing::instrument(skip(self))]
     async fn list_multipart_uploads(
         &self,
         bucket: &str,
@@ -4475,7 +4505,7 @@ impl StorageAPI for SetDisks {
                 Err(err) => {
                     if DiskError::DiskNotFound.is(&err) {
                         None
-                    } else if DiskError::FileNotFound.is(&err) {
+                    } else if is_err_object_not_found(&err) {
                         return Ok(ListMultipartsInfo {
                             key_marker: key_marker.to_owned(),
                             max_uploads,
@@ -4579,9 +4609,9 @@ impl StorageAPI for SetDisks {
             ..Default::default()
         })
     }
-    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
-        warn!("new_multipart_upload opt {:?}", opts);
 
+    #[tracing::instrument(skip(self))]
+    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
@@ -4684,6 +4714,8 @@ impl StorageAPI for SetDisks {
 
         Ok(MultipartUploadResult { upload_id })
     }
+
+    #[tracing::instrument(skip(self))]
     async fn get_multipart_info(
         &self,
         bucket: &str,
@@ -4705,6 +4737,8 @@ impl StorageAPI for SetDisks {
             ..Default::default()
         })
     }
+
+    #[tracing::instrument(skip(self))]
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, _opts: &ObjectOptions) -> Result<()> {
         self.check_upload_id_exists(bucket, object, upload_id, false).await?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
@@ -4712,7 +4746,7 @@ impl StorageAPI for SetDisks {
         self.delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path).await
     }
     // complete_multipart_upload 完成
-    // #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
         &self,
         bucket: &str,
@@ -4961,24 +4995,32 @@ impl StorageAPI for SetDisks {
         Ok(fi.to_object_info(bucket, object, opts.versioned || opts.version_suspended))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
         Ok(self.get_disks_internal().await)
     }
 
+    #[tracing::instrument(skip(self))]
     fn set_drive_counts(&self) -> Vec<usize> {
         unimplemented!()
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
 
+    #[tracing::instrument(skip(self))]
     async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         unimplemented!()
     }
+
+    #[tracing::instrument(skip(self))]
     async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
         unimplemented!()
     }
+
+    #[tracing::instrument(skip(self))]
     async fn heal_object(
         &self,
         bucket: &str,
@@ -5029,6 +5071,8 @@ impl StorageAPI for SetDisks {
         }
         return Ok((result, err));
     }
+
+    #[tracing::instrument(skip(self))]
     async fn heal_objects(
         &self,
         _bucket: &str,
@@ -5039,9 +5083,13 @@ impl StorageAPI for SetDisks {
     ) -> Result<()> {
         unimplemented!()
     }
+
+    #[tracing::instrument(skip(self))]
     async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
         unimplemented!()
     }
+
+    #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
     }

@@ -223,7 +223,7 @@ impl ECStore {
             disk_map,
             pools,
             peer_sys,
-            pool_meta: pool_meta.into(),
+            pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
         });
@@ -268,7 +268,7 @@ impl ECStore {
         meta.load(self.pools[0].clone(), self.pools.clone()).await?;
         let update = meta.validate(self.pools.clone())?;
 
-        if update {
+        if !update {
             {
                 let mut pool_meta = self.pool_meta.write().await;
                 *pool_meta = meta.clone();
@@ -1246,6 +1246,7 @@ lazy_static! {
 
 #[async_trait::async_trait]
 impl StorageAPI for ECStore {
+    #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> madmin::BackendInfo {
         let (standard_sc_parity, rr_sc_parity) = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
@@ -1290,6 +1291,7 @@ impl StorageAPI for ECStore {
             ..Default::default()
         }
     }
+    #[tracing::instrument(skip(self))]
     async fn storage_info(&self) -> madmin::StorageInfo {
         let Some(notification_sy) = get_global_notification_sys() else {
             return madmin::StorageInfo::default();
@@ -1297,6 +1299,7 @@ impl StorageAPI for ECStore {
 
         notification_sy.storage_info(self).await
     }
+    #[tracing::instrument(skip(self))]
     async fn local_storage_info(&self) -> madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.pools.len());
 
@@ -1316,6 +1319,7 @@ impl StorageAPI for ECStore {
         madmin::StorageInfo { backend, disks }
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         // TODO: opts.cached
 
@@ -1331,6 +1335,7 @@ impl StorageAPI for ECStore {
         Ok(buckets)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         if is_meta_bucketname(bucket) {
             return Err(StorageError::BucketNameInvalid(bucket.to_string()).into());
@@ -1360,6 +1365,7 @@ impl StorageAPI for ECStore {
             .await?;
         Ok(())
     }
+    #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         if !is_meta_bucketname(bucket) {
             if let Err(err) = check_valid_bucket_name_strict(bucket) {
@@ -1403,6 +1409,7 @@ impl StorageAPI for ECStore {
 
         Ok(())
     }
+    #[tracing::instrument(skip(self))]
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         let mut info = self
             .peer_sys
@@ -1420,6 +1427,7 @@ impl StorageAPI for ECStore {
     }
 
     // TODO: review
+    #[tracing::instrument(skip(self))]
     async fn copy_object(
         &self,
         src_bucket: &str,
@@ -1490,6 +1498,7 @@ impl StorageAPI for ECStore {
     }
 
     // TODO: review
+    #[tracing::instrument(skip(self))]
     async fn delete_objects(
         &self,
         bucket: &str,
@@ -1643,6 +1652,7 @@ impl StorageAPI for ECStore {
         Ok((del_objects, del_errs))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
 
@@ -1717,6 +1727,7 @@ impl StorageAPI for ECStore {
     // @start_after as marker when continuation_token empty
     // @delimiter default="/", empty when recursive
     // @max_keys limit
+    #[tracing::instrument(skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
         bucket: &str,
@@ -1730,6 +1741,7 @@ impl StorageAPI for ECStore {
         self.inner_list_objects_v2(bucket, prefix, continuation_token, delimiter, max_keys, fetch_owner, start_after)
             .await
     }
+    #[tracing::instrument(skip(self))]
     async fn list_object_versions(
         self: Arc<Self>,
         bucket: &str,
@@ -1742,6 +1754,7 @@ impl StorageAPI for ECStore {
         self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
             .await
     }
+    #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         check_object_args(bucket, object)?;
 
@@ -1758,6 +1771,7 @@ impl StorageAPI for ECStore {
         Ok(info)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
         let object = encode_dir_object(object);
 
@@ -1770,6 +1784,7 @@ impl StorageAPI for ECStore {
         Ok(oi.user_tags)
     }
 
+    #[tracing::instrument(skip(self))]
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let object = encode_dir_object(object);
         if self.single_pool() {
@@ -1796,6 +1811,7 @@ impl StorageAPI for ECStore {
 
         self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
     }
+    #[tracing::instrument(skip(self))]
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let object = encode_dir_object(object);
 
@@ -1807,6 +1823,8 @@ impl StorageAPI for ECStore {
 
         self.pools[idx].delete_object_tags(bucket, object.as_str(), opts).await
     }
+
+    #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
         src_bucket: &str,
@@ -1828,6 +1846,7 @@ impl StorageAPI for ECStore {
 
         unimplemented!()
     }
+    #[tracing::instrument(skip(self, data))]
     async fn put_object_part(
         &self,
         bucket: &str,
@@ -1859,6 +1878,7 @@ impl StorageAPI for ECStore {
             };
 
             if let Some(err) = err {
+                error!("put_object_part err: {:?}", err);
                 return Err(err);
             }
         }
@@ -1870,6 +1890,7 @@ impl StorageAPI for ECStore {
         )))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list_multipart_uploads(
         &self,
         bucket: &str,
@@ -1917,6 +1938,8 @@ impl StorageAPI for ECStore {
             ..Default::default()
         })
     }
+
+    #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         check_new_multipart_args(bucket, object)?;
 
@@ -1946,6 +1969,8 @@ impl StorageAPI for ECStore {
 
         self.pools[idx].new_multipart_upload(bucket, object, opts).await
     }
+
+    #[tracing::instrument(skip(self))]
     async fn get_multipart_info(
         &self,
         bucket: &str,
@@ -1981,6 +2006,7 @@ impl StorageAPI for ECStore {
             upload_id.to_owned(),
         )))
     }
+    #[tracing::instrument(skip(self))]
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
         check_abort_multipart_args(bucket, object, upload_id)?;
 
@@ -2016,6 +2042,7 @@ impl StorageAPI for ECStore {
             upload_id.to_owned(),
         )))
     }
+    #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
         &self,
         bucket: &str,
@@ -2062,6 +2089,7 @@ impl StorageAPI for ECStore {
         )))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
         if pool_idx < self.pools.len() && set_idx < self.pools[pool_idx].disk_set.len() {
             self.pools[pool_idx].disk_set[set_idx].get_disks(0, 0).await
@@ -2070,6 +2098,7 @@ impl StorageAPI for ECStore {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     fn set_drive_counts(&self) -> Vec<usize> {
         let mut counts = vec![0; self.pools.len()];
 
@@ -2078,6 +2107,8 @@ impl StorageAPI for ECStore {
         }
         counts
     }
+
+    #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         info!("heal_format");
         let mut r = HealResultItem {
@@ -2112,9 +2143,11 @@ impl StorageAPI for ECStore {
         Ok((r, None))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         self.peer_sys.heal_bucket(bucket, opts).await
     }
+    #[tracing::instrument(skip(self))]
     async fn heal_object(
         &self,
         bucket: &str,
@@ -2188,6 +2221,8 @@ impl StorageAPI for ECStore {
 
         Ok((HealResultItem::default(), Some(Error::new(DiskError::FileNotFound))))
     }
+
+    #[tracing::instrument(skip(self))]
     async fn heal_objects(
         &self,
         bucket: &str,
@@ -2299,6 +2334,7 @@ impl StorageAPI for ECStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
         for (pool_idx, pool) in self.pools.iter().enumerate() {
             for (set_idx, set) in pool.format.erasure.sets.iter().enumerate() {
@@ -2313,6 +2349,7 @@ impl StorageAPI for ECStore {
         Err(Error::new(DiskError::DiskNotFound))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
         let object = utils::path::encode_dir_object(object);
         if self.single_pool() {

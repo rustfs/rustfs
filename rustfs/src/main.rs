@@ -335,20 +335,27 @@ async fn run(opt: config::Opt) -> Result<()> {
                             span
                         })
                         .on_request(|request: &HttpRequest<_>, _span: &Span| {
-                            debug!("started method: {}, url path: {}", request.method(), request.uri().path())
+                            info!(
+                                counter.rustfs_api_requests_total = 1_u64,
+                                key_request_method = %request.method().to_string(),
+                                key_request_uri_path = %request.uri().path().to_owned(),
+                                "handle request api total",
+                            );
+                            debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
                         })
                         .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
-                            _span.record("status_code", tracing::field::display(response.status()));
-                            debug!("response generated in {:?}", latency)
+                            _span.record("http response status_code", tracing::field::display(response.status()));
+                            debug!("http response generated in {:?}", latency)
                         })
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
-                            debug!("sending {} bytes in {:?}", chunk.len(), latency)
+                            info!(histogram.request.body.len = chunk.len(), "histogram request body lenght",);
+                            debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
                         })
                         .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
-                            debug!("stream closed after {:?}", stream_duration)
+                            debug!("http stream closed after {:?}", stream_duration)
                         })
                         .on_failure(|_error, latency: Duration, _span: &Span| {
-                            debug!("request error: {:?} in {:?}", _error, latency)
+                            debug!("http request failure error: {:?} in {:?}", _error, latency)
                         }),
                 )
                 .layer(CorsLayer::permissive())

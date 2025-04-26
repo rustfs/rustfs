@@ -3,7 +3,7 @@ use crate::utils::get_local_ip_with_default;
 use crate::OtelConfig;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{global, KeyValue};
-use opentelemetry_appender_tracing::layer;
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::{
@@ -202,55 +202,33 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
     // configuring tracing
     {
-        // optimize filter configuration
-        let otel_layer = {
-            let filter_otel = match logger_level {
-                "trace" | "debug" => {
-                    info!("OpenTelemetry tracing initialized with level: {}", logger_level);
-                    EnvFilter::new(logger_level)
-                }
-                _ => {
-                    let mut filter = EnvFilter::new(logger_level);
-
-                    // use smallvec to avoid heap allocation
-                    let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
-
-                    for directive in directives {
-                        filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
-                    }
-                    filter
-                }
-            };
-            layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(filter_otel)
-        };
-
-        let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
-
-        // Configure registry to avoid repeated calls to filter methods
-        let level_filter = switch_level(logger_level);
-        let registry = tracing_subscriber::registry()
-            .with(level_filter)
-            .with(OpenTelemetryLayer::new(tracer))
-            .with(MetricsLayer::new(meter_provider.clone()))
-            .with(otel_layer)
-            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(logger_level)));
-
         // configure the formatting layer
         let enable_color = std::io::stdout().is_terminal();
         let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
             .with_ansi(enable_color)
             .with_thread_names(true)
+            .with_thread_ids(true)
             .with_file(true)
-            .with_line_number(true)
-            .with_filter(
-                EnvFilter::new(logger_level).add_directive(
-                    format!("opentelemetry={}", if endpoint.is_empty() { logger_level } else { "off" })
-                        .parse()
-                        .unwrap(),
-                ),
-            );
+            .with_line_number(true);
 
-        registry.with(ErrorLayer::default()).with(fmt_layer).init();
+        let filter = build_env_filter(logger_level, None);
+
+        let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
+
+        let otel_filter = build_env_filter(logger_level, None);
+        let otel_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_filter);
+
+        // Configure registry to avoid repeated calls to filter methods
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(ErrorLayer::default())
+            .with(otel_layer)
+            .with(MetricsLayer::new(meter_provider.clone()))
+            .with(OpenTelemetryLayer::new(tracer))
+            .with(ErrorLayer::default())
+            .init();
 
         if !endpoint.is_empty() {
             info!(
@@ -267,15 +245,16 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     }
 }
 
-/// Switch log level
-fn switch_level(logger_level: &str) -> tracing_subscriber::filter::LevelFilter {
-    use tracing_subscriber::filter::LevelFilter;
-    match logger_level {
-        "error" => LevelFilter::ERROR,
-        "warn" => LevelFilter::WARN,
-        "info" => LevelFilter::INFO,
-        "debug" => LevelFilter::DEBUG,
-        "trace" => LevelFilter::TRACE,
-        _ => LevelFilter::OFF,
+fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilter {
+    let level = default_level.unwrap_or(logger_level);
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    if !matches!(logger_level, "trace" | "debug") {
+        let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
+        for directive in directives {
+            filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
+        }
     }
+
+    filter
 }
