@@ -455,7 +455,7 @@ impl LocalDisk {
                         {
                             if let Err(aerr) = access(volume_dir.as_ref()).await {
                                 if os_is_not_exist(&aerr) {
-                                    warn!("read_metadata_with_dmtime os err {:?}", &aerr);
+                                    // warn!("read_metadata_with_dmtime os err {:?}", &aerr);
                                     return Err(Error::new(DiskError::VolumeNotFound));
                                 }
                             }

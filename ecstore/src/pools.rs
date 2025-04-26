@@ -2,6 +2,7 @@ use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
 use crate::config::com::{read_config, save_config, CONFIG_PREFIX};
 use crate::config::error::ConfigError;
+use crate::disk::error::is_err_volume_not_found;
 use crate::disk::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::heal::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::heal::heal_commands::HealOpts;
@@ -609,6 +610,12 @@ impl ECStore {
         let mut lock = self.pool_meta.write().await;
         if lock.decommission_cancel(idx) {
             lock.save(self.pools.clone()).await?;
+
+            drop(lock);
+
+            if let Some(notification_sys) = get_global_notification_sys() {
+                notification_sys.reload_pool_meta().await;
+            }
         }
 
         Ok(())
@@ -628,6 +635,7 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rx))]
     pub async fn decommission(&self, rx: B_Receiver<bool>, indices: Vec<usize>) -> Result<()> {
+        warn!("decommission: {:?}", indices);
         if indices.is_empty() {
             return Err(Error::msg("errInvalidArgument"));
         }
@@ -662,8 +670,10 @@ impl ECStore {
         wk: Arc<Workers>,
         rcfg: Option<String>,
     ) {
+        warn!("decommission_entry: {} {}", &bucket, &entry.name);
         wk.give().await;
         if entry.is_dir() {
+            warn!("decommission_entry: skip dir {}", &entry.name);
             return;
         }
 
@@ -782,6 +792,9 @@ impl ECStore {
                     }
                 };
 
+                let bucket_name = bucket.clone();
+                let object_name = rd.object_info.name.clone();
+
                 if let Err(err) = self.clone().decommission_object(idx, bucket, rd).await {
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
                         ignore = true;
@@ -793,6 +806,11 @@ impl ECStore {
                     error!("decommission_pool: decommission_object err {:?}", &err);
                     continue;
                 }
+
+                warn!(
+                    "decommission_pool: decommission_object done {}/{} {}",
+                    &bucket_name, &object_name, &version.name
+                );
 
                 failure = false;
                 break;
@@ -841,10 +859,16 @@ impl ECStore {
                 .update_after(idx, self.pools.clone(), Duration::seconds(30))
                 .await
                 .unwrap_or_default();
+
+            drop(pool_meta);
             if ok {
-                // TODO: ReloadPoolMeta
+                if let Some(notification_sys) = get_global_notification_sys() {
+                    notification_sys.reload_pool_meta().await;
+                }
             }
         }
+
+        warn!("decommission_pool: decommission_entry done {} {}", &bucket, &entry.name);
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -872,6 +896,8 @@ impl ECStore {
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
             wk.clone().take().await;
 
+            warn!("decommission_pool: decommission_pool {} {}", set_idx, &bi.name);
+
             let decommission_entry: ListCallback = Arc::new({
                 let this = Arc::clone(self);
                 let bucket = bi.name.clone();
@@ -895,19 +921,38 @@ impl ECStore {
             tokio::spawn(async move {
                 loop {
                     if rx.try_recv().is_ok() {
+                        warn!("decommission_pool: cancel {}", set_id);
                         break;
                     }
-                    if let Err(err) = set
+                    warn!("decommission_pool: list_objects_to_decommission {} {}", set_id, &bi.name);
+
+                    match set
                         .list_objects_to_decommission(rx.resubscribe(), bi.clone(), decommission_entry.clone())
                         .await
                     {
-                        error!("decommission_pool: list_objects_to_decommission {} err {:?}", set_id, &err);
+                        Ok(_) => {
+                            warn!("decommission_pool: list_objects_to_decommission {} done", set_id);
+                            break;
+                        }
+                        Err(err) => {
+                            error!("decommission_pool: list_objects_to_decommission {} err {:?}", set_id, &err);
+                            if is_err_volume_not_found(&err) {
+                                warn!("decommission_pool: list_objects_to_decommission {} volume not found", set_id);
+                                break;
+                            }
+
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        }
                     }
                 }
             });
         }
 
+        warn!("decommission_pool: decommission_pool wait {} {}", idx, &bi.name);
+
         wk.wait().await;
+
+        warn!("decommission_pool: decommission_pool done {} {}", idx, &bi.name);
 
         Ok(())
     }
@@ -918,10 +963,14 @@ impl ECStore {
             error!("decom err {:?}", &err);
             if let Err(er) = self.decommission_failed(idx).await {
                 error!("decom failed err {:?}", &er);
+            } else {
+                warn!("decommission: decommission_failed  {}", idx);
             }
 
             return;
         }
+
+        warn!("decommission: decommission_in_background complete {}", idx);
 
         let (failed, cmd_line) = {
             let pool_meta = self.pool_meta.read().await;
@@ -944,6 +993,8 @@ impl ECStore {
         } else if let Err(er) = self.complete_decommission(idx).await {
             error!("decom complete err {:?}", &er);
         }
+
+        warn!("Decommissioning complete for pool {}", cmd_line);
     }
 
     #[tracing::instrument(skip(self))]
@@ -955,6 +1006,9 @@ impl ECStore {
         let mut pool_meta = self.pool_meta.write().await;
         if pool_meta.decommission_failed(idx) {
             pool_meta.save(self.pools.clone()).await?;
+
+            drop(pool_meta);
+
             if let Some(notification_sys) = get_global_notification_sys() {
                 notification_sys.reload_pool_meta().await;
             }
@@ -972,6 +1026,7 @@ impl ECStore {
         let mut pool_meta = self.pool_meta.write().await;
         if pool_meta.decommission_complete(idx) {
             pool_meta.save(self.pools.clone()).await?;
+            drop(pool_meta);
             if let Some(notification_sys) = get_global_notification_sys() {
                 notification_sys.reload_pool_meta().await;
             }
@@ -996,7 +1051,7 @@ impl ECStore {
             };
 
             if is_decommissioned {
-                info!("decommission: already done, moving on {}", bucket.to_string());
+                warn!("decommission: already done, moving on {}", bucket.to_string());
 
                 {
                     let mut pool_meta = self.pool_meta.write().await;
@@ -1009,7 +1064,7 @@ impl ECStore {
                 continue;
             }
 
-            info!("decommission: currently on bucket {}", &bucket.name);
+            warn!("decommission: currently on bucket {}", &bucket.name);
 
             if let Err(err) = self
                 .decommission_pool(rx.resubscribe(), idx, pool.clone(), bucket.clone())
@@ -1017,6 +1072,8 @@ impl ECStore {
             {
                 error!("decommission: decommission_pool err {:?}", &err);
                 return Err(err);
+            } else {
+                warn!("decommission: decommission_pool done {}", &bucket.name);
             }
 
             {
@@ -1026,6 +1083,8 @@ impl ECStore {
                         error!("decom pool_meta.save err {:?}", err);
                     }
                 }
+
+                warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
             }
         }
 
@@ -1107,6 +1166,7 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rd))]
     async fn decommission_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
+        warn!("decommission_object: {} {}", &bucket, &rd.object_info.name);
         let object_info = rd.object_info.clone();
 
         // TODO: check : use size or actual_size ?
@@ -1269,10 +1329,23 @@ impl SetDisks {
                 min_disks: listing_quorum,
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
                     let resolver = resolver.clone();
-                    if let Ok(Some(entry)) = entries.resolve(resolver) {
-                        cb_func(entry)
-                    } else {
-                        Box::pin(async {})
+                    let cb_func = cb_func.clone();
+
+                    match entries.resolve(resolver) {
+                        Ok(Some(entry)) => {
+                            warn!("decommission_pool: list_objects_to_decommission get {}", &entry.name);
+                            Box::pin(async move {
+                                cb_func(entry).await;
+                            })
+                        }
+                        Ok(None) => {
+                            warn!("decommission_pool: list_objects_to_decommission get none");
+                            Box::pin(async {})
+                        }
+                        Err(err) => {
+                            error!("decommission_pool: list_objects_to_decommission get err {:?}", &err);
+                            Box::pin(async {})
+                        }
                     }
                 })),
                 ..Default::default()

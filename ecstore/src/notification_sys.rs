@@ -9,7 +9,7 @@ use lazy_static::lazy_static;
 use madmin::{ItemState, ServerProperties};
 use std::sync::OnceLock;
 use std::time::SystemTime;
-use tracing::error;
+use tracing::{error, warn};
 
 lazy_static! {
     pub static ref GLOBAL_NotificationSys: OnceLock<NotificationSys> = OnceLock::new();
@@ -151,6 +151,8 @@ impl NotificationSys {
         for result in results {
             if let Err(err) = result {
                 error!("notification load_rebalance_meta err {:?}", err);
+            } else {
+                warn!("notification load_rebalance_meta success");
             }
         }
     }
