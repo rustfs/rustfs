@@ -335,6 +335,12 @@ async fn run(opt: config::Opt) -> Result<()> {
                             span
                         })
                         .on_request(|request: &HttpRequest<_>, _span: &Span| {
+                            info!(
+                                counter.rustfs_api_requests_total = 1_u64,
+                                key_request_method = %request.method().to_string(),
+                                key_request_uri_path = %request.uri().path().to_owned(),
+                                "handle request api total",
+                            );
                             debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
                         })
                         .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
@@ -342,6 +348,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                             debug!("http response generated in {:?}", latency)
                         })
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
+                            info!(histogram.request.body.len = chunk.len(), "histogram request body lenght",);
                             debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
                         })
                         .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
