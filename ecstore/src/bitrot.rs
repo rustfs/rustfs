@@ -661,7 +661,10 @@ impl ReadAt for BitrotFileReader {
         }
 
         if offset != self.curr_offset {
-            error!("BitrotFileReader read_at offset != self.curr_offset, {} != {}", offset, self.curr_offset);
+            error!(
+                "BitrotFileReader read_at {}/{} offset != self.curr_offset, {} != {}",
+                &self.volume, &self.file_path, offset, self.curr_offset
+            );
             return Err(Error::new(DiskError::Unexpected));
         }
 

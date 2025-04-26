@@ -34,9 +34,9 @@ pub struct RebalPoolProgress {
     #[serde(rename = "object")]
     pub object: String,
     #[serde(rename = "elapsed")]
-    pub elapsed: Duration,
+    pub elapsed: u64,
     #[serde(rename = "eta")]
-    pub eta: Duration,
+    pub eta: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -78,13 +78,13 @@ impl Operation for RebalanceStart {
 
         if store.is_decommission_running().await {
             return Err(s3_error!(
-                InternalError,
+                InvalidRequest,
                 "Rebalance cannot be started, decommission is already in progress"
             ));
         }
 
         if store.is_rebalance_started().await {
-            return Err(s3_error!(InternalError, "Rebalance already in progress"));
+            return Err(s3_error!(OperationAborted, "Rebalance already in progress"));
         }
 
         let bucket_infos = store
@@ -101,8 +101,11 @@ impl Operation for RebalanceStart {
             }
         };
 
+        warn!("Rebalance started with id: {}", id);
         if let Some(notification_sys) = get_global_notification_sys() {
+            warn!("Loading rebalance meta");
             notification_sys.load_rebalance_meta(true).await;
+            warn!("Rebalance meta loaded");
         }
 
         let resp = RebalanceResp { id };
@@ -149,7 +152,7 @@ impl Operation for RebalanceStatus {
             disk_stats[disk.pool_index as usize].total_space += disk.total_space;
         }
 
-        let stop_time = meta.stopped_at;
+        let mut stop_time = meta.stopped_at;
         let mut admin_status = RebalanceAdminStatus {
             id: meta.id.clone(),
             stopped_at: meta.stopped_at,
@@ -171,7 +174,7 @@ impl Operation for RebalanceStatus {
             // Calculate total bytes to be rebalanced
             let total_bytes_to_rebal = ps.init_capacity as f64 * meta.percent_free_goal - ps.init_free_space as f64;
 
-            let elapsed = if let Some(start_time) = ps.info.start_time {
+            let mut elapsed = if let Some(start_time) = ps.info.start_time {
                 SystemTime::now()
                     .duration_since(start_time)
                     .map_err(|e| s3_error!(InternalError, "Failed to calculate elapsed time: {}", e))?
@@ -179,21 +182,25 @@ impl Operation for RebalanceStatus {
                 return Err(s3_error!(InternalError, "Start time is not available"));
             };
 
-            let eta = if ps.bytes > 0 {
+            let mut eta = if ps.bytes > 0 {
                 Duration::from_secs_f64(total_bytes_to_rebal * elapsed.as_secs_f64() / ps.bytes as f64)
             } else {
                 Duration::ZERO
             };
 
-            let stop_time = ps.info.end_time.unwrap_or(stop_time.unwrap_or(SystemTime::now()));
+            if ps.info.end_time.is_some() {
+                stop_time = ps.info.end_time;
+            }
 
-            let elapsed = if ps.info.end_time.is_some() || meta.stopped_at.is_some() {
-                stop_time
-                    .duration_since(ps.info.start_time.unwrap_or(stop_time))
-                    .unwrap_or_default()
-            } else {
-                elapsed
-            };
+            if let Some(stopped_at) = stop_time {
+                if let Ok(du) = stopped_at.duration_since(ps.info.start_time.unwrap_or(stopped_at)) {
+                    elapsed = du;
+                } else {
+                    return Err(s3_error!(InternalError, "Failed to calculate elapsed time"));
+                }
+
+                eta = Duration::ZERO;
+            }
 
             admin_status.pools[i].progress = Some(RebalPoolProgress {
                 num_objects: ps.num_objects,
@@ -201,8 +208,8 @@ impl Operation for RebalanceStatus {
                 bytes: ps.bytes,
                 bucket: ps.bucket.clone(),
                 object: ps.object.clone(),
-                elapsed,
-                eta,
+                elapsed: elapsed.as_secs(),
+                eta: eta.as_secs(),
             });
         }
 

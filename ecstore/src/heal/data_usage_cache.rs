@@ -18,7 +18,6 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
-use tracing::warn;
 
 use super::data_scanner::{SizeSummary, DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS};
 use super::data_usage::{BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo};
@@ -402,7 +401,7 @@ impl DataUsageCache {
                     break;
                 }
                 Err(err) => {
-                    warn!("Failed to load data usage cache from backend: {}", &err);
+                    // warn!("Failed to load data usage cache from backend: {}", &err);
                     match err.downcast_ref::<DiskError>() {
                         Some(DiskError::FileNotFound) | Some(DiskError::VolumeNotFound) => {
                             match store

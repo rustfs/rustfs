@@ -3667,7 +3667,7 @@ impl ObjectIO for SetDisks {
                 error!("get_object_with_fileinfo err {:?}", e);
             };
 
-            // error!("get_object_with_fileinfo end");
+            // error!("get_object_with_fileinfo end {}/{}", bucket, object);
         });
 
         Ok(reader)
