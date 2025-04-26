@@ -1,12 +1,12 @@
 [observability]
-endpoint = "http://localhost:4317" # Default is "http://localhost:4317" if not specified
+endpoint = "http://otel-collector:4317" # Default is "http://localhost:4317" if not specified
 use_stdout = false # Output with stdout, true output, false no output
 sample_ratio = 2.0
 meter_interval = 30
 service_name = "rustfs"
 service_version = "0.1.0"
 environments = "production"
-logger_level = "info"
+logger_level = "debug"
 
 [sinks]
 [sinks.kafka] # Kafka sink is disabled by default

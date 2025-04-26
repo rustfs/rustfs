@@ -10,19 +10,21 @@ use std::env;
 /// Add endpoint for metric collection
 /// Add use_stdout for output to stdout
 /// Add logger level for log level
+/// Add local_logging_enabled for local logging enabled
 #[derive(Debug, Deserialize, Clone)]
 pub struct OtelConfig {
-    pub endpoint: String,
-    pub use_stdout: Option<bool>,
-    pub sample_ratio: Option<f64>,
-    pub meter_interval: Option<u64>,
-    pub service_name: Option<String>,
-    pub service_version: Option<String>,
-    pub environment: Option<String>,
-    pub logger_level: Option<String>,
+    pub endpoint: String,                    // Endpoint for metric collection
+    pub use_stdout: Option<bool>,            // Output to stdout
+    pub sample_ratio: Option<f64>,           // Trace sampling ratio
+    pub meter_interval: Option<u64>,         // Metric collection interval
+    pub service_name: Option<String>,        // Service name
+    pub service_version: Option<String>,     // Service version
+    pub environment: Option<String>,         // Environment
+    pub logger_level: Option<String>,        // Logger level
+    pub local_logging_enabled: Option<bool>, // Local logging enabled
 }
 
-// 辅助函数：从环境变量中提取可观测性配置
+// Helper function: Extract observable configuration from environment variables
 fn extract_otel_config_from_env() -> OtelConfig {
     OtelConfig {
         endpoint: env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string()),
@@ -54,6 +56,10 @@ fn extract_otel_config_from_env() -> OtelConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .or(Some(LOGGER_LEVEL.to_string())),
+        local_logging_enabled: env::var("RUSTFS_OBSERVABILITY_LOCAL_LOGGING_ENABLED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(false)),
     }
 }
 
@@ -179,6 +185,10 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Create a new instance of AppConfig with default values
+    ///
+    /// # Returns
+    /// A new instance of AppConfig
     pub fn new() -> Self {
         Self {
             observability: OtelConfig::default(),
@@ -195,6 +205,7 @@ impl Default for AppConfig {
     }
 }
 
+/// Default configuration file name
 const DEFAULT_CONFIG_FILE: &str = "obs";
 
 /// Loading the configuration file
