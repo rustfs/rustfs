@@ -21,6 +21,7 @@ full = ["file", "gpu", "kafka", "webhook"]
 async-trait = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
+local-ip-address = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
@@ -41,7 +42,7 @@ reqwest = { workspace = true, optional = true, default-features = false }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
-local-ip-address = { workspace = true }
+
 
 
 [dev-dependencies]
