@@ -3,7 +3,7 @@ use lazy_static::lazy_static;
 use std::{
     collections::HashSet,
     fmt::Display,
-    net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs},
+    net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
 };
 
 use url::Host;
@@ -139,6 +139,33 @@ impl TryFrom<String> for XHost {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "value invalid"))
         }
     }
+}
+
+/// parses the address string, process the ":port" format for double-stack binding,
+/// and resolve the host name or IP address. If the port is 0, an available port is assigned.
+pub fn parse_and_resolve_address(addr_str: &str) -> Result<SocketAddr> {
+    let resolved_addr: SocketAddr = if let Some(port) = addr_str.strip_prefix(":") {
+        // Process the ":port" format for double stack binding
+        let port_str = port;
+        let port: u16 = port_str
+            .parse()
+            .map_err(|e| Error::from_string(format!("Invalid port format: {}, err:{:?}", addr_str, e)))?;
+        let final_port = if port == 0 {
+            get_available_port() // assume get_available_port is available here
+        } else {
+            port
+        };
+        // Using IPv6 without address specified [::], it should handle both IPv4 and IPv6
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), final_port)
+    } else {
+        // Use existing logic to handle regular address formats
+        let mut addr = check_local_server_addr(addr_str)?; // assume check_local_server_addr is available here
+        if addr.port() == 0 {
+            addr.set_port(get_available_port());
+        }
+        addr
+    };
+    Ok(resolved_addr)
 }
 
 #[cfg(test)]

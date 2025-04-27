@@ -27,7 +27,7 @@ use ecstore::config as ecconfig;
 use ecstore::config::GLOBAL_ConfigSys;
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::store_api::BucketOptions;
-use ecstore::utils::net::{self, get_available_port};
+use ecstore::utils::net;
 use ecstore::StorageAPI;
 use ecstore::{
     endpoints::EndpointServerPools,
@@ -136,14 +136,8 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     debug!("opt: {:?}", &opt);
 
-    let mut server_addr = net::check_local_server_addr(opt.address.as_str())?;
-
-    if server_addr.port() == 0 {
-        server_addr.set_port(get_available_port());
-    }
-
+    let server_addr = net::parse_and_resolve_address(opt.address.as_str())?;
     let server_port = server_addr.port();
-
     let server_address = server_addr.to_string();
 
     debug!("server_address {}", &server_address);
@@ -263,32 +257,58 @@ async fn run(opt: config::Opt) -> Result<()> {
         }
     });
 
-    let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
-
     let tls_path = opt.tls_path.clone().unwrap_or_default();
-    let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
-    let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
-    let has_tls_certs = tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
-    debug!("Main TLS certs: {:?}", has_tls_certs);
+    let has_tls_certs = tokio::fs::metadata(&tls_path).await.is_ok();
     let tls_acceptor = if has_tls_certs {
-        debug!("Found TLS certificates, starting with HTTPS");
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let certs = utils::load_certs(cert_path.as_str()).map_err(|e| error(e.to_string()))?;
-        let key = utils::load_private_key(key_path.as_str()).map_err(|e| error(e.to_string()))?;
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| error(e.to_string()))?;
-        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-        Some(TlsAcceptor::from(Arc::new(server_config)))
+        debug!("Found TLS directory, checking for certificates");
+
+        // 1. Try to load all certificates directly (including root and subdirectories)
+        match utils::load_all_certs_from_directory(&tls_path) {
+            Ok(cert_key_pairs) if !cert_key_pairs.is_empty() => {
+                debug!("Found {} certificates, starting with HTTPS", cert_key_pairs.len());
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+                // create a multi certificate configuration
+                let mut server_config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(utils::create_multi_cert_resolver(cert_key_pairs)?));
+
+                server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+                Some(TlsAcceptor::from(Arc::new(server_config)))
+            }
+            _ => {
+                // 2. If the synthesis fails, fall back to the traditional document certificate mode (backward compatible)
+                let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
+                let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+                let has_single_cert =
+                    tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
+
+                if has_single_cert {
+                    debug!("Found legacy single TLS certificate, starting with HTTPS");
+                    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+                    let certs = utils::load_certs(cert_path.as_str()).map_err(|e| error(e.to_string()))?;
+                    let key = utils::load_private_key(key_path.as_str()).map_err(|e| error(e.to_string()))?;
+                    let mut server_config = ServerConfig::builder()
+                        .with_no_client_auth()
+                        .with_single_cert(certs, key)
+                        .map_err(|e| error(e.to_string()))?;
+                    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+                    Some(TlsAcceptor::from(Arc::new(server_config)))
+                } else {
+                    debug!("No valid TLS certificates found, starting with HTTP");
+                    None
+                }
+            }
+        }
     } else {
         debug!("TLS certificates not found, starting with HTTP");
         None
     };
 
+    let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
     let state_manager = ServiceStateManager::new();
     let worker_state_manager = state_manager.clone();
-    // 更新服务状态为启动中
+    // Update service status to Starting
     state_manager.update(ServiceState::Starting);
 
     // Create shutdown channel
@@ -296,7 +316,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     let shutdown_tx_clone = shutdown_tx.clone();
 
     tokio::spawn(async move {
-        // 错误处理改进
+        // error handling improvements
         let sigterm_inner = match signal(SignalKind::terminate()) {
             Ok(signal) => signal,
             Err(e) => {
@@ -367,7 +387,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         let graceful = Arc::new(GracefulShutdown::new());
         debug!("graceful initiated");
 
-        // 服务准备就绪
+        // service ready
         worker_state_manager.update(ServiceState::Ready);
         let value = hybrid_service.clone();
         loop {

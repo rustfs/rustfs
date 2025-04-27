@@ -106,7 +106,6 @@ opentelemetry-otlp = { version = "0.29.0" }
 opentelemetry-semantic-conventions = { version = "0.29.0", features = ["semconv_experimental"] }
 parking_lot = "0.12.3"
 pin-project-lite = "0.2.16"
-prometheus = "0.14.0"
 # pin-utils = "0.1.0"
 prost = "0.13.5"
 prost-build = "0.13.5"

@@ -28,12 +28,12 @@ fi
 
 export RUSTFS_VOLUMES="./target/volume/test{0...4}"
 # export RUSTFS_VOLUMES="./target/volume/test"
-export RUSTFS_ADDRESS="[::]:9000"
+export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
-export RUSTFS_CONSOLE_ADDRESS="[::]:9002"
+export RUSTFS_CONSOLE_ADDRESS=":9002"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS 证书目录
-# export RUSTFS_TLS_PATH="./deploy/certs"
+ export RUSTFS_TLS_PATH="./deploy/certs"
 
 # 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考 其中`RUSTFS_OBS_CONFIG` 和下面变量二选一
 export RUSTFS_OBS_CONFIG="./deploy/config/obs.example.toml"
@@ -57,6 +57,11 @@ export RUSTFS__SINKS__KAFKA__ENABLED=false
 export RUSTFS__SINKS__KAFKA__BOOTSTRAP_SERVERS=""
 export RUSTFS__SINKS__KAFKA__TOPIC=""
 export RUSTFS__LOGGER__QUEUE_CAPACITY=10
+
+export OTEL_INSTRUMENTATION_NAME="rustfs"
+export OTEL_INSTRUMENTATION_VERSION="0.1.1"
+export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
+export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
 # 事件消息配置
 export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
