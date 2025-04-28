@@ -32,7 +32,17 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 ### TLS File
 
 ```text
- rustfs_public.crt  #api cert.pem
-
- rustfs_private.key #api key.pem
+cd deploy/certs/ 
+ls -la
+  ├── rustfs_cert.pem        // Default｜fallback certificate
+  ├── rustfs_key.pem         // Default｜fallback private key
+  ├── example.com/    // certificate directory of specific domain names
+  │   ├── rustfs_cert.pem
+  │   └── rustfs_key.pem
+  ├── api.example.com/
+  │   ├── rustfs_cert.pem
+  │   └── rustfs_key.pem
+  └── cdn.example.com/
+      ├── rustfs_cert.pem
+      └── rustfs_key.pem
 ```

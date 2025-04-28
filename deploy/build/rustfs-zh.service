@@ -51,6 +51,10 @@ ExecStart=/usr/local/bin/rustfs \
 EnvironmentFile=-/etc/default/rustfs
 ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
 
+# standard output and error log configuration
+StandardOutput=append:/data/deploy/rust/logs/rustfs.log
+StandardError=append:/data/deploy/rust/logs/rustfs-err.log
+
 # resource constraints
 LimitNOFILE=1048576
 # 设置文件描述符上限为 1048576，支持高并发连接。
