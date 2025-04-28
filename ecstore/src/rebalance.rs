@@ -18,6 +18,7 @@ use common::defer;
 use common::error::{Error, Result};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -389,10 +390,15 @@ impl ECStore {
         let mut rebalance_meta = self.rebalance_meta.write().await;
         if let Some(meta) = rebalance_meta.as_mut() {
             if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
-                if let Some(idx) = pool_stat.buckets.iter().position(|b| *b == bucket) {
+                warn!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
+                if let Some(idx) = pool_stat.buckets.iter().position(|b| b.as_str() == bucket.as_str()) {
+                    warn!("bucket_rebalance_done: bucket {} rebalanced", &bucket);
                     pool_stat.buckets.remove(idx);
                     pool_stat.rebalanced_buckets.push(bucket);
+
                     return Ok(());
+                } else {
+                    warn!("bucket_rebalance_done: bucket {} not found", bucket);
                 }
             }
         }
@@ -584,7 +590,7 @@ impl ECStore {
         warn!("Pool {} rebalancing is started", pool_index + 1);
 
         while let Some(bucket) = self.next_rebal_bucket(pool_index).await? {
-            warn!("Rebalancing bucket: {}", bucket);
+            warn!("Rebalancing bucket: start {}", bucket);
 
             if let Err(err) = self.rebalance_bucket(rx.resubscribe(), bucket.clone(), pool_index).await {
                 if err.to_string().contains("not initialized") {
@@ -596,6 +602,7 @@ impl ECStore {
                 break;
             }
 
+            warn!("Rebalance bucket: done {} ", bucket);
             self.bucket_rebalance_done(pool_index, bucket).await?;
         }
 
@@ -632,7 +639,6 @@ impl ECStore {
         false
     }
 
-    #[allow(unused_assignments)]
     #[tracing::instrument(skip(self, wk, set))]
     async fn rebalance_entry(
         &self,
@@ -854,7 +860,13 @@ impl ECStore {
             for (i, part) in object_info.parts.iter().enumerate() {
                 // 每次从reader中读取一个part上传
 
-                let mut data = PutObjReader::new(reader, part.size);
+                let mut chunk = vec![0u8; part.size];
+
+                reader.read_exact(&mut chunk).await?;
+
+                // 每次从reader中读取一个part上传
+                let rd = Box::new(Cursor::new(chunk));
+                let mut data = PutObjReader::new(rd, part.size);
 
                 let pi = match self
                     .put_object_part(
@@ -881,9 +893,6 @@ impl ECStore {
                     part_num: pi.part_num,
                     e_tag: pi.etag,
                 };
-
-                // 把reader所有权拿回来?
-                reader = data.stream;
             }
 
             if let Err(err) = self
@@ -937,7 +946,7 @@ impl ECStore {
     #[tracing::instrument(skip(self, rx))]
     async fn rebalance_bucket(self: &Arc<Self>, rx: B_Receiver<bool>, bucket: String, pool_index: usize) -> Result<()> {
         // Placeholder for actual bucket rebalance logic
-        tracing::info!("Rebalancing bucket {} in pool {}", bucket, pool_index);
+        warn!("Rebalancing bucket {} in pool {}", bucket, pool_index);
 
         // TODO: other config
         // if bucket != RUSTFS_META_BUCKET{
@@ -975,14 +984,12 @@ impl ECStore {
             let bucket = bucket.clone();
             let wk = wk.clone();
             tokio::spawn(async move {
-                defer!(|| async {
-                    wk.clone().give().await;
-                });
                 if let Err(err) = set.list_objects_to_rebalance(rx, bucket, rebalance_entry).await {
                     error!("Rebalance worker {} error: {}", set_idx, err);
                 } else {
                     info!("Rebalance worker {} done", set_idx);
                 }
+                wk.clone().give().await;
             });
         }
 
