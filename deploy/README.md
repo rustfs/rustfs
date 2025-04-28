@@ -23,13 +23,21 @@ managing and monitoring the system.
 |  |--rustfs.service // systemd service file
 |  |--rustfs-zh.service.md // systemd service file in Chinese
 |--certs
-|  |--README.md // certs readme
-|  |--rustfs_tls_cert.pem // API cert.pem
-|  |--rustfs_tls_key.pem // API key.pem
-|  |--rustfs_console_tls_cert.pem // console cert.pem
-|  |--rustfs_console_tls_key.pem // console key.pem
+|  ├── rustfs_cert.pem        // Default｜fallback certificate
+|  ├── rustfs_key.pem         // Default｜fallback private key
+|  ├── example.com/    // certificate directory of specific domain names
+|  │   ├── rustfs_cert.pem
+|  │   └── rustfs_key.pem
+|  ├── api.example.com/
+|  │   ├── rustfs_cert.pem
+|  │   └── rustfs_key.pem
+|  └── cdn.example.com/
+|      ├── rustfs_cert.pem
+|      └── rustfs_key.pem
 |--config
 |  |--obs.example.yaml // example config
 |  |--rustfs.env // env config
 |  |--rustfs-zh.env // env config in Chinese
+|  |--.example.obs.env // example env config
+|  |--event.example.toml // event config
 ```
