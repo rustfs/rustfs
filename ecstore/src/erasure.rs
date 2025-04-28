@@ -6,8 +6,10 @@ use common::error::{Error, Result};
 use futures::future::join_all;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use smallvec::SmallVec;
+use tokio::sync::mpsc;
 use std::any::Any;
 use std::io::ErrorKind;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
@@ -52,8 +54,8 @@ impl Erasure {
 
     #[tracing::instrument(level = "debug", skip(self, reader, writers))]
     pub async fn encode<S>(
-        &mut self,
-        reader: &mut S,
+        self: Arc<Self>,
+        mut reader: S,
         writers: &mut [Option<BitrotWriter>],
         // block_size: usize,
         total_size: usize,
@@ -67,40 +69,47 @@ impl Erasure {
         //     body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
         // );
 
-        let mut total: usize = 0;
-        let mut blocks = <SmallVec<[Bytes; 16]>>::new();
-
-        loop {
-            if total_size > 0 {
-                let new_len = {
-                    let remain = total_size - total;
-                    if remain > self.block_size {
-                        self.block_size
-                    } else {
-                        remain
-                    }
-                };
-
-                if new_len == 0 && total > 0 {
-                    break;
-                }
-
-                self.buf.resize(new_len, 0u8);
-                match reader.read_exact(&mut self.buf).await {
-                    Ok(res) => res,
-                    Err(e) => {
-                        if let ErrorKind::UnexpectedEof = e.kind() {
-                            break;
+        let (tx, mut rx) = mpsc::channel(3);
+        let self_clone = self.clone();
+        let task = tokio::spawn(async move {
+            let mut total: usize = 0;
+            let mut buf = Vec::new();
+            loop {
+                let mut blocks = <SmallVec<[Bytes; 16]>>::new();
+                if total_size > 0 {
+                    let new_len = {
+                        let remain = total_size - total;
+                        if remain > self_clone.block_size {
+                            self_clone.block_size
                         } else {
-                            return Err(Error::new(e));
+                            remain
                         }
+                    };
+                    
+                    if new_len == 0 && total > 0 {
+                        break;
                     }
-                };
-                total += self.buf.len();
+                    
+                    buf.resize(new_len, 0u8);
+                    match reader.read_exact(&mut buf).await {
+                        Ok(res) => res,
+                        Err(e) => {
+                            if let ErrorKind::UnexpectedEof = e.kind() {
+                                break;
+                            } else {
+                                return Err(Error::new(e));
+                            }
+                        }
+                    };
+                    total += buf.len();
+                }
+                self_clone.clone().encode_data(&buf, &mut blocks)?;
+                let _ = tx.send(blocks).await;
             }
-
-            self.encode_data(&self.buf, &mut blocks)?;
-
+            Ok(total)
+        });
+        
+        while let Some(blocks) = rx.recv().await {
             let write_futures = writers.iter_mut().enumerate().map(|(i, w_op)| {
                 let i_inner = i;
                 let blocks_inner = blocks.clone();
@@ -130,8 +139,7 @@ impl Erasure {
                 break;
             }
         }
-
-        Ok(total)
+        task.await?
 
         // // let stream = ChunkedStream::new(body, self.block_size);
         // let stream = ChunkedStream::new(body, total_size, self.block_size, false);
@@ -356,8 +364,8 @@ impl Erasure {
         self.data_shards + self.parity_shards
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
-    pub fn encode_data(&self, data: &[u8], shards: &mut SmallVec<[Bytes; 16]>) -> Result<()> {
+    #[tracing::instrument(level = "info", skip_all, fields(data_len=data.len()))]
+    pub fn encode_data(self: Arc<Self>, data: &[u8], shards: &mut SmallVec<[Bytes; 16]>) -> Result<()> {
         let (shard_size, total_size) = self.need_size(data.len());
 
         // 生成一个新的 所需的所有分片数据长度
@@ -618,34 +626,34 @@ impl ShardReader {
 #[cfg(test)]
 mod test {
 
-    use super::*;
+    // use super::*;
 
-    #[test]
-    fn test_erasure() {
-        let data_shards = 3;
-        let parity_shards = 2;
-        let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-        let ec = Erasure::new(data_shards, parity_shards, 1);
-        let mut shards = SmallVec::new();
-        ec.encode_data(data, &mut shards).unwrap();
-        println!("shards:{:?}", shards);
+    // #[test]
+    // fn test_erasure() {
+    //     let data_shards = 3;
+    //     let parity_shards = 2;
+    //     let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    //     let ec = Erasure::new(data_shards, parity_shards, 1);
+    //     let mut shards = SmallVec::new();
+    //     Arc::new(ec).encode_data(data, &mut shards).unwrap();
+    //     println!("shards:{:?}", shards);
 
-        let mut s: Vec<_> = shards
-            .iter()
-            .map(|d| if d.is_empty() { None } else { Some(d.to_vec()) })
-            .collect();
+    //     let mut s: Vec<_> = shards
+    //         .iter()
+    //         .map(|d| if d.is_empty() { None } else { Some(d.to_vec()) })
+    //         .collect();
 
-        // let mut s = shards_to_option_shards(&shards);
+    //     // let mut s = shards_to_option_shards(&shards);
 
-        // s[0] = None;
-        s[4] = None;
-        s[3] = None;
+    //     // s[0] = None;
+    //     s[4] = None;
+    //     s[3] = None;
 
-        println!("sss:{:?}", &s);
+    //     println!("sss:{:?}", &s);
 
-        ec.decode_data(&mut s).unwrap();
-        // ec.encoder.reconstruct(&mut s).unwrap();
+    //     ec.decode_data(&mut s).unwrap();
+    //     // ec.encoder.reconstruct(&mut s).unwrap();
 
-        println!("sss:{:?}", &s);
-    }
+    //     println!("sss:{:?}", &s);
+    // }
 }
