@@ -867,7 +867,7 @@ impl FolderScanner {
                                 //     return;
                                 // }
                                 let entry = match entries.resolve(resolver_partial) {
-                                    Ok(Some(entry)) => entry,
+                                    Some(entry) => entry,
                                     _ => match entries.first_found() {
                                         (Some(entry), _) => entry,
                                         _ => return,

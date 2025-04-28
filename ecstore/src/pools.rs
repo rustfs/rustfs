@@ -1330,20 +1330,15 @@ impl SetDisks {
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
                     let resolver = resolver.clone();
                     let cb_func = cb_func.clone();
-
                     match entries.resolve(resolver) {
-                        Ok(Some(entry)) => {
+                        Some(entry) => {
                             warn!("decommission_pool: list_objects_to_decommission get {}", &entry.name);
                             Box::pin(async move {
                                 cb_func(entry).await;
                             })
                         }
-                        Ok(None) => {
+                        None => {
                             warn!("decommission_pool: list_objects_to_decommission get none");
-                            Box::pin(async {})
-                        }
-                        Err(err) => {
-                            error!("decommission_pool: list_objects_to_decommission get err {:?}", &err);
                             Box::pin(async {})
                         }
                     }
