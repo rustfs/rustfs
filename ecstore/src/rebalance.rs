@@ -370,7 +370,7 @@ impl ECStore {
         let rebalance_meta = self.rebalance_meta.read().await;
         if let Some(meta) = rebalance_meta.as_ref() {
             if let Some(pool_stat) = meta.pool_stats.get(pool_index) {
-                if pool_stat.info.status != RebalStatus::Completed || !pool_stat.participating {
+                if pool_stat.info.status == RebalStatus::Completed || !pool_stat.participating {
                     return Ok(None);
                 }
 
@@ -581,17 +581,17 @@ impl ECStore {
             }
         });
 
-        tracing::warn!("Pool {} rebalancing is started", pool_index + 1);
+        warn!("Pool {} rebalancing is started", pool_index + 1);
 
         while let Some(bucket) = self.next_rebal_bucket(pool_index).await? {
-            tracing::info!("Rebalancing bucket: {}", bucket);
+            warn!("Rebalancing bucket: {}", bucket);
 
             if let Err(err) = self.rebalance_bucket(rx.resubscribe(), bucket.clone(), pool_index).await {
                 if err.to_string().contains("not initialized") {
                     warn!("rebalance_bucket: rebalance not initialized, continue");
                     continue;
                 }
-                tracing::error!("Error rebalancing bucket {}: {:?}", bucket, err);
+                error!("Error rebalancing bucket {}: {:?}", bucket, err);
                 done_tx.send(Err(err)).await.ok();
                 break;
             }
@@ -599,7 +599,7 @@ impl ECStore {
             self.bucket_rebalance_done(pool_index, bucket).await?;
         }
 
-        tracing::warn!("Pool {} rebalancing is done", pool_index + 1);
+        warn!("Pool {} rebalancing is done", pool_index + 1);
 
         done_tx.send(Ok(())).await.ok();
         save_task.await.ok();
@@ -838,8 +838,6 @@ impl ECStore {
                 }
             };
 
-            // TODO: defer abort_multipart_upload
-
             defer!(|| async {
                 if let Err(err) = self
                     .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
@@ -1068,7 +1066,7 @@ impl SetDisks {
                 bucket: bucket.clone(),
                 recursice: true,
                 min_disks: listing_quorum,
-                agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry.clone())))),
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
                     // let cb = cb.clone();
                     let resolver = resolver.clone();
