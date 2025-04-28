@@ -7,7 +7,7 @@ use common::error::{Error, Result};
 use futures::future::join_all;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::{spawn, sync::broadcast::Receiver as B_Receiver};
-use tracing::{error, info, warn};
+use tracing::error;
 
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 pub type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
@@ -54,7 +54,6 @@ impl Clone for ListPathRawOptions {
 pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> Result<()> {
     // println!("list_path_raw {},{}", &opts.bucket, &opts.path);
     if opts.disks.is_empty() {
-        info!("list_path_raw 0 drives provided");
         return Err(Error::from_string("list_path_raw: 0 drives provided"));
     }
 
@@ -214,16 +213,12 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 // If only the name matches we didn't agree, but add it for resolution.
                 if entry.name == current.name {
                     top_entries[i] = Some(entry);
-
                     continue;
                 }
                 // We got different entries
                 if entry.name > current.name {
                     continue;
                 }
-                // We got a new, better current.
-                // Clear existing entries.
-                top_entries = vec![None; top_entries.len()];
 
                 for item in top_entries.iter_mut().take(i) {
                     *item = None;
@@ -270,7 +265,6 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                     }
                 }
 
-                warn!("list_path_raw: all at eof or error");
                 break;
             }
 
@@ -279,7 +273,6 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                     let _ = r.skip(1).await;
                 }
 
-                warn!("list_path_raw: agree == readers.len() {} ", &current.name);
                 if let Some(agreed_fn) = opts.agreed.as_ref() {
                     agreed_fn(current).await;
                 }
@@ -293,7 +286,6 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
             }
 
-            warn!("list_path_raw: {} entries", top_entries.len());
             if let Some(partial_fn) = opts.partial.as_ref() {
                 partial_fn(MetaCacheEntries(top_entries), &errs).await;
             }
