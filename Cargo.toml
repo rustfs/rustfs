@@ -156,11 +156,11 @@ time = { version = "0.3.41", features = [
     "serde",
 ] }
 tokio = { version = "1.44.2", features = ["fs", "rt-multi-thread"] }
-tonic = { version = "0.13.0", features = ["gzip"] }
-tonic-build = "0.13.0"
 tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.14", features = ["io", "compat"] }
+tonic = { version = "0.13.0", features = ["gzip"] }
+tonic-build = "0.13.0"
 tower = { version = "0.5.2", features = ["timeout"] }
 tower-http = { version = "0.6.2", features = ["cors"] }
 tracing = "0.1.41"
