@@ -1075,16 +1075,12 @@ impl SetDisks {
                     let cb = cb.clone();
 
                     match entries.resolve(resolver) {
-                        Ok(Some(entry)) => {
+                        Some(entry) => {
                             warn!("rebalance: list_objects_to_decommission get {}", &entry.name);
                             Box::pin(async move { cb(entry).await })
                         }
-                        Ok(None) => {
+                        None => {
                             warn!("rebalance: list_objects_to_decommission get none");
-                            Box::pin(async {})
-                        }
-                        Err(err) => {
-                            error!("rebalance: list_objects_to_decommission get err {:?}", &err);
                             Box::pin(async {})
                         }
                     }

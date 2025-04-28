@@ -916,11 +916,20 @@ impl FileMetaVersionHeader {
     }
 
     pub fn matches_not_strict(&self, o: &FileMetaVersionHeader) -> bool {
+        let mut ok = self.version_id == o.version_id && self.version_type == o.version_type && self.matches_ec(o);
         if self.version_id.is_none() {
-            return self.version_id == o.version_id && self.version_type == o.version_type && self.mod_time == o.mod_time;
+            ok = ok && self.mod_time == o.mod_time;
         }
 
-        self.version_id == o.version_id && self.version_type == o.version_type
+        ok
+    }
+
+    pub fn matches_ec(&self, o: &FileMetaVersionHeader) -> bool {
+        if self.has_ec() && o.has_ec() {
+            return self.ec_n == o.ec_n && self.ec_m == o.ec_m;
+        }
+
+        true
     }
 
     pub fn free_version(&self) -> bool {
