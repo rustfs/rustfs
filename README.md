@@ -84,7 +84,7 @@ observability data formats (e.g. Jaeger, Prometheus, etc.) sending to one or mor
 2. Run the following command:
 
 ```bash
-docker-compose -f docker-compose.yml up -d
+docker compose -f docker-compose.yml up -d
 ```
 
 3. Access the Grafana dashboard by navigating to `http://localhost:3000` in your browser. The default username and
