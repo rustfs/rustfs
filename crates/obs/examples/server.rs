@@ -38,10 +38,12 @@ async fn run(bucket: String, object: String, user: String, service_name: String)
         &[opentelemetry::KeyValue::new("operation", "run")],
     );
 
-    match init_process_observer(meter).await {
-        Ok(_) => info!("Process observer initialized successfully"),
-        Err(e) => error!("Failed to initialize process observer: {:?}", e),
-    }
+    tokio::spawn(async move {
+        match init_process_observer(meter).await {
+            Ok(_) => info!("Process observer initialized successfully"),
+            Err(e) => error!("Failed to initialize process observer: {:?}", e),
+        }
+    });
 
     let base_entry = BaseLogEntry::new()
         .message(Some("run logger api_handler info".to_string()))

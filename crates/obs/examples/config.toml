@@ -3,10 +3,11 @@ endpoint = "http://localhost:4317" # Default is "http://localhost:4317" if not s
 use_stdout = false # Output with stdout, true output, false no output
 sample_ratio = 1
 meter_interval = 30
-service_name = "rustfs_obs"
+service_name = "rustfs"
 service_version = "0.1.0"
 environments = "develop"
 logger_level = "debug"
+local_logging_enabled = true # Default is false if not specified
 
 [sinks]
 [sinks.kafka]
