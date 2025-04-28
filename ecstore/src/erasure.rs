@@ -1,17 +1,18 @@
 use crate::bitrot::{BitrotReader, BitrotWriter};
 use crate::error::clone_err;
+use crate::io::Etag;
 use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
 use bytes::{Bytes, BytesMut};
 use common::error::{Error, Result};
 use futures::future::join_all;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use smallvec::SmallVec;
-use tokio::sync::mpsc;
 use std::any::Any;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::warn;
 use tracing::{error, info};
 // use tracing::debug;
@@ -28,7 +29,7 @@ pub struct Erasure {
     encoder: Option<ReedSolomon>,
     pub block_size: usize,
     _id: Uuid,
-    buf: Vec<u8>,
+    _buf: Vec<u8>,
 }
 
 impl Erasure {
@@ -48,7 +49,7 @@ impl Erasure {
             block_size,
             encoder,
             _id: Uuid::new_v4(),
-            buf: vec![0u8; block_size],
+            _buf: vec![0u8; block_size],
         }
     }
 
@@ -60,9 +61,9 @@ impl Erasure {
         // block_size: usize,
         total_size: usize,
         write_quorum: usize,
-    ) -> Result<usize>
+    ) -> Result<(usize, String)>
     where
-        S: AsyncRead + Unpin + Send + 'static,
+        S: AsyncRead + Etag + Unpin + Send + 'static,
     {
         // pin_mut!(body);
         // let mut reader = tokio_util::io::StreamReader::new(
@@ -85,11 +86,11 @@ impl Erasure {
                             remain
                         }
                     };
-                    
+
                     if new_len == 0 && total > 0 {
                         break;
                     }
-                    
+
                     buf.resize(new_len, 0u8);
                     match reader.read_exact(&mut buf).await {
                         Ok(res) => res,
@@ -106,9 +107,11 @@ impl Erasure {
                 self_clone.clone().encode_data(&buf, &mut blocks)?;
                 let _ = tx.send(blocks).await;
             }
-            Ok(total)
+            // let etag = reader.etag().await;
+            let etag = String::new();
+            Ok((total, etag))
         });
-        
+
         while let Some(blocks) = rx.recv().await {
             let write_futures = writers.iter_mut().enumerate().map(|(i, w_op)| {
                 let i_inner = i;

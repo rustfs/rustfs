@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use md5::Digest;
@@ -128,8 +129,9 @@ impl AsyncRead for HttpFileReader {
     }
 }
 
-pub trait  {
-    
+#[async_trait]
+pub trait Etag {
+    async fn etag(self) -> String;
 }
 
 pin_project! {
@@ -139,7 +141,6 @@ pin_project! {
         md5_rx: oneshot::Receiver<String>,
     }
 }
-
 
 impl<R> EtagReader<R> {
     pub fn new(inner: R) -> Self {
@@ -158,8 +159,11 @@ impl<R> EtagReader<R> {
 
         EtagReader { inner, bytes_tx, md5_rx }
     }
+}
 
-    pub async fn etag(self) -> String {
+#[async_trait]
+impl<R: Send> Etag for EtagReader<R> {
+    async fn etag(self) -> String {
         drop(self.inner);
         drop(self.bytes_tx);
         self.md5_rx.await.unwrap()

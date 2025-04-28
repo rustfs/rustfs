@@ -3759,7 +3759,7 @@ impl ObjectIO for SetDisks {
 
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
-        let mut erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let is_inline_buffer = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
@@ -3798,11 +3798,11 @@ impl ObjectIO for SetDisks {
         }
 
         let stream = replace(&mut data.stream, Box::new(empty()));
-        let mut etag_stream = EtagReader::new(stream);
+        let etag_stream = EtagReader::new(stream);
 
         // TODO: etag from header
 
-        let w_size = Arc::new(erasure)
+        let (w_size, etag) = Arc::new(erasure)
             .encode(etag_stream, &mut writers, data.content_length, write_quorum)
             .await?; // TODO: 出错，删除临时目录
 
@@ -3810,7 +3810,6 @@ impl ObjectIO for SetDisks {
             error!("close_bitrot_writers err {:?}", err);
         }
 
-        let etag = etag_stream.etag().await;
         //TODO: userDefined
 
         user_defined.insert("etag".to_owned(), etag.clone());
@@ -4408,20 +4407,18 @@ impl StorageAPI for SetDisks {
             }
         }
 
-        let mut erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let stream = replace(&mut data.stream, Box::new(empty()));
-        let mut etag_stream = EtagReader::new(stream);
+        let etag_stream = EtagReader::new(stream);
 
-        let w_size = erasure
-            .encode(&mut etag_stream, &mut writers, data.content_length, write_quorum)
+        let (w_size, mut etag) = Arc::new(erasure)
+            .encode(etag_stream, &mut writers, data.content_length, write_quorum)
             .await?;
 
         if let Err(err) = close_bitrot_writers(&mut writers).await {
             error!("close_bitrot_writers err {:?}", err);
         }
-
-        let mut etag = etag_stream.etag().await;
 
         if let Some(ref tag) = opts.preserve_etag {
             etag = tag.clone();
