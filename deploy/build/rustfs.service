@@ -31,6 +31,10 @@ ExecStart=/usr/local/bin/rustfs \
 EnvironmentFile=-/etc/default/rustfs
 ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
 
+# service log configuration
+StandardOutput=append:/data/deploy/rust/logs/rustfs.log
+StandardError=append:/data/deploy/rust/logs/rustfs-err.log
+
 # resource constraints
 LimitNOFILE=1048576
 LimitNPROC=32768
