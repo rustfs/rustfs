@@ -40,7 +40,7 @@ use tokio::spawn;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send>>;
 
@@ -2388,19 +2388,27 @@ impl Node for NodeService {
 
         let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
 
+        warn!("handle LoadRebalanceMetaRequest");
+
         store.load_rebalance_meta().await.map_err(|err| {
             error!("load_rebalance_meta err {:?}", err);
             Status::internal(err.to_string())
         })?;
 
+        warn!("load_rebalance_meta success");
+
         if start_rebalance {
+            warn!("start rebalance");
             let store = store.clone();
             tokio::spawn(async move {
                 store.start_rebalance().await;
             });
         }
 
-        unimplemented!()
+        Ok(tonic::Response::new(LoadRebalanceMetaResponse {
+            success: true,
+            error_info: None,
+        }))
     }
 
     async fn load_transition_tier_config(

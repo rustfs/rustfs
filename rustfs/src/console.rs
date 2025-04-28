@@ -207,42 +207,6 @@ async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
     let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
 
     let url = format!("{}://{}:{}", scheme, host, cfg.port);
-
-    // // 如果指定入口，直接使用
-    // let url = if let Some(endpoint) = &config::get_config().console_fs_endpoint {
-    //     debug!("axum Using rustfs endpoint address: {}", endpoint);
-    //     endpoint.clone()
-    // } else {
-    //     let host_with_port = if host.contains(':') {
-    //         host.clone()
-    //     } else {
-    //         format!("{}:80", host)
-    //     };
-    //     // 尝试解析为 socket address，但不强制要求一定要是 IP 地址
-    //     let socket_addr = host_with_port.to_socket_addrs().ok().and_then(|mut addrs| addrs.next());
-    //     debug!("axum Using host with port: {}, Socket address: {:?}", host_with_port, socket_addr);
-    //     match socket_addr {
-    //         Some(addr) if addr.ip().is_ipv4() => {
-    //             let ipv4 = addr.ip().to_string();
-    //             // 如果是私有 IP、环回地址或未指定地址，保留原始域名
-    //             if is_private_ip(addr.ip()) || addr.ip().is_loopback() || addr.ip().is_unspecified() {
-    //                 let (host, _) = host_with_port.split_once(':').unwrap_or((&host, "80"));
-    //                 debug!("axum Using private IPv4 address: {}", host);
-    //                 format!("http://{}:{}", host, cfg.port)
-    //             } else {
-    //                 debug!("axum Using public IPv4 address");
-    //                 format!("http://{}:{}", ipv4, cfg.port)
-    //             }
-    //         }
-    //         _ => {
-    //             // 如果不是有效的 IPv4 地址，保留原始域名
-    //             let (host, _) = host_with_port.split_once(':').unwrap_or((&host, "80"));
-    //             debug!("axum Using domain address: {}", host);
-    //             format!("http://{}:{}", host, cfg.port)
-    //         }
-    //     }
-    // };
-
     cfg.api.base_url = format!("{}{}", url, RUSTFS_ADMIN_PREFIX);
     cfg.s3.endpoint = url;
 
@@ -273,26 +237,29 @@ pub async fn start_static_file_server(
         .layer(cors)
         .layer(tower_http::compression::CompressionLayer::new().gzip(true).deflate(true))
         .layer(TraceLayer::new_for_http());
-    let local_addr: SocketAddr = addrs.parse().expect("Failed to parse socket address");
-    info!("WebUI: http://{}:{} http://127.0.0.1:{}", local_ip, local_addr.port(), local_addr.port());
+
+    use ecstore::utils::net;
+    let server_addr = net::parse_and_resolve_address(addrs).expect("Failed to parse socket address");
+    let server_port = server_addr.port();
+    let server_address = server_addr.to_string();
+
+    info!(
+        "WebUI: http://{}:{} http://127.0.0.1:{} http://{}",
+        local_ip, server_port, server_port, server_address
+    );
     info!("   RootUser: {}", access_key);
     info!("   RootPass: {}", secret_key);
 
     // Check and start the HTTPS/HTTP server
-    match start_server(addrs, local_addr, tls_path, app.clone()).await {
+    match start_server(server_addr, tls_path, app.clone()).await {
         Ok(_) => info!("Server shutdown gracefully"),
         Err(e) => error!("Server error: {}", e),
     }
 }
-async fn start_server(addrs: &str, local_addr: SocketAddr, tls_path: Option<String>, app: Router) -> io::Result<()> {
+async fn start_server(server_addr: SocketAddr, tls_path: Option<String>, app: Router) -> io::Result<()> {
     let tls_path = tls_path.unwrap_or_default();
     let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
     let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
-
-    let addr = addrs
-        .parse::<SocketAddr>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid address: {}", e)))?;
-
     let handle = axum_server::Handle::new();
     // create a signal off listening task
     let handle_clone = handle.clone();
@@ -309,24 +276,24 @@ async fn start_server(addrs: &str, local_addr: SocketAddr, tls_path: Option<Stri
         match RustlsConfig::from_pem_file(cert_path, key_path).await {
             Ok(config) => {
                 info!("Starting HTTPS server...");
-                axum_server::bind_rustls(local_addr, config)
+                axum_server::bind_rustls(server_addr, config)
                     .handle(handle.clone())
                     .serve(app.into_make_service())
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-                info!("HTTPS server running on https://{}", addr);
+                info!("HTTPS server running on https://{}", server_addr);
 
                 Ok(())
             }
             Err(e) => {
                 error!("Failed to create TLS config: {}", e);
-                start_http_server(addr, app, handle).await
+                start_http_server(server_addr, app, handle).await
             }
         }
     } else {
         info!("TLS certificates not found at {} and {}", key_path, cert_path);
-        start_http_server(addr, app, handle).await
+        start_http_server(server_addr, app, handle).await
     }
 }
 

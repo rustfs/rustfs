@@ -294,7 +294,12 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
 
     jobs.push(revjob);
 
-    let _ = join_all(jobs).await;
+    let results = join_all(jobs).await;
+    for result in results {
+        if let Err(err) = result {
+            error!("list_path_raw err {:?}", err);
+        }
+    }
 
     Ok(())
 }

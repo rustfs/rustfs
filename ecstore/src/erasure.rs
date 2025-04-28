@@ -470,7 +470,7 @@ impl Erasure {
                 self.encoder.as_ref().unwrap().reconstruct(&mut bufs)?;
             }
 
-            let shards = bufs.into_iter().flatten().collect::<Vec<_>>();
+            let shards = bufs.into_iter().flatten().map(Bytes::from).collect::<Vec<_>>();
             if shards.len() != self.parity_shards + self.data_shards {
                 return Err(Error::from_string("can not reconstruct data"));
             }
@@ -479,7 +479,7 @@ impl Erasure {
                 if w.is_none() {
                     continue;
                 }
-                match w.as_mut().unwrap().write(shards[i].clone().into()).await {
+                match w.as_mut().unwrap().write(shards[i].clone()).await {
                     Ok(_) => {}
                     Err(e) => {
                         info!("write failed, err: {:?}", e);

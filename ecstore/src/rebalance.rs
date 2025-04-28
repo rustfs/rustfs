@@ -20,7 +20,7 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 use workers::workers::Workers;
 
@@ -162,6 +162,7 @@ impl RebalanceMeta {
     pub async fn load_with_opts<S: StorageAPI>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
         let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
         if data.is_empty() {
+            warn!("rebalanceMeta: no data");
             return Ok(());
         }
         if data.len() <= 4 {
@@ -183,6 +184,7 @@ impl RebalanceMeta {
 
         self.last_refreshed_at = Some(SystemTime::now());
 
+        warn!("rebalanceMeta: loaded meta done");
         Ok(())
     }
 
@@ -214,20 +216,33 @@ impl ECStore {
     #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
         let mut meta = RebalanceMeta::new();
+        warn!("rebalanceMeta: load rebalance meta");
         match meta.load(self.pools[0].clone()).await {
             Ok(_) => {
-                let mut rebalance_meta = self.rebalance_meta.write().await;
+                warn!("rebalanceMeta: rebalance meta loaded0");
+                {
+                    let mut rebalance_meta = self.rebalance_meta.write().await;
 
-                *rebalance_meta = Some(meta);
+                    *rebalance_meta = Some(meta);
+
+                    drop(rebalance_meta);
+                }
+
+                warn!("rebalanceMeta: rebalance meta loaded1");
 
                 if let Err(err) = self.update_rebalance_stats().await {
                     error!("Failed to update rebalance stats: {}", err);
+                } else {
+                    warn!("rebalanceMeta: rebalance meta loaded2");
                 }
             }
             Err(err) => {
                 if !is_err_config_not_found(&err) {
+                    error!("rebalanceMeta: load rebalance meta err {:?}", &err);
                     return Err(err);
                 }
+
+                error!("rebalanceMeta: not found, rebalance not started");
             }
         }
 
@@ -237,21 +252,24 @@ impl ECStore {
     #[tracing::instrument(skip_all)]
     pub async fn update_rebalance_stats(&self) -> Result<()> {
         let mut ok = false;
-        let mut rebalance_meta = self.rebalance_meta.write().await;
 
         for i in 0..self.pools.len() {
             if self.find_index(i).await.is_none() {
+                let mut rebalance_meta = self.rebalance_meta.write().await;
                 if let Some(meta) = rebalance_meta.as_mut() {
                     meta.pool_stats.push(RebalanceStats::default());
                 }
                 ok = true;
+                drop(rebalance_meta);
             }
         }
 
         if ok {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
             if let Some(meta) = rebalance_meta.as_mut() {
                 meta.save(self.pools[0].clone()).await?;
             }
+            drop(rebalance_meta);
         }
 
         Ok(())
@@ -267,6 +285,7 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn init_rebalance_meta(&self, bucktes: Vec<String>) -> Result<String> {
+        warn!("init_rebalance_meta: start rebalance");
         let si = self.storage_info().await;
 
         let mut disk_stats = vec![DiskStat::default(); self.pools.len()];
@@ -321,10 +340,15 @@ impl ECStore {
 
         meta.save(self.pools[0].clone()).await?;
 
+        warn!("init_rebalance_meta: rebalance meta saved");
+
         let id = meta.id.clone();
 
-        let mut rebalance_meta = self.rebalance_meta.write().await;
-        *rebalance_meta = Some(meta);
+        {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            *rebalance_meta = Some(meta);
+            drop(rebalance_meta);
+        }
 
         Ok(id)
     }
@@ -424,6 +448,7 @@ impl ECStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) {
+        warn!("start_rebalance: start rebalance");
         // let rebalance_meta = self.rebalance_meta.read().await;
 
         let (tx, rx) = broadcast::channel::<bool>(1);
@@ -433,13 +458,17 @@ impl ECStore {
             if let Some(meta) = rebalance_meta.as_mut() {
                 meta.cancel = Some(tx)
             } else {
+                error!("start_rebalance: rebalance_meta is None exit");
                 return;
             }
+
+            drop(rebalance_meta);
         }
 
         let participants = {
             if let Some(ref meta) = *self.rebalance_meta.read().await {
                 if meta.stopped_at.is_some() {
+                    warn!("start_rebalance: rebalance already stopped exit");
                     return;
                 }
 
@@ -457,6 +486,7 @@ impl ECStore {
 
         for (idx, participating) in participants.iter().enumerate() {
             if !*participating {
+                warn!("start_rebalance: pool {} is not participating, skipping", idx);
                 continue;
             }
 
@@ -465,6 +495,7 @@ impl ECStore {
                 .get(idx)
                 .map_or(true, |v| v.endpoints.as_ref().first().map_or(true, |e| e.is_local))
             {
+                warn!("start_rebalance: pool {} is not local, skipping", idx);
                 continue;
             }
 
@@ -479,6 +510,8 @@ impl ECStore {
                 }
             });
         }
+
+        warn!("start_rebalance: rebalance started done");
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -540,6 +573,7 @@ impl ECStore {
                 }
 
                 if quit {
+                    warn!("{}: exiting save_task", msg);
                     return;
                 }
 
@@ -547,13 +581,14 @@ impl ECStore {
             }
         });
 
-        tracing::info!("Pool {} rebalancing is started", pool_index + 1);
+        tracing::warn!("Pool {} rebalancing is started", pool_index + 1);
 
         while let Some(bucket) = self.next_rebal_bucket(pool_index).await? {
             tracing::info!("Rebalancing bucket: {}", bucket);
 
             if let Err(err) = self.rebalance_bucket(rx.resubscribe(), bucket.clone(), pool_index).await {
                 if err.to_string().contains("not initialized") {
+                    warn!("rebalance_bucket: rebalance not initialized, continue");
                     continue;
                 }
                 tracing::error!("Error rebalancing bucket {}: {:?}", bucket, err);
@@ -564,7 +599,7 @@ impl ECStore {
             self.bucket_rebalance_done(pool_index, bucket).await?;
         }
 
-        tracing::info!("Pool {} rebalancing is done", pool_index + 1);
+        tracing::warn!("Pool {} rebalancing is done", pool_index + 1);
 
         done_tx.send(Ok(())).await.ok();
         save_task.await.ok();
@@ -1037,10 +1072,21 @@ impl SetDisks {
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
                     // let cb = cb.clone();
                     let resolver = resolver.clone();
-                    if let Ok(Some(entry)) = entries.resolve(resolver) {
-                        cb(entry)
-                    } else {
-                        Box::pin(async {})
+                    let cb = cb.clone();
+
+                    match entries.resolve(resolver) {
+                        Ok(Some(entry)) => {
+                            warn!("rebalance: list_objects_to_decommission get {}", &entry.name);
+                            Box::pin(async move { cb(entry).await })
+                        }
+                        Ok(None) => {
+                            warn!("rebalance: list_objects_to_decommission get none");
+                            Box::pin(async {})
+                        }
+                        Err(err) => {
+                            error!("rebalance: list_objects_to_decommission get err {:?}", &err);
+                            Box::pin(async {})
+                        }
                     }
                 })),
                 ..Default::default()

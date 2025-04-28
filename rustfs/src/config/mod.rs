@@ -29,11 +29,11 @@ pub const DEFAULT_OBS_CONFIG: &str = "config/obs.toml";
 
 /// Default TLS key for rustfs
 /// This is the default key for TLS.
-pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_private.key";
+pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_key.pem";
 
 /// Default TLS cert for rustfs
 /// This is the default cert for TLS.
-pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_public.crt";
+pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_cert.pem";
 
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {

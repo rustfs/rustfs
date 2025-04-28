@@ -213,22 +213,29 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             .with_line_number(true);
 
         let filter = build_env_filter(logger_level, None);
-
-        let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
-
         let otel_filter = build_env_filter(logger_level, None);
         let otel_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_filter);
+        let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
 
         // Configure registry to avoid repeated calls to filter methods
-        tracing_subscriber::registry()
+        let _registry = tracing_subscriber::registry()
             .with(filter)
-            .with(fmt_layer)
             .with(ErrorLayer::default())
+            .with(if config.local_logging_enabled.unwrap_or(false) {
+                Some(fmt_layer)
+            } else {
+                None
+            })
+            .with(OpenTelemetryLayer::new(tracer))
             .with(otel_layer)
             .with(MetricsLayer::new(meter_provider.clone()))
-            .with(OpenTelemetryLayer::new(tracer))
-            .with(ErrorLayer::default())
             .init();
+        info!("Telemetry logging enabled: {:?}", config.local_logging_enabled);
+        // if config.local_logging_enabled.unwrap_or(false) {
+        //     registry.with(fmt_layer).init();
+        // } else {
+        //     registry.init();
+        // }
 
         if !endpoint.is_empty() {
             info!(

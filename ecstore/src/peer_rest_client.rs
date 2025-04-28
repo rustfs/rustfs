@@ -663,6 +663,8 @@ impl PeerRestClient {
         let request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
 
         let response = client.load_rebalance_meta(request).await?.into_inner();
+
+        warn!("load_rebalance_meta response {:?}", response);
         if !response.success {
             if let Some(msg) = response.error_info {
                 return Err(Error::msg(msg));
