@@ -3802,8 +3802,8 @@ impl ObjectIO for SetDisks {
 
         // TODO: etag from header
 
-        let w_size = erasure
-            .encode(&mut etag_stream, &mut writers, data.content_length, write_quorum)
+        let w_size = Arc::new(erasure)
+            .encode(etag_stream, &mut writers, data.content_length, write_quorum)
             .await?; // TODO: 出错，删除临时目录
 
         if let Err(err) = close_bitrot_writers(&mut writers).await {

@@ -2,7 +2,10 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use md5::Digest;
 use md5::Md5;
+use pin_project_lite::pin_project;
+use std::io;
 use std::pin::Pin;
+use std::task::ready;
 use std::task::Context;
 use std::task::Poll;
 use tokio::io::AsyncRead;
@@ -125,11 +128,18 @@ impl AsyncRead for HttpFileReader {
     }
 }
 
-pub struct EtagReader<R> {
-    inner: R,
-    bytes_tx: mpsc::Sender<Bytes>,
-    md5_rx: oneshot::Receiver<String>,
+pub trait  {
+    
 }
+
+pin_project! {
+    pub struct EtagReader<R> {
+        inner: R,
+        bytes_tx: mpsc::Sender<Bytes>,
+        md5_rx: oneshot::Receiver<String>,
+    }
+}
+
 
 impl<R> EtagReader<R> {
     pub fn new(inner: R) -> Self {
@@ -157,21 +167,43 @@ impl<R> EtagReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for EtagReader<R> {
-    #[tracing::instrument(level = "debug", skip_all)]
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
-        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
-            if buf.remaining() == 0 {
+    #[tracing::instrument(level = "info", skip_all)]
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
+        let me = self.project();
+
+        loop {
+            let rem = buf.remaining();
+            if rem != 0 {
+                ready!(Pin::new(&mut *me.inner).poll_read(cx, buf))?;
+                if buf.remaining() == rem {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "early eof")).into();
+                }
+            } else {
                 let bytes = buf.filled();
                 let bytes = Bytes::copy_from_slice(bytes);
-                let tx = self.bytes_tx.clone();
+                let tx = me.bytes_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = tx.send(bytes).await {
                         warn!("EtagReader send error: {:?}", e);
                     }
                 });
+                return Poll::Ready(Ok(()));
             }
         }
-        poll
+
+        // let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        // if let Poll::Ready(Ok(())) = &poll {
+        //     if buf.remaining() == 0 {
+        //         let bytes = buf.filled();
+        //         let bytes = Bytes::copy_from_slice(bytes);
+        //         let tx = self.bytes_tx.clone();
+        //         tokio::spawn(async move {
+        //             if let Err(e) = tx.send(bytes).await {
+        //                 warn!("EtagReader send error: {:?}", e);
+        //             }
+        //         });
+        //     }
+        // }
+        // poll
     }
 }
