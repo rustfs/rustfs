@@ -7,6 +7,7 @@ service_name = "rustfs"
 service_version = "0.1.0"
 environments = "production"
 logger_level = "debug"
+local_logging_enabled = true
 
 [sinks]
 [sinks.kafka] # Kafka sink is disabled by default

@@ -37,9 +37,14 @@ extensions:
       traces_archive: another_store
     ui:
       config_file: ./cmd/jaeger/config-ui.json
+      log_access: true
     # The maximum duration that is considered for clock skew adjustments.
     # Defaults to 0 seconds, which means it's disabled.
     max_clock_skew_adjust: 0s
+    grpc:
+      endpoint: 0.0.0.0:16685
+    http:
+      endpoint: 0.0.0.0:16686
 
   jaeger_storage:
     backends:
@@ -49,6 +54,12 @@ extensions:
       another_store:
         memory:
           max_traces: 100000
+    metric_backends:
+      some_metrics_storage:
+        prometheus:
+          endpoint: http://prometheus:9090
+          normalize_calls: true
+          normalize_duration: true
 
   remote_sampling:
     # You can either use file or adaptive sampling strategy in remote_sampling
