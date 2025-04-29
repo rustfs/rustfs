@@ -2,6 +2,7 @@ use crate::{event_bus, ChannelAdapter, Error, Event, EventStore, NotifierConfig}
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 
 /// The `NotificationSystem` struct represents the notification system.
 /// It manages the event bus and the adapters.
@@ -18,6 +19,7 @@ pub struct NotifierSystem {
 
 impl NotifierSystem {
     /// Creates a new `NotificationSystem` instance.
+    #[instrument(skip(config))]
     pub async fn new(config: NotifierConfig) -> Result<Self, Error> {
         let (tx, rx) = mpsc::channel::<Event>(config.channel_capacity);
         let store = Arc::new(EventStore::new(&config.store_path).await?);
@@ -44,6 +46,7 @@ impl NotifierSystem {
 
     /// Starts the notification system.
     /// It initializes the event bus and the producer.
+    #[instrument(skip_all)]
     pub async fn start(&mut self, adapters: Vec<Arc<dyn ChannelAdapter>>) -> Result<(), Error> {
         if self.shutdown.is_cancelled() {
             let error = Error::custom("System is shutting down");
@@ -67,6 +70,7 @@ impl NotifierSystem {
 
     /// Sends an event to the notification system.
     /// This method is used to send events to the event bus.
+    #[instrument(skip(self))]
     pub async fn send_event(&self, event: Event) -> Result<(), Error> {
         self.log(tracing::Level::DEBUG, "send_event", &format!("Sending event: {:?}", event));
         if self.shutdown.is_cancelled() {
@@ -85,6 +89,7 @@ impl NotifierSystem {
 
     /// Shuts down the notification system.
     /// This method is used to cancel the event bus and producer tasks.
+    #[instrument(skip(self))]
     pub async fn shutdown(&mut self) -> Result<(), Error> {
         tracing::info!("Shutting down the notification system");
         self.shutdown.cancel();
@@ -112,10 +117,13 @@ impl NotifierSystem {
         self.shutdown.is_cancelled()
     }
 
-    fn handle_error(&self, context: &str, error: &Error) {
+    #[instrument(skip(self))]
+    pub fn handle_error(&self, context: &str, error: &Error) {
         self.log(tracing::Level::ERROR, context, &format!("{:?}", error));
         // TODO Can be extended to record to files or send to monitoring systems
     }
+
+    #[instrument(skip(self))]
     fn log(&self, level: tracing::Level, context: &str, message: &str) {
         match level {
             tracing::Level::ERROR => tracing::error!("[{}] {}", context, message),

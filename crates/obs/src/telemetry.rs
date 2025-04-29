@@ -231,7 +231,6 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             .with(otel_layer)
             .with(MetricsLayer::new(meter_provider.clone()))
             .init();
-        info!("Telemetry logging enabled: {:?}", config.local_logging_enabled);
 
         if !endpoint.is_empty() {
             info!(

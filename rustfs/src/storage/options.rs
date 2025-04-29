@@ -8,6 +8,7 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
     bucket: &str,
     object: &str,
@@ -56,6 +57,7 @@ pub async fn del_opts(
     Ok(opts)
 }
 
+/// Creates options for getting an object from a bucket.
 pub async fn get_opts(
     bucket: &str,
     object: &str,
@@ -105,6 +107,7 @@ pub async fn get_opts(
     Ok(opts)
 }
 
+/// Creates options for putting an object in a bucket.
 pub async fn put_opts(
     bucket: &str,
     object: &str,
@@ -151,6 +154,7 @@ pub async fn put_opts(
     Ok(opts)
 }
 
+/// Creates options for copying an object in a bucket.
 pub async fn copy_dst_opts(
     bucket: &str,
     object: &str,
@@ -172,6 +176,7 @@ pub fn put_opts_from_headers(
     get_default_opts(headers, metadata, false)
 }
 
+/// Creates default options for getting an object from a bucket.
 pub fn get_default_opts(
     _headers: &HeaderMap<HeaderValue>,
     metadata: Option<HashMap<String, String>>,
@@ -183,6 +188,7 @@ pub fn get_default_opts(
     })
 }
 
+/// Extracts metadata from headers and returns it as a HashMap.
 pub fn extract_metadata(headers: &HeaderMap<HeaderValue>) -> HashMap<String, String> {
     let mut metadata = HashMap::new();
 
@@ -191,6 +197,7 @@ pub fn extract_metadata(headers: &HeaderMap<HeaderValue>) -> HashMap<String, Str
     metadata
 }
 
+/// Extracts metadata from headers and returns it as a HashMap.
 pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &mut HashMap<String, String>) {
     for (k, v) in headers.iter() {
         if let Some(key) = k.as_str().strip_prefix("x-amz-meta-") {
@@ -219,7 +226,9 @@ pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &m
         metadata.insert("content-type".to_owned(), "binary/octet-stream".to_owned());
     }
 }
+
 lazy_static! {
+    /// List of supported headers.
     static ref SUPPORTED_HEADERS: Vec<&'static str> = vec![
         "content-type",
         "cache-control",

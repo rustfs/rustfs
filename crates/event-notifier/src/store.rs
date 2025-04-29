@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::{create_dir_all, File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::RwLock;
+use tracing::instrument;
 
 /// `EventStore` is a struct that manages the storage of event logs.
 pub struct EventStore {
@@ -21,6 +22,7 @@ impl EventStore {
         })
     }
 
+    #[instrument(skip(self))]
     pub async fn save_logs(&self, logs: &[Log]) -> Result<(), Error> {
         let _guard = self.lock.write().await;
         let file_path = format!(
