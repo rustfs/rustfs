@@ -66,7 +66,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 use tracing::{instrument, Span};
 
-// const MI_B: usize = 1024 * 1024;
+const MI_B: usize = 1024 * 1024;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
@@ -435,12 +435,12 @@ async fn run(opt: config::Opt) -> Result<()> {
             if let Err(err) = socket_ref.set_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
-            // if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {
-            //     warn!(?err, "Failed to set set_recv_buffer_size");
-            // }
-            // if let Err(err) = socket_ref.set_send_buffer_size(4 * MI_B) {
-            //     warn!(?err, "Failed to set set_send_buffer_size");
-            // }
+            if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {
+                warn!(?err, "Failed to set set_recv_buffer_size");
+            }
+            if let Err(err) = socket_ref.set_send_buffer_size(4 * MI_B) {
+                warn!(?err, "Failed to set set_send_buffer_size");
+            }
 
             if has_tls_certs {
                 debug!("TLS certificates found, starting with SIGINT");
