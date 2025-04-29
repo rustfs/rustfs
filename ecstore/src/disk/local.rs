@@ -38,7 +38,9 @@ use crate::set_disk::{
     CHECK_PART_VOLUME_NOT_FOUND,
 };
 use crate::store_api::{BitrotAlgorithm, StorageAPI};
-use crate::utils::fs::{access, lstat, remove, remove_all, rename, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
+use crate::utils::fs::{
+    access, lstat, remove, remove_all, remove_all_std, remove_std, rename, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY,
+};
 use crate::utils::os::get_info;
 use crate::utils::path::{
     self, clean, decode_dir_object, encode_dir_object, has_suffix, path_join, path_join_buf, GLOBAL_DIR_SUFFIX,
@@ -315,9 +317,9 @@ impl LocalDisk {
     #[allow(unused_variables)]
     pub async fn move_to_trash(&self, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
         if recursive {
-            remove_all(delete_path).await?;
+            remove_all_std(delete_path)?;
         } else {
-            remove(delete_path).await?;
+            remove_std(delete_path)?;
         }
 
         return Ok(());
@@ -365,7 +367,7 @@ impl LocalDisk {
         Ok(())
     }
 
-    // #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self))]
     pub async fn delete_file(
         &self,
         base_path: &PathBuf,
