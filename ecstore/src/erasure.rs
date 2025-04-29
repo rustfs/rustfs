@@ -619,35 +619,34 @@ impl ShardReader {
 
 #[cfg(test)]
 mod test {
+    use super::*;
 
-    // use super::*;
+    #[test]
+    fn test_erasure() {
+        let data_shards = 3;
+        let parity_shards = 2;
+        let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let ec = Erasure::new(data_shards, parity_shards, 1);
+        let shards = Arc::new(ec).encode_data(data).unwrap();
+        println!("shards:{:?}", shards);
 
-    // #[test]
-    // fn test_erasure() {
-    //     let data_shards = 3;
-    //     let parity_shards = 2;
-    //     let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-    //     let ec = Erasure::new(data_shards, parity_shards, 1);
-    //     let mut shards = SmallVec::new();
-    //     Arc::new(ec).encode_data(data, &mut shards).unwrap();
-    //     println!("shards:{:?}", shards);
+        let mut s: Vec<_> = shards
+            .iter()
+            .map(|d| if d.is_empty() { None } else { Some(d.to_vec()) })
+            .collect();
 
-    //     let mut s: Vec<_> = shards
-    //         .iter()
-    //         .map(|d| if d.is_empty() { None } else { Some(d.to_vec()) })
-    //         .collect();
+        // let mut s = shards_to_option_shards(&shards);
 
-    //     // let mut s = shards_to_option_shards(&shards);
+        // s[0] = None;
+        s[4] = None;
+        s[3] = None;
 
-    //     // s[0] = None;
-    //     s[4] = None;
-    //     s[3] = None;
+        println!("sss:{:?}", &s);
 
-    //     println!("sss:{:?}", &s);
+        let ec = Erasure::new(data_shards, parity_shards, 1);
+        ec.decode_data(&mut s).unwrap();
+        // ec.encoder.reconstruct(&mut s).unwrap();
 
-    //     ec.decode_data(&mut s).unwrap();
-    //     // ec.encoder.reconstruct(&mut s).unwrap();
-
-    //     println!("sss:{:?}", &s);
-    // }
+        println!("sss:{:?}", &s);
+    }
 }
