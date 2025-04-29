@@ -141,6 +141,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Copy an object from one location to another
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let CopyObjectInput {
@@ -227,6 +228,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Delete a bucket
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
@@ -249,6 +251,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
+    /// Delete an object
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput {
@@ -308,6 +311,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Delete multiple objects
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         // info!("delete_objects args {:?}", req.input);
@@ -367,6 +371,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Get bucket location
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
         // mc get  1
@@ -385,6 +390,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Get bucket notification
     #[tracing::instrument(
         level = "debug",
         skip(self, req),

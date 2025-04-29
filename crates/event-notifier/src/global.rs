@@ -1,6 +1,7 @@
 use crate::{create_adapters, Error, Event, NotifierConfig, NotifierSystem};
 use std::sync::{atomic, Arc};
 use tokio::sync::{Mutex, OnceCell};
+use tracing::instrument;
 
 static GLOBAL_SYSTEM: OnceCell<Arc<Mutex<NotifierSystem>>> = OnceCell::const_new();
 static INITIALIZED: atomic::AtomicBool = atomic::AtomicBool::new(false);
@@ -113,6 +114,7 @@ pub fn is_ready() -> bool {
 /// - The system is not initialized.
 /// - The system is not ready.
 /// - Sending the event fails.
+#[instrument(fields(event))]
 pub async fn send_event(event: Event) -> Result<(), Error> {
     if !READY.load(atomic::Ordering::SeqCst) {
         return Err(Error::custom("Notification system not ready, please wait for initialization to complete"));
@@ -124,6 +126,7 @@ pub async fn send_event(event: Event) -> Result<(), Error> {
 }
 
 /// Shuts down the notification system.
+#[instrument]
 pub async fn shutdown() -> Result<(), Error> {
     if let Some(system) = GLOBAL_SYSTEM.get() {
         tracing::info!("Shutting down notification system start");
