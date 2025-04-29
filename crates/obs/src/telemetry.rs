@@ -210,7 +210,8 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             .with_thread_names(true)
             .with_thread_ids(true)
             .with_file(true)
-            .with_line_number(true);
+            .with_line_number(true)
+            .with_filter(build_env_filter(logger_level, None));
 
         let filter = build_env_filter(logger_level, None);
         let otel_filter = build_env_filter(logger_level, None);
@@ -231,16 +232,13 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             .with(MetricsLayer::new(meter_provider.clone()))
             .init();
         info!("Telemetry logging enabled: {:?}", config.local_logging_enabled);
-        // if config.local_logging_enabled.unwrap_or(false) {
-        //     registry.with(fmt_layer).init();
-        // } else {
-        //     registry.init();
-        // }
 
         if !endpoint.is_empty() {
             info!(
-                "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {}",
-                endpoint, logger_level
+                "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {},RUST_LOG env: {}",
+                endpoint,
+                logger_level,
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "未设置".to_string())
             );
         }
     }
@@ -255,7 +253,6 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilter {
     let level = default_level.unwrap_or(logger_level);
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-
     if !matches!(logger_level, "trace" | "debug") {
         let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
         for directive in directives {
