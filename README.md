@@ -102,7 +102,7 @@ export RUSTFS__LOGGER__QUEUE_CAPACITY=10
 
 2. Start the observability stack:
    ```bash
-   docker compose up -d -f docker-compose.yml
+   docker compose -f docker-compose.yml  up -d
    ```
 
 #### Access Monitoring Dashboards
