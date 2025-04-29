@@ -62,6 +62,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded = { workspace = true }
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
+socket2 = "0.5.9"
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 tokio-util.workspace = true

@@ -407,7 +407,7 @@ impl SetDisks {
     }
 
     #[allow(dead_code)]
-    #[tracing::instrument(level = "debug", skip(self, disks))]
+    #[tracing::instrument(level = "info", skip(self, disks))]
     async fn commit_rename_data_dir(
         &self,
         disks: &[Option<DiskStore>],
@@ -417,40 +417,30 @@ impl SetDisks {
         write_quorum: usize,
     ) -> Result<()> {
         let file_path = format!("{}/{}", object, data_dir);
-
-        let mut futures = Vec::with_capacity(disks.len());
-        let mut errs = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
+        let futures = disks.iter().map(|disk| {
             let file_path = file_path.clone();
-            futures.push(async move {
+            async move {
                 if let Some(disk) = disk {
-                    disk.delete(
-                        bucket,
-                        &file_path,
-                        DeleteOptions {
-                            recursive: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
+                    match disk
+                        .delete(
+                            bucket,
+                            &file_path,
+                            DeleteOptions {
+                                recursive: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => None,
+                        Err(e) => Some(e),
+                    }
                 } else {
-                    Err(Error::new(DiskError::DiskNotFound))
-                }
-            });
-        }
-
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(_) => {
-                    errs.push(None);
-                }
-                Err(e) => {
-                    errs.push(Some(e));
+                    Some(Error::new(DiskError::DiskNotFound))
                 }
             }
-        }
+        });
+        let errs: Vec<Option<Error>> = join_all(futures).await;
 
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
             return Err(err);

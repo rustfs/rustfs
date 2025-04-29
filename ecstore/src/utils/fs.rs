@@ -132,6 +132,24 @@ pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
     }
 }
 
+pub fn remove_std(path: impl AsRef<Path>) -> io::Result<()> {
+    let meta = std::fs::metadata(path.as_ref())?;
+    if meta.is_dir() {
+        std::fs::remove_dir(path.as_ref())
+    } else {
+        std::fs::remove_file(path.as_ref())
+    }
+}
+
+pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
+    let meta = std::fs::metadata(path.as_ref())?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path.as_ref())
+    } else {
+        std::fs::remove_file(path.as_ref())
+    }
+}
+
 pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir(path.as_ref()).await
 }
