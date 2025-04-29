@@ -1,5 +1,6 @@
 use crate::bitrot::{BitrotReader, BitrotWriter};
 use crate::error::clone_err;
+use crate::io::Etag;
 use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
 use bytes::{Bytes, BytesMut};
 use common::error::{Error, Result};
@@ -8,8 +9,10 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use smallvec::SmallVec;
 use std::any::Any;
 use std::io::ErrorKind;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::warn;
 use tracing::{error, info};
 // use tracing::debug;
@@ -26,7 +29,7 @@ pub struct Erasure {
     encoder: Option<ReedSolomon>,
     pub block_size: usize,
     _id: Uuid,
-    buf: Vec<u8>,
+    _buf: Vec<u8>,
 }
 
 impl Erasure {
@@ -46,61 +49,62 @@ impl Erasure {
             block_size,
             encoder,
             _id: Uuid::new_v4(),
-            buf: vec![0u8; block_size],
+            _buf: vec![0u8; block_size],
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, reader, writers))]
+    #[tracing::instrument(level = "info", skip(self, reader, writers))]
     pub async fn encode<S>(
-        &mut self,
-        reader: &mut S,
+        self: Arc<Self>,
+        mut reader: S,
         writers: &mut [Option<BitrotWriter>],
         // block_size: usize,
         total_size: usize,
         write_quorum: usize,
-    ) -> Result<usize>
+    ) -> Result<(usize, String)>
     where
-        S: AsyncRead + Unpin + Send + 'static,
+        S: AsyncRead + Etag + Unpin + Send + 'static,
     {
-        // pin_mut!(body);
-        // let mut reader = tokio_util::io::StreamReader::new(
-        //     body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
-        // );
-
-        let mut total: usize = 0;
-        let mut blocks = <SmallVec<[Bytes; 16]>>::new();
-
-        loop {
-            if total_size > 0 {
-                let new_len = {
-                    let remain = total_size - total;
-                    if remain > self.block_size {
-                        self.block_size
-                    } else {
-                        remain
-                    }
-                };
-
-                if new_len == 0 && total > 0 {
-                    break;
-                }
-
-                self.buf.resize(new_len, 0u8);
-                match reader.read_exact(&mut self.buf).await {
-                    Ok(res) => res,
-                    Err(e) => {
-                        if let ErrorKind::UnexpectedEof = e.kind() {
-                            break;
+        let (tx, mut rx) = mpsc::channel(5);
+        let task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut total: usize = 0;
+            loop {
+                if total_size > 0 {
+                    let new_len = {
+                        let remain = total_size - total;
+                        if remain > self.block_size {
+                            self.block_size
                         } else {
-                            return Err(Error::new(e));
+                            remain
                         }
+                    };
+
+                    if new_len == 0 && total > 0 {
+                        break;
                     }
-                };
-                total += self.buf.len();
+
+                    buf.resize(new_len, 0u8);
+                    match reader.read_exact(&mut buf).await {
+                        Ok(res) => res,
+                        Err(e) => {
+                            if let ErrorKind::UnexpectedEof = e.kind() {
+                                break;
+                            } else {
+                                return Err(Error::new(e));
+                            }
+                        }
+                    };
+                    total += buf.len();
+                }
+                let blocks = Arc::new(Box::pin(self.clone().encode_data(&buf)?));
+                let _ = tx.send(blocks).await;
             }
+            let etag = reader.etag().await;
+            Ok((total, etag))
+        });
 
-            self.encode_data(&self.buf, &mut blocks)?;
-
+        while let Some(blocks) = rx.recv().await {
             let write_futures = writers.iter_mut().enumerate().map(|(i, w_op)| {
                 let i_inner = i;
                 let blocks_inner = blocks.clone();
@@ -130,8 +134,7 @@ impl Erasure {
                 break;
             }
         }
-
-        Ok(total)
+        task.await?
 
         // // let stream = ChunkedStream::new(body, self.block_size);
         // let stream = ChunkedStream::new(body, total_size, self.block_size, false);
@@ -356,8 +359,8 @@ impl Erasure {
         self.data_shards + self.parity_shards
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
-    pub fn encode_data(&self, data: &[u8], shards: &mut SmallVec<[Bytes; 16]>) -> Result<()> {
+    #[tracing::instrument(level = "info", skip_all, fields(data_len=data.len()))]
+    pub fn encode_data(self: Arc<Self>, data: &[u8]) -> Result<Vec<Bytes>> {
         let (shard_size, total_size) = self.need_size(data.len());
 
         // 生成一个新的 所需的所有分片数据长度
@@ -379,14 +382,13 @@ impl Erasure {
 
         // 零拷贝分片，所有 shard 引用 data_buffer
         let mut data_buffer = data_buffer.freeze();
-        shards.clear();
-        shards.reserve(self.total_shard_count());
+        let mut shards = Vec::with_capacity(self.total_shard_count());
         for _ in 0..self.total_shard_count() {
             let shard = data_buffer.split_to(shard_size);
             shards.push(shard);
         }
 
-        Ok(())
+        Ok(shards)
     }
 
     pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> Result<()> {
@@ -617,7 +619,6 @@ impl ShardReader {
 
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     #[test]
@@ -626,8 +627,7 @@ mod test {
         let parity_shards = 2;
         let data: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let ec = Erasure::new(data_shards, parity_shards, 1);
-        let mut shards = SmallVec::new();
-        ec.encode_data(data, &mut shards).unwrap();
+        let shards = Arc::new(ec).encode_data(data).unwrap();
         println!("shards:{:?}", shards);
 
         let mut s: Vec<_> = shards
@@ -643,6 +643,7 @@ mod test {
 
         println!("sss:{:?}", &s);
 
+        let ec = Erasure::new(data_shards, parity_shards, 1);
         ec.decode_data(&mut s).unwrap();
         // ec.encoder.reconstruct(&mut s).unwrap();
 

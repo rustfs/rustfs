@@ -189,7 +189,7 @@ mod tests {
         let config = NotifierConfig::default();
         let _ = initialize(config.clone()).await; // first initialization
         let result = initialize(config).await; // second initialization
-        assert!(!result.is_ok(), "Initialization should succeed");
+        assert!(result.is_err(), "Initialization should succeed");
         assert!(result.is_err(), "Re-initialization should fail");
     }
 
@@ -211,7 +211,7 @@ mod tests {
             ..Default::default()
         };
         let result = initialize(config).await;
-        assert!(!result.is_err(), "Initialization with invalid config should fail");
+        assert!(result.is_ok(), "Initialization with invalid config should fail");
         assert!(is_initialized(), "System should not be marked as initialized after failure");
         assert!(is_ready(), "System should not be marked as ready after failure");
     }
