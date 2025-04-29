@@ -194,20 +194,5 @@ impl<R: AsyncRead + Unpin> AsyncRead for EtagReader<R> {
                 return Poll::Ready(Ok(()));
             }
         }
-
-        // let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        // if let Poll::Ready(Ok(())) = &poll {
-        //     if buf.remaining() == 0 {
-        //         let bytes = buf.filled();
-        //         let bytes = Bytes::copy_from_slice(bytes);
-        //         let tx = self.bytes_tx.clone();
-        //         tokio::spawn(async move {
-        //             if let Err(e) = tx.send(bytes).await {
-        //                 warn!("EtagReader send error: {:?}", e);
-        //             }
-        //         });
-        //     }
-        // }
-        // poll
     }
 }
