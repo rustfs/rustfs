@@ -62,8 +62,8 @@ use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::Span;
-use tracing::{debug, error, info, info_span, warn};
+use tracing::{debug, error, info, warn};
+use tracing::{instrument, Span};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
@@ -77,7 +77,7 @@ fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
         _ => Err(Status::unauthenticated("No valid auth token")),
     }
 }
-
+#[instrument]
 fn print_server_info() {
     let cfg = CONSOLE_CONFIG.get().unwrap();
     let current_year = chrono::Utc::now().year();
@@ -95,8 +95,7 @@ async fn main() -> Result<()> {
     // Parse the obtained parameters
     let opt = config::Opt::parse();
 
-    // config::init_config(opt.clone());
-
+    // Initialize the configuration
     init_license(opt.license.clone());
 
     // Load the configuration file
@@ -108,8 +107,13 @@ async fn main() -> Result<()> {
     // Store in global storage
     set_global_guard(guard)?;
 
+    // Run parameters
+    run(opt).await
+}
+
+#[instrument]
+async fn init_event_notifier(notifier_config: Option<String>) {
     // Initialize event notifier
-    let notifier_config = opt.clone().event_config;
     if notifier_config.is_some() {
         info!("event_config is not empty");
         tokio::spawn(async move {
@@ -124,17 +128,15 @@ async fn main() -> Result<()> {
     } else {
         info!("event_config is empty");
     }
-
-    // Run parameters
-    run(opt).await
 }
 
-// #[tokio::main]
+#[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
-    let span = info_span!("trace-main-run");
-    let _enter = span.enter();
-
     debug!("opt: {:?}", &opt);
+
+    // Initialize event notifier
+    let notifier_config = opt.event_config;
+    init_event_notifier(notifier_config).await;
 
     let server_addr = net::parse_and_resolve_address(opt.address.as_str())?;
     let server_port = server_addr.port();
@@ -175,7 +177,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("http://{}:{}", local_ip, server_port);
     let localhost_endpoint = format!("http://127.0.0.1:{}", server_port);
-    info!("API: {}  {}", api_endpoints, localhost_endpoint);
+    info!("   API: {}  {}", api_endpoints, localhost_endpoint);
     info!("   RootUser: {}", opt.access_key.clone());
     info!("   RootPass: {}", opt.secret_key.clone());
     if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
@@ -339,7 +341,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 .layer(
                     TraceLayer::new_for_http()
                         .make_span_with(|request: &HttpRequest<_>| {
-                            let span = tracing::debug_span!("http-request",
+                            let span = tracing::info_span!("http-request",
                                 status_code = tracing::field::Empty,
                                 method = %request.method(),
                                 uri = %request.uri(),
@@ -368,13 +370,14 @@ async fn run(opt: config::Opt) -> Result<()> {
                             debug!("http response generated in {:?}", latency)
                         })
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
-                            info!(histogram.request.body.len = chunk.len(), "histogram request body lenght",);
+                            info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
                             debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
                         })
                         .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
                             debug!("http stream closed after {:?}", stream_duration)
                         })
                         .on_failure(|_error, latency: Duration, _span: &Span| {
+                            info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
                             debug!("http request failure error: {:?} in {:?}", _error, latency)
                         }),
                 )
