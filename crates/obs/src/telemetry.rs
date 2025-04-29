@@ -218,7 +218,7 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
 
         // Configure registry to avoid repeated calls to filter methods
-        let _registry = tracing_subscriber::registry()
+        tracing_subscriber::registry()
             .with(filter)
             .with(ErrorLayer::default())
             .with(if config.local_logging_enabled.unwrap_or(false) {

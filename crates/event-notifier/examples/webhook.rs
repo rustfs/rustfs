@@ -37,7 +37,7 @@ async fn receive_webhook(Json(payload): Json<Value>) -> StatusCode {
     println!("current time:{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, minute, second);
     println!(
         "received a webhook request time:{} content:\n {}",
-        seconds.to_string(),
+        seconds,
         serde_json::to_string_pretty(&payload).unwrap()
     );
     StatusCode::OK
@@ -66,10 +66,10 @@ fn convert_seconds_to_date(seconds: u64) -> (u32, u32, u32, u32, u32, u32) {
 
     // calculate month
     let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 0..12 {
-        if total_seconds >= days_in_month[m] * seconds_per_day {
+    for m in &days_in_month {
+        if total_seconds >= m * seconds_per_day {
             month += 1;
-            total_seconds -= days_in_month[m] * seconds_per_day;
+            total_seconds -= m * seconds_per_day;
         } else {
             break;
         }
