@@ -102,7 +102,7 @@ export RUSTFS__LOGGER__QUEUE_CAPACITY=10
 
 2. 启动可观测性系统：
    ```bash
-   docker compose up -d -f docker-compose.yml
+   docker compose -f docker-compose.yml  up -d
    ```
 
 #### 访问监控面板

@@ -33,7 +33,8 @@ const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 #[folder = "$CARGO_MANIFEST_DIR/static"]
 struct StaticFiles;
 
-async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
+/// Static file handler
+async fn static_handler(uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
     if path.is_empty() {
         path = "index.html"
@@ -193,7 +194,7 @@ fn _is_private_ip(ip: std::net::IpAddr) -> bool {
 async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
     let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or("http");
 
-    // 从 uri 中获取 host，如果没有则使用 Host extractor 的值
+    // Get the host from the uri and use the value of the host extractor if it doesn't have one
     let host = uri.host().unwrap_or(host.as_str());
 
     let host = if host.contains(':') {
@@ -203,7 +204,7 @@ async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
         host
     };
 
-    // 将当前配置复制一份
+    // Make a copy of the current configuration
     let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
 
     let url = format!("{}://{}:{}", scheme, host, cfg.port);
@@ -224,9 +225,9 @@ pub async fn start_static_file_server(
     secret_key: &str,
     tls_path: Option<String>,
 ) {
-    // 配置 CORS
+    // Configure CORS
     let cors = CorsLayer::new()
-        .allow_origin(Any) // 生产环境建议指定具体域名
+        .allow_origin(Any) // In the production environment, we recommend that you specify a specific domain name
         .allow_methods([http::Method::GET, http::Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
     // Create a route
@@ -298,7 +299,7 @@ async fn start_server(server_addr: SocketAddr, tls_path: Option<String>, app: Ro
 }
 
 #[allow(dead_code)]
-/// HTTP 到 HTTPS 的 308 重定向
+/// 308 redirect for HTTP to HTTPS
 fn redirect_to_https(https_port: u16) -> Router {
     Router::new().route(
         "/*path",
