@@ -7269,6 +7269,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "shadow-rs",
+ "socket2",
  "tikv-jemallocator",
  "time",
  "tokio",
