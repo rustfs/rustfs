@@ -62,6 +62,7 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
@@ -1896,14 +1897,14 @@ impl S3 for FS {
     ) -> S3Result<S3Response<SelectObjectContentOutput>> {
         info!("handle select_object_content");
 
-        let input = req.input;
+        let input = Arc::new(req.input);
         info!("{:?}", input);
 
         let db = make_rustfsms(input.clone(), false).await.map_err(|e| {
             error!("make db failed, {}", e.to_string());
             s3_error!(InternalError, "{}", e.to_string())
         })?;
-        let query = Query::new(Context { input: input.clone() }, input.request.expression);
+        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
         let result = db
             .execute(&query)
             .await

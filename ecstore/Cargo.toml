@@ -82,4 +82,4 @@ winapi = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]
-shadow-rs.workspace = true
+shadow-rs = { workspace = true, features = ["build", "metadata"] }
