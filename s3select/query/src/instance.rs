@@ -63,7 +63,7 @@ where
     }
 }
 
-pub async fn make_rustfsms(input: SelectObjectContentInput, is_test: bool) -> QueryResult<impl DatabaseManagerSystem> {
+pub async fn make_rustfsms(input: Arc<SelectObjectContentInput>, is_test: bool) -> QueryResult<impl DatabaseManagerSystem> {
     // init Function Manager, we can define some UDF if need
     let func_manager = SimpleFunctionMetadataManager::default();
     // TODO session config need load global system config
@@ -95,6 +95,8 @@ pub async fn make_rustfsms(input: SelectObjectContentInput, is_test: bool) -> Qu
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use api::{
         query::{Context, Query},
         server::dbms::DatabaseManagerSystem,
@@ -111,7 +113,7 @@ mod tests {
     #[ignore]
     async fn test_simple_sql() {
         let sql = "select * from S3Object";
-        let input = SelectObjectContentInput {
+        let input = Arc::new(SelectObjectContentInput {
             bucket: "dandan".to_string(),
             expected_bucket_owner: None,
             key: "test.csv".to_string(),
@@ -135,7 +137,7 @@ mod tests {
                 request_progress: None,
                 scan_range: None,
             },
-        };
+        });
         let db = make_rustfsms(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input }, sql.to_string());
 
@@ -167,8 +169,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_func_sql() {
-        let sql = "SELECT s._1 FROM S3Object s";
-        let input = SelectObjectContentInput {
+        let sql = "SELECT * FROM S3Object s";
+        let input = Arc::new(SelectObjectContentInput {
             bucket: "dandan".to_string(),
             expected_bucket_owner: None,
             key: "test.csv".to_string(),
@@ -194,7 +196,7 @@ mod tests {
                 request_progress: None,
                 scan_range: None,
             },
-        };
+        });
         let db = make_rustfsms(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input }, sql.to_string());
 
