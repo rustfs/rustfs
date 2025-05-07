@@ -1,4 +1,4 @@
-use crate::config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
 use rustls::sign::CertifiedKey;
 use rustls_pemfile::{certs, private_key};
@@ -12,34 +12,37 @@ use tracing::{debug, warn};
 
 /// Load public certificate from file.
 /// This function loads a public certificate from the specified file.
-pub(crate) fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
+pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     // Open certificate file.
-    let cert_file = fs::File::open(filename).map_err(|e| error(format!("failed to open {}: {}", filename, e)))?;
+    let cert_file = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {}: {}", filename, e)))?;
     let mut reader = io::BufReader::new(cert_file);
 
     // Load and return certificate.
     let certs = certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| error(format!("certificate file {} format error", filename)))?;
+        .map_err(|_| certs_error(format!("certificate file {} format error", filename)))?;
     if certs.is_empty() {
-        return Err(error(format!("No valid certificate was found in the certificate file {}", filename)));
+        return Err(certs_error(format!(
+            "No valid certificate was found in the certificate file {}",
+            filename
+        )));
     }
     Ok(certs)
 }
 
 /// Load private key from file.
 /// This function loads a private key from the specified file.
-pub(crate) fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
+pub fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
     // Open keyfile.
-    let keyfile = fs::File::open(filename).map_err(|e| error(format!("failed to open {}: {}", filename, e)))?;
+    let keyfile = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {}: {}", filename, e)))?;
     let mut reader = io::BufReader::new(keyfile);
 
     // Load and return a single private key.
-    private_key(&mut reader)?.ok_or_else(|| error(format!("no private key found in {}", filename)))
+    private_key(&mut reader)?.ok_or_else(|| certs_error(format!("no private key found in {}", filename)))
 }
 
 /// error function
-pub(crate) fn error(err: String) -> Error {
+pub fn certs_error(err: String) -> Error {
     Error::new(io::ErrorKind::Other, err)
 }
 
@@ -47,14 +50,14 @@ pub(crate) fn error(err: String) -> Error {
 /// This function loads all certificate and private key pairs from the specified directory.
 /// It looks for files named `rustfs_cert.pem` and `rustfs_key.pem` in each subdirectory.
 /// The root directory can also contain a default certificate/private key pair.
-pub(crate) fn load_all_certs_from_directory(
+pub fn load_all_certs_from_directory(
     dir_path: &str,
 ) -> io::Result<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
     let mut cert_key_pairs = HashMap::new();
     let dir = Path::new(dir_path);
 
     if !dir.exists() || !dir.is_dir() {
-        return Err(error(format!(
+        return Err(certs_error(format!(
             "The certificate directory does not exist or is not a directory: {}",
             dir_path
         )));
@@ -68,10 +71,10 @@ pub(crate) fn load_all_certs_from_directory(
         debug!("find the root directory certificate: {:?}", root_cert_path);
         let root_cert_str = root_cert_path
             .to_str()
-            .ok_or_else(|| error(format!("Invalid UTF-8 in root certificate path: {:?}", root_cert_path)))?;
+            .ok_or_else(|| certs_error(format!("Invalid UTF-8 in root certificate path: {:?}", root_cert_path)))?;
         let root_key_str = root_key_path
             .to_str()
-            .ok_or_else(|| error(format!("Invalid UTF-8 in root key path: {:?}", root_key_path)))?;
+            .ok_or_else(|| certs_error(format!("Invalid UTF-8 in root key path: {:?}", root_key_path)))?;
         match load_cert_key_pair(root_cert_str, root_key_str) {
             Ok((certs, key)) => {
                 // The root directory certificate is used as the default certificate and is stored using special keys.
@@ -92,7 +95,7 @@ pub(crate) fn load_all_certs_from_directory(
             let domain_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .ok_or_else(|| error(format!("invalid domain name directory:{:?}", path)))?;
+                .ok_or_else(|| certs_error(format!("invalid domain name directory:{:?}", path)))?;
 
             // find certificate and private key files
             let cert_path = path.join(RUSTFS_TLS_CERT); // e.g., rustfs_cert.pem
@@ -113,7 +116,10 @@ pub(crate) fn load_all_certs_from_directory(
     }
 
     if cert_key_pairs.is_empty() {
-        return Err(error(format!("No valid certificate/private key pair found in directory {}", dir_path)));
+        return Err(certs_error(format!(
+            "No valid certificate/private key pair found in directory {}",
+            dir_path
+        )));
     }
 
     Ok(cert_key_pairs)
@@ -159,7 +165,7 @@ pub fn create_multi_cert_resolver(
     for (domain, (certs, key)) in cert_key_pairs {
         // create a signature
         let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
-            .map_err(|_| error(format!("unsupported private key types:{}", domain)))?;
+            .map_err(|_| certs_error(format!("unsupported private key types:{}", domain)))?;
 
         // create a CertifiedKey
         let certified_key = CertifiedKey::new(certs, signing_key);
@@ -169,7 +175,7 @@ pub fn create_multi_cert_resolver(
             // add certificate to resolver
             resolver
                 .add(&domain, certified_key)
-                .map_err(|e| error(format!("failed to add a domain name certificate:{},err: {:?}", domain, e)))?;
+                .map_err(|e| certs_error(format!("failed to add a domain name certificate:{},err: {:?}", domain, e)))?;
         }
     }
 

@@ -3107,6 +3107,7 @@ dependencies = [
  "reqwest",
  "rmp",
  "rmp-serde",
+ "rustfs-config",
  "s3s",
  "s3s-policy",
  "serde",
@@ -7258,7 +7259,6 @@ dependencies = [
  "iam",
  "lazy_static",
  "libsystemd",
- "local-ip-address",
  "lock",
  "madmin",
  "matchit",
@@ -7273,11 +7273,11 @@ dependencies = [
  "query",
  "rmp-serde",
  "rust-embed",
+ "rustfs-config",
  "rustfs-event-notifier",
  "rustfs-obs",
+ "rustfs-utils",
  "rustls 0.23.27",
- "rustls-pemfile",
- "rustls-pki-types",
  "s3s",
  "serde",
  "serde_json",
@@ -7297,6 +7297,16 @@ dependencies = [
  "tracing",
  "transform-stream",
  "uuid",
+]
+
+[[package]]
+name = "rustfs-config"
+version = "0.0.1"
+dependencies = [
+ "config",
+ "const-str",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7371,6 +7381,18 @@ dependencies = [
  "tracing-error",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rustfs-utils"
+version = "0.0.1"
+dependencies = [
+ "local-ip-address",
+ "rustfs-config",
+ "rustls 0.23.27",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tracing",
 ]
 
 [[package]]
@@ -8611,9 +8633,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.44.2"
+version = "1.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6b88822cbe49de4185e3a4cbf8321dd487cf5fe0c5c65695fef6346371e9c48"
+checksum = "2513ca694ef9ede0fb23fe71a4ee4107cb102b9dc1930f6d0fd77aae068ae165"
 dependencies = [
  "backtrace",
  "bytes",

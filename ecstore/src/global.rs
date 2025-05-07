@@ -20,8 +20,6 @@ pub const DISK_MIN_INODES: u64 = 1000;
 pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 
-pub const DEFAULT_PORT: u16 = 9000;
-
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
@@ -41,31 +39,37 @@ lazy_static! {
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
 }
 
+/// Get the global rustfs port
 pub fn global_rustfs_port() -> u16 {
     if let Some(p) = GLOBAL_RUSTFS_PORT.get() {
         *p
     } else {
-        DEFAULT_PORT
+        rustfs_config::DEFAULT_PORT
     }
 }
 
+/// Set the global rustfs port
 pub fn set_global_rustfs_port(value: u16) {
     GLOBAL_RUSTFS_PORT.set(value).expect("set_global_rustfs_port fail");
 }
 
+/// Get the global rustfs port
 pub fn set_global_deployment_id(id: Uuid) {
     globalDeploymentIDPtr.set(id).unwrap();
 }
+
+/// Get the global deployment id
 pub fn get_global_deployment_id() -> Option<String> {
     globalDeploymentIDPtr.get().map(|v| v.to_string())
 }
-
+/// Get the global deployment id
 pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
     GLOBAL_Endpoints
         .set(EndpointServerPools::from(eps))
         .expect("GLOBAL_Endpoints set failed")
 }
 
+/// Get the global endpoints
 pub fn get_global_endpoints() -> EndpointServerPools {
     if let Some(eps) = GLOBAL_Endpoints.get() {
         eps.clone()

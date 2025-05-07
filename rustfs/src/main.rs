@@ -2,18 +2,18 @@ mod admin;
 mod auth;
 mod config;
 mod console;
+mod event;
 mod grpc;
 pub mod license;
 mod logging;
 mod server;
 mod service;
 mod storage;
-mod utils;
+
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 // Ensure the correct path for parse_license is imported
 use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
-use crate::utils::error;
 use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
@@ -21,7 +21,6 @@ use common::{
     error::{Error, Result},
     globals::set_global_addr,
 };
-use config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use ecstore::config as ecconfig;
 use ecstore::config::GLOBAL_ConfigSys;
@@ -48,7 +47,7 @@ use hyper_util::{
 use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
-use rustfs_event_notifier::NotifierConfig;
+use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_obs::{init_obs, init_process_observer, load_config, set_global_guard};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
@@ -85,7 +84,7 @@ fn print_server_info() {
     let cfg = CONSOLE_CONFIG.get().unwrap();
     let current_year = chrono::Utc::now().year();
 
-    // 使用自定义宏打印服务器信息
+    // Use custom macros to print server information
     info!("RustFS Object Storage Server");
     info!("Copyright: 2024-{} RustFS, Inc", current_year);
     info!("License: {}", cfg.license());
@@ -114,32 +113,12 @@ async fn main() -> Result<()> {
     run(opt).await
 }
 
-#[instrument]
-async fn init_event_notifier(notifier_config: Option<String>) {
-    // Initialize event notifier
-    if notifier_config.is_some() {
-        info!("event_config is not empty");
-        tokio::spawn(async move {
-            let config = NotifierConfig::event_load_config(notifier_config);
-            let result = rustfs_event_notifier::initialize(config).await;
-            if let Err(e) = result {
-                error!("Failed to initialize event notifier: {}", e);
-            } else {
-                info!("Event notifier initialized successfully");
-            }
-        });
-    } else {
-        info!("event_config is empty");
-    }
-}
-
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
     // Initialize event notifier
-    let notifier_config = opt.event_config;
-    init_event_notifier(notifier_config).await;
+    event::init_event_notifier(opt.event_config).await;
 
     let server_addr = net::parse_and_resolve_address(opt.address.as_str())?;
     let server_port = server_addr.port();
@@ -147,16 +126,17 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     debug!("server_address {}", &server_address);
 
-    //设置 AK 和 SK
+    // Set up AK and SK
     iam::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()))?;
 
     set_global_rustfs_port(server_port);
 
-    //监听地址，端口从参数中获取
+    // The listening address and port are obtained from the parameters
     let listener = TcpListener::bind(server_address.clone()).await?;
-    //获取监听地址
+    // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
-    let local_ip = utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
+    // let local_ip = utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
+    let local_ip = rustfs_utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
     // 用于 rpc
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
@@ -203,13 +183,13 @@ async fn run(opt: config::Opt) -> Result<()> {
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;
 
-    // 初始化本地磁盘
+    // Initialize the local disk
     init_local_disks(endpoint_pools.clone())
         .await
         .map_err(|err| Error::from_string(err.to_string()))?;
 
     // Setup S3 service
-    // 本项目使用 s3s 库来实现 s3 服务
+    // This project uses the S3S library to implement S3 services
     let s3_service = {
         let store = storage::ecfs::FS::new();
         // let mut b = S3ServiceBuilder::new(storage::ecfs::FS::new(server_address.clone(), endpoint_pools).await?);
@@ -217,7 +197,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         let access_key = opt.access_key.clone();
         let secret_key = opt.secret_key.clone();
-        //显示 info 信息
+        // Displays info information
         debug!("authentication is enabled {}, {}", &access_key, &secret_key);
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
@@ -268,7 +248,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         debug!("Found TLS directory, checking for certificates");
 
         // 1. Try to load all certificates directly (including root and subdirectories)
-        match utils::load_all_certs_from_directory(&tls_path) {
+        match rustfs_utils::load_all_certs_from_directory(&tls_path) {
             Ok(cert_key_pairs) if !cert_key_pairs.is_empty() => {
                 debug!("Found {} certificates, starting with HTTPS", cert_key_pairs.len());
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -276,7 +256,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 // create a multi certificate configuration
                 let mut server_config = ServerConfig::builder()
                     .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(utils::create_multi_cert_resolver(cert_key_pairs)?));
+                    .with_cert_resolver(Arc::new(rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?));
 
                 server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
                 Some(TlsAcceptor::from(Arc::new(server_config)))
@@ -291,12 +271,14 @@ async fn run(opt: config::Opt) -> Result<()> {
                 if has_single_cert {
                     debug!("Found legacy single TLS certificate, starting with HTTPS");
                     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-                    let certs = utils::load_certs(cert_path.as_str()).map_err(|e| error(e.to_string()))?;
-                    let key = utils::load_private_key(key_path.as_str()).map_err(|e| error(e.to_string()))?;
+                    let certs =
+                        rustfs_utils::load_certs(cert_path.as_str()).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+                    let key = rustfs_utils::load_private_key(key_path.as_str())
+                        .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
                     let mut server_config = ServerConfig::builder()
                         .with_no_client_auth()
                         .with_single_cert(certs, key)
-                        .map_err(|e| error(e.to_string()))?;
+                        .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
                     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
                     Some(TlsAcceptor::from(Arc::new(server_config)))
                 } else {
@@ -446,7 +428,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 debug!("TLS certificates found, starting with SIGINT");
                 let tls_socket = match tls_acceptor
                     .as_ref()
-                    .ok_or_else(|| error("TLS not configured".to_string()))
+                    .ok_or_else(|| rustfs_utils::certs_error("TLS not configured".to_string()))
                     .unwrap()
                     .accept(socket)
                     .await

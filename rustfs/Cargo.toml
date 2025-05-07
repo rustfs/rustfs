@@ -30,7 +30,7 @@ clap.workspace = true
 crypto = { workspace = true }
 datafusion = { workspace = true }
 common.workspace = true
-const-str = { version = "0.6.1", features = ["std", "proc"] }
+const-str = { workspace = true }
 ecstore.workspace = true
 policy.workspace = true
 flatbuffers.workspace = true
@@ -42,7 +42,6 @@ http.workspace = true
 http-body.workspace = true
 iam = { workspace = true }
 lock.workspace = true
-local-ip-address = { workspace = true }
 matchit = { workspace = true }
 mime.workspace = true
 mime_guess = { workspace = true }
@@ -51,18 +50,18 @@ pin-project-lite.workspace = true
 protos.workspace = true
 query = { workspace = true }
 rmp-serde.workspace = true
+rustfs-config = { workspace = true }
 rustfs-event-notifier = { workspace = true }
 rustfs-obs = { workspace = true }
+rustfs-utils = { workspace = true }
 rustls.workspace = true
-rustls-pemfile.workspace = true
-rustls-pki-types.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded = { workspace = true }
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
-socket2 = "0.5.9"
+socket2 = { workspace = true }
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 tokio-util.workspace = true
