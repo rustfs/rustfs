@@ -154,16 +154,6 @@ impl Default for Metadata {
     }
 }
 impl Metadata {
-    /// Create a new Metadata instance
-    pub fn create(schema_version: String, configuration_id: String, bucket: Bucket, object: Object) -> Self {
-        Self {
-            schema_version,
-            configuration_id,
-            bucket,
-            object,
-        }
-    }
-
     /// Create a new Metadata instance with default values
     pub fn new() -> Self {
         Self {
@@ -175,6 +165,16 @@ impl Metadata {
                 "arn:aws:s3:::default".to_string(),
             ),
             object: Object::new("default".to_string(), None, None, None, None, None, "default".to_string()),
+        }
+    }
+
+    /// Create a new Metadata instance
+    pub fn create(schema_version: String, configuration_id: String, bucket: Bucket, object: Object) -> Self {
+        Self {
+            schema_version,
+            configuration_id,
+            bucket,
+            object,
         }
     }
 
@@ -470,17 +470,7 @@ pub struct Log {
     pub records: Vec<Event>,
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    SerializeDisplay,
-    DeserializeFromStr,
-    Display,
-    EnumString
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr, Display, EnumString)]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 pub enum Name {
     ObjectAccessedGet,

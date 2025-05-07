@@ -1,4 +1,3 @@
-use crate::config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use crate::license::get_license;
 use axum::{
     body::Body,
@@ -8,6 +7,7 @@ use axum::{
     Router,
 };
 use axum_extra::extract::Host;
+use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use std::io;
 
 use axum::response::Redirect;
@@ -17,7 +17,7 @@ use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::signal;
@@ -73,7 +73,7 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    fn new(local_ip: Ipv4Addr, port: u16, version: &str, date: &str) -> Self {
+    fn new(local_ip: IpAddr, port: u16, version: &str, date: &str) -> Self {
         Config {
             port,
             api: Api {
@@ -144,7 +144,7 @@ struct License {
 pub(crate) static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[allow(clippy::const_is_empty)]
-pub(crate) fn init_console_cfg(local_ip: Ipv4Addr, port: u16) {
+pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
     CONSOLE_CONFIG.get_or_init(|| {
         let ver = {
             if !build::TAG.is_empty() {
@@ -220,7 +220,7 @@ async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
 
 pub async fn start_static_file_server(
     addrs: &str,
-    local_ip: Ipv4Addr,
+    local_ip: IpAddr,
     access_key: &str,
     secret_key: &str,
     tls_path: Option<String>,

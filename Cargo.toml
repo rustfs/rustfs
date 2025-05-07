@@ -1,21 +1,23 @@
 [workspace]
 members = [
-    "madmin", # Management dashboard and admin API interface
-    "rustfs", # Core file system implementation
-    "ecstore", # Erasure coding storage implementation
-    "e2e_test", # End-to-end test suite
+    "appauth", # Application authentication and authorization
+    "cli/rustfs-gui", # Graphical user interface client
     "common/common", # Shared utilities and data structures
     "common/lock", # Distributed locking implementation
     "common/protos", # Protocol buffer definitions
     "common/workers", # Worker thread pools and task scheduling
-    "iam", # Identity and Access Management
-    "crypto", # Cryptography and security features
-    "cli/rustfs-gui", # Graphical user interface client
-    "crates/obs", # Observability utilities
+    "crates/config", # Configuration management
     "crates/event-notifier", # Event notification system
+    "crates/obs", # Observability utilities
+    "crates/utils", # Utility functions and helpers
+    "crypto", # Cryptography and security features
+    "ecstore", # Erasure coding storage implementation
+    "e2e_test", # End-to-end test suite
+    "iam", # Identity and Access Management
+    "madmin", # Management dashboard and admin API interface
+    "rustfs", # Core file system implementation
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
-    "appauth", # Application authentication and authorization
 ]
 resolver = "2"
 
@@ -45,8 +47,10 @@ policy = { path = "./policy", version = "0.0.1" }
 protos = { path = "./common/protos", version = "0.0.1" }
 query = { path = "./s3select/query", version = "0.0.1" }
 rustfs = { path = "./rustfs", version = "0.0.1" }
+rustfs-config = { path = "./crates/config", version = "0.0.1" }
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
+rustfs-utils = { path = "crates/utils", version = "0.0.1" }
 workers = { path = "./common/workers", version = "0.0.1" }
 atoi = "2.0.0"
 async-recursion = "1.1.1"
@@ -62,6 +66,7 @@ bytesize = "2.0.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.37", features = ["derive", "env"] }
 config = "0.15.11"
+const-str = { version = "0.6.2", features = ["std", "proc"] }
 datafusion = "46.0.1"
 derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }
@@ -150,6 +155,7 @@ serde_with = "3.12.0"
 sha2 = "0.10.8"
 smallvec = { version = "1.15.0", features = ["serde"] }
 snafu = "0.8.5"
+socket2 = "0.5.9"
 strum = { version = "0.27.1", features = ["derive"] }
 sysinfo = "0.34.2"
 tempfile = "3.19.1"
@@ -162,7 +168,7 @@ time = { version = "0.3.41", features = [
     "macros",
     "serde",
 ] }
-tokio = { version = "1.44.2", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.45.0", features = ["fs", "rt-multi-thread"] }
 tonic = { version = "0.13.1", features = ["gzip"] }
 tonic-build = { version = "0.13.1" }
 tokio-rustls = { version = "0.26.2", default-features = false }

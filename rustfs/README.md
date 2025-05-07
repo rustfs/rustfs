@@ -1,30 +1,36 @@
-rustfs/
-├── Cargo.toml
-├── src/
-│ ├── main.rs # 主入口
-│ ├── admin/
-│ │ └── mod.rs # 管理接口
-│ ├── auth/
-│ │ └── mod.rs # 认证模块
-│ ├── config/
-│ │ ├── mod.rs # 配置模块
-│ │ └── options.rs # 命令行参数
-│ ├── console/
-│ │ ├── mod.rs # 控制台模块
-│ │ └── server.rs # 控制台服务器
-│ ├── grpc/
-│ │ └── mod.rs # gRPC 服务
-│ ├── license/
-│ │ └── mod.rs # 许可证管理
-│ ├── logging/
-│ │ └── mod.rs # 日志管理
-│ ├── server/
-│ │ ├── mod.rs # 服务器实现
-│ │ ├── connection.rs # 连接处理
-│ │ ├── service.rs # 服务实现
-│ │ └── state.rs # 状态管理
-│ ├── storage/
-│ │ ├── mod.rs # 存储模块
-│ │ └── fs.rs # 文件系统实现
-│ └── utils/
-│ └── mod.rs # 工具函数
+# RustFS
+
+RustFS is a simple file system written in Rust. It is designed to be a learning project for those who want to understand
+how file systems work and how to implement them in Rust.
+
+## Features
+
+- Simple file system structure
+- Basic file operations (create, read, write, delete)
+- Directory support
+- File metadata (size, creation time, etc.)
+- Basic error handling
+- Unit tests for core functionality
+- Documentation for public API
+- Example usage
+- License information
+- Contributing guidelines
+- Changelog
+- Code of conduct
+- Acknowledgements
+- Contact information
+- Links to additional resources
+
+## Getting Started
+
+To get started with RustFS, clone the repository and build the project:
+
+```bash
+git clone git@github.com:rustfs/s3-rustfs.git
+cd rustfs
+cargo build
+```
+
+## Usage
+
+To use RustFS, you can create a new file system instance and perform basic file operations. Here is an example:
