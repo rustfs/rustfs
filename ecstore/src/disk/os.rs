@@ -9,7 +9,6 @@ use crate::{
 };
 use common::error::{Error, Result};
 use tokio::fs;
-use tracing::info;
 
 use super::error::{os_err_to_file_err, os_is_exist, DiskError};
 
@@ -137,7 +136,7 @@ pub async fn reliable_rename(
 ) -> io::Result<()> {
     if let Some(parent) = dst_file_path.as_ref().parent() {
         if !file_exists(parent).await {
-            info!("reliable_rename reliable_mkdir_all parent: {:?}", parent);
+            // info!("reliable_rename reliable_mkdir_all parent: {:?}", parent);
             reliable_mkdir_all(parent, base_dir.as_ref()).await?;
         }
     }

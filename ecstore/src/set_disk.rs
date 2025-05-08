@@ -421,7 +421,7 @@ impl SetDisks {
             let file_path = file_path.clone();
             async move {
                 if let Some(disk) = disk {
-                    match disk
+                    (disk
                         .delete(
                             bucket,
                             &file_path,
@@ -430,11 +430,8 @@ impl SetDisks {
                                 ..Default::default()
                             },
                         )
-                        .await
-                    {
-                        Ok(_) => None,
-                        Err(e) => Some(e),
-                    }
+                        .await)
+                        .err()
                 } else {
                     Some(Error::new(DiskError::DiskNotFound))
                 }
