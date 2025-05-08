@@ -67,7 +67,7 @@ impl Erasure {
     {
         let (tx, mut rx) = mpsc::channel(5);
         let task = tokio::spawn(async move {
-            let mut buf = Vec::new();
+            let mut buf = vec![0u8; self.block_size];
             let mut total: usize = 0;
             loop {
                 if total_size > 0 {
@@ -99,6 +99,9 @@ impl Erasure {
                 }
                 let blocks = Arc::new(Box::pin(self.clone().encode_data(&buf)?));
                 let _ = tx.send(blocks).await;
+                if total_size == 0 {
+                    break;
+                }
             }
             let etag = reader.etag().await;
             Ok((total, etag))
@@ -129,83 +132,8 @@ impl Erasure {
                 warn!("Erasure encode errs {:?}", &errs);
                 return Err(err);
             }
-
-            if total_size == 0 {
-                break;
-            }
         }
         task.await?
-
-        // // let stream = ChunkedStream::new(body, self.block_size);
-        // let stream = ChunkedStream::new(body, total_size, self.block_size, false);
-        // let mut total: usize = 0;
-        // // let mut idx = 0;
-        // pin_mut!(stream);
-
-        // // warn!("encode start...");
-
-        // loop {
-        //     match stream.next().await {
-        //         Some(result) => match result {
-        //             Ok(data) => {
-        //                 total += data.len();
-
-        //                 // EOF
-        //                 if data.is_empty() {
-        //                     break;
-        //                 }
-
-        //                 // idx += 1;
-        //                 // warn!("encode {} get data {:?}", data.len(), data.to_vec());
-
-        //                 let blocks = self.encode_data(data.as_ref())?;
-
-        //                 // warn!(
-        //                 //     "encode shard  size: {}/{} from block_size {}, total_size {} ",
-        //                 //     blocks[0].len(),
-        //                 //     blocks.len(),
-        //                 //     data.len(),
-        //                 //     total_size
-        //                 // );
-
-        //                 let mut errs = Vec::new();
-
-        //                 for (i, w_op) in writers.iter_mut().enumerate() {
-        //                     if let Some(w) = w_op {
-        //                         match w.write(blocks[i].as_ref()).await {
-        //                             Ok(_) => errs.push(None),
-        //                             Err(e) => errs.push(Some(e)),
-        //                         }
-        //                     } else {
-        //                         errs.push(Some(Error::new(DiskError::DiskNotFound)));
-        //                     }
-        //                 }
-
-        //                 let none_count = errs.iter().filter(|&x| x.is_none()).count();
-        //                 if none_count >= write_quorum {
-        //                     continue;
-        //                 }
-
-        //                 if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
-        //                     warn!("Erasure encode errs {:?}", &errs);
-        //                     return Err(err);
-        //                 }
-        //             }
-        //             Err(e) => {
-        //                 warn!("poll result err {:?}", &e);
-        //                 return Err(Error::msg(e.to_string()));
-        //             }
-        //         },
-        //         None => {
-        //             // warn!("poll empty result");
-        //             break;
-        //         }
-        //     }
-        // }
-
-        // let _ = close_bitrot_writers(writers).await?;
-
-        // Ok(total)
     }
 
     pub async fn decode<W>(
