@@ -67,7 +67,7 @@ impl Erasure {
     {
         let (tx, mut rx) = mpsc::channel(5);
         let task = tokio::spawn(async move {
-            let mut buf = Vec::new();
+            let mut buf = vec![0u8; self.block_size];
             let mut total: usize = 0;
             loop {
                 if total_size > 0 {
@@ -99,6 +99,9 @@ impl Erasure {
                 }
                 let blocks = Arc::new(Box::pin(self.clone().encode_data(&buf)?));
                 let _ = tx.send(blocks).await;
+                if total_size == 0 {
+                    break;
+                }
             }
             let etag = reader.etag().await;
             Ok((total, etag))
@@ -128,10 +131,6 @@ impl Erasure {
             if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
                 warn!("Erasure encode errs {:?}", &errs);
                 return Err(err);
-            }
-
-            if total_size == 0 {
-                break;
             }
         }
         task.await?
