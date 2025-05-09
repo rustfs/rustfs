@@ -115,6 +115,10 @@ pub async fn lstat(path: impl AsRef<Path>) -> io::Result<Metadata> {
     fs::metadata(path).await
 }
 
+pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
+    std::fs::metadata(path)
+}
+
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir_all(path.as_ref()).await
 }
