@@ -2063,7 +2063,7 @@ impl SetDisks {
                     let bucket_partial = bucket_partial.clone();
                     async move {
                         let entry = match entries.resolve(resolver_partial) {
-                            Ok(Some(entry)) => entry,
+                            Some(entry) => entry,
                             _ => match entries.first_found() {
                                 (Some(entry), _) => entry,
                                 _ => return,
@@ -3516,7 +3516,7 @@ impl SetDisks {
                             let heal_entry = heal_entry.clone();
                             let resolver = resolver.clone();
                             async move {
-                                let entry = if let Ok(Some(entry)) = entries.resolve(resolver) {
+                                let entry = if let Some(entry) = entries.resolve(resolver) {
                                     entry
                                 } else if let (Some(entry), _) = entries.first_found() {
                                     entry

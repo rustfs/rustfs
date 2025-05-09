@@ -524,7 +524,9 @@ impl ECStore {
 
         // TODO: 并发
         for (idx, pool) in self.pools.iter().enumerate() {
-            // TODO: IsSuspended
+            if self.is_suspended(idx).await || self.is_pool_rebalancing(idx).await {
+                continue;
+            }
 
             n_sets[idx] = pool.set_count;
 
@@ -714,16 +716,14 @@ impl ECStore {
         let mut def_pool = PoolObjInfo::default();
         let mut has_def_pool = false;
 
-        let pool_meta = self.pool_meta.read().await;
         for pinfo in ress.iter() {
-            if opts.skip_decommissioned && pool_meta.is_suspended(pinfo.index) {
+            if opts.skip_decommissioned && self.is_suspended(pinfo.index).await {
                 continue;
             }
 
-            // TODO:SkipRebalancing
-            // if opts.SkipRebalancing && z.IsPoolRebalancing(pinfo.Index) {
-            //     continue
-            // }
+            if opts.skip_rebalancing && self.is_pool_rebalancing(pinfo.index).await {
+                continue;
+            }
 
             if pinfo.err.is_none() {
                 return Ok((pinfo.clone(), self.pools_with_object(&ress, opts).await));
@@ -756,15 +756,15 @@ impl ECStore {
 
     async fn pools_with_object(&self, pools: &[PoolObjInfo], opts: &ObjectOptions) -> Vec<PoolErr> {
         let mut errs = Vec::new();
-        let pool_meta = self.pool_meta.read().await;
+
         for pool in pools.iter() {
-            if opts.skip_decommissioned && pool_meta.is_suspended(pool.index) {
+            if opts.skip_decommissioned && self.is_suspended(pool.index).await {
                 continue;
             }
-            // TODO:SkipRebalancing
-            // if opts.SkipRebalancing && z.IsPoolRebalancing(pinfo.Index) {
-            //     continue
-            // }
+
+            if opts.skip_rebalancing && self.is_pool_rebalancing(pool.index).await {
+                continue;
+            }
 
             if let Some(err) = &pool.err {
                 if is_err_read_quorum(err) {
@@ -1865,7 +1865,9 @@ impl StorageAPI for ECStore {
         }
 
         for pool in self.pools.iter() {
-            // TODO: IsSuspended
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
             let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
                 Ok(res) => return Ok(res),
                 Err(err) => {
@@ -1915,6 +1917,9 @@ impl StorageAPI for ECStore {
         let mut uploads = Vec::new();
 
         for pool in self.pools.iter() {
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
             let res = pool
                 .list_multipart_uploads(
                     bucket,
@@ -1948,7 +1953,9 @@ impl StorageAPI for ECStore {
         }
 
         for (idx, pool) in self.pools.iter().enumerate() {
-            // // TODO: IsSuspended
+            if self.is_suspended(idx).await || self.is_pool_rebalancing(idx).await {
+                continue;
+            }
             let res = pool
                 .list_multipart_uploads(bucket, object, None, None, None, MAX_UPLOADS_LIST)
                 .await?;
@@ -1983,8 +1990,8 @@ impl StorageAPI for ECStore {
             return self.pools[0].get_multipart_info(bucket, object, upload_id, opts).await;
         }
 
-        for (idx, pool) in self.pools.iter().enumerate() {
-            if self.is_suspended(idx).await {
+        for pool in self.pools.iter() {
+            if self.is_suspended(pool.pool_idx).await {
                 continue;
             }
 
@@ -2017,7 +2024,9 @@ impl StorageAPI for ECStore {
         }
 
         for pool in self.pools.iter() {
-            // TODO: IsSuspended
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
 
             let err = match pool.abort_multipart_upload(bucket, object, upload_id, opts).await {
                 Ok(_) => return Ok(()),
@@ -2060,7 +2069,9 @@ impl StorageAPI for ECStore {
         }
 
         for pool in self.pools.iter() {
-            // TODO: IsSuspended
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
 
             let err = match pool
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)

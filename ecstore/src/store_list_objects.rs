@@ -778,7 +778,7 @@ impl ECStore {
                                     let value = tx2.clone();
                                     let resolver = resolver.clone();
                                     async move {
-                                        if let Ok(Some(entry)) = entries.resolve(resolver) {
+                                        if let Some(entry) = entries.resolve(resolver) {
                                             if let Err(err) = value.send(entry).await {
                                                 error!("list_path send fail {:?}", err);
                                             }
@@ -1296,7 +1296,7 @@ impl SetDisks {
                         let value = tx2.clone();
                         let resolver = resolver.clone();
                         async move {
-                            if let Ok(Some(entry)) = entries.resolve(resolver) {
+                            if let Some(entry) = entries.resolve(resolver) {
                                 if let Err(err) = value.send(entry).await {
                                     error!("list_path send fail {:?}", err);
                                 }
