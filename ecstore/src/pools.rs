@@ -31,6 +31,7 @@ use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
+use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast::Receiver as B_Receiver;
 use tracing::{error, info, warn};
 
@@ -910,7 +911,11 @@ impl ECStore {
                     let wk = wk.clone();
                     let set = set.clone();
                     let rcfg = rcfg.clone();
-                    Box::pin(async move { this.decommission_entry(idx, entry, bucket, set, wk, rcfg).await })
+
+                    Box::pin(async move {
+                        wk.take().await;
+                        this.decommission_entry(idx, entry, bucket, set, wk, rcfg).await
+                    })
                 }
             });
 
@@ -918,6 +923,7 @@ impl ECStore {
             let mut rx = rx.resubscribe();
             let bi = bi.clone();
             let set_id = set_idx;
+            let wk_clone = wk.clone();
             tokio::spawn(async move {
                 loop {
                     if rx.try_recv().is_ok() {
@@ -945,6 +951,8 @@ impl ECStore {
                         }
                     }
                 }
+
+                wk_clone.give().await;
             });
         }
 
@@ -1166,7 +1174,7 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, rd))]
     async fn decommission_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
-        warn!("decommission_object: {} {}", &bucket, &rd.object_info.name);
+        warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_info = rd.object_info.clone();
 
         // TODO: check : use size or actual_size ?
@@ -1194,8 +1202,6 @@ impl ECStore {
                 }
             };
 
-            // TODO: defer abort_multipart_upload
-
             defer!(|| async {
                 if let Err(err) = self
                     .abort_multipart_upload(&bucket, &object_info.name, &res.upload_id, &ObjectOptions::default())
@@ -1210,9 +1216,13 @@ impl ECStore {
             let mut reader = rd.stream;
 
             for (i, part) in object_info.parts.iter().enumerate() {
-                // 每次从reader中读取一个part上传
+                let mut chunk = vec![0u8; part.size];
 
-                let mut data = PutObjReader::new(reader, part.size);
+                reader.read_exact(&mut chunk).await?;
+
+                // 每次从reader中读取一个part上传
+                let rd = Box::new(Cursor::new(chunk));
+                let mut data = PutObjReader::new(rd, part.size);
 
                 let pi = match self
                     .put_object_part(
@@ -1230,18 +1240,17 @@ impl ECStore {
                 {
                     Ok(pi) => pi,
                     Err(err) => {
-                        error!("decommission_object: put_object_part err {:?}", &err);
+                        error!("decommission_object: put_object_part {} err {:?}", i, &err);
                         return Err(err);
                     }
                 };
+
+                warn!("decommission_object: put_object_part {} done {} {}", i, &bucket, &object_info.name);
 
                 parts[i] = CompletePart {
                     part_num: pi.part_num,
                     e_tag: pi.etag,
                 };
-
-                // 把reader所有权拿回来?
-                reader = data.stream;
             }
 
             if let Err(err) = self
@@ -1262,6 +1271,7 @@ impl ECStore {
                 return Err(err);
             }
 
+            warn!("decommission_object: complete_multipart_upload done {} {}", &bucket, &object_info.name);
             return Ok(());
         }
 
@@ -1289,6 +1299,7 @@ impl ECStore {
             return Err(err);
         }
 
+        warn!("decommission_object: put_object done {} {}", &bucket, &object_info.name);
         Ok(())
     }
 }
@@ -1319,6 +1330,8 @@ impl SetDisks {
             ..Default::default()
         };
 
+        let cb1 = cb_func.clone();
+
         list_path_raw(
             rx,
             ListPathRawOptions {
@@ -1327,23 +1340,19 @@ impl SetDisks {
                 path: bucket_info.prefix.clone(),
                 recursice: true,
                 min_disks: listing_quorum,
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
                     let resolver = resolver.clone();
                     let cb_func = cb_func.clone();
-
                     match entries.resolve(resolver) {
-                        Ok(Some(entry)) => {
+                        Some(entry) => {
                             warn!("decommission_pool: list_objects_to_decommission get {}", &entry.name);
                             Box::pin(async move {
                                 cb_func(entry).await;
                             })
                         }
-                        Ok(None) => {
+                        None => {
                             warn!("decommission_pool: list_objects_to_decommission get none");
-                            Box::pin(async {})
-                        }
-                        Err(err) => {
-                            error!("decommission_pool: list_objects_to_decommission get err {:?}", &err);
                             Box::pin(async {})
                         }
                     }

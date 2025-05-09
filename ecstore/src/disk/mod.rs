@@ -786,46 +786,62 @@ impl MetaCacheEntry {
         fm.into_file_info_versions(bucket, self.name.as_str(), false)
     }
 
-    pub fn matches(&self, other: &MetaCacheEntry, strict: bool) -> Result<(Option<MetaCacheEntry>, bool)> {
+    pub fn matches(&self, other: Option<&MetaCacheEntry>, strict: bool) -> (Option<MetaCacheEntry>, bool) {
+        if other.is_none() {
+            return (None, false);
+        }
+
+        let other = other.unwrap();
+
         let mut prefer = None;
         if self.name != other.name {
             if self.name < other.name {
-                return Ok((Some(self.clone()), false));
+                return (Some(self.clone()), false);
             }
-            return Ok((Some(other.clone()), false));
+            return (Some(other.clone()), false);
         }
 
         if other.is_dir() || self.is_dir() {
             if self.is_dir() {
-                return Ok((Some(self.clone()), other.is_dir()));
+                return (Some(self.clone()), other.is_dir() == self.is_dir());
             }
 
-            return Ok((Some(other.clone()), other.is_dir() == self.is_dir()));
+            return (Some(other.clone()), other.is_dir() == self.is_dir());
         }
         let self_vers = match &self.cached {
             Some(file_meta) => file_meta.clone(),
-            None => FileMeta::load(&self.metadata)?,
+            None => match FileMeta::load(&self.metadata) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    return (None, false);
+                }
+            },
         };
         let other_vers = match &other.cached {
             Some(file_meta) => file_meta.clone(),
-            None => FileMeta::load(&other.metadata)?,
+            None => match FileMeta::load(&other.metadata) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    return (None, false);
+                }
+            },
         };
 
         if self_vers.versions.len() != other_vers.versions.len() {
             match self_vers.lastest_mod_time().cmp(&other_vers.lastest_mod_time()) {
                 Ordering::Greater => {
-                    return Ok((Some(self.clone()), false));
+                    return (Some(self.clone()), false);
                 }
                 Ordering::Less => {
-                    return Ok((Some(self.clone()), false));
+                    return (Some(other.clone()), false);
                 }
                 _ => {}
             }
 
             if self_vers.versions.len() > other_vers.versions.len() {
-                return Ok((Some(self.clone()), false));
+                return (Some(self.clone()), false);
             }
-            return Ok((Some(self.clone()), false));
+            return (Some(other.clone()), false);
         }
 
         for (s_version, o_version) in self_vers.versions.iter().zip(other_vers.versions.iter()) {
@@ -853,14 +869,14 @@ impl MetaCacheEntry {
                 }
 
                 if prefer.is_some() {
-                    return Ok((prefer, false));
+                    return (prefer, false);
                 }
 
                 if s_version.header.sorts_before(&o_version.header) {
-                    return Ok((Some(self.clone()), false));
+                    return (Some(self.clone()), false);
                 }
 
-                return Ok((Some(other.clone()), false));
+                return (Some(other.clone()), false);
             }
         }
 
@@ -868,7 +884,7 @@ impl MetaCacheEntry {
             prefer = Some(self.clone());
         }
 
-        Ok((prefer, true))
+        (prefer, true)
     }
 
     pub fn xl_meta(&mut self) -> Result<FileMeta> {
@@ -900,9 +916,10 @@ impl MetaCacheEntries {
     pub fn as_ref(&self) -> &[Option<MetaCacheEntry>] {
         &self.0
     }
-    pub fn resolve(&self, mut params: MetadataResolutionParams) -> Result<Option<MetaCacheEntry>> {
+    pub fn resolve(&self, mut params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
         if self.0.is_empty() {
-            return Ok(None);
+            warn!("decommission_pool: entries resolve empty");
+            return None;
         }
 
         let mut dir_exists = 0;
@@ -913,76 +930,104 @@ impl MetaCacheEntries {
         let mut objs_valid = 0;
 
         for entry in self.0.iter().flatten() {
+            let mut entry = entry.clone();
+
+            warn!("decommission_pool: entries resolve entry {:?}", entry.name);
             if entry.name.is_empty() {
                 continue;
             }
             if entry.is_dir() {
                 dir_exists += 1;
                 selected = Some(entry.clone());
+                warn!("decommission_pool: entries resolve entry dir {:?}", entry.name);
                 continue;
             }
 
+            let xl = match entry.xl_meta() {
+                Ok(xl) => xl,
+                Err(e) => {
+                    warn!("decommission_pool: entries resolve entry xl_meta {:?}", e);
+                    continue;
+                }
+            };
+
             objs_valid += 1;
 
-            match &entry.cached {
-                Some(file_meta) => {
-                    params.candidates.push(file_meta.versions.clone());
-                }
-                None => {
-                    params.candidates.push(FileMeta::load(&entry.metadata)?.versions);
-                }
-            }
+            params.candidates.push(xl.versions.clone());
 
             if selected.is_none() {
                 selected = Some(entry.clone());
                 objs_agree = 1;
+                warn!("decommission_pool: entries resolve entry selected {:?}", entry.name);
                 continue;
             }
 
-            if let (Some(prefer), true) = entry.matches(selected.as_ref().unwrap(), params.strict)? {
-                selected = Some(prefer);
+            if let (prefer, true) = entry.matches(selected.as_ref(), params.strict) {
+                selected = prefer;
                 objs_agree += 1;
+                warn!("decommission_pool: entries resolve entry prefer {:?}", entry.name);
                 continue;
             }
         }
 
-        // Return dir entries, if enough...
-        if selected.is_some() && selected.as_ref().unwrap().is_dir() && dir_exists >= params.dir_quorum {
-            return Ok(selected);
+        let Some(selected) = selected else {
+            warn!("decommission_pool: entries resolve entry no selected");
+            return None;
+        };
+
+        if selected.is_dir() && dir_exists >= params.dir_quorum {
+            warn!("decommission_pool: entries resolve entry dir selected {:?}", selected.name);
+            return Some(selected);
         }
+
         // If we would never be able to reach read quorum.
         if objs_valid < params.obj_quorum {
-            return Ok(None);
+            warn!(
+                "decommission_pool: entries resolve entry not enough objects {} < {}",
+                objs_valid, params.obj_quorum
+            );
+            return None;
         }
-        // If all objects agree.
-        if selected.is_some() && objs_agree == objs_valid {
-            return Ok(selected);
+
+        if objs_agree == objs_valid {
+            warn!("decommission_pool: entries resolve entry all agree {} == {}", objs_agree, objs_valid);
+            return Some(selected);
         }
-        // If cached is nil we shall skip the entry.
-        if selected.is_none() || (selected.is_some() && selected.as_ref().unwrap().cached.is_none()) {
-            return Ok(None);
+
+        let Some(cached) = selected.cached else {
+            warn!("decommission_pool: entries resolve entry no cached");
+            return None;
+        };
+
+        let versions = merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates);
+        if versions.is_empty() {
+            warn!("decommission_pool: entries resolve entry no versions");
+            return None;
         }
+
+        let metadata = match cached.marshal_msg() {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!("decommission_pool: entries resolve entry marshal_msg {:?}", e);
+                return None;
+            }
+        };
+
         // Merge if we have disagreement.
         // Create a new merged result.
-        selected = Some(MetaCacheEntry {
-            name: selected.as_ref().unwrap().name.clone(),
+        let new_selected = MetaCacheEntry {
+            name: selected.name.clone(),
             cached: Some(FileMeta {
-                meta_ver: selected.as_ref().unwrap().cached.as_ref().unwrap().meta_ver,
+                meta_ver: cached.meta_ver,
+                versions,
                 ..Default::default()
             }),
             reusable: true,
-            ..Default::default()
-        });
+            metadata,
+        };
 
-        selected.as_mut().unwrap().cached.as_mut().unwrap().versions =
-            merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates);
-        if selected.as_ref().unwrap().cached.as_ref().unwrap().versions.is_empty() {
-            return Ok(None);
-        }
-
-        selected.as_mut().unwrap().metadata = selected.as_ref().unwrap().cached.as_ref().unwrap().marshal_msg()?;
-
-        Ok(selected)
+        warn!("decommission_pool: entries resolve entry selected {:?}", new_selected.name);
+        Some(new_selected)
     }
 
     pub fn first_found(&self) -> (Option<MetaCacheEntry>, usize) {
