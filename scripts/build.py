@@ -34,7 +34,7 @@ def main(args: CliArgs):
         use_zigbuild = True
         use_old_glibc = True
 
-    if args.target and args.target  == "x86_64-unknown-linux-musl":
+    if args.target and args.target  != "x86_64-unknown-linux-gnu":
         shell("rustup target add " + args.target)
 
     cmd = ["cargo", "build"]

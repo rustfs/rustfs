@@ -6,17 +6,25 @@ inputs:
   rust-version:
     required: true
     default: "stable"
+    description: "Rust version to use"
   cache-shared-key:
     required: true
     default: ""
+    description: "Cache key for shared cache"
   cache-save-if:
     required: true
     default: true
+    description: "Cache save condition"
+  run-os:
+    required: true
+    default: "ubuntu-latest"
+    description: "Running system"
 
 runs:
   using: "composite"
   steps:
     - name: Install system dependencies
+      if: inputs.run-os == 'ubuntu-latest'
       shell: bash
       run: |
         sudo apt update

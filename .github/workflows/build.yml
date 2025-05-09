@@ -11,21 +11,29 @@ on:
 
 jobs:
   build-rustfs:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
 
     strategy:
       matrix:
+        os: [ ubuntu-latest, macos-latest ]
         variant:
-          # - { profile: dev, target: x86_64-unknown-linux-musl, glibc: "default" }
           - { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
           - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
-          # - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "2.31" }
+          - { profile: release, target: aarch64-apple-darwin, glibc: "default" }
+        exclude:
+          - os: macos-latest
+            variant: { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - os: ubuntu-latest
+            variant: { profile: release, target: aarch64-apple-darwin, glibc: "default" }
+          - os: macos-latest
+            variant: { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
 
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
           cache-shared-key: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
+          run-os: ${{ matrix.os }}
 
       - name: Download and Extract Static Assets
         run: |
