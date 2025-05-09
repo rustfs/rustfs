@@ -50,5 +50,5 @@ runs:
         shared-key: ${{ inputs.cache-shared-key }}
         save-if: ${{ inputs.cache-save-if }}
 
-    - uses: mlugg/setup-zig@v1
+    - uses: mlugg/setup-zig@v2
     - uses: taiki-e/install-action@cargo-zigbuild
