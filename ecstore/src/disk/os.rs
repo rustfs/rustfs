@@ -107,6 +107,7 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> Result<Vec<String>>
     Ok(volumes)
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn rename_all(
     src_file_path: impl AsRef<Path>,
     dst_file_path: impl AsRef<Path>,
@@ -135,15 +136,15 @@ pub async fn reliable_rename(
     base_dir: impl AsRef<Path>,
 ) -> io::Result<()> {
     if let Some(parent) = dst_file_path.as_ref().parent() {
-        if !file_exists(parent).await {
-            // info!("reliable_rename reliable_mkdir_all parent: {:?}", parent);
+        if !file_exists(parent) {
+            info!("reliable_rename reliable_mkdir_all parent: {:?}", parent);
             reliable_mkdir_all(parent, base_dir.as_ref()).await?;
         }
     }
 
     let mut i = 0;
     loop {
-        if let Err(e) = utils::fs::rename(src_file_path.as_ref(), dst_file_path.as_ref()).await {
+        if let Err(e) = utils::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
             if os_is_not_exist(&e) && i == 0 {
                 i += 1;
                 continue;
@@ -220,6 +221,6 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
     Ok(())
 }
 
-pub async fn file_exists(path: impl AsRef<Path>) -> bool {
-    fs::metadata(path.as_ref()).await.map(|_| true).unwrap_or(false)
+pub fn file_exists(path: impl AsRef<Path>) -> bool {
+    std::fs::metadata(path.as_ref()).map(|_| true).unwrap_or(false)
 }

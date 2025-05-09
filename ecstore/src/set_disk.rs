@@ -284,10 +284,20 @@ impl SetDisks {
         // let mut ress = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
 
-        for (i, disk) in disks.iter().enumerate() {
-            let mut file_info = file_infos[i].clone();
+        let src_bucket = Arc::new(src_bucket.to_string());
+        let src_object = Arc::new(src_object.to_string());
+        let dst_bucket = Arc::new(dst_bucket.to_string());
+        let dst_object = Arc::new(dst_object.to_string());
 
-            futures.push(async move {
+        for (i, (disk, file_info)) in disks.iter().zip(file_infos.iter()).enumerate() {
+            let mut file_info = file_info.clone();
+            let disk = disk.clone();
+            let src_bucket = src_bucket.clone();
+            let src_object = src_object.clone();
+            let dst_object = dst_object.clone();
+            let dst_bucket = dst_bucket.clone();
+
+            futures.push(tokio::spawn(async move {
                 if file_info.erasure.index == 0 {
                     file_info.erasure.index = i + 1;
                 }
@@ -297,12 +307,12 @@ impl SetDisks {
                 }
 
                 if let Some(disk) = disk {
-                    disk.rename_data(src_bucket, src_object, file_info, dst_bucket, dst_object)
+                    disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
                         .await
                 } else {
                     Err(Error::new(DiskError::DiskNotFound))
                 }
-            })
+            }));
         }
 
         let mut disk_versions = vec![None; disks.len()];
@@ -311,15 +321,13 @@ impl SetDisks {
         let results = join_all(futures).await;
 
         for (idx, result) in results.iter().enumerate() {
-            match result {
+            match result.as_ref().map_err(|_| Error::new(DiskError::Unexpected))? {
                 Ok(res) => {
                     data_dirs[idx] = res.old_data_dir;
                     disk_versions[idx].clone_from(&res.sign);
-                    // ress.push(Some(res));
                     errs.push(None);
                 }
                 Err(e) => {
-                    // ress.push(None);
                     errs.push(Some(clone_err(e)));
                 }
             }
@@ -336,11 +344,14 @@ impl SetDisks {
                 if let Some(disk) = disks[i].as_ref() {
                     let fi = file_infos[i].clone();
                     let old_data_dir = data_dirs[i];
-                    futures.push(async move {
+                    let disk = disk.clone();
+                    let src_bucket = src_bucket.clone();
+                    let src_object = src_object.clone();
+                    futures.push(tokio::spawn(async move {
                         let _ = disk
                             .delete_version(
-                                src_bucket,
-                                src_object,
+                                &src_bucket,
+                                &src_object,
                                 fi,
                                 false,
                                 DeleteOptions {
@@ -354,7 +365,7 @@ impl SetDisks {
                                 debug!("rename_data delete_version err {:?}", e);
                                 e
                             });
-                    });
+                    }));
                 }
             }
 
@@ -407,7 +418,7 @@ impl SetDisks {
     }
 
     #[allow(dead_code)]
-    #[tracing::instrument(level = "info", skip(self, disks))]
+    #[tracing::instrument(level = "debug", skip(self, disks))]
     async fn commit_rename_data_dir(
         &self,
         disks: &[Option<DiskStore>],
@@ -416,14 +427,17 @@ impl SetDisks {
         data_dir: &str,
         write_quorum: usize,
     ) -> Result<()> {
-        let file_path = format!("{}/{}", object, data_dir);
+        let file_path = Arc::new(format!("{}/{}", object, data_dir));
+        let bucket = Arc::new(bucket.to_string());
         let futures = disks.iter().map(|disk| {
             let file_path = file_path.clone();
-            async move {
+            let bucket = bucket.clone();
+            let disk = disk.clone();
+            tokio::spawn(async move {
                 if let Some(disk) = disk {
                     (disk
                         .delete(
-                            bucket,
+                            &bucket,
                             &file_path,
                             DeleteOptions {
                                 recursive: true,
@@ -435,9 +449,16 @@ impl SetDisks {
                 } else {
                     Some(Error::new(DiskError::DiskNotFound))
                 }
-            }
+            })
         });
-        let errs: Vec<Option<Error>> = join_all(futures).await;
+        let errs: Vec<Option<Error>> = join_all(futures)
+            .await
+            .into_iter()
+            .map(|e| match e {
+                Ok(e) => e,
+                Err(_) => Some(Error::new(DiskError::Unexpected)),
+            })
+            .collect();
 
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
             return Err(err);
