@@ -36,6 +36,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Set up authentication
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Authenticated with GITHUB_TOKEN"
       - uses: ./.github/actions/setup
         with:
           cache-shared-key: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
@@ -133,6 +138,7 @@ jobs:
         with:
           tool: dioxus-cli
       - name: Build and Bundle rustfs-gui
+        id: package
         run: |
           ls -la
 
