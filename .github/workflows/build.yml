@@ -19,12 +19,12 @@ jobs:
         variant:
           #- { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
           - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
-          - { profile: release, target: aarch64-apple-darwin, glibc: "default" }
+          #- { profile: release, target: aarch64-apple-darwin, glibc: "default" }
           #- { profile: release, target: aarch64-unknown-linux-gnu, glibc: "default" }
           #- { profile: release, target: aarch64-unknown-linux-musl, glibc: "default" }
         exclude:
           - os: ubuntu-latest
-            variant: { profile: release, target: x86_64-apple-darwin, glibc: "default" }
+            variant: { profile: release, target: aarch64-apple-darwin, glibc: "default" }
           - os: macos-latest
             variant: { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
           - os: macos-latest
