@@ -18,7 +18,7 @@ use uuid::Uuid;
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 pub const RESERVED_METADATA_PREFIX: &str = "X-Rustfs-Internal-";
-pub const RESERVED_METADATA_PREFIX_LOWER: &str = "X-Rustfs-Internal-";
+pub const RESERVED_METADATA_PREFIX_LOWER: &str = "x-rustfs-internal-";
 pub const RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
 pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
@@ -602,6 +602,8 @@ pub struct ObjectOptions {
 
     pub replication_request: bool,
     pub delete_marker: bool,
+
+    pub eval_metadata: Option<HashMap<String, String>>,
 }
 
 // impl Default for ObjectOptions {

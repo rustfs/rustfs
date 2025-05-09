@@ -4320,6 +4320,23 @@ impl StorageAPI for SetDisks {
             fi.metadata = Some(metadata)
         }
 
+        if let Some(mt) = &opts.eval_metadata {
+            if let Some(ref mut metadata) = fi.metadata {
+                for (k, v) in mt {
+                    metadata.insert(k.clone(), v.clone());
+                }
+                fi.metadata = Some(metadata.clone())
+            } else {
+                let mut metadata = HashMap::new();
+
+                for (k, v) in mt {
+                    metadata.insert(k.clone(), v.clone());
+                }
+
+                fi.metadata = Some(metadata)
+            }
+        }
+
         fi.mod_time = opts.mod_time;
         if let Some(ref version_id) = opts.version_id {
             fi.version_id = Uuid::parse_str(version_id).ok();
