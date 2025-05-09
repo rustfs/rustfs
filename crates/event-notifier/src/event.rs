@@ -15,6 +15,18 @@ pub struct Identity {
     pub principal_id: String,
 }
 
+impl Identity {
+    /// Create a new Identity instance
+    pub fn new(principal_id: String) -> Self {
+        Self { principal_id }
+    }
+
+    /// Set the principal ID
+    pub fn set_principal_id(&mut self, principal_id: String) {
+        self.principal_id = principal_id;
+    }
+}
+
 /// A struct representing the bucket information
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Bucket {
@@ -22,6 +34,32 @@ pub struct Bucket {
     #[serde(rename = "ownerIdentity")]
     pub owner_identity: Identity,
     pub arn: String,
+}
+
+impl Bucket {
+    /// Create a new Bucket instance
+    pub fn new(name: String, owner_identity: Identity, arn: String) -> Self {
+        Self {
+            name,
+            owner_identity,
+            arn,
+        }
+    }
+
+    /// Set the name of the bucket
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
+    /// Set the ARN of the bucket
+    pub fn set_arn(&mut self, arn: String) {
+        self.arn = arn;
+    }
+
+    /// Set the owner identity of the bucket
+    pub fn set_owner_identity(&mut self, owner_identity: Identity) {
+        self.owner_identity = owner_identity;
+    }
 }
 
 /// A struct representing the object information
@@ -41,6 +79,64 @@ pub struct Object {
     pub sequencer: String,
 }
 
+impl Object {
+    /// Create a new Object instance
+    pub fn new(
+        key: String,
+        size: Option<i64>,
+        etag: Option<String>,
+        content_type: Option<String>,
+        user_metadata: Option<HashMap<String, String>>,
+        version_id: Option<String>,
+        sequencer: String,
+    ) -> Self {
+        Self {
+            key,
+            size,
+            etag,
+            content_type,
+            user_metadata,
+            version_id,
+            sequencer,
+        }
+    }
+
+    /// Set the key
+    pub fn set_key(&mut self, key: String) {
+        self.key = key;
+    }
+
+    /// Set the size
+    pub fn set_size(&mut self, size: Option<i64>) {
+        self.size = size;
+    }
+
+    /// Set the etag
+    pub fn set_etag(&mut self, etag: Option<String>) {
+        self.etag = etag;
+    }
+
+    /// Set the content type
+    pub fn set_content_type(&mut self, content_type: Option<String>) {
+        self.content_type = content_type;
+    }
+
+    /// Set the user metadata
+    pub fn set_user_metadata(&mut self, user_metadata: Option<HashMap<String, String>>) {
+        self.user_metadata = user_metadata;
+    }
+
+    /// Set the version ID
+    pub fn set_version_id(&mut self, version_id: Option<String>) {
+        self.version_id = version_id;
+    }
+
+    /// Set the sequencer
+    pub fn set_sequencer(&mut self, sequencer: String) {
+        self.sequencer = sequencer;
+    }
+}
+
 /// A struct representing the metadata of the event
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Metadata {
@@ -52,6 +148,57 @@ pub struct Metadata {
     pub object: Object,
 }
 
+impl Default for Metadata {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Metadata {
+    /// Create a new Metadata instance with default values
+    pub fn new() -> Self {
+        Self {
+            schema_version: "1.0".to_string(),
+            configuration_id: "default".to_string(),
+            bucket: Bucket::new(
+                "default".to_string(),
+                Identity::new("default".to_string()),
+                "arn:aws:s3:::default".to_string(),
+            ),
+            object: Object::new("default".to_string(), None, None, None, None, None, "default".to_string()),
+        }
+    }
+
+    /// Create a new Metadata instance
+    pub fn create(schema_version: String, configuration_id: String, bucket: Bucket, object: Object) -> Self {
+        Self {
+            schema_version,
+            configuration_id,
+            bucket,
+            object,
+        }
+    }
+
+    /// Set the schema version
+    pub fn set_schema_version(&mut self, schema_version: String) {
+        self.schema_version = schema_version;
+    }
+
+    /// Set the configuration ID
+    pub fn set_configuration_id(&mut self, configuration_id: String) {
+        self.configuration_id = configuration_id;
+    }
+
+    /// Set the bucket
+    pub fn set_bucket(&mut self, bucket: Bucket) {
+        self.bucket = bucket;
+    }
+
+    /// Set the object
+    pub fn set_object(&mut self, object: Object) {
+        self.object = object;
+    }
+}
+
 /// A struct representing the source of the event
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Source {
@@ -59,6 +206,28 @@ pub struct Source {
     pub port: String,
     #[serde(rename = "userAgent")]
     pub user_agent: String,
+}
+
+impl Source {
+    /// Create a new Source instance
+    pub fn new(host: String, port: String, user_agent: String) -> Self {
+        Self { host, port, user_agent }
+    }
+
+    /// Set the host
+    pub fn set_host(&mut self, host: String) {
+        self.host = host;
+    }
+
+    /// Set the port
+    pub fn set_port(&mut self, port: String) {
+        self.port = port;
+    }
+
+    /// Set the user agent
+    pub fn set_user_agent(&mut self, user_agent: String) {
+        self.user_agent = user_agent;
+    }
 }
 
 /// Builder for creating an Event.

@@ -147,6 +147,7 @@ pub fn reduce_read_quorum_errs(
 
 // 根据写quorum验证错误数量
 // 返回最大错误数量的下标，或QuorumError
+#[tracing::instrument(level = "info", skip_all)]
 pub fn reduce_write_quorum_errs(
     errs: &[Option<Error>],
     ignored_errs: &[Box<dyn CheckErrorFn>],

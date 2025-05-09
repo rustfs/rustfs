@@ -1,5 +1,5 @@
 [observability]
-endpoint = "http://otel-collector:4317" # Default is "http://localhost:4317" if not specified
+endpoint = "http://localhost:4317" # Default is "http://localhost:4317" if not specified
 use_stdout = false # Output with stdout, true output, false no output
 sample_ratio = 2.0
 meter_interval = 30

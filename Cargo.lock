@@ -185,12 +185,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "common",
  "datafusion",
  "ecstore",
  "futures",
  "futures-core",
  "http",
  "object_store",
+ "pin-project-lite",
  "s3s",
  "snafu",
  "tokio",
@@ -711,9 +713,9 @@ dependencies = [
 
 [[package]]
 name = "axum"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de45108900e1f9b9242f7f2e254aa3e2c029c921c258fe9e6b4217eeebd54288"
+checksum = "021e862c184ae977658b36c4500f7feac3221ca5da43e3f25bd04ab6c79a29b5"
 dependencies = [
  "axum-core",
  "bytes",
@@ -799,7 +801,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pin-project-lite",
- "rustls 0.23.26",
+ "rustls 0.23.27",
  "rustls-pemfile",
  "rustls-pki-types",
  "tokio",
@@ -1204,9 +1206,9 @@ dependencies = [
 
 [[package]]
 name = "chrono"
-version = "0.4.40"
+version = "0.4.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a7964611d71df112cb1730f2ee67324fcf4d0fc6606acbbe9bfe06df124637c"
+checksum = "c469d952047f47f91b68d1cba3f10d63c11d73e4636f24f08daf0278abf01c4d"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
@@ -1430,7 +1432,7 @@ dependencies = [
  "lazy_static",
  "scopeguard",
  "tokio",
- "tonic 0.13.0",
+ "tonic 0.13.1",
  "tracing-error",
 ]
 
@@ -3061,7 +3063,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tonic 0.13.0",
+ "tonic 0.13.1",
  "tower 0.5.2",
  "url",
 ]
@@ -3091,7 +3093,7 @@ dependencies = [
  "madmin",
  "md-5",
  "netif",
- "nix",
+ "nix 0.30.1",
  "num",
  "num_cpus",
  "path-absolutize",
@@ -3105,6 +3107,7 @@ dependencies = [
  "reqwest",
  "rmp",
  "rmp-serde",
+ "rustfs-config",
  "s3s",
  "s3s-policy",
  "serde",
@@ -3119,7 +3122,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tonic 0.13.0",
+ "tonic 0.13.1",
  "tower 0.5.2",
  "tracing",
  "tracing-error",
@@ -4129,7 +4132,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "rustls 0.23.26",
+ "rustls 0.23.27",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.2",
@@ -4780,14 +4783,14 @@ dependencies = [
 
 [[package]]
 name = "libsystemd"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b85fe9dc49de659d05829fdf72b5770c0a5952d1055c34a39f6d4e932bce175d"
+checksum = "19c97a761fc86953c5b885422b22c891dbf5bcb9dcc99d0110d6ce4c052759f0"
 dependencies = [
  "hmac 0.12.1",
  "libc",
  "log",
- "nix",
+ "nix 0.29.0",
  "nom 8.0.0",
  "once_cell",
  "serde",
@@ -4847,13 +4850,13 @@ checksum = "23fb14cb19457329c82206317a5663005a4d404783dc74f4252769b0d5f42856"
 
 [[package]]
 name = "local-ip-address"
-version = "0.6.3"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3669cf5561f8d27e8fc84cc15e58350e70f557d4d65f70e3154e54cd2f8e1782"
+checksum = "656b3b27f8893f7bbf9485148ff9a65f019e3f33bd5cdc87c83cab16b3fd9ec8"
 dependencies = [
  "libc",
  "neli",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "windows-sys 0.59.0",
 ]
 
@@ -4870,7 +4873,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tonic 0.13.0",
+ "tonic 0.13.1",
  "tracing",
  "tracing-error",
  "url",
@@ -5223,6 +5226,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.9.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -6587,7 +6602,7 @@ dependencies = [
  "prost-build",
  "protobuf",
  "tokio",
- "tonic 0.13.0",
+ "tonic 0.13.1",
  "tonic-build",
  "tower 0.5.2",
 ]
@@ -6641,7 +6656,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash 2.1.1",
- "rustls 0.23.26",
+ "rustls 0.23.27",
  "socket2",
  "thiserror 2.0.12",
  "tokio",
@@ -6660,7 +6675,7 @@ dependencies = [
  "rand 0.9.1",
  "ring",
  "rustc-hash 2.1.1",
- "rustls 0.23.26",
+ "rustls 0.23.27",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.12",
@@ -6986,7 +7001,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.26",
+ "rustls 0.23.27",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",
@@ -7143,9 +7158,9 @@ dependencies = [
 
 [[package]]
 name = "rust-embed"
-version = "8.7.0"
+version = "8.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5fbc0ee50fcb99af7cebb442e5df7b5b45e9460ffa3f8f549cd26b862bec49d"
+checksum = "60e425e204264b144d4c929d126d0de524b40a961686414bab5040f7465c71be"
 dependencies = [
  "rust-embed-impl",
  "rust-embed-utils",
@@ -7244,7 +7259,6 @@ dependencies = [
  "iam",
  "lazy_static",
  "libsystemd",
- "local-ip-address",
  "lock",
  "madmin",
  "matchit",
@@ -7259,29 +7273,40 @@ dependencies = [
  "query",
  "rmp-serde",
  "rust-embed",
+ "rustfs-config",
  "rustfs-event-notifier",
  "rustfs-obs",
- "rustls 0.23.26",
- "rustls-pemfile",
- "rustls-pki-types",
+ "rustfs-utils",
+ "rustls 0.23.27",
  "s3s",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "shadow-rs",
+ "socket2",
  "tikv-jemallocator",
  "time",
  "tokio",
  "tokio-rustls 0.26.2",
  "tokio-stream",
  "tokio-util",
- "tonic 0.13.0",
+ "tonic 0.13.1",
  "tonic-build",
  "tower 0.5.2",
  "tower-http",
  "tracing",
  "transform-stream",
  "uuid",
+]
+
+[[package]]
+name = "rustfs-config"
+version = "0.0.1"
+dependencies = [
+ "config",
+ "const-str",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7359,6 +7384,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-utils"
+version = "0.0.1"
+dependencies = [
+ "local-ip-address",
+ "rustfs-config",
+ "rustls 0.23.27",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tracing",
+]
+
+[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7400,16 +7437,16 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.26"
+version = "0.23.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df51b5869f3a441595eac5e8ff14d486ff285f7b8c0df8770e49c3b56351f0f0"
+checksum = "730944ca083c1c233a75c09f199e973ca499344a2b7ba9e755c457e86fb4a321"
 dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.1",
+ "rustls-webpki 0.103.2",
  "subtle",
  "zeroize",
 ]
@@ -7458,9 +7495,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.1"
+version = "0.103.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fef8b8769aaccf73098557a87cd1816b4f9c7c16811c9c77142aa695c16f2c03"
+checksum = "7149975849f1abb3832b246010ef62ccc80d3a76169517ada7188252b9cfb437"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -8596,9 +8633,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.44.2"
+version = "1.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6b88822cbe49de4185e3a4cbf8321dd487cf5fe0c5c65695fef6346371e9c48"
+checksum = "2513ca694ef9ede0fb23fe71a4ee4107cb102b9dc1930f6d0fd77aae068ae165"
 dependencies = [
  "backtrace",
  "bytes",
@@ -8641,7 +8678,7 @@ version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e727b36a1a0e8b74c376ac2211e40c2c8af09fb4013c60d910495810f008e9b"
 dependencies = [
- "rustls 0.23.26",
+ "rustls 0.23.27",
  "tokio",
 ]
 
@@ -8658,9 +8695,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.14"
+version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b9590b93e6fcc1739458317cccd391ad3955e2bde8913edf6f95f9e65a8f034"
+checksum = "66a539a9ad6d5d281510d5bd368c973d636c02dbf8a67300bfb6b950696ad7df"
 dependencies = [
  "bytes",
  "futures-core",
@@ -8755,9 +8792,9 @@ dependencies = [
 
 [[package]]
 name = "tonic"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85839f0b32fd242bb3209262371d07feda6d780d16ee9d2bc88581b89da1549b"
+checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
 dependencies = [
  "async-trait",
  "axum",
@@ -8785,9 +8822,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d85f0383fadd15609306383a90e85eaed44169f931a5d2be1b42c76ceff1825e"
+checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -10252,7 +10289,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "hex",
- "nix",
+ "nix 0.29.0",
  "ordered-stream",
  "rand 0.8.5",
  "serde",
@@ -10283,7 +10320,7 @@ dependencies = [
  "futures-core",
  "futures-lite",
  "hex",
- "nix",
+ "nix 0.29.0",
  "ordered-stream",
  "serde",
  "serde_repr",

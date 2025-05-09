@@ -3,13 +3,13 @@ use tokio::sync::{Mutex, Notify};
 use tracing::info;
 
 pub struct Workers {
-    available: Mutex<usize>, // 可用的工作槽
-    notify: Notify,          // 用于通知等待的任务
-    limit: usize,            // 最大并发工作数
+    available: Mutex<usize>, // Available working slots
+    notify: Notify,          // Used to notify waiting tasks
+    limit: usize,            // Maximum number of concurrent jobs
 }
 
 impl Workers {
-    // 创建 Workers 对象，允许最多 n 个作业并发执行
+    // Create a Workers object that allows up to n jobs to execute concurrently
     pub fn new(n: usize) -> Result<Arc<Workers>, &'static str> {
         if n == 0 {
             return Err("n must be > 0");
@@ -22,7 +22,7 @@ impl Workers {
         }))
     }
 
-    // 让一个作业获得执行的机会
+    // Give a job a chance to be executed
     pub async fn take(&self) {
         loop {
             let mut available = self.available.lock().await;
@@ -37,15 +37,15 @@ impl Workers {
         }
     }
 
-    // 让一个作业释放其机会
+    // Release a job's slot
     pub async fn give(&self) {
         let mut available = self.available.lock().await;
         info!("worker give, {}", *available);
-        *available += 1; // 增加可用槽
-        self.notify.notify_one(); // 通知一个等待的任务
+        *available += 1; // Increase available slots
+        self.notify.notify_one(); // Notify a waiting task
     }
 
-    // 等待所有并发作业完成
+    // Wait for all concurrent jobs to complete
     pub async fn wait(&self) {
         loop {
             {
@@ -54,7 +54,7 @@ impl Workers {
                     break;
                 }
             }
-            // 等待直到所有槽都被释放
+            // Wait until all slots are freed
             self.notify.notified().await;
         }
         info!("worker wait end");

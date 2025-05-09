@@ -129,7 +129,7 @@ impl Default for ServiceStateManager {
     }
 }
 
-// 使用示例
+// Example of use
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,18 +138,18 @@ mod tests {
     fn test_service_state_manager() {
         let manager = ServiceStateManager::new();
 
-        // 初始状态应该是 Starting
+        // The initial state should be Starting
         assert_eq!(manager.current_state(), ServiceState::Starting);
 
-        // 更新状态到 Ready
+        // Update the status to Ready
         manager.update(ServiceState::Ready);
         assert_eq!(manager.current_state(), ServiceState::Ready);
 
-        // 更新状态到 Stopping
+        // Update the status to Stopping
         manager.update(ServiceState::Stopping);
         assert_eq!(manager.current_state(), ServiceState::Stopping);
 
-        // 更新状态到 Stopped
+        // Update the status to Stopped
         manager.update(ServiceState::Stopped);
         assert_eq!(manager.current_state(), ServiceState::Stopped);
     }

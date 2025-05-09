@@ -7,11 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 
 /// Handles incoming events from the producer.
 ///
 /// This function is responsible for receiving events from the producer and sending them to the appropriate adapters.
 /// It also handles the shutdown process and saves any pending logs to the event store.
+#[instrument(skip_all)]
 pub async fn event_bus(
     mut rx: mpsc::Receiver<Event>,
     adapters: Vec<Arc<dyn ChannelAdapter>>,

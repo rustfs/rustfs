@@ -1,7 +1,0 @@
-[target.x86_64-unknown-linux-gnu]
-rustflags = [
-    "-C", "link-arg=-fuse-ld=bfd"
-]
-
-[target.x86_64-unknown-linux-musl]
-linker = "x86_64-linux-musl-gcc"

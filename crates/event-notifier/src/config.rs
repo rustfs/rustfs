@@ -162,7 +162,7 @@ impl NotifierConfig {
     }
 }
 
-const DEFAULT_CONFIG_FILE: &str = "obs";
+const DEFAULT_CONFIG_FILE: &str = "event";
 
 /// Provide temporary directories as default storage paths
 fn default_store_path() -> String {

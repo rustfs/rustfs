@@ -38,7 +38,9 @@ use crate::set_disk::{
     CHECK_PART_VOLUME_NOT_FOUND,
 };
 use crate::store_api::{BitrotAlgorithm, StorageAPI};
-use crate::utils::fs::{access, lstat, remove, remove_all, rename, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY};
+use crate::utils::fs::{
+    access, lstat, remove, remove_all, remove_all_std, remove_std, rename, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY,
+};
 use crate::utils::os::get_info;
 use crate::utils::path::{
     self, clean, decode_dir_object, encode_dir_object, has_suffix, path_join, path_join_buf, GLOBAL_DIR_SUFFIX,
@@ -259,7 +261,7 @@ impl LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn check_format_json(&self) -> Result<Metadata> {
-        let md = fs::metadata(&self.format_path).await.map_err(|e| match e.kind() {
+        let md = std::fs::metadata(&self.format_path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => DiskError::DiskNotFound,
             ErrorKind::PermissionDenied => DiskError::FileAccessDenied,
             _ => {
@@ -315,9 +317,9 @@ impl LocalDisk {
     #[allow(unused_variables)]
     pub async fn move_to_trash(&self, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
         if recursive {
-            remove_all(delete_path).await?;
+            remove_all_std(delete_path)?;
         } else {
-            remove(delete_path).await?;
+            remove_std(delete_path)?;
         }
 
         return Ok(());
@@ -365,7 +367,7 @@ impl LocalDisk {
         Ok(())
     }
 
-    // #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn delete_file(
         &self,
         base_path: &PathBuf,
@@ -688,6 +690,7 @@ impl LocalDisk {
     }
 
     // write_all_private with check_path_length
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn write_all_private(
         &self,
         volume: &str,
@@ -1213,7 +1216,7 @@ impl DiskAPI for LocalDisk {
         Ok(data)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
         self.write_all_public(volume, path, data).await
     }
@@ -1721,7 +1724,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -1732,7 +1735,7 @@ impl DiskAPI for LocalDisk {
     ) -> Result<RenameDataResp> {
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         if !skip_access_checks(src_volume) {
-            if let Err(e) = utils::fs::access(&src_volume_dir).await {
+            if let Err(e) = utils::fs::access_std(&src_volume_dir) {
                 info!("access checks failed, src_volume_dir: {:?}, err: {}", src_volume_dir, e.to_string());
                 return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
             }
@@ -1740,7 +1743,7 @@ impl DiskAPI for LocalDisk {
 
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
         if !skip_access_checks(dst_volume) {
-            if let Err(e) = utils::fs::access(&dst_volume_dir).await {
+            if let Err(e) = utils::fs::access_std(&dst_volume_dir) {
                 info!("access checks failed, dst_volume_dir: {:?}, err: {}", dst_volume_dir, e.to_string());
                 return Err(convert_access_error(e, DiskError::VolumeAccessDenied));
             }
@@ -1913,7 +1916,7 @@ impl DiskAPI for LocalDisk {
 
         if let Some(src_file_path_parent) = src_file_path.parent() {
             if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
-                let _ = utils::fs::remove(src_file_path_parent).await;
+                let _ = utils::fs::remove_std(src_file_path_parent);
             } else {
                 let _ = self
                     .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)

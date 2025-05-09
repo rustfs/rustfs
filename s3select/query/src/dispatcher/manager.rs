@@ -49,7 +49,7 @@ lazy_static! {
 
 #[derive(Clone)]
 pub struct SimpleQueryDispatcher {
-    input: SelectObjectContentInput,
+    input: Arc<SelectObjectContentInput>,
     // client for default tenant
     _default_table_provider: TableHandleProviderRef,
     session_factory: Arc<SessionCtxFactory>,
@@ -164,7 +164,9 @@ impl SimpleQueryDispatcher {
                             .map(|e| e.as_bytes().first().copied().unwrap_or_default()),
                     );
                 if let Some(delimiter) = csv.field_delimiter.as_ref() {
-                    file_format = file_format.with_delimiter(delimiter.as_bytes().first().copied().unwrap_or_default());
+                    if delimiter.len() == 1 {
+                        file_format = file_format.with_delimiter(delimiter.as_bytes()[0]);
+                    }
                 }
                 // TODO waiting for processing @junxiang Mu
                 // if csv.file_header_info.is_some() {}
@@ -272,7 +274,7 @@ impl Stream for TrackedRecordBatchStream {
 
 #[derive(Default, Clone)]
 pub struct SimpleQueryDispatcherBuilder {
-    input: Option<SelectObjectContentInput>,
+    input: Option<Arc<SelectObjectContentInput>>,
     default_table_provider: Option<TableHandleProviderRef>,
     session_factory: Option<Arc<SessionCtxFactory>>,
     parser: Option<Arc<dyn Parser + Send + Sync>>,
@@ -283,7 +285,7 @@ pub struct SimpleQueryDispatcherBuilder {
 }
 
 impl SimpleQueryDispatcherBuilder {
-    pub fn with_input(mut self, input: SelectObjectContentInput) -> Self {
+    pub fn with_input(mut self, input: Arc<SelectObjectContentInput>) -> Self {
         self.input = Some(input);
         self
     }

@@ -2,6 +2,9 @@ pub mod error;
 pub mod globals;
 pub mod last_minute;
 
+// is ','
+pub static DEFAULT_DELIMITER: u8 = 44;
+
 /// Defers evaluation of a block of code until the end of the scope.
 #[macro_export]
 macro_rules! defer {

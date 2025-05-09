@@ -20,6 +20,7 @@ pub(crate) struct ReqInfo {
     pub version_id: Option<String>,
 }
 
+/// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
 
