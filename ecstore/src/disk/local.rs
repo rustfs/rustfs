@@ -39,7 +39,7 @@ use crate::set_disk::{
 };
 use crate::store_api::{BitrotAlgorithm, StorageAPI};
 use crate::utils::fs::{
-    access, lstat, remove, remove_all, remove_all_std, remove_std, rename, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY,
+    access, lstat, lstat_std, remove, remove_all, remove_all_std, remove_std, rename, O_APPEND, O_CREATE, O_RDONLY, O_WRONLY,
 };
 use crate::utils::os::get_info;
 use crate::utils::path::{
@@ -1337,10 +1337,10 @@ impl DiskAPI for LocalDisk {
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
-            utils::fs::access(&src_volume_dir).await.map_err(map_err_not_exists)?
+            utils::fs::access_std(&src_volume_dir).map_err(map_err_not_exists)?
         }
         if !skip_access_checks(dst_volume) {
-            utils::fs::access(&dst_volume_dir).await.map_err(map_err_not_exists)?
+            utils::fs::access_std(&dst_volume_dir).map_err(map_err_not_exists)?
         }
 
         let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
@@ -1363,7 +1363,7 @@ impl DiskAPI for LocalDisk {
         check_path_length(dst_file_path.to_string_lossy().as_ref())?;
 
         if src_is_dir {
-            let meta_op = match lstat(&src_file_path).await {
+            let meta_op = match lstat_std(&src_file_path) {
                 Ok(meta) => Some(meta),
                 Err(e) => {
                     if is_sys_err_io(&e) {
@@ -1384,7 +1384,7 @@ impl DiskAPI for LocalDisk {
                 }
             }
 
-            if let Err(e) = utils::fs::remove(&dst_file_path).await {
+            if let Err(e) = utils::fs::remove_std(&dst_file_path) {
                 if is_sys_err_not_empty(&e) || is_sys_err_not_dir(&e) {
                     warn!("rename_part remove dst failed {:?} err {:?}", &dst_file_path, e);
                     return Err(Error::new(DiskError::FileAccessDenied));
