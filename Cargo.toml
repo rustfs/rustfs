@@ -1,23 +1,24 @@
 [workspace]
 members = [
-    "appauth", # Application authentication and authorization
-    "cli/rustfs-gui", # Graphical user interface client
-    "common/common", # Shared utilities and data structures
-    "common/lock", # Distributed locking implementation
-    "common/protos", # Protocol buffer definitions
-    "common/workers", # Worker thread pools and task scheduling
-    "crates/config", # Configuration management
+    "appauth",               # Application authentication and authorization
+    "cli/rustfs-gui",        # Graphical user interface client
+    "common/common",         # Shared utilities and data structures
+    "common/lock",           # Distributed locking implementation
+    "common/protos",         # Protocol buffer definitions
+    "common/workers",        # Worker thread pools and task scheduling
+    "crates/config",         # Configuration management
     "crates/event-notifier", # Event notification system
-    "crates/obs", # Observability utilities
-    "crates/utils", # Utility functions and helpers
-    "crypto", # Cryptography and security features
-    "ecstore", # Erasure coding storage implementation
-    "e2e_test", # End-to-end test suite
-    "iam", # Identity and Access Management
-    "madmin", # Management dashboard and admin API interface
-    "rustfs", # Core file system implementation
-    "s3select/api", # S3 Select API interface
-    "s3select/query", # S3 Select query engine
+    "crates/obs",            # Observability utilities
+    "crates/utils",          # Utility functions and helpers
+    "crypto",                # Cryptography and security features
+    "ecstore",               # Erasure coding storage implementation
+    "e2e_test",              # End-to-end test suite
+    "iam",                   # Identity and Access Management
+    "madmin",                # Management dashboard and admin API interface
+    "rustfs",                # Core file system implementation
+    "s3select/api",          # S3 Select API interface
+    "s3select/query",        # S3 Select query engine
+    "crates/zip",
 ]
 resolver = "2"
 
@@ -47,11 +48,13 @@ policy = { path = "./policy", version = "0.0.1" }
 protos = { path = "./common/protos", version = "0.0.1" }
 query = { path = "./s3select/query", version = "0.0.1" }
 rustfs = { path = "./rustfs", version = "0.0.1" }
+zip = { path = "./crates/zip", version = "0.0.1" }
 rustfs-config = { path = "./crates/config", version = "0.0.1" }
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
 rustfs-utils = { path = "crates/utils", version = "0.0.1" }
 workers = { path = "./common/workers", version = "0.0.1" }
+tokio-tar = "0.3.1"
 atoi = "2.0.0"
 async-recursion = "1.1.1"
 async-trait = "0.1.88"
@@ -113,7 +116,9 @@ opentelemetry-appender-tracing = { version = "0.29.1", features = [
 opentelemetry_sdk = { version = "0.29.0" }
 opentelemetry-stdout = { version = "0.29.0" }
 opentelemetry-otlp = { version = "0.29.0" }
-opentelemetry-semantic-conventions = { version = "0.29.0", features = ["semconv_experimental"] }
+opentelemetry-semantic-conventions = { version = "0.29.0", features = [
+    "semconv_experimental",
+] }
 parking_lot = "0.12.3"
 pin-project-lite = "0.2.16"
 # pin-utils = "0.1.0"
@@ -206,8 +211,8 @@ inherits = "dev"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"  # Optional, remove the panic expansion code
-strip = true     # strip symbol information to reduce binary size
+panic = "abort"   # Optional, remove the panic expansion code
+strip = true      # strip symbol information to reduce binary size
 
 [profile.production]
 inherits = "release"

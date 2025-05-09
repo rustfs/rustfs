@@ -9,7 +9,6 @@ use crate::{
 };
 use common::error::{Error, Result};
 use tokio::fs;
-use tracing::info;
 
 use super::error::{os_err_to_file_err, os_is_exist, DiskError};
 
