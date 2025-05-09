@@ -39,6 +39,7 @@ use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
+use ecstore::store_api::RESERVED_METADATA_PREFIX_LOWER;
 use ecstore::utils::path::path_join_buf;
 use ecstore::utils::xml;
 use ecstore::xhttp;
@@ -60,9 +61,12 @@ use s3s::S3ErrorCode;
 use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
@@ -1954,6 +1958,109 @@ impl S3 for FS {
 
         Ok(S3Response::new(SelectObjectContentOutput {
             payload: Some(SelectObjectContentEventStream::new(stream)),
+        }))
+    }
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        let GetObjectLegalHoldInput {
+            bucket, key, version_id, ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let _ = store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
+
+        // check object lock
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
+            .await
+            .map_err(to_s3_error)?;
+
+        let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
+            error!("get_object_info failed, {}", e.to_string());
+            s3_error!(InternalError, "{}", e.to_string())
+        })?;
+
+        let legal_hold = if let Some(ud) = object_info.user_defined {
+            ud.get("x-amz-object-lock-legal-hold").map(|v| v.as_str().to_string())
+        } else {
+            None
+        };
+
+        if legal_hold.is_none() {
+            return Err(s3_error!(InvalidRequest, "Object does not have legal hold"));
+        }
+
+        Ok(S3Response::new(GetObjectLegalHoldOutput {
+            legal_hold: Some(ObjectLockLegalHold {
+                status: Some(ObjectLockLegalHoldStatus::from(legal_hold.unwrap_or_default())),
+            }),
+        }))
+    }
+
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        let PutObjectLegalHoldInput {
+            bucket,
+            key,
+            legal_hold,
+            version_id,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let _ = store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(to_s3_error)?;
+
+        // check object lock
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
+            .await
+            .map_err(to_s3_error)?;
+
+        let mut eval_metadata = HashMap::new();
+        let legal_hold = legal_hold
+            .map(|v| v.status.map(|v| v.as_str().to_string()))
+            .unwrap_or_default()
+            .unwrap_or("OFF".to_string());
+
+        let now = OffsetDateTime::now_utc();
+        eval_metadata.insert("x-amz-object-lock-legal-hold".to_string(), legal_hold);
+        eval_metadata.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
+            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+        );
+
+        let popts = ObjectOptions {
+            mod_time: opts.mod_time,
+            version_id: opts.version_id,
+            eval_metadata: Some(eval_metadata),
+            ..Default::default()
+        };
+
+        store.put_object_metadata(&bucket, &key, &popts).await.map_err(|e| {
+            error!("get_object_info failed, {}", e.to_string());
+            s3_error!(InternalError, "{}", e.to_string())
+        })?;
+
+        Ok(S3Response::new(PutObjectLegalHoldOutput {
+            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         }))
     }
 }
