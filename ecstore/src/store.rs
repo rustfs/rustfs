@@ -2560,6 +2560,7 @@ fn check_abort_multipart_args(bucket: &str, object: &str, upload_id: &str) -> Re
     check_multipart_object_args(bucket, object, upload_id)
 }
 
+#[tracing::instrument(level = "debug")]
 fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
         return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));

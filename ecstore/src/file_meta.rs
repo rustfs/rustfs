@@ -58,10 +58,12 @@ impl FileMeta {
     }
 
     // isXL2V1Format
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn is_xl2_v1_format(buf: &[u8]) -> bool {
         !matches!(Self::check_xl2_v1(buf), Err(_e))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn load(buf: &[u8]) -> Result<FileMeta> {
         let mut xl = FileMeta::default();
         xl.unmarshal_msg(buf)?;
@@ -245,7 +247,7 @@ impl FileMeta {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut wr = Vec::new();
 
@@ -363,6 +365,7 @@ impl FileMeta {
     }
 
     // shard_data_dir_count 查询 vid下data_dir的数量
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn shard_data_dir_count(&self, vid: &Option<Uuid>, data_dir: &Option<Uuid>) -> usize {
         self.versions
             .iter()
@@ -434,6 +437,7 @@ impl FileMeta {
     }
 
     // 添加版本
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn add_version(&mut self, fi: FileInfo) -> Result<()> {
         let vid = fi.version_id;
 

@@ -62,6 +62,7 @@ use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
@@ -141,6 +142,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Copy an object from one location to another
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let CopyObjectInput {
@@ -227,6 +229,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Delete a bucket
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
@@ -249,6 +252,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
+    /// Delete an object
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput {
@@ -308,6 +312,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Delete multiple objects
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         // info!("delete_objects args {:?}", req.input);
@@ -367,6 +372,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Get bucket location
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
         // mc get  1
@@ -385,6 +391,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Get bucket notification
     #[tracing::instrument(
         level = "debug",
         skip(self, req),
@@ -1890,14 +1897,14 @@ impl S3 for FS {
     ) -> S3Result<S3Response<SelectObjectContentOutput>> {
         info!("handle select_object_content");
 
-        let input = req.input;
+        let input = Arc::new(req.input);
         info!("{:?}", input);
 
         let db = make_rustfsms(input.clone(), false).await.map_err(|e| {
             error!("make db failed, {}", e.to_string());
             s3_error!(InternalError, "{}", e.to_string())
         })?;
-        let query = Query::new(Context { input: input.clone() }, input.request.expression);
+        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
         let result = db
             .execute(&query)
             .await

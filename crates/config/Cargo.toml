@@ -1,0 +1,17 @@
+[package]
+name = "rustfs-config"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+config = { workspace = true }
+const-str = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+
+[lints]
+workspace = true

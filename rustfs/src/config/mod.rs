@@ -1,39 +1,7 @@
 use clap::Parser;
 use const_str::concat;
-use ecstore::global::DEFAULT_PORT;
 use std::string::ToString;
 shadow_rs::shadow!(build);
-
-/// Default Access Key
-/// Default value: rustfsadmin
-/// Environment variable: RUSTFS_ACCESS_KEY
-/// Command line argument: --access-key
-/// Example: RUSTFS_ACCESS_KEY=rustfsadmin
-/// Example: --access-key rustfsadmin
-pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
-/// Default Secret Key
-/// Default value: rustfsadmin
-/// Environment variable: RUSTFS_SECRET_KEY
-/// Command line argument: --secret-key
-/// Example: RUSTFS_SECRET_KEY=rustfsadmin
-/// Example: --secret-key rustfsadmin
-pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
-/// Default configuration file for observability
-/// Default value: config/obs.toml
-/// Environment variable: RUSTFS_OBS_CONFIG
-/// Command line argument: --obs-config
-/// Example: RUSTFS_OBS_CONFIG=config/obs.toml
-/// Example: --obs-config config/obs.toml
-/// Example: --obs-config /etc/rustfs/obs.toml
-pub const DEFAULT_OBS_CONFIG: &str = "config/obs.toml";
-
-/// Default TLS key for rustfs
-/// This is the default key for TLS.
-pub(crate) const RUSTFS_TLS_KEY: &str = "rustfs_key.pem";
-
-/// Default TLS cert for rustfs
-/// This is the default cert for TLS.
-pub(crate) const RUSTFS_TLS_CERT: &str = "rustfs_cert.pem";
 
 #[allow(clippy::const_is_empty)]
 const SHORT_VERSION: &str = {
@@ -67,7 +35,7 @@ pub struct Opt {
     pub volumes: Vec<String>,
 
     /// bind to a specific ADDRESS:PORT, ADDRESS can be an IP or hostname
-    #[arg(long, default_value_t = format!("0.0.0.0:{}", DEFAULT_PORT), env = "RUSTFS_ADDRESS")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_ADDRESS.to_string(), env = "RUSTFS_ADDRESS")]
     pub address: String,
 
     /// Domain name used for virtual-hosted-style requests.
@@ -75,17 +43,19 @@ pub struct Opt {
     pub server_domains: Vec<String>,
 
     /// Access key used for authentication.
-    #[arg(long, default_value_t = DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_ACCESS_KEY.to_string(), env = "RUSTFS_ACCESS_KEY")]
     pub access_key: String,
 
     /// Secret key used for authentication.
-    #[arg(long, default_value_t = DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_SECRET_KEY.to_string(), env = "RUSTFS_SECRET_KEY")]
     pub secret_key: String,
 
+    /// Enable console server
     #[arg(long, default_value_t = false, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
-    #[arg(long, default_value_t = format!("127.0.0.1:{}", 9002), env = "RUSTFS_CONSOLE_ADDRESS")]
+    /// Console server bind address
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_CONSOLE_ADDRESS.to_string(), env = "RUSTFS_CONSOLE_ADDRESS")]
     pub console_address: String,
 
     /// rustfs endpoint for console
@@ -94,7 +64,7 @@ pub struct Opt {
 
     /// Observability configuration file
     /// Default value: config/obs.toml
-    #[arg(long, default_value_t = DEFAULT_OBS_CONFIG.to_string(), env = "RUSTFS_OBS_CONFIG")]
+    #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_CONFIG.to_string(), env = "RUSTFS_OBS_CONFIG")]
     pub obs_config: String,
 
     /// tls path for rustfs api and console.

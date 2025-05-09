@@ -534,6 +534,7 @@ impl Writer for BitrotFileWriter {
         self
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     async fn write(&mut self, buf: Bytes) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
