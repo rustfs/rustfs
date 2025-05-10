@@ -45,6 +45,8 @@ jobs:
         with:
           cache-shared-key: rustfs.${{ matrix.variant.profile }}.${{ matrix.variant.target }}.${{ matrix.variant.glibc }}
           run-os: ${{ matrix.os }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download and Extract Static Assets
         run: |
