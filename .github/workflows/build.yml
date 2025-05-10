@@ -17,7 +17,7 @@ jobs:
       matrix:
         os: [ ubuntu-latest, macos-latest ]
         variant:
-          #- { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
+          - { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
           - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
           - { profile: release, target: aarch64-apple-darwin, glibc: "default" }
           #- { profile: release, target: aarch64-unknown-linux-gnu, glibc: "default" }
@@ -35,7 +35,7 @@ jobs:
             variant: { profile: release, target: aarch64-unknown-linux-gnu, glibc: "default" }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - name: Set up authentication
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -101,17 +101,35 @@ jobs:
             ${{ steps.package.outputs.artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.latest.zip
 
   build-rustfs-gui:
-    runs-on: ubuntu-latest
+    runs-on: ${ matrix.os }
     needs: build-rustfs
 
     strategy:
       matrix:
+        os: [ ubuntu-latest, macos-latest ]
         variant:
           - { profile: release, target: x86_64-unknown-linux-gnu }
+          - { profile: release, target: x86_64-unknown-linux-musl }
+          - { profile: release, target: aarch64-apple-darwin }
           # - { profile: release, target: x86_64-apple-darwin }
+          # - { profile: release, target: aarch64-unknown-linux-gnu }
+          # - { profile: release, target: aarch64-unknown-linux-musl }
+        exclude:
+          - os: ubuntu-latest
+            variant: { profile: release, target: aarch64-apple-darwin }
+          - os: ubuntu-latest
+            variant: { profile: release, target: x86_64-apple-darwin }
+          - os: macos-latest
+            variant: { profile: release, target: x86_64-unknown-linux-gnu }
+          - os: macos-latest
+            variant: { profile: release, target: x86_64-unknown-linux-musl }
+          - os: macos-latest
+            variant: { profile: release, target: aarch64-unknown-linux-musl }
+          - os: macos-latest
+            variant: { profile: release, target: aarch64-unknown-linux-gnu }
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -121,24 +139,10 @@ jobs:
           ls -R
           unzip -o -j "rustfs-${{ matrix.variant.profile }}-${{ matrix.variant.target }}.zip" -d ./cli/rustfs-gui/embedded-rustfs/
           ls -la cli/rustfs-gui/embedded-rustfs
-      #      - name: Cache dioxus-cli
-      #        uses: actions/cache@v4
-      #        with:
-      #          path: ~/.cargo/bin/dx
-      #          key: ${{ runner.os }}-dioxus-cli-${{ hashFiles('**/Cargo.lock') }}
-      #          restore-keys: |
-      #            ${{ runner.os }}-dioxus-cli-
-      #
-      #      - name: Install dioxus-cli
-      #        run: |
-      #          if [ ! -f ~/.cargo/bin/dx ]; then
-      #            cargo install dioxus-cli
-      #          fi
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: dioxus-cli
       - name: Build and Bundle rustfs-gui
-        id: package
         run: |
           ls -la
 
@@ -148,7 +152,7 @@ jobs:
           ls -la embedded-rustfs
 
           # Configure the linker based on the target
-          case "${{ matrix.target }}" in
+          case "${{ matrix.variant.target }}" in
           "x86_64-unknown-linux-gnu")
           # Default gcc
           export CC_x86_64_unknown_linux_gnu=gcc
@@ -171,8 +175,8 @@ jobs:
           ;;
           esac
           # Validating Environment Variables (for Debugging)
-          echo "CC for ${{ matrix.target }}: $CC_${{ matrix.target }}"
-          echo "Linker for ${{ matrix.target }}: $CARGO_TARGET_${{ matrix.target }}_LINKER"
+          echo "CC for ${{ matrix.variant.target }}: $CC_${{ matrix.variant.target }}"
+          echo "Linker for ${{ matrix.variant.target }}: $CARGO_TARGET_${{ matrix.variant.target }}_LINKER"
 
           if [[ "${{ matrix.variant.target }}" == *"apple-darwin"* ]]; then
             dx bundle --platform macos --package-types "macos" --package-types "dmg" --package-types "ios" --release --profile release --out-dir ../../${release_path}
