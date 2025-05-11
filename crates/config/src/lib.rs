@@ -7,3 +7,5 @@ mod observability;
 
 pub use config::RustFsConfig;
 pub use constants::app::*;
+
+pub use event::config::NotifierConfig;

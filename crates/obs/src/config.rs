@@ -1,6 +1,6 @@
 use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION, USE_STDOUT};
-use config::{Config, Environment, File, FileFormat};
-use serde::Deserialize;
+use config::{Config, File, FileFormat};
+use serde::{Deserialize, Serialize};
 use std::env;
 
 /// OpenTelemetry Configuration
@@ -11,7 +11,7 @@ use std::env;
 /// Add use_stdout for output to stdout
 /// Add logger level for log level
 /// Add local_logging_enabled for local logging enabled
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OtelConfig {
     pub endpoint: String,                    // Endpoint for metric collection
     pub use_stdout: Option<bool>,            // Output to stdout
@@ -24,7 +24,7 @@ pub struct OtelConfig {
     pub local_logging_enabled: Option<bool>, // Local logging enabled
 }
 
-// Helper function: Extract observable configuration from environment variables
+/// Helper function: Extract observable configuration from environment variables
 fn extract_otel_config_from_env() -> OtelConfig {
     OtelConfig {
         endpoint: env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string()),
@@ -63,36 +63,89 @@ fn extract_otel_config_from_env() -> OtelConfig {
     }
 }
 
-impl Default for OtelConfig {
-    fn default() -> Self {
+impl OtelConfig {
+    /// Create a new instance of OtelConfig with default values
+    ///
+    /// # Returns
+    /// A new instance of OtelConfig
+    pub fn new() -> Self {
         extract_otel_config_from_env()
     }
 }
 
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Kafka Sink Configuration - Add batch parameters
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct KafkaSinkConfig {
-    pub enabled: bool,
-    pub bootstrap_servers: String,
+    pub brokers: String,
     pub topic: String,
     pub batch_size: Option<usize>,     // Batch size, default 100
     pub batch_timeout_ms: Option<u64>, // Batch timeout time, default 1000ms
 }
 
+impl KafkaSinkConfig {
+    pub fn new() -> Self {
+        Self {
+            brokers: env::var("RUSTFS__SINKS_0_KAFKA_BROKERS")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "localhost:9092".to_string()),
+            topic: env::var("RUSTFS__SINKS_0_KAFKA_TOPIC")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "default_topic".to_string()),
+            batch_size: Some(100),
+            batch_timeout_ms: Some(1000),
+        }
+    }
+}
+
+impl Default for KafkaSinkConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Webhook Sink Configuration - Add Retry Parameters
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WebhookSinkConfig {
-    pub enabled: bool,
     pub endpoint: String,
     pub auth_token: String,
     pub max_retries: Option<usize>,  // Maximum number of retry times, default 3
     pub retry_delay_ms: Option<u64>, // Retry the delay cardinality, default 100ms
 }
 
+impl WebhookSinkConfig {
+    pub fn new() -> Self {
+        Self {
+            endpoint: env::var("RUSTFS__SINKS_0_WEBHOOK_ENDPOINT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "http://localhost:8080".to_string()),
+            auth_token: env::var("RUSTFS__SINKS_0_WEBHOOK_AUTH_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "default_token".to_string()),
+            max_retries: Some(3),
+            retry_delay_ms: Some(100),
+        }
+    }
+}
+
+impl Default for WebhookSinkConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// File Sink Configuration - Add buffering parameters
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FileSinkConfig {
-    pub enabled: bool,
     pub path: String,
     pub buffer_size: Option<usize>,     // Write buffer size, default 8192
     pub flush_interval_ms: Option<u64>, // Refresh interval time, default 1000ms
@@ -114,13 +167,9 @@ impl FileSinkConfig {
             .unwrap_or("rustfs/rustfs.log")
             .to_string()
     }
-}
-
-impl Default for FileSinkConfig {
-    fn default() -> Self {
-        FileSinkConfig {
-            enabled: true,
-            path: env::var("RUSTFS_SINKS_FILE_PATH")
+    pub fn new() -> Self {
+        Self {
+            path: env::var("RUSTFS__SINKS_0_FILE_PATH")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(Self::get_default_log_path),
@@ -131,35 +180,50 @@ impl Default for FileSinkConfig {
     }
 }
 
+impl Default for FileSinkConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Sink configuration collection
-#[derive(Debug, Deserialize, Clone)]
-pub struct SinkConfig {
-    pub kafka: Option<KafkaSinkConfig>,
-    pub webhook: Option<WebhookSinkConfig>,
-    pub file: Option<FileSinkConfig>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SinkConfig {
+    File(FileSinkConfig),
+    Kafka(KafkaSinkConfig),
+    Webhook(WebhookSinkConfig),
+}
+
+impl SinkConfig {
+    pub fn new() -> Self {
+        Self::File(FileSinkConfig::new())
+    }
 }
 
 impl Default for SinkConfig {
     fn default() -> Self {
-        SinkConfig {
-            kafka: None,
-            webhook: None,
-            file: Some(FileSinkConfig::default()),
-        }
+        Self::new()
     }
 }
 
 ///Logger Configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LoggerConfig {
     pub queue_capacity: Option<usize>,
 }
 
-impl Default for LoggerConfig {
-    fn default() -> Self {
-        LoggerConfig {
+impl LoggerConfig {
+    pub fn new() -> Self {
+        Self {
             queue_capacity: Some(10000),
         }
+    }
+}
+
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -180,7 +244,7 @@ impl Default for LoggerConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub observability: OtelConfig,
-    pub sinks: SinkConfig,
+    pub sinks: Vec<SinkConfig>,
     pub logger: Option<LoggerConfig>,
 }
 
@@ -192,7 +256,7 @@ impl AppConfig {
     pub fn new() -> Self {
         Self {
             observability: OtelConfig::default(),
-            sinks: SinkConfig::default(),
+            sinks: vec![SinkConfig::default()],
             logger: Some(LoggerConfig::default()),
         }
     }
@@ -258,14 +322,6 @@ pub fn load_config(config_dir: Option<String>) -> AppConfig {
     let app_config = Config::builder()
         .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml).required(false))
         .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Yaml).required(false))
-        .add_source(
-            Environment::default()
-                .prefix("RUSTFS")
-                .prefix_separator("__")
-                .separator("__")
-                .with_list_parse_key("volumes")
-                .try_parsing(true),
-        )
         .build()
         .unwrap_or_default();
 

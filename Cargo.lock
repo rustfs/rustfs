@@ -1746,7 +1746,7 @@ dependencies = [
  "pbkdf2",
  "rand 0.8.5",
  "serde_json",
- "sha2 0.10.8",
+ "sha2 0.10.9",
  "test-case",
  "thiserror 2.0.12",
  "time",
@@ -2141,7 +2141,7 @@ dependencies = [
  "md-5",
  "rand 0.8.5",
  "regex",
- "sha2 0.10.8",
+ "sha2 0.10.9",
  "unicode-segmentation",
  "uuid",
 ]
@@ -3019,6 +3019,12 @@ checksum = "442039f5147480ba31067cb00ada1adae6892028e40e45fc5de7b7df6dcc1b5f"
 dependencies = [
  "const-random",
 ]
+
+[[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dpi"
@@ -4807,7 +4813,7 @@ dependencies = [
  "nom 8.0.0",
  "once_cell",
  "serde",
- "sha2 0.10.8",
+ "sha2 0.10.9",
  "thiserror 2.0.12",
  "uuid",
 ]
@@ -6120,7 +6126,7 @@ checksum = "7f9f832470494906d1fca5329f8ab5791cc60beb230c74815dff541cbd2b5ca0"
 dependencies = [
  "once_cell",
  "pest",
- "sha2 0.10.8",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -7209,7 +7215,7 @@ version = "8.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d55b95147fe01265d06b3955db798bdaed52e60e2211c41137701b3aba8e21"
 dependencies = [
- "sha2 0.10.8",
+ "sha2 0.10.9",
  "walkdir",
 ]
 
@@ -7340,6 +7346,7 @@ dependencies = [
  "async-trait",
  "axum",
  "config",
+ "dotenvy",
  "http",
  "rdkafka",
  "reqwest",
@@ -7371,7 +7378,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
- "sha2 0.10.8",
+ "sha2 0.10.9",
  "tokio",
  "tracing-appender",
  "tracing-subscriber",
@@ -7394,6 +7401,7 @@ dependencies = [
  "opentelemetry_sdk",
  "rdkafka",
  "reqwest",
+ "rustfs-config",
  "serde",
  "serde_json",
  "smallvec",
@@ -7919,9 +7927,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.10.8"
+version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "793db75ad2bcafc3ffa7c68b215fee268f537982cd901d132f89c6343f3a3dc8"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",
@@ -10218,7 +10226,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "raw-window-handle 0.6.2",
- "sha2 0.10.8",
+ "sha2 0.10.9",
  "soup3",
  "tao-macros",
  "thiserror 1.0.69",

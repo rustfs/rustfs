@@ -1,23 +1,20 @@
-use crate::observability::file_sink::FileSinkConfig;
-use crate::observability::kafka_sink::KafkaSinkConfig;
-use crate::observability::webhook_sink::WebhookSinkConfig;
-use serde::Deserialize;
+use crate::observability::file::FileSink;
+use crate::observability::kafka::KafkaSink;
+use crate::observability::webhook::WebhookSink;
+use serde::{Deserialize, Serialize};
 
 /// Sink configuration
-#[derive(Debug, Deserialize, Clone)]
-pub struct SinkConfig {
-    pub kafka: Option<KafkaSinkConfig>,
-    pub webhook: Option<WebhookSinkConfig>,
-    pub file: Option<FileSinkConfig>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SinkConfig {
+    Kafka(KafkaSink),
+    Webhook(WebhookSink),
+    File(FileSink),
 }
 
 impl SinkConfig {
     pub fn new() -> Self {
-        Self {
-            kafka: None,
-            webhook: None,
-            file: Some(FileSinkConfig::new()),
-        }
+        Self::File(FileSink::new())
     }
 }
 

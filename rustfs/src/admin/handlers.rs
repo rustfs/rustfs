@@ -48,6 +48,7 @@ use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
+pub mod event;
 pub mod group;
 pub mod policys;
 pub mod pools;

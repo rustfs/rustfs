@@ -20,7 +20,7 @@ pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     // Load and return certificate.
     let certs = certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| certs_error(format!("certificate file {} format error", filename)))?;
+        .map_err(|e| certs_error(format!("certificate file {} format error:{:?}", filename, e)))?;
     if certs.is_empty() {
         return Err(certs_error(format!(
             "No valid certificate was found in the certificate file {}",
@@ -165,7 +165,7 @@ pub fn create_multi_cert_resolver(
     for (domain, (certs, key)) in cert_key_pairs {
         // create a signature
         let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
-            .map_err(|_| certs_error(format!("unsupported private key types:{}", domain)))?;
+            .map_err(|e| certs_error(format!("unsupported private key types:{}, err:{:?}", domain, e)))?;
 
         // create a CertifiedKey
         let certified_key = CertifiedKey::new(certs, signing_key);

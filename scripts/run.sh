@@ -39,24 +39,35 @@ export RUSTFS_CONSOLE_ADDRESS=":9002"
 export RUSTFS_OBS_CONFIG="./deploy/config/obs.example.toml"
 
 # 如下变量需要必须参数都有值才可以，以及会覆盖配置文件中的值
-export RUSTFS__OBSERVABILITY__ENDPOINT=http://localhost:4317
-export RUSTFS__OBSERVABILITY__USE_STDOUT=false
-export RUSTFS__OBSERVABILITY__SAMPLE_RATIO=2.0
-export RUSTFS__OBSERVABILITY__METER_INTERVAL=30
-export RUSTFS__OBSERVABILITY__SERVICE_NAME=rustfs
-export RUSTFS__OBSERVABILITY__SERVICE_VERSION=0.1.0
-export RUSTFS__OBSERVABILITY__ENVIRONMENT=develop
-export RUSTFS__OBSERVABILITY__LOGGER_LEVEL=debug
-export RUSTFS__OBSERVABILITY__LOCAL_LOGGING_ENABLED=true
-export RUSTFS__SINKS__FILE__ENABLED=true
-export RUSTFS__SINKS__FILE__PATH="./deploy/logs/rustfs.log"
-export RUSTFS__SINKS__WEBHOOK__ENABLED=false
-export RUSTFS__SINKS__WEBHOOK__ENDPOINT=""
-export RUSTFS__SINKS__WEBHOOK__AUTH_TOKEN=""
-export RUSTFS__SINKS__KAFKA__ENABLED=false
-export RUSTFS__SINKS__KAFKA__BOOTSTRAP_SERVERS=""
-export RUSTFS__SINKS__KAFKA__TOPIC=""
-export RUSTFS__LOGGER__QUEUE_CAPACITY=10
+#export RUSTFS__OBSERVABILITY__ENDPOINT=http://localhost:4317
+#export RUSTFS__OBSERVABILITY__USE_STDOUT=false
+#export RUSTFS__OBSERVABILITY__SAMPLE_RATIO=2.0
+#export RUSTFS__OBSERVABILITY__METER_INTERVAL=31
+#export RUSTFS__OBSERVABILITY__SERVICE_NAME=rustfs
+#export RUSTFS__OBSERVABILITY__SERVICE_VERSION=0.1.0
+#export RUSTFS__OBSERVABILITY__ENVIRONMENT=develop
+#export RUSTFS__OBSERVABILITY__LOGGER_LEVEL=debug
+#export RUSTFS__OBSERVABILITY__LOCAL_LOGGING_ENABLED=true
+#
+#export RUSTFS__SINKS_0__type=File
+#export RUSTFS__SINKS_0__path=./deploy/logs/rustfs.log
+#export RUSTFS__SINKS_0__buffer_size=12
+#export RUSTFS__SINKS_0__flush_interval_ms=1000
+#export RUSTFS__SINKS_0__flush_threshold=100
+#
+#export RUSTFS__SINKS_1__type=Kakfa
+#export RUSTFS__SINKS_1__brokers=localhost:9092
+#export RUSTFS__SINKS_1__topic=logs
+#export RUSTFS__SINKS_1__batch_size=100
+#export RUSTFS__SINKS_1__batch_timeout_ms=1000
+#
+#export RUSTFS__SINKS_2__type=Webhook
+#export RUSTFS__SINKS_2__endpoint=http://localhost:8080/webhook
+#export RUSTFS__SINKS_2__auth_token=you-auth-token
+#export RUSTFS__SINKS_2__batch_size=100
+#export RUSTFS__SINKS_2__batch_timeout_ms=1000
+#
+#export RUSTFS__LOGGER__QUEUE_CAPACITY=10
 
 export OTEL_INSTRUMENTATION_NAME="rustfs"
 export OTEL_INSTRUMENTATION_VERSION="0.1.1"
@@ -64,13 +75,13 @@ export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
 # 事件消息配置
-export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
+#export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
 
 if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
 
 # 启动 webhook 服务器
-cargo run --example webhook -p rustfs-event-notifier &
+#cargo run --example webhook -p rustfs-event-notifier &
 # 启动主服务
 cargo run --bin rustfs

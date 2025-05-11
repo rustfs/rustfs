@@ -14,6 +14,25 @@ pub const VERSION: &str = "0.0.1";
 /// Environment variable: RUSTFS_LOG_LEVEL
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
+/// Default configuration use stdout
+/// Default value: true
+pub(crate) const USE_STDOUT: bool = true;
+
+/// Default configuration sample ratio
+/// Default value: 1.0
+pub(crate) const SAMPLE_RATIO: f64 = 1.0;
+/// Default configuration meter interval
+/// Default value: 30
+pub(crate) const METER_INTERVAL: u64 = 30;
+
+/// Default configuration service version
+/// Default value: 0.0.1
+pub(crate) const SERVICE_VERSION: &str = "0.0.1";
+
+/// Default configuration environment
+/// Default value: production
+pub(crate) const ENVIRONMENT: &str = "production";
+
 /// maximum number of connections
 /// This is the maximum number of connections that the server will accept.
 /// This is used to limit the number of connections to the server.

@@ -1,5 +1,5 @@
 use crate::global::{ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION};
-use crate::sink::Sink;
+use crate::sinks::Sink;
 use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry};
 use std::sync::Arc;
 use std::time::SystemTime;

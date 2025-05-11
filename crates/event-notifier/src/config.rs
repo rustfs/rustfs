@@ -1,4 +1,4 @@
-use config::{Config, Environment, File, FileFormat};
+use config::{Config, File, FileFormat};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -138,15 +138,6 @@ impl NotifierConfig {
         let app_config = Config::builder()
             .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml).required(false))
             .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Yaml).required(false))
-            .add_source(
-                Environment::default()
-                    .prefix("NOTIFIER")
-                    .prefix_separator("__")
-                    .separator("__")
-                    .list_separator("_")
-                    .with_list_parse_key("adapters")
-                    .try_parsing(true),
-            )
             .build()
             .unwrap_or_default();
         match app_config.try_deserialize::<NotifierConfig>() {

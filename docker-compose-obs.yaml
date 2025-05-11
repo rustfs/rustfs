@@ -83,7 +83,7 @@ services:
       dockerfile: Dockerfile.obs
     container_name: node2
     environment:
-      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=:9002
