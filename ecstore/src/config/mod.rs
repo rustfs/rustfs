@@ -141,7 +141,7 @@ impl Config {
     }
 
     pub fn merge(&self) -> Config {
-        // TODO: merge defauls
+        // TODO: merge default
         self.clone()
     }
 }
@@ -158,6 +158,6 @@ pub fn register_default_kvs(kvs: HashMap<String, KVS>) {
 pub fn init() {
     let mut kvs = HashMap::new();
     kvs.insert(STORAGE_CLASS_SUB_SYS.to_owned(), storageclass::DefaultKVS.clone());
-    // TODO: other defauls
+    // TODO: other default
     register_default_kvs(kvs)
 }

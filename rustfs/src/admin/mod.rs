@@ -25,7 +25,7 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
 
     regist_rpc_route(&mut r)?;
-    regist_user_route(&mut r)?;
+    register_user_route(&mut r)?;
 
     r.insert(
         Method::POST,
@@ -124,7 +124,7 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     Ok(r)
 }
 
-fn regist_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
+fn register_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
     // 1
     r.insert(
         Method::GET,

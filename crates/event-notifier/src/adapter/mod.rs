@@ -4,7 +4,7 @@ use crate::Event;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-#[cfg(feature = "kafka")]
+#[cfg(all(feature = "kafka", target_os = "linux"))]
 pub(crate) mod kafka;
 #[cfg(feature = "mqtt")]
 pub(crate) mod mqtt;
@@ -31,7 +31,7 @@ pub fn create_adapters(configs: &[AdapterConfig]) -> Result<Vec<Arc<dyn ChannelA
                 webhook_config.validate().map_err(Error::ConfigError)?;
                 adapters.push(Arc::new(webhook::WebhookAdapter::new(webhook_config.clone())));
             }
-            #[cfg(feature = "kafka")]
+            #[cfg(all(feature = "kafka", target_os = "linux"))]
             AdapterConfig::Kafka(kafka_config) => {
                 adapters.push(Arc::new(kafka::KafkaAdapter::new(kafka_config)?));
             }
@@ -43,7 +43,7 @@ pub fn create_adapters(configs: &[AdapterConfig]) -> Result<Vec<Arc<dyn ChannelA
             }
             #[cfg(not(feature = "webhook"))]
             AdapterConfig::Webhook(_) => return Err(Error::FeatureDisabled("webhook")),
-            #[cfg(not(feature = "kafka"))]
+            #[cfg(any(not(feature = "kafka"), not(target_os = "linux")))]
             AdapterConfig::Kafka(_) => return Err(Error::FeatureDisabled("kafka")),
             #[cfg(not(feature = "mqtt"))]
             AdapterConfig::Mqtt(_) => return Err(Error::FeatureDisabled("mqtt")),
