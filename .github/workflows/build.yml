@@ -1,9 +1,9 @@
-name: Build
+name: Build RustFS And GUI
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * 0" # 每周日午夜执行
+    - cron: "0 0 * * 0" # at midnight of each sunday
   push:
     branches:
       - main
