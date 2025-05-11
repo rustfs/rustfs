@@ -60,12 +60,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up authentication
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "Authenticated with GITHUB_TOKEN"
-        shell: bash
-
       # Installation system dependencies
       - name: Install system dependencies (Ubuntu)
         if: runner.os == 'Linux'
@@ -81,11 +75,22 @@ jobs:
           targets: ${{ matrix.variant.target }}
           components: rustfmt, clippy
 
-      # Setting up Protobuf and Flatbuffers
-      - name: Setup Protoc
+      # Install system dependencies
+      - name: Cache Protoc
+        id: cache-protoc
+        uses: actions/cache@v4.2.3
+        with:
+          path: /Users/runner/hostedtoolcache/protoc
+          key: protoc-${{ runner.os }}-30.2
+          restore-keys: |
+            protoc-${{ runner.os }}-
+
+      - name: Install Protoc
+        if: steps.cache-protoc.outputs.cache-hit != 'true'
         uses: arduino/setup-protoc@v3
         with:
-          version: "30.2"
+          version: '30.2'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Flatc
         uses: Nugine/setup-flatc@v1
