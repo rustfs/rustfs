@@ -1740,16 +1740,26 @@ version = "0.0.1"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "base64 0.22.1",
  "cfg-if",
  "chacha20poly1305",
+ "hex",
+ "http",
  "jsonwebtoken",
+ "lazy_static",
  "pbkdf2",
  "rand 0.8.5",
+ "reqwest",
+ "ring",
+ "serde",
  "serde_json",
  "sha2 0.10.8",
  "test-case",
  "thiserror 2.0.12",
  "time",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

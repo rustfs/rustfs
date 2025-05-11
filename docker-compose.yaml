@@ -8,6 +8,8 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      # 添加KMS配置，从vault-config卷加载
+      - RUSTFS_KMS_ENABLED=true
     platform: linux/amd64
     ports:
       - "9000:9000"  # 映射宿主机的 9001 端口到容器的 9000 端口
@@ -15,7 +17,11 @@ services:
     volumes:
       - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
       # - ./data/node0:/data  # 将当前路径挂载到容器内的 /root/data
-    command: "/app/rustfs"
+      - vault-config:/etc/rustfs/kms:ro  # 读取KMS配置
+    command: "/bin/sh -c 'if [ -f /etc/rustfs/kms/rustfs-kms.env ]; then export $(cat /etc/rustfs/kms/rustfs-kms.env | xargs); fi && /app/rustfs'"
+    depends_on:
+      rustyvault:
+        condition: service_healthy
 
   node1:
     image: rustfs:v1
@@ -26,13 +32,19 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      # 添加KMS配置，从vault-config卷加载
+      - RUSTFS_KMS_ENABLED=true
     platform: linux/amd64
     ports:
       - "9001:9000"  # 映射宿主机的 9002 端口到容器的 9000 端口
     volumes:
       - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs 
       # - ./data/node1:/data
-    command: "/app/rustfs"
+      - vault-config:/etc/rustfs/kms:ro  # 读取KMS配置
+    command: "/bin/sh -c 'if [ -f /etc/rustfs/kms/rustfs-kms.env ]; then export $(cat /etc/rustfs/kms/rustfs-kms.env | xargs); fi && /app/rustfs'"
+    depends_on:
+      rustyvault:
+        condition: service_healthy
 
   node2:
     image: rustfs:v1
@@ -43,13 +55,19 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      # 添加KMS配置，从vault-config卷加载
+      - RUSTFS_KMS_ENABLED=true
     platform: linux/amd64
     ports:
       - "9002:9000"  # 映射宿主机的 9003 端口到容器的 9000 端口
     volumes:
       - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
       # - ./data/node2:/data
-    command: "/app/rustfs"
+      - vault-config:/etc/rustfs/kms:ro  # 读取KMS配置
+    command: "/bin/sh -c 'if [ -f /etc/rustfs/kms/rustfs-kms.env ]; then export $(cat /etc/rustfs/kms/rustfs-kms.env | xargs); fi && /app/rustfs'"
+    depends_on:
+      rustyvault:
+        condition: service_healthy
 
   node3:
     image: rustfs:v1
@@ -60,10 +78,21 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
+      # 添加KMS配置，从vault-config卷加载
+      - RUSTFS_KMS_ENABLED=true
     platform: linux/amd64
     ports:
       - "9003:9000"  # 映射宿主机的 9004 端口到容器的 9000 端口
     volumes:
       - ./target/x86_64-unknown-linux-musl/release/rustfs:/app/rustfs
       # - ./data/node3:/data
-    command: "/app/rustfs"
+      - vault-config:/etc/rustfs/kms:ro  # 读取KMS配置
+    command: "/bin/sh -c 'if [ -f /etc/rustfs/kms/rustfs-kms.env ]; then export $(cat /etc/rustfs/kms/rustfs-kms.env | xargs); fi && /app/rustfs'"
+    depends_on:
+      rustyvault:
+        condition: service_healthy
+
+# 定义用于存储Vault数据和配置的Docker卷
+volumes:
+  vault-data:
+  vault-config:

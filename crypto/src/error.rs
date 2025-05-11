@@ -24,4 +24,39 @@ pub enum Error {
 
     #[error("jwt err: {0}")]
     ErrJwt(#[from] jsonwebtoken::errors::Error),
+    
+    // SSE related errors
+    #[error("invalid SSE algorithm")]
+    ErrInvalidSSEAlgorithm,
+
+    #[error("missing SSE encryption key")]
+    ErrMissingSSEKey,
+
+    #[error("invalid SSE customer key")]
+    ErrInvalidSSECustomerKey,
+
+    #[error("SSE key MD5 mismatch")]
+    ErrSSEKeyMD5Mismatch,
+
+    #[error("invalid SSE encryption metadata")]
+    ErrInvalidEncryptionMetadata,
+
+    #[error("missing KMS configuration")]
+    ErrMissingKMSConfig,
+
+    #[error("KMS key ID configuration error: {0}")]
+    ErrKMSKeyConfiguration(String),
+
+    #[error("KMS error: {0}")]
+    ErrKMS(String),
+
+    #[error("invalid encrypted data format")]
+    ErrInvalidEncryptedDataFormat,
+
+    #[error("encrypted object key missing")]
+    ErrEncryptedObjectKeyMissing,
+    
+    // Base64 decoding error
+    #[error("base64 decode error: {0}")]
+    ErrBase64DecodeError(#[from] base64::DecodeError),
 }

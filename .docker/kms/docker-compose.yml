@@ -1,0 +1,26 @@
+services:
+  rustyvault:
+    build:
+      context: ./.docker
+      dockerfile: Dockerfile.rustyvault
+    container_name: rustyvault
+    hostname: rustyvault
+    ports:
+      - "8200:8200"  # Vault API port
+    volumes:
+      - vault-data:/vault/data
+      - vault-config:/vault/config
+    cap_add:
+      - IPC_LOCK  # Allow the vault to lock sensitive data in memory
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=rustfs-root-token
+      - VAULT_ADDR=http://0.0.0.0:8200
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+networks:
+  default:
+    driver: bridge

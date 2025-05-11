@@ -21,6 +21,7 @@ use common::{
     error::{Error, Result},
     globals::set_global_addr,
 };
+use crypto::init_kms;
 use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use ecstore::config as ecconfig;
 use ecstore::config::GLOBAL_ConfigSys;
@@ -520,6 +521,15 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_bucket_metadata_sys(store.clone(), buckets).await;
 
     init_iam_sys(store.clone()).await?;
+
+    // 初始化KMS客户端（如果启用）
+    init_kms();
+    // 检查KMS初始化状态并记录日志
+    if let Some(err) = crypto::get_kms_init_error() {
+        error!("Failed to initialize KMS: {}", err);
+    } else if crypto::is_kms_initialized() {
+        info!("KMS encryption is enabled and initialized successfully");
+    }
 
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
         error!("new_global_notification_sys failed {:?}", &err);

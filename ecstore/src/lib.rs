@@ -33,6 +33,8 @@ mod store_utils;
 pub mod utils;
 pub mod xhttp;
 
+pub mod encrypt;
+
 pub use global::new_object_layer_fn;
 pub use global::set_global_endpoints;
 pub use global::update_erasure_type;

@@ -1,0 +1,22 @@
+FROM vault:1.13
+
+# Configure Vault for dev mode
+ENV VAULT_DEV_ROOT_TOKEN_ID=rustfs-root-token
+ENV VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+
+# Install curl for health checks
+USER root
+RUN apk add --no-cache curl jq
+
+# Copy the Vault initialization script
+COPY vault-init.sh /usr/local/bin/vault-init.sh
+RUN chmod +x /usr/local/bin/vault-init.sh
+
+# Switch back to vault user
+USER vault
+
+# Expose Vault port
+EXPOSE 8200
+
+# Start Vault in dev mode and run the initialization script
+ENTRYPOINT ["sh", "-c", "vault server -dev & sleep 5 && vault-init.sh"]
