@@ -1,5 +1,5 @@
-use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION, USE_STDOUT};
 use config::{Config, File, FileFormat};
+use rustfs_config::{APP_NAME, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT};
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -43,7 +43,7 @@ fn extract_otel_config_from_env() -> OtelConfig {
         service_name: env::var("RUSTFS_OBSERVABILITY_SERVICE_NAME")
             .ok()
             .and_then(|v| v.parse().ok())
-            .or(Some(SERVICE_NAME.to_string())),
+            .or(Some(APP_NAME.to_string())),
         service_version: env::var("RUSTFS_OBSERVABILITY_SERVICE_VERSION")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -55,7 +55,7 @@ fn extract_otel_config_from_env() -> OtelConfig {
         logger_level: env::var("RUSTFS_OBSERVABILITY_LOGGER_LEVEL")
             .ok()
             .and_then(|v| v.parse().ok())
-            .or(Some(LOGGER_LEVEL.to_string())),
+            .or(Some(DEFAULT_LOG_LEVEL.to_string())),
         local_logging_enabled: env::var("RUSTFS_OBSERVABILITY_LOCAL_LOGGING_ENABLED")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -91,11 +91,11 @@ pub struct KafkaSinkConfig {
 impl KafkaSinkConfig {
     pub fn new() -> Self {
         Self {
-            brokers: env::var("RUSTFS__SINKS_0_KAFKA_BROKERS")
+            brokers: env::var("RUSTFS_SINKS_KAFKA_BROKERS")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "localhost:9092".to_string()),
-            topic: env::var("RUSTFS__SINKS_0_KAFKA_TOPIC")
+            topic: env::var("RUSTFS_SINKS_KAFKA_TOPIC")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "default_topic".to_string()),
@@ -123,11 +123,11 @@ pub struct WebhookSinkConfig {
 impl WebhookSinkConfig {
     pub fn new() -> Self {
         Self {
-            endpoint: env::var("RUSTFS__SINKS_0_WEBHOOK_ENDPOINT")
+            endpoint: env::var("RUSTFS_SINKS_WEBHOOK_ENDPOINT")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "http://localhost:8080".to_string()),
-            auth_token: env::var("RUSTFS__SINKS_0_WEBHOOK_AUTH_TOKEN")
+            auth_token: env::var("RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "default_token".to_string()),
@@ -160,7 +160,7 @@ impl FileSinkConfig {
             eprintln!("Failed to create log directory: {}", e);
             return "rustfs/rustfs.log".to_string();
         }
-
+        println!("Using log directory: {:?}", temp_dir);
         temp_dir
             .join("rustfs.log")
             .to_str()
@@ -169,7 +169,7 @@ impl FileSinkConfig {
     }
     pub fn new() -> Self {
         Self {
-            path: env::var("RUSTFS__SINKS_0_FILE_PATH")
+            path: env::var("RUSTFS_SINKS_FILE_PATH")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(Self::get_default_log_path),

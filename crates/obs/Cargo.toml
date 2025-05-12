@@ -29,6 +29,7 @@ opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
+rustfs-utils = { workspace = true, features = ["ip"] }
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }

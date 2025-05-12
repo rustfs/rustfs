@@ -1,5 +1,3 @@
-use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION, USE_STDOUT};
-use crate::utils::get_local_ip_with_default;
 use crate::OtelConfig;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{global, KeyValue};
@@ -15,6 +13,8 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
     SCHEMA_URL,
 };
+use rustfs_config::{APP_NAME, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT};
+use rustfs_utils::get_local_ip_with_default;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::io::IsTerminal;
@@ -70,7 +70,7 @@ impl Drop for OtelGuard {
 /// create OpenTelemetry Resource
 fn resource(config: &OtelConfig) -> Resource {
     Resource::builder()
-        .with_service_name(Cow::Borrowed(config.service_name.as_deref().unwrap_or(SERVICE_NAME)).to_string())
+        .with_service_name(Cow::Borrowed(config.service_name.as_deref().unwrap_or(APP_NAME)).to_string())
         .with_schema_url(
             [
                 KeyValue::new(
@@ -101,8 +101,8 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     let endpoint = &config.endpoint;
     let use_stdout = config.use_stdout.unwrap_or(USE_STDOUT);
     let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
-    let logger_level = config.logger_level.as_deref().unwrap_or(LOGGER_LEVEL);
-    let service_name = config.service_name.as_deref().unwrap_or(SERVICE_NAME);
+    let logger_level = config.logger_level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
+    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
 
     // Pre-create resource objects to avoid repeated construction
     let res = resource(config);

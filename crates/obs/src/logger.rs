@@ -1,6 +1,6 @@
-use crate::global::{ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION};
 use crate::sinks::Sink;
 use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry};
+use rustfs_config::{APP_NAME, ENVIRONMENT, SERVICE_VERSION};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -428,7 +428,7 @@ impl Default for InitLogStatus {
     fn default() -> Self {
         Self {
             timestamp: SystemTime::now(),
-            service_name: String::from(SERVICE_NAME),
+            service_name: String::from(APP_NAME),
             version: SERVICE_VERSION.to_string(),
             environment: ENVIRONMENT.to_string(),
         }
@@ -442,7 +442,7 @@ impl InitLogStatus {
         let version = config.service_version.unwrap_or(SERVICE_VERSION.to_string());
         Self {
             timestamp: SystemTime::now(),
-            service_name: String::from(SERVICE_NAME),
+            service_name: String::from(APP_NAME),
             version,
             environment,
         }

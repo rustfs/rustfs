@@ -35,7 +35,6 @@ mod logger;
 mod sinks;
 mod system;
 mod telemetry;
-mod utils;
 mod worker;
 
 use crate::logger::InitLogStatus;
