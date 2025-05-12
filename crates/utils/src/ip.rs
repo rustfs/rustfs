@@ -1,4 +1,3 @@
-use local_ip_address::{local_ip, local_ipv6};
 use std::net::{IpAddr, Ipv4Addr};
 
 /// Get the IP address of the machine
@@ -11,7 +10,9 @@ use std::net::{IpAddr, Ipv4Addr};
 /// * `Some(IpAddr)` - Native IP address (IPv4 or IPv6)
 /// * `None` - Unable to obtain any native IP address
 pub fn get_local_ip() -> Option<IpAddr> {
-    local_ip().ok().or_else(|| local_ipv6().ok())
+    local_ip_address::local_ip()
+        .ok()
+        .or_else(|| local_ip_address::local_ipv6().ok())
 }
 
 /// Get the IP address of the machine as a string

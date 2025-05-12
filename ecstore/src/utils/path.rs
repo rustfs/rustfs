@@ -52,7 +52,7 @@ pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && (s[..prefix.len()] == *prefix || s[..prefix.len()].eq_ignore_ascii_case(prefix))
 }
 
-pub fn has_profix(s: &str, prefix: &str) -> bool {
+pub fn has_prefix(s: &str, prefix: &str) -> bool {
     if cfg!(target_os = "windows") {
         return strings_has_prefix_fold(s, prefix);
     }

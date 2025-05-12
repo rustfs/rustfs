@@ -13,11 +13,11 @@ workspace = true
 default = ["file"]
 file = []
 gpu = ["dep:nvml-wrapper"]
-kafka = ["dep:rdkafka"]
 webhook = ["dep:reqwest"]
-full = ["file", "gpu", "kafka", "webhook"]
+kafka = ["dep:rdkafka"]
 
 [dependencies]
+rustfs-config = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
@@ -29,6 +29,7 @@ opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
+rustfs-utils = { workspace = true, features = ["ip"] }
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
@@ -37,12 +38,14 @@ tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
-rdkafka = { workspace = true, features = ["tokio"], optional = true }
 reqwest = { workspace = true, optional = true, default-features = false }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
 
+# Only enable kafka features and related dependencies on Linux
+[target.'cfg(target_os = "linux")'.dependencies]
+rdkafka = { workspace = true, features = ["tokio"], optional = true }
 
 
 [dev-dependencies]

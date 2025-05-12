@@ -15,7 +15,7 @@ pub enum Error {
     Serde(#[from] serde_json::Error),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-    #[cfg(feature = "kafka")]
+    #[cfg(all(feature = "kafka", target_os = "linux"))]
     #[error("Kafka error: {0}")]
     Kafka(#[from] rdkafka::error::KafkaError),
     #[cfg(feature = "mqtt")]

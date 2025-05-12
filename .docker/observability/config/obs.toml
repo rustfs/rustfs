@@ -1,5 +1,5 @@
 [observability]
-endpoint = "http://otel-collector:4317" # Default is "http://localhost:4317" if not specified
+endpoint = "http://localhost:4317" # Default is "http://localhost:4317" if not specified
 use_stdout = false # Output with stdout, true output, false no output
 sample_ratio = 2.0
 meter_interval = 30
@@ -9,26 +9,26 @@ environments = "production"
 logger_level = "debug"
 local_logging_enabled = true
 
-[sinks]
-[sinks.kafka] # Kafka sink is disabled by default
-enabled = false
-bootstrap_servers = "localhost:9092"
-topic = "logs"
-batch_size = 100 # Default is 100 if not specified
-batch_timeout_ms = 1000 # Default is 1000ms if not specified
+#[[sinks]]
+#type = "Kafka"
+#brokers = "localhost:9092"
+#topic = "logs"
+#batch_size = 100 # Default is 100 if not specified
+#batch_timeout_ms = 1000 # Default is 1000ms if not specified
+#
+#[[sinks]]
+#type = "Webhook"
+#endpoint = "http://localhost:8080/webhook"
+#auth_token = ""
+#batch_size = 100 # Default is 3 if not specified
+#batch_timeout_ms = 1000 # Default is 100ms if not specified
 
-[sinks.webhook]
-enabled = false
-endpoint = "http://localhost:8080/webhook"
-auth_token = ""
-batch_size = 100 # Default is 3 if not specified
-batch_timeout_ms = 1000 # Default is 100ms if not specified
-
-[sinks.file]
-enabled = true
-path = "/root/data/logs/app.log"
-batch_size = 10
-batch_timeout_ms = 1000 # Default is 8192 bytes if not specified
+[[sinks]]
+type = "File"
+path = "/root/data/logs/rustfs.log"
+buffer_size = 100 # Default is 8192 bytes if not specified
+flush_interval_ms = 1000
+flush_threshold = 100
 
 [logger]
 queue_capacity = 10

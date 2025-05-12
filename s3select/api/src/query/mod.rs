@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use s3s::dto::SelectObjectContentInput;
 
 pub mod analyzer;
@@ -16,7 +18,7 @@ pub mod session;
 #[derive(Clone)]
 pub struct Context {
     // maybe we need transfer some info?
-    pub input: SelectObjectContentInput,
+    pub input: Arc<SelectObjectContentInput>,
 }
 
 #[derive(Clone)]

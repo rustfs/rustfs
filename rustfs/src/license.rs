@@ -10,6 +10,7 @@ lazy_static::lazy_static! {
     static ref LICENSE: OnceLock<Token> = OnceLock::new();
 }
 
+/// Initialize the license
 pub fn init_license(license: Option<String>) {
     if license.is_none() {
         error!("License is None");
@@ -23,10 +24,13 @@ pub fn init_license(license: Option<String>) {
     });
 }
 
+/// Get the license
 pub fn get_license() -> Option<Token> {
     LICENSE.get().cloned()
 }
 
+/// Check the license
+/// This function checks if the license is valid.
 #[allow(unreachable_code)]
 pub fn license_check() -> Result<()> {
     return Ok(());

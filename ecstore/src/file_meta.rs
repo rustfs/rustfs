@@ -58,10 +58,12 @@ impl FileMeta {
     }
 
     // isXL2V1Format
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn is_xl2_v1_format(buf: &[u8]) -> bool {
         !matches!(Self::check_xl2_v1(buf), Err(_e))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn load(buf: &[u8]) -> Result<FileMeta> {
         let mut xl = FileMeta::default();
         xl.unmarshal_msg(buf)?;
@@ -245,7 +247,7 @@ impl FileMeta {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut wr = Vec::new();
 
@@ -363,6 +365,7 @@ impl FileMeta {
     }
 
     // shard_data_dir_count 查询 vid下data_dir的数量
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn shard_data_dir_count(&self, vid: &Option<Uuid>, data_dir: &Option<Uuid>) -> usize {
         self.versions
             .iter()
@@ -434,6 +437,7 @@ impl FileMeta {
     }
 
     // 添加版本
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn add_version(&mut self, fi: FileInfo) -> Result<()> {
         let vid = fi.version_id;
 
@@ -916,11 +920,20 @@ impl FileMetaVersionHeader {
     }
 
     pub fn matches_not_strict(&self, o: &FileMetaVersionHeader) -> bool {
+        let mut ok = self.version_id == o.version_id && self.version_type == o.version_type && self.matches_ec(o);
         if self.version_id.is_none() {
-            return self.version_id == o.version_id && self.version_type == o.version_type && self.mod_time == o.mod_time;
+            ok = ok && self.mod_time == o.mod_time;
         }
 
-        self.version_id == o.version_id && self.version_type == o.version_type
+        ok
+    }
+
+    pub fn matches_ec(&self, o: &FileMetaVersionHeader) -> bool {
+        if self.has_ec() && o.has_ec() {
+            return self.ec_n == o.ec_n && self.ec_m == o.ec_m;
+        }
+
+        true
     }
 
     pub fn free_version(&self) -> bool {

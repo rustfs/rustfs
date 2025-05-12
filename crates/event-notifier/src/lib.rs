@@ -8,7 +8,7 @@ mod notifier;
 mod store;
 
 pub use adapter::create_adapters;
-#[cfg(feature = "kafka")]
+#[cfg(all(feature = "kafka", target_os = "linux"))]
 pub use adapter::kafka::KafkaAdapter;
 #[cfg(feature = "mqtt")]
 pub use adapter::mqtt::MqttAdapter;
@@ -16,7 +16,7 @@ pub use adapter::mqtt::MqttAdapter;
 pub use adapter::webhook::WebhookAdapter;
 pub use adapter::ChannelAdapter;
 pub use bus::event_bus;
-#[cfg(feature = "kafka")]
+#[cfg(all(feature = "kafka", target_os = "linux"))]
 pub use config::KafkaConfig;
 #[cfg(feature = "mqtt")]
 pub use config::MqttConfig;

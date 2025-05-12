@@ -32,20 +32,13 @@ mod config;
 mod entry;
 mod global;
 mod logger;
-mod sink;
+mod sinks;
 mod system;
 mod telemetry;
-mod utils;
 mod worker;
 
 use crate::logger::InitLogStatus;
 pub use config::load_config;
-#[cfg(feature = "file")]
-pub use config::FileSinkConfig;
-#[cfg(feature = "kafka")]
-pub use config::KafkaSinkConfig;
-#[cfg(feature = "webhook")]
-pub use config::WebhookSinkConfig;
 pub use config::{AppConfig, LoggerConfig, OtelConfig, SinkConfig};
 pub use entry::args::Args;
 pub use entry::audit::{ApiDetails, AuditLogEntry};
@@ -79,7 +72,7 @@ use tracing::{error, info};
 /// ```
 pub async fn init_obs(config: AppConfig) -> (Arc<Mutex<Logger>>, telemetry::OtelGuard) {
     let guard = init_telemetry(&config.observability);
-    let sinks = sink::create_sinks(&config).await;
+    let sinks = sinks::create_sinks(&config).await;
     let logger = init_global_logger(&config, sinks).await;
     let obs_config = config.observability.clone();
     tokio::spawn(async move {

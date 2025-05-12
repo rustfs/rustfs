@@ -1,6 +1,6 @@
 services:
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.120.0
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.124.0
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -16,7 +16,7 @@ services:
     networks:
       - rustfs-network
   jaeger:
-    image: jaegertracing/jaeger:2.4.0
+    image: jaegertracing/jaeger:2.5.0
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -26,7 +26,7 @@ services:
     networks:
       - rustfs-network
   prometheus:
-    image: prom/prometheus:v3.2.1
+    image: prom/prometheus:v3.3.0
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -36,7 +36,7 @@ services:
     networks:
       - rustfs-network
   loki:
-    image: grafana/loki:3.4.2
+    image: grafana/loki:3.5.0
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -47,7 +47,7 @@ services:
     networks:
       - rustfs-network
   grafana:
-    image: grafana/grafana:11.6.0
+    image: grafana/grafana:11.6.1
     ports:
       - "3000:3000"  # Web UI
     environment:
@@ -63,10 +63,10 @@ services:
     container_name: node1
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
-      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs.toml
+      - RUSTFS_CONSOLE_ADDRESS=:9002
+      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
     platform: linux/amd64
     ports:
       - "9001:9000"  # 映射宿主机的 9001 端口到容器的 9000 端口
@@ -83,11 +83,11 @@ services:
       dockerfile: Dockerfile.obs
     container_name: node2
     environment:
-      - RUSTFS_VOLUMES=/root/data/target/volume/test{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
+      - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
-      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs.toml
+      - RUSTFS_CONSOLE_ADDRESS=:9002
+      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
     platform: linux/amd64
     ports:
       - "9002:9000"  # 映射宿主机的 9002 端口到容器的 9000 端口
@@ -105,10 +105,10 @@ services:
     container_name: node3
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
-      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs.toml
+      - RUSTFS_CONSOLE_ADDRESS=:9002
+      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
     platform: linux/amd64
     ports:
       - "9003:9000"  # 映射宿主机的 9003 端口到容器的 9000 端口
@@ -126,10 +126,10 @@ services:
     container_name: node4
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/root/data/target/volume/test{1...4}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9002
-      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs.toml
+      - RUSTFS_CONSOLE_ADDRESS=:9002
+      - RUSTFS_OBS_CONFIG=/etc/observability/config/obs-multi.toml
     platform: linux/amd64
     ports:
       - "9004:9000"  # 映射宿主机的 9004 端口到容器的 9000 端口

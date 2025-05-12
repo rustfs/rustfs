@@ -3,14 +3,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, SetError};
 use tracing::{error, info};
 
-pub(crate) const USE_STDOUT: bool = true;
-pub(crate) const SERVICE_NAME: &str = "RustFS";
-pub(crate) const SAMPLE_RATIO: f64 = 1.0;
-pub(crate) const METER_INTERVAL: u64 = 60;
-pub(crate) const SERVICE_VERSION: &str = "0.1.0";
-pub(crate) const ENVIRONMENT: &str = "production";
-pub(crate) const LOGGER_LEVEL: &str = "info";
-
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
 

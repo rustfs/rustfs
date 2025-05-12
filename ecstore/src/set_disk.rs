@@ -284,10 +284,20 @@ impl SetDisks {
         // let mut ress = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
 
-        for (i, disk) in disks.iter().enumerate() {
-            let mut file_info = file_infos[i].clone();
+        let src_bucket = Arc::new(src_bucket.to_string());
+        let src_object = Arc::new(src_object.to_string());
+        let dst_bucket = Arc::new(dst_bucket.to_string());
+        let dst_object = Arc::new(dst_object.to_string());
 
-            futures.push(async move {
+        for (i, (disk, file_info)) in disks.iter().zip(file_infos.iter()).enumerate() {
+            let mut file_info = file_info.clone();
+            let disk = disk.clone();
+            let src_bucket = src_bucket.clone();
+            let src_object = src_object.clone();
+            let dst_object = dst_object.clone();
+            let dst_bucket = dst_bucket.clone();
+
+            futures.push(tokio::spawn(async move {
                 if file_info.erasure.index == 0 {
                     file_info.erasure.index = i + 1;
                 }
@@ -297,12 +307,12 @@ impl SetDisks {
                 }
 
                 if let Some(disk) = disk {
-                    disk.rename_data(src_bucket, src_object, file_info, dst_bucket, dst_object)
+                    disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
                         .await
                 } else {
                     Err(Error::new(DiskError::DiskNotFound))
                 }
-            })
+            }));
         }
 
         let mut disk_versions = vec![None; disks.len()];
@@ -311,15 +321,13 @@ impl SetDisks {
         let results = join_all(futures).await;
 
         for (idx, result) in results.iter().enumerate() {
-            match result {
+            match result.as_ref().map_err(|_| Error::new(DiskError::Unexpected))? {
                 Ok(res) => {
                     data_dirs[idx] = res.old_data_dir;
                     disk_versions[idx].clone_from(&res.sign);
-                    // ress.push(Some(res));
                     errs.push(None);
                 }
                 Err(e) => {
-                    // ress.push(None);
                     errs.push(Some(clone_err(e)));
                 }
             }
@@ -336,11 +344,14 @@ impl SetDisks {
                 if let Some(disk) = disks[i].as_ref() {
                     let fi = file_infos[i].clone();
                     let old_data_dir = data_dirs[i];
-                    futures.push(async move {
+                    let disk = disk.clone();
+                    let src_bucket = src_bucket.clone();
+                    let src_object = src_object.clone();
+                    futures.push(tokio::spawn(async move {
                         let _ = disk
                             .delete_version(
-                                src_bucket,
-                                src_object,
+                                &src_bucket,
+                                &src_object,
                                 fi,
                                 false,
                                 DeleteOptions {
@@ -354,7 +365,7 @@ impl SetDisks {
                                 debug!("rename_data delete_version err {:?}", e);
                                 e
                             });
-                    });
+                    }));
                 }
             }
 
@@ -416,41 +427,38 @@ impl SetDisks {
         data_dir: &str,
         write_quorum: usize,
     ) -> Result<()> {
-        let file_path = format!("{}/{}", object, data_dir);
-
-        let mut futures = Vec::with_capacity(disks.len());
-        let mut errs = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
+        let file_path = Arc::new(format!("{}/{}", object, data_dir));
+        let bucket = Arc::new(bucket.to_string());
+        let futures = disks.iter().map(|disk| {
             let file_path = file_path.clone();
-            futures.push(async move {
+            let bucket = bucket.clone();
+            let disk = disk.clone();
+            tokio::spawn(async move {
                 if let Some(disk) = disk {
-                    disk.delete(
-                        bucket,
-                        &file_path,
-                        DeleteOptions {
-                            recursive: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
+                    (disk
+                        .delete(
+                            &bucket,
+                            &file_path,
+                            DeleteOptions {
+                                recursive: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await)
+                        .err()
                 } else {
-                    Err(Error::new(DiskError::DiskNotFound))
+                    Some(Error::new(DiskError::DiskNotFound))
                 }
-            });
-        }
-
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(_) => {
-                    errs.push(None);
-                }
-                Err(e) => {
-                    errs.push(Some(e));
-                }
-            }
-        }
+            })
+        });
+        let errs: Vec<Option<Error>> = join_all(futures)
+            .await
+            .into_iter()
+            .map(|e| match e {
+                Ok(e) => e,
+                Err(_) => Some(Error::new(DiskError::Unexpected)),
+            })
+            .collect();
 
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
             return Err(err);
@@ -502,24 +510,33 @@ impl SetDisks {
         meta: Vec<u8>,
         write_quorum: usize,
     ) -> Result<Vec<Option<DiskStore>>> {
-        let mut futures = Vec::with_capacity(disks.len());
+        let src_bucket = Arc::new(src_bucket.to_string());
+        let src_object = Arc::new(src_object.to_string());
+        let dst_bucket = Arc::new(dst_bucket.to_string());
+        let dst_object = Arc::new(dst_object.to_string());
 
         let mut errs = Vec::with_capacity(disks.len());
 
-        for disk in disks.iter() {
+        let futures = disks.iter().map(|disk| {
+            let disk = disk.clone();
             let meta = meta.clone();
-            futures.push(async move {
+            let src_bucket = src_bucket.clone();
+            let src_object = src_object.clone();
+            let dst_bucket = dst_bucket.clone();
+            let dst_object = dst_object.clone();
+            tokio::spawn(async move {
                 if let Some(disk) = disk {
-                    disk.rename_part(src_bucket, src_object, dst_bucket, dst_object, meta).await
+                    disk.rename_part(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
+                        .await
                 } else {
                     Err(Error::new(DiskError::DiskNotFound))
                 }
             })
-        }
+        });
 
         let results = join_all(futures).await;
         for result in results {
-            match result {
+            match result? {
                 Ok(_) => {
                     errs.push(None);
                 }
@@ -531,7 +548,7 @@ impl SetDisks {
 
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
             warn!("rename_part errs {:?}", &errs);
-            Self::cleanup_multipart_path(disks, &[dst_object.to_owned(), format!("{}.meta", dst_object)]).await;
+            Self::cleanup_multipart_path(disks, &[dst_object.to_string(), format!("{}.meta", dst_object)]).await;
             return Err(err);
         }
 
@@ -933,7 +950,7 @@ impl SetDisks {
         let disks = disks.clone();
 
         let (parts_metadata, errs) =
-            Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path, "", false, false).await;
+            Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path, "", false, false).await?;
 
         let map_err_notfound = |err: Error| {
             if is_err_object_not_found(&err) {
@@ -1103,39 +1120,47 @@ impl SetDisks {
         version_id: &str,
         read_data: bool,
         healing: bool,
-    ) -> (Vec<FileInfo>, Vec<Option<Error>>) {
-        let mut futures = Vec::with_capacity(disks.len());
+    ) -> Result<(Vec<FileInfo>, Vec<Option<Error>>)> {
         let mut ress = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
-            let opts = ReadOptions {
-                read_data,
-                healing,
-                ..Default::default()
-            };
-            futures.push(async move {
+        let opts = Arc::new(ReadOptions {
+            read_data,
+            healing,
+            ..Default::default()
+        });
+        let org_bucket = Arc::new(org_bucket.to_string());
+        let bucket = Arc::new(bucket.to_string());
+        let object = Arc::new(object.to_string());
+        let version_id = Arc::new(version_id.to_string());
+        let futures = disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let opts = opts.clone();
+            let org_bucket = org_bucket.clone();
+            let bucket = bucket.clone();
+            let object = object.clone();
+            let version_id = version_id.clone();
+            tokio::spawn(async move {
                 if let Some(disk) = disk {
                     if version_id.is_empty() {
-                        match disk.read_xl(bucket, object, read_data).await {
+                        match disk.read_xl(&bucket, &object, read_data).await {
                             Ok(info) => {
-                                let fi = file_info_from_raw(info, bucket, object, read_data).await?;
+                                let fi = file_info_from_raw(info, &bucket, &object, read_data).await?;
                                 Ok(fi)
                             }
                             Err(err) => Err(err),
                         }
                     } else {
-                        disk.read_version(org_bucket, bucket, object, version_id, &opts).await
+                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                     }
                 } else {
                     Err(Error::new(DiskError::DiskNotFound))
                 }
             })
-        }
+        });
 
         let results = join_all(futures).await;
         for result in results {
-            match result {
+            match result? {
                 Ok(res) => {
                     ress.push(res);
                     errors.push(None);
@@ -1146,7 +1171,7 @@ impl SetDisks {
                 }
             }
         }
-        (ress, errors)
+        Ok((ress, errors))
     }
 
     async fn read_all_xl(
@@ -1759,7 +1784,7 @@ impl SetDisks {
         let vid = opts.version_id.clone().unwrap_or_default();
 
         // TODO: 优化并发 可用数量中断
-        let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await;
+        let (parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false).await?;
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
@@ -2052,7 +2077,7 @@ impl SetDisks {
                     let bucket_partial = bucket_partial.clone();
                     async move {
                         let entry = match entries.resolve(resolver_partial) {
-                            Ok(Some(entry)) => entry,
+                            Some(entry) => entry,
                             _ => match entries.first_found() {
                                 (Some(entry), _) => entry,
                                 _ => return,
@@ -2166,7 +2191,7 @@ impl SetDisks {
 
         let disks = { self.disks.read().await.clone() };
 
-        let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await;
+        let (mut parts_metadata, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true).await?;
         if is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
@@ -3505,7 +3530,7 @@ impl SetDisks {
                             let heal_entry = heal_entry.clone();
                             let resolver = resolver.clone();
                             async move {
-                                let entry = if let Ok(Some(entry)) = entries.resolve(resolver) {
+                                let entry = if let Some(entry) = entries.resolve(resolver) {
                                     entry
                                 } else if let (Some(entry), _) = entries.first_found() {
                                     entry
@@ -3759,7 +3784,7 @@ impl ObjectIO for SetDisks {
 
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
-        let mut erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let is_inline_buffer = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
@@ -3798,19 +3823,18 @@ impl ObjectIO for SetDisks {
         }
 
         let stream = replace(&mut data.stream, Box::new(empty()));
-        let mut etag_stream = EtagReader::new(stream);
+        let etag_stream = EtagReader::new(stream);
 
         // TODO: etag from header
 
-        let w_size = erasure
-            .encode(&mut etag_stream, &mut writers, data.content_length, write_quorum)
+        let (w_size, etag) = Arc::new(erasure)
+            .encode(etag_stream, &mut writers, data.content_length, write_quorum)
             .await?; // TODO: 出错，删除临时目录
 
         if let Err(err) = close_bitrot_writers(&mut writers).await {
             error!("close_bitrot_writers err {:?}", err);
         }
 
-        let etag = etag_stream.etag().await;
         //TODO: userDefined
 
         user_defined.insert("etag".to_owned(), etag.clone());
@@ -3948,7 +3972,7 @@ impl StorageAPI for SetDisks {
 
         let (mut metas, errs) = {
             if let Some(vid) = &src_opts.version_id {
-                Self::read_all_fileinfo(&disks, "", src_bucket, src_object, vid, true, false).await
+                Self::read_all_fileinfo(&disks, "", src_bucket, src_object, vid, true, false).await?
             } else {
                 Self::read_all_xl(&disks, src_bucket, src_object, true, false).await
             }
@@ -4242,7 +4266,7 @@ impl StorageAPI for SetDisks {
                     false,
                     false,
                 )
-                .await
+                .await?
             } else {
                 Self::read_all_xl(&disks, bucket, object, false, false).await
             }
@@ -4382,46 +4406,56 @@ impl StorageAPI for SetDisks {
 
         let part_suffix = format!("part.{}", part_id);
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
-        let tmp_part_path = format!("{}/{}", tmp_part, part_suffix);
+        let tmp_part_path = Arc::new(format!("{}/{}", tmp_part, part_suffix));
 
         let mut writers = Vec::with_capacity(disks.len());
         let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let shared_size = erasure.shard_size(erasure.block_size);
 
-        for disk in disks.iter() {
-            if let Some(disk) = disk {
-                // let writer = disk.append_file(RUSTFS_META_TMP_BUCKET, &tmp_part_path).await?;
-                // let filewriter = disk
-                //     .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, data.content_length)
-                //     .await?;
-                let writer = new_bitrot_filewriter(
-                    disk.clone(),
-                    RUSTFS_META_TMP_BUCKET,
-                    &tmp_part_path,
-                    false,
-                    DEFAULT_BITROT_ALGO,
-                    erasure.shard_size(erasure.block_size),
-                )
-                .await?;
-                writers.push(Some(writer));
-            } else {
-                writers.push(None);
-            }
+        let futures = disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let tmp_part_path = tmp_part_path.clone();
+            tokio::spawn(async move {
+                if let Some(disk) = disk {
+                    // let writer = disk.append_file(RUSTFS_META_TMP_BUCKET, &tmp_part_path).await?;
+                    // let filewriter = disk
+                    //     .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, data.content_length)
+                    //     .await?;
+                    match new_bitrot_filewriter(
+                        disk.clone(),
+                        RUSTFS_META_TMP_BUCKET,
+                        &tmp_part_path,
+                        false,
+                        DEFAULT_BITROT_ALGO,
+                        shared_size,
+                    )
+                    .await
+                    {
+                        Ok(writer) => Ok(Some(writer)),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Ok(None)
+                }
+            })
+        });
+        for x in join_all(futures).await {
+            let x = x??;
+            writers.push(x);
         }
 
-        let mut erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let stream = replace(&mut data.stream, Box::new(empty()));
-        let mut etag_stream = EtagReader::new(stream);
+        let etag_stream = EtagReader::new(stream);
 
-        let w_size = erasure
-            .encode(&mut etag_stream, &mut writers, data.content_length, write_quorum)
+        let (w_size, mut etag) = Arc::new(erasure)
+            .encode(etag_stream, &mut writers, data.content_length, write_quorum)
             .await?;
 
         if let Err(err) = close_bitrot_writers(&mut writers).await {
             error!("close_bitrot_writers err {:?}", err);
         }
-
-        let mut etag = etag_stream.etag().await;
 
         if let Some(ref tag) = opts.preserve_etag {
             etag = tag.clone();
@@ -5036,7 +5070,7 @@ impl StorageAPI for SetDisks {
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
-        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false).await;
+        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false).await?;
         if is_all_not_found(&errs) {
             warn!(
                 "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",

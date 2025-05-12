@@ -4,6 +4,10 @@ use super::options::extract_metadata;
 use super::options::put_opts;
 use crate::auth::get_condition_values;
 use crate::storage::access::ReqInfo;
+use crate::storage::error::to_s3_error;
+use crate::storage::options::copy_dst_opts;
+use crate::storage::options::copy_src_opts;
+use crate::storage::options::{extract_metadata_from_mime, get_opts};
 use api::query::Context;
 use api::query::Query;
 use api::server::dbms::DatabaseManagerSystem;
@@ -61,9 +65,12 @@ use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::fmt::Debug;
+use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_tar::Archive;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
 use tracing::debug;
@@ -72,11 +79,7 @@ use tracing::info;
 use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
-
-use crate::storage::error::to_s3_error;
-use crate::storage::options::copy_dst_opts;
-use crate::storage::options::copy_src_opts;
-use crate::storage::options::{extract_metadata_from_mime, get_opts};
+use zip::CompressionFormat;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -105,6 +108,108 @@ impl FS {
     pub fn new() -> Self {
         // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
         Self {}
+    }
+
+    async fn put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        let PutObjectInput { body, bucket, key, .. } = req.input;
+
+        let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
+
+        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))));
+
+        // let etag_stream = EtagReader::new(body);
+
+        let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
+            return Err(s3_error!(InvalidArgument, "key extension not found"));
+        };
+
+        let ext = ext.to_owned();
+
+        // TODO: spport zip
+        let decoder = CompressionFormat::from_extension(&ext).get_decoder(body).map_err(|e| {
+            error!("get_decoder err {:?}", e);
+            s3_error!(InvalidArgument, "get_decoder err")
+        })?;
+
+        let mut ar = Archive::new(decoder);
+        let mut entries = ar.entries().map_err(|e| {
+            error!("get entries err {:?}", e);
+            s3_error!(InvalidArgument, "get entries err")
+        })?;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        let prefix = req
+            .headers
+            .get("X-Amz-Meta-RustFs-Snowball-Prefix")
+            .map(|v| v.to_str().unwrap_or_default())
+            .unwrap_or_default();
+
+        while let Some(entry) = entries.next().await {
+            let f = match entry {
+                Ok(f) => f,
+                Err(e) => {
+                    println!("Error reading entry: {}", e);
+                    return Err(s3_error!(InvalidArgument, "Error reading entry {:?}", e));
+                }
+            };
+
+            if f.header().entry_type().is_dir() {
+                continue;
+            }
+
+            if let Ok(fpath) = f.path() {
+                let mut fpath = fpath.to_string_lossy().to_string();
+
+                if !prefix.is_empty() {
+                    fpath = format!("{}/{}", prefix, fpath);
+                }
+
+                let size = f.header().size().unwrap_or_default() as usize;
+
+                println!("Extracted: {}, size {}", fpath, size);
+
+                let mut reader = PutObjReader::new(Box::new(f), size);
+
+                let _obj_info = store
+                    .put_object(&bucket, &fpath, &mut reader, &ObjectOptions::default())
+                    .await
+                    .map_err(to_s3_error)?;
+
+                // let e_tag = obj_info.etag;
+
+                // // store.put_object(bucket, object, data, opts);
+
+                // let output = PutObjectOutput {
+                //     e_tag,
+                //     ..Default::default()
+                // };
+            }
+        }
+
+        // match decompress(
+        //     body,
+        //     CompressionFormat::from_extension(&ext),
+        //     |entry: tokio_tar::Entry<tokio_tar::Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>| async move {
+        //         let path = entry.path().unwrap();
+        //         println!("Extracted: {}", path.display());
+        //         Ok(())
+        //     },
+        // )
+        // .await
+        // {
+        //     Ok(_) => println!("解压成功！"),
+        //     Err(e) => println!("解压失败: {}", e),
+        // }
+
+        // TODO: etag
+        let output = PutObjectOutput {
+            // e_tag: Some(etag_stream.etag().await),
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
     }
 }
 #[async_trait::async_trait]
@@ -141,6 +246,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Copy an object from one location to another
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let CopyObjectInput {
@@ -227,6 +333,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Delete a bucket
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
@@ -249,6 +356,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
+    /// Delete an object
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let DeleteObjectInput {
@@ -308,6 +416,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Delete multiple objects
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         // info!("delete_objects args {:?}", req.input);
@@ -367,6 +476,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Get bucket location
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
         // mc get  1
@@ -385,6 +495,7 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
+    /// Get bucket notification
     #[tracing::instrument(
         level = "debug",
         skip(self, req),
@@ -401,6 +512,8 @@ impl S3 for FS {
             range,
             ..
         } = req.input;
+
+        // TODO: getObjectInArchiveFileHandler object = xxx.zip/xxx/xxx.xxx
 
         // let range = HTTPRangeSpec::nil();
 
@@ -797,8 +910,16 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument(level = "debug", skip(self, req))]
+    // #[tracing::instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        if req
+            .headers
+            .get("X-Amz-Meta-Snowball-Auto-Extract")
+            .is_some_and(|v| v.to_str().unwrap_or_default() == "true")
+        {
+            return self.put_object_extract(req).await;
+        }
+
         let input = req.input;
 
         if let Some(ref storage_class) = input.storage_class {
@@ -1890,14 +2011,14 @@ impl S3 for FS {
     ) -> S3Result<S3Response<SelectObjectContentOutput>> {
         info!("handle select_object_content");
 
-        let input = req.input;
+        let input = Arc::new(req.input);
         info!("{:?}", input);
 
         let db = make_rustfsms(input.clone(), false).await.map_err(|e| {
             error!("make db failed, {}", e.to_string());
             s3_error!(InternalError, "{}", e.to_string())
         })?;
-        let query = Query::new(Context { input: input.clone() }, input.request.expression);
+        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
         let result = db
             .execute(&query)
             .await

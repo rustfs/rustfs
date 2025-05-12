@@ -59,30 +59,12 @@ export RUSTFS_ADDRESS="0.0.0.0:9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9001"
 
-# Observability config (option 1: config file)
+# Observability config
 export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
 
-# Observability config (option 2: environment variables)
-export RUSTFS__OBSERVABILITY__ENDPOINT=http://localhost:4317
-export RUSTFS__OBSERVABILITY__USE_STDOUT=true
-export RUSTFS__OBSERVABILITY__SAMPLE_RATIO=2.0
-export RUSTFS__OBSERVABILITY__METER_INTERVAL=30
-export RUSTFS__OBSERVABILITY__SERVICE_NAME=rustfs
-export RUSTFS__OBSERVABILITY__SERVICE_VERSION=0.1.0
-export RUSTFS__OBSERVABILITY__ENVIRONMENT=develop
-export RUSTFS__OBSERVABILITY__LOGGER_LEVEL=info
-export RUSTFS__OBSERVABILITY__LOCAL_LOGGING_ENABLED=true
+# Event message configuration
+#export RUSTFS_EVENT_CONFIG="./deploy/config/event.toml"
 
-# Logging sinks
-export RUSTFS__SINKS__FILE__ENABLED=true
-export RUSTFS__SINKS__FILE__PATH="./deploy/logs/rustfs.log"
-export RUSTFS__SINKS__WEBHOOK__ENABLED=false
-export RUSTFS__SINKS__WEBHOOK__ENDPOINT=""
-export RUSTFS__SINKS__WEBHOOK__AUTH_TOKEN=""
-export RUSTFS__SINKS__KAFKA__ENABLED=false
-export RUSTFS__SINKS__KAFKA__BOOTSTRAP_SERVERS=""
-export RUSTFS__SINKS__KAFKA__TOPIC=""
-export RUSTFS__LOGGER__QUEUE_CAPACITY=10
 ```
 
 #### Start the service
@@ -102,7 +84,7 @@ export RUSTFS__LOGGER__QUEUE_CAPACITY=10
 
 2. Start the observability stack:
    ```bash
-   docker compose up -d -f docker-compose.yml
+   docker compose -f docker-compose.yml  up -d
    ```
 
 #### Access Monitoring Dashboards
@@ -116,7 +98,7 @@ export RUSTFS__LOGGER__QUEUE_CAPACITY=10
 1. Copy the example configuration:
    ```bash
    cd deploy/config
-   cp obs.toml.example obs.toml
+   cp obs.example.toml obs.toml
    ```
 
 2. Edit `obs.toml` with the following parameters:

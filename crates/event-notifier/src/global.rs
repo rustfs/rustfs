@@ -1,6 +1,7 @@
 use crate::{create_adapters, Error, Event, NotifierConfig, NotifierSystem};
 use std::sync::{atomic, Arc};
 use tokio::sync::{Mutex, OnceCell};
+use tracing::instrument;
 
 static GLOBAL_SYSTEM: OnceCell<Arc<Mutex<NotifierSystem>>> = OnceCell::const_new();
 static INITIALIZED: atomic::AtomicBool = atomic::AtomicBool::new(false);
@@ -113,6 +114,7 @@ pub fn is_ready() -> bool {
 /// - The system is not initialized.
 /// - The system is not ready.
 /// - Sending the event fails.
+#[instrument(fields(event))]
 pub async fn send_event(event: Event) -> Result<(), Error> {
     if !READY.load(atomic::Ordering::SeqCst) {
         return Err(Error::custom("Notification system not ready, please wait for initialization to complete"));
@@ -124,6 +126,7 @@ pub async fn send_event(event: Event) -> Result<(), Error> {
 }
 
 /// Shuts down the notification system.
+#[instrument]
 pub async fn shutdown() -> Result<(), Error> {
     if let Some(system) = GLOBAL_SYSTEM.get() {
         tracing::info!("Shutting down notification system start");
@@ -189,7 +192,7 @@ mod tests {
         let config = NotifierConfig::default();
         let _ = initialize(config.clone()).await; // first initialization
         let result = initialize(config).await; // second initialization
-        assert!(!result.is_ok(), "Initialization should succeed");
+        assert!(result.is_err(), "Initialization should succeed");
         assert!(result.is_err(), "Re-initialization should fail");
     }
 
@@ -211,7 +214,7 @@ mod tests {
             ..Default::default()
         };
         let result = initialize(config).await;
-        assert!(!result.is_err(), "Initialization with invalid config should fail");
+        assert!(result.is_ok(), "Initialization with invalid config should fail");
         assert!(is_initialized(), "System should not be marked as initialized after failure");
         assert!(is_ready(), "System should not be marked as ready after failure");
     }

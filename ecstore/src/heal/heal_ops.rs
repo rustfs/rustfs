@@ -17,7 +17,7 @@ use crate::{
     global::GLOBAL_IsDistErasure,
     heal::heal_commands::{HealStartSuccess, HEAL_UNKNOWN_SCAN},
     new_object_layer_fn,
-    utils::path::has_profix,
+    utils::path::has_prefix,
 };
 use crate::{
     heal::heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT},
@@ -786,7 +786,7 @@ impl AllHealState {
         let _ = self.mu.write().await;
 
         for (k, v) in self.heal_seq_map.read().await.iter() {
-            if (has_profix(k, path_s) || has_profix(path_s, k)) && !v.has_ended().await {
+            if (has_prefix(k, path_s) || has_prefix(path_s, k)) && !v.has_ended().await {
                 return Err(Error::from_string(format!(
                     "The provided heal sequence path overlaps with an existing heal path: {}",
                     k

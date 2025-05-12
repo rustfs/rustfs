@@ -1,5 +1,3 @@
-use crate::global::{ENVIRONMENT, LOGGER_LEVEL, METER_INTERVAL, SAMPLE_RATIO, SERVICE_NAME, SERVICE_VERSION, USE_STDOUT};
-use crate::utils::get_local_ip_with_default;
 use crate::OtelConfig;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{global, KeyValue};
@@ -15,6 +13,8 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
     SCHEMA_URL,
 };
+use rustfs_config::{APP_NAME, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT};
+use rustfs_utils::get_local_ip_with_default;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::io::IsTerminal;
@@ -70,7 +70,7 @@ impl Drop for OtelGuard {
 /// create OpenTelemetry Resource
 fn resource(config: &OtelConfig) -> Resource {
     Resource::builder()
-        .with_service_name(Cow::Borrowed(config.service_name.as_deref().unwrap_or(SERVICE_NAME)).to_string())
+        .with_service_name(Cow::Borrowed(config.service_name.as_deref().unwrap_or(APP_NAME)).to_string())
         .with_schema_url(
             [
                 KeyValue::new(
@@ -101,8 +101,8 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     let endpoint = &config.endpoint;
     let use_stdout = config.use_stdout.unwrap_or(USE_STDOUT);
     let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
-    let logger_level = config.logger_level.as_deref().unwrap_or(LOGGER_LEVEL);
-    let service_name = config.service_name.as_deref().unwrap_or(SERVICE_NAME);
+    let logger_level = config.logger_level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
+    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
 
     // Pre-create resource objects to avoid repeated construction
     let res = resource(config);
@@ -210,7 +210,8 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             .with_thread_names(true)
             .with_thread_ids(true)
             .with_file(true)
-            .with_line_number(true);
+            .with_line_number(true)
+            .with_filter(build_env_filter(logger_level, None));
 
         let filter = build_env_filter(logger_level, None);
         let otel_filter = build_env_filter(logger_level, None);
@@ -218,7 +219,7 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
 
         // Configure registry to avoid repeated calls to filter methods
-        let _registry = tracing_subscriber::registry()
+        tracing_subscriber::registry()
             .with(filter)
             .with(ErrorLayer::default())
             .with(if config.local_logging_enabled.unwrap_or(false) {
@@ -230,10 +231,13 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             .with(otel_layer)
             .with(MetricsLayer::new(meter_provider.clone()))
             .init();
+
         if !endpoint.is_empty() {
             info!(
-                "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {}",
-                endpoint, logger_level
+                "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {},RUST_LOG env: {}",
+                endpoint,
+                logger_level,
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "未设置".to_string())
             );
         }
     }
@@ -248,7 +252,6 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilter {
     let level = default_level.unwrap_or(logger_level);
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-
     if !matches!(logger_level, "trace" | "debug") {
         let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
         for directive in directives {

@@ -204,7 +204,7 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
                     }
                 }
                 Err(err) => {
-                    error!("init storageclass err:{:?}", &err);
+                    error!("init storage class err:{:?}", &err);
                     break;
                 }
             }

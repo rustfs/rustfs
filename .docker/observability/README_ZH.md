@@ -9,7 +9,7 @@ Jaeger、Prometheus 等）而需要运行和维护多个代理/收集器的必�
 2. 执行以下命令启动服务：
 
 ```bash
-docker compose up -d -f docker-compose.yml
+docker compose -f docker-compose.yml  up -d
 ```
 
 ### 访问监控面板
@@ -34,7 +34,7 @@ docker compose up -d -f docker-compose.yml
 | service_name    | 服务名称                       | rustfs                |
 | service_version | 服务版本                       | 1.0.0                 |
 | environment     | 运行环境                       | production            |
-| meter_interval  | 指标导出间隔 (秒)                  | 30                    |
+| meter_interval  | 指标导出间隔 (秒)               | 30                  |
 | sample_ratio    | 采样率                        | 1.0                   |
 | use_stdout      | 是否输出到控制台                   | true/false            |
 | logger_level    | 日志级别                       | info                  |

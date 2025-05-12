@@ -1,4 +1,3 @@
-use crate::config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use crate::license::get_license;
 use axum::{
     body::Body,
@@ -8,6 +7,7 @@ use axum::{
     Router,
 };
 use axum_extra::extract::Host;
+use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use std::io;
 
 use axum::response::Redirect;
@@ -17,7 +17,7 @@ use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use shadow_rs::shadow;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::signal;
@@ -33,7 +33,8 @@ const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 #[folder = "$CARGO_MANIFEST_DIR/static"]
 struct StaticFiles;
 
-async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
+/// Static file handler
+async fn static_handler(uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
     if path.is_empty() {
         path = "index.html"
@@ -72,7 +73,7 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    fn new(local_ip: Ipv4Addr, port: u16, version: &str, date: &str) -> Self {
+    fn new(local_ip: IpAddr, port: u16, version: &str, date: &str) -> Self {
         Config {
             port,
             api: Api {
@@ -143,7 +144,7 @@ struct License {
 pub(crate) static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[allow(clippy::const_is_empty)]
-pub(crate) fn init_console_cfg(local_ip: Ipv4Addr, port: u16) {
+pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
     CONSOLE_CONFIG.get_or_init(|| {
         let ver = {
             if !build::TAG.is_empty() {
@@ -193,7 +194,7 @@ fn _is_private_ip(ip: std::net::IpAddr) -> bool {
 async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
     let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or("http");
 
-    // 从 uri 中获取 host，如果没有则使用 Host extractor 的值
+    // Get the host from the uri and use the value of the host extractor if it doesn't have one
     let host = uri.host().unwrap_or(host.as_str());
 
     let host = if host.contains(':') {
@@ -203,7 +204,7 @@ async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
         host
     };
 
-    // 将当前配置复制一份
+    // Make a copy of the current configuration
     let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
 
     let url = format!("{}://{}:{}", scheme, host, cfg.port);
@@ -219,14 +220,14 @@ async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
 
 pub async fn start_static_file_server(
     addrs: &str,
-    local_ip: Ipv4Addr,
+    local_ip: IpAddr,
     access_key: &str,
     secret_key: &str,
     tls_path: Option<String>,
 ) {
-    // 配置 CORS
+    // Configure CORS
     let cors = CorsLayer::new()
-        .allow_origin(Any) // 生产环境建议指定具体域名
+        .allow_origin(Any) // In the production environment, we recommend that you specify a specific domain name
         .allow_methods([http::Method::GET, http::Method::POST])
         .allow_headers([header::CONTENT_TYPE]);
     // Create a route
@@ -298,7 +299,7 @@ async fn start_server(server_addr: SocketAddr, tls_path: Option<String>, app: Ro
 }
 
 #[allow(dead_code)]
-/// HTTP 到 HTTPS 的 308 重定向
+/// 308 redirect for HTTP to HTTPS
 fn redirect_to_https(https_port: u16) -> Router {
     Router::new().route(
         "/*path",

@@ -1,0 +1,25 @@
+[package]
+name = "rustfs-utils"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+local-ip-address = { workspace = true, optional = true }
+rustfs-config = { workspace = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default = ["ip"]  # features that are enabled by default
+ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
+net = ["ip"]  # empty network features
+full = ["ip", "tls", "net"]  # all features

@@ -106,14 +106,24 @@ pub async fn access(path: impl AsRef<Path>) -> io::Result<()> {
     Ok(())
 }
 
+pub fn access_std(path: impl AsRef<Path>) -> io::Result<()> {
+    std::fs::metadata(path)?;
+    Ok(())
+}
+
 pub async fn lstat(path: impl AsRef<Path>) -> io::Result<Metadata> {
     fs::metadata(path).await
+}
+
+pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
+    std::fs::metadata(path)
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir_all(path.as_ref()).await
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
     let meta = fs::metadata(path.as_ref()).await?;
     if meta.is_dir() {
@@ -132,6 +142,25 @@ pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
     }
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
+pub fn remove_std(path: impl AsRef<Path>) -> io::Result<()> {
+    let meta = std::fs::metadata(path.as_ref())?;
+    if meta.is_dir() {
+        std::fs::remove_dir(path.as_ref())
+    } else {
+        std::fs::remove_file(path.as_ref())
+    }
+}
+
+pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
+    let meta = std::fs::metadata(path.as_ref())?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path.as_ref())
+    } else {
+        std::fs::remove_file(path.as_ref())
+    }
+}
+
 pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir(path.as_ref()).await
 }
@@ -140,6 +169,11 @@ pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<
     fs::rename(from, to).await
 }
 
+pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     fs::read(path.as_ref()).await
 }

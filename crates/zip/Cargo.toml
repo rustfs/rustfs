@@ -1,0 +1,28 @@
+[package]
+name = "zip"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+
+[dependencies]
+async-compression = { version = "0.4.0", features = [
+    "tokio",
+    "bzip2",
+    "gzip",
+    "zlib",
+    "zstd",
+    "xz",
+] }
+# async_zip = { version = "0.0.17", features = ["tokio"] }
+# rc-zip-tokio = "4.2.6"
+tokio = { version = "1.45.0", features = ["full"] }
+tokio-stream = "0.1.17"
+tokio-tar = { workspace = true }
+xz2 = { version = "0.1", optional = true, features = ["static"] }
+
+
+[lints]
+workspace = true
