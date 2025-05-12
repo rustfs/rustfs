@@ -14,3 +14,4 @@ deploy/config/obs.toml
 deploy/certs/*
 *jsonl
 .env
+.rustfs.sys

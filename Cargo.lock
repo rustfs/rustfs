@@ -7402,6 +7402,7 @@ dependencies = [
  "rdkafka",
  "reqwest",
  "rustfs-config",
+ "rustfs-utils",
  "serde",
  "serde_json",
  "smallvec",

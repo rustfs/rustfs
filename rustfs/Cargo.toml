@@ -55,7 +55,7 @@ rmp-serde.workspace = true
 rustfs-config = { workspace = true }
 rustfs-event-notifier = { workspace = true }
 rustfs-obs = { workspace = true }
-rustfs-utils = { workspace = true }
+rustfs-utils = { workspace = true, features = ["full"] }
 rustls.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
