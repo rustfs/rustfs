@@ -35,7 +35,6 @@ rdkafka = { workspace = true, features = ["tokio"], optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
-http = { workspace = true }
 axum = { workspace = true }
 dotenvy = "0.15.7"
 

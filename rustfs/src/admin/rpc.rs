@@ -22,7 +22,7 @@ use tokio_util::io::StreamReader;
 
 pub const RPC_PREFIX: &str = "/rustfs/rpc";
 
-pub fn regist_rpc_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
+pub fn register_rpc_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
     r.insert(
         Method::GET,
         format!("{}{}", RPC_PREFIX, "/read_file_stream").as_str(),

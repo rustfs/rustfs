@@ -21,6 +21,7 @@ rustfs-config = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
+lazy_static = { workspace = true }
 local-ip-address = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }

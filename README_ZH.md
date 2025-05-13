@@ -113,5 +113,3 @@ export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
 | use_stdout           | 是否输出到控制台                   | true/false            |
 | logger_level         | 日志级别                       | info                  |
 | local_logging_enable | 控制台是否答应日志                  | true/false            |
-
-```
