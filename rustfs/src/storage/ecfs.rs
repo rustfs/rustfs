@@ -2055,7 +2055,7 @@ impl S3 for FS {
         };
 
         store.put_object_metadata(&bucket, &key, &popts).await.map_err(|e| {
-            error!("get_object_info failed, {}", e.to_string());
+            error!("put_object_metadata failed, {}", e.to_string());
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
