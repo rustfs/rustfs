@@ -1,4 +1,5 @@
 /// The metric name is the individual name of the metric
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricName {
     // 通用指标名称
@@ -158,6 +159,15 @@ pub enum MetricName {
     ApiTrafficSentBytes,
     ApiTrafficRecvBytes,
 
+    // 审计指标
+    AuditFailedMessages,
+    AuditTargetQueueLength,
+    AuditTotalMessages,
+
+    // 集群配置相关指标
+    ConfigRRSParity,
+    ConfigStandardParity,
+
     // 自定义指标
     Custom(String),
 }
@@ -302,6 +312,14 @@ impl MetricName {
 
             Self::ApiTrafficSentBytes => "traffic_sent_bytes".to_string(),
             Self::ApiTrafficRecvBytes => "traffic_received_bytes".to_string(),
+
+            Self::AuditFailedMessages => "failed_messages".to_string(),
+            Self::AuditTargetQueueLength => "target_queue_length".to_string(),
+            Self::AuditTotalMessages => "total_messages".to_string(),
+
+            /// metrics related to cluster configurations
+            Self::ConfigRRSParity => "rrs_parity".to_string(),
+            Self::ConfigStandardParity => "standard_parity".to_string(),
 
             Self::Custom(name) => name.clone(),
         }
