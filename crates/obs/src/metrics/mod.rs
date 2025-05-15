@@ -1,8 +1,22 @@
 mod audit;
 mod bucket;
 mod bucket_replication;
+mod cluster_erasure_set;
+mod cluster_health;
+mod cluster_iam;
+mod cluster_notification;
+mod cluster_usage;
 mod entry;
+mod ilm;
+mod logger_webhook;
+mod replication;
 mod request;
+mod scanner;
+mod system_cpu;
+mod system_drive;
+mod system_memory;
+mod system_network;
+mod system_process;
 
 pub use entry::descriptor::MetricDescriptor;
 pub use entry::metric_name::MetricName;

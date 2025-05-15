@@ -1,27 +1,27 @@
 use crate::metrics::entry::path_utils::format_path_to_metric_name;
 
 /// The metrics subsystem is a subgroup of metrics within a namespace
-/// 指标子系统，表示命名空间内指标的子分组
+/// The metrics subsystem, which represents a subgroup of metrics within a namespace
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetricSubsystem {
-    // API 相关子系统
+    // API related subsystems
     ApiRequests,
 
-    // 桶相关子系统
+    // bucket related subsystems
     BucketApi,
     BucketReplication,
 
-    // 系统相关子系统
+    // system related subsystems
     SystemNetworkInternode,
     SystemDrive,
     SystemMemory,
     SystemCpu,
     SystemProcess,
 
-    // 调试相关子系统
+    // debug related subsystems
     DebugGo,
 
-    // 集群相关子系统
+    // cluster related subsystems
     ClusterHealth,
     ClusterUsageObjects,
     ClusterUsageBuckets,
@@ -29,7 +29,7 @@ pub enum MetricSubsystem {
     ClusterIam,
     ClusterConfig,
 
-    // 其他服务相关子系统
+    // other service related subsystems
     Ilm,
     Audit,
     LoggerWebhook,
@@ -37,32 +37,32 @@ pub enum MetricSubsystem {
     Notification,
     Scanner,
 
-    // 自定义路径
+    // Custom paths
     Custom(String),
 }
 
 impl MetricSubsystem {
-    /// 获取原始路径字符串
+    /// Gets the original path string
     pub fn path(&self) -> &str {
         match self {
-            // API 相关子系统
+            // api related subsystems
             Self::ApiRequests => "/api/requests",
 
-            // 桶相关子系统
+            // bucket related subsystems
             Self::BucketApi => "/bucket/api",
             Self::BucketReplication => "/bucket/replication",
 
-            // 系统相关子系统
+            // system related subsystems
             Self::SystemNetworkInternode => "/system/network/internode",
             Self::SystemDrive => "/system/drive",
             Self::SystemMemory => "/system/memory",
             Self::SystemCpu => "/system/cpu",
             Self::SystemProcess => "/system/process",
 
-            // 调试相关子系统
+            // debug related subsystems
             Self::DebugGo => "/debug/go",
 
-            // 集群相关子系统
+            // cluster related subsystems
             Self::ClusterHealth => "/cluster/health",
             Self::ClusterUsageObjects => "/cluster/usage/objects",
             Self::ClusterUsageBuckets => "/cluster/usage/buckets",
@@ -70,7 +70,7 @@ impl MetricSubsystem {
             Self::ClusterIam => "/cluster/iam",
             Self::ClusterConfig => "/cluster/config",
 
-            // 其他服务相关子系统
+            // other service related subsystems
             Self::Ilm => "/ilm",
             Self::Audit => "/audit",
             Self::LoggerWebhook => "/logger/webhook",
@@ -78,17 +78,18 @@ impl MetricSubsystem {
             Self::Notification => "/notification",
             Self::Scanner => "/scanner",
 
-            // 自定义路径
+            // Custom paths
             Self::Custom(path) => path,
         }
     }
 
-    /// 获取格式化后的指标名称格式字符串
+    /// Get the formatted metric name format string
+    #[allow(dead_code)]
     pub fn as_str(&self) -> String {
         format_path_to_metric_name(self.path())
     }
 
-    /// 从路径字符串创建子系统枚举
+    /// Create a subsystem enumeration from a path string
     pub fn from_path(path: &str) -> Self {
         match path {
             // API 相关子系统
@@ -129,13 +130,14 @@ impl MetricSubsystem {
         }
     }
 
-    // 便利方法，直接创建自定义子系统
+    /// A convenient way to create custom subsystems directly
+    #[allow(dead_code)]
     pub fn new(path: impl Into<String>) -> Self {
         Self::Custom(path.into())
     }
 }
 
-// 便于与字符串相互转换的实现
+/// Implementations that facilitate conversion to and from strings
 impl From<&str> for MetricSubsystem {
     fn from(s: &str) -> Self {
         Self::from_path(s)
@@ -158,10 +160,10 @@ impl std::fmt::Display for MetricSubsystem {
 pub mod subsystems {
     use super::MetricSubsystem;
 
-    // 集群基本路径常量
+    // cluster base path constant
     pub const CLUSTER_BASE_PATH: &str = "/cluster";
 
-    // 快捷访问各子系统的常量
+    // Quick access to constants for each subsystem
     pub const API_REQUESTS: MetricSubsystem = MetricSubsystem::ApiRequests;
     pub const BUCKET_API: MetricSubsystem = MetricSubsystem::BucketApi;
     pub const BUCKET_REPLICATION: MetricSubsystem = MetricSubsystem::BucketReplication;
@@ -198,7 +200,7 @@ mod tests {
         assert_eq!(MetricSubsystem::BucketApi.as_str(), "bucket_api");
         assert_eq!(MetricSubsystem::ClusterHealth.as_str(), "cluster_health");
 
-        // 测试自定义路径
+        // Test custom paths
         let custom = MetricSubsystem::new("/custom/path-test");
         assert_eq!(custom.as_str(), "custom_path_test");
     }

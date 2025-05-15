@@ -38,6 +38,7 @@ impl MetricDescriptor {
     }
 
     /// 获取完整的指标名称，包含前缀和格式化路径
+    #[allow(dead_code)]
     pub fn get_full_metric_name(&self) -> String {
         let prefix = self.metric_type.to_prom();
         let namespace = self.namespace.as_str();

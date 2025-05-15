@@ -1,3 +1,4 @@
+/// Bucket copy metric descriptor
 use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
 // Label constants
@@ -6,7 +7,6 @@ pub const OPERATION_L: &str = "operation";
 pub const TARGET_ARN_L: &str = "targetArn";
 pub const RANGE_L: &str = "range";
 
-/// Bucket copy metric descriptor
 lazy_static::lazy_static! {
     pub static ref BUCKET_REPL_LAST_HR_FAILED_BYTES_MD: MetricDescriptor =
         new_gauge_md(

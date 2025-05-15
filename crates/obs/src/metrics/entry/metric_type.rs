@@ -20,6 +20,7 @@ impl MetricType {
 
     /// Convert the metric type to the Prometheus value type
     /// In a Rust implementation, this might return the corresponding Prometheus Rust client type
+    #[allow(dead_code)]
     pub fn to_prom(&self) -> &'static str {
         match self {
             Self::Counter => "counter.",

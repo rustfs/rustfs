@@ -168,11 +168,175 @@ pub enum MetricName {
     ConfigRRSParity,
     ConfigStandardParity,
 
+    // 纠删码集合相关指标
+    ErasureSetOverallWriteQuorum,
+    ErasureSetOverallHealth,
+    ErasureSetReadQuorum,
+    ErasureSetWriteQuorum,
+    ErasureSetOnlineDrivesCount,
+    ErasureSetHealingDrivesCount,
+    ErasureSetHealth,
+    ErasureSetReadTolerance,
+    ErasureSetWriteTolerance,
+    ErasureSetReadHealth,
+    ErasureSetWriteHealth,
+
+    // 集群健康相关指标
+    HealthDrivesOfflineCount,
+    HealthDrivesOnlineCount,
+    HealthDrivesCount,
+
+    // IAM 相关指标
+    LastSyncDurationMillis,
+    PluginAuthnServiceFailedRequestsMinute,
+    PluginAuthnServiceLastFailSeconds,
+    PluginAuthnServiceLastSuccSeconds,
+    PluginAuthnServiceSuccAvgRttMsMinute,
+    PluginAuthnServiceSuccMaxRttMsMinute,
+    PluginAuthnServiceTotalRequestsMinute,
+    SinceLastSyncMillis,
+    SyncFailures,
+    SyncSuccesses,
+
+    // 通知相关指标
+    NotificationCurrentSendInProgress,
+    NotificationEventsErrorsTotal,
+    NotificationEventsSentTotal,
+    NotificationEventsSkippedTotal,
+
+    // 集群对象使用情况相关指标
+    UsageSinceLastUpdateSeconds,
+    UsageTotalBytes,
+    UsageObjectsCount,
+    UsageVersionsCount,
+    UsageDeleteMarkersCount,
+    UsageBucketsCount,
+    UsageSizeDistribution,
+    UsageVersionCountDistribution,
+
+    // 桶使用情况相关指标
+    UsageBucketQuotaTotalBytes,
+    UsageBucketTotalBytes,
+    UsageBucketObjectsCount,
+    UsageBucketVersionsCount,
+    UsageBucketDeleteMarkersCount,
+    UsageBucketObjectSizeDistribution,
+    UsageBucketObjectVersionCountDistribution,
+
+    // ILM 相关指标
+    IlmExpiryPendingTasks,
+    IlmTransitionActiveTasks,
+    IlmTransitionPendingTasks,
+    IlmTransitionMissedImmediateTasks,
+    IlmVersionsScanned,
+
+    // Webhook 日志相关指标
+    WebhookQueueLength,
+    WebhookTotalMessages,
+    WebhookFailedMessages,
+
+    // 复制相关指标
+    ReplicationAverageActiveWorkers,
+    ReplicationAverageQueuedBytes,
+    ReplicationAverageQueuedCount,
+    ReplicationAverageDataTransferRate,
+    ReplicationCurrentActiveWorkers,
+    ReplicationCurrentDataTransferRate,
+    ReplicationLastMinuteQueuedBytes,
+    ReplicationLastMinuteQueuedCount,
+    ReplicationMaxActiveWorkers,
+    ReplicationMaxQueuedBytes,
+    ReplicationMaxQueuedCount,
+    ReplicationMaxDataTransferRate,
+    ReplicationRecentBacklogCount,
+
+    // 扫描器相关指标
+    ScannerBucketScansFinished,
+    ScannerBucketScansStarted,
+    ScannerDirectoriesScanned,
+    ScannerObjectsScanned,
+    ScannerVersionsScanned,
+    ScannerLastActivitySeconds,
+
+    // CPU 系统相关指标
+    SysCPUAvgIdle,
+    SysCPUAvgIOWait,
+    SysCPULoad,
+    SysCPULoadPerc,
+    SysCPUNice,
+    SysCPUSteal,
+    SysCPUSystem,
+    SysCPUUser,
+
+    // 驱动器相关指标
+    DriveUsedBytes,
+    DriveFreeBytes,
+    DriveTotalBytes,
+    DriveUsedInodes,
+    DriveFreeInodes,
+    DriveTotalInodes,
+    DriveTimeoutErrorsTotal,
+    DriveIOErrorsTotal,
+    DriveAvailabilityErrorsTotal,
+    DriveWaitingIO,
+    DriveAPILatencyMicros,
+    DriveHealth,
+
+    DriveOfflineCount,
+    DriveOnlineCount,
+    DriveCount,
+
+    // iostat 相关指标
+    DriveReadsPerSec,
+    DriveReadsKBPerSec,
+    DriveReadsAwait,
+    DriveWritesPerSec,
+    DriveWritesKBPerSec,
+    DriveWritesAwait,
+    DrivePercUtil,
+
+    // 内存相关指标
+    MemTotal,
+    MemUsed,
+    MemUsedPerc,
+    MemFree,
+    MemBuffers,
+    MemCache,
+    MemShared,
+    MemAvailable,
+
+    // 网络相关指标
+    InternodeErrorsTotal,
+    InternodeDialErrorsTotal,
+    InternodeDialAvgTimeNanos,
+    InternodeSentBytesTotal,
+    InternodeRecvBytesTotal,
+
+    // 进程相关指标
+    ProcessLocksReadTotal,
+    ProcessLocksWriteTotal,
+    ProcessCPUTotalSeconds,
+    ProcessGoRoutineTotal,
+    ProcessIORCharBytes,
+    ProcessIOReadBytes,
+    ProcessIOWCharBytes,
+    ProcessIOWriteBytes,
+    ProcessStartTimeSeconds,
+    ProcessUptimeSeconds,
+    ProcessFileDescriptorLimitTotal,
+    ProcessFileDescriptorOpenTotal,
+    ProcessSyscallReadTotal,
+    ProcessSyscallWriteTotal,
+    ProcessResidentMemoryBytes,
+    ProcessVirtualMemoryBytes,
+    ProcessVirtualMemoryMaxBytes,
+
     // 自定义指标
     Custom(String),
 }
 
 impl MetricName {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> String {
         match self {
             Self::AuthTotal => "auth_total".to_string(),
@@ -317,9 +481,172 @@ impl MetricName {
             Self::AuditTargetQueueLength => "target_queue_length".to_string(),
             Self::AuditTotalMessages => "total_messages".to_string(),
 
-            /// metrics related to cluster configurations
+            // metrics related to cluster configurations
             Self::ConfigRRSParity => "rrs_parity".to_string(),
             Self::ConfigStandardParity => "standard_parity".to_string(),
+
+            // 纠删码集合相关指标
+            Self::ErasureSetOverallWriteQuorum => "overall_write_quorum".to_string(),
+            Self::ErasureSetOverallHealth => "overall_health".to_string(),
+            Self::ErasureSetReadQuorum => "read_quorum".to_string(),
+            Self::ErasureSetWriteQuorum => "write_quorum".to_string(),
+            Self::ErasureSetOnlineDrivesCount => "online_drives_count".to_string(),
+            Self::ErasureSetHealingDrivesCount => "healing_drives_count".to_string(),
+            Self::ErasureSetHealth => "health".to_string(),
+            Self::ErasureSetReadTolerance => "read_tolerance".to_string(),
+            Self::ErasureSetWriteTolerance => "write_tolerance".to_string(),
+            Self::ErasureSetReadHealth => "read_health".to_string(),
+            Self::ErasureSetWriteHealth => "write_health".to_string(),
+
+            // 集群健康相关指标
+            Self::HealthDrivesOfflineCount => "drives_offline_count".to_string(),
+            Self::HealthDrivesOnlineCount => "drives_online_count".to_string(),
+            Self::HealthDrivesCount => "drives_count".to_string(),
+
+            // IAM 相关指标
+            Self::LastSyncDurationMillis => "last_sync_duration_millis".to_string(),
+            Self::PluginAuthnServiceFailedRequestsMinute => "plugin_authn_service_failed_requests_minute".to_string(),
+            Self::PluginAuthnServiceLastFailSeconds => "plugin_authn_service_last_fail_seconds".to_string(),
+            Self::PluginAuthnServiceLastSuccSeconds => "plugin_authn_service_last_succ_seconds".to_string(),
+            Self::PluginAuthnServiceSuccAvgRttMsMinute => "plugin_authn_service_succ_avg_rtt_ms_minute".to_string(),
+            Self::PluginAuthnServiceSuccMaxRttMsMinute => "plugin_authn_service_succ_max_rtt_ms_minute".to_string(),
+            Self::PluginAuthnServiceTotalRequestsMinute => "plugin_authn_service_total_requests_minute".to_string(),
+            Self::SinceLastSyncMillis => "since_last_sync_millis".to_string(),
+            Self::SyncFailures => "sync_failures".to_string(),
+            Self::SyncSuccesses => "sync_successes".to_string(),
+
+            // 通知相关指标
+            Self::NotificationCurrentSendInProgress => "current_send_in_progress".to_string(),
+            Self::NotificationEventsErrorsTotal => "events_errors_total".to_string(),
+            Self::NotificationEventsSentTotal => "events_sent_total".to_string(),
+            Self::NotificationEventsSkippedTotal => "events_skipped_total".to_string(),
+
+            // 集群对象使用情况相关指标
+            Self::UsageSinceLastUpdateSeconds => "since_last_update_seconds".to_string(),
+            Self::UsageTotalBytes => "total_bytes".to_string(),
+            Self::UsageObjectsCount => "count".to_string(),
+            Self::UsageVersionsCount => "versions_count".to_string(),
+            Self::UsageDeleteMarkersCount => "delete_markers_count".to_string(),
+            Self::UsageBucketsCount => "buckets_count".to_string(),
+            Self::UsageSizeDistribution => "size_distribution".to_string(),
+            Self::UsageVersionCountDistribution => "version_count_distribution".to_string(),
+
+            // 桶使用情况相关指标
+            Self::UsageBucketQuotaTotalBytes => "quota_total_bytes".to_string(),
+            Self::UsageBucketTotalBytes => "total_bytes".to_string(),
+            Self::UsageBucketObjectsCount => "objects_count".to_string(),
+            Self::UsageBucketVersionsCount => "versions_count".to_string(),
+            Self::UsageBucketDeleteMarkersCount => "delete_markers_count".to_string(),
+            Self::UsageBucketObjectSizeDistribution => "object_size_distribution".to_string(),
+            Self::UsageBucketObjectVersionCountDistribution => "object_version_count_distribution".to_string(),
+
+            // ILM 相关指标
+            Self::IlmExpiryPendingTasks => "expiry_pending_tasks".to_string(),
+            Self::IlmTransitionActiveTasks => "transition_active_tasks".to_string(),
+            Self::IlmTransitionPendingTasks => "transition_pending_tasks".to_string(),
+            Self::IlmTransitionMissedImmediateTasks => "transition_missed_immediate_tasks".to_string(),
+            Self::IlmVersionsScanned => "versions_scanned".to_string(),
+
+            // Webhook 日志相关指标
+            Self::WebhookQueueLength => "queue_length".to_string(),
+            Self::WebhookTotalMessages => "total_messages".to_string(),
+            Self::WebhookFailedMessages => "failed_messages".to_string(),
+
+            // 复制相关指标
+            Self::ReplicationAverageActiveWorkers => "average_active_workers".to_string(),
+            Self::ReplicationAverageQueuedBytes => "average_queued_bytes".to_string(),
+            Self::ReplicationAverageQueuedCount => "average_queued_count".to_string(),
+            Self::ReplicationAverageDataTransferRate => "average_data_transfer_rate".to_string(),
+            Self::ReplicationCurrentActiveWorkers => "current_active_workers".to_string(),
+            Self::ReplicationCurrentDataTransferRate => "current_data_transfer_rate".to_string(),
+            Self::ReplicationLastMinuteQueuedBytes => "last_minute_queued_bytes".to_string(),
+            Self::ReplicationLastMinuteQueuedCount => "last_minute_queued_count".to_string(),
+            Self::ReplicationMaxActiveWorkers => "max_active_workers".to_string(),
+            Self::ReplicationMaxQueuedBytes => "max_queued_bytes".to_string(),
+            Self::ReplicationMaxQueuedCount => "max_queued_count".to_string(),
+            Self::ReplicationMaxDataTransferRate => "max_data_transfer_rate".to_string(),
+            Self::ReplicationRecentBacklogCount => "recent_backlog_count".to_string(),
+
+            // 扫描器相关指标
+            Self::ScannerBucketScansFinished => "bucket_scans_finished".to_string(),
+            Self::ScannerBucketScansStarted => "bucket_scans_started".to_string(),
+            Self::ScannerDirectoriesScanned => "directories_scanned".to_string(),
+            Self::ScannerObjectsScanned => "objects_scanned".to_string(),
+            Self::ScannerVersionsScanned => "versions_scanned".to_string(),
+            Self::ScannerLastActivitySeconds => "last_activity_seconds".to_string(),
+
+            // CPU 系统相关指标
+            Self::SysCPUAvgIdle => "avg_idle".to_string(),
+            Self::SysCPUAvgIOWait => "avg_iowait".to_string(),
+            Self::SysCPULoad => "load".to_string(),
+            Self::SysCPULoadPerc => "load_perc".to_string(),
+            Self::SysCPUNice => "nice".to_string(),
+            Self::SysCPUSteal => "steal".to_string(),
+            Self::SysCPUSystem => "system".to_string(),
+            Self::SysCPUUser => "user".to_string(),
+
+            // 驱动器相关指标
+            Self::DriveUsedBytes => "used_bytes".to_string(),
+            Self::DriveFreeBytes => "free_bytes".to_string(),
+            Self::DriveTotalBytes => "total_bytes".to_string(),
+            Self::DriveUsedInodes => "used_inodes".to_string(),
+            Self::DriveFreeInodes => "free_inodes".to_string(),
+            Self::DriveTotalInodes => "total_inodes".to_string(),
+            Self::DriveTimeoutErrorsTotal => "timeout_errors_total".to_string(),
+            Self::DriveIOErrorsTotal => "io_errors_total".to_string(),
+            Self::DriveAvailabilityErrorsTotal => "availability_errors_total".to_string(),
+            Self::DriveWaitingIO => "waiting_io".to_string(),
+            Self::DriveAPILatencyMicros => "api_latency_micros".to_string(),
+            Self::DriveHealth => "health".to_string(),
+
+            Self::DriveOfflineCount => "offline_count".to_string(),
+            Self::DriveOnlineCount => "online_count".to_string(),
+            Self::DriveCount => "count".to_string(),
+
+            // iostat 相关指标
+            Self::DriveReadsPerSec => "reads_per_sec".to_string(),
+            Self::DriveReadsKBPerSec => "reads_kb_per_sec".to_string(),
+            Self::DriveReadsAwait => "reads_await".to_string(),
+            Self::DriveWritesPerSec => "writes_per_sec".to_string(),
+            Self::DriveWritesKBPerSec => "writes_kb_per_sec".to_string(),
+            Self::DriveWritesAwait => "writes_await".to_string(),
+            Self::DrivePercUtil => "perc_util".to_string(),
+
+            // 内存相关指标
+            Self::MemTotal => "total".to_string(),
+            Self::MemUsed => "used".to_string(),
+            Self::MemUsedPerc => "used_perc".to_string(),
+            Self::MemFree => "free".to_string(),
+            Self::MemBuffers => "buffers".to_string(),
+            Self::MemCache => "cache".to_string(),
+            Self::MemShared => "shared".to_string(),
+            Self::MemAvailable => "available".to_string(),
+
+            // 网络相关指标
+            Self::InternodeErrorsTotal => "errors_total".to_string(),
+            Self::InternodeDialErrorsTotal => "dial_errors_total".to_string(),
+            Self::InternodeDialAvgTimeNanos => "dial_avg_time_nanos".to_string(),
+            Self::InternodeSentBytesTotal => "sent_bytes_total".to_string(),
+            Self::InternodeRecvBytesTotal => "recv_bytes_total".to_string(),
+
+            // 进程相关指标
+            Self::ProcessLocksReadTotal => "locks_read_total".to_string(),
+            Self::ProcessLocksWriteTotal => "locks_write_total".to_string(),
+            Self::ProcessCPUTotalSeconds => "cpu_total_seconds".to_string(),
+            Self::ProcessGoRoutineTotal => "go_routine_total".to_string(),
+            Self::ProcessIORCharBytes => "io_rchar_bytes".to_string(),
+            Self::ProcessIOReadBytes => "io_read_bytes".to_string(),
+            Self::ProcessIOWCharBytes => "io_wchar_bytes".to_string(),
+            Self::ProcessIOWriteBytes => "io_write_bytes".to_string(),
+            Self::ProcessStartTimeSeconds => "start_time_seconds".to_string(),
+            Self::ProcessUptimeSeconds => "uptime_seconds".to_string(),
+            Self::ProcessFileDescriptorLimitTotal => "file_descriptor_limit_total".to_string(),
+            Self::ProcessFileDescriptorOpenTotal => "file_descriptor_open_total".to_string(),
+            Self::ProcessSyscallReadTotal => "syscall_read_total".to_string(),
+            Self::ProcessSyscallWriteTotal => "syscall_write_total".to_string(),
+            Self::ProcessResidentMemoryBytes => "resident_memory_bytes".to_string(),
+            Self::ProcessVirtualMemoryBytes => "virtual_memory_bytes".to_string(),
+            Self::ProcessVirtualMemoryMaxBytes => "virtual_memory_max_bytes".to_string(),
 
             Self::Custom(name) => name.clone(),
         }
