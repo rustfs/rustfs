@@ -26,6 +26,9 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
     if let Some(cred) = &req_info.cred {
         let Ok(iam_store) = iam::get() else {
+            let _api_rejected_auth_total_key = rustfs_obs::API_REJECTED_AUTH_TOTAL_MD.get_full_metric_name();
+            let desc = rustfs_obs::API_REJECTED_AUTH_TOTAL_MD.clone().help;
+            tracing::info!(api_rejected_auth_total_key = 1_u64, desc);
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("authorize_request {:?}", IamError::IamSysNotInitialized),

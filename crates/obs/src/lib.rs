@@ -56,6 +56,8 @@ pub use telemetry::init_telemetry;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
+pub use metrics::request::*;
+
 /// Initialize the observability module
 ///
 /// # Parameters
