@@ -36,38 +36,38 @@ export RUSTFS_CONSOLE_ADDRESS=":9002"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考 其中`RUSTFS_OBS_CONFIG` 和下面变量二选一
-export RUSTFS_OBS_CONFIG="./deploy/config/obs.example.toml"
+#export RUSTFS_OBS_CONFIG="./deploy/config/obs.example.toml"
 
 # 如下变量需要必须参数都有值才可以，以及会覆盖配置文件中的值
-#export RUSTFS__OBSERVABILITY__ENDPOINT=http://localhost:4317
-#export RUSTFS__OBSERVABILITY__USE_STDOUT=false
-#export RUSTFS__OBSERVABILITY__SAMPLE_RATIO=2.0
-#export RUSTFS__OBSERVABILITY__METER_INTERVAL=31
-#export RUSTFS__OBSERVABILITY__SERVICE_NAME=rustfs
-#export RUSTFS__OBSERVABILITY__SERVICE_VERSION=0.1.0
-#export RUSTFS__OBSERVABILITY__ENVIRONMENT=develop
-#export RUSTFS__OBSERVABILITY__LOGGER_LEVEL=debug
-#export RUSTFS__OBSERVABILITY__LOCAL_LOGGING_ENABLED=true
+export RUSTFS_OBSERVABILITY_ENDPOINT=http://localhost:4317
+export RUSTFS_OBSERVABILITY_USE_STDOUT=false
+export RUSTFS_OBSERVABILITY_SAMPLE_RATIO=2.0
+export RUSTFS_OBSERVABILITY_METER_INTERVAL=31
+export RUSTFS_OBSERVABILITY_SERVICE_NAME=rustfs
+export RUSTFS_OBSERVABILITY_SERVICE_VERSION=0.1.0
+export RUSTFS_OBSERVABILITY_ENVIRONMENT=develop
+export RUSTFS_OBSERVABILITY_LOGGER_LEVEL=debug
+export RUSTFS_OBSERVABILITY_LOCAL_LOGGING_ENABLED=true
 #
-#export RUSTFS__SINKS_0__type=File
-#export RUSTFS__SINKS_0__path=./deploy/logs/rustfs.log
-#export RUSTFS__SINKS_0__buffer_size=12
-#export RUSTFS__SINKS_0__flush_interval_ms=1000
-#export RUSTFS__SINKS_0__flush_threshold=100
+#export RUSTFS_SINKS_type=File
+export RUSTFS_SINKS_FILE_PATH=./deploy/logs/rustfs.log
+#export RUSTFS_SINKS_buffer_size=12
+#export RUSTFS_SINKS_flush_interval_ms=1000
+#export RUSTFS_SINKS_flush_threshold=100
 #
-#export RUSTFS__SINKS_1__type=Kakfa
-#export RUSTFS__SINKS_1__brokers=localhost:9092
-#export RUSTFS__SINKS_1__topic=logs
-#export RUSTFS__SINKS_1__batch_size=100
-#export RUSTFS__SINKS_1__batch_timeout_ms=1000
+#export RUSTFS_SINKS_type=Kakfa
+#export RUSTFS_SINKS_KAFKA_BROKERS=localhost:9092
+#export RUSTFS_SINKS_KAFKA_TOPIC=logs
+#export RUSTFS_SINKS_batch_size=100
+#export RUSTFS_SINKS_batch_timeout_ms=1000
 #
-#export RUSTFS__SINKS_2__type=Webhook
-#export RUSTFS__SINKS_2__endpoint=http://localhost:8080/webhook
-#export RUSTFS__SINKS_2__auth_token=you-auth-token
-#export RUSTFS__SINKS_2__batch_size=100
-#export RUSTFS__SINKS_2__batch_timeout_ms=1000
+#export RUSTFS_SINKS_type=Webhook
+#export RUSTFS_SINKS_WEBHOOK_ENDPOINT=http://localhost:8080/webhook
+#export RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN=you-auth-token
+#export RUSTFS_SINKS_batch_size=100
+#export RUSTFS_SINKS_batch_timeout_ms=1000
 #
-#export RUSTFS__LOGGER__QUEUE_CAPACITY=10
+#export RUSTFS_LOGGER_QUEUE_CAPACITY=10
 
 export OTEL_INSTRUMENTATION_NAME="rustfs"
 export OTEL_INSTRUMENTATION_VERSION="0.1.1"
