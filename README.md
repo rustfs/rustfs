@@ -82,8 +82,6 @@ Please contact: hello@rustfs.com
 
 You can join us by email: hello@rustfs.com;
 
-You can also add WeChat, WeChat ID: mys3io (Developer applications only)
-
 
 # Invest in us
 
