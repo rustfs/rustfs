@@ -1,16 +1,17 @@
+/// Erasure code set related metric descriptors
 use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-// 定义标签常量
+/// The label for the pool ID
 pub const POOL_ID_L: &str = "pool_id";
+/// The label for the pool ID
 pub const SET_ID_L: &str = "set_id";
 
-/// 纠删码集合相关指标描述符
 lazy_static::lazy_static! {
     pub static ref ERASURE_SET_OVERALL_WRITE_QUORUM_MD: MetricDescriptor =
         new_gauge_md(
             MetricName::ErasureSetOverallWriteQuorum,
             "Overall write quorum across pools and sets",
-            &[],  // 无标签
+            &[],
             subsystems::CLUSTER_ERASURE_SET
         );
 
@@ -18,7 +19,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ErasureSetOverallHealth,
             "Overall health across pools and sets (1=healthy, 0=unhealthy)",
-            &[],  // 无标签
+            &[],
             subsystems::CLUSTER_ERASURE_SET
         );
 

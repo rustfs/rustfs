@@ -1,6 +1,7 @@
 mod audit;
 mod bucket;
 mod bucket_replication;
+mod cluster_config;
 mod cluster_erasure_set;
 mod cluster_health;
 mod cluster_iam;

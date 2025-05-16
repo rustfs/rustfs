@@ -1,7 +1,7 @@
 use crate::metrics::{MetricName, MetricNamespace, MetricSubsystem, MetricType};
 use std::collections::HashSet;
 
-/// MetricDescriptor - 指标描述符
+/// MetricDescriptor - Metric descriptors
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MetricDescriptor {
@@ -10,21 +10,21 @@ pub struct MetricDescriptor {
     pub help: String,
     pub variable_labels: Vec<String>,
     pub namespace: MetricNamespace,
-    pub subsystem: MetricSubsystem, // 从 String 修改为 MetricSubsystem
+    pub subsystem: MetricSubsystem,
 
-    // 内部管理值
+    // Internal management values
     label_set: Option<HashSet<String>>,
 }
 
 impl MetricDescriptor {
-    /// 创建新的指标描述符
+    /// Create a new metric descriptor
     pub fn new(
         name: MetricName,
         metric_type: MetricType,
         help: String,
         variable_labels: Vec<String>,
         namespace: MetricNamespace,
-        subsystem: impl Into<MetricSubsystem>, // 修改参数类型
+        subsystem: impl Into<MetricSubsystem>, // Modify the parameter type
     ) -> Self {
         Self {
             name,
@@ -37,23 +37,23 @@ impl MetricDescriptor {
         }
     }
 
-    /// 获取完整的指标名称，包含前缀和格式化路径
+    /// Get the full metric name, including the prefix and formatting path
     #[allow(dead_code)]
     pub fn get_full_metric_name(&self) -> String {
-        let prefix = self.metric_type.to_prom();
+        let prefix = self.metric_type.as_prom();
         let namespace = self.namespace.as_str();
         let formatted_subsystem = self.subsystem.as_str();
 
         format!("{}{}_{}_{}", prefix, namespace, formatted_subsystem, self.name.as_str())
     }
 
-    /// 检查标签是否在标签集中
+    /// check whether the label is in the label set
     #[allow(dead_code)]
     pub fn has_label(&mut self, label: &str) -> bool {
         self.get_label_set().contains(label)
     }
 
-    /// 获取标签集合，如果不存在则创建
+    /// Gets a collection of tags and creates them if they don't exist
     pub fn get_label_set(&mut self) -> &HashSet<String> {
         if self.label_set.is_none() {
             let mut set = HashSet::with_capacity(self.variable_labels.len());

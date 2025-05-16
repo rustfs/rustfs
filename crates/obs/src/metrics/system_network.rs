@@ -1,12 +1,12 @@
+/// Network-related metric descriptors
 use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-/// 网络相关指标描述符
 lazy_static::lazy_static! {
     pub static ref INTERNODE_ERRORS_TOTAL_MD: MetricDescriptor =
         new_counter_md(
             MetricName::InternodeErrorsTotal,
             "Total number of failed internode calls",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_NETWORK_INTERNODE
         );
 
@@ -14,7 +14,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::InternodeDialErrorsTotal,
             "Total number of internode TCP dial timeouts and errors",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_NETWORK_INTERNODE
         );
 
@@ -22,7 +22,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::InternodeDialAvgTimeNanos,
             "Average dial time of internode TCP calls in nanoseconds",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_NETWORK_INTERNODE
         );
 
@@ -30,7 +30,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::InternodeSentBytesTotal,
             "Total number of bytes sent to other peer nodes",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_NETWORK_INTERNODE
         );
 
@@ -38,7 +38,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::InternodeRecvBytesTotal,
             "Total number of bytes received from other peer nodes",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_NETWORK_INTERNODE
         );
 }

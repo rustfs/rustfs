@@ -1,12 +1,12 @@
+/// Copy the relevant metric descriptor
 use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-/// 复制相关指标描述符
 lazy_static::lazy_static! {
     pub static ref REPLICATION_AVERAGE_ACTIVE_WORKERS_MD: MetricDescriptor =
         new_gauge_md(
             MetricName::ReplicationAverageActiveWorkers,
             "Average number of active replication workers",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -14,7 +14,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationAverageQueuedBytes,
             "Average number of bytes queued for replication since server start",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -22,7 +22,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationAverageQueuedCount,
             "Average number of objects queued for replication since server start",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -30,7 +30,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationAverageDataTransferRate,
             "Average replication data transfer rate in bytes/sec",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -38,7 +38,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationCurrentActiveWorkers,
             "Total number of active replication workers",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -46,7 +46,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationCurrentDataTransferRate,
             "Current replication data transfer rate in bytes/sec",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -54,7 +54,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationLastMinuteQueuedBytes,
             "Number of bytes queued for replication in the last full minute",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -62,7 +62,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationLastMinuteQueuedCount,
             "Number of objects queued for replication in the last full minute",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -70,7 +70,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationMaxActiveWorkers,
             "Maximum number of active replication workers seen since server start",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -78,7 +78,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationMaxQueuedBytes,
             "Maximum number of bytes queued for replication since server start",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -86,7 +86,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationMaxQueuedCount,
             "Maximum number of objects queued for replication since server start",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -94,7 +94,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationMaxDataTransferRate,
             "Maximum replication data transfer rate in bytes/sec seen since server start",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 
@@ -102,7 +102,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ReplicationRecentBacklogCount,
             "Total number of objects seen in replication backlog in the last 5 minutes",
-            &[],  // 无标签
+            &[],
             subsystems::REPLICATION
         );
 }

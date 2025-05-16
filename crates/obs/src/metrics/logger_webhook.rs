@@ -1,12 +1,14 @@
+/// A descriptor for metrics related to webhook logs
 use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-/// 定义标签常量
+/// Define label constants for webhook metrics
+/// name label
 pub const NAME_LABEL: &str = "name";
+/// endpoint label
 pub const ENDPOINT_LABEL: &str = "endpoint";
 
-/// Webhook 日志相关指标描述符
 lazy_static::lazy_static! {
-    // 所有 Webhook 指标使用的标签
+    // The label used by all webhook metrics
     static ref ALL_WEBHOOK_LABELS: [&'static str; 2] = [NAME_LABEL, ENDPOINT_LABEL];
 
     pub static ref WEBHOOK_FAILED_MESSAGES_MD: MetricDescriptor =

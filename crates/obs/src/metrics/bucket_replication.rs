@@ -1,10 +1,13 @@
 /// Bucket copy metric descriptor
 use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-// Label constants
+/// Bucket level replication metric descriptor
 pub const BUCKET_L: &str = "bucket";
+/// Replication operation
 pub const OPERATION_L: &str = "operation";
+/// Replication target ARN
 pub const TARGET_ARN_L: &str = "targetArn";
+/// Replication range
 pub const RANGE_L: &str = "range";
 
 lazy_static::lazy_static! {

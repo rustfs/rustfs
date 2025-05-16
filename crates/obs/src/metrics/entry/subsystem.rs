@@ -92,21 +92,21 @@ impl MetricSubsystem {
     /// Create a subsystem enumeration from a path string
     pub fn from_path(path: &str) -> Self {
         match path {
-            // API 相关子系统
+            // API-related subsystems
             "/api/requests" => Self::ApiRequests,
 
-            // 桶相关子系统
+            // Bucket-related subsystems
             "/bucket/api" => Self::BucketApi,
             "/bucket/replication" => Self::BucketReplication,
 
-            // 系统相关子系统
+            // System-related subsystems
             "/system/network/internode" => Self::SystemNetworkInternode,
             "/system/drive" => Self::SystemDrive,
             "/system/memory" => Self::SystemMemory,
             "/system/cpu" => Self::SystemCpu,
             "/system/process" => Self::SystemProcess,
 
-            // 调试相关子系统
+            // Debug related subsystems
             "/debug/go" => Self::DebugGo,
 
             // 集群相关子系统

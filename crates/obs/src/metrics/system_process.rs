@@ -1,12 +1,12 @@
+/// process related metric descriptors
 use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-/// process related metric descriptors
 lazy_static::lazy_static! {
     pub static ref PROCESS_LOCKS_READ_TOTAL_MD: MetricDescriptor =
         new_gauge_md(
             MetricName::ProcessLocksReadTotal,
             "Number of current READ locks on this peer",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -14,7 +14,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessLocksWriteTotal,
             "Number of current WRITE locks on this peer",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -22,7 +22,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::ProcessCPUTotalSeconds,
             "Total user and system CPU time spent in seconds",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -30,7 +30,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessGoRoutineTotal,
             "Total number of go routines running",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -38,7 +38,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::ProcessIORCharBytes,
             "Total bytes read by the process from the underlying storage system including cache, /proc/[pid]/io rchar",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -46,7 +46,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::ProcessIOReadBytes,
             "Total bytes read by the process from the underlying storage system, /proc/[pid]/io read_bytes",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -54,7 +54,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::ProcessIOWCharBytes,
             "Total bytes written by the process to the underlying storage system including page cache, /proc/[pid]/io wchar",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -62,7 +62,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::ProcessIOWriteBytes,
             "Total bytes written by the process to the underlying storage system, /proc/[pid]/io write_bytes",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -70,7 +70,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessStartTimeSeconds,
             "Start time for RustFS process in seconds since Unix epoc",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -78,7 +78,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessUptimeSeconds,
             "Uptime for RustFS process in seconds",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -86,7 +86,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessFileDescriptorLimitTotal,
             "Limit on total number of open file descriptors for the RustFS Server process",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -94,7 +94,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessFileDescriptorOpenTotal,
             "Total number of open file descriptors by the RustFS Server process",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -102,7 +102,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::ProcessSyscallReadTotal,
             "Total read SysCalls to the kernel. /proc/[pid]/io syscr",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -110,7 +110,7 @@ lazy_static::lazy_static! {
         new_counter_md(
             MetricName::ProcessSyscallWriteTotal,
             "Total write SysCalls to the kernel. /proc/[pid]/io syscw",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -118,7 +118,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessResidentMemoryBytes,
             "Resident memory size in bytes",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -126,7 +126,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessVirtualMemoryBytes,
             "Virtual memory size in bytes",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 
@@ -134,7 +134,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::ProcessVirtualMemoryMaxBytes,
             "Maximum virtual memory size in bytes",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_PROCESS
         );
 }

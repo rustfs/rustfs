@@ -1,18 +1,22 @@
+/// Drive-related metric descriptors
 use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-/// 定义标签常量
+/// drive related labels
 pub const DRIVE_LABEL: &str = "drive";
+/// pool index label
 pub const POOL_INDEX_LABEL: &str = "pool_index";
+/// set index label
 pub const SET_INDEX_LABEL: &str = "set_index";
+/// drive index label
 pub const DRIVE_INDEX_LABEL: &str = "drive_index";
+/// API label
 pub const API_LABEL: &str = "api";
 
-/// 所有驱动器相关的标签
 lazy_static::lazy_static! {
+    /// All drive-related labels
     static ref ALL_DRIVE_LABELS: [&'static str; 4] = [DRIVE_LABEL, POOL_INDEX_LABEL, SET_INDEX_LABEL, DRIVE_INDEX_LABEL];
 }
 
-/// 驱动器相关指标描述符
 lazy_static::lazy_static! {
     pub static ref DRIVE_USED_BYTES_MD: MetricDescriptor =
         new_gauge_md(

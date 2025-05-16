@@ -1193,15 +1193,15 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
-        // 本地不需要设置
+        // No setup is required locally
         // TODO: add check_id_store
         let mut format_info = self.format_info.write().await;
         format_info.id = id;
         Ok(())
     }
 
-    #[must_use]
     #[tracing::instrument(skip(self))]
+    #[must_use]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
         if volume == super::RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let format_info = self.format_info.read().await;

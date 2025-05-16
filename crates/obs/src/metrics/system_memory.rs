@@ -1,12 +1,12 @@
+/// Memory-related metric descriptors
 use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-/// 内存相关指标描述符
 lazy_static::lazy_static! {
     pub static ref MEM_TOTAL_MD: MetricDescriptor =
         new_gauge_md(
             MetricName::MemTotal,
             "Total memory on the node",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_MEMORY
         );
 
@@ -14,7 +14,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::MemUsed,
             "Used memory on the node",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_MEMORY
         );
 
@@ -22,7 +22,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::MemUsedPerc,
             "Used memory percentage on the node",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_MEMORY
         );
 
@@ -30,7 +30,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::MemFree,
             "Free memory on the node",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_MEMORY
         );
 
@@ -38,7 +38,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::MemBuffers,
             "Buffers memory on the node",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_MEMORY
         );
 
@@ -46,7 +46,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::MemCache,
             "Cache memory on the node",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_MEMORY
         );
 
@@ -54,7 +54,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::MemShared,
             "Shared memory on the node",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_MEMORY
         );
 
@@ -62,7 +62,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::MemAvailable,
             "Available memory on the node",
-            &[],  // 无标签
+            &[],
             subsystems::SYSTEM_MEMORY
         );
 }

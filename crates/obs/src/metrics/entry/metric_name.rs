@@ -2,7 +2,7 @@
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricName {
-    // 通用指标名称
+    // The generic metric name
     AuthTotal,
     CanceledTotal,
     ErrorsTotal,
@@ -27,7 +27,7 @@ pub enum MetricName {
     Total,
     FreeInodes,
 
-    // 失败统计指标
+    // Failure statistical metrics
     LastMinFailedCount,
     LastMinFailedBytes,
     LastHourFailedCount,
@@ -35,7 +35,7 @@ pub enum MetricName {
     TotalFailedCount,
     TotalFailedBytes,
 
-    // 工作线程指标
+    // Worker metrics
     CurrActiveWorkers,
     AvgActiveWorkers,
     MaxActiveWorkers,
@@ -49,23 +49,23 @@ pub enum MetricName {
     MaxTransferRate,
     CredentialErrors,
 
-    // 链接延迟指标
+    // Link latency metrics
     CurrLinkLatency,
     AvgLinkLatency,
     MaxLinkLatency,
 
-    // 链接状态指标
+    // Link status metrics
     LinkOnline,
     LinkOfflineDuration,
     LinkDowntimeTotalDuration,
 
-    // 队列指标
+    // Queue metrics
     AvgInQueueCount,
     AvgInQueueBytes,
     MaxInQueueCount,
     MaxInQueueBytes,
 
-    // 代理请求指标
+    // Proxy request metrics
     ProxiedGetRequestsTotal,
     ProxiedHeadRequestsTotal,
     ProxiedPutTaggingRequestsTotal,
@@ -77,7 +77,7 @@ pub enum MetricName {
     ProxiedGetTaggingRequestFailures,
     ProxiedDeleteTaggingRequestFailures,
 
-    // 字节相关指标
+    // Byte-related metrics
     FreeBytes,
     ReadBytes,
     RcharBytes,
@@ -89,22 +89,22 @@ pub enum MetricName {
     WriteBytes,
     WcharBytes,
 
-    // 延迟指标
+    // Latency metrics
     LatencyMicroSec,
     LatencyNanoSec,
 
-    // 信息指标
+    // Information metrics
     CommitInfo,
     UsageInfo,
     VersionInfo,
 
-    // 分布指标
+    // Distribution metrics
     SizeDistribution,
     VersionDistribution,
     TtfbDistribution,
     TtlbDistribution,
 
-    // 时间指标
+    // Time metrics
     LastActivityTime,
     StartTime,
     UpTime,
@@ -112,7 +112,7 @@ pub enum MetricName {
     Vmemory,
     Cpu,
 
-    // 过期和转换指标
+    // Expiration and conversion metrics
     ExpiryMissedTasks,
     ExpiryMissedFreeVersions,
     ExpiryMissedTierJournalTasks,
@@ -122,18 +122,18 @@ pub enum MetricName {
     TransitionedObjects,
     TransitionedVersions,
 
-    // Tier 请求指标
+    //Tier request metrics
     TierRequestsSuccess,
     TierRequestsFailure,
 
-    // KMS 指标
+    // KMS metrics
     KmsOnline,
     KmsRequestsSuccess,
     KmsRequestsError,
     KmsRequestsFail,
     KmsUptime,
 
-    // Webhook 指标
+    // Webhook metrics
     WebhookOnline,
 
     // API 拒绝指标
@@ -142,7 +142,7 @@ pub enum MetricName {
     ApiRejectedTimestampTotal,
     ApiRejectedInvalidTotal,
 
-    // API 请求指标
+    //API request metrics
     ApiRequestsWaitingTotal,
     ApiRequestsIncomingTotal,
     ApiRequestsInFlightTotal,
@@ -152,23 +152,23 @@ pub enum MetricName {
     ApiRequests4xxErrorsTotal,
     ApiRequestsCanceledTotal,
 
-    // API 分布指标
+    // API distribution metrics
     ApiRequestsTTFBSecondsDistribution,
 
-    // API 流量指标
+    // API traffic metrics
     ApiTrafficSentBytes,
     ApiTrafficRecvBytes,
 
-    // 审计指标
+    // Audit metrics
     AuditFailedMessages,
     AuditTargetQueueLength,
     AuditTotalMessages,
 
-    // 集群配置相关指标
+    // Metrics related to cluster configurations
     ConfigRRSParity,
     ConfigStandardParity,
 
-    // 纠删码集合相关指标
+    // Erasure coding set related metrics
     ErasureSetOverallWriteQuorum,
     ErasureSetOverallHealth,
     ErasureSetReadQuorum,
@@ -181,12 +181,12 @@ pub enum MetricName {
     ErasureSetReadHealth,
     ErasureSetWriteHealth,
 
-    // 集群健康相关指标
+    // Cluster health-related metrics
     HealthDrivesOfflineCount,
     HealthDrivesOnlineCount,
     HealthDrivesCount,
 
-    // IAM 相关指标
+    // IAM-related metrics
     LastSyncDurationMillis,
     PluginAuthnServiceFailedRequestsMinute,
     PluginAuthnServiceLastFailSeconds,
@@ -198,13 +198,13 @@ pub enum MetricName {
     SyncFailures,
     SyncSuccesses,
 
-    // 通知相关指标
+    // Notify relevant metrics
     NotificationCurrentSendInProgress,
     NotificationEventsErrorsTotal,
     NotificationEventsSentTotal,
     NotificationEventsSkippedTotal,
 
-    // 集群对象使用情况相关指标
+    // Metrics related to the usage of cluster objects
     UsageSinceLastUpdateSeconds,
     UsageTotalBytes,
     UsageObjectsCount,
@@ -214,7 +214,7 @@ pub enum MetricName {
     UsageSizeDistribution,
     UsageVersionCountDistribution,
 
-    // 桶使用情况相关指标
+    // Metrics related to bucket usage
     UsageBucketQuotaTotalBytes,
     UsageBucketTotalBytes,
     UsageBucketObjectsCount,
@@ -223,19 +223,19 @@ pub enum MetricName {
     UsageBucketObjectSizeDistribution,
     UsageBucketObjectVersionCountDistribution,
 
-    // ILM 相关指标
+    // ILM-related metrics
     IlmExpiryPendingTasks,
     IlmTransitionActiveTasks,
     IlmTransitionPendingTasks,
     IlmTransitionMissedImmediateTasks,
     IlmVersionsScanned,
 
-    // Webhook 日志相关指标
+    // Webhook logs
     WebhookQueueLength,
     WebhookTotalMessages,
     WebhookFailedMessages,
 
-    // 复制相关指标
+    // Copy the relevant metrics
     ReplicationAverageActiveWorkers,
     ReplicationAverageQueuedBytes,
     ReplicationAverageQueuedCount,
@@ -250,7 +250,7 @@ pub enum MetricName {
     ReplicationMaxDataTransferRate,
     ReplicationRecentBacklogCount,
 
-    // 扫描器相关指标
+    // Scanner-related metrics
     ScannerBucketScansFinished,
     ScannerBucketScansStarted,
     ScannerDirectoriesScanned,
@@ -258,7 +258,7 @@ pub enum MetricName {
     ScannerVersionsScanned,
     ScannerLastActivitySeconds,
 
-    // CPU 系统相关指标
+    // CPU system-related metrics
     SysCPUAvgIdle,
     SysCPUAvgIOWait,
     SysCPULoad,
@@ -268,7 +268,7 @@ pub enum MetricName {
     SysCPUSystem,
     SysCPUUser,
 
-    // 驱动器相关指标
+    // Drive-related metrics
     DriveUsedBytes,
     DriveFreeBytes,
     DriveTotalBytes,
@@ -286,7 +286,7 @@ pub enum MetricName {
     DriveOnlineCount,
     DriveCount,
 
-    // iostat 相关指标
+    // iostat related metrics
     DriveReadsPerSec,
     DriveReadsKBPerSec,
     DriveReadsAwait,
@@ -295,7 +295,7 @@ pub enum MetricName {
     DriveWritesAwait,
     DrivePercUtil,
 
-    // 内存相关指标
+    // Memory-related metrics
     MemTotal,
     MemUsed,
     MemUsedPerc,
@@ -305,14 +305,14 @@ pub enum MetricName {
     MemShared,
     MemAvailable,
 
-    // 网络相关指标
+    // Network-related metrics
     InternodeErrorsTotal,
     InternodeDialErrorsTotal,
     InternodeDialAvgTimeNanos,
     InternodeSentBytesTotal,
     InternodeRecvBytesTotal,
 
-    // 进程相关指标
+    // Process-related metrics
     ProcessLocksReadTotal,
     ProcessLocksWriteTotal,
     ProcessCPUTotalSeconds,
@@ -331,7 +331,7 @@ pub enum MetricName {
     ProcessVirtualMemoryBytes,
     ProcessVirtualMemoryMaxBytes,
 
-    // 自定义指标
+    // Custom metrics
     Custom(String),
 }
 
@@ -485,7 +485,7 @@ impl MetricName {
             Self::ConfigRRSParity => "rrs_parity".to_string(),
             Self::ConfigStandardParity => "standard_parity".to_string(),
 
-            // 纠删码集合相关指标
+            // Erasure coding set related metrics
             Self::ErasureSetOverallWriteQuorum => "overall_write_quorum".to_string(),
             Self::ErasureSetOverallHealth => "overall_health".to_string(),
             Self::ErasureSetReadQuorum => "read_quorum".to_string(),
@@ -498,12 +498,12 @@ impl MetricName {
             Self::ErasureSetReadHealth => "read_health".to_string(),
             Self::ErasureSetWriteHealth => "write_health".to_string(),
 
-            // 集群健康相关指标
+            // Cluster health-related metrics
             Self::HealthDrivesOfflineCount => "drives_offline_count".to_string(),
             Self::HealthDrivesOnlineCount => "drives_online_count".to_string(),
             Self::HealthDrivesCount => "drives_count".to_string(),
 
-            // IAM 相关指标
+            // IAM-related metrics
             Self::LastSyncDurationMillis => "last_sync_duration_millis".to_string(),
             Self::PluginAuthnServiceFailedRequestsMinute => "plugin_authn_service_failed_requests_minute".to_string(),
             Self::PluginAuthnServiceLastFailSeconds => "plugin_authn_service_last_fail_seconds".to_string(),
@@ -515,13 +515,13 @@ impl MetricName {
             Self::SyncFailures => "sync_failures".to_string(),
             Self::SyncSuccesses => "sync_successes".to_string(),
 
-            // 通知相关指标
+            // Notify relevant metrics
             Self::NotificationCurrentSendInProgress => "current_send_in_progress".to_string(),
             Self::NotificationEventsErrorsTotal => "events_errors_total".to_string(),
             Self::NotificationEventsSentTotal => "events_sent_total".to_string(),
             Self::NotificationEventsSkippedTotal => "events_skipped_total".to_string(),
 
-            // 集群对象使用情况相关指标
+            // Metrics related to the usage of cluster objects
             Self::UsageSinceLastUpdateSeconds => "since_last_update_seconds".to_string(),
             Self::UsageTotalBytes => "total_bytes".to_string(),
             Self::UsageObjectsCount => "count".to_string(),
@@ -531,7 +531,7 @@ impl MetricName {
             Self::UsageSizeDistribution => "size_distribution".to_string(),
             Self::UsageVersionCountDistribution => "version_count_distribution".to_string(),
 
-            // 桶使用情况相关指标
+            // Metrics related to bucket usage
             Self::UsageBucketQuotaTotalBytes => "quota_total_bytes".to_string(),
             Self::UsageBucketTotalBytes => "total_bytes".to_string(),
             Self::UsageBucketObjectsCount => "objects_count".to_string(),
@@ -540,19 +540,19 @@ impl MetricName {
             Self::UsageBucketObjectSizeDistribution => "object_size_distribution".to_string(),
             Self::UsageBucketObjectVersionCountDistribution => "object_version_count_distribution".to_string(),
 
-            // ILM 相关指标
+            // ILM-related metrics
             Self::IlmExpiryPendingTasks => "expiry_pending_tasks".to_string(),
             Self::IlmTransitionActiveTasks => "transition_active_tasks".to_string(),
             Self::IlmTransitionPendingTasks => "transition_pending_tasks".to_string(),
             Self::IlmTransitionMissedImmediateTasks => "transition_missed_immediate_tasks".to_string(),
             Self::IlmVersionsScanned => "versions_scanned".to_string(),
 
-            // Webhook 日志相关指标
+            // Webhook logs
             Self::WebhookQueueLength => "queue_length".to_string(),
             Self::WebhookTotalMessages => "total_messages".to_string(),
             Self::WebhookFailedMessages => "failed_messages".to_string(),
 
-            // 复制相关指标
+            // Copy the relevant metrics
             Self::ReplicationAverageActiveWorkers => "average_active_workers".to_string(),
             Self::ReplicationAverageQueuedBytes => "average_queued_bytes".to_string(),
             Self::ReplicationAverageQueuedCount => "average_queued_count".to_string(),
@@ -567,7 +567,7 @@ impl MetricName {
             Self::ReplicationMaxDataTransferRate => "max_data_transfer_rate".to_string(),
             Self::ReplicationRecentBacklogCount => "recent_backlog_count".to_string(),
 
-            // 扫描器相关指标
+            // Scanner-related metrics
             Self::ScannerBucketScansFinished => "bucket_scans_finished".to_string(),
             Self::ScannerBucketScansStarted => "bucket_scans_started".to_string(),
             Self::ScannerDirectoriesScanned => "directories_scanned".to_string(),
@@ -575,7 +575,7 @@ impl MetricName {
             Self::ScannerVersionsScanned => "versions_scanned".to_string(),
             Self::ScannerLastActivitySeconds => "last_activity_seconds".to_string(),
 
-            // CPU 系统相关指标
+            // CPU system-related metrics
             Self::SysCPUAvgIdle => "avg_idle".to_string(),
             Self::SysCPUAvgIOWait => "avg_iowait".to_string(),
             Self::SysCPULoad => "load".to_string(),
@@ -585,7 +585,7 @@ impl MetricName {
             Self::SysCPUSystem => "system".to_string(),
             Self::SysCPUUser => "user".to_string(),
 
-            // 驱动器相关指标
+            // Drive-related metrics
             Self::DriveUsedBytes => "used_bytes".to_string(),
             Self::DriveFreeBytes => "free_bytes".to_string(),
             Self::DriveTotalBytes => "total_bytes".to_string(),
@@ -603,7 +603,7 @@ impl MetricName {
             Self::DriveOnlineCount => "online_count".to_string(),
             Self::DriveCount => "count".to_string(),
 
-            // iostat 相关指标
+            // iostat related metrics
             Self::DriveReadsPerSec => "reads_per_sec".to_string(),
             Self::DriveReadsKBPerSec => "reads_kb_per_sec".to_string(),
             Self::DriveReadsAwait => "reads_await".to_string(),
@@ -612,7 +612,7 @@ impl MetricName {
             Self::DriveWritesAwait => "writes_await".to_string(),
             Self::DrivePercUtil => "perc_util".to_string(),
 
-            // 内存相关指标
+            // Memory-related metrics
             Self::MemTotal => "total".to_string(),
             Self::MemUsed => "used".to_string(),
             Self::MemUsedPerc => "used_perc".to_string(),
@@ -622,14 +622,14 @@ impl MetricName {
             Self::MemShared => "shared".to_string(),
             Self::MemAvailable => "available".to_string(),
 
-            // 网络相关指标
+            // Network-related metrics
             Self::InternodeErrorsTotal => "errors_total".to_string(),
             Self::InternodeDialErrorsTotal => "dial_errors_total".to_string(),
             Self::InternodeDialAvgTimeNanos => "dial_avg_time_nanos".to_string(),
             Self::InternodeSentBytesTotal => "sent_bytes_total".to_string(),
             Self::InternodeRecvBytesTotal => "recv_bytes_total".to_string(),
 
-            // 进程相关指标
+            // Process-related metrics
             Self::ProcessLocksReadTotal => "locks_read_total".to_string(),
             Self::ProcessLocksWriteTotal => "locks_write_total".to_string(),
             Self::ProcessCPUTotalSeconds => "cpu_total_seconds".to_string(),

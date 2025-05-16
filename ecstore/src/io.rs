@@ -58,7 +58,7 @@ impl HttpFileWriter {
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(io::Error::other)
             {
                 error!("HttpFileWriter put file err: {:?}", err);
 
@@ -115,9 +115,9 @@ impl HttpFileReader {
             ))
             .send()
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
-        let inner = Box::new(StreamReader::new(resp.bytes_stream().map_err(std::io::Error::other)));
+        let inner = Box::new(StreamReader::new(resp.bytes_stream().map_err(io::Error::other)));
 
         Ok(Self { inner })
     }

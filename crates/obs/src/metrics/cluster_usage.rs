@@ -1,12 +1,17 @@
+/// Descriptors of metrics related to cluster object and bucket usage
 use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
 
-/// 集群对象使用情况相关指标描述符
+/// Bucket labels
+pub const BUCKET_LABEL: &str = "bucket";
+/// Range labels
+pub const RANGE_LABEL: &str = "range";
+
 lazy_static::lazy_static! {
     pub static ref USAGE_SINCE_LAST_UPDATE_SECONDS_MD: MetricDescriptor =
         new_gauge_md(
             MetricName::UsageSinceLastUpdateSeconds,
             "Time since last update of usage metrics in seconds",
-            &[],  // 无标签
+            &[],
             subsystems::CLUSTER_USAGE_OBJECTS
         );
 
@@ -14,7 +19,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::UsageTotalBytes,
             "Total cluster usage in bytes",
-            &[],  // 无标签
+            &[],
             subsystems::CLUSTER_USAGE_OBJECTS
         );
 
@@ -22,7 +27,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::UsageObjectsCount,
             "Total cluster objects count",
-            &[],  // 无标签
+            &[],
             subsystems::CLUSTER_USAGE_OBJECTS
         );
 
@@ -30,7 +35,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::UsageVersionsCount,
             "Total cluster object versions (including delete markers) count",
-            &[],  // 无标签
+            &[],
             subsystems::CLUSTER_USAGE_OBJECTS
         );
 
@@ -38,7 +43,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::UsageDeleteMarkersCount,
             "Total cluster delete markers count",
-            &[],  // 无标签
+            &[],
             subsystems::CLUSTER_USAGE_OBJECTS
         );
 
@@ -46,7 +51,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::UsageBucketsCount,
             "Total cluster buckets count",
-            &[],  // 无标签
+            &[],
             subsystems::CLUSTER_USAGE_OBJECTS
         );
 
@@ -54,7 +59,7 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::UsageSizeDistribution,
             "Cluster object size distribution",
-            &["range"],  // 标签
+            &[RANGE_LABEL],
             subsystems::CLUSTER_USAGE_OBJECTS
         );
 
@@ -62,16 +67,11 @@ lazy_static::lazy_static! {
         new_gauge_md(
             MetricName::UsageVersionCountDistribution,
             "Cluster object version count distribution",
-            &["range"],  // 标签
+            &[RANGE_LABEL],
             subsystems::CLUSTER_USAGE_OBJECTS
         );
 }
 
-/// 定义常量
-pub const BUCKET_LABEL: &str = "bucket";
-pub const RANGE_LABEL: &str = "range";
-
-/// 桶使用情况相关指标描述符
 lazy_static::lazy_static! {
     pub static ref USAGE_BUCKET_TOTAL_BYTES_MD: MetricDescriptor =
         new_gauge_md(
