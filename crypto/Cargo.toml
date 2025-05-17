@@ -23,7 +23,7 @@ pbkdf2 = { version = "0.12.2", optional = true }
 rand = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["json"] }
 ring = { version = "0.17.14", features = ["std"] }
-sha2 = { version = "0.10.8", optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true

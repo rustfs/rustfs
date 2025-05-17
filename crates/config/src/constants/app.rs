@@ -14,6 +14,25 @@ pub const VERSION: &str = "0.0.1";
 /// Environment variable: RUSTFS_LOG_LEVEL
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
+/// Default configuration use stdout
+/// Default value: true
+pub const USE_STDOUT: bool = true;
+
+/// Default configuration sample ratio
+/// Default value: 1.0
+pub const SAMPLE_RATIO: f64 = 1.0;
+/// Default configuration meter interval
+/// Default value: 30
+pub const METER_INTERVAL: u64 = 30;
+
+/// Default configuration service version
+/// Default value: 0.0.1
+pub const SERVICE_VERSION: &str = "0.0.1";
+
+/// Default configuration environment
+/// Default value: production
+pub const ENVIRONMENT: &str = "production";
+
 /// maximum number of connections
 /// This is the maximum number of connections that the server will accept.
 /// This is used to limit the number of connections to the server.
@@ -44,7 +63,7 @@ pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 /// Example: RUSTFS_OBS_CONFIG=config/obs.toml
 /// Example: --obs-config config/obs.toml
 /// Example: --obs-config /etc/rustfs/obs.toml
-pub const DEFAULT_OBS_CONFIG: &str = "config/obs.toml";
+pub const DEFAULT_OBS_CONFIG: &str = "./deploy/config/obs.toml";
 
 /// Default TLS key for rustfs
 /// This is the default key for TLS.

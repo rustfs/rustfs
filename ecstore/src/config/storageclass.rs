@@ -8,8 +8,8 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-// default_partiy_count 默认配置，根据磁盘总数分配校验磁盘数量
-pub fn default_partiy_count(drive: usize) -> usize {
+// default_parity_count 默认配置，根据磁盘总数分配校验磁盘数量
+pub fn default_parity_count(drive: usize) -> usize {
     match drive {
         1 => 0,
         2 | 3 => 1,
@@ -158,7 +158,7 @@ pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
             parse_storage_class(&ssc_str)?
         } else {
             StorageClass {
-                parity: default_partiy_count(set_drive_count),
+                parity: default_parity_count(set_drive_count),
             }
         }
     };

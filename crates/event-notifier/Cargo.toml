@@ -9,13 +9,12 @@ version.workspace = true
 [features]
 default = ["webhook"]
 webhook = ["dep:reqwest"]
-kafka = ["rdkafka"]
 mqtt = ["rumqttc"]
+kafka = ["dep:rdkafka"]
 
 [dependencies]
 async-trait = { workspace = true }
 config = { workspace = true }
-rdkafka = { workspace = true, features = ["tokio"], optional = true }
 reqwest = { workspace = true, optional = true }
 rumqttc = { workspace = true, optional = true }
 serde = { workspace = true }
@@ -29,12 +28,16 @@ tokio = { workspace = true, features = ["sync", "net", "macros", "signal", "rt-m
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 
+# Only enable kafka features and related dependencies on Linux
+[target.'cfg(target_os = "linux")'.dependencies]
+rdkafka = { workspace = true, features = ["tokio"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 http = { workspace = true }
 axum = { workspace = true }
+dotenvy = "0.15.7"
 
 [lints]
 workspace = true

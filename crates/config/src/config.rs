@@ -1,17 +1,17 @@
-use crate::event::config::EventConfig;
+use crate::event::config::NotifierConfig;
 use crate::ObservabilityConfig;
 
 /// RustFs configuration
 pub struct RustFsConfig {
     pub observability: ObservabilityConfig,
-    pub event: EventConfig,
+    pub event: NotifierConfig,
 }
 
 impl RustFsConfig {
     pub fn new() -> Self {
         Self {
             observability: ObservabilityConfig::new(),
-            event: EventConfig::new(),
+            event: NotifierConfig::new(),
         }
     }
 }
