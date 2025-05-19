@@ -5,7 +5,7 @@ sample_ratio = 2.0                 # 采样率，表示每 2 条数据采样 1 �
 meter_interval = 30                # 指标收集间隔，单位为秒
 service_name = "rustfs"            # 服务名称，用于标识当前服务
 service_version = "0.1.0"          # 服务版本号
-environments = "develop"           # 运行环境，如开发环境 (develop)
+environment = "develop"           # 运行环境，如开发环境 (develop)
 logger_level = "debug"             # 日志级别，可选 debug/info/warn/error 等
 local_logging_enabled = true       # 是否启用本地 stdout 日志记录，true 表示启用，false 表示禁用
 

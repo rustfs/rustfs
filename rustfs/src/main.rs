@@ -497,7 +497,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     });
 
     // init store
-    let store = ECStore::new(server_address.clone(), endpoint_pools.clone())
+    let store = ECStore::new(server_addr.clone(), endpoint_pools.clone())
         .await
         .map_err(|err| {
             error!("ECStore::new {:?}", &err);
