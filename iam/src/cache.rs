@@ -22,7 +22,7 @@ pub struct Cache {
     pub sts_accounts: ArcSwap<CacheEntity<UserIdentity>>,
     pub sts_policies: ArcSwap<CacheEntity<MappedPolicy>>,
     pub groups: ArcSwap<CacheEntity<GroupInfo>>,
-    pub user_group_memeberships: ArcSwap<CacheEntity<HashSet<String>>>,
+    pub user_group_memberships: ArcSwap<CacheEntity<HashSet<String>>>,
     pub group_policies: ArcSwap<CacheEntity<MappedPolicy>>,
 }
 
@@ -35,7 +35,7 @@ impl Default for Cache {
             sts_accounts: ArcSwap::new(Arc::new(CacheEntity::default())),
             sts_policies: ArcSwap::new(Arc::new(CacheEntity::default())),
             groups: ArcSwap::new(Arc::new(CacheEntity::default())),
-            user_group_memeberships: ArcSwap::new(Arc::new(CacheEntity::default())),
+            user_group_memberships: ArcSwap::new(Arc::new(CacheEntity::default())),
             group_policies: ArcSwap::new(Arc::new(CacheEntity::default())),
         }
     }
@@ -97,7 +97,7 @@ impl Cache {
                     .insert(group_name.clone());
             }
         }
-        self.user_group_memeberships
+        self.user_group_memberships
             .store(Arc::new(CacheEntity::new(user_group_memeberships)));
     }
 }
@@ -228,7 +228,7 @@ impl From<&Cache> for CacheInner {
             sts_accounts: value.sts_accounts.load(),
             sts_policies: value.sts_policies.load(),
             groups: value.groups.load(),
-            user_group_memeberships: value.user_group_memeberships.load(),
+            user_group_memeberships: value.user_group_memberships.load(),
             group_policies: value.group_policies.load(),
         }
     }

@@ -110,7 +110,7 @@ pub struct ObjectStore {
 }
 
 impl ObjectStore {
-    const BUCKET_NAME: &str = ".rustfs.sys";
+    const BUCKET_NAME: &'static str = ".rustfs.sys";
 
     pub fn new(object_api: Arc<ECStore>) -> Self {
         Self { object_api }
@@ -135,7 +135,7 @@ impl ObjectStore {
     async fn list_iam_config_items(&self, prefix: &str, ctx_rx: B_Receiver<bool>, sender: Sender<StringOrErr>) {
         // debug!("list iam config items, prefix: {}", &prefix);
 
-        // todo, 实现walk，使用walk
+        // todo, 实现 walk，使用 walk
 
         // let prefix = format!("{}{}", prefix, item);
 
@@ -349,7 +349,7 @@ impl ObjectStore {
     //         user.credentials.access_key = name.to_owned();
     //     }
 
-    //     // todo, 校验session token
+    //     // todo, 校验 session token
 
     //     Ok(Some(user))
     // }
@@ -932,7 +932,7 @@ impl Store for ObjectStore {
     //         Arc::new(tokio::sync::Mutex::new(CacheEntity::default())),
     //     );
 
-    //     // 一次读取32个元素
+    //     // 一次读取 32 个元素
     //     let iter = items
     //         .iter()
     //         .map(|item| item.trim_start_matches("config/iam/"))

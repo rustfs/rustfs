@@ -44,7 +44,7 @@ pub const BUCKET_TARGETS_FILE: &str = "bucket-targets.json";
 pub struct BucketMetadata {
     pub name: String,
     pub created: OffsetDateTime,
-    pub lock_enabled: bool, // 虽然标记为不使用，但可能需要保留
+    pub lock_enabled: bool, // While marked as unused, it may need to be retained
     pub policy_config_json: Vec<u8>,
     pub notification_config_xml: Vec<u8>,
     pub lifecycle_config_xml: Vec<u8>,
@@ -420,7 +420,6 @@ where
 
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     #[tokio::test]
