@@ -53,7 +53,7 @@ protos.workspace = true
 query = { workspace = true }
 rmp-serde.workspace = true
 rustfs-config = { workspace = true }
-rustfs-event-notifier = { workspace = true }
+rustfs-event = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustls.workspace = true

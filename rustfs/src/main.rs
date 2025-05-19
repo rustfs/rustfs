@@ -562,9 +562,9 @@ async fn run(opt: config::Opt) -> Result<()> {
             state_manager.update(ServiceState::Stopping);
 
             // Stop the notification system
-            if rustfs_event_notifier::is_ready() {
+            if rustfs_event::is_ready() {
                 // stop event notifier
-                rustfs_event_notifier::shutdown().await.map_err(|err| {
+                rustfs_event::shutdown().await.map_err(|err| {
                     error!("Failed to shut down the notification system: {}", err);
                     Error::from_string(err.to_string())
                 })?;

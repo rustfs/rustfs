@@ -1,4 +1,4 @@
-use rustfs_event_notifier::{
+use rustfs_event::{
     AdapterConfig, Bucket, Error as NotifierError, Event, Identity, Metadata, Name, NotifierConfig, Object, Source, WebhookConfig,
 };
 use std::collections::HashMap;
@@ -19,12 +19,12 @@ async fn setup_notification_system() -> Result<(), NotifierError> {
         })],
     };
 
-    rustfs_event_notifier::initialize(config).await?;
+    rustfs_event::initialize(config).await?;
 
     // wait for the system to be ready
     for _ in 0..50 {
         // wait up to 5 seconds
-        if rustfs_event_notifier::is_ready() {
+        if rustfs_event::is_ready() {
             return Ok(());
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .build()
                     .expect("failed to create event");
 
-                if let Err(e) = rustfs_event_notifier::send_event(event).await {
+                if let Err(e) = rustfs_event::send_event(event).await {
                     eprintln!("send event failed:{}", e);
                 }
 
@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 优雅关闭通知系统
     println!("turn off the notification system");
-    if let Err(e) = rustfs_event_notifier::shutdown().await {
+    if let Err(e) = rustfs_event::shutdown().await {
         eprintln!("An error occurred while shutting down the notification system:{}", e);
     } else {
         println!("the notification system has been closed safely");

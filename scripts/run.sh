@@ -82,6 +82,6 @@ if [ -n "$1" ]; then
 fi
 
 # 启动 webhook 服务器
-#cargo run --example webhook -p rustfs-event-notifier &
+#cargo run --example webhook -p rustfs-event &
 # 启动主服务
 cargo run --bin rustfs

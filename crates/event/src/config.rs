@@ -100,7 +100,7 @@ impl NotifierConfig {
     ///
     /// # Example
     /// ```
-    /// use rustfs_event_notifier::NotifierConfig;
+    /// use rustfs_event::NotifierConfig;
     ///
     /// let config = NotifierConfig::event_load_config(None);
     /// ```

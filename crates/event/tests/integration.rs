@@ -1,6 +1,6 @@
-use rustfs_event_notifier::{AdapterConfig, NotifierSystem, WebhookConfig};
-use rustfs_event_notifier::{Bucket, Event, EventBuilder, Identity, Metadata, Name, Object, Source};
-use rustfs_event_notifier::{ChannelAdapter, WebhookAdapter};
+use rustfs_event::{AdapterConfig, NotifierSystem, WebhookConfig};
+use rustfs_event::{Bucket, Event, EventBuilder, Identity, Metadata, Name, Object, Source};
+use rustfs_event::{ChannelAdapter, WebhookAdapter};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -67,7 +67,7 @@ async fn test_webhook_adapter() {
 
 #[tokio::test]
 async fn test_notification_system() {
-    let config = rustfs_event_notifier::NotifierConfig {
+    let config = rustfs_event::NotifierConfig {
         store_path: "./test_events".to_string(),
         channel_capacity: 100,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
