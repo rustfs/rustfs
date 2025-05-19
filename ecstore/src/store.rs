@@ -58,7 +58,6 @@ use std::slice::Iter;
 use std::time::SystemTime;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::OffsetDateTime;
-use tokio::select;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::{interval, sleep};
@@ -135,7 +134,7 @@ impl ECStore {
 
             // validate_parity(partiy_count, pool_eps.drives_per_set)?;
 
-            let (disks, errs) = crate::store_init::init_disks(
+            let (disks, errs) = store_init::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
@@ -204,7 +203,7 @@ impl ECStore {
             disk_map.insert(i, disks);
         }
 
-        // 替换本地磁盘
+        // Replace the local disk
         if !is_dist_erasure().await {
             let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
             for disk in local_disks {
@@ -237,11 +236,11 @@ impl ECStore {
         loop {
             if let Err(err) = ec.init().await {
                 error!("init err: {}", err);
-                error!("retry after  {} second", wait_sec);
+                info!("retry after  {} second ,exit count: {}", wait_sec, exit_count);
                 sleep(Duration::from_secs(wait_sec)).await;
 
                 if exit_count > 10 {
-                    return Err(Error::msg("ec init faild"));
+                    return Err(Error::msg("ec init failed"));
                 }
 
                 exit_count += 1;
@@ -257,6 +256,7 @@ impl ECStore {
         Ok(ec)
     }
 
+    /// init
     pub async fn init(self: &Arc<Self>) -> Result<()> {
         GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 
@@ -283,13 +283,13 @@ impl ECStore {
         }
 
         let pools = meta.return_resumable_pools();
-        let mut pool_indeces = Vec::with_capacity(pools.len());
+        let mut pool_indexes = Vec::with_capacity(pools.len());
 
         let endpoints = get_global_endpoints();
 
         for p in pools.iter() {
             if let Some(idx) = endpoints.get_pool_idx(&p.cmd_line) {
-                pool_indeces.push(idx);
+                pool_indexes.push(idx);
             } else {
                 return Err(Error::msg(format!(
                     "unexpected state present for decommission status pool({}) not found",
@@ -298,8 +298,8 @@ impl ECStore {
             }
         }
 
-        if !pool_indeces.is_empty() {
-            let idx = pool_indeces[0];
+        if !pool_indexes.is_empty() {
+            let idx = pool_indexes[0];
             if endpoints.as_ref()[idx].endpoints.as_ref()[0].is_local {
                 let (_tx, rx) = broadcast::channel(1);
 
@@ -309,9 +309,9 @@ impl ECStore {
                     // wait  3 minutes for cluster init
                     tokio::time::sleep(Duration::from_secs(60 * 3)).await;
 
-                    if let Err(err) = store.decommission(rx.resubscribe(), pool_indeces.clone()).await {
+                    if let Err(err) = store.decommission(rx.resubscribe(), pool_indexes.clone()).await {
                         if is_err_decommission_already_running(&err) {
-                            for i in pool_indeces.iter() {
+                            for i in pool_indexes.iter() {
                                 store.do_decommission_in_routine(rx.resubscribe(), *i).await;
                             }
                             return;
@@ -684,7 +684,7 @@ impl ECStore {
 
         let mut ress = Vec::new();
 
-        // join_all 结果跟输入顺序一致
+        // join_all The results are in the same order as they were entered
         for (i, res) in results.into_iter().enumerate() {
             let index = i;
 
@@ -851,7 +851,7 @@ impl ECStore {
             let mut interval = interval(Duration::from_secs(30));
             let all_merged = Arc::new(RwLock::new(DataUsageCache::default()));
             loop {
-                select! {
+                tokio::select! {
                     _ = ctx_clone.recv() => {
                         return;
                     }
@@ -867,7 +867,7 @@ impl ECStore {
         });
         let _ = join_all(futures).await;
         let mut ctx_closer = cancel.subscribe();
-        select! {
+        tokio::select! {
             _ = update_closer_tx.send(true) => {
 
             }
