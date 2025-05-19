@@ -75,7 +75,7 @@ where
     T: Store,
 {
     pub(crate) async fn new(api: T) -> Arc<Self> {
-        let (sender, reciver) = mpsc::channel::<i64>(100);
+        let (sender, receiver) = mpsc::channel::<i64>(100);
 
         let sys = Arc::new(Self {
             api,
@@ -86,20 +86,20 @@ where
             last_timestamp: AtomicI64::new(0),
         });
 
-        sys.clone().init(reciver).await.unwrap();
+        sys.clone().init(receiver).await.unwrap();
         sys
     }
 
-    async fn init(self: Arc<Self>, reciver: Receiver<i64>) -> Result<()> {
+    async fn init(self: Arc<Self>, receiver: Receiver<i64>) -> Result<()> {
         self.clone().save_iam_formatter().await?;
         self.clone().load().await?;
 
-        // 后台线程开启定时更新或者接收到信号更新
+        // The background thread enables scheduled updates or receives signal updates
         tokio::spawn({
             let s = Arc::clone(&self);
             async move {
                 let ticker = tokio::time::interval(Duration::from_secs(120));
-                tokio::pin!(ticker, reciver);
+                tokio::pin!(ticker, receiver);
                 loop {
                     select! {
                         _ = ticker.tick() => {
@@ -107,7 +107,7 @@ where
                                 error!("iam load err {:?}", err);
                             }
                         },
-                        i = reciver.recv() => {
+                        i = receiver.recv() => {
                             match i {
                                 Some(t) => {
                                     let last = s.last_timestamp.load(Ordering::Relaxed);
@@ -142,7 +142,7 @@ where
         Ok(())
     }
 
-    // todo, 判断是否存在，是否可以重试
+    // todo,Check whether it exists and whether it can be retried
     #[tracing::instrument(level = "debug", skip(self))]
     async fn save_iam_formatter(self: Arc<Self>) -> Result<()> {
         let path = get_iam_format_file_path();
@@ -798,7 +798,7 @@ where
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
             if combined_policy_stmt.is_empty() {
-                return Err(Error::msg(format!("need poliy not found {}", IamError::NoSuchPolicy)));
+                return Err(Error::msg(format!("need policy not found {}", IamError::NoSuchPolicy)));
             }
 
             self.api
@@ -971,7 +971,7 @@ where
                 _ => auth::ACCOUNT_OFF,
             }
         };
-        let user_entiry = UserIdentity::from(Credentials {
+        let user_entity = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: args.secret_key.to_string(),
             status: status.to_owned(),
@@ -979,10 +979,10 @@ where
         });
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entiry.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, user_entity.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, user_entiry)?;
+        self.update_user_with_claims(access_key, user_entity)?;
 
         Ok(OffsetDateTime::now_utc())
     }
@@ -1088,7 +1088,7 @@ where
             }
         };
 
-        let user_entiry = UserIdentity::from(Credentials {
+        let user_entity = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: u.credentials.secret_key.clone(),
             status: status.to_owned(),
@@ -1096,10 +1096,10 @@ where
         });
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entiry.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, user_entity.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, user_entiry)?;
+        self.update_user_with_claims(access_key, user_entity)?;
 
         Ok(OffsetDateTime::now_utc())
     }
@@ -1167,9 +1167,9 @@ where
 
         Cache::add_or_update(&self.cache.groups, group, &gi, OffsetDateTime::now_utc());
 
-        let user_group_memeberships = self.cache.user_group_memberships.load();
+        let user_group_memberships = self.cache.user_group_memberships.load();
         members.iter().for_each(|member| {
-            if let Some(m) = user_group_memeberships.get(member) {
+            if let Some(m) = user_group_memberships.get(member) {
                 let mut m = m.clone();
                 m.insert(group.to_string());
                 Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
@@ -1252,9 +1252,9 @@ where
 
         Cache::add_or_update(&self.cache.groups, name, &gi, OffsetDateTime::now_utc());
 
-        let user_group_memeberships = self.cache.user_group_memberships.load();
+        let user_group_memberships = self.cache.user_group_memberships.load();
         members.iter().for_each(|member| {
-            if let Some(m) = user_group_memeberships.get(member) {
+            if let Some(m) = user_group_memberships.get(member) {
                 let mut m = m.clone();
                 m.remove(name);
                 Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
@@ -1308,8 +1308,8 @@ where
     }
 
     fn remove_group_from_memberships_map(&self, group: &str) {
-        let user_group_memeberships = self.cache.user_group_memberships.load();
-        for (k, v) in user_group_memeberships.iter() {
+        let user_group_memberships = self.cache.user_group_memberships.load();
+        for (k, v) in user_group_memberships.iter() {
             if v.contains(group) {
                 let mut m = v.clone();
                 m.remove(group);
@@ -1319,9 +1319,9 @@ where
     }
 
     fn update_group_memberships_map(&self, group: &str, gi: &GroupInfo) {
-        let user_group_memeberships = self.cache.user_group_memberships.load();
+        let user_group_memberships = self.cache.user_group_memberships.load();
         for member in gi.members.iter() {
-            if let Some(m) = user_group_memeberships.get(member) {
+            if let Some(m) = user_group_memberships.get(member) {
                 let mut m = m.clone();
                 m.insert(group.to_string());
                 Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());

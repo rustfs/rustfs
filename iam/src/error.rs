@@ -7,7 +7,7 @@ pub enum Error {
     #[error(transparent)]
     PolicyError(#[from] PolicyError),
 
-    #[error("ecsotre error: {0}")]
+    #[error("ecstore error: {0}")]
     EcstoreError(common::error::Error),
 
     #[error("{0}")]

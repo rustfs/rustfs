@@ -55,7 +55,8 @@ impl Cache {
     fn exec<T: Clone>(target: &ArcSwap<CacheEntity<T>>, t: OffsetDateTime, mut op: impl FnMut(&mut CacheEntity<T>)) {
         let mut cur = target.load();
         loop {
-            // 当前的更新时间晚于执行时间，说明后台任务加载完毕，不需要执行当前操作。
+            // If the current update time is later than the execution time,
+            // the background task is loaded and the current operation does not need to be performed.
             if cur.load_time >= t {
                 return;
             }
@@ -63,7 +64,7 @@ impl Cache {
             let mut new = CacheEntity::clone(&cur);
             op(&mut new);
 
-            // 使用 cas 原子替换内容
+            // Replace content with CAS atoms
             let prev = target.compare_and_swap(&*cur, Arc::new(new));
             let swapped = Self::ptr_eq(&*cur, &*prev);
             if swapped {
@@ -88,17 +89,17 @@ impl Cache {
 
     pub fn build_user_group_memberships(&self) {
         let groups = self.groups.load();
-        let mut user_group_memeberships = HashMap::new();
+        let mut user_group_memberships = HashMap::new();
         for (group_name, group) in groups.iter() {
             for user_name in &group.members {
-                user_group_memeberships
+                user_group_memberships
                     .entry(user_name.clone())
                     .or_insert_with(HashSet::new)
                     .insert(group_name.clone());
             }
         }
         self.user_group_memberships
-            .store(Arc::new(CacheEntity::new(user_group_memeberships)));
+            .store(Arc::new(CacheEntity::new(user_group_memberships)));
     }
 }
 
@@ -164,7 +165,7 @@ impl CacheInner {
 #[derive(Clone)]
 pub struct CacheEntity<T> {
     map: HashMap<String, T>,
-    /// 重新加载的时间
+    /// The time of the reload
     load_time: OffsetDateTime,
 }
 
@@ -215,7 +216,7 @@ pub struct CacheInner {
     pub sts_accounts: G<UserIdentity>,
     pub sts_policies: G<MappedPolicy>,
     pub groups: G<GroupInfo>,
-    pub user_group_memeberships: G<HashSet<String>>,
+    pub user_group_memberships: G<HashSet<String>>,
     pub group_policies: G<MappedPolicy>,
 }
 
@@ -228,7 +229,7 @@ impl From<&Cache> for CacheInner {
             sts_accounts: value.sts_accounts.load(),
             sts_policies: value.sts_policies.load(),
             groups: value.groups.load(),
-            user_group_memeberships: value.user_group_memberships.load(),
+            user_group_memberships: value.user_group_memberships.load(),
             group_policies: value.group_policies.load(),
         }
     }

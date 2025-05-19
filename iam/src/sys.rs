@@ -246,7 +246,7 @@ impl<T: Store> IamSys<T> {
         // set expiration time default to 1 hour
         m.insert(
             "exp".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(
+            Value::Number(serde_json::Number::from(
                 opts.expiration
                     .map_or(OffsetDateTime::now_utc().unix_timestamp() + 3600, |t| t.unix_timestamp()),
             )),
@@ -282,7 +282,7 @@ impl<T: Store> IamSys<T> {
         self.store.list_service_accounts(access_key).await
     }
 
-    pub async fn list_tmep_accounts(&self, access_key: &str) -> Result<Vec<UserIdentity>> {
+    pub async fn list_temp_accounts(&self, access_key: &str) -> Result<Vec<UserIdentity>> {
         self.store.list_temp_accounts(access_key).await
     }
 
@@ -637,17 +637,17 @@ impl<T: Store> IamSys<T> {
 }
 
 fn is_allowed_by_session_policy(args: &Args<'_>) -> (bool, bool) {
-    let Some(spolicy) = args.claims.get(SESSION_POLICY_NAME_EXTRACTED) else {
+    let Some(policy) = args.claims.get(SESSION_POLICY_NAME_EXTRACTED) else {
         return (false, false);
     };
 
     let has_session_policy = true;
 
-    let Some(spolicy_str) = spolicy.as_str() else {
+    let Some(policy_str) = policy.as_str() else {
         return (has_session_policy, false);
     };
 
-    let Ok(sub_policy) = Policy::parse_config(spolicy_str.as_bytes()) else {
+    let Ok(sub_policy) = Policy::parse_config(policy_str.as_bytes()) else {
         return (has_session_policy, false);
     };
 
@@ -662,17 +662,17 @@ fn is_allowed_by_session_policy(args: &Args<'_>) -> (bool, bool) {
 }
 
 fn is_allowed_by_session_policy_for_service_account(args: &Args<'_>) -> (bool, bool) {
-    let Some(spolicy) = args.claims.get(SESSION_POLICY_NAME_EXTRACTED) else {
+    let Some(policy) = args.claims.get(SESSION_POLICY_NAME_EXTRACTED) else {
         return (false, false);
     };
 
     let mut has_session_policy = true;
 
-    let Some(spolicy_str) = spolicy.as_str() else {
+    let Some(policy_str) = policy.as_str() else {
         return (has_session_policy, false);
     };
 
-    let Ok(sub_policy) = Policy::parse_config(spolicy_str.as_bytes()) else {
+    let Ok(sub_policy) = Policy::parse_config(policy_str.as_bytes()) else {
         return (has_session_policy, false);
     };
 
