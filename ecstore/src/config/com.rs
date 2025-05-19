@@ -12,25 +12,54 @@ use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{error, warn};
 
+/// * config prefix
 pub const CONFIG_PREFIX: &str = "config";
+/// * config file
 const CONFIG_FILE: &str = "config.json";
 
+/// * config class sub system
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
+/// * config class sub system
 pub const DEFAULT_KV_KEY: &str = "_";
 
 lazy_static! {
+    /// * config bucket
     static ref CONFIG_BUCKET: String = format!("{}{}{}", RUSTFS_META_BUCKET, SLASH_SEPARATOR, CONFIG_PREFIX);
+    /// * config file
     static ref SubSystemsDynamic: HashSet<String> = {
         let mut h = HashSet::new();
         h.insert(STORAGE_CLASS_SUB_SYS.to_owned());
         h
     };
 }
+
+/// * read config
+///
+/// * @param api
+/// * @param file
+///
+/// * @return
+/// * @description
+/// * read config
+/// * @error
+/// * * ConfigError::NotFound
 pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
     Ok(data)
 }
 
+/// * read_config_with_metadata
+/// read config with metadata
+///
+/// * @param api
+/// * @param file
+/// * @param opts
+///
+/// * @return
+/// * @description
+/// * read config with metadata
+/// * @error
+/// * * ConfigError::NotFound
 pub async fn read_config_with_metadata<S: StorageAPI>(
     api: Arc<S>,
     file: &str,
@@ -57,6 +86,15 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
     Ok((data, rd.object_info))
 }
 
+/// * save_config   
+///
+/// * @param api
+/// * @param file
+/// * @param data
+///
+/// * @return
+/// * @description
+/// * save config
 pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
     save_config_with_opts(
         api,
@@ -70,6 +108,13 @@ pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) 
     .await
 }
 
+/// * delete_config
+///
+/// * @param api
+/// * @param file
+/// * @return
+/// * @description
+/// * delete config
 pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()> {
     match api
         .delete_object(
@@ -94,6 +139,15 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
     }
 }
 
+/// * save_config_with_opts
+/// save config with opts
+/// * @param api
+/// * @param file
+/// * @param data
+/// * @param opts
+/// * @return
+/// * @description
+/// * save config with opts
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
     let size = data.len();
     let _ = api
@@ -114,19 +168,20 @@ async fn new_and_save_server_config<S: StorageAPI>(api: Arc<S>) -> Result<Config
     Ok(cfg)
 }
 
+/// * read_config_without_migrate
 pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
     let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
     let data = match read_config(api.clone(), config_file.as_str()).await {
         Ok(res) => res,
         Err(err) => {
-            if is_err_config_not_found(&err) {
+            return if is_err_config_not_found(&err) {
                 warn!("config not found, start to init");
                 let cfg = new_and_save_server_config(api).await?;
                 warn!("config init done");
-                return Ok(cfg);
+                Ok(cfg)
             } else {
                 error!("read config err {:?}", &err);
-                return Err(err);
+                Err(err)
             }
         }
     };
@@ -141,14 +196,14 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
             let cfg_data = match read_config(api.clone(), config_file.as_str()).await {
                 Ok(res) => res,
                 Err(err) => {
-                    if is_err_config_not_found(&err) {
+                    return if is_err_config_not_found(&err) {
                         warn!("config not found init start");
                         let cfg = new_and_save_server_config(api).await?;
                         warn!("config not found init done");
-                        return Ok(cfg);
+                        Ok(cfg)
                     } else {
                         error!("read config err {:?}", &err);
-                        return Err(err);
+                        Err(err)
                     }
                 }
             };
@@ -171,6 +226,7 @@ async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Result<
     save_config(api, &config_file, data).await
 }
 
+/// * lookup_configs
 pub async fn lookup_configs<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) {
     // TODO: from etcd
     if let Err(err) = apply_dynamic_config(cfg, api).await {
@@ -186,13 +242,12 @@ async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> R
     Ok(())
 }
 
-async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()> {
+async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: Arc<S>, sub_sys: &str) -> Result<()> {
     let set_drive_counts = api.set_drive_counts();
-    if subsys == STORAGE_CLASS_SUB_SYS {
-        let kvs = match cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY) {
-            Some(res) => res,
-            None => KVS::new(),
-        };
+    if sub_sys == STORAGE_CLASS_SUB_SYS {
+        let kvs = cfg
+            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY)
+            .unwrap_or_else(|| KVS::new());
 
         for (i, count) in set_drive_counts.iter().enumerate() {
             match storageclass::lookup_config(&kvs, *count) {

@@ -129,7 +129,7 @@ impl FS {
 
         let ext = ext.to_owned();
 
-        // TODO: spport zip
+        // TODO: support zip
         let decoder = CompressionFormat::from_extension(&ext).get_decoder(body).map_err(|e| {
             error!("get_decoder err {:?}", e);
             s3_error!(InvalidArgument, "get_decoder err")
