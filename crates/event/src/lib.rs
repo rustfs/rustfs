@@ -3,6 +3,7 @@ mod bus;
 mod config;
 mod error;
 mod event;
+mod event_sys;
 mod global;
 mod notifier;
 mod store;
@@ -29,3 +30,11 @@ pub use event::{Bucket, Event, EventBuilder, Identity, Log, Metadata, Name, Obje
 pub use global::{initialize, is_initialized, is_ready, send_event, shutdown};
 pub use notifier::NotifierSystem;
 pub use store::EventStore;
+
+pub use event_sys::delete_config;
+pub use event_sys::get_event_notifier_config;
+pub use event_sys::read_config;
+pub use event_sys::save_config;
+
+pub use event_sys::EventSys;
+pub use event_sys::GLOBAL_EventSys;

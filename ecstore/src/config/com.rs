@@ -168,47 +168,45 @@ async fn new_and_save_server_config<S: StorageAPI>(api: Arc<S>) -> Result<Config
     Ok(cfg)
 }
 
-/// * read_config_without_migrate
+fn get_config_file() -> String {
+    format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE)
+}
+
+/// * read config without migrate
 pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
-    let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
-    let data = match read_config(api.clone(), config_file.as_str()).await {
-        Ok(res) => res,
-        Err(err) => {
-            return if is_err_config_not_found(&err) {
-                warn!("config not found, start to init");
-                let cfg = new_and_save_server_config(api).await?;
-                warn!("config init done");
-                Ok(cfg)
-            } else {
-                error!("read config err {:?}", &err);
-                Err(err)
-            }
-        }
+    let config_file = get_config_file();
+    let data = match read_config_and_init_if_not_found(api.clone(), config_file.as_str()).await? {
+        Some(data) => data,
+        None => return Ok(new_and_save_server_config(api).await?),
     };
 
     read_server_config(api, data.as_slice()).await
 }
 
+/// read config and init if not found
+async fn read_config_and_init_if_not_found<S: StorageAPI>(api: Arc<S>, config_file: &str) -> Result<Option<Vec<u8>>> {
+    match read_config(api.clone(), config_file).await {
+        Ok(data) => Ok(Some(data)),
+        Err(err) => {
+            if is_err_config_not_found(&err) {
+                warn!("config not found, start to init");
+                return Ok(None);
+            }
+            error!("read config err {:?}", &err);
+            Err(err)
+        }
+    }
+}
+
 async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<Config> {
     let cfg = {
         if data.is_empty() {
-            let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
-            let cfg_data = match read_config(api.clone(), config_file.as_str()).await {
-                Ok(res) => res,
-                Err(err) => {
-                    return if is_err_config_not_found(&err) {
-                        warn!("config not found init start");
-                        let cfg = new_and_save_server_config(api).await?;
-                        warn!("config not found init done");
-                        Ok(cfg)
-                    } else {
-                        error!("read config err {:?}", &err);
-                        Err(err)
-                    }
-                }
+            let config_file = get_config_file();
+            let cfg_data = match read_config_and_init_if_not_found(api.clone(), config_file.as_str()).await? {
+                Some(data) => data,
+                None => return Ok(new_and_save_server_config(api).await?),
             };
             // TODO: decrypt
-
             Config::unmarshal(cfg_data.as_slice())?
         } else {
             Config::unmarshal(data)?
@@ -221,7 +219,7 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
 async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Result<()> {
     let data = cfg.marshal()?;
 
-    let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
+    let config_file = get_config_file();
 
     save_config(api, &config_file, data).await
 }

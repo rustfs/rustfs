@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 
-/// Configuration for the notification system.
+/// Configuration for the webhook adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookConfig {
     pub endpoint: String,
@@ -14,7 +14,26 @@ pub struct WebhookConfig {
 }
 
 impl WebhookConfig {
-    /// verify that the configuration is valid
+    /// validate the configuration for the webhook adapter
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>`: Ok if the configuration is valid, Err with a message if invalid.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rustfs_event::WebhookConfig;
+    ///
+    /// let config = WebhookConfig {
+    ///     endpoint: "http://example.com/webhook".to_string(),
+    ///     auth_token: Some("my_token".to_string()),
+    ///     custom_headers: None,
+    ///     max_retries: 3,
+    ///     timeout: 5000,
+    /// };
+    ///
+    /// assert!(config.validate().is_ok());
     pub fn validate(&self) -> Result<(), String> {
         // verify that endpoint cannot be empty
         if self.endpoint.trim().is_empty() {
@@ -54,7 +73,7 @@ pub struct MqttConfig {
     pub max_retries: u32,
 }
 
-/// Configuration for the notification system.
+/// Configuration for the adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AdapterConfig {
@@ -64,6 +83,23 @@ pub enum AdapterConfig {
 }
 
 /// Configuration for the notification system.
+///
+/// This struct contains the configuration for the notification system, including
+/// the storage path, channel capacity, and a list of adapters.
+///
+/// # Fields
+///
+/// - `store_path`: The path to the storage directory.
+/// - `channel_capacity`: The capacity of the notification channel.
+/// - `adapters`: A list of adapters to be used for notifications.
+///
+/// # Example
+///
+/// ```
+/// use rustfs_event::NotifierConfig;
+///
+/// let config = NotifierConfig::new();
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotifierConfig {
     #[serde(default = "default_store_path")]
@@ -151,13 +187,33 @@ impl NotifierConfig {
             }
         }
     }
+
+    /// unmarshal the configuration from a byte array
+    pub fn unmarshal(data: &[u8]) -> common::error::Result<NotifierConfig> {
+        let m: NotifierConfig = serde_json::from_slice(data)?;
+        Ok(m)
+    }
+
+    /// marshal the configuration to a byte array
+    pub fn marshal(&self) -> common::error::Result<Vec<u8>> {
+        let data = serde_json::to_vec(&self)?;
+        Ok(data)
+    }
+
+    /// merge the configuration with default values
+    pub fn merge(&self) -> NotifierConfig {
+        self.clone()
+    }
 }
 
 const DEFAULT_CONFIG_FILE: &str = "event";
 
 /// Provide temporary directories as default storage paths
 fn default_store_path() -> String {
-    std::env::temp_dir().join("event-notification").to_string_lossy().to_string()
+    env::var("EVENT_STORE_PATH").unwrap_or_else(|e| {
+        tracing::error!("Failed to get EVENT_STORE_PATH: {}", e);
+        env::temp_dir().join(DEFAULT_CONFIG_FILE).to_string_lossy().to_string()
+    })
 }
 
 /// Provides the recommended default channel capacity for high concurrency systems

@@ -25,7 +25,8 @@ static INIT_LOCK: Mutex<()> = Mutex::const_new(());
 /// - Creating adapters fails.
 /// - Starting the notification system fails.
 /// - Setting the global system instance fails.
-pub async fn initialize(config: NotifierConfig) -> Result<(), Error> {
+#[instrument]
+pub async fn initialize(config: &NotifierConfig) -> Result<(), Error> {
     let _lock = INIT_LOCK.lock().await;
 
     // Check if the system is already initialized.
@@ -180,7 +181,7 @@ mod tests {
     async fn test_initialize_success() {
         tracing_subscriber::fmt::init();
         let config = NotifierConfig::default(); // assume there is a default configuration
-        let result = initialize(config).await;
+        let result = initialize(&config).await;
         assert!(result.is_err(), "Initialization should not succeed");
         assert!(!is_initialized(), "System should not be marked as initialized");
         assert!(!is_ready(), "System should not be marked as ready");
@@ -190,8 +191,8 @@ mod tests {
     async fn test_initialize_twice() {
         tracing_subscriber::fmt::init();
         let config = NotifierConfig::default();
-        let _ = initialize(config.clone()).await; // first initialization
-        let result = initialize(config).await; // second initialization
+        let _ = initialize(&config.clone()).await; // first initialization
+        let result = initialize(&config).await; // second initialization
         assert!(result.is_err(), "Initialization should succeed");
         assert!(result.is_err(), "Re-initialization should fail");
     }
@@ -213,7 +214,7 @@ mod tests {
             ], // assuming that the empty adapter will cause failure
             ..Default::default()
         };
-        let result = initialize(config).await;
+        let result = initialize(&config).await;
         assert!(result.is_ok(), "Initialization with invalid config should fail");
         assert!(is_initialized(), "System should not be marked as initialized after failure");
         assert!(is_ready(), "System should not be marked as ready after failure");
@@ -226,7 +227,7 @@ mod tests {
         assert!(!is_ready(), "System should not be ready initially");
 
         let config = NotifierConfig::default();
-        let _ = initialize(config).await;
+        let _ = initialize(&config).await;
         assert!(!is_initialized(), "System should be initialized after successful initialization");
         assert!(!is_ready(), "System should be ready after successful initialization");
     }

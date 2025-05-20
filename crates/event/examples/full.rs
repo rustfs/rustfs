@@ -19,7 +19,7 @@ async fn setup_notification_system() -> Result<(), NotifierError> {
         })],
     };
 
-    rustfs_event::initialize(config).await?;
+    rustfs_event::initialize(&config).await?;
 
     // wait for the system to be ready
     for _ in 0..50 {

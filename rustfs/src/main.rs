@@ -48,6 +48,7 @@ use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_event::GLOBAL_EventSys;
 use rustfs_obs::{init_obs, init_process_observer, load_config, set_global_guard};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
@@ -118,7 +119,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
 
     // Initialize event notifier
-    event::init_event_notifier(opt.event_config).await;
+    // event::init_event_notifier(opt.event_config).await;
 
     let server_addr = net::parse_and_resolve_address(opt.address.as_str())?;
     let server_port = server_addr.port();
@@ -506,6 +507,11 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     ecconfig::init();
     GLOBAL_ConfigSys.init(store.clone()).await?;
+
+    GLOBAL_EventSys.init(store.clone()).await?;
+
+    // Initialize event notifier
+    event::init_event_notifier(opt.event_config).await;
 
     let buckets_list = store
         .list_bucket(&BucketOptions {

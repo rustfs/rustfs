@@ -7495,8 +7495,12 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
+ "common",
  "config",
  "dotenvy",
+ "ecstore",
+ "http",
+ "lazy_static",
  "rdkafka",
  "reqwest",
  "rumqttc",
