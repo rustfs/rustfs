@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 
+const DEFAULT_CONFIG_FILE: &str = "event";
+
 /// Configuration for the webhook adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookConfig {
@@ -206,17 +208,18 @@ impl NotifierConfig {
     }
 }
 
-const DEFAULT_CONFIG_FILE: &str = "event";
-
 /// Provide temporary directories as default storage paths
 fn default_store_path() -> String {
     env::var("EVENT_STORE_PATH").unwrap_or_else(|e| {
-        tracing::error!("Failed to get EVENT_STORE_PATH: {}", e);
+        tracing::info!("Failed to get `EVENT_STORE_PATH` failed err: {}", e.to_string());
         env::temp_dir().join(DEFAULT_CONFIG_FILE).to_string_lossy().to_string()
     })
 }
 
 /// Provides the recommended default channel capacity for high concurrency systems
 fn default_channel_capacity() -> usize {
-    10000 // Reasonable default values for high concurrency systems
+    env::var("EVENT_CHANNEL_CAPACITY")
+        .unwrap_or_else(|_| "10000".to_string())
+        .parse()
+        .unwrap_or(10000) // Default to 10000 if parsing fails
 }

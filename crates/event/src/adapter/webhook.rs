@@ -1,7 +1,7 @@
-use crate::ChannelAdapter;
 use crate::Error;
 use crate::Event;
 use crate::WebhookConfig;
+use crate::{ChannelAdapter, ChannelAdapterType};
 use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder};
 use std::time::Duration;
@@ -16,10 +16,11 @@ pub struct WebhookAdapter {
 impl WebhookAdapter {
     /// Creates a new Webhook adapter.
     pub fn new(config: WebhookConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(config.timeout))
-            .build()
-            .expect("Failed to build reqwest client");
+        let mut builder = Client::builder();
+        if config.timeout > 0 {
+            builder = builder.timeout(Duration::from_secs(config.timeout));
+        }
+        let client = builder.build().expect("Failed to build reqwest client");
         Self { config, client }
     }
     /// Builds the request to send the event.
@@ -40,7 +41,7 @@ impl WebhookAdapter {
 #[async_trait]
 impl ChannelAdapter for WebhookAdapter {
     fn name(&self) -> String {
-        "webhook".to_string()
+        ChannelAdapterType::Webhook.to_string()
     }
 
     async fn send(&self, event: &Event) -> Result<(), Error> {

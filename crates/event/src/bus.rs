@@ -21,17 +21,10 @@ pub async fn event_bus(
     shutdown: CancellationToken,
     shutdown_complete: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), Error> {
-    let mut current_log = Log {
-        event_name: crate::event::Name::Everything,
-        key: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(),
-        records: Vec::new(),
-    };
-
     let mut unprocessed_events = Vec::new();
     loop {
         tokio::select! {
             Some(event) = rx.recv() => {
-                current_log.records.push(event.clone());
                 let mut send_tasks = Vec::new();
                 for adapter in &adapters {
                     if event.channels.contains(&adapter.name()) {
@@ -54,9 +47,6 @@ pub async fn event_bus(
                         unprocessed_events.push(failed_event);
                     }
                 }
-
-                // Clear the current log because we only care about unprocessed events
-                 current_log.records.clear();
             }
             _ = shutdown.cancelled() => {
                 tracing::info!("Shutting down event bus, saving pending logs...");

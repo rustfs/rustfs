@@ -1,4 +1,4 @@
-use rustfs_event::{AdapterConfig, NotifierSystem, WebhookConfig};
+use rustfs_event::{AdapterConfig, ChannelAdapterType, NotifierSystem, WebhookConfig};
 use rustfs_event::{Bucket, Event, EventBuilder, Identity, Metadata, Name, Object, Source};
 use rustfs_event::{ChannelAdapter, WebhookAdapter};
 use std::collections::HashMap;
@@ -57,7 +57,7 @@ async fn test_webhook_adapter() {
         .response_elements(HashMap::new())
         .s3(metadata)
         .source(source)
-        .channels(vec!["webhook".to_string()])
+        .channels(vec![ChannelAdapterType::Webhook.to_string()])
         .build()
         .expect("failed to create event");
 
@@ -122,7 +122,7 @@ async fn test_notification_system() {
             principal_id: "user123".to_string(),
         })
         .event_time("2023-10-01T12:00:00.000Z")
-        .channels(vec!["webhook".to_string()])
+        .channels(vec![ChannelAdapterType::Webhook.to_string()])
         .build()
         .expect("failed to create event");
 

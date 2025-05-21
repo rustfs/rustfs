@@ -11,6 +11,53 @@ pub(crate) mod mqtt;
 #[cfg(feature = "webhook")]
 pub(crate) mod webhook;
 
+/// The `ChannelAdapterType` enum represents the different types of channel adapters.
+///
+/// It is used to identify the type of adapter being used in the system.
+///
+/// # Variants
+///
+/// - `Webhook`: Represents a webhook adapter.
+/// - `Kafka`: Represents a Kafka adapter.
+/// - `Mqtt`: Represents an MQTT adapter.
+///
+/// # Example
+///
+/// ```
+/// use rustfs_event::ChannelAdapterType;
+///
+/// let adapter_type = ChannelAdapterType::Webhook;
+/// match adapter_type {
+///    ChannelAdapterType::Webhook => println!("Using webhook adapter"),
+///    ChannelAdapterType::Kafka => println!("Using Kafka adapter"),
+///    ChannelAdapterType::Mqtt => println!("Using MQTT adapter"),
+/// }
+pub enum ChannelAdapterType {
+    Webhook,
+    Kafka,
+    Mqtt,
+}
+
+impl ChannelAdapterType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChannelAdapterType::Webhook => "webhook",
+            ChannelAdapterType::Kafka => "kafka",
+            ChannelAdapterType::Mqtt => "mqtt",
+        }
+    }
+}
+
+impl std::fmt::Display for ChannelAdapterType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelAdapterType::Webhook => write!(f, "webhook"),
+            ChannelAdapterType::Kafka => write!(f, "kafka"),
+            ChannelAdapterType::Mqtt => write!(f, "mqtt"),
+        }
+    }
+}
+
 /// The `ChannelAdapter` trait defines the interface for all channel adapters.
 #[async_trait]
 pub trait ChannelAdapter: Send + Sync + 'static {

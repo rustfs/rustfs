@@ -1,7 +1,7 @@
-use crate::ChannelAdapter;
 use crate::Error;
 use crate::Event;
 use crate::KafkaConfig;
+use crate::{ChannelAdapter, ChannelAdapterType};
 use async_trait::async_trait;
 use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -60,7 +60,7 @@ impl KafkaAdapter {
 #[async_trait]
 impl ChannelAdapter for KafkaAdapter {
     fn name(&self) -> String {
-        "kafka".to_string()
+        ChannelAdapterType::Kafka.to_string()
     }
 
     async fn send(&self, event: &Event) -> Result<(), Error> {

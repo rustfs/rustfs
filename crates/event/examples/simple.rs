@@ -1,5 +1,5 @@
-use rustfs_event::create_adapters;
 use rustfs_event::NotifierSystem;
+use rustfs_event::{create_adapters, ChannelAdapterType};
 use rustfs_event::{AdapterConfig, NotifierConfig, WebhookConfig};
 use rustfs_event::{Bucket, Event, Identity, Metadata, Name, Object, Source};
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
     // event_load_config
     // loading configuration from environment variables
-    let _config = NotifierConfig::event_load_config(Some("./crates/event-notifier/examples/event.toml".to_string()));
+    let _config = NotifierConfig::event_load_config(Some("./crates/event/examples/event.toml".to_string()));
     tracing::info!("event_load_config config: {:?} \n", _config);
     dotenvy::dotenv()?;
     let _config = NotifierConfig::event_load_config(None);
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         })
         .s3(metadata)
         .source(source)
-        .channels(vec!["webhook".to_string()])
+        .channels(vec![ChannelAdapterType::Webhook.to_string()])
         .build()
         .expect("failed to create event");
 

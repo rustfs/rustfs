@@ -40,7 +40,7 @@ rdkafka = { workspace = true, features = ["tokio"], optional = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 axum = { workspace = true }
-dotenvy = "0.15.7"
+dotenvy = { workspace = true }
 
 [lints]
 workspace = true

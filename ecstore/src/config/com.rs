@@ -33,33 +33,41 @@ lazy_static! {
     };
 }
 
-/// * read config
+/// Reads configuration file content from the storage system
 ///
-/// * @param api
-/// * @param file
+/// This function reads a specified configuration file through the provided storage API interface
+/// and returns its raw byte content. It's a basic configuration reading function that returns
+/// only the configuration data without any metadata.
 ///
-/// * @return
-/// * @description
-/// * read config
-/// * @error
-/// * * ConfigError::NotFound
+/// # Parameters
+/// * `api` - An Arc smart pointer containing an implementation of the StorageAPI trait
+/// * `file` - The name of the configuration file to read
+///
+/// # Returns
+/// * `Result<Vec<u8>>` - Returns the configuration file contents as bytes on success, or an error on failure
+///
+/// # Errors
+/// May return the following errors:
+/// * `ConfigError::NotFound` - When the requested configuration file does not exist
+/// * Other storage operation related errors
+///
 pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
     Ok(data)
 }
 
-/// * read_config_with_metadata
-/// read config with metadata
+/// read config with metadata with api,file and opts
 ///
-/// * @param api
-/// * @param file
-/// * @param opts
+/// # Parameters
+/// - `api`: StorageAPI
+/// - `file`: file name
+/// - `opts`: object options
 ///
-/// * @return
-/// * @description
-/// * read config with metadata
-/// * @error
-/// * * ConfigError::NotFound
+/// # Returns
+/// Result<(Vec<u8>, ObjectInfo)>
+///
+/// # Errors
+/// - ConfigError::NotFound
 pub async fn read_config_with_metadata<S: StorageAPI>(
     api: Arc<S>,
     file: &str,
@@ -86,15 +94,16 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
     Ok((data, rd.object_info))
 }
 
-/// * save_config   
+/// save config with api,file and data
 ///
-/// * @param api
-/// * @param file
-/// * @param data
+/// # Parameters
 ///
-/// * @return
-/// * @description
-/// * save config
+/// - `api`: StorageAPI
+/// - `file`: file name
+/// - `data`: data to save
+///
+/// # Returns
+/// Result
 pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
     save_config_with_opts(
         api,
@@ -108,13 +117,15 @@ pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) 
     .await
 }
 
-/// * delete_config
+/// delete config with api and file
 ///
-/// * @param api
-/// * @param file
-/// * @return
-/// * @description
-/// * delete config
+/// # Parameters
+/// - `api`: StorageAPI
+/// - `file`: file name
+///
+/// # Returns
+/// Result
+///
 pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()> {
     match api
         .delete_object(
@@ -139,15 +150,15 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
     }
 }
 
-/// * save_config_with_opts
 /// save config with opts
-/// * @param api
-/// * @param file
-/// * @param data
-/// * @param opts
-/// * @return
-/// * @description
-/// * save config with opts
+///
+/// # Parameters
+/// - `api`: StorageAPI
+/// - `file`: file name
+/// - `data`: data to save
+///
+/// # Returns
+/// Result
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
     let size = data.len();
     let _ = api

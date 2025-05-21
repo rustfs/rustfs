@@ -1,5 +1,6 @@
 use rustfs_event::{
-    AdapterConfig, Bucket, Error as NotifierError, Event, Identity, Metadata, Name, NotifierConfig, Object, Source, WebhookConfig,
+    AdapterConfig, Bucket, ChannelAdapterType, Error as NotifierError, Event, Identity, Metadata, Name, NotifierConfig, Object,
+    Source, WebhookConfig,
 };
 use std::collections::HashMap;
 use tokio::signal;
@@ -103,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .s3(metadata)
                     .source(source)
-                    .channels(vec!["webhook".to_string()])
+                    .channels(vec![ChannelAdapterType::Webhook.to_string()])
                     .build()
                     .expect("failed to create event");
 

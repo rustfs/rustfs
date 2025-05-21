@@ -506,8 +506,10 @@ async fn run(opt: config::Opt) -> Result<()> {
         })?;
 
     ecconfig::init();
+    // config system configuration
     GLOBAL_ConfigSys.init(store.clone()).await?;
 
+    // event system configuration
     GLOBAL_EventSys.init(store.clone()).await?;
 
     // Initialize event notifier

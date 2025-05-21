@@ -1,7 +1,7 @@
-use crate::ChannelAdapter;
 use crate::Error;
 use crate::Event;
 use crate::MqttConfig;
+use crate::{ChannelAdapter, ChannelAdapterType};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use std::time::Duration;
@@ -33,7 +33,7 @@ impl MqttAdapter {
 #[async_trait]
 impl ChannelAdapter for MqttAdapter {
     fn name(&self) -> String {
-        "mqtt".to_string()
+        ChannelAdapterType::Mqtt.to_string()
     }
 
     async fn send(&self, event: &Event) -> Result<(), Error> {
