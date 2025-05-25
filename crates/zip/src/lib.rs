@@ -315,7 +315,7 @@ mod tests {
 
         #[test]
     fn test_compression_format_from_extension() {
-        // 测试支持的压缩格式识别
+        // Test supported compression format recognition
         assert_eq!(CompressionFormat::from_extension("gz"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("gzip"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("bz2"), CompressionFormat::Bzip2);
@@ -327,11 +327,11 @@ mod tests {
         assert_eq!(CompressionFormat::from_extension("zstd"), CompressionFormat::Zstd);
         assert_eq!(CompressionFormat::from_extension("tar"), CompressionFormat::Tar);
 
-        // 测试大小写不敏感
+        // Test case insensitivity
         assert_eq!(CompressionFormat::from_extension("GZ"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("ZIP"), CompressionFormat::Zip);
 
-        // 测试未知格式
+        // Test unknown formats
         assert_eq!(CompressionFormat::from_extension("unknown"), CompressionFormat::Unknown);
         assert_eq!(CompressionFormat::from_extension("txt"), CompressionFormat::Unknown);
         assert_eq!(CompressionFormat::from_extension(""), CompressionFormat::Unknown);
