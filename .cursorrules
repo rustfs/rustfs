@@ -318,9 +318,11 @@ async fn health_check() -> Result<HealthStatus> {
 - [ ] Does it follow the project's architectural patterns?
 - [ ] Is there appropriate documentation?
 
-### 6. Code Commits
+### 6. Code Commits and Documentation
 - [ ] Does it comply with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)?
+- [ ] Are commit messages concise and under 72 characters for the title line?
 - [ ] Commit titles should be concise and in English, avoid Chinese
+- [ ] Is PR description provided in copyable markdown format for easy copying?
 
 ## Common Patterns and Best Practices
 
@@ -401,6 +403,7 @@ These rules should serve as guiding principles when developing the RustFS projec
  - Do not arbitrarily modify numbers and constants in test cases, carefully analyze their meaning to ensure test case correctness
  - When writing or modifying tests, check existing test cases to ensure they have scientific naming and rigorous logic testing, if not compliant, modify test cases to ensure scientific and rigorous testing
  - After each development completion, first git add . then git commit -m "feat: feature description" or "fix: issue description", ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+ - **Keep commit messages concise and under 72 characters** for the title line, use body for detailed explanations if needed
  - After each development completion, first git push to remote repository
  - After each change completion, summarize the changes, do not create summary files, provide a brief change description, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
  - Provide change descriptions needed for PR in the conversation, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
@@ -410,3 +413,4 @@ These rules should serve as guiding principles when developing the RustFS projec
    - List of key changes and improvements
    - Any breaking changes or migration notes if applicable
    - Testing information and verification steps
+ - **Provide PR descriptions in copyable markdown format** enclosed in code blocks for easy one-click copying
