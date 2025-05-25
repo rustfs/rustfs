@@ -37,12 +37,17 @@ single_line_let_else_max_width = 100
 - Use `PascalCase` for types, traits, enums
 - Constants use `SCREAMING_SNAKE_CASE`
 - Global variables prefix `GLOBAL_`, e.g., `GLOBAL_Endpoints`
+- Use meaningful and descriptive names for variables, functions, and methods
+- Avoid meaningless names like `temp`, `data`, `foo`, `bar`, `test123`
+- Choose names that clearly express the purpose and intent
 
 ### 3. Documentation Comments
 - Public APIs must have documentation comments
 - Use `///` for documentation comments
 - Complex functions add `# Examples` and `# Parameters` descriptions
 - Error cases use `# Errors` descriptions
+- Always use English for all comments and documentation
+- Avoid meaningless comments like "debug 111" or placeholder text
 
 ### 4. Import Guidelines
 - Standard library imports first
@@ -181,6 +186,13 @@ mod tests {
 ### 2. Integration Tests
 - Use `e2e_test` module for end-to-end testing
 - Simulate real storage environments
+
+### 3. Test Quality Standards
+- Write meaningful test cases that verify actual functionality
+- Avoid placeholder or debug content like "debug 111", "test test", etc.
+- Use descriptive test names that clearly indicate what is being tested
+- Each test should have a clear purpose and verify specific behavior
+- Test data should be realistic and representative of actual use cases
 
 ## Security Guidelines
 
@@ -336,7 +348,9 @@ These rules should serve as guiding principles when developing the RustFS projec
  - Always check the .cursorrules file before starting to ensure you understand the project guidelines
  - Before starting any change or requirement development, first git checkout to main branch, then git pull to get the latest code
  - For each feature or change to be developed, first create a branch, then git checkout to that branch
- - Use English for code comments, do not use Chinese
+ - Use English for all code comments, documentation, and variable names
+ - Write meaningful and descriptive names for variables, functions, and methods
+ - Avoid meaningless test content like "debug 111" or placeholder values
  - Before each change, carefully read the existing code to ensure you understand the code structure and implementation, do not break existing logic implementation, do not introduce new issues
  - Ensure each change provides sufficient test cases to guarantee code correctness
  - Do not arbitrarily modify numbers and constants in test cases, carefully analyze their meaning to ensure test case correctness
