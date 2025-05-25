@@ -129,7 +129,7 @@ impl FS {
 
         let ext = ext.to_owned();
 
-        // TODO: spport zip
+        // TODO: support zip
         let decoder = CompressionFormat::from_extension(&ext).get_decoder(body).map_err(|e| {
             error!("get_decoder err {:?}", e);
             s3_error!(InvalidArgument, "get_decoder err")
@@ -204,8 +204,8 @@ impl FS {
         // )
         // .await
         // {
-        //     Ok(_) => println!("解压成功！"),
-        //     Err(e) => println!("解压失败: {}", e),
+        //     Ok(_) => println!("Decompression successful!"),
+        //     Err(e) => println!("Decompression failed: {}", e),
         // }
 
         // TODO: etag
@@ -341,7 +341,7 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
-        // TODO: DeleteBucketInput 没有 force 参数？
+        // TODO: DeleteBucketInput doesn't have force parameter?
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };

@@ -156,7 +156,7 @@ pub fn clone_err(e: &common::error::Error) -> common::error::Error {
             common::error::Error::new(std::io::Error::new(e.kind(), e.to_string()))
         }
     } else {
-        //TODO: 优化其他类型
+        //TODO: Optimize other types
         common::error::Error::msg(e.to_string())
     }
 }
