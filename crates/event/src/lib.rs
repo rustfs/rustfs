@@ -6,6 +6,7 @@ mod event;
 mod global;
 mod notifier;
 mod store;
+mod target;
 
 pub use adapter::create_adapters;
 #[cfg(all(feature = "kafka", target_os = "linux"))]
@@ -17,13 +18,15 @@ pub use adapter::webhook::WebhookAdapter;
 pub use adapter::ChannelAdapter;
 pub use adapter::ChannelAdapterType;
 pub use bus::event_bus;
+pub use config::AdapterCommon;
+pub use config::EventNotifierConfig;
 #[cfg(all(feature = "kafka", target_os = "linux"))]
 pub use config::KafkaConfig;
 #[cfg(feature = "mqtt")]
 pub use config::MqttConfig;
 #[cfg(feature = "webhook")]
 pub use config::WebhookConfig;
-pub use config::{AdapterConfig, NotifierConfig};
+pub use config::{AdapterConfig, NotifierConfig, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_INTERVAL};
 pub use error::Error;
 
 pub use event::{Bucket, Event, EventBuilder, Identity, Log, Metadata, Name, Object, Source};
@@ -32,6 +35,7 @@ pub use notifier::NotifierSystem;
 pub use store::event::EventStore;
 
 pub use store::get_event_notifier_config;
+pub use store::queue::QueueStore;
 
 pub use store::EventSys;
 pub use store::GLOBAL_EventSys;

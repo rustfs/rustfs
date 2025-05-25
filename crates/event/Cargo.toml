@@ -17,8 +17,8 @@ async-trait = { workspace = true }
 config = { workspace = true }
 common = { workspace = true }
 ecstore = { workspace = true }
-http = { workspace = true }
 lazy_static = { workspace = true }
+once_cell = { workspace = true }
 reqwest = { workspace = true, optional = true }
 rumqttc = { workspace = true, optional = true }
 serde = { workspace = true }
@@ -31,6 +31,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "macros", "signal", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
+snap = { workspace = true }
+
 
 # Only enable kafka features and related dependencies on Linux
 [target.'cfg(target_os = "linux")'.dependencies]

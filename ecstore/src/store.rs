@@ -1671,7 +1671,7 @@ impl StorageAPI for ECStore {
         let object = utils::path::encode_dir_object(object);
         let object = object.as_str();
 
-        // 查询在哪个 pool
+        // Query which pool it is in
         let (mut pinfo, errs) = self
             .get_pool_info_existing_with_opts(bucket, object, &opts)
             .await

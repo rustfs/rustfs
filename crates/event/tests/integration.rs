@@ -1,4 +1,4 @@
-use rustfs_event::{AdapterConfig, ChannelAdapterType, NotifierSystem, WebhookConfig};
+use rustfs_event::{AdapterCommon, AdapterConfig, ChannelAdapterType, NotifierSystem, WebhookConfig};
 use rustfs_event::{Bucket, Event, EventBuilder, Identity, Metadata, Name, Object, Source};
 use rustfs_event::{ChannelAdapter, WebhookAdapter};
 use std::collections::HashMap;
@@ -7,11 +7,21 @@ use std::sync::Arc;
 #[tokio::test]
 async fn test_webhook_adapter() {
     let adapter = WebhookAdapter::new(WebhookConfig {
+        common: AdapterCommon {
+            identifier: "webhook".to_string(),
+            comment: "webhook".to_string(),
+            enable: true,
+            queue_dir: "./deploy/logs/event_queue".to_string(),
+            queue_limit: 100,
+        },
         endpoint: "http://localhost:8080/webhook".to_string(),
         auth_token: None,
         custom_headers: None,
         max_retries: 1,
-        timeout: 5,
+        timeout: Some(5),
+        retry_interval: Some(5),
+        client_cert: None,
+        client_key: None,
     });
 
     // create an s3 metadata object
@@ -71,20 +81,28 @@ async fn test_notification_system() {
         store_path: "./test_events".to_string(),
         channel_capacity: 100,
         adapters: vec![AdapterConfig::Webhook(WebhookConfig {
+            common: Default::default(),
             endpoint: "http://localhost:8080/webhook".to_string(),
             auth_token: None,
             custom_headers: None,
             max_retries: 1,
-            timeout: 5,
+            timeout: Some(5),
+            retry_interval: Some(5),
+            client_cert: None,
+            client_key: None,
         })],
     };
     let system = Arc::new(tokio::sync::Mutex::new(NotifierSystem::new(config.clone()).await.unwrap()));
     let adapters: Vec<Arc<dyn ChannelAdapter>> = vec![Arc::new(WebhookAdapter::new(WebhookConfig {
+        common: Default::default(),
         endpoint: "http://localhost:8080/webhook".to_string(),
         auth_token: None,
         custom_headers: None,
         max_retries: 1,
-        timeout: 5,
+        timeout: Some(5),
+        retry_interval: Some(5),
+        client_cert: None,
+        client_key: None,
     }))];
 
     // create an s3 metadata object

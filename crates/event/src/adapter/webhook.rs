@@ -1,15 +1,20 @@
-use crate::Error;
-use crate::Event;
+use crate::store::queue::Store;
 use crate::WebhookConfig;
 use crate::{ChannelAdapter, ChannelAdapterType};
+use crate::{Error, QueueStore};
+use crate::{Event, DEFAULT_RETRY_INTERVAL};
 use async_trait::async_trait;
-use reqwest::{Client, RequestBuilder};
+use reqwest::{self, Client, Identity, RequestBuilder};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
 /// Webhook adapter for sending events to a webhook endpoint.
 pub struct WebhookAdapter {
     config: WebhookConfig,
+    store: Option<Arc<QueueStore<Event>>>,
     client: Client,
 }
 
@@ -17,17 +22,154 @@ impl WebhookAdapter {
     /// Creates a new Webhook adapter.
     pub fn new(config: WebhookConfig) -> Self {
         let mut builder = Client::builder();
-        if config.timeout > 0 {
-            builder = builder.timeout(Duration::from_secs(config.timeout));
+        if config.timeout.is_some() {
+            // Set the timeout for the client
+            match config.timeout {
+                Some(t) => builder = builder.timeout(Duration::from_secs(t)),
+                None => tracing::warn!("Timeout is not set, using default timeout"),
+            }
         }
-        let client = builder.build().expect("Failed to build reqwest client");
-        Self { config, client }
+        let client = if let (Some(cert_path), Some(key_path)) = (&config.client_cert, &config.client_key) {
+            let cert_path = PathBuf::from(cert_path);
+            let key_path = PathBuf::from(key_path);
+
+            // Check if the certificate file exists
+            if !cert_path.exists() || !key_path.exists() {
+                tracing::warn!("Certificate files not found, falling back to default client");
+                builder.build()
+            } else {
+                // Try to read and load the certificate
+                match (fs::read(&cert_path), fs::read(&key_path)) {
+                    (Ok(cert_data), Ok(key_data)) => {
+                        // Create an identity
+                        let mut pem_data = cert_data;
+                        pem_data.extend_from_slice(&key_data);
+
+                        match Identity::from_pem(&pem_data) {
+                            Ok(identity) => {
+                                tracing::info!("Successfully loaded client certificate");
+                                builder.identity(identity).build()
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to create identity from PEM: {}, falling back to default client", e);
+                                builder.build()
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::warn!("Failed to read certificate files, falling back to default client");
+                        builder.build()
+                    }
+                }
+            }
+        } else {
+            builder.build()
+        }
+        .expect("Failed to create HTTP client");
+
+        // create a queue store if enabled
+        let store = if !config.common.queue_dir.len() > 0 {
+            let store_path = PathBuf::from(&config.common.queue_dir);
+            let store = QueueStore::new(store_path, config.common.queue_limit, Some(".webhook".to_string()));
+            if let Err(e) = store.open() {
+                tracing::error!("Unable to open queue storage: {}", e);
+                None
+            } else {
+                Some(Arc::new(store))
+            }
+        } else {
+            None
+        };
+
+        Self { config, store, client }
     }
+
+    /// Handle backlog events in storage
+    pub async fn process_backlog(&self) -> Result<(), Error> {
+        if let Some(store) = &self.store {
+            let keys = store.list();
+            for key in keys {
+                match store.get_multiple(&key) {
+                    Ok(events) => {
+                        for event in events {
+                            if let Err(e) = self.send_with_retry(&event).await {
+                                tracing::error!("Processing of backlog events failed: {}", e);
+                                continue;
+                            }
+                        }
+                        // Deleted after successful processing
+                        let _ = store.del(&key);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to read events from storage: {}", e);
+                        // delete the broken entries
+                        let _ = store.del(&key);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    ///Send events to the webhook endpoint with retry logic
+    async fn send_with_retry(&self, event: &Event) -> Result<(), Error> {
+        let retry_interval = match self.config.retry_interval {
+            Some(t) => Duration::from_secs(t),
+            None => Duration::from_secs(DEFAULT_RETRY_INTERVAL), // Default to 3 seconds if not set
+        };
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+            match self.send_request(event).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if attempts <= self.config.max_retries {
+                        tracing::warn!("Send to webhook fails and will be retried after 3 seconds:{}", e);
+                        sleep(retry_interval).await;
+                    } else if let Some(store) = &self.store {
+                        // store in a queue for later processing
+                        tracing::warn!("The maximum number of retries is reached, and the event is stored in a queue:{}", e);
+                        if let Err(store_err) = store.put(event.clone()) {
+                            tracing::error!("Events cannot be stored to a queue:{}", store_err);
+                        }
+                        return Err(e);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a single HTTP request
+    async fn send_request(&self, event: &Event) -> Result<(), Error> {
+        // Send a request
+        let response = self.build_request(event).send().await?;
+
+        // Check the response status
+        if !response.status().is_success() {
+            return Err(Error::Custom(format!("Webhook request failed, status code:{}", response.status())));
+        }
+
+        Ok(())
+    }
+
     /// Builds the request to send the event.
     fn build_request(&self, event: &Event) -> RequestBuilder {
-        let mut request = self.client.post(&self.config.endpoint).json(event);
+        let mut request = self
+            .client
+            .post(&self.config.endpoint)
+            .json(event)
+            .header("Content-Type", "application/json");
         if let Some(token) = &self.config.auth_token {
-            request = request.header("Authorization", format!("Bearer {}", token));
+            let tokens: Vec<&str> = token.split_whitespace().collect();
+            match tokens.len() {
+                2 => request = request.header("Authorization", token),
+                1 => request = request.header("Authorization", format!("Bearer {}", token)),
+                _ => tracing::warn!("Invalid auth token format, skipping Authorization header"),
+            }
         }
         if let Some(headers) = &self.config.custom_headers {
             for (key, value) in headers {
@@ -45,21 +187,10 @@ impl ChannelAdapter for WebhookAdapter {
     }
 
     async fn send(&self, event: &Event) -> Result<(), Error> {
-        let mut attempt = 0;
-        tracing::info!("Attempting to send webhook request: {:?}", event);
-        loop {
-            match self.build_request(event).send().await {
-                Ok(response) => {
-                    response.error_for_status().map_err(Error::Http)?;
-                    return Ok(());
-                }
-                Err(e) if attempt < self.config.max_retries => {
-                    attempt += 1;
-                    tracing::warn!("Webhook attempt {} failed: {}. Retrying...", attempt, e);
-                    sleep(Duration::from_secs(2u64.pow(attempt))).await;
-                }
-                Err(e) => return Err(Error::Http(e)),
-            }
-        }
+        // Deal with the backlog of events first
+        let _ = self.process_backlog().await;
+
+        // Send the current event
+        self.send_with_retry(event).await
     }
 }

@@ -109,6 +109,7 @@ nix = { version = "0.30.1", features = ["fs"] }
 num_cpus = { version = "1.16.0" }
 nvml-wrapper = "0.10.0"
 object_store = "0.11.2"
+once_cell = "1.21.3"
 opentelemetry = { version = "0.29.1" }
 opentelemetry-appender-tracing = { version = "0.29.1", features = [
     "experimental_use_tracing_span_context",
@@ -162,6 +163,7 @@ serde_with = "3.12.0"
 sha2 = "0.10.9"
 smallvec = { version = "1.15.0", features = ["serde"] }
 snafu = "0.8.5"
+snap = "1.1.1"
 socket2 = "0.5.9"
 strum = { version = "0.27.1", features = ["derive"] }
 sysinfo = "0.34.2"

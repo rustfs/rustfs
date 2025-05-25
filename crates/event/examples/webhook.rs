@@ -1,3 +1,4 @@
+use axum::routing::get;
 use axum::{extract::Json, http::StatusCode, routing::post, Router};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[tokio::main]
 async fn main() {
     // 构建应用
-    let app = Router::new().route("/webhook", post(receive_webhook));
+    let app = Router::new()
+        .route("/webhook", post(receive_webhook))
+        .route("/webhook", get(receive_webhook));
     // 启动服务器
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3020").await.unwrap();
     println!("Server running on http://0.0.0.0:3020");

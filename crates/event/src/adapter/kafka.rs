@@ -1,20 +1,22 @@
-use crate::Error;
 use crate::Event;
 use crate::KafkaConfig;
 use crate::{ChannelAdapter, ChannelAdapterType};
+use crate::{Error, QueueStore};
 use async_trait::async_trait;
 use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::util::Timeout;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
 /// Kafka adapter for sending events to a Kafka topic.
 pub struct KafkaAdapter {
     producer: FutureProducer,
-    topic: String,
-    max_retries: u32,
+    store: Option<Arc<QueueStore<Event>>>,
+    config: KafkaConfig,
 }
 
 impl KafkaAdapter {
@@ -26,11 +28,21 @@ impl KafkaAdapter {
             .set("message.timeout.ms", config.timeout.to_string())
             .create()?;
 
-        Ok(Self {
-            producer,
-            topic: config.topic.clone(),
-            max_retries: config.max_retries,
-        })
+        // create a queue store if enabled
+        let store = if !config.queue_dir.is_empty() {
+            let store_path = PathBuf::from(&config.queue_dir);
+            let store = QueueStore::new(store_path, config.queue_limit, Some(".kafka".to_string()));
+            if let Err(e) = store.open() {
+                tracing::error!("Unable to open queue storage: {}", e);
+                None
+            } else {
+                Some(Arc::new(store))
+            }
+        } else {
+            None
+        };
+
+        Ok(Self { config, producer, store })
     }
     /// Sends an event to the Kafka topic with retry logic.
     async fn send_with_retry(&self, event: &Event) -> Result<(), Error> {

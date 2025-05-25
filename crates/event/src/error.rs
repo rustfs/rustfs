@@ -37,6 +37,8 @@ pub enum Error {
     ConfigError(String),
     #[error("Configuration loading error: {0}")]
     Config(#[from] ConfigError),
+    #[error("create adapter failed error: {0}")]
+    AdapterCreationFailed(String),
 }
 
 impl Error {

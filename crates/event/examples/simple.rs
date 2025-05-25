@@ -25,7 +25,17 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
             auth_token: Some("secret-token".to_string()),
             custom_headers: Some(HashMap::from([("X-Custom".to_string(), "value".to_string())])),
             max_retries: 3,
-            timeout: 10,
+            timeout: Some(30),
+            retry_interval: Some(5),
+            client_cert: None,
+            client_key: None,
+            common: rustfs_event::AdapterCommon {
+                identifier: "webhook".to_string(),
+                comment: "webhook".to_string(),
+                enable: true,
+                queue_dir: "./deploy/logs/event_queue".to_string(),
+                queue_limit: 100,
+            },
         })],
     };
 

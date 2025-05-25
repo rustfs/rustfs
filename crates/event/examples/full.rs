@@ -16,7 +16,17 @@ async fn setup_notification_system() -> Result<(), NotifierError> {
             auth_token: Some("your-auth-token".into()),
             custom_headers: Some(HashMap::new()),
             max_retries: 3,
-            timeout: 30,
+            timeout: Some(30),
+            retry_interval: Some(5),
+            client_cert: None,
+            client_key: None,
+            common: rustfs_event::AdapterCommon {
+                identifier: "webhook".into(),
+                comment: "webhook".into(),
+                enable: true,
+                queue_dir: "./deploy/logs/event_queue".into(),
+                queue_limit: 100,
+            },
         })],
     };
 

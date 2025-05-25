@@ -174,7 +174,7 @@ async fn get_system() -> Result<Arc<Mutex<NotifierSystem>>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AdapterConfig, NotifierConfig, WebhookConfig};
+    use crate::{AdapterCommon, AdapterConfig, NotifierConfig, WebhookConfig};
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -205,11 +205,21 @@ mod tests {
             adapters: vec![
                 // assuming that the empty adapter will cause failure
                 AdapterConfig::Webhook(WebhookConfig {
+                    common: AdapterCommon {
+                        identifier: "empty".to_string(),
+                        comment: "empty".to_string(),
+                        enable: true,
+                        queue_dir: "".to_string(),
+                        queue_limit: 10,
+                    },
                     endpoint: "http://localhost:8080/webhook".to_string(),
                     auth_token: Some("secret-token".to_string()),
                     custom_headers: Some(HashMap::from([("X-Custom".to_string(), "value".to_string())])),
                     max_retries: 3,
-                    timeout: 10,
+                    timeout: Some(10),
+                    retry_interval: Some(5),
+                    client_cert: None,
+                    client_key: None,
                 }),
             ], // assuming that the empty adapter will cause failure
             ..Default::default()

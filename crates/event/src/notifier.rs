@@ -21,7 +21,7 @@ impl NotifierSystem {
     /// Creates a new `NotificationSystem` instance.
     #[instrument(skip(config))]
     pub async fn new(config: NotifierConfig) -> Result<Self, Error> {
-        let (tx, rx) = mpsc::channel::<Event>(config.channel_capacity);
+        let (tx, rx) = mpsc::channel::<Event>(config.channel_capacity.try_into().unwrap());
         let store = Arc::new(EventStore::new(&config.store_path).await?);
         let shutdown = CancellationToken::new();
 
