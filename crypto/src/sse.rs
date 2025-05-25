@@ -6,7 +6,14 @@ use http::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::{Once, RwLock};
-use tracing::{debug, error, info};
+use tracing::debug;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use std::sync::OnceLock;
+
+#[cfg(feature = "kms")]
+use tracing::{info, error};
+
+static INIT_KMS_CLIENT: OnceLock<()> = OnceLock::new();
 
 /// SSE specifies the type of server-side encryption used
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,18 +54,18 @@ impl fmt::Display for Algorithm {
     }
 }
 
-/// S3 SSE Headers
-pub const SSE_HEADER: &str = "X-Amz-Server-Side-Encryption";
-pub const SSE_C_HEADER: &str = "X-Amz-Server-Side-Encryption-Customer-Algorithm";
-pub const SSE_C_KEY_HEADER: &str = "X-Amz-Server-Side-Encryption-Customer-Key";
-pub const SSE_C_KEY_MD5_HEADER: &str = "X-Amz-Server-Side-Encryption-Customer-Key-Md5";
-pub const SSE_KMS_KEY_ID_HEADER: &str = "X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id";
-pub const SSE_KMS_CONTEXT_HEADER: &str = "X-Amz-Server-Side-Encryption-Context";
+/// S3 SSE Headers - 使用小写以符合AWS S3标准
+pub const SSE_HEADER: &str = "x-amz-server-side-encryption";
+pub const SSE_C_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
+pub const SSE_C_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
+pub const SSE_C_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
+pub const SSE_KMS_KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+pub const SSE_KMS_CONTEXT_HEADER: &str = "x-amz-server-side-encryption-context";
 
-/// SSE Copy Headers
-pub const SSE_COPY_C_HEADER: &str = "X-Amz-Copy-Source-Server-Side-Encryption-Customer-Algorithm";
-pub const SSE_COPY_C_KEY_HEADER: &str = "X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key";
-pub const SSE_COPY_C_KEY_MD5_HEADER: &str = "X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key-Md5";
+/// SSE Copy Headers - 使用小写以符合AWS S3标准
+pub const SSE_COPY_C_HEADER: &str = "x-amz-copy-source-server-side-encryption-customer-algorithm";
+pub const SSE_COPY_C_KEY_HEADER: &str = "x-amz-copy-source-server-side-encryption-customer-key";
+pub const SSE_COPY_C_KEY_MD5_HEADER: &str = "x-amz-copy-source-server-side-encryption-customer-key-md5";
 
 /// SSEOptions contain encryption options specified by the user
 #[derive(Clone, Debug, Default)]
@@ -89,8 +96,12 @@ impl SSEOptions {
                 
                 // SSE-C requires the customer-provided key
                 if let Some(key) = headers.get(SSE_C_KEY_HEADER) {
-                    match base64::decode(key.as_bytes()) {
+                    let key_str = key.to_str().map_err(|_| Error::ErrInvalidSSECustomerKey)?;
+                    match BASE64_STANDARD.decode(key_str.as_bytes()) {
                         Ok(decoded_key) => {
+                            if decoded_key.len() != 32 {
+                                return Err(Error::ErrInvalidSSECustomerKey);
+                            }
                             options.customer_key = Some(decoded_key);
                         },
                         Err(_) => return Err(Error::ErrInvalidSSECustomerKey),
@@ -102,7 +113,7 @@ impl SSEOptions {
                 // MD5 is optional but should be validated if provided
                 if let Some(md5) = headers.get(SSE_C_KEY_MD5_HEADER) {
                     options.customer_key_md5 = Some(md5.to_str().unwrap_or("").to_string());
-                    // TODO: Validate MD5 if present
+                    // TODO: Validate MD5 against the decoded key
                 }
             } else {
                 return Err(Error::ErrInvalidSSEAlgorithm);
@@ -149,7 +160,7 @@ impl SSEOptions {
                 
                 // SSE-C requires the customer-provided key
                 if let Some(key) = headers.get(SSE_COPY_C_KEY_HEADER) {
-                    match base64::decode(key.as_bytes()) {
+                    match BASE64_STANDARD.decode(key.as_bytes()) {
                         Ok(decoded_key) => {
                             options.customer_key = Some(decoded_key);
                         },
@@ -205,6 +216,20 @@ pub struct DefaultKMSConfig {
     pub skip_tls_verify: bool,
     pub client_cert_path: Option<String>,
     pub client_key_path: Option<String>,
+}
+
+impl Default for DefaultKMSConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:8200".to_string(),
+            key_id: "default".to_string(),
+            token: "root".to_string(),
+            ca_path: None,
+            skip_tls_verify: false,
+            client_cert_path: None,
+            client_key_path: None,
+        }
+    }
 }
 
 // KMS initialization status tracking - using thread-safe RwLock instead of unsafe
@@ -273,37 +298,36 @@ pub fn get_kms_init_error() -> Option<String> {
 /// Initialize KMS client on system startup
 #[cfg(feature = "kms")]
 pub fn init_kms() {
-    if let Some(config) = get_default_kms_config() {
-        INIT_KMS.call_once(|| {
-            info!("Initializing KMS client with endpoint: {}", config.endpoint);
-            
-            match crate::sse_kms::KMSClient::new(&config) {
-                Ok(client) => {
-                    match crate::sse_kms::KMSClient::set_global_client(client) {
-                        Ok(_) => {
-                            info!("KMS client initialized successfully");
-                        },
-                        Err(e) => {
-                            let err_msg = format!("Failed to set global KMS client: {}", e);
-                            error!("{}", &err_msg);
-                            if let Ok(mut error) = KMS_INIT_ERROR.write() {
-                                *error = Some(err_msg);
-                            }
-                        }
-                    }
-                },
-                Err(e) => {
-                    let err_msg = format!("Failed to create KMS client: {}", e);
-                    error!("{}", &err_msg);
-                    if let Ok(mut error) = KMS_INIT_ERROR.write() {
-                        *error = Some(err_msg);
-                    }
-                }
-            }
-        });
-    } else {
-        debug!("KMS is not enabled or not properly configured");
-    }
+    // 改为延迟初始化，不在启动时强制初始化KMS
+    debug!("KMS initialization deferred until first use");
+}
+
+/// Lazy initialize KMS client when needed
+#[cfg(feature = "kms")]
+pub fn ensure_kms_client() -> Result<(), Error> {
+    use crate::sse_kms::RustyVaultKMSClient;
+    
+    INIT_KMS_CLIENT.get_or_init(|| {
+        // Initialize KMS client with default configuration or environment variables
+        let config = get_default_kms_config().unwrap_or_default();
+        
+        let client = RustyVaultKMSClient::new(
+            config.endpoint,
+            config.token,
+            config.key_id,
+        );
+        
+        if let Err(e) = RustyVaultKMSClient::set_global_client(client) {
+            eprintln!("Failed to set global KMS client: {}", e);
+        }
+    });
+    
+    Ok(())
+}
+
+#[cfg(not(feature = "kms"))]
+pub fn ensure_kms_client() -> Result<(), Error> {
+    Err(Error::ErrMissingKMSConfig)
 }
 
 /// No-op implementation when KMS feature is not enabled

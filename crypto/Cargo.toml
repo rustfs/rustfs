@@ -46,3 +46,4 @@ crypto = [
     "dep:rand",
     "dep:sha2",
 ]
+kms = ["crypto"] # KMS功能依赖crypto feature

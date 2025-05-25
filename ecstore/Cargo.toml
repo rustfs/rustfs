@@ -11,6 +11,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+crypto = { path = "../crypto" }
 rustfs-config = { workspace = true }
 async-trait.workspace = true
 backon.workspace = true

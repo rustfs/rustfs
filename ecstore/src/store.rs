@@ -16,7 +16,6 @@ use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
 use crate::heal::heal_commands::{HealOpts, HealScanMode, HEAL_ITEM_METADATA};
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
-use crate::io::FileReader;
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -53,10 +52,7 @@ use lazy_static::lazy_static;
 use madmin::heal_commands::HealResultItem;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
-use tokio::io::AsyncReadExt;
 use std::cmp::Ordering;
-use std::io::Cursor;
-use std::ops::DerefMut;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
@@ -1196,7 +1192,7 @@ impl ObjectIO for ECStore {
 
         let object = utils::path::encode_dir_object(object);
         
-        let mut reader: GetObjectReader;
+        let reader: GetObjectReader;
         
         if self.single_pool() {
             reader = self.pools[0].get_object_reader(bucket, object.as_str(), range, h, opts).await?;

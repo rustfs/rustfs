@@ -6,12 +6,8 @@ use common::error::{Error, Result};
 use http::HeaderMap;
 use md5::Digest;
 use ring::aead::{Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, CHACHA20_POLY1305};
-use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 // 加密算法常量

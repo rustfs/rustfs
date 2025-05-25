@@ -4,11 +4,11 @@ mod encdec;
 mod error;
 mod jwt;
 mod metadata;
-mod rusty_vault_client;
+pub mod rusty_vault_client;  // 改为public
 mod sse;
 mod sse_c;
 mod sse_s3;
-mod sse_kms;
+pub mod sse_kms;             // 改为public
 #[cfg(test)]
 mod tests;
 
@@ -21,13 +21,15 @@ pub use jwt::encode::encode as jwt_encode;
 // 导出SSE功能
 pub use sse::{SSE, Algorithm, SSEOptions, Encryptable, get_default_kms_config, DefaultKMSConfig};
 pub use sse::{init_kms, is_kms_initialized, get_kms_init_error};
+#[cfg(feature = "kms")]
+pub use sse::ensure_kms_client;
 pub use metadata::{EncryptionInfo, extract_encryption_metadata, remove_encryption_metadata};
 pub use sse_c::SSECEncryption;
 pub use sse_s3::{SSES3Encryption, init_master_key};
 
 // KMS 功能导出
 #[cfg(feature = "kms")]
-pub use sse_kms::{KMSClient, SSEKMSEncryption};
+pub use sse_kms::{KMSClient, SSEKMSEncryption, RustyVaultClient};
 
 /// Encryption factory: Create appropriate encryptor based on encryption type
 pub struct CryptoFactory;

@@ -2081,7 +2081,7 @@ impl SetDisks {
                             _ => match entries.first_found() {
                                 (Some(entry), _) => entry,
                                 _ => return,
-                            },
+                            }
                         };
 
                         if heal_entry(bucket_partial.clone(), entry.clone(), opts_clone.scan_mode)
@@ -4400,6 +4400,7 @@ impl StorageAPI for SetDisks {
         unimplemented!()
     }
 
+    
     #[tracing::instrument(level = "debug", skip(self, data, opts))]
     async fn put_object_part(
         &self,
@@ -4413,6 +4414,80 @@ impl StorageAPI for SetDisks {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let (mut fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+
+        // Check if encryption is enabled and handle part-level encryption
+        let mut encrypted_data: Option<Vec<u8>> = None;
+        let mut encryption_metadata: Option<HashMap<String, String>> = None;
+        
+        if let Some(user_defined) = &opts.user_defined {
+            // Check for SSE-KMS encryption
+            if user_defined.contains_key("x-amz-server-side-encryption") &&
+               user_defined.get("x-amz-server-side-encryption") == Some(&"aws:kms".to_string()) {
+                
+                // Read the entire part data for encryption
+                let mut part_buffer = Vec::new();
+                use tokio::io::AsyncReadExt;
+                let mut stream = std::mem::replace(&mut data.stream, Box::new(tokio::io::empty()));
+                stream.read_to_end(&mut part_buffer).await
+                    .map_err(|e| Error::msg(format!("Failed to read part data: {}", e)))?;
+                
+                // Initialize SSE-KMS encryption with RustyVault
+                use crypto::sse_kms::SSEKMSEncryption;
+                use crypto::rusty_vault_client::ClientBuilder as RustyVaultClient;
+                
+                let vault_endpoint = std::env::var("RUSTYVAULT_ENDPOINT")
+                    .unwrap_or_else(|_| "http://localhost:8200".to_string());
+                let vault_token = std::env::var("RUSTYVAULT_TOKEN")
+                    .unwrap_or_else(|_| "root".to_string());
+                
+                let vault_client = RustyVaultClient::new()
+                    .with_addr(&vault_endpoint)
+                    .with_token(&vault_token)
+                    .with_key_name(
+                        user_defined.get("x-amz-server-side-encryption-aws-kms-key-id")
+                            .unwrap_or(&"default".to_string())
+                            .clone()
+                    );
+                
+                // Initialize the global KMS client
+                if let Ok(built_client) = vault_client.build() {
+                    let _ = crypto::sse_kms::RustyVaultKMSClient::set_global_client(built_client);
+                }
+                
+                // Create SSE-KMS encryption instance
+                let sse_kms = SSEKMSEncryption::new()?;
+                
+                // Encrypt the part with part-specific context
+                let (ciphertext, enc_info) = sse_kms.encrypt_part(
+                    &part_buffer,
+                    Some(part_id),
+                    Some(upload_id)
+                ).await.map_err(|e| Error::msg(format!("Part encryption failed: {}", e)))?;
+                
+                // Create new stream from encrypted data
+                encrypted_data = Some(ciphertext);
+                
+                // Convert encryption info to metadata
+                let mut metadata = HashMap::new();
+                metadata.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
+                metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), 
+                    enc_info.key_id.unwrap_or_default());
+                if let Some(ctx) = enc_info.context {
+                    metadata.insert("x-amz-server-side-encryption-context".to_string(), ctx);
+                }
+                metadata.insert("x-amz-server-side-encryption-iv".to_string(), 
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &enc_info.iv));
+                if let Some(key) = enc_info.key {
+                    metadata.insert("x-amz-server-side-encryption-key".to_string(), 
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key));
+                }
+                
+                encryption_metadata = Some(metadata);
+                
+                // Update content length for encrypted data
+                data.content_length = encrypted_data.as_ref().unwrap().len();
+            }
+        }
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
@@ -4434,10 +4509,6 @@ impl StorageAPI for SetDisks {
             let tmp_part_path = tmp_part_path.clone();
             tokio::spawn(async move {
                 if let Some(disk) = disk {
-                    // let writer = disk.append_file(RUSTFS_META_TMP_BUCKET, &tmp_part_path).await?;
-                    // let filewriter = disk
-                    //     .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, data.content_length)
-                    //     .await?;
                     match new_bitrot_filewriter(
                         disk.clone(),
                         RUSTFS_META_TMP_BUCKET,
@@ -4463,12 +4534,25 @@ impl StorageAPI for SetDisks {
 
         let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
-        let stream = replace(&mut data.stream, Box::new(empty()));
-        let etag_stream = EtagReader::new(stream);
-
-        let (w_size, mut etag) = Arc::new(erasure)
-            .encode(etag_stream, &mut writers, data.content_length, write_quorum)
-            .await?;
+        // Use encrypted data if available, otherwise use original stream
+        let (w_size, mut etag) = if let Some(encrypted_bytes) = encrypted_data {
+            // Create a stream from encrypted bytes
+            use std::io::Cursor;
+            let cursor = Cursor::new(encrypted_bytes);
+            let etag_stream = EtagReader::new(Box::new(cursor));
+            
+            Arc::new(erasure)
+                .encode(etag_stream, &mut writers, data.content_length, write_quorum)
+                .await?
+        } else {
+            // Use original stream
+            let stream = replace(&mut data.stream, Box::new(empty()));
+            let etag_stream = EtagReader::new(stream);
+            
+            Arc::new(erasure)
+                .encode(etag_stream, &mut writers, data.content_length, write_quorum)
+                .await?
+        };
 
         if let Err(err) = close_bitrot_writers(&mut writers).await {
             error!("close_bitrot_writers err {:?}", err);
@@ -4486,7 +4570,10 @@ impl StorageAPI for SetDisks {
             actual_size: data.content_length,
         };
 
-        // debug!("put_object_part part_info {:?}", part_info);
+        // Add encryption metadata to file info if present
+        if let Some(enc_metadata) = encryption_metadata {
+            fi.metadata = Some(enc_metadata);
+        }
 
         fi.parts = vec![part_info];
 
@@ -4510,8 +4597,6 @@ impl StorageAPI for SetDisks {
             last_mod: Some(OffsetDateTime::now_utc()),
             size: w_size,
         };
-
-        // error!("put_object_part ret {:?}", &ret);
 
         Ok(ret)
     }

@@ -59,4 +59,8 @@ pub enum Error {
     // Base64 decoding error
     #[error("base64 decode error: {0}")]
     ErrBase64DecodeError(#[from] base64::DecodeError),
+    
+    // Feature not supported error
+    #[error("feature not supported: {0}")]
+    ErrNotSupported(String),
 }

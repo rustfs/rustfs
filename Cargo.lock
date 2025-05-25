@@ -3099,6 +3099,7 @@ dependencies = [
  "chrono",
  "common",
  "crc32fast",
+ "crypto",
  "flatbuffers 25.2.10",
  "futures",
  "glob",
