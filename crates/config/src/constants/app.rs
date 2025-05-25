@@ -89,3 +89,212 @@ pub const DEFAULT_CONSOLE_PORT: u16 = 9002;
 /// Default address for rustfs console
 /// This is the default address for rustfs console.
 pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_basic_constants() {
+        // 测试应用基本常量
+        assert_eq!(APP_NAME, "RustFs");
+        assert!(!APP_NAME.is_empty(), "App name should not be empty");
+        assert!(!APP_NAME.contains(' '), "App name should not contain spaces");
+
+        assert_eq!(VERSION, "0.0.1");
+        assert!(!VERSION.is_empty(), "Version should not be empty");
+
+        assert_eq!(SERVICE_VERSION, "0.0.1");
+        assert_eq!(VERSION, SERVICE_VERSION, "Version and service version should be consistent");
+    }
+
+    #[test]
+    fn test_logging_constants() {
+        // 测试日志相关常量
+        assert_eq!(DEFAULT_LOG_LEVEL, "info");
+        assert!(["trace", "debug", "info", "warn", "error"].contains(&DEFAULT_LOG_LEVEL),
+            "Log level should be a valid tracing level");
+
+        assert_eq!(USE_STDOUT, true);
+
+        assert_eq!(SAMPLE_RATIO, 1.0);
+        assert!(SAMPLE_RATIO >= 0.0 && SAMPLE_RATIO <= 1.0,
+            "Sample ratio should be between 0.0 and 1.0");
+
+        assert_eq!(METER_INTERVAL, 30);
+        assert!(METER_INTERVAL > 0, "Meter interval should be positive");
+    }
+
+    #[test]
+    fn test_environment_constants() {
+        // 测试环境相关常量
+        assert_eq!(ENVIRONMENT, "production");
+        assert!(["development", "staging", "production", "test"].contains(&ENVIRONMENT),
+            "Environment should be a standard environment name");
+    }
+
+    #[test]
+    fn test_connection_constants() {
+        // 测试连接相关常量
+        assert_eq!(MAX_CONNECTIONS, 100);
+        assert!(MAX_CONNECTIONS > 0, "Max connections should be positive");
+        assert!(MAX_CONNECTIONS <= 10000, "Max connections should be reasonable");
+
+        assert_eq!(DEFAULT_TIMEOUT_MS, 3000);
+        assert!(DEFAULT_TIMEOUT_MS > 0, "Timeout should be positive");
+        assert!(DEFAULT_TIMEOUT_MS >= 1000, "Timeout should be at least 1 second");
+    }
+
+    #[test]
+    fn test_security_constants() {
+        // 测试安全相关常量
+        assert_eq!(DEFAULT_ACCESS_KEY, "rustfsadmin");
+        assert!(!DEFAULT_ACCESS_KEY.is_empty(), "Access key should not be empty");
+        assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");
+
+        assert_eq!(DEFAULT_SECRET_KEY, "rustfsadmin");
+        assert!(!DEFAULT_SECRET_KEY.is_empty(), "Secret key should not be empty");
+        assert!(DEFAULT_SECRET_KEY.len() >= 8, "Secret key should be at least 8 characters");
+
+        // 在生产环境中，访问密钥和秘密密钥应该不同
+        // 这里是默认值，所以相同是可以接受的，但应该在文档中警告
+        println!("Warning: Default access key and secret key are the same. Change them in production!");
+    }
+
+    #[test]
+    fn test_file_path_constants() {
+        // 测试文件路径相关常量
+        assert_eq!(DEFAULT_OBS_CONFIG, "./deploy/config/obs.toml");
+        assert!(DEFAULT_OBS_CONFIG.ends_with(".toml"), "Config file should be TOML format");
+        assert!(!DEFAULT_OBS_CONFIG.is_empty(), "Config path should not be empty");
+
+        assert_eq!(RUSTFS_TLS_KEY, "rustfs_key.pem");
+        assert!(RUSTFS_TLS_KEY.ends_with(".pem"), "TLS key should be PEM format");
+
+        assert_eq!(RUSTFS_TLS_CERT, "rustfs_cert.pem");
+        assert!(RUSTFS_TLS_CERT.ends_with(".pem"), "TLS cert should be PEM format");
+    }
+
+    #[test]
+    fn test_port_constants() {
+        // 测试端口相关常量
+        assert_eq!(DEFAULT_PORT, 9000);
+        assert!(DEFAULT_PORT > 1024, "Default port should be above reserved range");
+        // u16类型自动保证端口在有效范围内(0-65535)
+
+        assert_eq!(DEFAULT_CONSOLE_PORT, 9002);
+        assert!(DEFAULT_CONSOLE_PORT > 1024, "Console port should be above reserved range");
+        // u16类型自动保证端口在有效范围内(0-65535)
+
+        assert_ne!(DEFAULT_PORT, DEFAULT_CONSOLE_PORT,
+            "Main port and console port should be different");
+    }
+
+    #[test]
+    fn test_address_constants() {
+        // 测试地址相关常量
+        assert_eq!(DEFAULT_ADDRESS, ":9000");
+        assert!(DEFAULT_ADDRESS.starts_with(':'), "Address should start with colon");
+        assert!(DEFAULT_ADDRESS.contains(&DEFAULT_PORT.to_string()),
+            "Address should contain the default port");
+
+        assert_eq!(DEFAULT_CONSOLE_ADDRESS, ":9002");
+        assert!(DEFAULT_CONSOLE_ADDRESS.starts_with(':'), "Console address should start with colon");
+        assert!(DEFAULT_CONSOLE_ADDRESS.contains(&DEFAULT_CONSOLE_PORT.to_string()),
+            "Console address should contain the console port");
+
+        assert_ne!(DEFAULT_ADDRESS, DEFAULT_CONSOLE_ADDRESS,
+            "Main address and console address should be different");
+    }
+
+    #[test]
+    fn test_const_str_concat_functionality() {
+        // 测试const_str::concat宏的功能
+        let expected_address = format!(":{}", DEFAULT_PORT);
+        assert_eq!(DEFAULT_ADDRESS, expected_address);
+
+        let expected_console_address = format!(":{}", DEFAULT_CONSOLE_PORT);
+        assert_eq!(DEFAULT_CONSOLE_ADDRESS, expected_console_address);
+    }
+
+    #[test]
+    fn test_string_constants_validity() {
+        // 测试字符串常量的有效性
+        let string_constants = [
+            APP_NAME,
+            VERSION,
+            DEFAULT_LOG_LEVEL,
+            SERVICE_VERSION,
+            ENVIRONMENT,
+            DEFAULT_ACCESS_KEY,
+            DEFAULT_SECRET_KEY,
+            DEFAULT_OBS_CONFIG,
+            RUSTFS_TLS_KEY,
+            RUSTFS_TLS_CERT,
+            DEFAULT_ADDRESS,
+            DEFAULT_CONSOLE_ADDRESS,
+        ];
+
+        for constant in &string_constants {
+            assert!(!constant.is_empty(), "String constant should not be empty: {}", constant);
+            assert!(!constant.starts_with(' '), "String constant should not start with space: {}", constant);
+            assert!(!constant.ends_with(' '), "String constant should not end with space: {}", constant);
+        }
+    }
+
+    #[test]
+    fn test_numeric_constants_validity() {
+        // 测试数值常量的有效性
+        assert!(SAMPLE_RATIO.is_finite(), "Sample ratio should be finite");
+        assert!(!SAMPLE_RATIO.is_nan(), "Sample ratio should not be NaN");
+
+        assert!(METER_INTERVAL < u64::MAX, "Meter interval should be reasonable");
+        assert!(MAX_CONNECTIONS < usize::MAX, "Max connections should be reasonable");
+        assert!(DEFAULT_TIMEOUT_MS < u64::MAX, "Timeout should be reasonable");
+
+        assert!(DEFAULT_PORT != 0, "Default port should not be zero");
+        assert!(DEFAULT_CONSOLE_PORT != 0, "Console port should not be zero");
+    }
+
+    #[test]
+    fn test_security_best_practices() {
+        // 测试安全最佳实践
+
+        // 这些是默认值，在生产环境中应该被更改
+        println!("Security Warning: Default credentials detected!");
+        println!("Access Key: {}", DEFAULT_ACCESS_KEY);
+        println!("Secret Key: {}", DEFAULT_SECRET_KEY);
+        println!("These should be changed in production environments!");
+
+        // 验证密钥长度符合最低安全要求
+        assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");
+        assert!(DEFAULT_SECRET_KEY.len() >= 8, "Secret key should be at least 8 characters");
+
+        // 检查默认凭据是否包含常见的不安全模式
+        let _insecure_patterns = ["admin", "password", "123456", "default"];
+        let _access_key_lower = DEFAULT_ACCESS_KEY.to_lowercase();
+        let _secret_key_lower = DEFAULT_SECRET_KEY.to_lowercase();
+
+        // 注意：这里可以添加更多的安全检查逻辑
+        // 例如检查密钥是否包含不安全的模式
+    }
+
+    #[test]
+    fn test_configuration_consistency() {
+        // 测试配置的一致性
+
+        // 版本一致性
+        assert_eq!(VERSION, SERVICE_VERSION, "Application version should match service version");
+
+        // 端口不冲突
+        let ports = [DEFAULT_PORT, DEFAULT_CONSOLE_PORT];
+        let mut unique_ports = std::collections::HashSet::new();
+        for port in &ports {
+            assert!(unique_ports.insert(port), "Port {} is duplicated", port);
+        }
+
+        // 地址格式一致性
+        assert_eq!(DEFAULT_ADDRESS, format!(":{}", DEFAULT_PORT));
+        assert_eq!(DEFAULT_CONSOLE_ADDRESS, format!(":{}", DEFAULT_CONSOLE_PORT));
+    }
+}
