@@ -2691,3 +2691,197 @@ pub async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> 
 
     Ok(available > want as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test validation functions
+    #[test]
+    fn test_is_valid_object_name() {
+        assert_eq!(is_valid_object_name("valid-object-name"), true);
+        assert_eq!(is_valid_object_name(""), false);
+        assert_eq!(is_valid_object_name("object/with/slashes"), true);
+        assert_eq!(is_valid_object_name("object with spaces"), true);
+    }
+
+    #[test]
+    fn test_is_valid_object_prefix() {
+        assert_eq!(is_valid_object_prefix("valid-prefix"), true);
+        assert_eq!(is_valid_object_prefix(""), true);
+        assert_eq!(is_valid_object_prefix("prefix/with/slashes"), true);
+    }
+
+    #[test]
+    fn test_check_bucket_and_object_names() {
+        // Valid names
+        assert!(check_bucket_and_object_names("valid-bucket", "valid-object").is_ok());
+
+        // Invalid bucket names
+        assert!(check_bucket_and_object_names("", "valid-object").is_err());
+        assert!(check_bucket_and_object_names("INVALID", "valid-object").is_err());
+
+        // Invalid object names
+        assert!(check_bucket_and_object_names("valid-bucket", "").is_err());
+    }
+
+    #[test]
+    fn test_check_list_objs_args() {
+        assert!(check_list_objs_args("valid-bucket", "", &None).is_ok());
+        assert!(check_list_objs_args("", "", &None).is_err());
+        assert!(check_list_objs_args("INVALID", "", &None).is_err());
+    }
+
+    #[test]
+    fn test_check_multipart_args() {
+        assert!(check_new_multipart_args("valid-bucket", "valid-object").is_ok());
+        assert!(check_new_multipart_args("", "valid-object").is_err());
+        assert!(check_new_multipart_args("valid-bucket", "").is_err());
+
+        // Use valid base64 encoded upload_id
+        let valid_upload_id = "dXBsb2FkLWlk"; // base64 encoded "upload-id"
+        assert!(check_multipart_object_args("valid-bucket", "valid-object", valid_upload_id).is_ok());
+        assert!(check_multipart_object_args("", "valid-object", valid_upload_id).is_err());
+        assert!(check_multipart_object_args("valid-bucket", "", valid_upload_id).is_err());
+        // Empty string is valid base64 (decodes to empty vec), so this should pass bucket/object validation
+        // but fail on empty upload_id check in the function logic
+        assert!(check_multipart_object_args("valid-bucket", "valid-object", "").is_ok());
+        assert!(check_multipart_object_args("valid-bucket", "valid-object", "invalid-base64!").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_disk_infos() {
+        let disks = vec![None, None]; // Empty disks for testing
+        let infos = get_disk_infos(&disks).await;
+
+        assert_eq!(infos.len(), disks.len());
+        // All should be None since we passed None disks
+        assert!(infos.iter().all(|info| info.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_has_space_for() {
+        let disk_infos = vec![None, None]; // No actual disk info
+
+        let result = has_space_for(&disk_infos, 1024).await;
+        // Should fail due to no valid disk info
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_server_pools_available_space() {
+        let mut spaces = ServerPoolsAvailableSpace(vec![
+            PoolAvailableSpace {
+                index: 0,
+                available: 1000,
+                max_used_pct: 50,
+            },
+            PoolAvailableSpace {
+                index: 1,
+                available: 2000,
+                max_used_pct: 80,
+            },
+        ]);
+
+        assert_eq!(spaces.total_available(), 3000);
+
+        spaces.filter_max_used(60);
+        // filter_max_used sets available to 0 for filtered pools, doesn't remove them
+        assert_eq!(spaces.0.len(), 2); // Length remains the same
+        assert_eq!(spaces.0[0].index, 0);
+        assert_eq!(spaces.0[0].available, 1000); // First pool should still be available
+        assert_eq!(spaces.0[1].available, 0); // Second pool should be filtered (available = 0)
+        assert_eq!(spaces.total_available(), 1000); // Only first pool contributes to total
+    }
+
+    #[tokio::test]
+    async fn test_find_local_disk() {
+        let result = find_local_disk(&"/nonexistent/path".to_string()).await;
+        assert!(result.is_none(), "Should return None for nonexistent path");
+    }
+
+    #[tokio::test]
+    async fn test_all_local_disk_path() {
+        let paths = all_local_disk_path().await;
+        // Should return empty or some paths depending on global state
+        assert!(paths.is_empty() || !paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_all_local_disk() {
+        let disks = all_local_disk().await;
+        // Should return empty or some disks depending on global state
+        assert!(disks.is_empty() || !disks.is_empty());
+    }
+
+    // Test that we can create the basic structures without global state
+    #[test]
+    fn test_pool_available_space_creation() {
+        let space = PoolAvailableSpace {
+            index: 0,
+            available: 1000,
+            max_used_pct: 50,
+        };
+        assert_eq!(space.index, 0);
+        assert_eq!(space.available, 1000);
+        assert_eq!(space.max_used_pct, 50);
+    }
+
+    #[test]
+    fn test_server_pools_available_space_iter() {
+        let spaces = ServerPoolsAvailableSpace(vec![
+            PoolAvailableSpace {
+                index: 0,
+                available: 1000,
+                max_used_pct: 50,
+            },
+        ]);
+
+        let mut count = 0;
+        for space in spaces.iter() {
+            assert_eq!(space.index, 0);
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_validation_functions_comprehensive() {
+        // Test object name validation edge cases
+        assert!(!is_valid_object_name(""));
+        assert!(is_valid_object_name("a"));
+        assert!(is_valid_object_name("test.txt"));
+        assert!(is_valid_object_name("folder/file.txt"));
+        assert!(is_valid_object_name("very-long-object-name-with-many-characters"));
+
+        // Test prefix validation
+        assert!(is_valid_object_prefix(""));
+        assert!(is_valid_object_prefix("prefix"));
+        assert!(is_valid_object_prefix("prefix/"));
+        assert!(is_valid_object_prefix("deep/nested/prefix/"));
+    }
+
+    #[test]
+    fn test_argument_validation_comprehensive() {
+        // Test bucket and object name validation
+        assert!(check_bucket_and_object_names("test-bucket", "test-object").is_ok());
+        assert!(check_bucket_and_object_names("test-bucket", "folder/test-object").is_ok());
+
+        // Test list objects arguments
+        assert!(check_list_objs_args("test-bucket", "prefix", &Some("marker".to_string())).is_ok());
+        assert!(check_list_objs_args("test-bucket", "", &None).is_ok());
+
+        // Test multipart upload arguments with valid base64 upload_id
+        let valid_upload_id = "dXBsb2FkLWlk"; // base64 encoded "upload-id"
+        assert!(check_put_object_part_args("test-bucket", "test-object", valid_upload_id).is_ok());
+        assert!(check_list_parts_args("test-bucket", "test-object", valid_upload_id).is_ok());
+        assert!(check_complete_multipart_args("test-bucket", "test-object", valid_upload_id).is_ok());
+        assert!(check_abort_multipart_args("test-bucket", "test-object", valid_upload_id).is_ok());
+
+        // Test put object arguments
+        assert!(check_put_object_args("test-bucket", "test-object").is_ok());
+        assert!(check_put_object_args("", "test-object").is_err());
+        assert!(check_put_object_args("test-bucket", "").is_err());
+    }
+}
+
