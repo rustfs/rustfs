@@ -416,8 +416,8 @@ mod tests {
 
         #[tokio::test]
     async fn test_get_decoder_all_supported_formats() {
-        // 测试所有支持的格式都能创建解码器
-        let test_data = b"test data";
+        // Test that all supported formats can create decoders successfully
+        let sample_content = b"Hello, compression world!";
 
         let supported_formats = vec![
             CompressionFormat::Gzip,
@@ -429,7 +429,7 @@ mod tests {
         ];
 
         for format in supported_formats {
-            let cursor = Cursor::new(test_data);
+            let cursor = Cursor::new(sample_content);
             let decoder_result = format.get_decoder(cursor);
             assert!(decoder_result.is_ok(), "Format {:?} should create decoder successfully", format);
         }
@@ -437,17 +437,17 @@ mod tests {
 
         #[tokio::test]
     async fn test_decoder_type_consistency() {
-        // 测试解码器返回类型的一致性
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
+        // Test decoder return type consistency
+        let sample_content = b"Hello, compression world!";
+        let cursor = Cursor::new(sample_content);
 
         let gzip_format = CompressionFormat::Gzip;
         let mut decoder = gzip_format.get_decoder(cursor).unwrap();
 
-        // 验证返回的是正确的trait对象
-        let mut buffer = Vec::new();
-        // 这里只是验证类型，不期望实际读取成功（因为数据不是真正的gzip格式）
-        let _result = decoder.read_to_end(&mut buffer).await;
+        // Verify that the returned decoder implements the correct trait object
+        let mut output_buffer = Vec::new();
+        // This only verifies the type, we don't expect successful reading (since data is not actual gzip format)
+        let _read_result = decoder.read_to_end(&mut output_buffer).await;
     }
 
     #[test]
@@ -515,15 +515,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_decoder_error_handling() {
-        // 测试解码器的错误处理
-        let empty_data = b"";
-        let cursor = Cursor::new(empty_data);
+        // Test decoder error handling with edge cases
+        let empty_content = b"";
+        let cursor = Cursor::new(empty_content);
 
         let gzip_format = CompressionFormat::Gzip;
         let decoder_result = gzip_format.get_decoder(cursor);
 
-        // 解码器创建应该成功，即使数据为空
-        assert!(decoder_result.is_ok(), "Decoder creation should succeed even with empty data");
+        // Decoder creation should succeed even with empty content
+        assert!(decoder_result.is_ok(), "Decoder creation should succeed even with empty content");
     }
 
     #[test]
@@ -573,16 +573,16 @@ mod tests {
 
         #[tokio::test]
     async fn test_decoder_trait_bounds() {
-        // 测试解码器的trait bounds
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
+        // Test decoder trait bounds compliance
+        let sample_content = b"Hello, compression world!";
+        let cursor = Cursor::new(sample_content);
 
         let gzip_format = CompressionFormat::Gzip;
         let decoder = gzip_format.get_decoder(cursor).unwrap();
 
-        // 验证返回的解码器满足所需的trait bounds
-        fn check_bounds<T: AsyncRead + Send + Unpin + ?Sized>(_: &T) {}
-        check_bounds(&*decoder);
+        // Verify that the returned decoder satisfies required trait bounds
+        fn check_trait_bounds<T: AsyncRead + Send + Unpin + ?Sized>(_: &T) {}
+        check_trait_bounds(&*decoder);
     }
 
     #[test]
@@ -606,75 +606,75 @@ mod tests {
 
         #[tokio::test]
     async fn test_decompress_with_invalid_format() {
-        // 测试使用无效格式进行解压
+        // Test decompression with invalid format
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
+        let sample_content = b"Hello, compression world!";
+        let cursor = Cursor::new(sample_content);
 
-        let entry_count = Arc::new(AtomicUsize::new(0));
-        let entry_count_clone = entry_count.clone();
+        let processed_entries_count = Arc::new(AtomicUsize::new(0));
+        let processed_entries_count_clone = processed_entries_count.clone();
 
-        let result = decompress(
+        let decompress_result = decompress(
             cursor,
             CompressionFormat::Unknown,
-            move |_entry| {
-                entry_count_clone.fetch_add(1, Ordering::SeqCst);
+            move |_archive_entry| {
+                processed_entries_count_clone.fetch_add(1, Ordering::SeqCst);
                 async move { Ok(()) }
             }
         ).await;
 
-        assert!(result.is_err(), "Decompress with Unknown format should fail");
-        assert_eq!(entry_count.load(Ordering::SeqCst), 0, "No entries should be processed with invalid format");
+        assert!(decompress_result.is_err(), "Decompress with Unknown format should fail");
+        assert_eq!(processed_entries_count.load(Ordering::SeqCst), 0, "No entries should be processed with invalid format");
     }
 
         #[tokio::test]
     async fn test_decompress_with_zip_format() {
-        // 测试使用Zip格式进行解压（当前不支持）
+        // Test decompression with Zip format (currently not supported)
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
+        let sample_content = b"Hello, compression world!";
+        let cursor = Cursor::new(sample_content);
 
-        let entry_count = Arc::new(AtomicUsize::new(0));
-        let entry_count_clone = entry_count.clone();
+        let processed_entries_count = Arc::new(AtomicUsize::new(0));
+        let processed_entries_count_clone = processed_entries_count.clone();
 
-        let result = decompress(
+        let decompress_result = decompress(
             cursor,
             CompressionFormat::Zip,
-            move |_entry| {
-                entry_count_clone.fetch_add(1, Ordering::SeqCst);
+            move |_archive_entry| {
+                processed_entries_count_clone.fetch_add(1, Ordering::SeqCst);
                 async move { Ok(()) }
             }
         ).await;
 
-        assert!(result.is_err(), "Decompress with Zip format should fail (not implemented)");
-        assert_eq!(entry_count.load(Ordering::SeqCst), 0, "No entries should be processed with unsupported format");
+        assert!(decompress_result.is_err(), "Decompress with Zip format should fail (not implemented)");
+        assert_eq!(processed_entries_count.load(Ordering::SeqCst), 0, "No entries should be processed with unsupported format");
     }
 
     #[tokio::test]
     async fn test_decompress_error_propagation() {
-        // 测试解压过程中的错误传播
+        // Test error propagation during decompression process
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
+        let sample_content = b"Hello, compression world!";
+        let cursor = Cursor::new(sample_content);
 
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count_clone = call_count.clone();
+        let callback_invocation_count = Arc::new(AtomicUsize::new(0));
+        let callback_invocation_count_clone = callback_invocation_count.clone();
 
-        let result = decompress(
+        let decompress_result = decompress(
             cursor,
             CompressionFormat::Gzip,
-            move |_entry| {
-                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            move |_archive_entry| {
+                let invocation_number = callback_invocation_count_clone.fetch_add(1, Ordering::SeqCst);
                 async move {
-                    if count == 0 {
-                        // 第一次调用返回错误
-                        Err(io::Error::new(io::ErrorKind::Other, "Test error"))
+                    if invocation_number == 0 {
+                        // First invocation returns an error
+                        Err(io::Error::new(io::ErrorKind::Other, "Simulated callback error"))
                     } else {
                         Ok(())
                     }
@@ -682,34 +682,34 @@ mod tests {
             }
         ).await;
 
-        // 由于输入数据不是有效的gzip格式，可能在解析阶段就失败
-        // 这里主要测试错误处理机制
-        assert!(result.is_err(), "Should propagate callback errors");
+        // Since input data is not valid gzip format, it may fail during parsing phase
+        // This mainly tests the error handling mechanism
+        assert!(decompress_result.is_err(), "Should propagate callback errors");
     }
 
     #[tokio::test]
     async fn test_decompress_callback_execution() {
-        // 测试回调函数的执行
+        // Test callback function execution during decompression
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
+        let sample_content = b"Hello, compression world!";
+        let cursor = Cursor::new(sample_content);
 
-        let callback_called = Arc::new(AtomicBool::new(false));
-        let callback_called_clone = callback_called.clone();
+        let callback_was_invoked = Arc::new(AtomicBool::new(false));
+        let callback_was_invoked_clone = callback_was_invoked.clone();
 
-        let _result = decompress(
+        let _decompress_result = decompress(
             cursor,
             CompressionFormat::Gzip,
-            move |_entry| {
-                callback_called_clone.store(true, Ordering::SeqCst);
+            move |_archive_entry| {
+                callback_was_invoked_clone.store(true, Ordering::SeqCst);
                 async move { Ok(()) }
             }
         ).await;
 
-        // 注意：由于测试数据不是有效的gzip格式，回调可能不会被调用
-        // 这个测试主要验证函数签名和基本流程
+        // Note: Since test data is not valid gzip format, callback may not be invoked
+        // This test mainly verifies function signature and basic flow
     }
 
     #[test]
@@ -867,31 +867,31 @@ mod tests {
 
         #[tokio::test]
     async fn test_compressor_basic_functionality() {
-        // 测试压缩器基本功能（注意：当前实现返回空向量作为占位符）
+        // Test basic compressor functionality (Note: current implementation returns empty vector as placeholder)
         let compressor = Compressor::new(CompressionFormat::Gzip);
-        let test_data = b"Hello, World! This is a test string for compression.";
+        let sample_text = b"Hello, World! This is a sample string for compression testing.";
 
-        let compressed = compressor.compress(test_data).await;
-        assert!(compressed.is_ok(), "Compression should succeed");
+        let compression_result = compressor.compress(sample_text).await;
+        assert!(compression_result.is_ok(), "Compression should succeed");
 
-        // 注意：当前实现返回空向量，这是一个占位符实现
-        let compressed_data = compressed.unwrap();
-        // assert!(!compressed_data.is_empty(), "Compressed data should not be empty");
-        // assert_ne!(compressed_data.as_slice(), test_data, "Compressed data should be different from original");
+        // Note: Current implementation returns empty vector as placeholder
+        let compressed_output = compression_result.unwrap();
+        // assert!(!compressed_output.is_empty(), "Compressed data should not be empty");
+        // assert_ne!(compressed_output.as_slice(), sample_text, "Compressed data should be different from original");
 
-        // 暂时验证函数能够正常调用
-        assert!(compressed_data.is_empty(), "Current implementation returns empty vector as placeholder");
+        // Temporarily verify that function can be called normally
+        assert!(compressed_output.is_empty(), "Current implementation returns empty vector as placeholder");
     }
 
     #[tokio::test]
     async fn test_compressor_with_level() {
-        // 测试带压缩级别的压缩器
+        // Test compressor with custom compression level
         let compressor = Compressor::new(CompressionFormat::Gzip)
             .with_level(CompressionLevel::Best);
 
-        let test_data = b"Test data for compression level testing";
-        let result = compressor.compress(test_data).await;
-        assert!(result.is_ok(), "Compression with custom level should succeed");
+        let sample_text = b"Sample text for compression level testing";
+        let compression_result = compressor.compress(sample_text).await;
+        assert!(compression_result.is_ok(), "Compression with custom level should succeed");
     }
 
     #[test]
