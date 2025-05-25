@@ -205,10 +205,7 @@ pub struct ZipEntry {
 }
 
 /// Simplified ZIP file processing (temporarily using standard library zip crate)
-pub async fn extract_zip_simple<P: AsRef<Path>>(
-    zip_path: P,
-    extract_to: P,
-) -> io::Result<Vec<ZipEntry>> {
+pub async fn extract_zip_simple<P: AsRef<Path>>(zip_path: P, extract_to: P) -> io::Result<Vec<ZipEntry>> {
     // Use standard library zip processing, return empty list as placeholder for now
     // Actual implementation needs to be improved in future versions
     let _zip_path = zip_path.as_ref();
@@ -224,10 +221,7 @@ pub async fn create_zip_simple<P: AsRef<Path>>(
     _compression_level: CompressionLevel,
 ) -> io::Result<()> {
     // Return unimplemented error for now
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "ZIP creation not yet implemented",
-    ))
+    Err(io::Error::new(io::ErrorKind::Unsupported, "ZIP creation not yet implemented"))
 }
 
 /// Compression utility struct
@@ -312,8 +306,7 @@ mod tests {
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
 
-
-        #[test]
+    #[test]
     fn test_compression_format_from_extension() {
         // Test supported compression format recognition
         assert_eq!(CompressionFormat::from_extension("gz"), CompressionFormat::Gzip);
@@ -414,7 +407,7 @@ mod tests {
         assert!(decoder_result.is_err(), "Zip format should return error (not implemented)");
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_get_decoder_all_supported_formats() {
         // Test that all supported formats can create decoders successfully
         let sample_content = b"Hello, compression world!";
@@ -435,7 +428,7 @@ mod tests {
         }
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_decoder_type_consistency() {
         // Test decoder return type consistency
         let sample_content = b"Hello, compression world!";
@@ -489,8 +482,13 @@ mod tests {
         ];
 
         for (ext, expected_format) in extension_mappings {
-            assert_eq!(CompressionFormat::from_extension(ext), expected_format,
-                "Extension '{}' should map to {:?}", ext, expected_format);
+            assert_eq!(
+                CompressionFormat::from_extension(ext),
+                expected_format,
+                "Extension '{}' should map to {:?}",
+                ext,
+                expected_format
+            );
         }
     }
 
@@ -508,8 +506,13 @@ mod tests {
         ];
 
         for (format, expected_str) in format_strings {
-            assert_eq!(format!("{:?}", format), expected_str,
-                "Format {:?} should have string representation '{}'", format, expected_str);
+            assert_eq!(
+                format!("{:?}", format),
+                expected_str,
+                "Format {:?} should have string representation '{}'",
+                format,
+                expected_str
+            );
         }
     }
 
@@ -537,7 +540,11 @@ mod tests {
 
         // Verify Option<CompressionFormat> size
         let option_size = mem::size_of::<Option<CompressionFormat>>();
-        assert!(option_size <= 16, "Option<CompressionFormat> should be efficient, got {} bytes", option_size);
+        assert!(
+            option_size <= 16,
+            "Option<CompressionFormat> should be efficient, got {} bytes",
+            option_size
+        );
     }
 
     #[test]
@@ -548,13 +555,11 @@ mod tests {
             ("gz", true),
             ("bz2", true),
             ("xz", true),
-
             // Edge cases
             ("", false),
             ("g", false),
             ("gzz", false),
             ("gz2", false),
-
             // Special characters
             ("gz.", false),
             (".gz", false),
@@ -565,13 +570,15 @@ mod tests {
         for (ext, should_be_known) in test_cases {
             let format = CompressionFormat::from_extension(ext);
             let is_known = format != CompressionFormat::Unknown;
-            assert_eq!(is_known, should_be_known,
+            assert_eq!(
+                is_known, should_be_known,
                 "Extension '{}' recognition mismatch: expected {}, got {}",
-                ext, should_be_known, is_known);
+                ext, should_be_known, is_known
+            );
         }
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_decoder_trait_bounds() {
         // Test decoder trait bounds compliance
         let sample_content = b"Hello, compression world!";
@@ -599,12 +606,11 @@ mod tests {
 
         for (format, ext) in consistency_tests {
             let parsed_format = CompressionFormat::from_extension(ext);
-            assert_eq!(parsed_format, format,
-                "Extension '{}' should consistently map to {:?}", ext, format);
+            assert_eq!(parsed_format, format, "Extension '{}' should consistently map to {:?}", ext, format);
         }
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_decompress_with_invalid_format() {
         // Test decompression with invalid format
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -616,20 +622,21 @@ mod tests {
         let processed_entries_count = Arc::new(AtomicUsize::new(0));
         let processed_entries_count_clone = processed_entries_count.clone();
 
-        let decompress_result = decompress(
-            cursor,
-            CompressionFormat::Unknown,
-            move |_archive_entry| {
-                processed_entries_count_clone.fetch_add(1, Ordering::SeqCst);
-                async move { Ok(()) }
-            }
-        ).await;
+        let decompress_result = decompress(cursor, CompressionFormat::Unknown, move |_archive_entry| {
+            processed_entries_count_clone.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(()) }
+        })
+        .await;
 
         assert!(decompress_result.is_err(), "Decompress with Unknown format should fail");
-        assert_eq!(processed_entries_count.load(Ordering::SeqCst), 0, "No entries should be processed with invalid format");
+        assert_eq!(
+            processed_entries_count.load(Ordering::SeqCst),
+            0,
+            "No entries should be processed with invalid format"
+        );
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_decompress_with_zip_format() {
         // Test decompression with Zip format (currently not supported)
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -641,17 +648,18 @@ mod tests {
         let processed_entries_count = Arc::new(AtomicUsize::new(0));
         let processed_entries_count_clone = processed_entries_count.clone();
 
-        let decompress_result = decompress(
-            cursor,
-            CompressionFormat::Zip,
-            move |_archive_entry| {
-                processed_entries_count_clone.fetch_add(1, Ordering::SeqCst);
-                async move { Ok(()) }
-            }
-        ).await;
+        let decompress_result = decompress(cursor, CompressionFormat::Zip, move |_archive_entry| {
+            processed_entries_count_clone.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(()) }
+        })
+        .await;
 
         assert!(decompress_result.is_err(), "Decompress with Zip format should fail (not implemented)");
-        assert_eq!(processed_entries_count.load(Ordering::SeqCst), 0, "No entries should be processed with unsupported format");
+        assert_eq!(
+            processed_entries_count.load(Ordering::SeqCst),
+            0,
+            "No entries should be processed with unsupported format"
+        );
     }
 
     #[tokio::test]
@@ -666,21 +674,18 @@ mod tests {
         let callback_invocation_count = Arc::new(AtomicUsize::new(0));
         let callback_invocation_count_clone = callback_invocation_count.clone();
 
-        let decompress_result = decompress(
-            cursor,
-            CompressionFormat::Gzip,
-            move |_archive_entry| {
-                let invocation_number = callback_invocation_count_clone.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    if invocation_number == 0 {
-                        // First invocation returns an error
-                        Err(io::Error::new(io::ErrorKind::Other, "Simulated callback error"))
-                    } else {
-                        Ok(())
-                    }
+        let decompress_result = decompress(cursor, CompressionFormat::Gzip, move |_archive_entry| {
+            let invocation_number = callback_invocation_count_clone.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if invocation_number == 0 {
+                    // First invocation returns an error
+                    Err(io::Error::new(io::ErrorKind::Other, "Simulated callback error"))
+                } else {
+                    Ok(())
                 }
             }
-        ).await;
+        })
+        .await;
 
         // Since input data is not valid gzip format, it may fail during parsing phase
         // This mainly tests the error handling mechanism
@@ -699,14 +704,11 @@ mod tests {
         let callback_was_invoked = Arc::new(AtomicBool::new(false));
         let callback_was_invoked_clone = callback_was_invoked.clone();
 
-        let _decompress_result = decompress(
-            cursor,
-            CompressionFormat::Gzip,
-            move |_archive_entry| {
-                callback_was_invoked_clone.store(true, Ordering::SeqCst);
-                async move { Ok(()) }
-            }
-        ).await;
+        let _decompress_result = decompress(cursor, CompressionFormat::Gzip, move |_archive_entry| {
+            callback_was_invoked_clone.store(true, Ordering::SeqCst);
+            async move { Ok(()) }
+        })
+        .await;
 
         // Note: Since test data is not valid gzip format, callback may not be invoked
         // This test mainly verifies function signature and basic flow
@@ -767,15 +769,14 @@ mod tests {
         assert!(true, "Extension parsing performance test completed");
     }
 
-        #[test]
+    #[test]
     fn test_format_default_behavior() {
         // 测试格式的默认行为
         let unknown_extensions = vec!["", "txt", "doc", "pdf", "unknown_ext"];
 
         for ext in unknown_extensions {
             let format = CompressionFormat::from_extension(ext);
-            assert_eq!(format, CompressionFormat::Unknown,
-                "Extension '{}' should default to Unknown", ext);
+            assert_eq!(format, CompressionFormat::Unknown, "Extension '{}' should default to Unknown", ext);
         }
     }
 
@@ -851,7 +852,7 @@ mod tests {
         // 测试不支持的格式返回错误
         use std::io::Cursor;
 
-                let output1 = Vec::new();
+        let output1 = Vec::new();
         let cursor1 = Cursor::new(output1);
 
         let unknown_format = CompressionFormat::Unknown;
@@ -865,7 +866,7 @@ mod tests {
         assert!(zip_encoder_result.is_err(), "Zip format should return error (requires special handling)");
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_compressor_basic_functionality() {
         // Test basic compressor functionality (Note: current implementation returns empty vector as placeholder)
         let compressor = Compressor::new(CompressionFormat::Gzip);
@@ -886,8 +887,7 @@ mod tests {
     #[tokio::test]
     async fn test_compressor_with_level() {
         // Test compressor with custom compression level
-        let compressor = Compressor::new(CompressionFormat::Gzip)
-            .with_level(CompressionLevel::Best);
+        let compressor = Compressor::new(CompressionFormat::Gzip).with_level(CompressionLevel::Best);
 
         let sample_text = b"Sample text for compression level testing";
         let compression_result = compressor.compress(sample_text).await;

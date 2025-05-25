@@ -190,11 +190,7 @@ mod tests {
     #[test]
     fn test_all_algorithms_produce_valid_keys() {
         // Test that all algorithm variants can generate valid keys
-        let algorithms = [
-            ID::Argon2idAESGCM,
-            ID::Argon2idChaCHa20Poly1305,
-            ID::Pbkdf2AESGCM,
-        ];
+        let algorithms = [ID::Argon2idAESGCM, ID::Argon2idChaCHa20Poly1305, ID::Pbkdf2AESGCM];
 
         let password = b"test_password_123";
         let salt = b"test_salt_16bytes";
@@ -214,20 +210,17 @@ mod tests {
     #[test]
     fn test_round_trip_conversion() {
         // Test round-trip conversion: ID -> u8 -> ID
-        let original_ids = [
-            ID::Argon2idAESGCM,
-            ID::Argon2idChaCHa20Poly1305,
-            ID::Pbkdf2AESGCM,
-        ];
+        let original_ids = [ID::Argon2idAESGCM, ID::Argon2idChaCHa20Poly1305, ID::Pbkdf2AESGCM];
 
         for original in &original_ids {
             let as_u8 = *original as u8;
             let converted_back = ID::try_from(as_u8).unwrap();
 
-            assert!(matches!((original, converted_back),
-                (ID::Argon2idAESGCM, ID::Argon2idAESGCM) |
-                (ID::Argon2idChaCHa20Poly1305, ID::Argon2idChaCHa20Poly1305) |
-                (ID::Pbkdf2AESGCM, ID::Pbkdf2AESGCM)
+            assert!(matches!(
+                (original, converted_back),
+                (ID::Argon2idAESGCM, ID::Argon2idAESGCM)
+                    | (ID::Argon2idChaCHa20Poly1305, ID::Argon2idChaCHa20Poly1305)
+                    | (ID::Pbkdf2AESGCM, ID::Pbkdf2AESGCM)
             ));
         }
     }

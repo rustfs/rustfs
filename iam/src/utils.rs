@@ -58,7 +58,7 @@ pub fn extract_claims<T: DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use super::{gen_access_key, gen_secret_key, generate_jwt, extract_claims};
+    use super::{extract_claims, gen_access_key, gen_secret_key, generate_jwt};
     use serde::{Deserialize, Serialize};
 
     #[test]
@@ -89,7 +89,10 @@ mod tests {
         let key = gen_access_key(100).unwrap();
         for ch in key.chars() {
             assert!(ch.is_ascii_alphanumeric(), "Access key should only contain alphanumeric characters");
-            assert!(ch.is_ascii_uppercase() || ch.is_ascii_digit(), "Access key should only contain uppercase letters and digits");
+            assert!(
+                ch.is_ascii_uppercase() || ch.is_ascii_digit(),
+                "Access key should only contain uppercase letters and digits"
+            );
         }
     }
 
@@ -130,8 +133,10 @@ mod tests {
 
         // Should not contain invalid characters for URL-safe base64
         for ch in key.chars() {
-            assert!(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '_',
-                "Secret key should be URL-safe base64 compatible");
+            assert!(
+                ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '_',
+                "Secret key should be URL-safe base64 compatible"
+            );
         }
     }
 

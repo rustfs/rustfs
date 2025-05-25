@@ -5666,7 +5666,7 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
 mod tests {
     use super::*;
     use crate::disk::error::DiskError;
-    use crate::store_api::{CompletePart, FileInfo, ErasureInfo};
+    use crate::store_api::{CompletePart, ErasureInfo, FileInfo};
     use common::error::Error;
     use time::OffsetDateTime;
 
@@ -5958,7 +5958,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 4,
                 parity_blocks: 2,
-                index: 1, // Must be > 0 for is_valid() to return true
+                index: 1,                             // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3, 4, 5, 6], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -5970,7 +5970,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 6,
                 parity_blocks: 3,
-                index: 2, // Must be > 0 for is_valid() to return true
+                index: 2,                                      // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -5982,7 +5982,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 2,
                 parity_blocks: 1,
-                index: 1, // Must be > 0 for is_valid() to return true
+                index: 1,                    // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -6007,13 +6007,22 @@ mod tests {
         assert_eq!(result2[1], -1); // Should be -1 due to error
     }
 
-        #[test]
+    #[test]
     fn test_conv_part_err_to_int() {
         // Test error to integer conversion
         assert_eq!(conv_part_err_to_int(&None), CHECK_PART_SUCCESS);
-        assert_eq!(conv_part_err_to_int(&Some(Error::new(DiskError::DiskNotFound))), CHECK_PART_DISK_NOT_FOUND);
-        assert_eq!(conv_part_err_to_int(&Some(Error::new(DiskError::VolumeNotFound))), CHECK_PART_VOLUME_NOT_FOUND);
-        assert_eq!(conv_part_err_to_int(&Some(Error::new(DiskError::FileNotFound))), CHECK_PART_FILE_NOT_FOUND);
+        assert_eq!(
+            conv_part_err_to_int(&Some(Error::new(DiskError::DiskNotFound))),
+            CHECK_PART_DISK_NOT_FOUND
+        );
+        assert_eq!(
+            conv_part_err_to_int(&Some(Error::new(DiskError::VolumeNotFound))),
+            CHECK_PART_VOLUME_NOT_FOUND
+        );
+        assert_eq!(
+            conv_part_err_to_int(&Some(Error::new(DiskError::FileNotFound))),
+            CHECK_PART_FILE_NOT_FOUND
+        );
         assert_eq!(conv_part_err_to_int(&Some(Error::new(DiskError::FileCorrupt))), CHECK_PART_FILE_CORRUPT);
 
         // Test unknown error - function returns CHECK_PART_SUCCESS for non-DiskError
@@ -6062,32 +6071,17 @@ mod tests {
         assert!(should_heal2);
 
         // Test with no error but part errors
-        let (should_heal3, _) = should_heal_object_on_disk(
-            &None,
-            &[CHECK_PART_FILE_NOT_FOUND],
-            &latest_meta,
-            &latest_meta,
-        );
+        let (should_heal3, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_NOT_FOUND], &latest_meta, &latest_meta);
         assert!(should_heal3);
 
         // Test with no error and no part errors
-        let (should_heal4, _) = should_heal_object_on_disk(
-            &None,
-            &[CHECK_PART_SUCCESS],
-            &latest_meta,
-            &latest_meta,
-        );
+        let (should_heal4, _) = should_heal_object_on_disk(&None, &[CHECK_PART_SUCCESS], &latest_meta, &latest_meta);
         assert!(!should_heal4);
 
         // Test with outdated metadata
         let mut old_meta = latest_meta.clone();
         old_meta.name = "different-name".to_string();
-        let (should_heal5, _) = should_heal_object_on_disk(
-            &None,
-            &[CHECK_PART_SUCCESS],
-            &old_meta,
-            &latest_meta,
-        );
+        let (should_heal5, _) = should_heal_object_on_disk(&None, &[CHECK_PART_SUCCESS], &old_meta, &latest_meta);
         assert!(should_heal5);
     }
 
@@ -6156,12 +6150,7 @@ mod tests {
     #[test]
     fn test_join_errs() {
         // Test error joining
-        let errs = vec![
-            None,
-            Some(Error::msg("error1")),
-            Some(Error::msg("error2")),
-            None,
-        ];
+        let errs = vec![None, Some(Error::msg("error1")), Some(Error::msg("error2")), None];
 
         let result = join_errs(&errs);
         assert!(result.contains("error1"));
@@ -6204,11 +6193,7 @@ mod tests {
         // Test disk evaluation based on errors
         // This test would need mock DiskStore objects, so we'll test the logic conceptually
         let disks = vec![None, None, None]; // Mock empty disks
-        let errs = vec![
-            None,
-            Some(Error::new(DiskError::DiskNotFound)),
-            None,
-        ];
+        let errs = vec![None, Some(Error::new(DiskError::DiskNotFound)), None];
 
         let result = SetDisks::eval_disks(&disks, &errs);
         assert_eq!(result.len(), 3);
@@ -6219,9 +6204,18 @@ mod tests {
     fn test_shuffle_parts_metadata() {
         // Test metadata shuffling
         let metadata = vec![
-            FileInfo { name: "file1".to_string(), ..Default::default() },
-            FileInfo { name: "file2".to_string(), ..Default::default() },
-            FileInfo { name: "file3".to_string(), ..Default::default() },
+            FileInfo {
+                name: "file1".to_string(),
+                ..Default::default()
+            },
+            FileInfo {
+                name: "file2".to_string(),
+                ..Default::default()
+            },
+            FileInfo {
+                name: "file3".to_string(),
+                ..Default::default()
+            },
         ];
 
         // Distribution uses 1-based indexing
