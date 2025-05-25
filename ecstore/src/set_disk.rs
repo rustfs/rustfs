@@ -5774,9 +5774,10 @@ mod tests {
         // - parity=2: read_quorum = 3-2 = 1, occ=1 >= 1, so valid
         // - parity=3: read_quorum = 3-3 = 0, occ=1 >= 0, so valid
         // - max_occ=1, both parity=2 and parity=3 have same occurrence
-        // - The function picks the first one with max occurrence, which should be parity=2
+        // - HashMap iteration order is not guaranteed, so result could be either 2 or 3
         let parities = vec![1, 2, 3];
-        assert_eq!(SetDisks::common_parity(&parities, 2), 2); // Should return 2, not -1
+        let result = SetDisks::common_parity(&parities, 2);
+        assert!(result == 2 || result == 3); // Either 2 or 3 is valid
 
         let empty_parities = vec![];
         assert_eq!(SetDisks::common_parity(&empty_parities, 3), -1); // Empty returns -1
