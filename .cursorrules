@@ -194,6 +194,38 @@ mod tests {
 - Each test should have a clear purpose and verify specific behavior
 - Test data should be realistic and representative of actual use cases
 
+## Cross-Platform Compatibility Guidelines
+
+### 1. CPU Architecture Compatibility
+- **Always consider multi-platform and different CPU architecture compatibility** when writing code
+- Support major architectures: x86_64, aarch64 (ARM64), and other target platforms
+- Use conditional compilation for architecture-specific code:
+```rust
+#[cfg(target_arch = "x86_64")]
+fn optimized_x86_64_function() { /* x86_64 specific implementation */ }
+
+#[cfg(target_arch = "aarch64")]
+fn optimized_aarch64_function() { /* ARM64 specific implementation */ }
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn generic_function() { /* Generic fallback implementation */ }
+```
+
+### 2. Platform-Specific Dependencies
+- Use feature flags for platform-specific dependencies
+- Provide fallback implementations for unsupported platforms
+- Test on multiple architectures in CI/CD pipeline
+
+### 3. Endianness Considerations
+- Use explicit byte order conversion when dealing with binary data
+- Prefer `to_le_bytes()`, `from_le_bytes()` for consistent little-endian format
+- Use `byteorder` crate for complex binary format handling
+
+### 4. SIMD and Performance Optimizations
+- Use portable SIMD libraries like `wide` or `packed_simd`
+- Provide fallback implementations for non-SIMD architectures
+- Use runtime feature detection when appropriate
+
 ## Security Guidelines
 
 ### 1. Memory Safety
@@ -275,14 +307,22 @@ async fn health_check() -> Result<HealthStatus> {
 - [ ] Are there appropriate permission checks?
 - [ ] Is information leakage avoided?
 
-### 4. Maintainability
+### 4. Cross-Platform Compatibility
+- [ ] Does the code work on different CPU architectures (x86_64, aarch64)?
+- [ ] Are platform-specific features properly gated with conditional compilation?
+- [ ] Is byte order handling correct for binary data?
+- [ ] Are there appropriate fallback implementations for unsupported platforms?
+
+### 5. Maintainability
 - [ ] Is the code clear and understandable?
 - [ ] Does it follow the project's architectural patterns?
 - [ ] Is there appropriate documentation?
 
-### 5. Code Commits
+### 6. Code Commits and Documentation
 - [ ] Does it comply with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)?
+- [ ] Are commit messages concise and under 72 characters for the title line?
 - [ ] Commit titles should be concise and in English, avoid Chinese
+- [ ] Is PR description provided in copyable markdown format for easy copying?
 
 ## Common Patterns and Best Practices
 
@@ -363,6 +403,14 @@ These rules should serve as guiding principles when developing the RustFS projec
  - Do not arbitrarily modify numbers and constants in test cases, carefully analyze their meaning to ensure test case correctness
  - When writing or modifying tests, check existing test cases to ensure they have scientific naming and rigorous logic testing, if not compliant, modify test cases to ensure scientific and rigorous testing
  - After each development completion, first git add . then git commit -m "feat: feature description" or "fix: issue description", ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+ - **Keep commit messages concise and under 72 characters** for the title line, use body for detailed explanations if needed
  - After each development completion, first git push to remote repository
  - After each change completion, summarize the changes, do not create summary files, provide a brief change description, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
  - Provide change descriptions needed for PR in the conversation, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+ - **Always provide PR descriptions in English** after completing any changes, including:
+   - Clear and concise title following Conventional Commits format
+   - Detailed description of what was changed and why
+   - List of key changes and improvements
+   - Any breaking changes or migration notes if applicable
+   - Testing information and verification steps
+ - **Provide PR descriptions in copyable markdown format** enclosed in code blocks for easy one-click copying

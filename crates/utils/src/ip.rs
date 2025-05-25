@@ -35,13 +35,13 @@ mod tests {
 
     #[test]
     fn test_get_local_ip_returns_some_ip() {
-        // 测试获取本地IP地址，应该返回Some值
+        // Test getting local IP address, should return Some value
         let ip = get_local_ip();
         assert!(ip.is_some(), "Should be able to get local IP address");
 
         if let Some(ip_addr) = ip {
             println!("Local IP address: {}", ip_addr);
-            // 验证返回的是有效的IP地址
+            // Verify that the returned IP address is valid
             match ip_addr {
                 IpAddr::V4(ipv4) => {
                     assert!(!ipv4.is_unspecified(), "IPv4 should not be unspecified (0.0.0.0)");
@@ -57,11 +57,11 @@ mod tests {
 
     #[test]
     fn test_get_local_ip_with_default_never_empty() {
-        // 测试带默认值的函数永远不会返回空字符串
+        // Test that function with default value never returns empty string
         let ip_string = get_local_ip_with_default();
         assert!(!ip_string.is_empty(), "IP string should never be empty");
 
-        // 验证返回的字符串可以解析为有效的IP地址
+        // Verify that the returned string can be parsed as a valid IP address
         let parsed_ip: Result<IpAddr, _> = ip_string.parse();
         assert!(parsed_ip.is_ok(), "Returned string should be a valid IP address: {}", ip_string);
 
@@ -70,38 +70,38 @@ mod tests {
 
     #[test]
     fn test_get_local_ip_with_default_fallback() {
-        // 测试默认值是否为127.0.0.1
+        // Test whether the default value is 127.0.0.1
         let default_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let ip_string = get_local_ip_with_default();
 
-        // 如果无法获取真实IP，应该返回默认值
+        // If unable to get real IP, should return default value
         if get_local_ip().is_none() {
             assert_eq!(ip_string, default_ip.to_string());
         }
 
-        // 无论如何，返回的都应该是有效的IP地址字符串
+        // In any case, should always return a valid IP address string
         let parsed: Result<IpAddr, _> = ip_string.parse();
         assert!(parsed.is_ok(), "Should always return a valid IP string");
     }
 
     #[test]
     fn test_ip_address_types() {
-        // 测试IP地址类型的识别
+        // Test IP address type recognition
         if let Some(ip) = get_local_ip() {
             match ip {
                 IpAddr::V4(ipv4) => {
-                    // 测试IPv4地址的属性
+                    // Test IPv4 address properties
                     println!("IPv4 address: {}", ipv4);
                     assert!(!ipv4.is_multicast(), "Local IP should not be multicast");
                     assert!(!ipv4.is_broadcast(), "Local IP should not be broadcast");
 
-                    // 检查是否为私有地址（通常本地IP是私有的）
+                    // Check if it's a private address (usually local IP is private)
                     let is_private = ipv4.is_private();
                     let is_loopback = ipv4.is_loopback();
                     println!("IPv4 is private: {}, is loopback: {}", is_private, is_loopback);
                 }
                 IpAddr::V6(ipv6) => {
-                    // 测试IPv6地址的属性
+                    // Test IPv6 address properties
                     println!("IPv6 address: {}", ipv6);
                     assert!(!ipv6.is_multicast(), "Local IP should not be multicast");
 
@@ -114,28 +114,28 @@ mod tests {
 
     #[test]
     fn test_ip_string_format() {
-        // 测试IP地址字符串格式
+        // Test IP address string format
         let ip_string = get_local_ip_with_default();
 
-        // 验证字符串格式
+        // Verify string format
         assert!(!ip_string.contains(' '), "IP string should not contain spaces");
         assert!(!ip_string.is_empty(), "IP string should not be empty");
 
-        // 验证可以往返转换
+        // Verify round-trip conversion
         let parsed_ip: IpAddr = ip_string.parse().expect("Should parse as valid IP");
         let back_to_string = parsed_ip.to_string();
 
-        // 对于标准IP地址，往返转换应该保持一致
+        // For standard IP addresses, round-trip conversion should be consistent
         println!("Original: {}, Parsed back: {}", ip_string, back_to_string);
     }
 
     #[test]
     fn test_default_fallback_value() {
-        // 测试默认回退值的正确性
+        // Test correctness of default fallback value
         let default_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         assert_eq!(default_ip.to_string(), "127.0.0.1");
 
-        // 验证默认IP的属性
+        // Verify default IP properties
         if let IpAddr::V4(ipv4) = default_ip {
             assert!(ipv4.is_loopback(), "Default IP should be loopback");
             assert!(!ipv4.is_unspecified(), "Default IP should not be unspecified");
@@ -145,18 +145,18 @@ mod tests {
 
     #[test]
     fn test_consistency_between_functions() {
-        // 测试两个函数之间的一致性
+        // Test consistency between the two functions
         let ip_option = get_local_ip();
         let ip_string = get_local_ip_with_default();
 
         match ip_option {
             Some(ip) => {
-                // 如果get_local_ip返回Some，那么get_local_ip_with_default应该返回相同的IP
+                // If get_local_ip returns Some, then get_local_ip_with_default should return the same IP
                 assert_eq!(ip.to_string(), ip_string,
                     "Both functions should return the same IP when available");
             }
             None => {
-                // 如果get_local_ip返回None，那么get_local_ip_with_default应该返回默认值
+                // If get_local_ip returns None, then get_local_ip_with_default should return default value
                 assert_eq!(ip_string, "127.0.0.1",
                     "Should return default value when no IP is available");
             }
@@ -165,13 +165,13 @@ mod tests {
 
     #[test]
     fn test_multiple_calls_consistency() {
-        // 测试多次调用的一致性
+        // Test consistency of multiple calls
         let ip1 = get_local_ip();
         let ip2 = get_local_ip();
         let ip_str1 = get_local_ip_with_default();
         let ip_str2 = get_local_ip_with_default();
 
-        // 多次调用应该返回相同的结果
+        // Multiple calls should return the same result
         assert_eq!(ip1, ip2, "Multiple calls to get_local_ip should return same result");
         assert_eq!(ip_str1, ip_str2, "Multiple calls to get_local_ip_with_default should return same result");
     }
@@ -179,20 +179,20 @@ mod tests {
     #[cfg(feature = "integration")]
     #[test]
     fn test_network_connectivity() {
-        // 集成测试：验证获取的IP地址是否可用于网络连接
+        // Integration test: verify that the obtained IP address can be used for network connections
         if let Some(ip) = get_local_ip() {
             match ip {
                 IpAddr::V4(ipv4) => {
-                    // 对于IPv4，检查是否为有效的网络地址
+                    // For IPv4, check if it's a valid network address
                     assert!(!ipv4.is_unspecified(), "Should not be 0.0.0.0");
 
-                    // 如果不是回环地址，应该是可路由的
+                    // If it's not a loopback address, it should be routable
                     if !ipv4.is_loopback() {
                         println!("Got routable IPv4: {}", ipv4);
                     }
                 }
                 IpAddr::V6(ipv6) => {
-                    // 对于IPv6，检查是否为有效的网络地址
+                    // For IPv6, check if it's a valid network address
                     assert!(!ipv6.is_unspecified(), "Should not be ::");
 
                     if !ipv6.is_loopback() {
