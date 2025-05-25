@@ -345,9 +345,16 @@ async fn shutdown_gracefully(shutdown_rx: &mut Receiver<()>) {
 These rules should serve as guiding principles when developing the RustFS project, ensuring code quality, performance, and maintainability.
 
 ### 4. Code Operations
+
+#### Branch Management
+ - **NEVER modify code directly on main or master branch**
  - Always check the .cursorrules file before starting to ensure you understand the project guidelines
  - Before starting any change or requirement development, first git checkout to main branch, then git pull to get the latest code
  - For each feature or change to be developed, first create a branch, then git checkout to that branch
+ - Use descriptive branch names following the pattern: `feat/feature-name`, `fix/issue-name`, `refactor/component-name`, etc.
+ - Ensure all changes are made on feature branches and merged through pull requests
+
+#### Development Workflow
  - Use English for all code comments, documentation, and variable names
  - Write meaningful and descriptive names for variables, functions, and methods
  - Avoid meaningless test content like "debug 111" or placeholder values
