@@ -117,7 +117,7 @@ impl FuncKeyValue<StringFuncValue> {
     }
 }
 
-/// 解析values字段
+/// Parse values field
 #[derive(Clone, PartialEq, Eq, Debug)]
 
 pub struct StringFuncValue(pub Set<String>);
@@ -229,7 +229,7 @@ mod tests {
     }
 
     #[test_case(r#"{"aws:usernamea":"johndoe"}"#)]
-    #[test_case(r#"{"aws:username":[]}"#)] // 空
+    #[test_case(r#"{"aws:username":[]}"#)] // Empty
     #[test_case(r#"{"aws:usernamea/value":"johndoe"}"#)]
     #[test_case(r#"{"aws:usernamea/value":["johndoe", "aaa"]}"#)]
     #[test_case(r#""aaa""#)]

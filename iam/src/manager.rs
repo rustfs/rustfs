@@ -94,7 +94,7 @@ where
         self.clone().save_iam_formatter().await?;
         self.clone().load().await?;
 
-        // 后台线程开启定时更新或者接收到信号更新
+        // Background thread starts periodic updates or receives signal updates
         tokio::spawn({
             let s = Arc::clone(&self);
             async move {
@@ -142,7 +142,7 @@ where
         Ok(())
     }
 
-    // todo, 判断是否存在，是否可以重试
+    // TODO: Check if exists, whether retry is possible
     #[tracing::instrument(level = "debug", skip(self))]
     async fn save_iam_formatter(self: Arc<Self>) -> Result<()> {
         let path = get_iam_format_file_path();

@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test_case(r#"{"aws:usernamea":"johndoe"}"#)]
-    #[test_case(r#"{"aws:username":[]}"#)] // 空
+    #[test_case(r#"{"aws:username":[]}"#)] // Empty
     #[test_case(r#"{"aws:usernamea/value":"johndoe"}"#)]
     #[test_case(r#"{"aws:usernamea/value":["johndoe", "aaa"]}"#)]
     #[test_case(r#""aaa""#)]

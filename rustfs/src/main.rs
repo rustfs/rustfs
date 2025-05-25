@@ -138,7 +138,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // let local_ip = utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
     let local_ip = rustfs_utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
-    // 用于 rpc
+    // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
 
