@@ -293,7 +293,7 @@ mod tests {
     #[test_case(new_fkv("s3:LocationConstraint", vec![KeyName::S3(S3LocationConstraint).var_name().as_str()]), false, vec![("LocationConstraint", vec!["us-west-1"])] => true ; "18")]
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/security", vec!["public"])] => true ; "19")]
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/security", vec!["private"])] => false ; "20")]
-    #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/project", vec!["foo"])] => false ; "21")]
+    #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/project", vec!["webapp"])] => false ; "21")]
     fn test_string_equals(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
         test_eval(s, for_all, false, false, values)
     }

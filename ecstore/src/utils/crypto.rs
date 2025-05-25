@@ -25,15 +25,15 @@ pub fn hex(data: impl AsRef<[u8]>) -> String {
 // }
 
 #[test]
-fn test_base64() {
-    let src = "c0194290-d911-45cb-8e12-79ec563f46a8x1735460504394878000";
+fn test_base64_encoding_decoding() {
+    let original_uuid_timestamp = "c0194290-d911-45cb-8e12-79ec563f46a8x1735460504394878000";
 
-    let s = base64_encode(src.as_bytes());
+    let encoded_string = base64_encode(original_uuid_timestamp.as_bytes());
 
-    println!("{}", &s);
+    println!("Encoded: {}", &encoded_string);
 
-    let de = base64_decode(s.clone().as_bytes()).unwrap();
-    let decoded_str = String::from_utf8(de).unwrap();
+    let decoded_bytes = base64_decode(encoded_string.clone().as_bytes()).unwrap();
+    let decoded_string = String::from_utf8(decoded_bytes).unwrap();
 
-    assert_eq!(decoded_str, src)
+    assert_eq!(decoded_string, original_uuid_timestamp)
 }
