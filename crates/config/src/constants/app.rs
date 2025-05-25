@@ -112,14 +112,15 @@ mod tests {
     fn test_logging_constants() {
         // Test logging related constants
         assert_eq!(DEFAULT_LOG_LEVEL, "info");
-        assert!(["trace", "debug", "info", "warn", "error"].contains(&DEFAULT_LOG_LEVEL),
-            "Log level should be a valid tracing level");
+        assert!(
+            ["trace", "debug", "info", "warn", "error"].contains(&DEFAULT_LOG_LEVEL),
+            "Log level should be a valid tracing level"
+        );
 
         assert_eq!(USE_STDOUT, true);
 
         assert_eq!(SAMPLE_RATIO, 1.0);
-        assert!(SAMPLE_RATIO >= 0.0 && SAMPLE_RATIO <= 1.0,
-            "Sample ratio should be between 0.0 and 1.0");
+        assert!(SAMPLE_RATIO >= 0.0 && SAMPLE_RATIO <= 1.0, "Sample ratio should be between 0.0 and 1.0");
 
         assert_eq!(METER_INTERVAL, 30);
         assert!(METER_INTERVAL > 0, "Meter interval should be positive");
@@ -129,8 +130,10 @@ mod tests {
     fn test_environment_constants() {
         // Test environment related constants
         assert_eq!(ENVIRONMENT, "production");
-        assert!(["development", "staging", "production", "test"].contains(&ENVIRONMENT),
-            "Environment should be a standard environment name");
+        assert!(
+            ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
+            "Environment should be a standard environment name"
+        );
     }
 
     #[test]
@@ -186,8 +189,7 @@ mod tests {
         assert!(DEFAULT_CONSOLE_PORT > 1024, "Console port should be above reserved range");
         // u16 type automatically ensures port is in valid range (0-65535)
 
-        assert_ne!(DEFAULT_PORT, DEFAULT_CONSOLE_PORT,
-            "Main port and console port should be different");
+        assert_ne!(DEFAULT_PORT, DEFAULT_CONSOLE_PORT, "Main port and console port should be different");
     }
 
     #[test]
@@ -195,16 +197,22 @@ mod tests {
         // Test address related constants
         assert_eq!(DEFAULT_ADDRESS, ":9000");
         assert!(DEFAULT_ADDRESS.starts_with(':'), "Address should start with colon");
-        assert!(DEFAULT_ADDRESS.contains(&DEFAULT_PORT.to_string()),
-            "Address should contain the default port");
+        assert!(
+            DEFAULT_ADDRESS.contains(&DEFAULT_PORT.to_string()),
+            "Address should contain the default port"
+        );
 
         assert_eq!(DEFAULT_CONSOLE_ADDRESS, ":9002");
         assert!(DEFAULT_CONSOLE_ADDRESS.starts_with(':'), "Console address should start with colon");
-        assert!(DEFAULT_CONSOLE_ADDRESS.contains(&DEFAULT_CONSOLE_PORT.to_string()),
-            "Console address should contain the console port");
+        assert!(
+            DEFAULT_CONSOLE_ADDRESS.contains(&DEFAULT_CONSOLE_PORT.to_string()),
+            "Console address should contain the console port"
+        );
 
-        assert_ne!(DEFAULT_ADDRESS, DEFAULT_CONSOLE_ADDRESS,
-            "Main address and console address should be different");
+        assert_ne!(
+            DEFAULT_ADDRESS, DEFAULT_CONSOLE_ADDRESS,
+            "Main address and console address should be different"
+        );
     }
 
     #[test]

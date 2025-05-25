@@ -1,23 +1,23 @@
 [workspace]
 members = [
-    "appauth",               # Application authentication and authorization
-    "cli/rustfs-gui",        # Graphical user interface client
-    "common/common",         # Shared utilities and data structures
-    "common/lock",           # Distributed locking implementation
-    "common/protos",         # Protocol buffer definitions
-    "common/workers",        # Worker thread pools and task scheduling
-    "crates/config",         # Configuration management
+    "appauth", # Application authentication and authorization
+    "cli/rustfs-gui", # Graphical user interface client
+    "common/common", # Shared utilities and data structures
+    "common/lock", # Distributed locking implementation
+    "common/protos", # Protocol buffer definitions
+    "common/workers", # Worker thread pools and task scheduling
+    "crates/config", # Configuration management
     "crates/event-notifier", # Event notification system
-    "crates/obs",            # Observability utilities
-    "crates/utils",          # Utility functions and helpers
-    "crypto",                # Cryptography and security features
-    "ecstore",               # Erasure coding storage implementation
-    "e2e_test",              # End-to-end test suite
-    "iam",                   # Identity and Access Management
-    "madmin",                # Management dashboard and admin API interface
-    "rustfs",                # Core file system implementation
-    "s3select/api",          # S3 Select API interface
-    "s3select/query",        # S3 Select query engine
+    "crates/obs", # Observability utilities
+    "crates/utils", # Utility functions and helpers
+    "crypto", # Cryptography and security features
+    "ecstore", # Erasure coding storage implementation
+    "e2e_test", # End-to-end test suite
+    "iam", # Identity and Access Management
+    "madmin", # Management dashboard and admin API interface
+    "rustfs", # Core file system implementation
+    "s3select/api", # S3 Select API interface
+    "s3select/query", # S3 Select query engine
     "crates/zip",
 ]
 resolver = "2"
@@ -162,7 +162,7 @@ smallvec = { version = "1.15.0", features = ["serde"] }
 snafu = "0.8.5"
 socket2 = "0.5.9"
 strum = { version = "0.27.1", features = ["derive"] }
-sysinfo = "0.34.2"
+sysinfo = "0.35.1"
 tempfile = "3.19.1"
 test-case = "3.3.1"
 thiserror = "2.0.12"
@@ -173,7 +173,7 @@ time = { version = "0.3.41", features = [
     "macros",
     "serde",
 ] }
-tokio = { version = "1.45.0", features = ["fs", "rt-multi-thread"] }
+tokio = { version = "1.45.1", features = ["fs", "rt-multi-thread"] }
 tonic = { version = "0.13.1", features = ["gzip"] }
 tonic-build = { version = "0.13.1" }
 tokio-rustls = { version = "0.26.2", default-features = false }

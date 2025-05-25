@@ -2422,39 +2422,32 @@ impl Node for NodeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protos::proto_gen::node_service::{
+        BackgroundHealStatusRequest, BackgroundHealStatusResponse, CheckPartsRequest, CheckPartsResponse,
+        DeleteBucketMetadataRequest, DeleteBucketMetadataResponse, DeleteBucketRequest, DeleteBucketResponse, DeletePathsRequest,
+        DeletePathsResponse, DeletePolicyRequest, DeletePolicyResponse, DeleteRequest, DeleteResponse,
+        DeleteServiceAccountRequest, DeleteServiceAccountResponse, DeleteUserRequest, DeleteUserResponse, DeleteVersionRequest,
+        DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DeleteVolumeResponse,
+        DiskInfoRequest, DiskInfoResponse, GenerallyLockRequest, GenerallyLockResponse, GetBucketInfoRequest,
+        GetBucketInfoResponse, GetCpusRequest, GetCpusResponse, GetMemInfoRequest, GetMemInfoResponse, GetNetInfoRequest,
+        GetNetInfoResponse, GetOsInfoRequest, GetOsInfoResponse, GetPartitionsRequest, GetPartitionsResponse, GetProcInfoRequest,
+        GetProcInfoResponse, GetSeLinuxInfoRequest, GetSeLinuxInfoResponse, GetSysConfigRequest, GetSysConfigResponse,
+        GetSysErrorsRequest, GetSysErrorsResponse, HealBucketRequest, HealBucketResponse, ListBucketRequest, ListBucketResponse,
+        ListDirRequest, ListDirResponse, ListVolumesRequest, ListVolumesResponse, LoadBucketMetadataRequest,
+        LoadBucketMetadataResponse, LoadGroupRequest, LoadGroupResponse, LoadPolicyMappingRequest, LoadPolicyMappingResponse,
+        LoadPolicyRequest, LoadPolicyResponse, LoadRebalanceMetaRequest, LoadRebalanceMetaResponse, LoadServiceAccountRequest,
+        LoadServiceAccountResponse, LoadUserRequest, LoadUserResponse, LocalStorageInfoRequest, LocalStorageInfoResponse,
+        MakeBucketRequest, MakeBucketResponse, MakeVolumeRequest, MakeVolumeResponse, MakeVolumesRequest, MakeVolumesResponse,
+        Mss, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadMultipleRequest, ReadMultipleResponse,
+        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, ReloadPoolMetaRequest, ReloadPoolMetaResponse,
+        ReloadSiteReplicationConfigRequest, ReloadSiteReplicationConfigResponse, RenameDataRequest, RenameDataResponse,
+        RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse, ServerInfoRequest, ServerInfoResponse,
+        SignalServiceRequest, SignalServiceResponse, StatVolumeRequest, StatVolumeResponse, StopRebalanceRequest,
+        StopRebalanceResponse, UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest, VerifyFileResponse,
+        WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse,
+    };
     use std::collections::HashMap;
     use tonic::Request;
-    use protos::proto_gen::node_service::{
-        PingRequest, PingResponse, HealBucketRequest, HealBucketResponse,
-        ListBucketRequest, ListBucketResponse, MakeBucketRequest, MakeBucketResponse,
-        GetBucketInfoRequest, GetBucketInfoResponse, DeleteBucketRequest, DeleteBucketResponse,
-        ReadAllRequest, ReadAllResponse, WriteAllRequest, WriteAllResponse,
-        DeleteRequest, DeleteResponse, VerifyFileRequest, VerifyFileResponse,
-        CheckPartsRequest, CheckPartsResponse, RenamePartRequst, RenamePartResponse,
-        RenameFileRequst, RenameFileResponse, ListDirRequest, ListDirResponse,
-        RenameDataRequest, RenameDataResponse, MakeVolumesRequest, MakeVolumesResponse,
-        MakeVolumeRequest, MakeVolumeResponse, ListVolumesRequest, ListVolumesResponse,
-        StatVolumeRequest, StatVolumeResponse, DeletePathsRequest, DeletePathsResponse,
-        UpdateMetadataRequest, UpdateMetadataResponse, WriteMetadataRequest, WriteMetadataResponse,
-        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse,
-        DeleteVersionRequest, DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse,
-        ReadMultipleRequest, ReadMultipleResponse, DeleteVolumeRequest, DeleteVolumeResponse,
-        DiskInfoRequest, DiskInfoResponse, GenerallyLockRequest, GenerallyLockResponse,
-        LocalStorageInfoRequest, LocalStorageInfoResponse, ServerInfoRequest, ServerInfoResponse,
-        GetCpusRequest, GetCpusResponse, GetNetInfoRequest, GetNetInfoResponse,
-        GetPartitionsRequest, GetPartitionsResponse, GetOsInfoRequest, GetOsInfoResponse,
-        GetSeLinuxInfoRequest, GetSeLinuxInfoResponse, GetSysConfigRequest, GetSysConfigResponse,
-        GetSysErrorsRequest, GetSysErrorsResponse, GetMemInfoRequest, GetMemInfoResponse,
-        GetProcInfoRequest, GetProcInfoResponse, BackgroundHealStatusRequest, BackgroundHealStatusResponse,
-        ReloadPoolMetaRequest, ReloadPoolMetaResponse, StopRebalanceRequest, StopRebalanceResponse,
-        LoadRebalanceMetaRequest, LoadRebalanceMetaResponse, LoadBucketMetadataRequest, LoadBucketMetadataResponse,
-        DeleteBucketMetadataRequest, DeleteBucketMetadataResponse, DeletePolicyRequest, DeletePolicyResponse,
-        LoadPolicyRequest, LoadPolicyResponse, LoadPolicyMappingRequest, LoadPolicyMappingResponse,
-        DeleteUserRequest, DeleteUserResponse, DeleteServiceAccountRequest, DeleteServiceAccountResponse,
-        LoadUserRequest, LoadUserResponse, LoadServiceAccountRequest, LoadServiceAccountResponse,
-        LoadGroupRequest, LoadGroupResponse, ReloadSiteReplicationConfigRequest, ReloadSiteReplicationConfigResponse,
-        SignalServiceRequest, SignalServiceResponse, Mss,
-    };
 
     fn create_test_node_service() -> NodeService {
         make_server()
@@ -3382,9 +3375,7 @@ mod tests {
     async fn test_local_storage_info() {
         let service = create_test_node_service();
 
-        let request = Request::new(LocalStorageInfoRequest {
-            metrics: false,
-        });
+        let request = Request::new(LocalStorageInfoRequest { metrics: false });
 
         let response = service.local_storage_info(request).await;
         assert!(response.is_ok());
@@ -3399,9 +3390,7 @@ mod tests {
     async fn test_server_info() {
         let service = create_test_node_service();
 
-        let request = Request::new(ServerInfoRequest {
-            metrics: false,
-        });
+        let request = Request::new(ServerInfoRequest { metrics: false });
 
         let response = service.server_info(request).await;
         assert!(response.is_ok());
@@ -3585,9 +3574,7 @@ mod tests {
     async fn test_load_rebalance_meta() {
         let service = create_test_node_service();
 
-        let request = Request::new(LoadRebalanceMetaRequest {
-            start_rebalance: false,
-        });
+        let request = Request::new(LoadRebalanceMetaRequest { start_rebalance: false });
 
         let response = service.load_rebalance_meta(request).await;
         // Should return error because object layer is not initialized, or success if it's implemented
@@ -3598,9 +3585,7 @@ mod tests {
     async fn test_load_bucket_metadata_empty_bucket() {
         let service = create_test_node_service();
 
-        let request = Request::new(LoadBucketMetadataRequest {
-            bucket: "".to_string(),
-        });
+        let request = Request::new(LoadBucketMetadataRequest { bucket: "".to_string() });
 
         let response = service.load_bucket_metadata(request).await;
         assert!(response.is_ok());
@@ -3769,9 +3754,7 @@ mod tests {
     async fn test_load_group_empty_name() {
         let service = create_test_node_service();
 
-        let request = Request::new(LoadGroupRequest {
-            group: "".to_string(),
-        });
+        let request = Request::new(LoadGroupRequest { group: "".to_string() });
 
         let response = service.load_group(request).await;
         assert!(response.is_ok());
@@ -3797,7 +3780,7 @@ mod tests {
         assert!(reload_response.error_info.is_some());
     }
 
-        // Note: signal_service test is skipped because it contains todo!() and would panic
+    // Note: signal_service test is skipped because it contains todo!() and would panic
 
     #[test]
     fn test_node_service_debug() {

@@ -2829,13 +2829,11 @@ mod tests {
 
     #[test]
     fn test_server_pools_available_space_iter() {
-        let spaces = ServerPoolsAvailableSpace(vec![
-            PoolAvailableSpace {
-                index: 0,
-                available: 1000,
-                max_used_pct: 50,
-            },
-        ]);
+        let spaces = ServerPoolsAvailableSpace(vec![PoolAvailableSpace {
+            index: 0,
+            available: 1000,
+            max_used_pct: 50,
+        }]);
 
         let mut count = 0;
         for space in spaces.iter() {
@@ -2884,4 +2882,3 @@ mod tests {
         assert!(check_put_object_args("test-bucket", "").is_err());
     }
 }
-

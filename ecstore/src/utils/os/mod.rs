@@ -221,7 +221,7 @@ mod tests {
         let invalid_paths = [
             "/this/path/definitely/does/not/exist/anywhere",
             "/dev/null/invalid", // /dev/null is a file, not a directory
-            "", // Empty path
+            "",                  // Empty path
         ];
 
         for invalid_path in &invalid_paths {

@@ -169,7 +169,7 @@ mod tests {
         drop(rx); // Close receiver
 
         // Create a test event
-        use crate::event::{Name, Metadata, Source, Bucket, Object, Identity};
+        use crate::event::{Bucket, Identity, Metadata, Name, Object, Source};
         use std::collections::HashMap;
 
         let identity = Identity::new("test-user".to_string());
@@ -260,7 +260,7 @@ mod tests {
 
         let event_bus_error = Error::EventBusStarted;
         match event_bus_error {
-            Error::EventBusStarted => {}, // 正确匹配
+            Error::EventBusStarted => {} // 正确匹配
             _ => panic!("Pattern matching failed"),
         }
     }

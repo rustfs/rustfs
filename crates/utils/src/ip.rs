@@ -152,13 +152,11 @@ mod tests {
         match ip_option {
             Some(ip) => {
                 // If get_local_ip returns Some, then get_local_ip_with_default should return the same IP
-                assert_eq!(ip.to_string(), ip_string,
-                    "Both functions should return the same IP when available");
+                assert_eq!(ip.to_string(), ip_string, "Both functions should return the same IP when available");
             }
             None => {
                 // If get_local_ip returns None, then get_local_ip_with_default should return default value
-                assert_eq!(ip_string, "127.0.0.1",
-                    "Should return default value when no IP is available");
+                assert_eq!(ip_string, "127.0.0.1", "Should return default value when no IP is available");
             }
         }
     }
