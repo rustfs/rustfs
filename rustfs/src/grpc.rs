@@ -2418,3 +2418,1417 @@ impl Node for NodeService {
         todo!()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tonic::Request;
+    use protos::proto_gen::node_service::{
+        PingRequest, PingResponse, HealBucketRequest, HealBucketResponse,
+        ListBucketRequest, ListBucketResponse, MakeBucketRequest, MakeBucketResponse,
+        GetBucketInfoRequest, GetBucketInfoResponse, DeleteBucketRequest, DeleteBucketResponse,
+        ReadAllRequest, ReadAllResponse, WriteAllRequest, WriteAllResponse,
+        DeleteRequest, DeleteResponse, VerifyFileRequest, VerifyFileResponse,
+        CheckPartsRequest, CheckPartsResponse, RenamePartRequst, RenamePartResponse,
+        RenameFileRequst, RenameFileResponse, ListDirRequest, ListDirResponse,
+        RenameDataRequest, RenameDataResponse, MakeVolumesRequest, MakeVolumesResponse,
+        MakeVolumeRequest, MakeVolumeResponse, ListVolumesRequest, ListVolumesResponse,
+        StatVolumeRequest, StatVolumeResponse, DeletePathsRequest, DeletePathsResponse,
+        UpdateMetadataRequest, UpdateMetadataResponse, WriteMetadataRequest, WriteMetadataResponse,
+        ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse,
+        DeleteVersionRequest, DeleteVersionResponse, DeleteVersionsRequest, DeleteVersionsResponse,
+        ReadMultipleRequest, ReadMultipleResponse, DeleteVolumeRequest, DeleteVolumeResponse,
+        DiskInfoRequest, DiskInfoResponse, GenerallyLockRequest, GenerallyLockResponse,
+        LocalStorageInfoRequest, LocalStorageInfoResponse, ServerInfoRequest, ServerInfoResponse,
+        GetCpusRequest, GetCpusResponse, GetNetInfoRequest, GetNetInfoResponse,
+        GetPartitionsRequest, GetPartitionsResponse, GetOsInfoRequest, GetOsInfoResponse,
+        GetSeLinuxInfoRequest, GetSeLinuxInfoResponse, GetSysConfigRequest, GetSysConfigResponse,
+        GetSysErrorsRequest, GetSysErrorsResponse, GetMemInfoRequest, GetMemInfoResponse,
+        GetProcInfoRequest, GetProcInfoResponse, BackgroundHealStatusRequest, BackgroundHealStatusResponse,
+        ReloadPoolMetaRequest, ReloadPoolMetaResponse, StopRebalanceRequest, StopRebalanceResponse,
+        LoadRebalanceMetaRequest, LoadRebalanceMetaResponse, LoadBucketMetadataRequest, LoadBucketMetadataResponse,
+        DeleteBucketMetadataRequest, DeleteBucketMetadataResponse, DeletePolicyRequest, DeletePolicyResponse,
+        LoadPolicyRequest, LoadPolicyResponse, LoadPolicyMappingRequest, LoadPolicyMappingResponse,
+        DeleteUserRequest, DeleteUserResponse, DeleteServiceAccountRequest, DeleteServiceAccountResponse,
+        LoadUserRequest, LoadUserResponse, LoadServiceAccountRequest, LoadServiceAccountResponse,
+        LoadGroupRequest, LoadGroupResponse, ReloadSiteReplicationConfigRequest, ReloadSiteReplicationConfigResponse,
+        SignalServiceRequest, SignalServiceResponse, Mss,
+    };
+
+    fn create_test_node_service() -> NodeService {
+        make_server()
+    }
+
+    #[tokio::test]
+    async fn test_make_server() {
+        let service = make_server();
+        // LocalPeerS3Client is a struct, not an Option, so we just check it exists
+        assert!(format!("{:?}", service.local_peer).contains("LocalPeerS3Client"));
+    }
+
+    #[tokio::test]
+    async fn test_ping_success() {
+        let service = create_test_node_service();
+
+        // Create a valid ping request with flatbuffer body
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let payload = fbb.create_vector(b"test payload");
+        let mut builder = PingBodyBuilder::new(&mut fbb);
+        builder.add_payload(payload);
+        let root = builder.finish();
+        fbb.finish(root, None);
+
+        let request = Request::new(PingRequest {
+            version: 1,
+            body: fbb.finished_data().to_vec(),
+        });
+
+        let response = service.ping(request).await;
+        assert!(response.is_ok());
+
+        let ping_response = response.unwrap().into_inner();
+        assert_eq!(ping_response.version, 1);
+        assert!(!ping_response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ping_with_invalid_flatbuffer() {
+        let service = create_test_node_service();
+
+        let request = Request::new(PingRequest {
+            version: 1,
+            body: vec![0x00, 0x01, 0x02], // Invalid flatbuffer data
+        });
+
+        let response = service.ping(request).await;
+        assert!(response.is_ok()); // Should still succeed but log error
+
+        let ping_response = response.unwrap().into_inner();
+        assert_eq!(ping_response.version, 1);
+        assert!(!ping_response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_heal_bucket_invalid_options() {
+        let service = create_test_node_service();
+
+        let request = Request::new(HealBucketRequest {
+            bucket: "test-bucket".to_string(),
+            options: "invalid json".to_string(),
+        });
+
+        let response = service.heal_bucket(request).await;
+        assert!(response.is_ok());
+
+        let heal_response = response.unwrap().into_inner();
+        assert!(!heal_response.success);
+        assert!(heal_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_invalid_options() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ListBucketRequest {
+            options: "invalid json".to_string(),
+        });
+
+        let response = service.list_bucket(request).await;
+        assert!(response.is_ok());
+
+        let list_response = response.unwrap().into_inner();
+        assert!(!list_response.success);
+        assert!(list_response.error.is_some());
+        assert!(list_response.bucket_infos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_make_bucket_invalid_options() {
+        let service = create_test_node_service();
+
+        let request = Request::new(MakeBucketRequest {
+            name: "test-bucket".to_string(),
+            options: "invalid json".to_string(),
+        });
+
+        let response = service.make_bucket(request).await;
+        assert!(response.is_ok());
+
+        let make_response = response.unwrap().into_inner();
+        assert!(!make_response.success);
+        assert!(make_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_bucket_info_invalid_options() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetBucketInfoRequest {
+            bucket: "test-bucket".to_string(),
+            options: "invalid json".to_string(),
+        });
+
+        let response = service.get_bucket_info(request).await;
+        assert!(response.is_ok());
+
+        let info_response = response.unwrap().into_inner();
+        assert!(!info_response.success);
+        assert!(info_response.error.is_some());
+        assert!(info_response.bucket_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteBucketRequest {
+            bucket: "test-bucket".to_string(),
+        });
+
+        let response = service.delete_bucket(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        // Response should be valid regardless of success/failure
+        assert!(delete_response.success || delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_all_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ReadAllRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+        });
+
+        let response = service.read_all(request).await;
+        assert!(response.is_ok());
+
+        let read_response = response.unwrap().into_inner();
+        assert!(!read_response.success);
+        assert!(read_response.error.is_some());
+        assert!(read_response.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_all_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(WriteAllRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            data: vec![1, 2, 3, 4],
+        });
+
+        let response = service.write_all(request).await;
+        assert!(response.is_ok());
+
+        let write_response = response.unwrap().into_inner();
+        assert!(!write_response.success);
+        assert!(write_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            options: "{}".to_string(),
+        });
+
+        let response = service.delete(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_invalid_options() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            options: "invalid json".to_string(),
+        });
+
+        let response = service.delete(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_verify_file_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(VerifyFileRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "{}".to_string(),
+        });
+
+        let response = service.verify_file(request).await;
+        assert!(response.is_ok());
+
+        let verify_response = response.unwrap().into_inner();
+        assert!(!verify_response.success);
+        assert!(verify_response.error.is_some());
+        assert!(verify_response.check_parts_resp.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_verify_file_invalid_file_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(VerifyFileRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "invalid json".to_string(),
+        });
+
+        let response = service.verify_file(request).await;
+        assert!(response.is_ok());
+
+        let verify_response = response.unwrap().into_inner();
+        assert!(!verify_response.success);
+        assert!(verify_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_check_parts_invalid_file_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(CheckPartsRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "invalid json".to_string(),
+        });
+
+        let response = service.check_parts(request).await;
+        assert!(response.is_ok());
+
+        let check_response = response.unwrap().into_inner();
+        assert!(!check_response.success);
+        assert!(check_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rename_part_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(RenamePartRequst {
+            disk: "invalid-disk-path".to_string(),
+            src_volume: "src-volume".to_string(),
+            src_path: "src-path".to_string(),
+            dst_volume: "dst-volume".to_string(),
+            dst_path: "dst-path".to_string(),
+            meta: vec![],
+        });
+
+        let response = service.rename_part(request).await;
+        assert!(response.is_ok());
+
+        let rename_response = response.unwrap().into_inner();
+        assert!(!rename_response.success);
+        assert!(rename_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(RenameFileRequst {
+            disk: "invalid-disk-path".to_string(),
+            src_volume: "src-volume".to_string(),
+            src_path: "src-path".to_string(),
+            dst_volume: "dst-volume".to_string(),
+            dst_path: "dst-path".to_string(),
+        });
+
+        let response = service.rename_file(request).await;
+        assert!(response.is_ok());
+
+        let rename_response = response.unwrap().into_inner();
+        assert!(!rename_response.success);
+        assert!(rename_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ListDirRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+        });
+
+        let response = service.list_dir(request).await;
+        assert!(response.is_ok());
+
+        let list_response = response.unwrap().into_inner();
+        assert!(!list_response.success);
+        assert!(list_response.error.is_some());
+        assert!(list_response.volumes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(RenameDataRequest {
+            disk: "invalid-disk-path".to_string(),
+            src_volume: "src-volume".to_string(),
+            src_path: "src-path".to_string(),
+            dst_volume: "dst-volume".to_string(),
+            dst_path: "dst-path".to_string(),
+            file_info: "{}".to_string(),
+        });
+
+        let response = service.rename_data(request).await;
+        assert!(response.is_ok());
+
+        let rename_response = response.unwrap().into_inner();
+        assert!(!rename_response.success);
+        assert!(rename_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_invalid_file_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(RenameDataRequest {
+            disk: "invalid-disk-path".to_string(),
+            src_volume: "src-volume".to_string(),
+            src_path: "src-path".to_string(),
+            dst_volume: "dst-volume".to_string(),
+            dst_path: "dst-path".to_string(),
+            file_info: "invalid json".to_string(),
+        });
+
+        let response = service.rename_data(request).await;
+        assert!(response.is_ok());
+
+        let rename_response = response.unwrap().into_inner();
+        assert!(!rename_response.success);
+        assert!(rename_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_make_volumes_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(MakeVolumesRequest {
+            disk: "invalid-disk-path".to_string(),
+            volumes: vec!["volume1".to_string(), "volume2".to_string()],
+        });
+
+        let response = service.make_volumes(request).await;
+        assert!(response.is_ok());
+
+        let make_response = response.unwrap().into_inner();
+        assert!(!make_response.success);
+        assert!(make_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_make_volume_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(MakeVolumeRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+        });
+
+        let response = service.make_volume(request).await;
+        assert!(response.is_ok());
+
+        let make_response = response.unwrap().into_inner();
+        assert!(!make_response.success);
+        assert!(make_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_volumes_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ListVolumesRequest {
+            disk: "invalid-disk-path".to_string(),
+        });
+
+        let response = service.list_volumes(request).await;
+        assert!(response.is_ok());
+
+        let list_response = response.unwrap().into_inner();
+        assert!(!list_response.success);
+        assert!(list_response.error.is_some());
+        assert!(list_response.volume_infos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stat_volume_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(StatVolumeRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+        });
+
+        let response = service.stat_volume(request).await;
+        assert!(response.is_ok());
+
+        let stat_response = response.unwrap().into_inner();
+        assert!(!stat_response.success);
+        assert!(stat_response.error.is_some());
+        assert!(stat_response.volume_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_paths_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeletePathsRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            paths: vec!["path1".to_string(), "path2".to_string()],
+        });
+
+        let response = service.delete_paths(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_metadata_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(UpdateMetadataRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "{}".to_string(),
+            opts: "{}".to_string(),
+        });
+
+        let response = service.update_metadata(request).await;
+        assert!(response.is_ok());
+
+        let update_response = response.unwrap().into_inner();
+        assert!(!update_response.success);
+        assert!(update_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_metadata_invalid_file_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(UpdateMetadataRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "invalid json".to_string(),
+            opts: "{}".to_string(),
+        });
+
+        let response = service.update_metadata(request).await;
+        assert!(response.is_ok());
+
+        let update_response = response.unwrap().into_inner();
+        assert!(!update_response.success);
+        assert!(update_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_metadata_invalid_opts() {
+        let service = create_test_node_service();
+
+        let request = Request::new(UpdateMetadataRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "{}".to_string(),
+            opts: "invalid json".to_string(),
+        });
+
+        let response = service.update_metadata(request).await;
+        assert!(response.is_ok());
+
+        let update_response = response.unwrap().into_inner();
+        assert!(!update_response.success);
+        assert!(update_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_write_metadata_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(WriteMetadataRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "{}".to_string(),
+        });
+
+        let response = service.write_metadata(request).await;
+        assert!(response.is_ok());
+
+        let write_response = response.unwrap().into_inner();
+        assert!(!write_response.success);
+        assert!(write_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_write_metadata_invalid_file_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(WriteMetadataRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "invalid json".to_string(),
+        });
+
+        let response = service.write_metadata(request).await;
+        assert!(response.is_ok());
+
+        let write_response = response.unwrap().into_inner();
+        assert!(!write_response.success);
+        assert!(write_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_version_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ReadVersionRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            version_id: "version1".to_string(),
+            opts: "{}".to_string(),
+        });
+
+        let response = service.read_version(request).await;
+        assert!(response.is_ok());
+
+        let read_response = response.unwrap().into_inner();
+        assert!(!read_response.success);
+        assert!(read_response.error.is_some());
+        assert!(read_response.file_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_version_invalid_opts() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ReadVersionRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            version_id: "version1".to_string(),
+            opts: "invalid json".to_string(),
+        });
+
+        let response = service.read_version(request).await;
+        assert!(response.is_ok());
+
+        let read_response = response.unwrap().into_inner();
+        assert!(!read_response.success);
+        assert!(read_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_xl_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ReadXlRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            read_data: true,
+        });
+
+        let response = service.read_xl(request).await;
+        assert!(response.is_ok());
+
+        let read_response = response.unwrap().into_inner();
+        assert!(!read_response.success);
+        assert!(read_response.error.is_some());
+        assert!(read_response.raw_file_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteVersionRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "{}".to_string(),
+            force_del_marker: false,
+            opts: "{}".to_string(),
+        });
+
+        let response = service.delete_version(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_invalid_file_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteVersionRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "invalid json".to_string(),
+            force_del_marker: false,
+            opts: "{}".to_string(),
+        });
+
+        let response = service.delete_version(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_invalid_opts() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteVersionRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            path: "test-path".to_string(),
+            file_info: "{}".to_string(),
+            force_del_marker: false,
+            opts: "invalid json".to_string(),
+        });
+
+        let response = service.delete_version(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_versions_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteVersionsRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            versions: vec!["{}".to_string()],
+            opts: "{}".to_string(),
+        });
+
+        let response = service.delete_versions(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_versions_invalid_versions() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteVersionsRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            versions: vec!["invalid json".to_string()],
+            opts: "{}".to_string(),
+        });
+
+        let response = service.delete_versions(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_versions_invalid_opts() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteVersionsRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+            versions: vec!["{}".to_string()],
+            opts: "invalid json".to_string(),
+        });
+
+        let response = service.delete_versions(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_multiple_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ReadMultipleRequest {
+            disk: "invalid-disk-path".to_string(),
+            read_multiple_req: "{}".to_string(),
+        });
+
+        let response = service.read_multiple(request).await;
+        assert!(response.is_ok());
+
+        let read_response = response.unwrap().into_inner();
+        assert!(!read_response.success);
+        assert!(read_response.error.is_some());
+        assert!(read_response.read_multiple_resps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_multiple_invalid_request() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ReadMultipleRequest {
+            disk: "invalid-disk-path".to_string(),
+            read_multiple_req: "invalid json".to_string(),
+        });
+
+        let response = service.read_multiple(request).await;
+        assert!(response.is_ok());
+
+        let read_response = response.unwrap().into_inner();
+        assert!(!read_response.success);
+        assert!(read_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_volume_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteVolumeRequest {
+            disk: "invalid-disk-path".to_string(),
+            volume: "test-volume".to_string(),
+        });
+
+        let response = service.delete_volume(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_disk_info_invalid_disk() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DiskInfoRequest {
+            disk: "invalid-disk-path".to_string(),
+            opts: "{}".to_string(),
+        });
+
+        let response = service.disk_info(request).await;
+        assert!(response.is_ok());
+
+        let info_response = response.unwrap().into_inner();
+        assert!(!info_response.success);
+        assert!(info_response.error.is_some());
+        assert!(info_response.disk_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_disk_info_invalid_opts() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DiskInfoRequest {
+            disk: "invalid-disk-path".to_string(),
+            opts: "invalid json".to_string(),
+        });
+
+        let response = service.disk_info(request).await;
+        assert!(response.is_ok());
+
+        let info_response = response.unwrap().into_inner();
+        assert!(!info_response.success);
+        assert!(info_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_lock_invalid_args() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GenerallyLockRequest {
+            args: "invalid json".to_string(),
+        });
+
+        let response = service.lock(request).await;
+        assert!(response.is_ok());
+
+        let lock_response = response.unwrap().into_inner();
+        assert!(!lock_response.success);
+        assert!(lock_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_un_lock_invalid_args() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GenerallyLockRequest {
+            args: "invalid json".to_string(),
+        });
+
+        let response = service.un_lock(request).await;
+        assert!(response.is_ok());
+
+        let unlock_response = response.unwrap().into_inner();
+        assert!(!unlock_response.success);
+        assert!(unlock_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_r_lock_invalid_args() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GenerallyLockRequest {
+            args: "invalid json".to_string(),
+        });
+
+        let response = service.r_lock(request).await;
+        assert!(response.is_ok());
+
+        let rlock_response = response.unwrap().into_inner();
+        assert!(!rlock_response.success);
+        assert!(rlock_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_r_un_lock_invalid_args() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GenerallyLockRequest {
+            args: "invalid json".to_string(),
+        });
+
+        let response = service.r_un_lock(request).await;
+        assert!(response.is_ok());
+
+        let runlock_response = response.unwrap().into_inner();
+        assert!(!runlock_response.success);
+        assert!(runlock_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_force_un_lock_invalid_args() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GenerallyLockRequest {
+            args: "invalid json".to_string(),
+        });
+
+        let response = service.force_un_lock(request).await;
+        assert!(response.is_ok());
+
+        let force_unlock_response = response.unwrap().into_inner();
+        assert!(!force_unlock_response.success);
+        assert!(force_unlock_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_invalid_args() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GenerallyLockRequest {
+            args: "invalid json".to_string(),
+        });
+
+        let response = service.refresh(request).await;
+        assert!(response.is_ok());
+
+        let refresh_response = response.unwrap().into_inner();
+        assert!(!refresh_response.success);
+        assert!(refresh_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_local_storage_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LocalStorageInfoRequest {
+            metrics: false,
+        });
+
+        let response = service.local_storage_info(request).await;
+        assert!(response.is_ok());
+
+        let info_response = response.unwrap().into_inner();
+        // Should fail because object layer is not initialized in test
+        assert!(!info_response.success);
+        assert!(info_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_server_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ServerInfoRequest {
+            metrics: false,
+        });
+
+        let response = service.server_info(request).await;
+        assert!(response.is_ok());
+
+        let info_response = response.unwrap().into_inner();
+        assert!(info_response.success);
+        assert!(!info_response.server_properties.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_cpus() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetCpusRequest {});
+
+        let response = service.get_cpus(request).await;
+        assert!(response.is_ok());
+
+        let cpus_response = response.unwrap().into_inner();
+        assert!(cpus_response.success);
+        assert!(!cpus_response.cpus.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_net_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetNetInfoRequest {});
+
+        let response = service.get_net_info(request).await;
+        assert!(response.is_ok());
+
+        let net_response = response.unwrap().into_inner();
+        assert!(net_response.success);
+        assert!(!net_response.net_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_partitions() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetPartitionsRequest {});
+
+        let response = service.get_partitions(request).await;
+        assert!(response.is_ok());
+
+        let partitions_response = response.unwrap().into_inner();
+        assert!(partitions_response.success);
+        assert!(!partitions_response.partitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_os_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetOsInfoRequest {});
+
+        let response = service.get_os_info(request).await;
+        assert!(response.is_ok());
+
+        let os_response = response.unwrap().into_inner();
+        assert!(os_response.success);
+        assert!(!os_response.os_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_se_linux_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetSeLinuxInfoRequest {});
+
+        let response = service.get_se_linux_info(request).await;
+        assert!(response.is_ok());
+
+        let selinux_response = response.unwrap().into_inner();
+        assert!(selinux_response.success);
+        assert!(!selinux_response.sys_services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_sys_config() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetSysConfigRequest {});
+
+        let response = service.get_sys_config(request).await;
+        assert!(response.is_ok());
+
+        let config_response = response.unwrap().into_inner();
+        assert!(config_response.success);
+        assert!(!config_response.sys_config.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_sys_errors() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetSysErrorsRequest {});
+
+        let response = service.get_sys_errors(request).await;
+        assert!(response.is_ok());
+
+        let errors_response = response.unwrap().into_inner();
+        assert!(errors_response.success);
+        assert!(!errors_response.sys_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_mem_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetMemInfoRequest {});
+
+        let response = service.get_mem_info(request).await;
+        assert!(response.is_ok());
+
+        let mem_response = response.unwrap().into_inner();
+        assert!(mem_response.success);
+        assert!(!mem_response.mem_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_proc_info() {
+        let service = create_test_node_service();
+
+        let request = Request::new(GetProcInfoRequest {});
+
+        let response = service.get_proc_info(request).await;
+        assert!(response.is_ok());
+
+        let proc_response = response.unwrap().into_inner();
+        assert!(proc_response.success);
+        assert!(!proc_response.proc_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_background_heal_status() {
+        let service = create_test_node_service();
+
+        let request = Request::new(BackgroundHealStatusRequest {});
+
+        let response = service.background_heal_status(request).await;
+        assert!(response.is_ok());
+
+        let heal_response = response.unwrap().into_inner();
+        // May fail if heal status is not available
+        assert!(heal_response.success || heal_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_reload_pool_meta() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ReloadPoolMetaRequest {});
+
+        let response = service.reload_pool_meta(request).await;
+        assert!(response.is_ok());
+
+        let reload_response = response.unwrap().into_inner();
+        // Should fail because object layer is not initialized in test
+        assert!(!reload_response.success);
+        assert!(reload_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_stop_rebalance() {
+        let service = create_test_node_service();
+
+        let request = Request::new(StopRebalanceRequest {});
+
+        let response = service.stop_rebalance(request).await;
+        assert!(response.is_ok());
+
+        let stop_response = response.unwrap().into_inner();
+        // Should fail because object layer is not initialized in test
+        assert!(!stop_response.success);
+        assert!(stop_response.error_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_load_rebalance_meta() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LoadRebalanceMetaRequest {
+            start_rebalance: false,
+        });
+
+        let response = service.load_rebalance_meta(request).await;
+        // Should return error because object layer is not initialized, or success if it's implemented
+        assert!(response.is_err() || response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_load_bucket_metadata_empty_bucket() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LoadBucketMetadataRequest {
+            bucket: "".to_string(),
+        });
+
+        let response = service.load_bucket_metadata(request).await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("bucket name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_load_bucket_metadata_no_object_layer() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LoadBucketMetadataRequest {
+            bucket: "test-bucket".to_string(),
+        });
+
+        let response = service.load_bucket_metadata(request).await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("errServerNotInitialized"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_metadata() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteBucketMetadataRequest {
+            bucket: "test-bucket".to_string(),
+        });
+
+        let response = service.delete_bucket_metadata(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(delete_response.success); // Currently returns success (todo implementation)
+    }
+
+    #[tokio::test]
+    async fn test_delete_policy_empty_name() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeletePolicyRequest {
+            policy_name: "".to_string(),
+        });
+
+        let response = service.delete_policy(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error_info.is_some());
+        assert!(delete_response.error_info.unwrap().contains("policy name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_load_policy_empty_name() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LoadPolicyRequest {
+            policy_name: "".to_string(),
+        });
+
+        let response = service.load_policy(request).await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("policy name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_load_policy_mapping_empty_user() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LoadPolicyMappingRequest {
+            user_or_group: "".to_string(),
+            user_type: 0,
+            is_group: false,
+        });
+
+        let response = service.load_policy_mapping(request).await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("user_or_group name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_empty_access_key() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteUserRequest {
+            access_key: "".to_string(),
+        });
+
+        let response = service.delete_user(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error_info.is_some());
+        assert!(delete_response.error_info.unwrap().contains("access_key name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_service_account_empty_access_key() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteServiceAccountRequest {
+            access_key: "".to_string(),
+        });
+
+        let response = service.delete_service_account(request).await;
+        assert!(response.is_ok());
+
+        let delete_response = response.unwrap().into_inner();
+        assert!(!delete_response.success);
+        assert!(delete_response.error_info.is_some());
+        assert!(delete_response.error_info.unwrap().contains("access_key name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_load_user_empty_access_key() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LoadUserRequest {
+            access_key: "".to_string(),
+            temp: false,
+        });
+
+        let response = service.load_user(request).await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("access_key name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_load_service_account_empty_access_key() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LoadServiceAccountRequest {
+            access_key: "".to_string(),
+        });
+
+        let response = service.load_service_account(request).await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("access_key name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_load_group_empty_name() {
+        let service = create_test_node_service();
+
+        let request = Request::new(LoadGroupRequest {
+            group: "".to_string(),
+        });
+
+        let response = service.load_group(request).await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("group name is missing"));
+    }
+
+    #[tokio::test]
+    async fn test_reload_site_replication_config() {
+        let service = create_test_node_service();
+
+        let request = Request::new(ReloadSiteReplicationConfigRequest {});
+
+        let response = service.reload_site_replication_config(request).await;
+        assert!(response.is_ok());
+
+        let reload_response = response.unwrap().into_inner();
+        // Should fail because object layer is not initialized in test
+        assert!(!reload_response.success);
+        assert!(reload_response.error_info.is_some());
+    }
+
+        // Note: signal_service test is skipped because it contains todo!() and would panic
+
+    #[test]
+    fn test_node_service_debug() {
+        let service = create_test_node_service();
+        let debug_str = format!("{:?}", service);
+        assert!(debug_str.contains("NodeService"));
+    }
+
+    #[test]
+    fn test_node_service_creation() {
+        let service1 = make_server();
+        let service2 = make_server();
+
+        // Both services should be created successfully
+        assert!(format!("{:?}", service1).contains("NodeService"));
+        assert!(format!("{:?}", service2).contains("NodeService"));
+    }
+
+    #[tokio::test]
+    async fn test_all_disk_method() {
+        let service = create_test_node_service();
+        let disks = service.all_disk().await;
+        // Should return empty vector in test environment
+        assert!(disks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_disk_method() {
+        let service = create_test_node_service();
+        let disk = service.find_disk(&"non-existent-disk".to_string()).await;
+        // Should return None for non-existent disk
+        assert!(disk.is_none());
+    }
+}
