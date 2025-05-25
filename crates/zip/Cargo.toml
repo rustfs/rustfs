@@ -1,5 +1,5 @@
 [package]
-name = "zip"
+name = "rustfs-zip"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,8 +16,8 @@ async-compression = { version = "0.4.0", features = [
     "zstd",
     "xz",
 ] }
-# async_zip = { version = "0.0.17", features = ["tokio"] }
-# rc-zip-tokio = "4.2.6"
+async_zip = { version = "0.0.17", features = ["tokio"] }
+zip = "2.2.0"
 tokio = { version = "1.45.0", features = ["full"] }
 tokio-stream = "0.1.17"
 tokio-tar = { workspace = true }
