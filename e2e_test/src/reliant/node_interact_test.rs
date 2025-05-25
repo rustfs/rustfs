@@ -35,19 +35,19 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
     assert!(decoded_payload.is_ok());
 
-    // 创建客户端
+    // Create client
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
 
-    // 构造 PingRequest
+    // Construct PingRequest
     let request = Request::new(PingRequest {
         version: 1,
         body: finished_data.to_vec(),
     });
 
-    // 发送请求并获取响应
+    // Send request and get response
     let response: PingResponse = client.ping(request).await?.into_inner();
 
-    // 打印响应
+    // Print response
     let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
     if let Err(e) = ping_response_body {
         eprintln!("{}", e);

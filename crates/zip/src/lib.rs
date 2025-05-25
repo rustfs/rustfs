@@ -36,7 +36,7 @@ impl Default for CompressionLevel {
 }
 
 impl CompressionFormat {
-    /// 从文件扩展名识别压缩格式
+    /// Identify compression format from file extension
     pub fn from_extension(ext: &str) -> Self {
         match ext.to_lowercase().as_str() {
             "gz" | "gzip" => CompressionFormat::Gzip,
@@ -50,7 +50,7 @@ impl CompressionFormat {
         }
     }
 
-    /// 从文件路径识别压缩格式
+    /// Identify compression format from file path
     pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
         let path = path.as_ref();
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
@@ -60,7 +60,7 @@ impl CompressionFormat {
         }
     }
 
-    /// 获取格式对应的文件扩展名
+    /// Get file extension corresponding to the format
     pub fn extension(&self) -> &'static str {
         match self {
             CompressionFormat::Gzip => "gz",
@@ -74,12 +74,12 @@ impl CompressionFormat {
         }
     }
 
-    /// 检查格式是否支持
+    /// Check if format is supported
     pub fn is_supported(&self) -> bool {
         !matches!(self, CompressionFormat::Unknown)
     }
 
-    /// 创建解压缩器
+    /// Create decompressor
     pub fn get_decoder<R>(&self, input: R) -> io::Result<Box<dyn AsyncRead + Send + Unpin>>
     where
         R: AsyncRead + Send + Unpin + 'static,
@@ -107,7 +107,7 @@ impl CompressionFormat {
         Ok(decoder)
     }
 
-    /// 创建压缩器
+    /// Create compressor
     pub fn get_encoder<W>(&self, output: W, level: CompressionLevel) -> io::Result<Box<dyn AsyncWrite + Send + Unpin>>
     where
         W: AsyncWrite + Send + Unpin + 'static,
@@ -176,7 +176,7 @@ impl CompressionFormat {
     }
 }
 
-/// 解压tar格式的压缩文件
+/// Decompress tar format compressed files
 pub async fn decompress<R, F>(input: R, format: CompressionFormat, mut callback: F) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -194,7 +194,7 @@ where
     Ok(())
 }
 
-/// ZIP文件条目信息
+/// ZIP file entry information
 #[derive(Debug, Clone)]
 pub struct ZipEntry {
     pub name: String,
@@ -204,33 +204,33 @@ pub struct ZipEntry {
     pub compression_method: String,
 }
 
-/// 简化的ZIP文件处理（暂时使用标准库的zip crate）
+/// Simplified ZIP file processing (temporarily using standard library zip crate)
 pub async fn extract_zip_simple<P: AsRef<Path>>(
     zip_path: P,
     extract_to: P,
 ) -> io::Result<Vec<ZipEntry>> {
-    // 使用标准库的zip处理，这里先返回空列表作为占位符
-    // 实际实现需要在后续版本中完善
+    // Use standard library zip processing, return empty list as placeholder for now
+    // Actual implementation needs to be improved in future versions
     let _zip_path = zip_path.as_ref();
     let _extract_to = extract_to.as_ref();
 
     Ok(Vec::new())
 }
 
-/// 简化的ZIP文件创建
+/// Simplified ZIP file creation
 pub async fn create_zip_simple<P: AsRef<Path>>(
     _zip_path: P,
-    _files: Vec<(String, Vec<u8>)>, // (文件名, 文件内容)
+    _files: Vec<(String, Vec<u8>)>, // (filename, file content)
     _compression_level: CompressionLevel,
 ) -> io::Result<()> {
-    // 暂时返回未实现错误
+    // Return unimplemented error for now
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "ZIP creation not yet implemented",
     ))
 }
 
-/// 压缩工具结构体
+/// Compression utility struct
 pub struct Compressor {
     format: CompressionFormat,
     level: CompressionLevel,
@@ -249,7 +249,7 @@ impl Compressor {
         self
     }
 
-        /// 压缩数据
+    /// Compress data
     pub async fn compress(&self, input: &[u8]) -> io::Result<Vec<u8>> {
         let output = Vec::new();
         let cursor = std::io::Cursor::new(output);
@@ -258,13 +258,13 @@ impl Compressor {
         tokio::io::copy(&mut std::io::Cursor::new(input), &mut encoder).await?;
         encoder.shutdown().await?;
 
-        // 获取压缩后的数据
-        // 注意：这里需要重新设计API，因为我们无法从encoder中取回数据
-        // 暂时返回空向量作为占位符
+        // Get compressed data
+        // Note: API needs to be redesigned here as we cannot retrieve data from encoder
+        // Return empty vector as placeholder for now
         Ok(Vec::new())
     }
 
-        /// 解压缩数据
+    /// Decompress data
     pub async fn decompress(&self, input: Vec<u8>) -> io::Result<Vec<u8>> {
         let mut output = Vec::new();
         let cursor = std::io::Cursor::new(input);
@@ -276,7 +276,7 @@ impl Compressor {
     }
 }
 
-/// 解压缩工具结构体
+/// Decompression utility struct
 pub struct Decompressor {
     format: CompressionFormat,
 }
@@ -291,7 +291,7 @@ impl Decompressor {
         Self { format }
     }
 
-    /// 解压缩文件
+    /// Decompress file
     pub async fn decompress_file<P: AsRef<Path>>(&self, input_path: P, output_path: P) -> io::Result<()> {
         let input_file = File::open(&input_path).await?;
         let output_file = File::create(&output_path).await?;
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_compression_format_case_sensitivity() {
-        // 测试大小写不敏感性（现在支持大小写不敏感）
+        // Test case insensitivity (now supports case insensitivity)
         assert_eq!(CompressionFormat::from_extension("GZ"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("Gz"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("BZ2"), CompressionFormat::Bzip2);
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_compression_format_edge_cases() {
-        // 测试边界情况
+        // Test edge cases
         assert_eq!(CompressionFormat::from_extension("gz "), CompressionFormat::Unknown);
         assert_eq!(CompressionFormat::from_extension(" gz"), CompressionFormat::Unknown);
         assert_eq!(CompressionFormat::from_extension("gz.bak"), CompressionFormat::Unknown);
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_compression_format_debug() {
-        // 测试Debug trait实现
+        // Test Debug trait implementation
         let format = CompressionFormat::Gzip;
         let debug_str = format!("{:?}", format);
         assert_eq!(debug_str, "Gzip");
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_compression_format_equality() {
-        // 测试PartialEq trait实现
+        // Test PartialEq trait implementation
         assert_eq!(CompressionFormat::Gzip, CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::Unknown, CompressionFormat::Unknown);
         assert_ne!(CompressionFormat::Gzip, CompressionFormat::Bzip2);
@@ -378,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_decoder_supported_formats() {
-        // 测试支持的格式能够创建解码器
+        // Test that supported formats can create decoders
         let test_data = b"test data";
         let cursor = Cursor::new(test_data);
 
@@ -389,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_decoder_unsupported_formats() {
-        // 测试不支持的格式返回错误
+        // Test that unsupported formats return errors
         let test_data = b"test data";
         let cursor = Cursor::new(test_data);
 
@@ -405,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_decoder_zip_format() {
-        // 测试Zip格式（当前不支持）
+        // Test Zip format (currently not supported)
         let test_data = b"test data";
         let cursor = Cursor::new(test_data);
 
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_compression_format_exhaustive_matching() {
-        // 测试所有枚举变体都有对应的处理
+        // Test that all enum variants have corresponding handling
         let all_formats = vec![
             CompressionFormat::Gzip,
             CompressionFormat::Bzip2,
@@ -464,17 +464,17 @@ mod tests {
         ];
 
         for format in all_formats {
-            // 验证每个格式都有对应的Debug实现
+            // Verify each format has corresponding Debug implementation
             let _debug_str = format!("{:?}", format);
 
-            // 验证每个格式都有对应的PartialEq实现
+            // Verify each format has corresponding PartialEq implementation
             assert_eq!(format, format);
         }
     }
 
     #[test]
     fn test_extension_mapping_completeness() {
-        // 测试扩展名映射的完整性
+        // Test completeness of extension mapping
         let extension_mappings = vec![
             ("gz", CompressionFormat::Gzip),
             ("gzip", CompressionFormat::Gzip),
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_format_string_representations() {
-        // 测试格式的字符串表示
+        // Test string representation of formats
         let format_strings = vec![
             (CompressionFormat::Gzip, "Gzip"),
             (CompressionFormat::Bzip2, "Bzip2"),
@@ -528,34 +528,34 @@ mod tests {
 
     #[test]
     fn test_compression_format_memory_efficiency() {
-        // 测试枚举的内存效率
+        // Test memory efficiency of enum
         use std::mem;
 
-        // 验证枚举大小合理
+        // Verify enum size is reasonable
         let size = mem::size_of::<CompressionFormat>();
         assert!(size <= 8, "CompressionFormat should be memory efficient, got {} bytes", size);
 
-        // 验证Option<CompressionFormat>的大小
+        // Verify Option<CompressionFormat> size
         let option_size = mem::size_of::<Option<CompressionFormat>>();
         assert!(option_size <= 16, "Option<CompressionFormat> should be efficient, got {} bytes", option_size);
     }
 
     #[test]
     fn test_extension_validation() {
-        // 测试扩展名验证的边界情况
+        // Test edge cases of extension validation
         let test_cases = vec![
-            // 正常情况
+            // Normal cases
             ("gz", true),
             ("bz2", true),
             ("xz", true),
 
-            // 边界情况
+            // Edge cases
             ("", false),
             ("g", false),
             ("gzz", false),
             ("gz2", false),
 
-            // 特殊字符
+            // Special characters
             ("gz.", false),
             (".gz", false),
             ("gz-", false),
