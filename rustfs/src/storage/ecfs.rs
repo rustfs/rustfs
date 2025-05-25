@@ -58,6 +58,7 @@ use policy::policy::BucketPolicy;
 use policy::policy::BucketPolicyArgs;
 use policy::policy::Validator;
 use query::instance::make_rustfsms;
+use rustfs_zip::CompressionFormat;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -83,7 +84,6 @@ use tracing::info;
 use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
-use zip::CompressionFormat;
 
 macro_rules! try_ {
     ($result:expr) => {
