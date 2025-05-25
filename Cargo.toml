@@ -48,7 +48,7 @@ policy = { path = "./policy", version = "0.0.1" }
 protos = { path = "./common/protos", version = "0.0.1" }
 query = { path = "./s3select/query", version = "0.0.1" }
 rustfs = { path = "./rustfs", version = "0.0.1" }
-zip = { path = "./crates/zip", version = "0.0.1" }
+rustfs-zip = { path = "./crates/zip", version = "0.0.1" }
 rustfs-config = { path = "./crates/config", version = "0.0.1" }
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
