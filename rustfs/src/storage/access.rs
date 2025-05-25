@@ -147,7 +147,7 @@ impl S3Access for FS {
     // /// + [`cx.s3_op().name()`](crate::S3Operation::name)
     // /// + [`cx.extensions_mut()`](S3AccessContext::extensions_mut)
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
-        // 上层验证了 ak/sk
+        // Upper layer has verified ak/sk
         // info!(
         //     "s3 check uri: {:?}, method: {:?} path: {:?}, s3_op: {:?}, cred: {:?}, headers:{:?}",
         //     cx.uri(),
@@ -176,7 +176,7 @@ impl S3Access for FS {
         let ext = cx.extensions_mut();
         ext.insert(req_info);
 
-        // 统一在这验证？还是在下面各自验证？
+        // Verify uniformly here? Or verify separately below?
 
         Ok(())
     }

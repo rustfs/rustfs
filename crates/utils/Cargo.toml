@@ -22,4 +22,5 @@ default = ["ip"]  # features that are enabled by default
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
 net = ["ip"]  # empty network features
-full = ["ip", "tls", "net"]  # all features
+integration = []  # integration test features
+full = ["ip", "tls", "net", "integration"]  # all features

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
@@ -16,6 +14,7 @@ use s3s::{
 use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
+use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
 
@@ -50,7 +49,7 @@ impl Operation for AssumeRoleHandle {
         let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &user.access_key).await?;
 
-        // // TODO: 判断权限，不允许 sts 访问
+        // TODO: Check permissions, do not allow STS access
         if cred.is_temp() || cred.is_service_account() {
             return Err(s3_error!(InvalidRequest, "AccessDenied"));
         }
