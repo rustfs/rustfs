@@ -1,58 +1,58 @@
-# RustFS 项目 Cursor 规则
+# RustFS Project Cursor Rules
 
-## 项目概述
-RustFS 是一个用 Rust 编写的高性能分布式对象存储系统，兼容 S3 API。项目采用模块化架构，支持纠删码存储、多租户管理、可观测性等企业级功能。
+## Project Overview
+RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API. The project adopts a modular architecture, supporting erasure coding storage, multi-tenant management, observability, and other enterprise-level features.
 
-## 核心架构原则
+## Core Architecture Principles
 
-### 1. 模块化设计
-- 项目采用 Cargo workspace 结构，包含多个独立的 crate
-- 核心模块：`rustfs`（主服务）、`ecstore`（纠删码存储）、`common`（共享组件）
-- 功能模块：`iam`（身份管理）、`madmin`（管理接口）、`crypto`（加密）等
-- 工具模块：`cli`（命令行工具）、`crates/*`（工具库）
+### 1. Modular Design
+- Project uses Cargo workspace structure, containing multiple independent crates
+- Core modules: `rustfs` (main service), `ecstore` (erasure coding storage), `common` (shared components)
+- Functional modules: `iam` (identity management), `madmin` (management interface), `crypto` (encryption), etc.
+- Tool modules: `cli` (command line tool), `crates/*` (utility libraries)
 
-### 2. 异步编程模式
-- 全面使用 `tokio` 异步运行时
-- 优先使用 `async/await` 语法
-- 使用 `async-trait` 处理 trait 中的异步方法
-- 避免阻塞操作，必要时使用 `spawn_blocking`
+### 2. Asynchronous Programming Pattern
+- Comprehensive use of `tokio` async runtime
+- Prioritize `async/await` syntax
+- Use `async-trait` for async methods in traits
+- Avoid blocking operations, use `spawn_blocking` when necessary
 
-### 3. 错误处理策略
-- 使用统一的错误类型 `common::error::Error`
-- 支持错误链和上下文信息
-- 使用 `thiserror` 定义具体错误类型
-- 错误转换使用 `downcast_ref` 进行类型检查
+### 3. Error Handling Strategy
+- Use unified error type `common::error::Error`
+- Support error chains and context information
+- Use `thiserror` to define specific error types
+- Error conversion uses `downcast_ref` for type checking
 
-## 代码风格规范
+## Code Style Guidelines
 
-### 1. 格式化配置
+### 1. Formatting Configuration
 ```toml
 max_width = 130
 fn_call_width = 90
 single_line_let_else_max_width = 100
 ```
 
-### 2. 命名约定
-- 使用 `snake_case` 命名函数、变量、模块
-- 使用 `PascalCase` 命名类型、trait、枚举
-- 常量使用 `SCREAMING_SNAKE_CASE`
-- 全局变量前缀 `GLOBAL_`，如 `GLOBAL_Endpoints`
+### 2. Naming Conventions
+- Use `snake_case` for functions, variables, modules
+- Use `PascalCase` for types, traits, enums
+- Constants use `SCREAMING_SNAKE_CASE`
+- Global variables prefix `GLOBAL_`, e.g., `GLOBAL_Endpoints`
 
-### 3. 文档注释
-- 公共 API 必须有文档注释
-- 使用 `///` 进行文档注释
-- 复杂函数添加 `# Examples` 和 `# Parameters` 说明
-- 错误情况使用 `# Errors` 说明
+### 3. Documentation Comments
+- Public APIs must have documentation comments
+- Use `///` for documentation comments
+- Complex functions add `# Examples` and `# Parameters` descriptions
+- Error cases use `# Errors` descriptions
 
-### 4. 导入规范
-- 标准库导入在最前面
-- 第三方 crate 导入在中间
-- 本项目内部导入在最后
-- 使用 `use` 语句分组，组间空行分隔
+### 4. Import Guidelines
+- Standard library imports first
+- Third-party crate imports in the middle
+- Project internal imports last
+- Group `use` statements with blank lines between groups
 
-## 异步编程规范
+## Asynchronous Programming Guidelines
 
-### 1. Trait 定义
+### 1. Trait Definition
 ```rust
 #[async_trait::async_trait]
 pub trait StorageAPI: Send + Sync {
@@ -60,9 +60,9 @@ pub trait StorageAPI: Send + Sync {
 }
 ```
 
-### 2. 错误处理
+### 2. Error Handling
 ```rust
-// 使用 ? 操作符传播错误
+// Use ? operator to propagate errors
 async fn example_function() -> Result<()> {
     let data = read_file("path").await?;
     process_data(data).await?;
@@ -70,30 +70,30 @@ async fn example_function() -> Result<()> {
 }
 ```
 
-### 3. 并发控制
-- 使用 `Arc` 和 `Mutex`/`RwLock` 进行共享状态管理
-- 优先使用 `tokio::sync` 中的异步锁
-- 避免长时间持有锁
+### 3. Concurrency Control
+- Use `Arc` and `Mutex`/`RwLock` for shared state management
+- Prioritize async locks from `tokio::sync`
+- Avoid holding locks for long periods
 
-## 日志和追踪规范
+## Logging and Tracing Guidelines
 
-### 1. Tracing 使用
+### 1. Tracing Usage
 ```rust
 #[tracing::instrument(skip(self, data))]
 async fn process_data(&self, data: &[u8]) -> Result<()> {
     info!("Processing {} bytes", data.len());
-    // 实现逻辑
+    // Implementation logic
 }
 ```
 
-### 2. 日志级别
-- `error!`: 系统错误，需要立即关注
-- `warn!`: 警告信息，可能影响功能
-- `info!`: 重要的业务信息
-- `debug!`: 调试信息，开发时使用
-- `trace!`: 详细的执行路径
+### 2. Log Levels
+- `error!`: System errors requiring immediate attention
+- `warn!`: Warning information that may affect functionality
+- `info!`: Important business information
+- `debug!`: Debug information for development use
+- `trace!`: Detailed execution paths
 
-### 3. 结构化日志
+### 3. Structured Logging
 ```rust
 info!(
     counter.rustfs_api_requests_total = 1_u64,
@@ -103,9 +103,9 @@ info!(
 );
 ```
 
-## 错误处理规范
+## Error Handling Guidelines
 
-### 1. 错误类型定义
+### 1. Error Type Definition
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum MyError {
@@ -116,7 +116,7 @@ pub enum MyError {
 }
 ```
 
-### 2. 错误转换
+### 2. Error Conversion
 ```rust
 pub fn to_s3_error(err: Error) -> S3Error {
     if let Some(storage_err) = err.downcast_ref::<StorageError>() {
@@ -124,40 +124,40 @@ pub fn to_s3_error(err: Error) -> S3Error {
             StorageError::ObjectNotFound(bucket, object) => {
                 s3_error!(NoSuchKey, "{}/{}", bucket, object)
             }
-            // 其他错误类型...
+            // Other error types...
         }
     }
-    // 默认错误处理
+    // Default error handling
 }
 ```
 
-### 3. 错误上下文
+### 3. Error Context
 ```rust
-// 添加错误上下文
+// Add error context
 .map_err(|e| Error::from_string(format!("Failed to process {}: {}", path, e)))?
 ```
 
-## 性能优化规范
+## Performance Optimization Guidelines
 
-### 1. 内存管理
-- 使用 `Bytes` 而不是 `Vec<u8>` 进行零拷贝操作
-- 避免不必要的克隆，使用引用传递
-- 大对象使用 `Arc` 共享
+### 1. Memory Management
+- Use `Bytes` instead of `Vec<u8>` for zero-copy operations
+- Avoid unnecessary cloning, use reference passing
+- Use `Arc` for sharing large objects
 
-### 2. 并发优化
+### 2. Concurrency Optimization
 ```rust
-// 使用 join_all 进行并发操作
+// Use join_all for concurrent operations
 let futures = disks.iter().map(|disk| disk.operation());
 let results = join_all(futures).await;
 ```
 
-### 3. 缓存策略
-- 使用 `lazy_static` 或 `OnceCell` 进行全局缓存
-- 实现 LRU 缓存避免内存泄漏
+### 3. Caching Strategy
+- Use `lazy_static` or `OnceCell` for global caching
+- Implement LRU cache to avoid memory leaks
 
-## 测试规范
+## Testing Guidelines
 
-### 1. 单元测试
+### 1. Unit Tests
 ```rust
 #[cfg(test)]
 mod tests {
@@ -178,31 +178,31 @@ mod tests {
 }
 ```
 
-### 2. 集成测试
-- 使用 `e2e_test` 模块进行端到端测试
-- 模拟真实的存储环境
+### 2. Integration Tests
+- Use `e2e_test` module for end-to-end testing
+- Simulate real storage environments
 
-## 安全规范
+## Security Guidelines
 
-### 1. 内存安全
-- 禁用 `unsafe` 代码（workspace.lints.rust.unsafe_code = "deny"）
-- 使用 `rustls` 而不是 `openssl`
+### 1. Memory Safety
+- Disable `unsafe` code (workspace.lints.rust.unsafe_code = "deny")
+- Use `rustls` instead of `openssl`
 
-### 2. 认证授权
+### 2. Authentication and Authorization
 ```rust
-// 使用 IAM 系统进行权限检查
+// Use IAM system for permission checks
 let identity = iam.authenticate(&access_key, &secret_key).await?;
 iam.authorize(&identity, &action, &resource).await?;
 ```
 
-## 配置管理规范
+## Configuration Management Guidelines
 
-### 1. 环境变量
-- 使用 `RUSTFS_` 前缀
-- 支持配置文件和环境变量两种方式
-- 提供合理的默认值
+### 1. Environment Variables
+- Use `RUSTFS_` prefix
+- Support both configuration files and environment variables
+- Provide reasonable default values
 
-### 2. 配置结构
+### 2. Configuration Structure
 ```rust
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -213,13 +213,13 @@ pub struct Config {
 }
 ```
 
-## 依赖管理规范
+## Dependency Management Guidelines
 
-### 1. Workspace 依赖
-- 在 workspace 级别统一管理版本
-- 使用 `workspace = true` 继承配置
+### 1. Workspace Dependencies
+- Manage versions uniformly at workspace level
+- Use `workspace = true` to inherit configuration
 
-### 2. 功能特性
+### 2. Feature Flags
 ```rust
 [features]
 default = ["file"]
@@ -227,84 +227,84 @@ gpu = ["dep:nvml-wrapper"]
 kafka = ["dep:rdkafka"]
 ```
 
-## 部署和运维规范
+## Deployment and Operations Guidelines
 
-### 1. 容器化
-- 提供 Dockerfile 和 docker-compose 配置
-- 支持多阶段构建优化镜像大小
+### 1. Containerization
+- Provide Dockerfile and docker-compose configuration
+- Support multi-stage builds to optimize image size
 
-### 2. 可观测性
-- 集成 OpenTelemetry 进行分布式追踪
-- 支持 Prometheus 指标收集
-- 提供 Grafana 仪表板
+### 2. Observability
+- Integrate OpenTelemetry for distributed tracing
+- Support Prometheus metrics collection
+- Provide Grafana dashboards
 
-### 3. 健康检查
+### 3. Health Checks
 ```rust
-// 实现健康检查端点
+// Implement health check endpoint
 async fn health_check() -> Result<HealthStatus> {
-    // 检查各个组件状态
+    // Check component status
 }
 ```
 
-## 代码审查清单
+## Code Review Checklist
 
-### 1. 功能性
-- [ ] 是否正确处理所有错误情况
-- [ ] 是否有适当的日志记录
-- [ ] 是否有必要的测试覆盖
+### 1. Functionality
+- [ ] Are all error cases properly handled?
+- [ ] Is there appropriate logging?
+- [ ] Is there necessary test coverage?
 
-### 2. 性能
-- [ ] 是否避免了不必要的内存分配
-- [ ] 是否正确使用了异步操作
-- [ ] 是否有潜在的死锁风险
+### 2. Performance
+- [ ] Are unnecessary memory allocations avoided?
+- [ ] Are async operations used correctly?
+- [ ] Are there potential deadlock risks?
 
-### 3. 安全性
-- [ ] 是否正确验证输入参数
-- [ ] 是否有适当的权限检查
-- [ ] 是否避免了信息泄露
+### 3. Security
+- [ ] Are input parameters properly validated?
+- [ ] Are there appropriate permission checks?
+- [ ] Is information leakage avoided?
 
-### 4. 可维护性
-- [ ] 代码是否清晰易懂
-- [ ] 是否遵循项目的架构模式
-- [ ] 是否有适当的文档
+### 4. Maintainability
+- [ ] Is the code clear and understandable?
+- [ ] Does it follow the project's architectural patterns?
+- [ ] Is there appropriate documentation?
 
-### 5. 代码提交
-- [ ] 是否符合[代码提交规范](https://www.conventionalcommits.org/en/v1.0.0/)
-- [ ] 提交的标题要精简，以英文为主，不要使用中文
+### 5. Code Commits
+- [ ] Does it comply with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)?
+- [ ] Commit titles should be concise and in English, avoid Chinese
 
-## 常用模式和最佳实践
+## Common Patterns and Best Practices
 
-### 1. 资源管理
+### 1. Resource Management
 ```rust
-// 使用 RAII 模式管理资源
+// Use RAII pattern for resource management
 pub struct ResourceGuard {
     resource: Resource,
 }
 
 impl Drop for ResourceGuard {
     fn drop(&mut self) {
-        // 清理资源
+        // Clean up resources
     }
 }
 ```
 
-### 2. 配置注入
+### 2. Dependency Injection
 ```rust
-// 使用依赖注入模式
+// Use dependency injection pattern
 pub struct Service {
     config: Arc<Config>,
     storage: Arc<dyn StorageAPI>,
 }
 ```
 
-### 3. 优雅关闭
+### 3. Graceful Shutdown
 ```rust
-// 实现优雅关闭
+// Implement graceful shutdown
 async fn shutdown_gracefully(shutdown_rx: &mut Receiver<()>) {
     tokio::select! {
         _ = shutdown_rx.recv() => {
             info!("Received shutdown signal");
-            // 执行清理操作
+            // Perform cleanup operations
         }
         _ = tokio::time::sleep(SHUTDOWN_TIMEOUT) => {
             warn!("Shutdown timeout reached");
@@ -313,34 +313,35 @@ async fn shutdown_gracefully(shutdown_rx: &mut Receiver<()>) {
 }
 ```
 
-## 特定领域规范
+## Domain-Specific Guidelines
 
-### 1. 存储操作
-- 所有存储操作必须支持纠删码
-- 实现读写仲裁机制
-- 支持数据完整性校验
+### 1. Storage Operations
+- All storage operations must support erasure coding
+- Implement read/write quorum mechanisms
+- Support data integrity verification
 
-### 2. 网络通信
-- 使用 gRPC 进行内部服务通信
-- HTTP/HTTPS 支持 S3 兼容 API
-- 实现连接池和重试机制
+### 2. Network Communication
+- Use gRPC for internal service communication
+- HTTP/HTTPS support for S3-compatible API
+- Implement connection pooling and retry mechanisms
 
-### 3. 元数据管理
-- 使用 FlatBuffers 进行序列化
-- 支持版本控制和迁移
-- 实现元数据缓存
+### 3. Metadata Management
+- Use FlatBuffers for serialization
+- Support version control and migration
+- Implement metadata caching
 
-这些规则应该作为开发 RustFS 项目时的指导原则，确保代码质量、性能和可维护性。
+These rules should serve as guiding principles when developing the RustFS project, ensuring code quality, performance, and maintainability.
 
-### 4. 代码操作
- - 每次开始前先查看.cursorrules文件，确保你了解项目规范
- - 每次开始一个变更或者需求的开发，先 git checkout 到 main 分支，然后 git pull 拉取最新代码
- - 每次确定要开发的功能或者做的变更，先创建一个分支，然后 git checkout 到这个分支
- - 每次变更前，请切记仔细阅读现有代码，确保你了解代码的结构和实现，不要破坏已有的逻辑实现，不要引入新的问题
- - 每次的变更确保提供足够的测试用例，确保代码的正确性
- - 测试用例里的数字和常量不要随意修改，请谨慎分析它的含义，确保测试用例的正确性
- - 每次编写或者修改测试的时候，请检查已有的测试用例，检查它是否科学的命名和谨慎的逻辑测试，如果不符合，请修改测试用例，确保测试用例的科学性和严谨性
- - 每次开发完成后，先 git add . 然后 git commit -m "feat: 功能描述" 或者 "fix: 问题描述"，确保符合[代码提交规范](https://www.conventionalcommits.org/en/v1.0.0/)
- - 每次开发完成后，先 git push 到远程仓库
- - 每次改动完成，先总结变更内容，不要创建总结文件，提供一个简短的变更描述，确保符合[代码提交规范](https://www.conventionalcommits.org/en/v1.0.0/)
- - 在对话里提供 PR 时需要的变更描述，确保符合[代码提交规范](https://www.conventionalcommits.org/en/v1.0.0/)
+### 4. Code Operations
+ - Always check the .cursorrules file before starting to ensure you understand the project guidelines
+ - Before starting any change or requirement development, first git checkout to main branch, then git pull to get the latest code
+ - For each feature or change to be developed, first create a branch, then git checkout to that branch
+ - Use English for code comments, do not use Chinese
+ - Before each change, carefully read the existing code to ensure you understand the code structure and implementation, do not break existing logic implementation, do not introduce new issues
+ - Ensure each change provides sufficient test cases to guarantee code correctness
+ - Do not arbitrarily modify numbers and constants in test cases, carefully analyze their meaning to ensure test case correctness
+ - When writing or modifying tests, check existing test cases to ensure they have scientific naming and rigorous logic testing, if not compliant, modify test cases to ensure scientific and rigorous testing
+ - After each development completion, first git add . then git commit -m "feat: feature description" or "fix: issue description", ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+ - After each development completion, first git push to remote repository
+ - After each change completion, summarize the changes, do not create summary files, provide a brief change description, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+ - Provide change descriptions needed for PR in the conversation, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
