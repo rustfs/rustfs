@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        // 测试错误消息的显示
+        // Test error message display
         let custom_error = Error::custom("test message");
         assert_eq!(custom_error.to_string(), "Custom error: test message");
 
@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn test_error_debug() {
-        // 测试错误的Debug实现
+        // Test Debug trait implementation
         let custom_error = Error::custom("debug test");
         let debug_str = format!("{:?}", custom_error);
         assert!(debug_str.contains("Custom"));
@@ -90,31 +90,31 @@ mod tests {
 
     #[test]
     fn test_custom_error_creation() {
-        // 测试自定义错误的创建
+        // Test custom error creation
         let error = Error::custom("test custom error");
         match error {
             Error::Custom(msg) => assert_eq!(msg, "test custom error"),
             _ => panic!("Expected Custom error variant"),
         }
 
-        // 测试空字符串
+        // Test empty string
         let empty_error = Error::custom("");
         match empty_error {
             Error::Custom(msg) => assert_eq!(msg, ""),
             _ => panic!("Expected Custom error variant"),
         }
 
-        // 测试特殊字符
-        let special_error = Error::custom("测试中文 & special chars: !@#$%");
+        // Test special characters
+        let special_error = Error::custom("Test Chinese 中文 & special chars: !@#$%");
         match special_error {
-            Error::Custom(msg) => assert_eq!(msg, "测试中文 & special chars: !@#$%"),
+            Error::Custom(msg) => assert_eq!(msg, "Test Chinese 中文 & special chars: !@#$%"),
             _ => panic!("Expected Custom error variant"),
         }
     }
 
     #[test]
     fn test_io_error_conversion() {
-        // 测试IO错误的转换
+        // Test IO error conversion
         let io_error = io::Error::new(io::ErrorKind::NotFound, "file not found");
         let converted_error: Error = io_error.into();
 
@@ -126,7 +126,7 @@ mod tests {
             _ => panic!("Expected Io error variant"),
         }
 
-        // 测试不同类型的IO错误
+        // Test different types of IO errors
         let permission_error = io::Error::new(io::ErrorKind::PermissionDenied, "access denied");
         let converted: Error = permission_error.into();
         assert!(matches!(converted, Error::Io(_)));
@@ -134,14 +134,14 @@ mod tests {
 
     #[test]
     fn test_serde_error_conversion() {
-        // 测试序列化错误的转换
+        // Test serialization error conversion
         let invalid_json = r#"{"invalid": json}"#;
         let serde_error = serde_json::from_str::<serde_json::Value>(invalid_json).unwrap_err();
         let converted_error: Error = serde_error.into();
 
         match converted_error {
             Error::Serde(_) => {
-                // 验证错误类型正确
+                // Verify error type is correct
                 assert!(converted_error.to_string().contains("Serialization error"));
             }
             _ => panic!("Expected Serde error variant"),
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_config_error_conversion() {
-        // 测试配置错误的转换
+        // Test configuration error conversion
         let config_error = ConfigError::Message("invalid configuration".to_string());
         let converted_error: Error = config_error.into();
 
@@ -164,11 +164,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_channel_send_error_conversion() {
-        // 测试通道发送错误的转换
+        // Test channel send error conversion
         let (tx, rx) = mpsc::channel::<crate::event::Event>(1);
-        drop(rx); // 关闭接收端
+        drop(rx); // Close receiver
 
-        // 创建一个测试事件
+        // Create a test event
         use crate::event::{Name, Metadata, Source, Bucket, Object, Identity};
         use std::collections::HashMap;
 
