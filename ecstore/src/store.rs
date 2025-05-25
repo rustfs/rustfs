@@ -16,6 +16,7 @@ use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
 use crate::heal::heal_commands::{HealOpts, HealScanMode, HEAL_ITEM_METADATA};
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
+use crate::io::FileReader;
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -52,7 +53,10 @@ use lazy_static::lazy_static;
 use madmin::heal_commands::HealResultItem;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
+use tokio::io::AsyncReadExt;
 use std::cmp::Ordering;
+use std::io::Cursor;
+use std::ops::DerefMut;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
@@ -1192,13 +1196,6 @@ impl ObjectIO for ECStore {
 
         let object = utils::path::encode_dir_object(object);
         
-        // Check if decryption is needed
-        let customer_key = if let Some(sse_opts) = crate::encrypt::ObjectEncryption::detect_encryption_mode(&h)? {
-            sse_opts.customer_key
-        } else {
-            None
-        };
-
         let mut reader: GetObjectReader;
         
         if self.single_pool() {
@@ -1215,26 +1212,6 @@ impl ObjectIO for ECStore {
                 .await?;
         }
 
-        // Check if the object needs to be decrypted
-        if reader.is_encrypted || crate::encrypt::ObjectEncryption::needs_decryption(&reader.info) {
-            // Get object metadata
-            let metadata = reader.info.user_defined.as_ref()
-                .ok_or_else(|| Error::msg("Missing encryption metadata"))?;
-                
-            // Handle decryption logic
-            let encrypted_data = reader.get_object_data().await?;
-            
-            // Decrypt data
-            let decrypted_data = crate::encrypt::ObjectEncryption::decrypt_object_data(
-                &encrypted_data,
-                metadata,
-                customer_key
-            ).await?;
-            
-            // update the reader with decrypted data
-            reader.set_decrypted_data(decrypted_data);
-        }
-
         Ok(reader)
     }
     
@@ -1244,58 +1221,21 @@ impl ObjectIO for ECStore {
 
         let object = utils::path::encode_dir_object(object);
         
-        // Check if the object needs to be encrypted
-        if let Some(sse_opts) = crate::encrypt::ObjectEncryption::detect_encryption_mode(&data.headers)? {
-            // Get the encryption metadata
-            let object_data = data.get_data().await?;
-            
-            // Encrypt the data
-            let (encrypted_data, crypto_metadata) = crate::encrypt::ObjectEncryption::encrypt_object_data(
-                &object_data,
-                &sse_opts
-            ).await?;
-            
-            // Update the headers with encryption metadata
-            let mut opts = opts.clone();
-            crate::encrypt::ObjectEncryption::add_encryption_metadata(&mut opts, crypto_metadata);
-            
-            // Create a new put object reader with the encrypted data.
-            let mut encrypted_reader = data.clone_with_data(encrypted_data);
-            
-            // Put the encrypted object
-            if self.single_pool() {
-                return self.pools[0].put_object(bucket, object.as_str(), &mut encrypted_reader, &opts).await;
-            }
-
-            let idx = self.get_pool_idx(bucket, &object, data.content_length as i64).await?;
-
-            if opts.data_movement && idx == opts.src_pool_idx {
-                return Err(Error::new(StorageError::DataMovementOverwriteErr(
-                    bucket.to_owned(),
-                    object.to_owned(),
-                    opts.version_id.clone().unwrap_or_default(),
-                )));
-            }
-
-            return self.pools[idx].put_object(bucket, &object, &mut encrypted_reader, &opts).await;
-        } else {
-            // No encryption needed
-            if self.single_pool() {
-                return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
-            }
-
-            let idx = self.get_pool_idx(bucket, &object, data.content_length as i64).await?;
-
-            if opts.data_movement && idx == opts.src_pool_idx {
-                return Err(Error::new(StorageError::DataMovementOverwriteErr(
-                    bucket.to_owned(),
-                    object.to_owned(),
-                    opts.version_id.clone().unwrap_or_default(),
-                )));
-            }
-
-            return self.pools[idx].put_object(bucket, &object, data, opts).await;
+        if self.single_pool() {
+            return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
+
+        let idx = self.get_pool_idx(bucket, &object, data.content_length as i64).await?;
+
+        if opts.data_movement && idx == opts.src_pool_idx {
+            return Err(Error::new(StorageError::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                opts.version_id.clone().unwrap_or_default(),
+            )));
+        }
+
+        return self.pools[idx].put_object(bucket, &object, data, opts).await;
     }
 }
 

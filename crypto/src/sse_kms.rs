@@ -3,18 +3,17 @@
 
 use crate::{
     Error,
-    metadata::EncryptionInfo,
     sse::{SSEOptions, Encryptable, DefaultKMSConfig, get_default_kms_config},
     rusty_vault_client::{self, Client, ClientError},
 };
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit},
+    aead::KeyInit,
     Aes256Gcm, Key, Nonce
 };
 use rand::RngCore;
-use std::sync::{Arc, Mutex, RwLock, Once};
+use std::sync::{Arc, RwLock, Once};
 use serde_json::{json, Map, Value};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 // Lazily initialized KMS client
 static INIT_KMS_CLIENT: Once = Once::new();

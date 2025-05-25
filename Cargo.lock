@@ -3090,6 +3090,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "backon",
+ "base64 0.22.1",
  "base64-simd",
  "blake2",
  "byteorder",
@@ -3121,6 +3122,7 @@ dependencies = [
  "reed-solomon-erasure",
  "regex",
  "reqwest",
+ "ring",
  "rmp",
  "rmp-serde",
  "rustfs-config",

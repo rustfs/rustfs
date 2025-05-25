@@ -16,6 +16,7 @@ async-trait.workspace = true
 backon.workspace = true
 blake2 = { workspace = true }
 bytes.workspace = true
+base64 = "0.22.1"
 common.workspace = true
 policy.workspace = true
 chrono.workspace = true
@@ -68,6 +69,7 @@ md-5.workspace = true
 madmin.workspace = true
 workers.workspace = true
 reqwest = { workspace = true }
+ring = "0.17.14"
 urlencoding = "2.1.3"
 smallvec = { workspace = true }
 shadow-rs.workspace = true

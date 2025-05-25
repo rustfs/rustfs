@@ -4,6 +4,7 @@
 use crate::store_api::{ObjectInfo, ObjectOptions};
 use common::error::{Error, Result};
 use http::HeaderMap;
+use md5::Digest;
 use ring::aead::{Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, CHACHA20_POLY1305};
 use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -11,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 // 加密算法常量
 pub const ENC_AES_256_GCM: &str = "AES256";
@@ -90,7 +92,7 @@ impl ObjectEncryption {
                 .map_err(|_| Error::msg("无效的SSE-C密钥"))?;
             
             // 将Base64编码的密钥转换为字节
-            let key_bytes = base64::decode(key).map_err(|_| Error::msg("无效的SSE-C密钥格式"))?;
+            let key_bytes = BASE64_STANDARD.decode(key).map_err(|_| Error::msg("无效的SSE-C密钥格式"))?;
             
             // 验证MD5校验和
             if headers.contains_key(HEADER_SSE_C_KEY_MD5) {
@@ -157,8 +159,10 @@ impl ObjectEncryption {
 
     /// 计算MD5摘要并返回Base64编码的字符串
     fn compute_md5(data: &[u8]) -> String {
-        let digest = md5::compute(data);
-        base64::encode(digest.as_ref())
+        let mut hasher = md5::Md5::new();
+        hasher.update(data);
+        let digest = hasher.finalize();
+        BASE64_STANDARD.encode::<&[u8]>(digest.as_slice())
     }
 
     /// 检查对象是否需要解密
@@ -206,7 +210,7 @@ impl ObjectEncryption {
                     .map_err(|_| Error::msg("数据加密失败"))?;
                 
                 // 设置加密元数据
-                metadata.insert(META_CRYPTO_IV.to_string(), base64::encode(&iv));
+                metadata.insert(META_CRYPTO_IV.to_string(), BASE64_STANDARD.encode(&iv));
                 metadata.insert(META_CRYPTO_ALGORITHM.to_string(), ENC_CHACHA20_POLY1305.to_string());
                 metadata.insert(META_UNENCRYPTED_CONTENT_LENGTH.to_string(), data.len().to_string());
                 metadata.insert(META_OBJECT_ENCRYPTION.to_string(), "SSE-C".to_string());
@@ -242,8 +246,8 @@ impl ObjectEncryption {
                 // 在实际实现中，这里应该调用密钥管理服务
                 // 这里简化处理，直接将数据密钥放入元数据
                 
-                metadata.insert(META_CRYPTO_IV.to_string(), base64::encode(&iv));
-                metadata.insert(META_CRYPTO_KEY.to_string(), base64::encode(&data_key));
+                metadata.insert(META_CRYPTO_IV.to_string(), BASE64_STANDARD.encode(&iv));
+                metadata.insert(META_CRYPTO_KEY.to_string(), BASE64_STANDARD.encode(&data_key));
                 metadata.insert(META_CRYPTO_ALGORITHM.to_string(), ENC_AES_256_GCM.to_string());
                 metadata.insert(META_UNENCRYPTED_CONTENT_LENGTH.to_string(), data.len().to_string());
                 metadata.insert(META_OBJECT_ENCRYPTION.to_string(), "SSE-S3".to_string());
@@ -283,8 +287,8 @@ impl ObjectEncryption {
                 // 在实际实现中，这里应该调用KMS加密数据密钥
                 // 这里简化处理，直接将数据密钥放入元数据
                 
-                metadata.insert(META_CRYPTO_IV.to_string(), base64::encode(&iv));
-                metadata.insert(META_CRYPTO_KEY.to_string(), base64::encode(&data_key));
+                metadata.insert(META_CRYPTO_IV.to_string(), BASE64_STANDARD.encode(&iv));
+                metadata.insert(META_CRYPTO_KEY.to_string(), BASE64_STANDARD.encode(&data_key));
                 metadata.insert(META_CRYPTO_KEY_ID.to_string(), key_id.clone());
                 metadata.insert(META_CRYPTO_ALGORITHM.to_string(), ENC_AES_256_GCM.to_string());
                 metadata.insert(META_UNENCRYPTED_CONTENT_LENGTH.to_string(), data.len().to_string());
@@ -308,7 +312,7 @@ impl ObjectEncryption {
         // 获取IV
         let iv_base64 = metadata.get(META_CRYPTO_IV)
             .ok_or_else(|| Error::msg("缺少IV元数据"))?;
-        let iv = base64::decode(iv_base64).map_err(|_| Error::msg("无效的IV格式"))?;
+        let iv = BASE64_STANDARD.decode(iv_base64).map_err(|_| Error::msg("无效的IV格式"))?;
         
         match encryption_mode.as_str() {
             "SSE-C" => {
@@ -333,7 +337,7 @@ impl ObjectEncryption {
                 // 获取加密的数据密钥
                 let key_base64 = metadata.get(META_CRYPTO_KEY)
                     .ok_or_else(|| Error::msg("缺少数据密钥元数据"))?;
-                let data_key = base64::decode(key_base64).map_err(|_| Error::msg("无效的数据密钥格式"))?;
+                let data_key = BASE64_STANDARD.decode(key_base64).map_err(|_| Error::msg("无效的数据密钥格式"))?;
                 
                 // 使用数据密钥和ChaCha20-Poly1305解密
                 let opening_key = ring::aead::UnboundKey::new(&CHACHA20_POLY1305, &data_key)
@@ -352,7 +356,7 @@ impl ObjectEncryption {
                 // 获取加密的数据密钥
                 let key_base64 = metadata.get(META_CRYPTO_KEY)
                     .ok_or_else(|| Error::msg("缺少数据密钥元数据"))?;
-                let data_key = base64::decode(key_base64).map_err(|_| Error::msg("无效的数据密钥格式"))?;
+                let data_key = BASE64_STANDARD.decode(key_base64).map_err(|_| Error::msg("无效的数据密钥格式"))?;
                 
                 // 使用数据密钥和ChaCha20-Poly1305解密
                 let opening_key = ring::aead::UnboundKey::new(&CHACHA20_POLY1305, &data_key)
