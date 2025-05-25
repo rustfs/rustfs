@@ -5661,3 +5661,600 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
 
     format!("{:x}-{}", hasher.finalize(), parts.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::error::DiskError;
+    use crate::store_api::{CompletePart, FileInfo, ErasureInfo};
+    use common::error::Error;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn test_check_part_constants() {
+        // Test that check part constants have expected values
+        assert_eq!(CHECK_PART_UNKNOWN, 0);
+        assert_eq!(CHECK_PART_SUCCESS, 1);
+        assert_eq!(CHECK_PART_DISK_NOT_FOUND, 2);
+        assert_eq!(CHECK_PART_VOLUME_NOT_FOUND, 3);
+        assert_eq!(CHECK_PART_FILE_NOT_FOUND, 4);
+        assert_eq!(CHECK_PART_FILE_CORRUPT, 5);
+    }
+
+    #[test]
+    fn test_is_min_allowed_part_size() {
+        // Test minimum part size validation
+        assert!(!is_min_allowed_part_size(0));
+        assert!(!is_min_allowed_part_size(1024)); // 1KB
+        assert!(!is_min_allowed_part_size(1024 * 1024)); // 1MB
+        assert!(is_min_allowed_part_size(5 * 1024 * 1024)); // 5MB
+        assert!(is_min_allowed_part_size(10 * 1024 * 1024)); // 10MB
+        assert!(is_min_allowed_part_size(100 * 1024 * 1024)); // 100MB
+    }
+
+    #[test]
+    fn test_get_complete_multipart_md5() {
+        // Test MD5 calculation for multipart upload
+        let parts = vec![
+            CompletePart {
+                part_num: 1,
+                e_tag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            },
+            CompletePart {
+                part_num: 2,
+                e_tag: Some("098f6bcd4621d373cade4e832627b4f6".to_string()),
+            },
+        ];
+
+        let result = get_complete_multipart_md5(&parts);
+        assert!(result.ends_with("-2")); // Should end with part count
+        assert!(result.len() > 10); // Should have reasonable length
+
+        // Test with empty parts
+        let empty_parts = vec![];
+        let empty_result = get_complete_multipart_md5(&empty_parts);
+        assert!(empty_result.ends_with("-0"));
+
+        // Test with single part
+        let single_part = vec![CompletePart {
+            part_num: 1,
+            e_tag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+        }];
+        let single_result = get_complete_multipart_md5(&single_part);
+        assert!(single_result.ends_with("-1"));
+    }
+
+    #[test]
+    fn test_get_upload_id_dir() {
+        // Test upload ID directory path generation
+        // The function returns a SHA256 hash, not the original bucket/object names
+        let result = SetDisks::get_upload_id_dir("test-bucket", "test-object", "upload123");
+        assert!(!result.is_empty());
+        assert!(result.len() > 10); // Should be a reasonable hash length
+
+        // Test with base64 encoded upload ID
+        let result2 = SetDisks::get_upload_id_dir("bucket", "object", "dXBsb2FkLWlk"); // base64 for "upload-id"
+        assert!(!result2.is_empty());
+        assert!(result2.len() > 10);
+    }
+
+    #[test]
+    fn test_get_multipart_sha_dir() {
+        // Test multipart SHA directory path generation
+        // The function returns a SHA256 hash of the bucket/object path
+        let result = SetDisks::get_multipart_sha_dir("test-bucket", "test-object");
+        assert!(!result.is_empty());
+        assert_eq!(result.len(), 64); // SHA256 hex string length
+
+        // Test with empty strings
+        let result2 = SetDisks::get_multipart_sha_dir("", "");
+        assert!(!result2.is_empty());
+        assert_eq!(result2.len(), 64); // SHA256 hex string length
+
+        // Test that different inputs produce different hashes
+        let result3 = SetDisks::get_multipart_sha_dir("bucket1", "object1");
+        let result4 = SetDisks::get_multipart_sha_dir("bucket2", "object2");
+        assert_ne!(result3, result4);
+    }
+
+    #[test]
+    fn test_common_parity() {
+        // Test common parity calculation
+        let parities = vec![2, 2, 2, 2];
+        assert_eq!(SetDisks::common_parity(&parities, 1), 2);
+
+        let mixed_parities = vec![1, 2, 1, 1];
+        assert_eq!(SetDisks::common_parity(&mixed_parities, 1), 1);
+
+        let empty_parities = vec![];
+        assert_eq!(SetDisks::common_parity(&empty_parities, 3), -1); // Returns -1 when no valid parity found
+
+        let single_parity = vec![4];
+        assert_eq!(SetDisks::common_parity(&single_parity, 1), 4);
+
+        // Test with -1 values (ignored)
+        let parities_with_invalid = vec![-1, 2, 2, -1];
+        assert_eq!(SetDisks::common_parity(&parities_with_invalid, 1), 2);
+    }
+
+    #[test]
+    fn test_common_time() {
+        // Test common time calculation
+        let now = OffsetDateTime::now_utc();
+        let later = now + Duration::from_secs(60);
+
+        let times = vec![Some(now), Some(now), Some(later)];
+        assert_eq!(SetDisks::common_time(&times, 2), Some(now));
+
+        let times2 = vec![Some(now), Some(later), Some(later)];
+        assert_eq!(SetDisks::common_time(&times2, 2), Some(later));
+
+        let times_with_none = vec![Some(now), None, Some(now)];
+        assert_eq!(SetDisks::common_time(&times_with_none, 2), Some(now));
+
+        let empty_times = vec![];
+        assert_eq!(SetDisks::common_time(&empty_times, 1), None);
+    }
+
+    #[test]
+    fn test_common_time_and_occurrence() {
+        // Test common time and occurrence counting
+        let now = OffsetDateTime::now_utc();
+        let later = now + Duration::from_secs(60);
+
+        let times = vec![Some(now), Some(now), Some(later)];
+        let (common_time, count) = SetDisks::common_time_and_occurrence(&times);
+        assert_eq!(common_time, Some(now));
+        assert_eq!(count, 2);
+
+        let times2 = vec![Some(later), Some(later), Some(later)];
+        let (common_time2, count2) = SetDisks::common_time_and_occurrence(&times2);
+        assert_eq!(common_time2, Some(later));
+        assert_eq!(count2, 3);
+
+        let times_with_none = vec![None, None, Some(now)];
+        let (common_time3, count3) = SetDisks::common_time_and_occurrence(&times_with_none);
+        assert_eq!(common_time3, Some(now)); // Returns the only valid time
+        assert_eq!(count3, 1); // Count of the valid time
+
+        // Test with all None
+        let all_none = vec![None, None, None];
+        let (common_time4, count4) = SetDisks::common_time_and_occurrence(&all_none);
+        assert_eq!(common_time4, None);
+        assert_eq!(count4, 0);
+    }
+
+    #[test]
+    fn test_common_etag() {
+        // Test common etag calculation
+        let etag1 = "etag1".to_string();
+        let etag2 = "etag2".to_string();
+
+        let etags = vec![Some(etag1.clone()), Some(etag1.clone()), Some(etag2.clone())];
+        assert_eq!(SetDisks::common_etag(&etags, 2), Some(etag1.clone()));
+
+        let etags2 = vec![Some(etag2.clone()), Some(etag2.clone()), Some(etag2.clone())];
+        assert_eq!(SetDisks::common_etag(&etags2, 2), Some(etag2.clone()));
+
+        let etags_with_none = vec![Some(etag1.clone()), None, Some(etag1.clone())];
+        assert_eq!(SetDisks::common_etag(&etags_with_none, 2), Some(etag1));
+
+        let empty_etags = vec![];
+        assert_eq!(SetDisks::common_etag(&empty_etags, 1), None);
+    }
+
+    #[test]
+    fn test_common_etags() {
+        // Test common etags with occurrence counting
+        let etag1 = "etag1".to_string();
+        let etag2 = "etag2".to_string();
+
+        let etags = vec![Some(etag1.clone()), Some(etag1.clone()), Some(etag2.clone())];
+        let (common_etag, count) = SetDisks::common_etags(&etags);
+        assert_eq!(common_etag, Some(etag1.clone()));
+        assert_eq!(count, 2);
+
+        let etags2 = vec![Some(etag2.clone()), Some(etag2.clone()), Some(etag2.clone())];
+        let (common_etag2, count2) = SetDisks::common_etags(&etags2);
+        assert_eq!(common_etag2, Some(etag2));
+        assert_eq!(count2, 3);
+
+        let etags_with_none = vec![None, None, Some(etag1.clone())];
+        let (common_etag3, count3) = SetDisks::common_etags(&etags_with_none);
+        assert_eq!(common_etag3, Some(etag1)); // Returns the only valid etag
+        assert_eq!(count3, 1); // Count of the valid etag
+
+        // Test with all None
+        let all_none = vec![None, None, None];
+        let (common_etag4, count4) = SetDisks::common_etags(&all_none);
+        assert_eq!(common_etag4, None);
+        assert_eq!(count4, 0);
+    }
+
+    #[test]
+    fn test_list_object_modtimes() {
+        // Test extracting modification times from file info
+        let now = OffsetDateTime::now_utc();
+        let later = now + Duration::from_secs(60);
+
+        let file_info1 = FileInfo {
+            mod_time: Some(now),
+            ..Default::default()
+        };
+        let file_info2 = FileInfo {
+            mod_time: Some(later),
+            ..Default::default()
+        };
+        let file_info3 = FileInfo {
+            mod_time: None,
+            ..Default::default()
+        };
+
+        let parts_metadata = vec![file_info1, file_info2, file_info3];
+        let errs = vec![None, None, None];
+
+        let result = SetDisks::list_object_modtimes(&parts_metadata, &errs);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some(now));
+        assert_eq!(result[1], Some(later));
+        assert_eq!(result[2], None);
+
+        // Test with errors
+        let errs_with_error = vec![None, Some(Error::new(DiskError::FileNotFound)), None];
+        let result2 = SetDisks::list_object_modtimes(&parts_metadata, &errs_with_error);
+        assert_eq!(result2.len(), 3);
+        assert_eq!(result2[0], Some(now));
+        assert_eq!(result2[1], None); // Should be None due to error
+        assert_eq!(result2[2], None);
+    }
+
+    #[test]
+    fn test_list_object_etags() {
+        // Test extracting etags from file info metadata
+        // The function looks for "etag" in metadata HashMap
+        let mut metadata1 = std::collections::HashMap::new();
+        metadata1.insert("etag".to_string(), "etag1".to_string());
+
+        let mut metadata2 = std::collections::HashMap::new();
+        metadata2.insert("etag".to_string(), "etag2".to_string());
+
+        let file_info1 = FileInfo {
+            name: "file1".to_string(),
+            metadata: Some(metadata1),
+            ..Default::default()
+        };
+        let file_info2 = FileInfo {
+            name: "file2".to_string(),
+            metadata: Some(metadata2),
+            ..Default::default()
+        };
+        let file_info3 = FileInfo {
+            name: "file3".to_string(),
+            metadata: None,
+            ..Default::default()
+        };
+
+        let parts_metadata = vec![file_info1, file_info2, file_info3];
+        let errs = vec![None, None, None];
+
+        let result = SetDisks::list_object_etags(&parts_metadata, &errs);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], Some("etag1".to_string()));
+        assert_eq!(result[1], Some("etag2".to_string()));
+        assert_eq!(result[2], None); // No metadata should result in None
+
+        // Test with errors
+        let errs_with_error = vec![None, Some(Error::new(DiskError::FileNotFound)), None];
+        let result2 = SetDisks::list_object_etags(&parts_metadata, &errs_with_error);
+        assert_eq!(result2.len(), 3);
+        assert_eq!(result2[1], None); // Should be None due to error
+    }
+
+    #[test]
+    fn test_list_object_parities() {
+        // Test extracting parity counts from file info
+        // The function has complex logic for determining parity based on file state
+        let file_info1 = FileInfo {
+            erasure: ErasureInfo {
+                data_blocks: 4,
+                parity_blocks: 2,
+                index: 1, // Must be > 0 for is_valid() to return true
+                distribution: vec![1, 2, 3, 4, 5, 6], // Must match data_blocks + parity_blocks
+                ..Default::default()
+            },
+            size: 100, // Non-zero size
+            deleted: false,
+            ..Default::default()
+        };
+        let file_info2 = FileInfo {
+            erasure: ErasureInfo {
+                data_blocks: 6,
+                parity_blocks: 3,
+                index: 2, // Must be > 0 for is_valid() to return true
+                distribution: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], // Must match data_blocks + parity_blocks
+                ..Default::default()
+            },
+            size: 200, // Non-zero size
+            deleted: false,
+            ..Default::default()
+        };
+        let file_info3 = FileInfo {
+            erasure: ErasureInfo {
+                data_blocks: 2,
+                parity_blocks: 1,
+                index: 1, // Must be > 0 for is_valid() to return true
+                distribution: vec![1, 2, 3], // Must match data_blocks + parity_blocks
+                ..Default::default()
+            },
+            size: 0, // Zero size - function returns half of total shards
+            deleted: false,
+            ..Default::default()
+        };
+
+        let parts_metadata = vec![file_info1, file_info2, file_info3];
+        let errs = vec![None, None, None];
+
+        let result = SetDisks::list_object_parities(&parts_metadata, &errs);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], 2);
+        assert_eq!(result[1], 3);
+        assert_eq!(result[2], 1); // Half of 3 total shards = 1 (invalid metadata with size=0)
+
+        // Test with errors
+        let errs_with_error = vec![None, Some(Error::new(DiskError::FileNotFound)), None];
+        let result2 = SetDisks::list_object_parities(&parts_metadata, &errs_with_error);
+        assert_eq!(result2.len(), 3);
+        assert_eq!(result2[1], -1); // Should be -1 due to error
+    }
+
+        #[test]
+    fn test_conv_part_err_to_int() {
+        // Test error to integer conversion
+        assert_eq!(conv_part_err_to_int(&None), CHECK_PART_SUCCESS);
+        assert_eq!(conv_part_err_to_int(&Some(Error::new(DiskError::DiskNotFound))), CHECK_PART_DISK_NOT_FOUND);
+        assert_eq!(conv_part_err_to_int(&Some(Error::new(DiskError::VolumeNotFound))), CHECK_PART_VOLUME_NOT_FOUND);
+        assert_eq!(conv_part_err_to_int(&Some(Error::new(DiskError::FileNotFound))), CHECK_PART_FILE_NOT_FOUND);
+        assert_eq!(conv_part_err_to_int(&Some(Error::new(DiskError::FileCorrupt))), CHECK_PART_FILE_CORRUPT);
+
+        // Test unknown error - function returns CHECK_PART_SUCCESS for non-DiskError
+        assert_eq!(conv_part_err_to_int(&Some(Error::msg("unknown error"))), CHECK_PART_SUCCESS);
+    }
+
+    #[test]
+    fn test_has_part_err() {
+        // Test checking for part errors
+        assert!(!has_part_err(&[CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]));
+        assert!(has_part_err(&[CHECK_PART_SUCCESS, CHECK_PART_FILE_NOT_FOUND]));
+        assert!(has_part_err(&[CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS]));
+        assert!(has_part_err(&[CHECK_PART_DISK_NOT_FOUND]));
+
+        // Empty slice should return false
+        assert!(!has_part_err(&[]));
+    }
+
+    #[test]
+    fn test_should_heal_object_on_disk() {
+        // Test healing decision logic
+        let latest_meta = FileInfo {
+            volume: "test-volume".to_string(),
+            name: "test-object".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            deleted: false,
+            ..Default::default()
+        };
+
+        // Test with file not found error
+        let (should_heal, _) = should_heal_object_on_disk(
+            &Some(Error::new(DiskError::FileNotFound)),
+            &[CHECK_PART_SUCCESS],
+            &latest_meta,
+            &latest_meta,
+        );
+        assert!(should_heal);
+
+        // Test with file corrupt error
+        let (should_heal2, _) = should_heal_object_on_disk(
+            &Some(Error::new(DiskError::FileCorrupt)),
+            &[CHECK_PART_SUCCESS],
+            &latest_meta,
+            &latest_meta,
+        );
+        assert!(should_heal2);
+
+        // Test with no error but part errors
+        let (should_heal3, _) = should_heal_object_on_disk(
+            &None,
+            &[CHECK_PART_FILE_NOT_FOUND],
+            &latest_meta,
+            &latest_meta,
+        );
+        assert!(should_heal3);
+
+        // Test with no error and no part errors
+        let (should_heal4, _) = should_heal_object_on_disk(
+            &None,
+            &[CHECK_PART_SUCCESS],
+            &latest_meta,
+            &latest_meta,
+        );
+        assert!(!should_heal4);
+
+        // Test with outdated metadata
+        let mut old_meta = latest_meta.clone();
+        old_meta.name = "different-name".to_string();
+        let (should_heal5, _) = should_heal_object_on_disk(
+            &None,
+            &[CHECK_PART_SUCCESS],
+            &old_meta,
+            &latest_meta,
+        );
+        assert!(should_heal5);
+    }
+
+    #[test]
+    fn test_dang_ling_meta_errs_count() {
+        // Test counting dangling metadata errors
+        let errs = vec![
+            None,
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileCorrupt)),
+            None,
+        ];
+
+        let (not_found_count, corrupt_count) = dang_ling_meta_errs_count(&errs);
+        assert_eq!(not_found_count, 1);
+        assert_eq!(corrupt_count, 1);
+
+        // Test with all success
+        let success_errs = vec![None, None, None];
+        let (not_found2, corrupt2) = dang_ling_meta_errs_count(&success_errs);
+        assert_eq!(not_found2, 0);
+        assert_eq!(corrupt2, 0);
+    }
+
+    #[test]
+    fn test_dang_ling_part_errs_count() {
+        // Test counting dangling part errors
+        let results = vec![
+            CHECK_PART_SUCCESS,
+            CHECK_PART_FILE_NOT_FOUND,
+            CHECK_PART_FILE_CORRUPT,
+            CHECK_PART_SUCCESS,
+        ];
+
+        let (not_found_count, corrupt_count) = dang_ling_part_errs_count(&results);
+        assert_eq!(not_found_count, 1);
+        assert_eq!(corrupt_count, 1);
+
+        // Test with all success
+        let success_results = vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS];
+        let (not_found2, corrupt2) = dang_ling_part_errs_count(&success_results);
+        assert_eq!(not_found2, 0);
+        assert_eq!(corrupt2, 0);
+    }
+
+    #[test]
+    fn test_is_object_dir_dang_ling() {
+        // Test object directory dangling detection
+        let errs = vec![
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            None,
+        ];
+        assert!(is_object_dir_dang_ling(&errs));
+
+        let errs2 = vec![None, None, None];
+        assert!(!is_object_dir_dang_ling(&errs2));
+
+        let errs3 = vec![
+            Some(Error::new(DiskError::FileCorrupt)),
+            Some(Error::new(DiskError::FileNotFound)),
+        ];
+        assert!(!is_object_dir_dang_ling(&errs3)); // Mixed errors, not all not found
+    }
+
+    #[test]
+    fn test_join_errs() {
+        // Test error joining
+        let errs = vec![
+            None,
+            Some(Error::msg("error1")),
+            Some(Error::msg("error2")),
+            None,
+        ];
+
+        let result = join_errs(&errs);
+        assert!(result.contains("error1"));
+        assert!(result.contains("error2"));
+        assert!(result.contains("<nil>")); // Function includes "<nil>" for None errors
+
+        // Test with no errors
+        let no_errs = vec![None, None];
+        let result2 = join_errs(&no_errs);
+        assert!(!result2.is_empty()); // Contains "<nil>, <nil>"
+        assert!(result2.contains("<nil>"));
+    }
+
+    #[test]
+    fn test_reduce_common_data_dir() {
+        // Test reducing common data directory
+        let data_dirs = vec![
+            Some(uuid::Uuid::new_v4()),
+            Some(uuid::Uuid::new_v4()),
+            Some(uuid::Uuid::new_v4()),
+        ];
+
+        // All different UUIDs, should return None
+        let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
+        assert!(result.is_none());
+
+        // Same UUIDs meeting quorum
+        let same_uuid = uuid::Uuid::new_v4();
+        let same_dirs = vec![Some(same_uuid), Some(same_uuid), None];
+        let result2 = SetDisks::reduce_common_data_dir(&same_dirs, 2);
+        assert_eq!(result2, Some(same_uuid));
+
+        // Not enough for quorum
+        let result3 = SetDisks::reduce_common_data_dir(&same_dirs, 3);
+        assert!(result3.is_none());
+    }
+
+    #[test]
+    fn test_eval_disks() {
+        // Test disk evaluation based on errors
+        // This test would need mock DiskStore objects, so we'll test the logic conceptually
+        let disks = vec![None, None, None]; // Mock empty disks
+        let errs = vec![
+            None,
+            Some(Error::new(DiskError::DiskNotFound)),
+            None,
+        ];
+
+        let result = SetDisks::eval_disks(&disks, &errs);
+        assert_eq!(result.len(), 3);
+        // The function should return disks where errors are None
+    }
+
+    #[test]
+    fn test_shuffle_parts_metadata() {
+        // Test metadata shuffling
+        let metadata = vec![
+            FileInfo { name: "file1".to_string(), ..Default::default() },
+            FileInfo { name: "file2".to_string(), ..Default::default() },
+            FileInfo { name: "file3".to_string(), ..Default::default() },
+        ];
+
+        // Distribution uses 1-based indexing
+        let distribution = vec![3, 1, 2]; // 1-based shuffle order
+        let result = SetDisks::shuffle_parts_metadata(&metadata, &distribution);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].name, "file2"); // distribution[1] = 1, so metadata[1] goes to index 0
+        assert_eq!(result[1].name, "file3"); // distribution[2] = 2, so metadata[2] goes to index 1
+        assert_eq!(result[2].name, "file1"); // distribution[0] = 3, so metadata[0] goes to index 2
+
+        // Test with empty distribution
+        let empty_distribution = vec![];
+        let result2 = SetDisks::shuffle_parts_metadata(&metadata, &empty_distribution);
+        assert_eq!(result2.len(), 3);
+        assert_eq!(result2[0].name, "file1"); // Should return original order
+    }
+
+    #[test]
+    fn test_shuffle_disks() {
+        // Test disk shuffling
+        let disks = vec![None, None, None]; // Mock disks
+        let distribution = vec![3, 1, 2]; // 1-based indexing
+
+        let result = SetDisks::shuffle_disks(&disks, &distribution);
+        assert_eq!(result.len(), 3);
+        // All disks are None, so result should be all None
+        assert!(result.iter().all(|d| d.is_none()));
+
+        // Test with empty distribution
+        let empty_distribution = vec![];
+        let result2 = SetDisks::shuffle_disks(&disks, &empty_distribution);
+        assert_eq!(result2.len(), 3);
+        assert!(result2.iter().all(|d| d.is_none()));
+    }
+}
