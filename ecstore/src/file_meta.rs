@@ -2290,14 +2290,12 @@ async fn test_read_xl_meta_no_data() {
         fm.add_version(fi).unwrap();
     }
 
-    let mut buff = fm.marshal_msg().unwrap();
-
-    buff.resize(buff.len() + 100, 0);
+    // Use marshal_msg to create properly formatted data with XL headers
+    let buff = fm.marshal_msg().unwrap();
 
     let filepath = "./test_xl.meta";
 
     let mut file = File::create(filepath).await.unwrap();
-    // 写入字符串
     file.write_all(&buff).await.unwrap();
 
     let mut f = File::open(filepath).await.unwrap();
