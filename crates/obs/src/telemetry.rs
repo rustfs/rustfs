@@ -21,6 +21,7 @@ use std::io::IsTerminal;
 use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
+use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 /// A guard object that manages the lifecycle of OpenTelemetry components.
@@ -103,6 +104,7 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
     let logger_level = config.logger_level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
+    let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);
 
     // Pre-create resource objects to avoid repeated construction
     let res = resource(config);
@@ -203,15 +205,23 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     // configuring tracing
     {
         // configure the formatting layer
-        let enable_color = std::io::stdout().is_terminal();
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_ansi(enable_color)
-            .with_thread_names(true)
-            .with_thread_ids(true)
-            .with_file(true)
-            .with_line_number(true)
-            .with_filter(build_env_filter(logger_level, None));
+        let fmt_layer = {
+            let enable_color = std::io::stdout().is_terminal();
+            let mut layer = tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_ansi(enable_color)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true);
+
+            // Only add full span events tracking in the development environment
+            if environment != ENVIRONMENT {
+                layer = layer.with_span_events(FmtSpan::FULL);
+            }
+
+            layer.with_filter(build_env_filter(logger_level, None))
+        };
 
         let filter = build_env_filter(logger_level, None);
         let otel_filter = build_env_filter(logger_level, None);
@@ -237,7 +247,7 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                 "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {},RUST_LOG env: {}",
                 endpoint,
                 logger_level,
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "未设置".to_string())
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
             );
         }
     }
