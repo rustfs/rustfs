@@ -15,8 +15,8 @@ pub const VERSION: &str = "0.0.1";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Default configuration use stdout
-/// Default value: true
-pub const USE_STDOUT: bool = true;
+/// Default value: false
+pub const USE_STDOUT: bool = false;
 
 /// Default configuration sample ratio
 /// Default value: 1.0

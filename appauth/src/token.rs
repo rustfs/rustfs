@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Token {
-    pub name: String, // 应用ID
-    pub expired: u64, // 到期时间 (UNIX时间戳)
+    pub name: String, // 应用 ID
+    pub expired: u64, // 到期时间 (UNIX 时间戳)
 }
 
-// 公钥生成Token
-// [token] Token对象
+// 公钥生成 Token
+// [token] Token 对象
 // [key] 公钥字符串
-// 返回base64处理的加密字符串
+// 返回 base64 处理的加密字符串
 pub fn gencode(token: &Token, key: &str) -> Result<String> {
     let data = serde_json::to_vec(token)?;
     let public_key = RsaPublicKey::from_public_key_pem(key)?;
@@ -23,10 +23,10 @@ pub fn gencode(token: &Token, key: &str) -> Result<String> {
     Ok(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encrypted_data))
 }
 
-// 私钥解析Token
-// [token] base64处理的加密字符串
+// 私钥解析 Token
+// [token] base64 处理的加密字符串
 // [key] 私钥字符串
-// 返回Token对象
+// 返回 Token 对象
 pub fn parse(token: &str, key: &str) -> Result<Token> {
     let encrypted_data = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(token.as_bytes())?;
     let private_key = RsaPrivateKey::from_pkcs8_pem(key)?;

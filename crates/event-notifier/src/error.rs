@@ -286,10 +286,10 @@ mod tests {
         use std::mem;
 
         let size = mem::size_of::<Error>();
-        // 错误类型应该相对紧凑，考虑到包含多种错误类型，96字节是合理的
+        // 错误类型应该相对紧凑，考虑到包含多种错误类型，96 字节是合理的
         assert!(size <= 128, "Error size should be reasonable, got {} bytes", size);
 
-        // 测试Option<Error>的大小
+        // 测试 Option<Error>的大小
         let option_size = mem::size_of::<Option<Error>>();
         assert!(option_size <= 136, "Option<Error> should be efficient, got {} bytes", option_size);
     }
@@ -321,7 +321,7 @@ mod tests {
             _ => panic!("Expected Custom error variant"),
         }
 
-        // 测试包含Unicode字符的消息
+        // 测试包含 Unicode 字符的消息
         let unicode_error = Error::custom("🚀 Unicode test 测试 🎉");
         match unicode_error {
             Error::Custom(msg) => assert!(msg.contains('🚀')),
@@ -405,11 +405,11 @@ mod tests {
             let display_str = error.to_string();
             let debug_str = format!("{:?}", error);
 
-            // Display和Debug都不应该为空
+            // Display 和 Debug 都不应该为空
             assert!(!display_str.is_empty());
             assert!(!debug_str.is_empty());
 
-            // Debug输出通常包含更多信息，但不是绝对的
+            // Debug 输出通常包含更多信息，但不是绝对的
             // 这里我们只验证两者都有内容即可
             assert!(debug_str.len() > 0);
             assert!(display_str.len() > 0);

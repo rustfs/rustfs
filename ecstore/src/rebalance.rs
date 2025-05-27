@@ -858,13 +858,13 @@ impl ECStore {
             let mut reader = rd.stream;
 
             for (i, part) in object_info.parts.iter().enumerate() {
-                // 每次从reader中读取一个part上传
+                // 每次从 reader 中读取一个 part 上传
 
                 let mut chunk = vec![0u8; part.size];
 
                 reader.read_exact(&mut chunk).await?;
 
-                // 每次从reader中读取一个part上传
+                // 每次从 reader 中读取一个 part 上传
                 let rd = Box::new(Cursor::new(chunk));
                 let mut data = PutObjReader::new(rd, part.size);
 

@@ -19,7 +19,8 @@ mkdir -p ./target/volume/test{0..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
+#    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
+    export RUST_LOG="rustfs=info,ecstore=info,s3s=info,iam=info,rustfs-obs=info"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -35,7 +36,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9002"
 # HTTPS 证书目录
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
-# 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考 其中`RUSTFS_OBS_CONFIG` 和下面变量二选一
+# 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考 其中 `RUSTFS_OBS_CONFIG` 和下面变量二选一
 export RUSTFS_OBS_CONFIG="./deploy/config/obs.example.toml"
 
 # 如下变量需要必须参数都有值才可以，以及会覆盖配置文件中的值

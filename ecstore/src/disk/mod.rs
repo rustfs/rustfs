@@ -237,7 +237,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, fi))]
     async fn rename_data(
         &self,
         src_volume: &str,

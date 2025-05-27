@@ -192,7 +192,7 @@ fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
     Ok(())
 }
 
-// load_format_erasure_all 读取所有foramt.json
+// load_format_erasure_all 读取所有 foramt.json
 pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) -> (Vec<Option<FormatV3>>, Vec<Option<Error>>) {
     let mut futures = Vec::with_capacity(disks.len());
     let mut datas = Vec::with_capacity(disks.len());

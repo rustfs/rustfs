@@ -199,7 +199,7 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
     }
 
     if let Some(parent) = dir_path.as_ref().parent() {
-        // 不支持递归，直接create_dir_all了
+        // 不支持递归，直接 create_dir_all 了
         if let Err(e) = utils::fs::make_dir_all(&parent).await {
             if os_is_exist(&e) {
                 return Ok(());
