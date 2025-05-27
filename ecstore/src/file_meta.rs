@@ -71,9 +71,9 @@ impl FileMeta {
         Ok(xl)
     }
 
-    // check_xl2_v1 读xl文件头，返回后续内容，版本信息
+    // check_xl2_v1 读 xl 文件头，返回后续内容，版本信息
     // checkXL2V1
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn check_xl2_v1(buf: &[u8]) -> Result<(&[u8], u16, u16)> {
         if buf.len() < 8 {
             return Err(Error::msg("xl file header not exists"));
@@ -92,11 +92,11 @@ impl FileMeta {
         Ok((&buf[8..], major, minor))
     }
 
-    // 固定u32
+    // 固定 u32
     pub fn read_bytes_header(buf: &[u8]) -> Result<(u32, &[u8])> {
         let (mut size_buf, _) = buf.split_at(5);
 
-        //  取meta数据，buf = crc + data
+        //  取 meta 数据，buf = crc + data
         let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
 
         Ok((bin_len, &buf[5..]))
@@ -110,7 +110,7 @@ impl FileMeta {
 
         let (mut size_buf, buf) = buf.split_at(5);
 
-        //  取meta数据，buf = crc + data
+        //  取 meta 数据，buf = crc + data
         let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
 
         let (meta, buf) = buf.split_at(bin_len as usize);
@@ -130,7 +130,7 @@ impl FileMeta {
             self.data.validate()?;
         }
 
-        // 解析meta
+        // 解析 meta
         if !meta.is_empty() {
             let (versions_len, _, meta_ver, meta) = Self::decode_xl_headers(meta)?;
 
@@ -168,8 +168,8 @@ impl FileMeta {
         Ok(i)
     }
 
-    // decode_xl_headers 解析 meta 头，返回 (versions数量，xl_header_version, xl_meta_version, 已读数据长度)
-    #[tracing::instrument]
+    // decode_xl_headers 解析 meta 头，返回 (versions 数量，xl_header_version, xl_meta_version, 已读数据长度)
+    #[tracing::instrument(level = "debug", skip_all)]
     fn decode_xl_headers(buf: &[u8]) -> Result<(usize, u8, u8, &[u8])> {
         let mut cur = Cursor::new(buf);
 
@@ -280,7 +280,7 @@ impl FileMeta {
             rmp::encode::write_bin(&mut wr, &ver.meta)?;
         }
 
-        // 更新bin长度
+        // 更新 bin 长度
         let data_len = wr.len() - offset;
         byteorder::BigEndian::write_u32(&mut wr[offset - 4..offset], data_len as u32);
 
@@ -368,7 +368,7 @@ impl FileMeta {
         Err(Error::new(DiskError::FileVersionNotFound))
     }
 
-    // shard_data_dir_count 查询 vid下data_dir的数量
+    // shard_data_dir_count 查询 vid 下 data_dir 的数量
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn shard_data_dir_count(&self, vid: &Option<Uuid>, data_dir: &Option<Uuid>) -> usize {
         self.versions
@@ -494,7 +494,7 @@ impl FileMeta {
         Err(Error::msg("add_version failed"))
     }
 
-    // delete_version 删除版本，返回data_dir
+    // delete_version 删除版本，返回 data_dir
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
@@ -710,7 +710,7 @@ impl FileMetaVersion {
         }
     }
 
-    // decode_data_dir_from_meta 从 meta中读取data_dir TODO: 直接从meta buf中只解析出data_dir, msg.skip
+    // decode_data_dir_from_meta 从 meta 中读取 data_dir TODO: 直接从 meta buf 中只解析出 data_dir, msg.skip
     pub fn decode_data_dir_from_meta(buf: &[u8]) -> Result<Option<Uuid>> {
         let mut ver = Self::default();
         ver.unmarshal_msg(buf)?;
@@ -733,7 +733,7 @@ impl FileMetaVersion {
 
             // println!("unmarshal_msg fields name len() {}", &str_len);
 
-            // ！！！ Vec::with_capacity(str_len) 失败，vec!正常
+            // ！！！Vec::with_capacity(str_len) 失败，vec! 正常
             let mut field_buff = vec![0u8; str_len as usize];
 
             cur.read_exact(&mut field_buff)?;
@@ -1143,7 +1143,7 @@ impl From<FileMetaVersion> for FileMetaVersionHeader {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-// 因为自定义message_pack，所以一定要保证字段顺序
+// 因为自定义 message_pack，所以一定要保证字段顺序
 pub struct MetaObject {
     pub version_id: Option<Uuid>,                   // Version ID
     pub data_dir: Option<Uuid>,                     // Data dir ID
@@ -1182,7 +1182,7 @@ impl MetaObject {
 
             // println!("unmarshal_msg fields name len() {}", &str_len);
 
-            // ！！！ Vec::with_capacity(str_len) 失败，vec!正常
+            // ！！！Vec::with_capacity(str_len) 失败，vec! 正常
             let mut field_buff = vec![0u8; str_len as usize];
 
             cur.read_exact(&mut field_buff)?;
@@ -1413,7 +1413,7 @@ impl MetaObject {
 
         Ok(cur.position())
     }
-    // marshal_msg 自定义 messagepack 命名与go一致
+    // marshal_msg 自定义 messagepack 命名与 go 一致
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut len: u32 = 18;
         let mut mask: u32 = 0;
@@ -1682,7 +1682,7 @@ impl MetaDeleteMarker {
 
             let str_len = rmp::decode::read_str_len(&mut cur)?;
 
-            // ！！！ Vec::with_capacity(str_len) 失败，vec!正常
+            // ！！！Vec::with_capacity(str_len) 失败，vec! 正常
             let mut field_buff = vec![0u8; str_len as usize];
 
             cur.read_exact(&mut field_buff)?;
@@ -2175,7 +2175,6 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
 }
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     #[test]
@@ -2242,7 +2241,7 @@ mod test {
     #[test]
     #[tracing::instrument]
     fn test_marshal_metaversion() {
-        let mut fi = FileInfo::new("tset", 3, 2);
+        let mut fi = FileInfo::new("test", 3, 2);
         fi.version_id = Some(Uuid::new_v4());
         fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()).unwrap());
         let mut obj = FileMetaVersion::from(fi);
@@ -2257,7 +2256,7 @@ mod test {
 
         // println!("obj2 {:?}", &obj2);
 
-        // 时间截不一致- -
+        // 时间截不一致 - -
         assert_eq!(obj, obj2);
         assert_eq!(obj.get_version_id(), obj2.get_version_id());
         assert_eq!(obj.write_version, obj2.write_version);
@@ -2276,7 +2275,7 @@ mod test {
         let mut obj2 = FileMetaVersionHeader::default();
         obj2.unmarshal_msg(&encoded).unwrap();
 
-        // 时间截不一致- -
+        // 时间截不一致 - -
         assert_eq!(obj, obj2);
         assert_eq!(obj.version_id, obj2.version_id);
         assert_eq!(obj.version_id, vid);
@@ -2520,7 +2519,7 @@ mod test {
         fi3.mod_time = Some(time3);
         fm.add_version(fi3).unwrap();
 
-                // Sort first to ensure latest is at the front
+        // Sort first to ensure latest is at the front
         fm.sort_by_mod_time();
 
         // Should return the first version's mod time (lastest_mod_time returns first version's time)
@@ -2690,7 +2689,7 @@ mod test {
         assert!(result.is_err());
     }
 
-            #[test]
+    #[test]
     fn test_is_latest_delete_marker() {
         // Test the is_latest_delete_marker function with simple data
         // Since the function is complex and requires specific XL format,
@@ -2798,9 +2797,7 @@ async fn test_file_info_from_raw() {
 
     let encoded = fm.marshal_msg().unwrap();
 
-    let raw_info = RawFileInfo {
-        buf: encoded,
-    };
+    let raw_info = RawFileInfo { buf: encoded };
 
     let result = file_info_from_raw(raw_info, "test-bucket", "test-object", false).await;
     assert!(result.is_ok());
@@ -2833,26 +2830,26 @@ fn test_file_meta_load_function() {
     assert!(result.is_err());
 }
 
-            #[test]
-    fn test_file_meta_read_bytes_header() {
-        // Test read_bytes_header function - it expects the first 5 bytes to be msgpack bin length
-        // Create a buffer with proper msgpack bin format for a 9-byte binary
-        let mut buf = vec![0xc4, 0x09]; // msgpack bin8 format for 9 bytes
-        buf.extend_from_slice(b"test data"); // 9 bytes of data
-        buf.extend_from_slice(b"extra"); // additional data
+#[test]
+fn test_file_meta_read_bytes_header() {
+    // Test read_bytes_header function - it expects the first 5 bytes to be msgpack bin length
+    // Create a buffer with proper msgpack bin format for a 9-byte binary
+    let mut buf = vec![0xc4, 0x09]; // msgpack bin8 format for 9 bytes
+    buf.extend_from_slice(b"test data"); // 9 bytes of data
+    buf.extend_from_slice(b"extra"); // additional data
 
-        let result = FileMeta::read_bytes_header(&buf);
-        assert!(result.is_ok());
-        let (length, remaining) = result.unwrap();
-        assert_eq!(length, 9); // "test data" length
-        // remaining should be everything after the 5-byte header (but we only have 2-byte header)
-        assert_eq!(remaining.len(), buf.len() - 5);
+    let result = FileMeta::read_bytes_header(&buf);
+    assert!(result.is_ok());
+    let (length, remaining) = result.unwrap();
+    assert_eq!(length, 9); // "test data" length
+                           // remaining should be everything after the 5-byte header (but we only have 2-byte header)
+    assert_eq!(remaining.len(), buf.len() - 5);
 
-        // Test with buffer too small
-        let small_buf = vec![0u8; 2];
-        let result = FileMeta::read_bytes_header(&small_buf);
-        assert!(result.is_err());
-    }
+    // Test with buffer too small
+    let small_buf = vec![0u8; 2];
+    let result = FileMeta::read_bytes_header(&small_buf);
+    assert!(result.is_err());
+}
 
 #[test]
 fn test_file_meta_get_set_idx() {
@@ -3080,11 +3077,11 @@ fn test_file_meta_version_header_ordering() {
     // Test partial_cmp
     assert!(header1.partial_cmp(&header2).is_some());
 
-            // Test cmp - header2 should be greater (newer)
-        use std::cmp::Ordering;
-        assert_eq!(header1.cmp(&header2), Ordering::Less); // header1 has earlier time
-        assert_eq!(header2.cmp(&header1), Ordering::Greater); // header2 has later time
-        assert_eq!(header1.cmp(&header1), Ordering::Equal);
+    // Test cmp - header2 should be greater (newer)
+    use std::cmp::Ordering;
+    assert_eq!(header1.cmp(&header2), Ordering::Less); // header1 has earlier time
+    assert_eq!(header2.cmp(&header1), Ordering::Greater); // header2 has later time
+    assert_eq!(header1.cmp(&header1), Ordering::Equal);
 }
 
 #[test]
@@ -3110,10 +3107,7 @@ fn test_merge_file_meta_versions_edge_cases() {
     version2.header.version_id = Some(Uuid::new_v4());
     version2.header.mod_time = Some(OffsetDateTime::from_unix_timestamp(2000).unwrap());
 
-    let versions = vec![
-        vec![version1.clone()],
-        vec![version2.clone()],
-    ];
+    let versions = vec![vec![version1.clone()], vec![version2.clone()]];
 
     let _merged_strict = merge_file_meta_versions(1, true, 10, &versions);
     let merged_non_strict = merge_file_meta_versions(1, false, 10, &versions);
@@ -3191,9 +3185,7 @@ async fn test_get_file_info_edge_cases() {
 #[tokio::test]
 async fn test_file_info_from_raw_edge_cases() {
     // Test with empty buffer
-    let empty_raw = RawFileInfo {
-        buf: vec![],
-    };
+    let empty_raw = RawFileInfo { buf: vec![] };
     let result = file_info_from_raw(empty_raw, "bucket", "object", false).await;
     assert!(result.is_err());
 
@@ -3227,12 +3219,12 @@ fn test_meta_object_edge_cases() {
     obj.data_dir = None;
     assert!(obj.use_data_dir());
 
-            // Test use_inlinedata (always returns false in current implementation)
-        obj.size = 128 * 1024; // 128KB threshold
-        assert!(!obj.use_inlinedata()); // Should be false
+    // Test use_inlinedata (always returns false in current implementation)
+    obj.size = 128 * 1024; // 128KB threshold
+    assert!(!obj.use_inlinedata()); // Should be false
 
-        obj.size = 128 * 1024 - 1;
-        assert!(!obj.use_inlinedata()); // Should also be false (always false)
+    obj.size = 128 * 1024 - 1;
+    assert!(!obj.use_inlinedata()); // Should also be false (always false)
 }
 
 #[test]
@@ -3244,17 +3236,17 @@ fn test_file_meta_version_header_edge_cases() {
     header.ec_m = 0;
     assert!(!header.has_ec());
 
-            // Test matches_not_strict with different signatures but same version_id
-        let mut other = FileMetaVersionHeader::default();
-        let version_id = Some(Uuid::new_v4());
-        header.version_id = version_id;
-        other.version_id = version_id;
-        header.version_type = VersionType::Object;
-        other.version_type = VersionType::Object;
-        header.signature = [1, 2, 3, 4];
-        other.signature = [5, 6, 7, 8];
-        // Should match because they have same version_id and type
-        assert!(header.matches_not_strict(&other));
+    // Test matches_not_strict with different signatures but same version_id
+    let mut other = FileMetaVersionHeader::default();
+    let version_id = Some(Uuid::new_v4());
+    header.version_id = version_id;
+    other.version_id = version_id;
+    header.version_type = VersionType::Object;
+    other.version_type = VersionType::Object;
+    header.signature = [1, 2, 3, 4];
+    other.signature = [5, 6, 7, 8];
+    // Should match because they have same version_id and type
+    assert!(header.matches_not_strict(&other));
 
     // Test sorts_before with same mod_time but different version_id
     let time = OffsetDateTime::from_unix_timestamp(1000).unwrap();
@@ -3286,12 +3278,12 @@ fn test_file_meta_add_version_edge_cases() {
     fi2.mod_time = Some(OffsetDateTime::now_utc());
     fm.add_version(fi2).unwrap();
 
-            // Should still have only one version, but updated
-        assert_eq!(fm.versions.len(), 1);
-        let (_, version) = fm.find_version(version_id).unwrap();
-        if let Some(obj) = version.object {
-            assert_eq!(obj.size, 2048); // Size gets updated when adding same version_id
-        }
+    // Should still have only one version, but updated
+    assert_eq!(fm.versions.len(), 1);
+    let (_, version) = fm.find_version(version_id).unwrap();
+    if let Some(obj) = version.object {
+        assert_eq!(obj.size, 2048); // Size gets updated when adding same version_id
+    }
 }
 
 #[test]
@@ -3324,12 +3316,11 @@ fn test_file_meta_shard_data_dir_count_edge_cases() {
     fi.mod_time = Some(OffsetDateTime::now_utc());
     fm.add_version(fi).unwrap();
 
-            let count = fm.shard_data_dir_count(&version_id, &data_dir);
-        assert_eq!(count, 0); // Should be 0 because user_data_dir() requires flag
+    let count = fm.shard_data_dir_count(&version_id, &data_dir);
+    assert_eq!(count, 0); // Should be 0 because user_data_dir() requires flag
 
     // Test with different version_id
     let other_version_id = Some(Uuid::new_v4());
-            let count = fm.shard_data_dir_count(&other_version_id, &data_dir);
-        assert_eq!(count, 1); // Should be 1 because the version has matching data_dir and user_data_dir() is true
+    let count = fm.shard_data_dir_count(&other_version_id, &data_dir);
+    assert_eq!(count, 1); // Should be 1 because the version has matching data_dir and user_data_dir() is true
 }
-

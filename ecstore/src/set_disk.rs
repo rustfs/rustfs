@@ -1452,7 +1452,7 @@ impl SetDisks {
             }
         };
 
-        // check endpoint是否一致
+        // check endpoint 是否一致
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
 

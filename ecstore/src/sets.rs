@@ -287,7 +287,7 @@ struct DelObj {
 
 #[async_trait::async_trait]
 impl ObjectIO for Sets {
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, object, h, opts))]
     async fn get_object_reader(
         &self,
         bucket: &str,

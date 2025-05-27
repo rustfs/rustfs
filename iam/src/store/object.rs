@@ -349,7 +349,7 @@ impl ObjectStore {
     //         user.credentials.access_key = name.to_owned();
     //     }
 
-    //     // todo, 校验session token
+    //     // todo, 校验 session token
 
     //     Ok(Some(user))
     // }
@@ -932,7 +932,7 @@ impl Store for ObjectStore {
     //         Arc::new(tokio::sync::Mutex::new(CacheEntity::default())),
     //     );
 
-    //     // 一次读取32个元素
+    //     // 一次读取 32 个元素
     //     let iter = items
     //         .iter()
     //         .map(|item| item.trim_start_matches("config/iam/"))

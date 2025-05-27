@@ -25,7 +25,7 @@ pub struct LatencyStat {
     max: Duration,  // 最大延迟
 }
 
-// 定义BucketTarget结构体
+// 定义 BucketTarget 结构体
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketTarget {
     source_bucket: String,

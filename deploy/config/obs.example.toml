@@ -5,7 +5,7 @@ sample_ratio = 2.0
 meter_interval = 30
 service_name = "rustfs"
 service_version = "0.0.1"
-environment = "develop"
+environment = "production" # Default is "production" if not specified
 logger_level = "info"
 local_logging_enabled = true
 

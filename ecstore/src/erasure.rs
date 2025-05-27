@@ -302,7 +302,7 @@ impl Erasure {
             // ec encode, 结果会写进 data_buffer
             let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(shard_size).collect();
 
-            // partiy 数量大于0 才ec
+            // partiy 数量大于 0 才 ec
             if self.parity_shards > 0 {
                 self.encoder.as_ref().unwrap().encode(data_slices)?;
             }
@@ -348,7 +348,7 @@ impl Erasure {
         let last_shard_size = last_block_size.div_ceil(self.data_shards);
         num_shards * self.shard_size(self.block_size) + last_shard_size
 
-        // // 因为写入的时候ec需要补全，所以最后一个长度应该也是一样的
+        // // 因为写入的时候 ec 需要补全，所以最后一个长度应该也是一样的
         // if last_block_size != 0 {
         //     num_shards += 1
         // }
@@ -446,7 +446,7 @@ pub struct ShardReader {
     parity_block_count: usize,
     shard_size: usize,      // 每个分片的块大小 一次读取一块
     shard_file_size: usize, // 分片文件总长度
-    offset: usize,          // 在分片中的offset
+    offset: usize,          // 在分片中的 offset
 }
 
 impl ShardReader {
