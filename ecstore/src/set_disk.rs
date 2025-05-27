@@ -5890,7 +5890,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 4,
                 parity_blocks: 2,
-                index: 1, // Must be > 0 for is_valid() to return true
+                index: 1,                             // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3, 4, 5, 6], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -5902,7 +5902,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 6,
                 parity_blocks: 3,
-                index: 1, // Must be > 0 for is_valid() to return true
+                index: 1,                                      // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -5914,7 +5914,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 2,
                 parity_blocks: 1,
-                index: 1, // Must be > 0 for is_valid() to return true
+                index: 1,                    // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -6019,11 +6019,7 @@ mod tests {
     #[test]
     fn test_join_errs() {
         // Test joining error messages
-        let errs = vec![
-            None,
-            Some(Error::from_string("error1")),
-            Some(Error::from_string("error2")),
-        ];
+        let errs = vec![None, Some(Error::from_string("error1")), Some(Error::from_string("error2"))];
         let joined = join_errs(&errs);
         assert!(joined.contains("<nil>"));
         assert!(joined.contains("error1"));
