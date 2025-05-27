@@ -229,7 +229,7 @@ impl FileInfo {
         }
     }
 
-    // to_part_offset 取offset 所在的part index, 返回part index, offset
+    // `to_part_offset` takes the `part index` where the `offset` is located, and returns `part index`, `offset`
     pub fn to_part_offset(&self, offset: usize) -> Result<(usize, usize)> {
         if offset == 0 {
             return Ok((0, 0));
@@ -356,7 +356,7 @@ impl ErasureInfo {
         let last_shard_size = last_block_size.div_ceil(self.data_blocks);
         num_shards * self.shard_size(self.block_size) + last_shard_size
 
-        // // 因为写入的时候ec需要补全，所以最后一个长度应该也是一样的
+        // // 因为写入的时候 ec 需要补全，所以最后一个长度应该也是一样的
         // if last_block_size != 0 {
         //     num_shards += 1
         // }
@@ -1250,7 +1250,7 @@ mod tests {
         assert_eq!(object_info.etag, Some("test-etag".to_string()));
     }
 
-    // to_part_offset 取offset 所在的part index, 返回part index, offset
+    // to_part_offset 取 offset 所在的 part index, 返回 part index, offset
     #[test]
     fn test_file_info_to_part_offset() {
         let mut file_info = FileInfo::new("test", 4, 2);

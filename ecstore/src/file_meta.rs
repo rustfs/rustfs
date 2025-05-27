@@ -71,7 +71,7 @@ impl FileMeta {
         Ok(xl)
     }
 
-    // check_xl2_v1 读xl文件头，返回后续内容，版本信息
+    // check_xl2_v1 读 xl 文件头，返回后续内容，版本信息
     // checkXL2V1
     #[tracing::instrument]
     pub fn check_xl2_v1(buf: &[u8]) -> Result<(&[u8], u16, u16)> {
@@ -92,11 +92,11 @@ impl FileMeta {
         Ok((&buf[8..], major, minor))
     }
 
-    // 固定u32
+    // 固定 u32
     pub fn read_bytes_header(buf: &[u8]) -> Result<(u32, &[u8])> {
         let (mut size_buf, _) = buf.split_at(5);
 
-        //  取meta数据，buf = crc + data
+        //  取 meta 数据，buf = crc + data
         let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
 
         Ok((bin_len, &buf[5..]))
@@ -110,7 +110,7 @@ impl FileMeta {
 
         let (mut size_buf, buf) = buf.split_at(5);
 
-        //  取meta数据，buf = crc + data
+        //  取 meta 数据，buf = crc + data
         let bin_len = rmp::decode::read_bin_len(&mut size_buf)?;
 
         let (meta, buf) = buf.split_at(bin_len as usize);
@@ -130,7 +130,7 @@ impl FileMeta {
             self.data.validate()?;
         }
 
-        // 解析meta
+        // 解析 meta
         if !meta.is_empty() {
             let (versions_len, _, meta_ver, meta) = Self::decode_xl_headers(meta)?;
 
@@ -168,7 +168,7 @@ impl FileMeta {
         Ok(i)
     }
 
-    // decode_xl_headers 解析 meta 头，返回 (versions数量，xl_header_version, xl_meta_version, 已读数据长度)
+    // decode_xl_headers 解析 meta 头，返回 (versions 数量，xl_header_version, xl_meta_version, 已读数据长度)
     #[tracing::instrument]
     fn decode_xl_headers(buf: &[u8]) -> Result<(usize, u8, u8, &[u8])> {
         let mut cur = Cursor::new(buf);
@@ -280,7 +280,7 @@ impl FileMeta {
             rmp::encode::write_bin(&mut wr, &ver.meta)?;
         }
 
-        // 更新bin长度
+        // 更新 bin 长度
         let data_len = wr.len() - offset;
         byteorder::BigEndian::write_u32(&mut wr[offset - 4..offset], data_len as u32);
 
@@ -368,7 +368,7 @@ impl FileMeta {
         Err(Error::new(DiskError::FileVersionNotFound))
     }
 
-    // shard_data_dir_count 查询 vid下data_dir的数量
+    // shard_data_dir_count 查询 vid 下 data_dir 的数量
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn shard_data_dir_count(&self, vid: &Option<Uuid>, data_dir: &Option<Uuid>) -> usize {
         self.versions
@@ -494,7 +494,7 @@ impl FileMeta {
         Err(Error::msg("add_version failed"))
     }
 
-    // delete_version 删除版本，返回data_dir
+    // delete_version 删除版本，返回 data_dir
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
@@ -710,7 +710,7 @@ impl FileMetaVersion {
         }
     }
 
-    // decode_data_dir_from_meta 从 meta中读取data_dir TODO: 直接从meta buf中只解析出data_dir, msg.skip
+    // decode_data_dir_from_meta 从 meta 中读取 data_dir TODO: 直接从 meta buf 中只解析出 data_dir, msg.skip
     pub fn decode_data_dir_from_meta(buf: &[u8]) -> Result<Option<Uuid>> {
         let mut ver = Self::default();
         ver.unmarshal_msg(buf)?;
@@ -733,7 +733,7 @@ impl FileMetaVersion {
 
             // println!("unmarshal_msg fields name len() {}", &str_len);
 
-            // ！！！ Vec::with_capacity(str_len) 失败，vec!正常
+            // ！！！Vec::with_capacity(str_len) 失败，vec! 正常
             let mut field_buff = vec![0u8; str_len as usize];
 
             cur.read_exact(&mut field_buff)?;
@@ -1143,7 +1143,7 @@ impl From<FileMetaVersion> for FileMetaVersionHeader {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-// 因为自定义message_pack，所以一定要保证字段顺序
+// 因为自定义 message_pack，所以一定要保证字段顺序
 pub struct MetaObject {
     pub version_id: Option<Uuid>,                   // Version ID
     pub data_dir: Option<Uuid>,                     // Data dir ID
@@ -1182,7 +1182,7 @@ impl MetaObject {
 
             // println!("unmarshal_msg fields name len() {}", &str_len);
 
-            // ！！！ Vec::with_capacity(str_len) 失败，vec!正常
+            // ！！！Vec::with_capacity(str_len) 失败，vec! 正常
             let mut field_buff = vec![0u8; str_len as usize];
 
             cur.read_exact(&mut field_buff)?;
@@ -1413,7 +1413,7 @@ impl MetaObject {
 
         Ok(cur.position())
     }
-    // marshal_msg 自定义 messagepack 命名与go一致
+    // marshal_msg 自定义 messagepack 命名与 go 一致
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut len: u32 = 18;
         let mut mask: u32 = 0;
@@ -1682,7 +1682,7 @@ impl MetaDeleteMarker {
 
             let str_len = rmp::decode::read_str_len(&mut cur)?;
 
-            // ！！！ Vec::with_capacity(str_len) 失败，vec!正常
+            // ！！！Vec::with_capacity(str_len) 失败，vec! 正常
             let mut field_buff = vec![0u8; str_len as usize];
 
             cur.read_exact(&mut field_buff)?;
@@ -2175,7 +2175,6 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
 }
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     #[test]
@@ -2257,7 +2256,7 @@ mod test {
 
         // println!("obj2 {:?}", &obj2);
 
-        // 时间截不一致- -
+        // 时间截不一致 - -
         assert_eq!(obj, obj2);
         assert_eq!(obj.get_version_id(), obj2.get_version_id());
         assert_eq!(obj.write_version, obj2.write_version);
@@ -2276,7 +2275,7 @@ mod test {
         let mut obj2 = FileMetaVersionHeader::default();
         obj2.unmarshal_msg(&encoded).unwrap();
 
-        // 时间截不一致- -
+        // 时间截不一致 - -
         assert_eq!(obj, obj2);
         assert_eq!(obj.version_id, obj2.version_id);
         assert_eq!(obj.version_id, vid);
