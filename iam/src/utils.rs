@@ -23,7 +23,7 @@ pub fn gen_access_key(length: usize) -> Result<String> {
     Ok(result)
 }
 
-pub fn gen_secret_key(length: usize) -> crate::Result<String> {
+pub fn gen_secret_key(length: usize) -> Result<String> {
     use base64_simd::URL_SAFE_NO_PAD;
 
     if length < 8 {

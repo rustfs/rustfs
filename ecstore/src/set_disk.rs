@@ -36,7 +36,6 @@ use crate::{
     store_err::{is_err_object_not_found, to_object_err, StorageError},
     store_init::{load_format_erasure, ErasureError},
     utils::{
-        self,
         crypto::{base64_decode, base64_encode, hex},
         path::{encode_dir_object, has_suffix, SLASH_SEPARATOR},
     },
@@ -174,7 +173,7 @@ impl SetDisks {
             let mut rng = thread_rng();
             disks.shuffle(&mut rng);
 
-            numbers.shuffle(&mut rand::thread_rng());
+            numbers.shuffle(&mut thread_rng());
         }
 
         for &i in numbers.iter() {
@@ -395,7 +394,7 @@ impl SetDisks {
     }
 
     fn reduce_common_data_dir(data_dirs: &Vec<Option<Uuid>>, write_quorum: usize) -> Option<Uuid> {
-        let mut data_dirs_count = std::collections::HashMap::new();
+        let mut data_dirs_count = HashMap::new();
 
         for ddir in data_dirs {
             *data_dirs_count.entry(ddir).or_insert(0) += 1;
@@ -454,10 +453,7 @@ impl SetDisks {
         let errs: Vec<Option<Error>> = join_all(futures)
             .await
             .into_iter()
-            .map(|e| match e {
-                Ok(e) => e,
-                Err(_) => Some(Error::new(DiskError::Unexpected)),
-            })
+            .map(|e| e.unwrap_or_else(|_| Some(Error::new(DiskError::Unexpected))))
             .collect();
 
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
@@ -726,7 +722,7 @@ impl SetDisks {
         }
 
         if max_occ == 0 {
-            // Did not found anything useful
+            // Did not find anything useful
             return -1;
         }
         cparity
@@ -1039,7 +1035,7 @@ impl SetDisks {
 
                 hasher.flush()?;
 
-                meta_hashs[i] = Some(utils::crypto::hex(hasher.clone().finalize().as_slice()));
+                meta_hashs[i] = Some(hex(hasher.clone().finalize().as_slice()));
 
                 hasher.reset();
             }
@@ -2331,7 +2327,7 @@ impl SetDisks {
 
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
-                            match self
+                            return match self
                                 .delete_if_dang_ling(
                                     bucket,
                                     object,
@@ -2355,10 +2351,7 @@ impl SetDisks {
                                     for _ in 0..errs.len() {
                                         t_errs.push(None);
                                     }
-                                    return Ok((
-                                        self.default_heal_result(m, &t_errs, bucket, object, version_id).await,
-                                        Some(derr),
-                                    ));
+                                    Ok((self.default_heal_result(m, &t_errs, bucket, object, version_id).await, Some(derr)))
                                 }
                                 Err(err) => {
                                     // t_errs = vec![Some(err.clone()); errs.len()];
@@ -2367,13 +2360,13 @@ impl SetDisks {
                                         t_errs.push(Some(clone_err(&err)));
                                     }
 
-                                    return Ok((
+                                    Ok((
                                         self.default_heal_result(FileInfo::default(), &t_errs, bucket, object, version_id)
                                             .await,
                                         Some(err),
-                                    ));
+                                    ))
                                 }
-                            }
+                            };
                         }
 
                         if !lastest_meta.deleted && lastest_meta.erasure.distribution.len() != available_disks.len() {
@@ -2908,6 +2901,7 @@ impl SetDisks {
     ) -> Result<()> {
         info!("ns_scanner");
         if buckets.is_empty() {
+            info!("data-scanner: no buckets to scan, skipping scanner cycle");
             return Ok(());
         }
 
@@ -2930,7 +2924,7 @@ impl SetDisks {
         // Put all buckets into channel.
         let (bucket_tx, bucket_rx) = mpsc::channel(buckets.len());
         // Shuffle buckets to ensure total randomness of buckets, being scanned.
-        // Otherwise same set of buckets get scanned across erasure sets always.
+        // Otherwise, same set of buckets get scanned across erasure sets always.
         // at any given point in time. This allows different buckets to be scanned
         // in different order per erasure set, this wider spread is needed when
         // there are lots of buckets with different order of objects in them.
@@ -5120,7 +5114,7 @@ impl StorageAPI for SetDisks {
                 _ => {}
             }
         }
-        return Ok((result, err));
+        Ok((result, err))
     }
 
     #[tracing::instrument(skip(self))]
@@ -5420,7 +5414,7 @@ async fn disks_with_all_parts(
             if let Some(data) = &meta.data {
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
                 let data_len = data.len();
-                let verify_err = (bitrot_verify(
+                let verify_err = bitrot_verify(
                     Box::new(Cursor::new(data.clone())),
                     data_len,
                     meta.erasure.shard_file_size(meta.size),
@@ -5428,8 +5422,8 @@ async fn disks_with_all_parts(
                     checksum_info.hash,
                     meta.erasure.shard_size(meta.erasure.block_size),
                 )
-                .await)
-                    .err();
+                .await
+                .err();
 
                 if let Some(vec) = data_errs_by_part.get_mut(&0) {
                     if index < vec.len() {

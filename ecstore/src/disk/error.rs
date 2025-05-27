@@ -301,8 +301,8 @@ pub fn clone_disk_err(e: &DiskError) -> Error {
 
 pub fn os_err_to_file_err(e: io::Error) -> Error {
     match e.kind() {
-        io::ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
-        io::ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
+        ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
+        ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
         // io::ErrorKind::ConnectionRefused => todo!(),
         // io::ErrorKind::ConnectionReset => todo!(),
         // io::ErrorKind::HostUnreachable => todo!(),
@@ -350,7 +350,7 @@ pub fn os_err_to_file_err(e: io::Error) -> Error {
 pub struct FileAccessDeniedWithContext {
     pub path: PathBuf,
     #[source]
-    pub source: std::io::Error,
+    pub source: io::Error,
 }
 
 impl std::fmt::Display for FileAccessDeniedWithContext {

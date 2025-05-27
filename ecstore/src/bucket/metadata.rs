@@ -288,12 +288,7 @@ impl BucketMetadata {
     }
 
     pub fn set_created(&mut self, created: Option<OffsetDateTime>) {
-        self.created = {
-            match created {
-                Some(t) => t,
-                None => OffsetDateTime::now_utc(),
-            }
-        }
+        self.created = { created.unwrap_or_else(|| OffsetDateTime::now_utc()) }
     }
 
     pub async fn save(&mut self) -> Result<()> {
@@ -420,7 +415,6 @@ where
 
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     #[tokio::test]

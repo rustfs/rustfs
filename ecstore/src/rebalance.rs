@@ -139,7 +139,7 @@ pub struct DiskStat {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RebalanceMeta {
     #[serde(skip)]
-    pub cancel: Option<tokio::sync::broadcast::Sender<bool>>, // To be invoked on rebalance-stop
+    pub cancel: Option<broadcast::Sender<bool>>, // To be invoked on rebalance-stop
     #[serde(skip)]
     pub last_refreshed_at: Option<SystemTime>,
     #[serde(rename = "stopTs")]

@@ -277,13 +277,13 @@ impl ECStore {
             };
         };
 
-        let mut list_result = match self.list_path(&opts).await {
-            Ok(res) => res,
-            Err(err) => MetaCacheEntriesSortedResult {
+        let mut list_result = self
+            .list_path(&opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
                 err: Some(err),
                 ..Default::default()
-            },
-        };
+            });
 
         if let Some(err) = &list_result.err {
             if !is_err_eof(err) {

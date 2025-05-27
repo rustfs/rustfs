@@ -546,8 +546,7 @@ impl Writer for BitrotFileWriter {
             hasher.update(h_buf);
             hasher.finalize()
         })
-        .await
-        .unwrap();
+        .await?;
 
         if let Some(f) = self.inner.as_mut() {
             f.write_all(&hash_bytes).await?;
@@ -775,7 +774,7 @@ mod test {
             if !algo.available() || *algo != BitrotAlgorithm::HighwayHash256 {
                 continue;
             }
-            let checksum = decode_to_vec(checksums.get(algo).unwrap()).unwrap();
+            let checksum = decode_to_vec(checksums.get(algo).unwrap())?;
 
             let mut h = algo.new_hasher();
             let mut msg = Vec::with_capacity(h.size() * h.block_size());

@@ -375,7 +375,7 @@ pub struct ChecksumInfo {
 pub const DEFAULT_BITROT_ALGO: BitrotAlgorithm = BitrotAlgorithm::HighwayHash256S;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone, Eq, Hash)]
-// BitrotAlgorithm specifies a algorithm used for bitrot protection.
+// BitrotAlgorithm specifies an algorithm used for bitrot protection.
 pub enum BitrotAlgorithm {
     // SHA256 represents the SHA-256 hash function
     SHA256,
@@ -465,23 +465,23 @@ impl GetObjectReader {
         if let Some(rs) = rs {
             let (off, length) = rs.get_offset_length(oi.size)?;
 
-            return Ok((
+            Ok((
                 GetObjectReader {
                     stream: reader,
                     object_info: oi.clone(),
                 },
                 off,
                 length,
-            ));
+            ))
         } else {
-            return Ok((
+            Ok((
                 GetObjectReader {
                     stream: reader,
                     object_info: oi.clone(),
                 },
                 0,
                 oi.size,
-            ));
+            ))
         }
     }
     pub async fn read_all(&mut self) -> Result<Vec<u8>> {

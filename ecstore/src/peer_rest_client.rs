@@ -89,7 +89,7 @@ impl PeerRestClient {
         let data = response.storage_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let storage_info: madmin::StorageInfo = Deserialize::deserialize(&mut buf).unwrap();
+        let storage_info: madmin::StorageInfo = Deserialize::deserialize(&mut buf)?;
 
         Ok(storage_info)
     }
@@ -110,7 +110,7 @@ impl PeerRestClient {
         let data = response.server_properties;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let storage_properties: ServerProperties = Deserialize::deserialize(&mut buf).unwrap();
+        let storage_properties: ServerProperties = Deserialize::deserialize(&mut buf)?;
 
         Ok(storage_properties)
     }
@@ -131,7 +131,7 @@ impl PeerRestClient {
         let data = response.cpus;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let cpus: Cpus = Deserialize::deserialize(&mut buf).unwrap();
+        let cpus: Cpus = Deserialize::deserialize(&mut buf)?;
 
         Ok(cpus)
     }
@@ -152,7 +152,7 @@ impl PeerRestClient {
         let data = response.net_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let net_info: NetInfo = Deserialize::deserialize(&mut buf).unwrap();
+        let net_info: NetInfo = Deserialize::deserialize(&mut buf)?;
 
         Ok(net_info)
     }
@@ -173,7 +173,7 @@ impl PeerRestClient {
         let data = response.partitions;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let partitions: Partitions = Deserialize::deserialize(&mut buf).unwrap();
+        let partitions: Partitions = Deserialize::deserialize(&mut buf)?;
 
         Ok(partitions)
     }
@@ -194,7 +194,7 @@ impl PeerRestClient {
         let data = response.os_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let os_info: OsInfo = Deserialize::deserialize(&mut buf).unwrap();
+        let os_info: OsInfo = Deserialize::deserialize(&mut buf)?;
 
         Ok(os_info)
     }
@@ -215,7 +215,7 @@ impl PeerRestClient {
         let data = response.sys_services;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let sys_services: SysService = Deserialize::deserialize(&mut buf).unwrap();
+        let sys_services: SysService = Deserialize::deserialize(&mut buf)?;
 
         Ok(sys_services)
     }
@@ -236,7 +236,7 @@ impl PeerRestClient {
         let data = response.sys_config;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let sys_config: SysConfig = Deserialize::deserialize(&mut buf).unwrap();
+        let sys_config: SysConfig = Deserialize::deserialize(&mut buf)?;
 
         Ok(sys_config)
     }
@@ -257,7 +257,7 @@ impl PeerRestClient {
         let data = response.sys_errors;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let sys_errors: SysErrors = Deserialize::deserialize(&mut buf).unwrap();
+        let sys_errors: SysErrors = Deserialize::deserialize(&mut buf)?;
 
         Ok(sys_errors)
     }
@@ -278,7 +278,7 @@ impl PeerRestClient {
         let data = response.mem_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let mem_info: MemInfo = Deserialize::deserialize(&mut buf).unwrap();
+        let mem_info: MemInfo = Deserialize::deserialize(&mut buf)?;
 
         Ok(mem_info)
     }
@@ -306,7 +306,7 @@ impl PeerRestClient {
         let data = response.realtime_metrics;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let realtime_metrics: RealtimeMetrics = Deserialize::deserialize(&mut buf).unwrap();
+        let realtime_metrics: RealtimeMetrics = Deserialize::deserialize(&mut buf)?;
 
         Ok(realtime_metrics)
     }
@@ -327,7 +327,7 @@ impl PeerRestClient {
         let data = response.proc_info;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let proc_info: ProcInfo = Deserialize::deserialize(&mut buf).unwrap();
+        let proc_info: ProcInfo = Deserialize::deserialize(&mut buf)?;
 
         Ok(proc_info)
     }
@@ -603,20 +603,20 @@ impl PeerRestClient {
         let data = response.bg_heal_state;
 
         let mut buf = Deserializer::new(Cursor::new(data));
-        let bg_heal_state: BgHealState = Deserialize::deserialize(&mut buf).unwrap();
+        let bg_heal_state: BgHealState = Deserialize::deserialize(&mut buf)?;
 
         Ok(bg_heal_state)
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
-        let mut _client = node_service_time_out_client(&self.grid_host)
+        let _client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         todo!()
     }
 
     pub async fn update_metacache_listing(&self) -> Result<()> {
-        let mut _client = node_service_time_out_client(&self.grid_host)
+        let _client = node_service_time_out_client(&self.grid_host)
             .await
             .map_err(|err| Error::msg(err.to_string()))?;
         todo!()

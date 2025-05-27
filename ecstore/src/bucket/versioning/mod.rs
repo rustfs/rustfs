@@ -14,10 +14,6 @@ impl VersioningApi for VersioningConfiguration {
     fn enabled(&self) -> bool {
         self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED))
     }
-    fn suspended(&self) -> bool {
-        self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED))
-    }
-
     fn prefix_enabled(&self, prefix: &str) -> bool {
         if self.status != Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)) {
             return false;
@@ -46,6 +42,7 @@ impl VersioningApi for VersioningConfiguration {
 
         true
     }
+
     fn prefix_suspended(&self, prefix: &str) -> bool {
         if self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)) {
             return true;
@@ -78,5 +75,8 @@ impl VersioningApi for VersioningConfiguration {
     }
     fn versioned(&self, prefix: &str) -> bool {
         self.prefix_enabled(prefix) || self.prefix_suspended(prefix)
+    }
+    fn suspended(&self) -> bool {
+        self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED))
     }
 }

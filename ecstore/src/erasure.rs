@@ -113,7 +113,7 @@ impl Erasure {
                 let blocks_inner = blocks.clone();
                 async move {
                     if let Some(w) = w_op {
-                        (w.write(blocks_inner[i_inner].clone()).await).err()
+                        w.write(blocks_inner[i_inner].clone()).await.err()
                     } else {
                         Some(Error::new(DiskError::DiskNotFound))
                     }

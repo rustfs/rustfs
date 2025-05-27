@@ -39,7 +39,7 @@ impl Serialize for DateFuncValue {
             &self
                 .0
                 .format(&Rfc3339)
-                .map_err(|e| S::Error::custom(format!("format datetime failed: {e:?}")))?,
+                .map_err(|e| Error::custom(format!("format datetime failed: {e:?}")))?,
         )
     }
 }

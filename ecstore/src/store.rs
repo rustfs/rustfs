@@ -70,7 +70,7 @@ const MAX_UPLOADS_LIST: usize = 10000;
 
 #[derive(Debug)]
 pub struct ECStore {
-    pub id: uuid::Uuid,
+    pub id: Uuid,
     // pub disks: Vec<DiskStore>,
     pub disk_map: HashMap<usize, Vec<Option<DiskStore>>>,
     pub pools: Vec<Arc<Sets>>,
@@ -135,7 +135,7 @@ impl ECStore {
 
             // validate_parity(partiy_count, pool_eps.drives_per_set)?;
 
-            let (disks, errs) = crate::store_init::init_disks(
+            let (disks, errs) = store_init::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
@@ -169,7 +169,7 @@ impl ECStore {
                         return Err(Error::from_string("can not get formats"));
                     }
                     info!("retrying get formats after {:?}", interval);
-                    tokio::select! {
+                    select! {
                         _ = tokio::signal::ctrl_c() => {
                             info!("got ctrl+c, exits");
                             exit(0);
@@ -937,11 +937,7 @@ impl ECStore {
             };
 
             if a_mod == b_mod {
-                if a.idx < b.idx {
-                    return Ordering::Greater;
-                } else {
-                    return Ordering::Less;
-                }
+                return if a.idx < b.idx { Ordering::Greater } else { Ordering::Less };
             }
 
             b_mod.cmp(&a_mod)
@@ -1190,7 +1186,7 @@ impl ObjectIO for ECStore {
     ) -> Result<GetObjectReader> {
         check_get_obj_args(bucket, object)?;
 
-        let object = utils::path::encode_dir_object(object);
+        let object = encode_dir_object(object);
 
         if self.single_pool() {
             return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, opts).await;
@@ -1213,7 +1209,7 @@ impl ObjectIO for ECStore {
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         check_put_object_args(bucket, object)?;
 
-        let object = utils::path::encode_dir_object(object);
+        let object = encode_dir_object(object);
 
         if self.single_pool() {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
@@ -1320,52 +1316,6 @@ impl StorageAPI for ECStore {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        // TODO: opts.cached
-
-        let mut buckets = self.peer_sys.list_bucket(opts).await?;
-
-        if !opts.no_metadata {
-            for bucket in buckets.iter_mut() {
-                if let Ok(created) = metadata_sys::created_at(&bucket.name).await {
-                    bucket.created = Some(created);
-                }
-            }
-        }
-        Ok(buckets)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
-        if is_meta_bucketname(bucket) {
-            return Err(StorageError::BucketNameInvalid(bucket.to_string()).into());
-        }
-
-        if let Err(err) = check_valid_bucket_name(bucket) {
-            return Err(StorageError::BucketNameInvalid(err.to_string()).into());
-        }
-
-        // TODO: nslock
-
-        let mut opts = opts.clone();
-        if !opts.force {
-            // FIXME: check bucket exists
-            opts.force = true
-        }
-
-        self.peer_sys
-            .delete_bucket(bucket, &opts)
-            .await
-            .map_err(|e| to_object_err(e, vec![bucket]))?;
-
-        // TODO: replication opts.srdelete_op
-
-        // 删除 meta
-        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
-            .await?;
-        Ok(())
-    }
-    #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         if !is_meta_bucketname(bucket) {
             if let Err(err) = check_valid_bucket_name_strict(bucket) {
@@ -1409,6 +1359,7 @@ impl StorageAPI for ECStore {
 
         Ok(())
     }
+
     #[tracing::instrument(skip(self))]
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         let mut info = self
@@ -1422,6 +1373,101 @@ impl StorageAPI for ECStore {
             info.versionning = sys.versioning();
             info.object_locking = sys.object_locking();
         }
+
+        Ok(info)
+    }
+    #[tracing::instrument(skip(self))]
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        // TODO: opts.cached
+
+        let mut buckets = self.peer_sys.list_bucket(opts).await?;
+
+        if !opts.no_metadata {
+            for bucket in buckets.iter_mut() {
+                if let Ok(created) = metadata_sys::created_at(&bucket.name).await {
+                    bucket.created = Some(created);
+                }
+            }
+        }
+        Ok(buckets)
+    }
+    #[tracing::instrument(skip(self))]
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        if is_meta_bucketname(bucket) {
+            return Err(StorageError::BucketNameInvalid(bucket.to_string()).into());
+        }
+
+        if let Err(err) = check_valid_bucket_name(bucket) {
+            return Err(StorageError::BucketNameInvalid(err.to_string()).into());
+        }
+
+        // TODO: nslock
+
+        let mut opts = opts.clone();
+        if !opts.force {
+            // FIXME: check bucket exists
+            opts.force = true
+        }
+
+        self.peer_sys
+            .delete_bucket(bucket, &opts)
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket]))?;
+
+        // TODO: replication opts.srdelete_op
+
+        // 删除 meta
+        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
+            .await?;
+        Ok(())
+    }
+
+    // @continuation_token marker
+    // @start_after as marker when continuation_token empty
+    // @delimiter default="/", empty when recursive
+    // @max_keys limit
+    #[tracing::instrument(skip(self))]
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: Option<String>,
+    ) -> Result<ListObjectsV2Info> {
+        self.inner_list_objects_v2(bucket, prefix, continuation_token, delimiter, max_keys, fetch_owner, start_after)
+            .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_versions(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+            .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        check_object_args(bucket, object)?;
+
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].get_object_info(bucket, object.as_str(), opts).await;
+        }
+
+        // TODO: nslock
+
+        let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
 
         Ok(info)
     }
@@ -1441,8 +1487,8 @@ impl StorageAPI for ECStore {
         check_copy_obj_args(src_bucket, src_object)?;
         check_copy_obj_args(dst_bucket, dst_object)?;
 
-        let src_object = utils::path::encode_dir_object(src_object);
-        let dst_object = utils::path::encode_dir_object(dst_object);
+        let src_object = encode_dir_object(src_object);
+        let dst_object = encode_dir_object(dst_object);
 
         let cp_src_dst_same = path_join_buf(&[src_bucket, &src_object]) == path_join_buf(&[dst_bucket, &dst_object]);
 
@@ -1496,7 +1542,76 @@ impl StorageAPI for ECStore {
             "put_object_reader is none".to_owned(),
         )))
     }
+    #[tracing::instrument(skip(self))]
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        check_del_obj_args(bucket, object)?;
 
+        if opts.delete_prefix {
+            self.delete_prefix(bucket, object).await?;
+            return Ok(ObjectInfo::default());
+        }
+
+        // TODO: nslock
+
+        let object = encode_dir_object(object);
+        let object = object.as_str();
+
+        // 查询在哪个 pool
+        let (mut pinfo, errs) = self
+            .get_pool_info_existing_with_opts(bucket, object, &opts)
+            .await
+            .map_err(|e| {
+                if is_err_read_quorum(&e) {
+                    Error::new(StorageError::InsufficientWriteQuorum)
+                } else {
+                    e
+                }
+            })?;
+
+        if pinfo.object_info.delete_marker && opts.version_id.is_none() {
+            pinfo.object_info.name = decode_dir_object(object);
+            return Ok(pinfo.object_info);
+        }
+
+        if opts.data_movement && opts.src_pool_idx == pinfo.index {
+            return Err(Error::new(StorageError::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                opts.version_id.unwrap_or_default(),
+            )));
+        }
+
+        if opts.data_movement {
+            let mut obj = self.pools[pinfo.index].delete_object(bucket, object, opts).await?;
+            obj.name = decode_dir_object(obj.name.as_str());
+            return Ok(obj);
+        }
+
+        if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
+            return self.delete_object_from_all_pools(bucket, object, &opts, errs).await;
+        }
+
+        for pool in self.pools.iter() {
+            match pool.delete_object(bucket, object, opts.clone()).await {
+                Ok(res) => {
+                    let mut obj = res;
+                    obj.name = decode_dir_object(object);
+                    return Ok(obj);
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(ver) = opts.version_id {
+            return Err(Error::new(StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), ver)));
+        }
+
+        Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
+    }
     // TODO: review
     #[tracing::instrument(skip(self))]
     async fn delete_objects(
@@ -1510,7 +1625,7 @@ impl StorageAPI for ECStore {
             .iter()
             .map(|v| {
                 let mut v = v.clone();
-                v.object_name = utils::path::encode_dir_object(v.object_name.as_str());
+                v.object_name = encode_dir_object(v.object_name.as_str());
                 v
             })
             .collect();
@@ -1580,7 +1695,7 @@ impl StorageAPI for ECStore {
                             del_objects[i] = DeletedObject {
                                 delete_marker: pinfo.object_info.delete_marker,
                                 delete_marker_version_id: pinfo.object_info.version_id.map(|v| v.to_string()),
-                                object_name: utils::path::decode_dir_object(&pinfo.object_info.name),
+                                object_name: decode_dir_object(&pinfo.object_info.name),
                                 delete_marker_mtime: pinfo.object_info.mod_time,
                                 ..Default::default()
                             };
@@ -1607,7 +1722,7 @@ impl StorageAPI for ECStore {
 
                     if let Some(obj) = objects.get(i) {
                         del_objects[i] = DeletedObject {
-                            object_name: utils::path::decode_dir_object(&obj.object_name),
+                            object_name: decode_dir_object(&obj.object_name),
                             version_id: obj.version_id.map(|v| v.to_string()),
                             ..Default::default()
                         }
@@ -1641,7 +1756,7 @@ impl StorageAPI for ECStore {
                         }
 
                         let mut dobj = pdel_objs.get(i).unwrap().clone();
-                        dobj.object_name = utils::path::decode_dir_object(&dobj.object_name);
+                        dobj.object_name = decode_dir_object(&dobj.object_name);
 
                         del_objects[obj_idx] = dobj;
                     }
@@ -1650,246 +1765,6 @@ impl StorageAPI for ECStore {
         }
 
         Ok((del_objects, del_errs))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
-        check_del_obj_args(bucket, object)?;
-
-        if opts.delete_prefix {
-            self.delete_prefix(bucket, object).await?;
-            return Ok(ObjectInfo::default());
-        }
-
-        // TODO: nslock
-
-        let object = utils::path::encode_dir_object(object);
-        let object = object.as_str();
-
-        // 查询在哪个 pool
-        let (mut pinfo, errs) = self
-            .get_pool_info_existing_with_opts(bucket, object, &opts)
-            .await
-            .map_err(|e| {
-                if is_err_read_quorum(&e) {
-                    Error::new(StorageError::InsufficientWriteQuorum)
-                } else {
-                    e
-                }
-            })?;
-
-        if pinfo.object_info.delete_marker && opts.version_id.is_none() {
-            pinfo.object_info.name = utils::path::decode_dir_object(object);
-            return Ok(pinfo.object_info);
-        }
-
-        if opts.data_movement && opts.src_pool_idx == pinfo.index {
-            return Err(Error::new(StorageError::DataMovementOverwriteErr(
-                bucket.to_owned(),
-                object.to_owned(),
-                opts.version_id.unwrap_or_default(),
-            )));
-        }
-
-        if opts.data_movement {
-            let mut obj = self.pools[pinfo.index].delete_object(bucket, object, opts).await?;
-            obj.name = decode_dir_object(obj.name.as_str());
-            return Ok(obj);
-        }
-
-        if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
-            return self.delete_object_from_all_pools(bucket, object, &opts, errs).await;
-        }
-
-        for pool in self.pools.iter() {
-            match pool.delete_object(bucket, object, opts.clone()).await {
-                Ok(res) => {
-                    let mut obj = res;
-                    obj.name = utils::path::decode_dir_object(object);
-                    return Ok(obj);
-                }
-                Err(err) => {
-                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                        return Err(err);
-                    }
-                }
-            }
-        }
-
-        if let Some(ver) = opts.version_id {
-            return Err(Error::new(StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), ver)));
-        }
-
-        Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
-    }
-
-    // @continuation_token marker
-    // @start_after as marker when continuation_token empty
-    // @delimiter default="/", empty when recursive
-    // @max_keys limit
-    #[tracing::instrument(skip(self))]
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        continuation_token: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-        fetch_owner: bool,
-        start_after: Option<String>,
-    ) -> Result<ListObjectsV2Info> {
-        self.inner_list_objects_v2(bucket, prefix, continuation_token, delimiter, max_keys, fetch_owner, start_after)
-            .await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn list_object_versions(
-        self: Arc<Self>,
-        bucket: &str,
-        prefix: &str,
-        marker: Option<String>,
-        version_marker: Option<String>,
-        delimiter: Option<String>,
-        max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
-            .await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        check_object_args(bucket, object)?;
-
-        let object = utils::path::encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].get_object_info(bucket, object.as_str(), opts).await;
-        }
-
-        // TODO: nslock
-
-        let (info, _) = self.get_latest_object_info_with_idx(bucket, object.as_str(), opts).await?;
-
-        Ok(info)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
-        let object = encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].get_object_tags(bucket, object.as_str(), opts).await;
-        }
-
-        let (oi, _) = self.get_latest_object_info_with_idx(bucket, &object, opts).await?;
-
-        Ok(oi.user_tags)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let object = encode_dir_object(object);
-        if self.single_pool() {
-            return self.pools[0].put_object_metadata(bucket, object.as_str(), opts).await;
-        }
-
-        let mut opts = opts.clone();
-        opts.metadata_chg = true;
-
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), &opts).await?;
-
-        self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let object = encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].put_object_tags(bucket, object.as_str(), tags, opts).await;
-        }
-
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
-
-        self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let object = encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].delete_object_tags(bucket, object.as_str(), opts).await;
-        }
-
-        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
-
-        self.pools[idx].delete_object_tags(bucket, object.as_str(), opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn copy_object_part(
-        &self,
-        src_bucket: &str,
-        src_object: &str,
-        _dst_bucket: &str,
-        _dst_object: &str,
-        _upload_id: &str,
-        _part_id: usize,
-        _start_offset: i64,
-        _length: i64,
-        _src_info: &ObjectInfo,
-        _src_opts: &ObjectOptions,
-        _dst_opts: &ObjectOptions,
-    ) -> Result<()> {
-        check_new_multipart_args(src_bucket, src_object)?;
-
-        // TODO: PutObjectReader
-        // self.put_object_part(dst_bucket, dst_object, upload_id, part_id, data, opts)
-
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self, data))]
-    async fn put_object_part(
-        &self,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        part_id: usize,
-        data: &mut PutObjReader,
-        opts: &ObjectOptions,
-    ) -> Result<PartInfo> {
-        check_put_object_part_args(bucket, object, upload_id)?;
-
-        if self.single_pool() {
-            return self.pools[0]
-                .put_object_part(bucket, object, upload_id, part_id, data, opts)
-                .await;
-        }
-
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
-                continue;
-            }
-            let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
-                Ok(res) => return Ok(res),
-                Err(err) => {
-                    if is_err_invalid_upload_id(&err) {
-                        None
-                    } else {
-                        Some(err)
-                    }
-                }
-            };
-
-            if let Some(err) = err {
-                error!("put_object_part err: {:?}", err);
-                return Err(err);
-            }
-        }
-
-        Err(Error::new(StorageError::InvalidUploadID(
-            bucket.to_owned(),
-            object.to_owned(),
-            upload_id.to_owned(),
-        )))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1978,6 +1853,74 @@ impl StorageAPI for ECStore {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn copy_object_part(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        _dst_bucket: &str,
+        _dst_object: &str,
+        _upload_id: &str,
+        _part_id: usize,
+        _start_offset: i64,
+        _length: i64,
+        _src_info: &ObjectInfo,
+        _src_opts: &ObjectOptions,
+        _dst_opts: &ObjectOptions,
+    ) -> Result<()> {
+        check_new_multipart_args(src_bucket, src_object)?;
+
+        // TODO: PutObjectReader
+        // self.put_object_part(dst_bucket, dst_object, upload_id, part_id, data, opts)
+
+        unimplemented!()
+    }
+    #[tracing::instrument(skip(self, data))]
+    async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: usize,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<PartInfo> {
+        check_put_object_part_args(bucket, object, upload_id)?;
+
+        if self.single_pool() {
+            return self.pools[0]
+                .put_object_part(bucket, object, upload_id, part_id, data, opts)
+                .await;
+        }
+
+        for pool in self.pools.iter() {
+            if self.is_suspended(pool.pool_idx).await {
+                continue;
+            }
+            let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
+                Ok(res) => return Ok(res),
+                Err(err) => {
+                    if is_err_invalid_upload_id(&err) {
+                        None
+                    } else {
+                        Some(err)
+                    }
+                }
+            };
+
+            if let Some(err) = err {
+                error!("put_object_part err: {:?}", err);
+                return Err(err);
+            }
+        }
+
+        Err(Error::new(StorageError::InvalidUploadID(
+            bucket.to_owned(),
+            object.to_owned(),
+            upload_id.to_owned(),
+        )))
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn get_multipart_info(
         &self,
         bucket: &str,
@@ -1995,16 +1938,16 @@ impl StorageAPI for ECStore {
                 continue;
             }
 
-            match pool.get_multipart_info(bucket, object, upload_id, opts).await {
-                Ok(res) => return Ok(res),
+            return match pool.get_multipart_info(bucket, object, upload_id, opts).await {
+                Ok(res) => Ok(res),
                 Err(err) => {
                     if is_err_invalid_upload_id(&err) {
                         continue;
                     }
 
-                    return Err(err);
+                    Err(err)
                 }
-            }
+            };
         }
 
         Err(Error::new(StorageError::InvalidUploadID(
@@ -2051,6 +1994,7 @@ impl StorageAPI for ECStore {
             upload_id.to_owned(),
         )))
     }
+
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
         &self,
@@ -2118,6 +2062,58 @@ impl StorageAPI for ECStore {
         }
         counts
     }
+    #[tracing::instrument(skip(self))]
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        let object = encode_dir_object(object);
+        if self.single_pool() {
+            return self.pools[0].put_object_metadata(bucket, object.as_str(), opts).await;
+        }
+
+        let mut opts = opts.clone();
+        opts.metadata_chg = true;
+
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), &opts).await?;
+
+        self.pools[idx].put_object_metadata(bucket, object.as_str(), &opts).await
+    }
+    #[tracing::instrument(skip(self))]
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].get_object_tags(bucket, object.as_str(), opts).await;
+        }
+
+        let (oi, _) = self.get_latest_object_info_with_idx(bucket, &object, opts).await?;
+
+        Ok(oi.user_tags)
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].put_object_tags(bucket, object.as_str(), tags, opts).await;
+        }
+
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+
+        self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].delete_object_tags(bucket, object.as_str(), opts).await;
+        }
+
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+
+        self.pools[idx].delete_object_tags(bucket, object.as_str(), opts).await
+    }
 
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
@@ -2167,7 +2163,7 @@ impl StorageAPI for ECStore {
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
         info!("ECStore heal_object");
-        let object = utils::path::encode_dir_object(object);
+        let object = encode_dir_object(object);
 
         let mut futures = Vec::with_capacity(self.pools.len());
         for pool in self.pools.iter() {
@@ -2195,7 +2191,7 @@ impl StorageAPI for ECStore {
             match res {
                 Ok((result, err)) => {
                     let mut result = result;
-                    result.object = utils::path::decode_dir_object(&result.object);
+                    result.object = decode_dir_object(&result.object);
                     ress.push(result);
                     errs.push(err);
                 }
@@ -2265,10 +2261,10 @@ impl StorageAPI for ECStore {
                 let fivs = match entry.file_info_versions(&bucket) {
                     Ok(fivs) => fivs,
                     Err(_) => {
-                        if is_meta {
-                            return HealSequence::heal_meta_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await;
+                        return if is_meta {
+                            HealSequence::heal_meta_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await
                         } else {
-                            return HealSequence::heal_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await;
+                            HealSequence::heal_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await
                         }
                     }
                 };
@@ -2362,7 +2358,7 @@ impl StorageAPI for ECStore {
 
     #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
-        let object = utils::path::encode_dir_object(object);
+        let object = encode_dir_object(object);
         if self.single_pool() {
             return self.pools[0].check_abandoned_parts(bucket, &object, opts).await;
         }

@@ -151,7 +151,7 @@ pub async fn init_data_scanner() {
                 let mut r = rand::thread_rng();
                 r.gen_range(0.0..1.0)
             };
-            let duration = Duration::from_secs_f64(random * (SCANNER_CYCLE.load(std::sync::atomic::Ordering::SeqCst) as f64));
+            let duration = Duration::from_secs_f64(random * (SCANNER_CYCLE.load(Ordering::SeqCst) as f64));
             let sleep_duration = if duration < Duration::new(1, 0) {
                 Duration::new(1, 0)
             } else {
@@ -227,7 +227,7 @@ async fn run_data_scanner() {
             }
         }
         stop_fn(&res).await;
-        sleep(Duration::from_secs(SCANNER_CYCLE.load(std::sync::atomic::Ordering::SeqCst))).await;
+        sleep(Duration::from_secs(SCANNER_CYCLE.load(Ordering::SeqCst))).await;
     }
 }
 
@@ -383,7 +383,7 @@ impl CurrentScannerCycle {
                         Deserialize::deserialize(&mut Deserializer::new(&buf[..])).expect("Deserialization failed");
                     self.cycle_completed = u;
                 }
-                name => return Err(Error::msg(format!("not suport field name {}", name))),
+                name => return Err(Error::msg(format!("not support field name {}", name))),
             }
         }
 
@@ -435,8 +435,8 @@ impl ScannerItem {
         path_join(&[PathBuf::from(self.prefix.clone()), PathBuf::from(self.object_name.clone())])
     }
 
-    pub async fn apply_versions_actions(&self, fivs: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
-        let obj_infos = self.apply_newer_noncurrent_version_limit(fivs).await?;
+    pub async fn apply_versions_actions(&self, fives: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
+        let obj_infos = self.apply_newer_noncurrent_version_limit(fives).await?;
         if obj_infos.len() >= SCANNER_EXCESS_OBJECT_VERSIONS.load(Ordering::SeqCst) as usize {
             // todo
         }
@@ -453,16 +453,16 @@ impl ScannerItem {
         Ok(obj_infos)
     }
 
-    pub async fn apply_newer_noncurrent_version_limit(&self, fivs: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
+    pub async fn apply_newer_noncurrent_version_limit(&self, fives: &[FileInfo]) -> Result<Vec<ObjectInfo>> {
         // let done = ScannerMetrics::time(ScannerMetric::ApplyNonCurrent);
         let versioned = match BucketVersioningSys::get(&self.bucket).await {
             Ok(vcfg) => vcfg.versioned(self.object_path().to_str().unwrap_or_default()),
             Err(_) => false,
         };
-        let mut object_infos = Vec::with_capacity(fivs.len());
+        let mut object_infos = Vec::with_capacity(fives.len());
 
         if self.lifecycle.is_none() {
-            for info in fivs.iter() {
+            for info in fives.iter() {
                 object_infos.push(info.to_object_info(&self.bucket, &self.object_path().to_string_lossy(), versioned));
             }
             return Ok(object_infos);
@@ -1000,7 +1000,7 @@ impl FolderScanner {
         if !into.compacted {
             self.new_cache.reduce_children_of(
                 &this_hash,
-                DATA_SCANNER_COMPACT_AT_CHILDREN.try_into().unwrap(),
+                DATA_SCANNER_COMPACT_AT_CHILDREN.try_into()?,
                 self.new_cache.info.name != folder.name,
             );
         }

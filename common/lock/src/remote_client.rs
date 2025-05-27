@@ -88,23 +88,6 @@ impl Locker for RemoteClient {
         Ok(response.success)
     }
 
-    async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
-        info!("remote force_unlock");
-        let args = serde_json::to_string(args)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(GenerallyLockRequest { args });
-
-        let response = client.force_un_lock(request).await?.into_inner();
-
-        if let Some(error_info) = response.error_info {
-            return Err(Error::from_string(error_info));
-        }
-
-        Ok(response.success)
-    }
-
     async fn refresh(&mut self, args: &LockArgs) -> Result<bool> {
         info!("remote refresh");
         let args = serde_json::to_string(args)?;
@@ -122,13 +105,30 @@ impl Locker for RemoteClient {
         Ok(response.success)
     }
 
-    async fn is_local(&self) -> bool {
-        false
+    async fn force_unlock(&mut self, args: &LockArgs) -> Result<bool> {
+        info!("remote force_unlock");
+        let args = serde_json::to_string(args)?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(GenerallyLockRequest { args });
+
+        let response = client.force_un_lock(request).await?.into_inner();
+
+        if let Some(error_info) = response.error_info {
+            return Err(Error::from_string(error_info));
+        }
+
+        Ok(response.success)
     }
 
     async fn close(&self) {}
 
     async fn is_online(&self) -> bool {
         true
+    }
+
+    async fn is_local(&self) -> bool {
+        false
     }
 }

@@ -40,7 +40,7 @@ pub struct FormatErasureV3 {
     pub this: Uuid,
 
     /// Sets field carries the input disk order generated the first
-    /// time when fresh disks were supplied, it is a two dimensional
+    /// time when fresh disks were supplied, it is a two-dimensional
     /// array second dimension represents list of disks used per set.
     pub sets: Vec<Vec<Uuid>>,
 

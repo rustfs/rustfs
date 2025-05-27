@@ -275,14 +275,35 @@ impl Locker for LocalLocker {
         Ok(reply)
     }
 
-    async fn close(&self) {}
+    async fn refresh(&mut self, args: &LockArgs) -> Result<bool> {
+        let mut idx = 0;
+        let mut key = args.uid.to_string();
+        format_uuid(&mut key, &idx);
+        match self.lock_uid.get(&key) {
+            Some(resource) => {
+                let mut resource = resource;
+                loop {
+                    match self.lock_map.get_mut(resource) {
+                        Some(_lris) => {}
+                        None => {
+                            let mut key = args.uid.to_string();
+                            format_uuid(&mut key, &0);
+                            self.lock_uid.remove(&key);
+                            return Ok(idx > 0);
+                        }
+                    }
 
-    async fn is_online(&self) -> bool {
-        true
-    }
-
-    async fn is_local(&self) -> bool {
-        true
+                    idx += 1;
+                    let mut key = args.uid.to_string();
+                    format_uuid(&mut key, &idx);
+                    resource = match self.lock_uid.get(&key) {
+                        Some(resource) => resource,
+                        None => return Ok(true),
+                    };
+                }
+            }
+            None => Ok(false),
+        }
     }
 
     // TODO: need add timeout mechanism
@@ -350,37 +371,14 @@ impl Locker for LocalLocker {
         Ok(reply)
     }
 
-    async fn refresh(&mut self, args: &LockArgs) -> Result<bool> {
-        let mut idx = 0;
-        let mut key = args.uid.to_string();
-        format_uuid(&mut key, &idx);
-        match self.lock_uid.get(&key) {
-            Some(resource) => {
-                let mut resource = resource;
-                loop {
-                    match self.lock_map.get_mut(resource) {
-                        Some(_lris) => {}
-                        None => {
-                            let mut key = args.uid.to_string();
-                            format_uuid(&mut key, &0);
-                            self.lock_uid.remove(&key);
-                            return Ok(idx > 0);
-                        }
-                    }
+    async fn close(&self) {}
 
-                    idx += 1;
-                    let mut key = args.uid.to_string();
-                    format_uuid(&mut key, &idx);
-                    resource = match self.lock_uid.get(&key) {
-                        Some(resource) => resource,
-                        None => return Ok(true),
-                    };
-                }
-            }
-            None => {
-                return Ok(false);
-            }
-        }
+    async fn is_online(&self) -> bool {
+        true
+    }
+
+    async fn is_local(&self) -> bool {
+        true
     }
 }
 
