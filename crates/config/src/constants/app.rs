@@ -117,7 +117,7 @@ mod tests {
             "Log level should be a valid tracing level"
         );
 
-        assert_eq!(USE_STDOUT, true);
+        assert_eq!(USE_STDOUT, false);
 
         assert_eq!(SAMPLE_RATIO, 1.0);
         assert!(SAMPLE_RATIO >= 0.0 && SAMPLE_RATIO <= 1.0, "Sample ratio should be between 0.0 and 1.0");
