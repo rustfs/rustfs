@@ -14,7 +14,7 @@ use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 // Ensure the correct path for parse_license is imported
 use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
-// use bytes::Bytes;
+use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
 use common::{
@@ -37,7 +37,7 @@ use ecstore::{
 };
 use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
 use grpc::make_server;
-// use http::{HeaderMap, Request as HttpRequest, Response};
+use http::{HeaderMap, Request as HttpRequest, Response};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -61,10 +61,9 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
-// use tracing::{instrument, Span};
-use tracing::instrument;
-// use tower_http::trace::TraceLayer;
+use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
+use tracing::{instrument, Span};
 
 const MI_B: usize = 1024 * 1024;
 
@@ -324,49 +323,49 @@ async fn run(opt: config::Opt) -> Result<()> {
         let mut sigint_inner = sigint_inner;
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
-                //.layer(
-                //     TraceLayer::new_for_http()
-                //         .make_span_with(|request: &HttpRequest<_>| {
-                //             let span = tracing::info_span!("http-request",
-                //                 status_code = tracing::field::Empty,
-                //                 method = %request.method(),
-                //                 uri = %request.uri(),
-                //                 version = ?request.version(),
-                //             );
-                //             for (header_name, header_value) in request.headers() {
-                //                 if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length"
-                //                 {
-                //                     span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
-                //                 }
-                //             }
-                //
-                //             span
-                //         })
-                //         .on_request(|request: &HttpRequest<_>, _span: &Span| {
-                //             info!(
-                //                 counter.rustfs_api_requests_total = 1_u64,
-                //                 key_request_method = %request.method().to_string(),
-                //                 key_request_uri_path = %request.uri().path().to_owned(),
-                //                 "handle request api total",
-                //             );
-                //             debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
-                //         })
-                //         .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
-                //             _span.record("http response status_code", tracing::field::display(response.status()));
-                //             debug!("http response generated in {:?}", latency)
-                //         })
-                //         .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
-                //             info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
-                //             debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
-                //         })
-                //         .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
-                //             debug!("http stream closed after {:?}", stream_duration)
-                //         })
-                //         .on_failure(|_error, latency: Duration, _span: &Span| {
-                //             info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
-                //             debug!("http request failure error: {:?} in {:?}", _error, latency)
-                //         }),
-                // )
+                .layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(|request: &HttpRequest<_>| {
+                            let span = tracing::info_span!("http-request",
+                                status_code = tracing::field::Empty,
+                                method = %request.method(),
+                                uri = %request.uri(),
+                                version = ?request.version(),
+                            );
+                            for (header_name, header_value) in request.headers() {
+                                if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length"
+                                {
+                                    span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
+                                }
+                            }
+
+                            span
+                        })
+                        .on_request(|request: &HttpRequest<_>, _span: &Span| {
+                            info!(
+                                counter.rustfs_api_requests_total = 1_u64,
+                                key_request_method = %request.method().to_string(),
+                                key_request_uri_path = %request.uri().path().to_owned(),
+                                "handle request api total",
+                            );
+                            debug!("http started method: {}, url path: {}", request.method(), request.uri().path())
+                        })
+                        .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
+                            _span.record("http response status_code", tracing::field::display(response.status()));
+                            debug!("http response generated in {:?}", latency)
+                        })
+                        .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
+                            info!(histogram.request.body.len = chunk.len(), "histogram request body length",);
+                            debug!("http body sending {} bytes in {:?}", chunk.len(), latency)
+                        })
+                        .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
+                            debug!("http stream closed after {:?}", stream_duration)
+                        })
+                        .on_failure(|_error, latency: Duration, _span: &Span| {
+                            info!(counter.rustfs_api_requests_failure_total = 1_u64, "handle request api failure total");
+                            debug!("http request failure error: {:?} in {:?}", _error, latency)
+                        }),
+                )
                 .layer(CorsLayer::permissive())
                 .service(hybrid(s3_service, rpc_service)),
         );
@@ -452,7 +451,8 @@ async fn run(opt: config::Opt) -> Result<()> {
                             let conn = http_server_clone.serve_connection(TokioIo::new(tls_socket), value_clone);
                             let conn = graceful_clone.watch(conn);
                             if let Err(err) = conn.await {
-                                error!("Https Connection error: {}", err);
+                                // Handle hyper::Error and low-level IO errors at a more granular level
+                                handle_connection_error(&*err);
                             }
                         });
                 });
@@ -467,7 +467,8 @@ async fn run(opt: config::Opt) -> Result<()> {
                     let conn = http_server_clone.serve_connection(TokioIo::new(socket), value_clone);
                     let conn = graceful_clone.watch(conn);
                     if let Err(err) = conn.await {
-                        error!("Http Connection error: {}", err);
+                        // Handle hyper::Error and low-level IO errors at a more granular level
+                        handle_connection_error(&*err);
                     }
                 });
                 debug!("Http handshake success");
@@ -583,4 +584,26 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     info!("server is stopped state: {:?}", state_manager.current_state());
     Ok(())
+}
+
+fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
+    if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+        if hyper_err.is_incomplete_message() {
+            warn!("The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err);
+        } else if hyper_err.is_closed() {
+            warn!("The HTTP connection is closed:{}", hyper_err);
+        } else if hyper_err.is_parse() {
+            error!("HTTP message parsing failed:{}", hyper_err);
+        } else if hyper_err.is_user() {
+            error!("HTTP user-custom error:{}", hyper_err);
+        } else if hyper_err.is_canceled() {
+            warn!("The HTTP connection is canceled:{}", hyper_err);
+        } else {
+            error!("Unknown hyper error:{:?}", hyper_err);
+        }
+    } else if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        error!("Unknown connection IO error:{}", io_err);
+    } else {
+        error!("Unknown connection error type:{:?}", err);
+    }
 }

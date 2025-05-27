@@ -349,9 +349,9 @@ impl FileMeta {
         self.versions.sort_by(|a, b| {
             match (a.header.mod_time, b.header.mod_time) {
                 (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // Descending order
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
             }
         });
     }
@@ -515,18 +515,18 @@ impl FileMeta {
                 continue;
             }
 
-            match ver.header.version_type {
-                VersionType::Invalid => return Err(Error::msg("invalid file meta version")),
-                VersionType::Delete => return Ok(None),
+            return match ver.header.version_type {
+                VersionType::Invalid => Err(Error::msg("invalid file meta version")),
+                VersionType::Delete => Ok(None),
                 VersionType::Object => {
                     let v = self.get_idx(i)?;
 
                     self.versions.remove(i);
 
                     let a = v.object.map(|v| v.data_dir).unwrap_or_default();
-                    return Ok(a);
+                    Ok(a)
                 }
-            }
+            };
         }
 
         Err(Error::new(DiskError::FileVersionNotFound))
@@ -1079,20 +1079,20 @@ impl PartialOrd for FileMetaVersionHeader {
 impl Ord for FileMetaVersionHeader {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.mod_time.cmp(&other.mod_time) {
-            core::cmp::Ordering::Equal => {}
+            Ordering::Equal => {}
             ord => return ord,
         }
 
         match self.version_type.cmp(&other.version_type) {
-            core::cmp::Ordering::Equal => {}
+            Ordering::Equal => {}
             ord => return ord,
         }
         match self.signature.cmp(&other.signature) {
-            core::cmp::Ordering::Equal => {}
+            Ordering::Equal => {}
             ord => return ord,
         }
         match self.version_id.cmp(&other.version_id) {
-            core::cmp::Ordering::Equal => {}
+            Ordering::Equal => {}
             ord => return ord,
         }
         self.flags.cmp(&other.flags)

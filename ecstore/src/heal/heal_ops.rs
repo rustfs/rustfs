@@ -57,18 +57,18 @@ pub type HealEntryFn =
 
 pub const BG_HEALING_UUID: &str = "0000-0000-0000-0000";
 pub const HEALING_TRACKER_FILENAME: &str = ".healing.bin";
-const KEEP_HEAL_SEQ_STATE_DURATION: std::time::Duration = Duration::from_secs(10 * 60);
+const KEEP_HEAL_SEQ_STATE_DURATION: Duration = Duration::from_secs(10 * 60);
 const HEAL_NOT_STARTED_STATUS: &str = "not started";
 const HEAL_RUNNING_STATUS: &str = "running";
 const HEAL_STOPPED_STATUS: &str = "stopped";
 const HEAL_FINISHED_STATUS: &str = "finished";
 
-pub const RUESTFS_RESERVED_BUCKET: &str = "rustfs";
-pub const RUESTFS_RESERVED_BUCKET_PATH: &str = "/rustfs";
+pub const RUSTFS_RESERVED_BUCKET: &str = "rustfs";
+pub const RUSTFS_RESERVED_BUCKET_PATH: &str = "/rustfs";
 pub const LOGIN_PATH_PREFIX: &str = "/login";
 
 const MAX_UNCONSUMED_HEAL_RESULT_ITEMS: usize = 1000;
-const HEAL_UNCONSUMED_TIMEOUT: std::time::Duration = Duration::from_secs(24 * 60 * 60);
+const HEAL_UNCONSUMED_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const NOP_HEAL: &str = "";
 
 lazy_static! {}
@@ -125,7 +125,7 @@ pub fn new_bg_heal_sequence() -> HealSequence {
     HealSequence {
         start_time: SystemTime::now(),
         client_token: BG_HEALING_UUID.to_string(),
-        bucket: RUESTFS_RESERVED_BUCKET.to_string(),
+        bucket: RUSTFS_RESERVED_BUCKET.to_string(),
         setting: hs,
         current_status: Arc::new(RwLock::new(HealSequenceStatus {
             summary: HEAL_NOT_STARTED_STATUS.to_string(),
@@ -195,12 +195,12 @@ impl Default for HealSequence {
 }
 
 impl HealSequence {
-    pub fn new(bucket: &str, obj_profix: &str, client_addr: &str, hs: HealOpts, force_start: bool) -> Self {
+    pub fn new(bucket: &str, obj_prefix: &str, client_addr: &str, hs: HealOpts, force_start: bool) -> Self {
         let client_token = Uuid::new_v4().to_string();
 
         Self {
             bucket: bucket.to_string(),
-            object: obj_profix.to_string(),
+            object: obj_prefix.to_string(),
             report_progress: true,
             client_token,
             client_address: client_addr.to_string(),
@@ -354,14 +354,14 @@ impl HealSequence {
                     self.count_failed(heal_type.clone()).await;
                 }
                 if !self.report_progress {
-                    if let Some(err) = res.err {
+                    return if let Some(err) = res.err {
                         if err.to_string() == ERR_SKIP_FILE {
                             return Ok(());
                         }
-                        return Err(err);
+                        Err(err)
                     } else {
-                        return Ok(());
-                    }
+                        Ok(())
+                    };
                 }
                 res.result.heal_item_type = heal_type.clone();
                 if let Some(err) = res.err.as_ref() {
@@ -406,7 +406,7 @@ impl HealSequence {
 
     async fn traverse_and_heal(h: Arc<HealSequence>) {
         let buckets_only = false;
-        let result = (Self::heal_items(h.clone(), buckets_only).await).err();
+        let result = Self::heal_items(h.clone(), buckets_only).await.err();
         let _ = h.traverse_and_heal_done_tx.read().await.send(result).await;
     }
 
@@ -542,12 +542,12 @@ pub async fn heal_sequence_start(h: Arc<HealSequence>) {
                 match err {
                     Some(err) => {
                         let mut current_status_w = h.current_status.write().await;
-                        (current_status_w).summary = HEAL_STOPPED_STATUS.to_string();
-                        (current_status_w).failure_detail = err.to_string();
+                        current_status_w.summary = HEAL_STOPPED_STATUS.to_string();
+                        current_status_w.failure_detail = err.to_string();
                     },
                     None => {
                         let mut current_status_w = h.current_status.write().await;
-                        (current_status_w).summary = HEAL_FINISHED_STATUS.to_string();
+                        current_status_w.summary = HEAL_FINISHED_STATUS.to_string();
                     }
                 }
             }
@@ -567,11 +567,11 @@ pub struct AllHealState {
 
 impl AllHealState {
     pub fn new(cleanup: bool) -> Arc<Self> {
-        let hstate = Arc::new(AllHealState::default());
+        let state = Arc::new(AllHealState::default());
         let (_, mut rx) = broadcast::channel(1);
         if cleanup {
-            let hstate_clone = hstate.clone();
-            tokio::spawn(async move {
+            let state_clone = state.clone();
+            spawn(async move {
                 loop {
                     select! {
                         result = rx.recv() =>{
@@ -580,14 +580,14 @@ impl AllHealState {
                             }
                         }
                         _ = sleep(Duration::from_secs(5 * 60)) => {
-                            hstate_clone.periodic_heal_seqs_clean().await;
+                            state_clone.periodic_heal_seqs_clean().await;
                         }
                     }
                 }
             });
         }
 
-        hstate
+        state
     }
 
     pub async fn pop_heal_local_disks(&self, heal_local_disks: &[Endpoint]) {
@@ -698,13 +698,13 @@ impl AllHealState {
         let _ = self.mu.write().await;
         let now = SystemTime::now();
 
-        let mut keys_to_reomve = Vec::new();
+        let mut keys_to_remove = Vec::new();
         for (k, v) in self.heal_seq_map.read().await.iter() {
             if v.has_ended().await && now.duration_since(*(v.end_time.read().await)).unwrap() > KEEP_HEAL_SEQ_STATE_DURATION {
-                keys_to_reomve.push(k.clone())
+                keys_to_remove.push(k.clone())
             }
         }
-        for key in keys_to_reomve.iter() {
+        for key in keys_to_remove.iter() {
             self.heal_seq_map.write().await.remove(key);
         }
     }
@@ -808,7 +808,7 @@ impl AllHealState {
             // For background heal do nothing, do not spawn an unnecessary goroutine.
         } else {
             let heal_sequence_clone = heal_sequence.clone();
-            tokio::spawn(async {
+            spawn(async {
                 heal_sequence_start(heal_sequence_clone).await;
             });
         }
