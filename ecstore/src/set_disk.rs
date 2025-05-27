@@ -1452,7 +1452,7 @@ impl SetDisks {
             }
         };
 
-        // check endpoint是否一致
+        // check endpoint 是否一致
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
 
@@ -1643,7 +1643,7 @@ impl SetDisks {
                             ..Default::default()
                         },
                     )
-                        .await
+                    .await
                 } else {
                     Err(Error::new(DiskError::DiskNotFound))
                 }
@@ -2232,7 +2232,7 @@ impl SetDisks {
                             object,
                             opts.scan_mode,
                         )
-                            .await?;
+                        .await?;
 
                         // info!(
                         //     "disks_with_all_parts: got available_disks: {:?}, data_errs_by_disk: {:?}, data_errs_by_part: {:?}, lastest_meta: {:?}",
@@ -2509,7 +2509,7 @@ impl SetDisks {
                                             DEFAULT_BITROT_ALGO,
                                             erasure.shard_size(erasure.block_size),
                                         )
-                                            .await?;
+                                        .await?;
 
                                         writers.push(Some(writer));
                                     } else {
@@ -2601,7 +2601,7 @@ impl SetDisks {
                                             ..Default::default()
                                         },
                                     )
-                                        .await?;
+                                    .await?;
                                 }
 
                                 for (i, v) in result.before.drives.iter().enumerate() {
@@ -3359,10 +3359,10 @@ impl SetDisks {
                     }
                     if bucket == RUSTFS_META_BUCKET
                         && (Pattern::new("buckets/*/.metacache/*")
-                        .map(|p| p.matches(&entry.name))
-                        .unwrap_or(false)
-                        || Pattern::new("tmp/.trash/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
-                        || Pattern::new("multipart/*").map(|p| p.matches(&entry.name)).unwrap_or(false))
+                            .map(|p| p.matches(&entry.name))
+                            .unwrap_or(false)
+                            || Pattern::new("tmp/.trash/*").map(|p| p.matches(&entry.name)).unwrap_or(false)
+                            || Pattern::new("multipart/*").map(|p| p.matches(&entry.name)).unwrap_or(false))
                     {
                         defer.await;
                         return;
@@ -3550,7 +3550,7 @@ impl SetDisks {
                     ..Default::default()
                 },
             )
-                .await
+            .await
             {
                 ret_err = Some(err);
             }
@@ -3601,7 +3601,7 @@ impl SetDisks {
                             ..Default::default()
                         },
                     )
-                        .await
+                    .await
                 } else {
                     Ok(())
                 }
@@ -3687,7 +3687,7 @@ impl ObjectIO for SetDisks {
                 set_index,
                 pool_index,
             )
-                .await
+            .await
             {
                 error!("get_object_with_fileinfo err {:?}", e);
             };
@@ -3814,7 +3814,7 @@ impl ObjectIO for SetDisks {
                     DEFAULT_BITROT_ALGO,
                     erasure.shard_size(erasure.block_size),
                 )
-                    .await?;
+                .await?;
 
                 writers.push(Some(writer));
             } else {
@@ -3880,7 +3880,7 @@ impl ObjectIO for SetDisks {
             object,
             write_quorum,
         )
-            .await?;
+        .await?;
 
         if let Some(old_dir) = op_old_dir {
             self.commit_rename_data_dir(&shuffle_disks, bucket, object, &old_dir.to_string(), write_quorum)
@@ -3984,9 +3984,9 @@ impl StorageAPI for SetDisks {
                 if ErasureError::ErasureReadQuorum.is(&err)
                     && !src_bucket.starts_with(RUSTFS_META_BUCKET)
                     && self
-                    .delete_if_dang_ling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
-                    .await
-                    .is_ok()
+                        .delete_if_dang_ling(src_bucket, src_object, &metas, &errs, &HashMap::new(), src_opts.clone())
+                        .await
+                        .is_ok()
                 {
                     if src_opts.version_id.is_some() {
                         err = Error::new(DiskError::FileVersionNotFound)
@@ -4266,7 +4266,7 @@ impl StorageAPI for SetDisks {
                     false,
                     false,
                 )
-                    .await?
+                .await?
             } else {
                 Self::read_all_xl(&disks, bucket, object, false, false).await
             }
@@ -4278,9 +4278,9 @@ impl StorageAPI for SetDisks {
                 if ErasureError::ErasureReadQuorum.is(&err)
                     && !bucket.starts_with(RUSTFS_META_BUCKET)
                     && self
-                    .delete_if_dang_ling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
-                    .await
-                    .is_ok()
+                        .delete_if_dang_ling(bucket, object, &metas, &errs, &HashMap::new(), opts.clone())
+                        .await
+                        .is_ok()
                 {
                     if opts.version_id.is_some() {
                         err = Error::new(DiskError::FileVersionNotFound)
@@ -4446,7 +4446,7 @@ impl StorageAPI for SetDisks {
                         DEFAULT_BITROT_ALGO,
                         shared_size,
                     )
-                        .await
+                    .await
                     {
                         Ok(writer) => Ok(Some(writer)),
                         Err(e) => Err(e),
@@ -4502,7 +4502,7 @@ impl StorageAPI for SetDisks {
             fi_buff,
             write_quorum,
         )
-            .await?;
+        .await?;
 
         let ret: PartInfo = PartInfo {
             etag: Some(etag.clone()),
@@ -4758,8 +4758,8 @@ impl StorageAPI for SetDisks {
             &parts_metadatas,
             write_quorum,
         )
-            .await
-            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+        .await
+        .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
         // evalDisks
 
@@ -5007,7 +5007,7 @@ impl StorageAPI for SetDisks {
             object,
             write_quorum,
         )
-            .await?;
+        .await?;
 
         for (i, op_disk) in online_disks.iter().enumerate() {
             if let Some(disk) = op_disk {
@@ -5428,7 +5428,7 @@ async fn disks_with_all_parts(
                     checksum_info.hash,
                     meta.erasure.shard_size(meta.erasure.block_size),
                 )
-                    .await)
+                .await)
                     .err();
 
                 if let Some(vec) = data_errs_by_part.get_mut(&0) {
@@ -5890,7 +5890,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 4,
                 parity_blocks: 2,
-                index: 1, // Must be > 0 for is_valid() to return true
+                index: 1,                             // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3, 4, 5, 6], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -5902,7 +5902,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 6,
                 parity_blocks: 3,
-                index: 1, // Must be > 0 for is_valid() to return true
+                index: 1,                                      // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -5914,7 +5914,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 2,
                 parity_blocks: 1,
-                index: 1, // Must be > 0 for is_valid() to return true
+                index: 1,                    // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3], // Must match data_blocks + parity_blocks
                 ..Default::default()
             },
@@ -6019,11 +6019,7 @@ mod tests {
     #[test]
     fn test_join_errs() {
         // Test joining error messages
-        let errs = vec![
-            None,
-            Some(Error::from_string("error1")),
-            Some(Error::from_string("error2")),
-        ];
+        let errs = vec![None, Some(Error::from_string("error1")), Some(Error::from_string("error2"))];
         let joined = join_errs(&errs);
         assert!(joined.contains("<nil>"));
         assert!(joined.contains("error1"));
