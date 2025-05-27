@@ -309,7 +309,6 @@ pub enum AwsKeyName {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::Error;
     use serde::Deserialize;
     use test_case::test_case;
 
@@ -330,7 +329,7 @@ mod tests {
     #[test_case("ldap:us")]
     #[test_case("DurationSeconds")]
     fn key_name_from_str_failed(val: &str) {
-        assert_eq!(KeyName::try_from(val), Err(Error::InvalidKeyName(val.to_string())));
+        assert_eq!(KeyName::try_from(val), Err(InvalidKeyName(val.to_string())));
     }
 
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]

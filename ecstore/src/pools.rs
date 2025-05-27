@@ -127,7 +127,7 @@ impl PoolMeta {
         }
 
         let mut buf = Deserializer::new(Cursor::new(&data[4..]));
-        let meta: PoolMeta = Deserialize::deserialize(&mut buf).unwrap();
+        let meta: PoolMeta = Deserialize::deserialize(&mut buf)?;
         *self = meta;
 
         if self.version != POOL_META_VERSION {
@@ -141,8 +141,8 @@ impl PoolMeta {
             return Ok(());
         }
         let mut data = Vec::new();
-        data.write_u16::<LittleEndian>(POOL_META_FORMAT).unwrap();
-        data.write_u16::<LittleEndian>(POOL_META_VERSION).unwrap();
+        data.write_u16::<LittleEndian>(POOL_META_FORMAT)?;
+        data.write_u16::<LittleEndian>(POOL_META_VERSION)?;
         let mut buf = Vec::new();
         self.serialize(&mut Serializer::new(&mut buf))?;
         data.write_all(&buf)?;

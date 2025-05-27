@@ -174,9 +174,9 @@ async fn license_handler() -> impl IntoResponse {
         .unwrap()
 }
 
-fn _is_private_ip(ip: std::net::IpAddr) -> bool {
+fn _is_private_ip(ip: IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(ip) => {
+        IpAddr::V4(ip) => {
             let octets = ip.octets();
             // 10.0.0.0/8
             octets[0] == 10 ||
@@ -185,7 +185,7 @@ fn _is_private_ip(ip: std::net::IpAddr) -> bool {
                 // 192.168.0.0/16
                 (octets[0] == 192 && octets[1] == 168)
         }
-        std::net::IpAddr::V6(_) => false,
+        IpAddr::V6(_) => false,
     }
 }
 

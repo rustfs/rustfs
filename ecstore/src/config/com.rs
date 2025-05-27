@@ -119,14 +119,14 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
     let data = match read_config(api.clone(), config_file.as_str()).await {
         Ok(res) => res,
         Err(err) => {
-            if is_err_config_not_found(&err) {
+            return if is_err_config_not_found(&err) {
                 warn!("config not found, start to init");
                 let cfg = new_and_save_server_config(api).await?;
                 warn!("config init done");
-                return Ok(cfg);
+                Ok(cfg)
             } else {
                 error!("read config err {:?}", &err);
-                return Err(err);
+                Err(err)
             }
         }
     };
@@ -141,14 +141,14 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
             let cfg_data = match read_config(api.clone(), config_file.as_str()).await {
                 Ok(res) => res,
                 Err(err) => {
-                    if is_err_config_not_found(&err) {
+                    return if is_err_config_not_found(&err) {
                         warn!("config not found init start");
                         let cfg = new_and_save_server_config(api).await?;
                         warn!("config not found init done");
-                        return Ok(cfg);
+                        Ok(cfg)
                     } else {
                         error!("read config err {:?}", &err);
-                        return Err(err);
+                        Err(err)
                     }
                 }
             };
@@ -189,10 +189,9 @@ async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> R
 async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()> {
     let set_drive_counts = api.set_drive_counts();
     if subsys == STORAGE_CLASS_SUB_SYS {
-        let kvs = match cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY) {
-            Some(res) => res,
-            None => KVS::new(),
-        };
+        let kvs = cfg
+            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY)
+            .unwrap_or_else(|| KVS::new());
 
         for (i, count) in set_drive_counts.iter().enumerate() {
             match storageclass::lookup_config(&kvs, *count) {

@@ -241,7 +241,7 @@ impl ReplicationAllStats {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageEntry {
     pub children: DataUsageHashMap,
-    // These fields do no include any children.
+    // These fields do not include any children.
     pub size: usize,
     pub objects: usize,
     pub versions: usize,

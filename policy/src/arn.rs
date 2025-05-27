@@ -17,7 +17,7 @@ pub struct ARN {
 
 impl ARN {
     pub fn new_iam_role_arn(resource_id: &str, server_region: &str) -> Result<Self> {
-        let valid_resource_id_regex = Regex::new(r"^[A-Za-z0-9_/\.-]+$").unwrap();
+        let valid_resource_id_regex = Regex::new(r"^[A-Za-z0-9_/\.-]+$")?;
         if !valid_resource_id_regex.is_match(resource_id) {
             return Err(Error::msg("ARN resource ID invalid"));
         }
@@ -57,7 +57,7 @@ impl ARN {
             return Err(Error::msg("ARN resource type invalid"));
         }
 
-        let valid_resource_id_regex = Regex::new(r"^[A-Za-z0-9_/\.-]+$").unwrap();
+        let valid_resource_id_regex = Regex::new(r"^[A-Za-z0-9_/\.-]+$")?;
         if !valid_resource_id_regex.is_match(res[1]) {
             return Err(Error::msg("ARN resource ID invalid"));
         }

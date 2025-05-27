@@ -92,7 +92,7 @@ impl Output {
 }
 
 impl Stream for Output {
-    type Item = std::result::Result<RecordBatch, QueryError>;
+    type Item = Result<RecordBatch, QueryError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();

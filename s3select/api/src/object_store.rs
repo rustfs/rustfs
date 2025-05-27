@@ -203,7 +203,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ConvertStream<R> {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    ) -> Poll<std::io::Result<()>> {
         let me = self.project();
         ready!(Pin::new(&mut *me.inner).poll_read(cx, buf))?;
         let bytes = buf.filled();

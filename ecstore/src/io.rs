@@ -27,14 +27,14 @@ pub const READ_BUFFER_SIZE: usize = 1024 * 1024;
 #[derive(Debug)]
 pub struct HttpFileWriter {
     wd: tokio::io::DuplexStream,
-    err_rx: oneshot::Receiver<std::io::Error>,
+    err_rx: oneshot::Receiver<io::Error>,
 }
 
 impl HttpFileWriter {
-    pub fn new(url: &str, disk: &str, volume: &str, path: &str, size: usize, append: bool) -> std::io::Result<Self> {
+    pub fn new(url: &str, disk: &str, volume: &str, path: &str, size: usize, append: bool) -> io::Result<Self> {
         let (rd, wd) = tokio::io::duplex(READ_BUFFER_SIZE);
 
-        let (err_tx, err_rx) = oneshot::channel::<std::io::Error>();
+        let (err_tx, err_rx) = oneshot::channel::<io::Error>();
 
         let body = reqwest::Body::wrap_stream(ReaderStream::with_capacity(rd, READ_BUFFER_SIZE));
 
@@ -58,7 +58,7 @@ impl HttpFileWriter {
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
             {
                 error!("HttpFileWriter put file err: {:?}", err);
 
@@ -74,11 +74,7 @@ impl HttpFileWriter {
 
 impl AsyncWrite for HttpFileWriter {
     #[tracing::instrument(level = "debug", skip(self, buf))]
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
         if let Ok(err) = self.as_mut().err_rx.try_recv() {
             return Poll::Ready(Err(err));
         }
@@ -87,12 +83,12 @@ impl AsyncWrite for HttpFileWriter {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::result::Result<(), std::io::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.wd).poll_flush(cx)
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::result::Result<(), std::io::Error>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.wd).poll_shutdown(cx)
     }
 }
@@ -102,7 +98,7 @@ pub struct HttpFileReader {
 }
 
 impl HttpFileReader {
-    pub async fn new(url: &str, disk: &str, volume: &str, path: &str, offset: usize, length: usize) -> std::io::Result<Self> {
+    pub async fn new(url: &str, disk: &str, volume: &str, path: &str, offset: usize, length: usize) -> io::Result<Self> {
         let resp = reqwest::Client::new()
             .get(format!(
                 "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
@@ -115,16 +111,16 @@ impl HttpFileReader {
             ))
             .send()
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        let inner = Box::new(StreamReader::new(resp.bytes_stream().map_err(std::io::Error::other)));
+        let inner = Box::new(StreamReader::new(resp.bytes_stream().map_err(io::Error::other)));
 
         Ok(Self { inner })
     }
 }
 
 impl AsyncRead for HttpFileReader {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -172,7 +168,7 @@ impl<R: Send> Etag for EtagReader<R> {
 
 impl<R: AsyncRead + Unpin> AsyncRead for EtagReader<R> {
     #[tracing::instrument(level = "info", skip_all)]
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<tokio::io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let me = self.project();
 
         loop {
