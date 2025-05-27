@@ -33,9 +33,4 @@ pub use event::{Bucket, Event, EventBuilder, Identity, Log, Metadata, Name, Obje
 pub use global::{initialize, is_initialized, is_ready, send_event, shutdown};
 pub use notifier::NotifierSystem;
 pub use store::event::EventStore;
-
-pub use store::get_event_notifier_config;
 pub use store::queue::QueueStore;
-
-pub use store::EventSys;
-pub use store::GLOBAL_EventSys;

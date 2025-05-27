@@ -1153,7 +1153,11 @@ mod tests {
         assert_eq!(file_info.get_etag(), None);
 
         // With etag
-        file_info.metadata.as_mut().unwrap().insert("etag".to_string(), "test-etag".to_string());
+        file_info
+            .metadata
+            .as_mut()
+            .unwrap()
+            .insert("etag".to_string(), "test-etag".to_string());
         assert_eq!(file_info.get_etag(), Some("test-etag".to_string()));
     }
 
@@ -1282,10 +1286,7 @@ mod tests {
         file_info.set_healing();
 
         assert!(file_info.metadata.is_some());
-        assert_eq!(
-            file_info.metadata.as_ref().unwrap().get(RUSTFS_HEALING),
-            Some(&"true".to_string())
-        );
+        assert_eq!(file_info.metadata.as_ref().unwrap().get(RUSTFS_HEALING), Some(&"true".to_string()));
     }
 
     #[test]
@@ -1656,10 +1657,11 @@ mod tests {
         assert!(!object_info.is_compressed());
 
         // With compression metadata
-        object_info.user_defined.as_mut().unwrap().insert(
-            format!("{}compression", RESERVED_METADATA_PREFIX),
-            "gzip".to_string()
-        );
+        object_info
+            .user_defined
+            .as_mut()
+            .unwrap()
+            .insert(format!("{}compression", RESERVED_METADATA_PREFIX), "gzip".to_string());
         assert!(object_info.is_compressed());
     }
 
@@ -1866,7 +1868,7 @@ mod tests {
         let shard_size = erasure.shard_size(1000);
         assert_eq!(shard_size, 1000); // 1000 / 1 = 1000
 
-                // Test with zero block size - this will cause division by zero in shard_size
+        // Test with zero block size - this will cause division by zero in shard_size
         // So we need to test with non-zero block_size but zero data_blocks was already fixed above
         let erasure = ErasureInfo {
             data_blocks: 4,

@@ -1,20 +1,26 @@
+use crate::config::STORE_PREFIX;
 use crate::store::queue::Store;
 use crate::WebhookConfig;
 use crate::{ChannelAdapter, ChannelAdapterType};
 use crate::{Error, QueueStore};
 use crate::{Event, DEFAULT_RETRY_INTERVAL};
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{self, Client, Identity, RequestBuilder};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use ChannelAdapterType::Webhook;
 
 /// Webhook adapter for sending events to a webhook endpoint.
 pub struct WebhookAdapter {
+    /// Configuration information
     config: WebhookConfig,
+    /// Event storage queues
     store: Option<Arc<QueueStore<Event>>>,
+    /// HTTP client
     client: Client,
 }
 
@@ -65,12 +71,25 @@ impl WebhookAdapter {
         } else {
             builder.build()
         }
-        .expect("Failed to create HTTP client");
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to create HTTP client: {}", e);
+            reqwest::Client::new()
+        });
 
         // create a queue store if enabled
         let store = if !config.common.queue_dir.len() > 0 {
-            let store_path = PathBuf::from(&config.common.queue_dir);
-            let store = QueueStore::new(store_path, config.common.queue_limit, Some(".webhook".to_string()));
+            let store_path = PathBuf::from(&config.common.queue_dir).join(format!(
+                "{}-{}-{}",
+                STORE_PREFIX,
+                Webhook.as_str(),
+                config.common.identifier
+            ));
+            let queue_limit = if config.common.queue_limit > 0 {
+                config.common.queue_limit
+            } else {
+                crate::config::default_queue_limit()
+            };
+            let store = QueueStore::new(store_path, queue_limit, Some(".event".to_string()));
             if let Err(e) = store.open() {
                 tracing::error!("Unable to open queue storage: {}", e);
                 None
@@ -94,16 +113,22 @@ impl WebhookAdapter {
                         for event in events {
                             if let Err(e) = self.send_with_retry(&event).await {
                                 tracing::error!("Processing of backlog events failed: {}", e);
-                                continue;
+                                // If it still fails, we remain in the queue
+                                break;
                             }
                         }
                         // Deleted after successful processing
-                        let _ = store.del(&key);
+                        if let Err(e) = store.del(&key) {
+                            tracing::error!("Failed to delete a handled event: {}", e);
+                        }
                     }
                     Err(e) => {
                         tracing::error!("Failed to read events from storage: {}", e);
                         // delete the broken entries
-                        let _ = store.del(&key);
+                        // If the event cannot be read, it may be corrupted, delete it
+                        if let Err(del_err) = store.del(&key) {
+                            tracing::error!("Failed to delete a corrupted event: {}", del_err);
+                        }
                     }
                 }
             }
@@ -146,11 +171,20 @@ impl WebhookAdapter {
     /// Send a single HTTP request
     async fn send_request(&self, event: &Event) -> Result<(), Error> {
         // Send a request
-        let response = self.build_request(event).send().await?;
+        let response = self
+            .build_request(event)
+            .send()
+            .await
+            .map_err(|e| Error::Custom(format!("Sending a webhook request failed:{}", e)))?;
 
         // Check the response status
         if !response.status().is_success() {
-            return Err(Error::Custom(format!("Webhook request failed, status code:{}", response.status())));
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unable to read response body".to_string());
+            return Err(Error::Custom(format!("Webhook request failed, status code:{},response:{}", status, body)));
         }
 
         Ok(())
@@ -172,18 +206,32 @@ impl WebhookAdapter {
             }
         }
         if let Some(headers) = &self.config.custom_headers {
+            let mut header_map = HeaderMap::new();
             for (key, value) in headers {
-                request = request.header(key, value);
+                if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(key.as_bytes()), HeaderValue::from_str(value)) {
+                    header_map.insert(name, val);
+                }
             }
+            request = request.headers(header_map);
         }
         request
+    }
+
+    /// Save the event to the queue
+    async fn save_to_queue(&self, event: &Event) -> Result<(), Error> {
+        if let Some(store) = &self.store {
+            store
+                .put(event.clone())
+                .map_err(|e| Error::Custom(format!("Saving events to queue failed: {}", e)))?;
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl ChannelAdapter for WebhookAdapter {
     fn name(&self) -> String {
-        ChannelAdapterType::Webhook.to_string()
+        Webhook.to_string()
     }
 
     async fn send(&self, event: &Event) -> Result<(), Error> {
@@ -191,6 +239,17 @@ impl ChannelAdapter for WebhookAdapter {
         let _ = self.process_backlog().await;
 
         // Send the current event
-        self.send_with_retry(event).await
+        match self.send_with_retry(event).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // If the send fails and the queue is enabled, save to the queue
+                if let Some(_) = &self.store {
+                    tracing::warn!("Failed to send the event and saved to the queue: {}", e);
+                    self.save_to_queue(event).await?;
+                    return Ok(());
+                }
+                Err(e)
+            }
+        }
     }
 }

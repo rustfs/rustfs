@@ -192,7 +192,7 @@ where
 
     /// Write the object to a file
     fn write_object(&self, key: &Key, item: &T) -> Result<()> {
-        // 序列化对象
+        // Serialize the object
         let data = serde_json::to_vec(item)?;
         self.write_bytes(key, &data)
     }
@@ -213,7 +213,7 @@ where
         let path = self.directory.join(key.to_string());
 
         let file_data = if key.compress {
-            // 使用 snap 压缩数据
+            // Use snap to compress data
             let mut encoder = Encoder::new();
             encoder
                 .compress_vec(data)
@@ -271,7 +271,10 @@ where
         // Read existing files
         let files = self.list_files()?;
 
-        let mut entries = self.entries.write().map_err(|_| Error::msg("获取写锁失败"))?;
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| Error::msg("Failed to obtain a write lock"))?;
 
         for file in files {
             if let Ok(meta) = file.metadata() {
@@ -293,7 +296,7 @@ where
 
     fn put(&self, item: T) -> Result<Key> {
         {
-            let entries = self.entries.read().map_err(|_| Error::msg("获取读锁失败"))?;
+            let entries = self.entries.read().map_err(|_| Error::msg("Failed to obtain a read lock"))?;
             if entries.len() as u64 >= self.entry_limit {
                 return Err(Error::msg("The storage limit has been reached"));
             }
@@ -314,7 +317,7 @@ where
         }
 
         {
-            let entries = self.entries.read().map_err(|_| Error::msg("获取读锁失败"))?;
+            let entries = self.entries.read().map_err(|_| Error::msg("Failed to obtain a read lock"))?;
             if entries.len() as u64 >= self.entry_limit {
                 return Err(Error::msg("The storage limit has been reached"));
             }
@@ -397,7 +400,7 @@ where
 
     fn put_raw(&self, data: &[u8]) -> Result<Key> {
         {
-            let entries = self.entries.read().map_err(|_| Error::msg("获取读锁失败"))?;
+            let entries = self.entries.read().map_err(|_| Error::msg("Failed to obtain a read lock"))?;
             if entries.len() as u64 >= self.entry_limit {
                 return Err(Error::msg("the storage limit has been reached"));
             }
@@ -441,7 +444,10 @@ where
         }
 
         // Remove the entry from the map
-        let mut entries = self.entries.write().map_err(|_| Error::msg("获取写锁失败"))?;
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| Error::msg("Failed to obtain a write lock"))?;
         entries.remove(&key.to_string());
 
         Ok(())

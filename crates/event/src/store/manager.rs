@@ -1,5 +1,4 @@
-use crate::store::{CONFIG_FILE, EVENT};
-use crate::{adapter, ChannelAdapter, EventNotifierConfig, WebhookAdapter};
+use crate::{adapter, ChannelAdapter, EventNotifierConfig};
 use common::error::{Error, Result};
 use ecstore::config::com::{read_config, save_config, CONFIG_PREFIX};
 use ecstore::disk::RUSTFS_META_BUCKET;
@@ -11,6 +10,12 @@ use once_cell::sync::Lazy;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::instrument;
+
+/// * config file
+const CONFIG_FILE: &str = "event.json";
+
+/// event sys config
+const EVENT: &str = "event";
 
 /// Global storage API access point
 pub static GLOBAL_STORE_API: Lazy<Mutex<Option<Arc<ECStore>>>> = Lazy::new(|| Mutex::new(None));
@@ -44,8 +49,11 @@ impl EventManager {
     pub async fn init(&self) -> Result<EventNotifierConfig> {
         tracing::info!("Event system configuration initialization begins");
 
-        let cfg = match read_event_config(self.api.clone()).await {
-            Ok(cfg) => cfg,
+        let cfg = match read_config_without_migrate(self.api.clone()).await {
+            Ok(cfg) => {
+                tracing::info!("The event system configuration was successfully read");
+                cfg
+            }
             Err(err) => {
                 tracing::error!("Failed to initialize the event system configuration:{:?}", err);
                 return Err(err);
@@ -53,6 +61,7 @@ impl EventManager {
         };
 
         *GLOBAL_EVENT_CONFIG.lock().await = Some(cfg.clone());
+
         tracing::info!("The initialization of the event system configuration is complete");
 
         Ok(cfg)
@@ -152,59 +161,20 @@ impl EventManager {
             None => return Err(Error::msg("The global configuration is not initialized")),
         };
 
-        let mut adapters: Vec<Arc<dyn ChannelAdapter>> = Vec::new();
-
-        // Create a webhook adapter
-        for (_, webhook_config) in &config.webhook {
-            if webhook_config.common.enable {
-                #[cfg(feature = "webhook")]
-                {
-                    adapters.push(Arc::new(WebhookAdapter::new(webhook_config.clone())));
-                }
-
-                #[cfg(not(feature = "webhook"))]
-                {
-                    return Err(Error::msg("The webhook feature is not enabled"));
-                }
+        let adapter_configs = config.to_adapter_configs();
+        match adapter::create_adapters(&adapter_configs) {
+            Ok(adapters) => Ok(adapters),
+            Err(err) => {
+                tracing::error!("Failed to create adapters: {:?}", err);
+                Err(Error::from(err))
             }
         }
-
-        // Create a Kafka adapter
-        for (_, kafka_config) in &config.kafka {
-            if kafka_config.common.enable {
-                #[cfg(all(feature = "kafka", target_os = "linux"))]
-                {
-                    match KafkaAdapter::new(kafka_config.clone()) {
-                        Ok(adapter) => adapters.push(Arc::new(adapter)),
-                        Err(e) => tracing::error!("Failed to create a Kafka adapter:{}", e),
-                    }
-                }
-
-                #[cfg(any(not(feature = "kafka"), not(target_os = "linux")))]
-                {
-                    return Err(Error::msg("Kafka functionality is not enabled or is not a Linux environment"));
-                }
-            }
-        }
-
-        // Create an MQTT adapter
-        for (_, mqtt_config) in &config.mqtt {
-            if mqtt_config.common.enable {
-                #[cfg(feature = "mqtt")]
-                {
-                    // Implement MQTT adapter creation logic
-                    // ...
-                }
-
-                #[cfg(not(feature = "mqtt"))]
-                {
-                    return Err(Error::msg("MQTT The feature is not enabled"));
-                }
-            }
-        }
-
-        Ok(adapters)
     }
+}
+
+/// Get the Global Storage API
+pub async fn get_global_store_api() -> Option<Arc<ECStore>> {
+    GLOBAL_STORE_API.lock().await.clone()
 }
 
 /// Get the Global Storage API
@@ -213,7 +183,7 @@ pub async fn get_global_event_config() -> Option<EventNotifierConfig> {
 }
 
 /// Read event configuration
-async fn read_event_config(api: Arc<ECStore>) -> Result<EventNotifierConfig> {
+async fn read_event_config<S: StorageAPI>(api: Arc<S>) -> Result<EventNotifierConfig> {
     let config_file = get_event_config_file();
     let data = read_config(api, &config_file).await?;
 
@@ -221,7 +191,7 @@ async fn read_event_config(api: Arc<ECStore>) -> Result<EventNotifierConfig> {
 }
 
 /// Save the event configuration
-async fn save_event_config(api: Arc<ECStore>, config: &EventNotifierConfig) -> Result<()> {
+async fn save_event_config<S: StorageAPI>(api: Arc<S>, config: &EventNotifierConfig) -> Result<()> {
     let config_file = get_event_config_file();
     let data = config.marshal()?;
 
@@ -231,6 +201,38 @@ async fn save_event_config(api: Arc<ECStore>, config: &EventNotifierConfig) -> R
 
 /// Get the event profile path
 fn get_event_config_file() -> String {
-    // "event/config.json".to_string()
     format!("{}{}{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, EVENT, SLASH_SEPARATOR, CONFIG_FILE)
+}
+
+/// Read the configuration file and create a default configuration if it doesn't exist
+pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<EventNotifierConfig> {
+    let config_file = get_event_config_file();
+    let data = match read_config(api.clone(), &config_file).await {
+        Ok(data) => {
+            if data.is_empty() {
+                return new_and_save_event_config(api).await;
+            }
+            data
+        }
+        Err(err) if ecstore::config::error::is_err_config_not_found(&err) => {
+            tracing::warn!("If the configuration file does not exist, start initializing the default configuration");
+            return new_and_save_event_config(api).await;
+        }
+        Err(err) => {
+            tracing::error!("Read configuration file error: {:?}", err);
+            return Err(err);
+        }
+    };
+
+    // Parse configuration
+    let cfg = EventNotifierConfig::unmarshal(&data)?;
+    Ok(cfg)
+}
+
+/// Create and save a new configuration
+async fn new_and_save_event_config<S: StorageAPI>(api: Arc<S>) -> Result<EventNotifierConfig> {
+    let cfg = EventNotifierConfig::default();
+    save_event_config(api, &cfg).await?;
+
+    Ok(cfg)
 }

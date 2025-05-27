@@ -9,7 +9,7 @@ use tracing::info;
 const DEFAULT_CONFIG_FILE: &str = "event";
 
 /// The prefix for the configuration file
-pub(crate) const STORE_PREFIX: &str = "rustfs";
+pub const STORE_PREFIX: &str = "rustfs";
 
 /// The default retry interval for the webhook adapter
 pub const DEFAULT_RETRY_INTERVAL: u64 = 3;
@@ -371,7 +371,7 @@ fn default_queue_dir() -> String {
 }
 
 /// Provides the recommended default channel capacity for high concurrency systems
-fn default_queue_limit() -> u64 {
+pub(crate) fn default_queue_limit() -> u64 {
     env::var("EVENT_CHANNEL_CAPACITY")
         .unwrap_or_else(|_| "10000".to_string())
         .parse()
@@ -404,7 +404,7 @@ impl EventNotifierConfig {
         // The existing implementation remains the same, but returns EventNotifierConfig
         // ...
 
-        EventNotifierConfig::default()
+        Self::default()
     }
 
     /// Deserialization configuration
