@@ -247,11 +247,7 @@ mod tests {
 
     #[test]
     fn test_acc_elem_avg_zero_total() {
-        let elem = AccElem {
-            total: 0,
-            size: 0,
-            n: 5,
-        };
+        let elem = AccElem { total: 0, size: 0, n: 5 };
 
         let avg = elem.avg();
         assert_eq!(avg, Duration::from_secs(0));
@@ -464,7 +460,8 @@ mod tests {
         let mut latency = LastMinuteLatency::default();
 
         // Test that indices wrap around correctly
-        for sec in 0..120 { // Test for 2 minutes
+        for sec in 0..120 {
+            // Test for 2 minutes
             let acc_elem = AccElem {
                 total: sec,
                 size: 0,
@@ -482,7 +479,14 @@ mod tests {
         let mut latency = LastMinuteLatency::default();
 
         // Add data at time 1000
-        latency.add_all(1000, &AccElem { total: 10, size: 0, n: 1 });
+        latency.add_all(
+            1000,
+            &AccElem {
+                total: 10,
+                size: 0,
+                n: 1,
+            },
+        );
 
         // Forward to time 1030 (30 seconds later)
         latency.forward_to(1030);
@@ -637,9 +641,21 @@ mod tests {
         latency.last_sec = current_time;
 
         // Add data to multiple slots
-        latency.totals[0] = AccElem { total: 10, size: 100, n: 1 };
-        latency.totals[1] = AccElem { total: 20, size: 200, n: 2 };
-        latency.totals[59] = AccElem { total: 30, size: 300, n: 3 };
+        latency.totals[0] = AccElem {
+            total: 10,
+            size: 100,
+            n: 1,
+        };
+        latency.totals[1] = AccElem {
+            total: 20,
+            size: 200,
+            n: 2,
+        };
+        latency.totals[59] = AccElem {
+            total: 30,
+            size: 300,
+            n: 3,
+        };
 
         let total = latency.get_total();
 
@@ -653,29 +669,20 @@ mod tests {
         // Test that window index calculation works correctly
         let _latency = LastMinuteLatency::default();
 
-        let acc_elem = AccElem {
-            total: 1,
-            size: 1,
-            n: 1,
-        };
+        let acc_elem = AccElem { total: 1, size: 1, n: 1 };
 
         // Test various timestamps
-        let test_cases = [
-            (0, 0),
-            (1, 1),
-            (59, 59),
-            (60, 0),
-            (61, 1),
-            (119, 59),
-            (120, 0),
-        ];
+        let test_cases = [(0, 0), (1, 1), (59, 59), (60, 0), (61, 1), (119, 59), (120, 0)];
 
         for (timestamp, expected_idx) in test_cases {
             let mut test_latency = LastMinuteLatency::default();
             test_latency.add_all(timestamp, &acc_elem);
 
-            assert_eq!(test_latency.totals[expected_idx].n, 1,
-                "Failed for timestamp {} (expected index {})", timestamp, expected_idx);
+            assert_eq!(
+                test_latency.totals[expected_idx].n, 1,
+                "Failed for timestamp {} (expected index {})",
+                timestamp, expected_idx
+            );
         }
     }
 

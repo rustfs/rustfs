@@ -104,7 +104,7 @@ mod tests {
         assert!(std::mem::size_of::<DefaultParser>() == 0, "Parser should be zero-sized");
     }
 
-        #[test]
+    #[test]
     fn test_default_parser_simple_select() {
         let parser = DefaultParser::default();
         let sql = "SELECT * FROM S3Object";
@@ -119,11 +119,11 @@ mod tests {
         match &statements[0] {
             ExtStatement::SqlStatement(_) => {
                 // Successfully parsed as SQL statement
-            },
+            }
         }
     }
 
-            #[test]
+    #[test]
     fn test_default_parser_select_with_columns() {
         let parser = DefaultParser::default();
         let sql = "SELECT id, name, age FROM S3Object";
@@ -137,11 +137,11 @@ mod tests {
         match &statements[0] {
             ExtStatement::SqlStatement(_) => {
                 // Successfully parsed as SQL statement
-            },
+            }
         }
     }
 
-        #[test]
+    #[test]
     fn test_default_parser_select_with_where() {
         let parser = DefaultParser::default();
         let sql = "SELECT * FROM S3Object WHERE age > 25";
@@ -155,7 +155,7 @@ mod tests {
         match &statements[0] {
             ExtStatement::SqlStatement(_) => {
                 // Successfully parsed as SQL statement
-            },
+            }
         }
     }
 
@@ -248,7 +248,7 @@ mod tests {
         assert!(result.is_ok(), "ExtParser::new_with_dialect should work");
     }
 
-        #[test]
+    #[test]
     fn test_ext_parser_complex_query() {
         let sql = "SELECT id, name, age FROM S3Object WHERE age > 25 AND department = 'IT' ORDER BY age DESC LIMIT 10";
 
@@ -261,11 +261,11 @@ mod tests {
         match &statements[0] {
             ExtStatement::SqlStatement(_) => {
                 // Successfully parsed as SQL statement
-            },
+            }
         }
     }
 
-        #[test]
+    #[test]
     fn test_ext_parser_aggregate_functions() {
         let sql = "SELECT COUNT(*), AVG(age), MAX(salary) FROM S3Object GROUP BY department";
 
@@ -278,7 +278,7 @@ mod tests {
         match &statements[0] {
             ExtStatement::SqlStatement(_) => {
                 // Successfully parsed as SQL statement
-            },
+            }
         }
     }
 
@@ -348,14 +348,14 @@ mod tests {
         assert_eq!(statements.len(), 1, "Should have exactly one statement");
     }
 
-        #[test]
+    #[test]
     fn test_ext_parser_error_handling() {
         let invalid_sqls = vec![
-            "SELECT FROM",  // Missing column list
-            "SELECT * FROM",  // Missing table name
-            "SELECT * FROM S3Object WHERE",  // Incomplete WHERE clause
-            "SELECT * FROM S3Object GROUP",  // Incomplete GROUP BY
-            "SELECT * FROM S3Object ORDER",  // Incomplete ORDER BY
+            "SELECT FROM",                  // Missing column list
+            "SELECT * FROM",                // Missing table name
+            "SELECT * FROM S3Object WHERE", // Incomplete WHERE clause
+            "SELECT * FROM S3Object GROUP", // Incomplete GROUP BY
+            "SELECT * FROM S3Object ORDER", // Incomplete ORDER BY
         ];
 
         for sql in invalid_sqls {
@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(statements.len(), 1, "Should have exactly one statement");
     }
 
-        #[test]
+    #[test]
     fn test_parser_err_macro() {
         let error: Result<()> = parser_err!("Test error message");
         assert!(error.is_err(), "parser_err! macro should create error");
@@ -410,7 +410,7 @@ mod tests {
         match error {
             Err(ParserError::ParserError(msg)) => {
                 assert_eq!(msg, "Test error message", "Error message should match");
-            },
+            }
             _ => panic!("Expected ParserError::ParserError"),
         }
     }
@@ -428,7 +428,7 @@ mod tests {
             Err(ParserError::ParserError(msg)) => {
                 assert!(msg.contains("Expected test token"), "Error should contain expected message");
                 assert!(msg.contains("found: found token"), "Error should contain found message");
-            },
+            }
             _ => panic!("Expected ParserError::ParserError"),
         }
     }

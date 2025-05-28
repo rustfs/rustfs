@@ -374,9 +374,9 @@ fn check_quorum_locked(locks: &[String], quorum: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_locker::LocalLocker;
     use async_trait::async_trait;
     use common::error::{Error, Result};
-    use crate::local_locker::LocalLocker;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -776,11 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drw_mutex_multiple_resources() {
-        let names = vec![
-            "resource1".to_string(),
-            "resource2".to_string(),
-            "resource3".to_string(),
-        ];
+        let names = vec!["resource1".to_string(), "resource2".to_string(), "resource3".to_string()];
         let lockers = create_mock_lockers(1);
         let mut mutex = DRWMutex::new("owner1".to_string(), names.clone(), lockers);
 
@@ -884,8 +880,8 @@ mod tests {
         // Case 1: Even number of lockers
         let locks = vec!["uid1".to_string(), "uid2".to_string(), "uid3".to_string(), "uid4".to_string()];
         let tolerance = 2; // locks.len() / 2 = 4 / 2 = 2
-        // locks.len() - tolerance = 4 - 2 = 2, which equals tolerance
-        // So the special case applies: un_locks_failed >= tolerance
+                           // locks.len() - tolerance = 4 - 2 = 2, which equals tolerance
+                           // So the special case applies: un_locks_failed >= tolerance
 
         // All 4 failed unlocks
         assert!(check_failed_unlocks(&locks, tolerance)); // 4 >= 2 = true
@@ -901,8 +897,8 @@ mod tests {
         // Case 2: Odd number of lockers
         let locks = vec!["uid1".to_string(), "uid2".to_string(), "uid3".to_string()];
         let tolerance = 1; // locks.len() / 2 = 3 / 2 = 1
-        // locks.len() - tolerance = 3 - 1 = 2, which does NOT equal tolerance (1)
-        // So the normal case applies: un_locks_failed > tolerance
+                           // locks.len() - tolerance = 3 - 1 = 2, which does NOT equal tolerance (1)
+                           // So the normal case applies: un_locks_failed > tolerance
 
         // 3 failed unlocks
         assert!(check_failed_unlocks(&locks, tolerance)); // 3 > 1 = true
@@ -946,11 +942,36 @@ mod tests {
         }
 
         let test_cases = vec![
-            QuorumTest { locker_count: 1, expected_tolerance: 0, expected_write_quorum: 1, expected_read_quorum: 1 },
-            QuorumTest { locker_count: 2, expected_tolerance: 1, expected_write_quorum: 2, expected_read_quorum: 1 },
-            QuorumTest { locker_count: 3, expected_tolerance: 1, expected_write_quorum: 2, expected_read_quorum: 2 },
-            QuorumTest { locker_count: 4, expected_tolerance: 2, expected_write_quorum: 3, expected_read_quorum: 2 },
-            QuorumTest { locker_count: 5, expected_tolerance: 2, expected_write_quorum: 3, expected_read_quorum: 3 },
+            QuorumTest {
+                locker_count: 1,
+                expected_tolerance: 0,
+                expected_write_quorum: 1,
+                expected_read_quorum: 1,
+            },
+            QuorumTest {
+                locker_count: 2,
+                expected_tolerance: 1,
+                expected_write_quorum: 2,
+                expected_read_quorum: 1,
+            },
+            QuorumTest {
+                locker_count: 3,
+                expected_tolerance: 1,
+                expected_write_quorum: 2,
+                expected_read_quorum: 2,
+            },
+            QuorumTest {
+                locker_count: 4,
+                expected_tolerance: 2,
+                expected_write_quorum: 3,
+                expected_read_quorum: 2,
+            },
+            QuorumTest {
+                locker_count: 5,
+                expected_tolerance: 2,
+                expected_write_quorum: 3,
+                expected_read_quorum: 3,
+            },
         ];
 
         for test_case in test_cases {
@@ -963,12 +984,21 @@ mod tests {
                 write_quorum += 1;
             }
 
-            assert_eq!(tolerance, test_case.expected_tolerance,
-                "Tolerance mismatch for {} lockers", test_case.locker_count);
-            assert_eq!(write_quorum, test_case.expected_write_quorum,
-                "Write quorum mismatch for {} lockers", test_case.locker_count);
-            assert_eq!(read_quorum, test_case.expected_read_quorum,
-                "Read quorum mismatch for {} lockers", test_case.locker_count);
+            assert_eq!(
+                tolerance, test_case.expected_tolerance,
+                "Tolerance mismatch for {} lockers",
+                test_case.locker_count
+            );
+            assert_eq!(
+                write_quorum, test_case.expected_write_quorum,
+                "Write quorum mismatch for {} lockers",
+                test_case.locker_count
+            );
+            assert_eq!(
+                read_quorum, test_case.expected_read_quorum,
+                "Read quorum mismatch for {} lockers",
+                test_case.locker_count
+            );
         }
     }
 
@@ -998,11 +1028,7 @@ mod tests {
 
     #[test]
     fn test_drw_mutex_new_with_unsorted_names() {
-        let names = vec![
-            "zebra".to_string(),
-            "alpha".to_string(),
-            "beta".to_string(),
-        ];
+        let names = vec!["zebra".to_string(), "alpha".to_string(), "beta".to_string()];
         let lockers = create_mock_lockers(1);
         let mutex = DRWMutex::new("owner1".to_string(), names, lockers);
 

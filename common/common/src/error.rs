@@ -258,7 +258,9 @@ mod tests {
     fn test_multiple_error_types() {
         let errors = vec![
             Error::new(io::Error::new(io::ErrorKind::NotFound, "Not found")),
-            Error::new(CustomTestError { message: "Custom".to_string() }),
+            Error::new(CustomTestError {
+                message: "Custom".to_string(),
+            }),
             Error::new(AnotherTestError),
             Error::msg("String error"),
         ];

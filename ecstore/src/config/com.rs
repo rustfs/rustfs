@@ -189,9 +189,7 @@ async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> R
 async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()> {
     let set_drive_counts = api.set_drive_counts();
     if subsys == STORAGE_CLASS_SUB_SYS {
-        let kvs = cfg
-            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY)
-            .unwrap_or_default();
+        let kvs = cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY).unwrap_or_default();
 
         for (i, count) in set_drive_counts.iter().enumerate() {
             match storageclass::lookup_config(&kvs, *count) {

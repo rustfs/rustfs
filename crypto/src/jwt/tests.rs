@@ -1,5 +1,5 @@
-use time::OffsetDateTime;
 use serde_json::json;
+use time::OffsetDateTime;
 
 use super::{decode::decode, encode::encode};
 
@@ -64,11 +64,11 @@ fn test_jwt_decode_invalid_token_format() {
 
     // Test various invalid token formats
     let invalid_tokens = [
-        "",                           // Empty token
-        "invalid",                    // Not a JWT format
-        "header.payload",             // Missing signature
-        "header.payload.signature.extra", // Too many parts
-        "invalid.header.signature",   // Invalid base64
+        "",                                                       // Empty token
+        "invalid",                                                // Not a JWT format
+        "header.payload",                                         // Missing signature
+        "header.payload.signature.extra",                         // Too many parts
+        "invalid.header.signature",                               // Invalid base64
         "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.invalid.signature", // Invalid payload
     ];
 
@@ -110,7 +110,10 @@ fn test_jwt_with_future_issued_at() {
     let result = decode(&jwt_token, secret);
     // For now, we just verify the token can be decoded, but in a production system
     // you might want to add custom validation for iat claims
-    assert!(result.is_ok(), "Token decoding should succeed, but iat validation should be handled separately");
+    assert!(
+        result.is_ok(),
+        "Token decoding should succeed, but iat validation should be handled separately"
+    );
 }
 
 #[test]
@@ -135,18 +138,18 @@ fn test_jwt_with_different_secret_lengths() {
 
     // Test with various secret lengths
     let secrets = [
-        b"a".as_slice(),                    // Very short
-        b"short_key".as_slice(),            // Short
-        b"medium_length_secret_key".as_slice(), // Medium
+        b"a".as_slice(),                                                              // Very short
+        b"short_key".as_slice(),                                                      // Short
+        b"medium_length_secret_key".as_slice(),                                       // Medium
         b"very_long_secret_key_with_many_characters_for_testing_purposes".as_slice(), // Long
     ];
 
     for secret in &secrets {
-        let jwt_token = encode(secret, &claims)
-            .unwrap_or_else(|_| panic!("Failed to encode JWT with secret length {}", secret.len()));
+        let jwt_token =
+            encode(secret, &claims).unwrap_or_else(|_| panic!("Failed to encode JWT with secret length {}", secret.len()));
 
-        let decoded = decode(&jwt_token, secret)
-            .unwrap_or_else(|_| panic!("Failed to decode JWT with secret length {}", secret.len()));
+        let decoded =
+            decode(&jwt_token, secret).unwrap_or_else(|_| panic!("Failed to decode JWT with secret length {}", secret.len()));
 
         assert_eq!(decoded.claims, claims);
     }

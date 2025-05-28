@@ -97,7 +97,7 @@ impl FileMeta {
         if buf.len() < 5 {
             return Err(Error::new(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("Buffer too small: {} bytes, need at least 5", buf.len())
+                format!("Buffer too small: {} bytes, need at least 5", buf.len()),
             )));
         }
 

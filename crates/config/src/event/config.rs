@@ -53,7 +53,10 @@ mod tests {
 
         // Verify store path is set
         assert!(!config.store_path.is_empty(), "Store path should not be empty");
-        assert!(config.store_path.contains("event-notification"), "Store path should contain event-notification");
+        assert!(
+            config.store_path.contains("event-notification"),
+            "Store path should contain event-notification"
+        );
 
         // Verify channel capacity is reasonable
         assert_eq!(config.channel_capacity, 10000, "Channel capacity should be 10000");
@@ -153,7 +156,10 @@ mod tests {
         assert!(!debug_str.is_empty(), "Debug output should not be empty");
         assert!(debug_str.contains("NotifierConfig"), "Debug output should contain struct name");
         assert!(debug_str.contains("store_path"), "Debug output should contain store_path field");
-        assert!(debug_str.contains("channel_capacity"), "Debug output should contain channel_capacity field");
+        assert!(
+            debug_str.contains("channel_capacity"),
+            "Debug output should contain channel_capacity field"
+        );
         assert!(debug_str.contains("adapters"), "Debug output should contain adapters field");
     }
 
@@ -217,13 +223,13 @@ mod tests {
             match adapter {
                 AdapterConfig::Webhook(_) => {
                     // Webhook adapter should be properly configured
-                },
+                }
                 AdapterConfig::Kafka(_) => {
                     // Kafka adapter should be properly configured
-                },
+                }
                 AdapterConfig::Mqtt(_) => {
                     // MQTT adapter should be properly configured
-                },
+                }
             }
         }
     }
@@ -320,6 +326,9 @@ mod tests {
         // DEFAULT_CONFIG_FILE is a const, so is_empty() check is redundant
         // assert!(!DEFAULT_CONFIG_FILE.is_empty(), "Config file name should not be empty");
         assert!(!DEFAULT_CONFIG_FILE.contains('/'), "Config file name should not contain path separators");
-        assert!(!DEFAULT_CONFIG_FILE.contains('\\'), "Config file name should not contain Windows path separators");
+        assert!(
+            !DEFAULT_CONFIG_FILE.contains('\\'),
+            "Config file name should not contain Windows path separators"
+        );
     }
 }

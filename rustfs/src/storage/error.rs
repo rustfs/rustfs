@@ -104,11 +104,8 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_invalid_argument() {
-        let storage_err = StorageError::InvalidArgument(
-            "test-bucket".to_string(),
-            "test-object".to_string(),
-            "test-version".to_string(),
-        );
+        let storage_err =
+            StorageError::InvalidArgument("test-bucket".to_string(), "test-object".to_string(), "test-version".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -163,10 +160,7 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_object_name_invalid() {
-        let storage_err = StorageError::ObjectNameInvalid(
-            "test-bucket".to_string(),
-            "invalid-object".to_string(),
-        );
+        let storage_err = StorageError::ObjectNameInvalid("test-bucket".to_string(), "invalid-object".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -193,7 +187,10 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::ServiceUnavailable);
-        assert!(s3_err.message().unwrap().contains("Storage reached its minimum free drive threshold"));
+        assert!(s3_err
+            .message()
+            .unwrap()
+            .contains("Storage reached its minimum free drive threshold"));
     }
 
     #[test]
@@ -208,10 +205,7 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_prefix_access_denied() {
-        let storage_err = StorageError::PrefixAccessDenied(
-            "test-bucket".to_string(),
-            "test-prefix".to_string(),
-        );
+        let storage_err = StorageError::PrefixAccessDenied("test-bucket".to_string(), "test-prefix".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -223,10 +217,7 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_invalid_upload_id_key_combination() {
-        let storage_err = StorageError::InvalidUploadIDKeyCombination(
-            "test-bucket".to_string(),
-            "test-object".to_string(),
-        );
+        let storage_err = StorageError::InvalidUploadIDKeyCombination("test-bucket".to_string(), "test-object".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -249,10 +240,7 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_object_name_too_long() {
-        let storage_err = StorageError::ObjectNameTooLong(
-            "test-bucket".to_string(),
-            "very-long-object-name".to_string(),
-        );
+        let storage_err = StorageError::ObjectNameTooLong("test-bucket".to_string(), "very-long-object-name".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -264,25 +252,22 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_object_name_prefix_as_slash() {
-        let storage_err = StorageError::ObjectNamePrefixAsSlash(
-            "test-bucket".to_string(),
-            "/invalid-object".to_string(),
-        );
+        let storage_err = StorageError::ObjectNamePrefixAsSlash("test-bucket".to_string(), "/invalid-object".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::InvalidArgument);
-        assert!(s3_err.message().unwrap().contains("Object name contains forward slash as prefix"));
+        assert!(s3_err
+            .message()
+            .unwrap()
+            .contains("Object name contains forward slash as prefix"));
         assert!(s3_err.message().unwrap().contains("test-bucket"));
         assert!(s3_err.message().unwrap().contains("/invalid-object"));
     }
 
     #[test]
     fn test_to_s3_error_object_not_found() {
-        let storage_err = StorageError::ObjectNotFound(
-            "test-bucket".to_string(),
-            "missing-object".to_string(),
-        );
+        let storage_err = StorageError::ObjectNotFound("test-bucket".to_string(), "missing-object".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -293,11 +278,8 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_version_not_found() {
-        let storage_err = StorageError::VersionNotFound(
-            "test-bucket".to_string(),
-            "test-object".to_string(),
-            "missing-version".to_string(),
-        );
+        let storage_err =
+            StorageError::VersionNotFound("test-bucket".to_string(), "test-object".to_string(), "missing-version".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -309,11 +291,8 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_invalid_upload_id() {
-        let storage_err = StorageError::InvalidUploadID(
-            "test-bucket".to_string(),
-            "test-object".to_string(),
-            "invalid-upload-id".to_string(),
-        );
+        let storage_err =
+            StorageError::InvalidUploadID("test-bucket".to_string(), "test-object".to_string(), "invalid-upload-id".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -361,10 +340,7 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_object_exists_as_directory() {
-        let storage_err = StorageError::ObjectExistsAsDirectory(
-            "test-bucket".to_string(),
-            "directory-object".to_string(),
-        );
+        let storage_err = StorageError::ObjectExistsAsDirectory("test-bucket".to_string(), "directory-object".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -382,7 +358,10 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::SlowDown);
-        assert!(s3_err.message().unwrap().contains("Storage resources are insufficient for the read operation"));
+        assert!(s3_err
+            .message()
+            .unwrap()
+            .contains("Storage resources are insufficient for the read operation"));
     }
 
     #[test]
@@ -392,7 +371,10 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::SlowDown);
-        assert!(s3_err.message().unwrap().contains("Storage resources are insufficient for the write operation"));
+        assert!(s3_err
+            .message()
+            .unwrap()
+            .contains("Storage resources are insufficient for the write operation"));
     }
 
     #[test]
@@ -428,11 +410,7 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_invalid_part() {
-        let storage_err = StorageError::InvalidPart(
-            1,
-            "expected-part".to_string(),
-            "got-part".to_string(),
-        );
+        let storage_err = StorageError::InvalidPart(1, "expected-part".to_string(), "got-part".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 
@@ -477,10 +455,7 @@ mod tests {
 
     #[test]
     fn test_to_s3_error_with_special_characters() {
-        let storage_err = StorageError::ObjectNameInvalid(
-            "bucket-with-@#$%".to_string(),
-            "object-with-!@#$%^&*()".to_string(),
-        );
+        let storage_err = StorageError::ObjectNameInvalid("bucket-with-@#$%".to_string(), "object-with-!@#$%^&*()".to_string());
         let err = Error::new(storage_err);
         let s3_err = to_s3_error(err);
 

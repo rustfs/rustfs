@@ -191,7 +191,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-        #[test]
+    #[test]
     fn test_certs_error_function() {
         let error_msg = "Test error message";
         let error = certs_error(error_msg.to_string());
@@ -210,7 +210,7 @@ mod tests {
         assert!(error.to_string().contains("failed to open"));
     }
 
-        #[test]
+    #[test]
     fn test_load_private_key_file_not_found() {
         let result = load_private_key("non_existent_key.pem");
         assert!(result.is_err());
@@ -233,7 +233,7 @@ mod tests {
         assert!(error.to_string().contains("No valid certificate was found"));
     }
 
-        #[test]
+    #[test]
     fn test_load_certs_invalid_format() {
         let temp_dir = TempDir::new().unwrap();
         let cert_path = temp_dir.path().join("invalid.pem");
@@ -259,7 +259,7 @@ mod tests {
         assert!(error.to_string().contains("no private key found"));
     }
 
-        #[test]
+    #[test]
     fn test_load_private_key_invalid_format() {
         let temp_dir = TempDir::new().unwrap();
         let key_path = temp_dir.path().join("invalid_key.pem");
@@ -281,7 +281,7 @@ mod tests {
         assert!(error.to_string().contains("does not exist or is not a directory"));
     }
 
-        #[test]
+    #[test]
     fn test_load_all_certs_from_directory_empty() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -315,7 +315,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-        #[test]
+    #[test]
     fn test_load_cert_key_pair_missing_key() {
         let temp_dir = TempDir::new().unwrap();
         let cert_path = temp_dir.path().join("test_cert.pem");
@@ -355,12 +355,12 @@ mod tests {
     fn test_path_handling_edge_cases() {
         // Test with various path formats
         let path_cases = vec![
-            "",                    // Empty path
-            ".",                   // Current directory
-            "..",                  // Parent directory
-            "/",                   // Root directory (Unix)
-            "relative/path",       // Relative path
-            "/absolute/path",      // Absolute path
+            "",               // Empty path
+            ".",              // Current directory
+            "..",             // Parent directory
+            "/",              // Root directory (Unix)
+            "relative/path",  // Relative path
+            "/absolute/path", // Absolute path
         ];
 
         for path in path_cases {
@@ -396,7 +396,10 @@ mod tests {
         // Should fail because no certificates found
         let result = load_all_certs_from_directory(temp_dir.path().to_str().unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No valid certificate/private key pair found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No valid certificate/private key pair found"));
     }
 
     #[test]
@@ -409,7 +412,10 @@ mod tests {
 
         let result = load_all_certs_from_directory(unicode_dir.to_str().unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No valid certificate/private key pair found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No valid certificate/private key pair found"));
     }
 
     #[test]
@@ -420,14 +426,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = Arc::new(temp_dir.path().to_string_lossy().to_string());
 
-        let handles: Vec<_> = (0..5).map(|_| {
-            let path = Arc::clone(&dir_path);
-            thread::spawn(move || {
-                let result = load_all_certs_from_directory(&path);
-                // All should fail since directory is empty
-                assert!(result.is_err());
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let path = Arc::clone(&dir_path);
+                thread::spawn(move || {
+                    let result = load_all_certs_from_directory(&path);
+                    // All should fail since directory is empty
+                    assert!(result.is_err());
+                })
             })
-        }).collect();
+            .collect();
 
         for handle in handles {
             handle.join().expect("Thread should complete successfully");

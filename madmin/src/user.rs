@@ -685,10 +685,7 @@ mod tests {
             write: false,
         };
 
-        let full_access = AccountAccess {
-            read: true,
-            write: true,
-        };
+        let full_access = AccountAccess { read: true, write: true };
 
         let no_access = AccountAccess {
             read: false,

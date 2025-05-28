@@ -193,12 +193,18 @@ mod tests {
         let valid_parts = ['a', 'A', '0', '9', '_', '#', '@', '$', 'α', '中'];
 
         for start_char in valid_starts {
-            assert!(dialect.is_identifier_start(start_char),
-                "Character '{}' should be valid identifier start", start_char);
+            assert!(
+                dialect.is_identifier_start(start_char),
+                "Character '{}' should be valid identifier start",
+                start_char
+            );
 
             for part_char in valid_parts {
-                assert!(dialect.is_identifier_part(part_char),
-                    "Character '{}' should be valid identifier part", part_char);
+                assert!(
+                    dialect.is_identifier_part(part_char),
+                    "Character '{}' should be valid identifier part",
+                    part_char
+                );
             }
         }
     }
@@ -211,8 +217,14 @@ mod tests {
         assert!(!dialect.is_identifier_start('\0'), "Null character should not be valid identifier start");
         assert!(!dialect.is_identifier_part('\0'), "Null character should not be valid identifier part");
 
-        assert!(!dialect.is_identifier_start('\x01'), "Control character should not be valid identifier start");
-        assert!(!dialect.is_identifier_part('\x01'), "Control character should not be valid identifier part");
+        assert!(
+            !dialect.is_identifier_start('\x01'),
+            "Control character should not be valid identifier start"
+        );
+        assert!(
+            !dialect.is_identifier_part('\x01'),
+            "Control character should not be valid identifier part"
+        );
 
         assert!(!dialect.is_identifier_start('\x7F'), "DEL character should not be valid identifier start");
         assert!(!dialect.is_identifier_part('\x7F'), "DEL character should not be valid identifier part");
@@ -226,10 +238,12 @@ mod tests {
         let unicode_letters = ['α', 'β', 'γ', 'Α', 'Β', 'Γ', '中', '文', '日', '本', 'ñ', 'ü', 'ç'];
 
         for ch in unicode_letters {
-            assert!(dialect.is_identifier_start(ch),
-                "Unicode letter '{}' should be valid identifier start", ch);
-            assert!(dialect.is_identifier_part(ch),
-                "Unicode letter '{}' should be valid identifier part", ch);
+            assert!(
+                dialect.is_identifier_start(ch),
+                "Unicode letter '{}' should be valid identifier start",
+                ch
+            );
+            assert!(dialect.is_identifier_part(ch), "Unicode letter '{}' should be valid identifier part", ch);
         }
     }
 
@@ -239,10 +253,16 @@ mod tests {
 
         // Test all ASCII digits
         for digit in '0'..='9' {
-            assert!(!dialect.is_identifier_start(digit),
-                "ASCII digit '{}' should not be valid identifier start", digit);
-            assert!(dialect.is_identifier_part(digit),
-                "ASCII digit '{}' should be valid identifier part", digit);
+            assert!(
+                !dialect.is_identifier_start(digit),
+                "ASCII digit '{}' should not be valid identifier start",
+                digit
+            );
+            assert!(
+                dialect.is_identifier_part(digit),
+                "ASCII digit '{}' should be valid identifier part",
+                digit
+            );
         }
     }
 
@@ -252,14 +272,16 @@ mod tests {
 
         // Test that all valid identifier starts are also valid identifier parts
         let test_chars = [
-            'a', 'A', 'z', 'Z', '_', '#', '@', 'α', '中', 'ñ',
-            '0', '9', '$', ' ', '.', ',', ';', '(', ')', '=', '+', '-'
+            'a', 'A', 'z', 'Z', '_', '#', '@', 'α', '中', 'ñ', '0', '9', '$', ' ', '.', ',', ';', '(', ')', '=', '+', '-',
         ];
 
         for ch in test_chars {
             if dialect.is_identifier_start(ch) {
-                assert!(dialect.is_identifier_part(ch),
-                    "Character '{}' that is valid identifier start should also be valid identifier part", ch);
+                assert!(
+                    dialect.is_identifier_part(ch),
+                    "Character '{}' that is valid identifier start should also be valid identifier part",
+                    ch
+                );
             }
         }
     }
@@ -285,7 +307,10 @@ mod tests {
         assert!(!dialect_ref.is_identifier_start('0'), "Trait method should work for invalid start");
         assert!(dialect_ref.is_identifier_part('a'), "Trait method should work for valid part");
         assert!(dialect_ref.is_identifier_part('0'), "Trait method should work for digit part");
-        assert!(dialect_ref.supports_group_by_expr(), "Trait method should return true for GROUP BY support");
+        assert!(
+            dialect_ref.supports_group_by_expr(),
+            "Trait method should return true for GROUP BY support"
+        );
     }
 
     #[test]
@@ -297,13 +322,22 @@ mod tests {
         let test_chars = ['a', 'A', '0', '_', '#', '@', '$', ' ', '.'];
 
         for ch in test_chars {
-            assert_eq!(dialect1.is_identifier_start(ch), dialect2.is_identifier_start(ch),
-                "Different instances should behave the same for is_identifier_start");
-            assert_eq!(dialect1.is_identifier_part(ch), dialect2.is_identifier_part(ch),
-                "Different instances should behave the same for is_identifier_part");
+            assert_eq!(
+                dialect1.is_identifier_start(ch),
+                dialect2.is_identifier_start(ch),
+                "Different instances should behave the same for is_identifier_start"
+            );
+            assert_eq!(
+                dialect1.is_identifier_part(ch),
+                dialect2.is_identifier_part(ch),
+                "Different instances should behave the same for is_identifier_part"
+            );
         }
 
-        assert_eq!(dialect1.supports_group_by_expr(), dialect2.supports_group_by_expr(),
-            "Different instances should behave the same for supports_group_by_expr");
+        assert_eq!(
+            dialect1.supports_group_by_expr(),
+            dialect2.supports_group_by_expr(),
+            "Different instances should behave the same for supports_group_by_expr"
+        );
     }
 }

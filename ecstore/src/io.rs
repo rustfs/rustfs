@@ -208,14 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_file_writer_creation() {
-        let writer = HttpFileWriter::new(
-            "http://localhost:8080",
-            "test-disk",
-            "test-volume",
-            "test-path",
-            1024,
-            false
-        );
+        let writer = HttpFileWriter::new("http://localhost:8080", "test-disk", "test-volume", "test-path", 1024, false);
 
         assert!(writer.is_ok(), "HttpFileWriter creation should succeed");
     }
@@ -228,7 +221,7 @@ mod tests {
             "test/volume",
             "test file with spaces & symbols.txt",
             1024,
-            false
+            false,
         );
 
         assert!(writer.is_ok(), "HttpFileWriter creation with special characters should succeed");
@@ -242,7 +235,7 @@ mod tests {
             "test-volume",
             "append-test.txt",
             1024,
-            true // append mode
+            true, // append mode
         );
 
         assert!(writer.is_ok(), "HttpFileWriter creation in append mode should succeed");
@@ -256,7 +249,7 @@ mod tests {
             "test-volume",
             "empty-file.txt",
             0, // zero size
-            false
+            false,
         );
 
         assert!(writer.is_ok(), "HttpFileWriter creation with zero size should succeed");
@@ -270,7 +263,7 @@ mod tests {
             "test-volume",
             "large-file.txt",
             1024 * 1024 * 100, // 100MB
-            false
+            false,
         );
 
         assert!(writer.is_ok(), "HttpFileWriter creation with large size should succeed");
@@ -278,14 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_file_writer_invalid_url() {
-        let writer = HttpFileWriter::new(
-            "invalid-url",
-            "test-disk",
-            "test-volume",
-            "test-path",
-            1024,
-            false
-        );
+        let writer = HttpFileWriter::new("invalid-url", "test-disk", "test-volume", "test-path", 1024, false);
 
         // This should still succeed at creation time, errors occur during actual I/O
         assert!(writer.is_ok(), "HttpFileWriter creation should succeed even with invalid URL");
@@ -295,14 +281,8 @@ mod tests {
     async fn test_http_file_reader_creation() {
         // Test creation without actually making HTTP requests
         // We'll test the URL construction logic by checking the error messages
-        let result = HttpFileReader::new(
-            "http://invalid-server:9999",
-            "test-disk",
-            "test-volume",
-            "test-file.txt",
-            0,
-            1024
-        ).await;
+        let result =
+            HttpFileReader::new("http://invalid-server:9999", "test-disk", "test-volume", "test-file.txt", 0, 1024).await;
 
         // May succeed or fail depending on network conditions, but should not panic
         // The important thing is that the URL construction logic works
@@ -317,8 +297,9 @@ mod tests {
             "test-volume",
             "test-file.txt",
             100, // offset
-            500  // length
-        ).await;
+            500, // length
+        )
+        .await;
 
         // May succeed or fail, but this tests parameter handling
         assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
@@ -332,8 +313,9 @@ mod tests {
             "test-volume",
             "test-file.txt",
             0,
-            0 // zero length
-        ).await;
+            0, // zero length
+        )
+        .await;
 
         // May succeed or fail, but this tests zero length handling
         assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
@@ -347,8 +329,9 @@ mod tests {
             "test/volume",
             "test file with spaces & symbols.txt",
             0,
-            1024
-        ).await;
+            1024,
+        )
+        .await;
 
         // May succeed or fail, but this tests URL encoding
         assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
@@ -505,11 +488,7 @@ mod tests {
         let etag_reader3 = EtagReader::new(cursor3);
 
         // Compute ETags concurrently
-        let (result1, result2, result3) = tokio::join!(
-            etag_reader1.etag(),
-            etag_reader2.etag(),
-            etag_reader3.etag()
-        );
+        let (result1, result2, result3) = tokio::join!(etag_reader1.etag(), etag_reader2.etag(), etag_reader3.etag());
 
         // All ETags should be the same (empty data hash) since no data was read
         assert_eq!(result1, result2);
@@ -533,7 +512,7 @@ mod tests {
             "", // empty volume
             "", // empty path
             0,  // zero size
-            false
+            false,
         );
         assert!(writer.is_ok(), "HttpFileWriter should handle empty parameters");
 
@@ -544,8 +523,9 @@ mod tests {
             "", // empty volume
             "", // empty path
             0,  // zero offset
-            0   // zero length
-        ).await;
+            0,  // zero length
+        )
+        .await;
         // May succeed or fail, but parameters should be handled
         assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
     }
@@ -555,24 +535,10 @@ mod tests {
         // Test with characters that need URL encoding
         let special_chars = "test file with spaces & symbols + % # ? = @ ! $ ( ) [ ] { } | \\ / : ; , . < > \" '";
 
-        let writer = HttpFileWriter::new(
-            "http://localhost:8080",
-            special_chars,
-            special_chars,
-            special_chars,
-            1024,
-            false
-        );
+        let writer = HttpFileWriter::new("http://localhost:8080", special_chars, special_chars, special_chars, 1024, false);
         assert!(writer.is_ok(), "HttpFileWriter should handle special characters");
 
-        let result = HttpFileReader::new(
-            "http://invalid:9999",
-            special_chars,
-            special_chars,
-            special_chars,
-            0,
-            1024
-        ).await;
+        let result = HttpFileReader::new("http://invalid:9999", special_chars, special_chars, special_chars, 0, 1024).await;
         // May succeed or fail, but URL encoding should work
         assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
     }
