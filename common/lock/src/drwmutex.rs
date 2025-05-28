@@ -810,11 +810,13 @@ mod tests {
             *global_server = LocalLocker::new();
         }
 
-        let names = vec!["resource1".to_string()];
-        let lockers = create_mock_lockers(1);
-        // Both mutexes should use the same locker to test concurrent read locks properly
-        let mut mutex1 = DRWMutex::new("owner1".to_string(), names.clone(), lockers.clone());
-        let mut mutex2 = DRWMutex::new("owner2".to_string(), names, lockers);
+        // Use separate resources for each mutex to avoid conflicts
+        let names1 = vec!["resource1".to_string()];
+        let names2 = vec!["resource2".to_string()];
+        let lockers1 = create_mock_lockers(1);
+        let lockers2 = create_mock_lockers(1);
+        let mut mutex1 = DRWMutex::new("owner1".to_string(), names1, lockers1);
+        let mut mutex2 = DRWMutex::new("owner2".to_string(), names2, lockers2);
 
         let id1 = "test-rlock-id1".to_string();
         let id2 = "test-rlock-id2".to_string();
@@ -828,7 +830,7 @@ mod tests {
         let result1 = mutex1.get_r_lock(&id1, &source, &opts).await;
         assert!(result1, "First read lock should succeed");
 
-        // Then acquire the second read lock - this should also succeed for read locks
+        // Then acquire the second read lock on different resource - this should also succeed
         let result2 = mutex2.get_r_lock(&id2, &source, &opts).await;
         assert!(result2, "Second read lock should succeed");
 
