@@ -78,7 +78,6 @@ mod tests {
         // Test OTEL default values
         if let Some(_use_stdout) = config.otel.use_stdout {
             // Test boolean values - any boolean value is valid
-            // assert!(use_stdout || !use_stdout, "use_stdout should be a valid boolean");
         }
 
         if let Some(sample_ratio) = config.otel.sample_ratio {
