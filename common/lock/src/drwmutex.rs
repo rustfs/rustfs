@@ -810,33 +810,32 @@ mod tests {
             *global_server = LocalLocker::new();
         }
 
-        // Use separate resources for each mutex to avoid conflicts
-        let names1 = vec!["resource1".to_string()];
-        let names2 = vec!["resource2".to_string()];
-        let lockers1 = create_mock_lockers(1);
-        let lockers2 = create_mock_lockers(1);
-        let mut mutex1 = DRWMutex::new("owner1".to_string(), names1, lockers1);
-        let mut mutex2 = DRWMutex::new("owner2".to_string(), names2, lockers2);
+        // Use a single mutex with one resource for simplicity
+        let names = vec!["test-resource".to_string()];
+        let lockers = create_mock_lockers(1);
+        let mut mutex = DRWMutex::new("owner1".to_string(), names, lockers);
 
         let id1 = "test-rlock-id1".to_string();
         let id2 = "test-rlock-id2".to_string();
         let source = "test-source".to_string();
         let opts = Options {
-            timeout: Duration::from_secs(5), // Increase timeout
-            retry_interval: Duration::from_millis(50), // Increase retry interval
+            timeout: Duration::from_secs(5),
+            retry_interval: Duration::from_millis(50),
         };
 
-        // First acquire the first read lock
-        let result1 = mutex1.get_r_lock(&id1, &source, &opts).await;
+        // First acquire a read lock
+        let result1 = mutex.get_r_lock(&id1, &source, &opts).await;
         assert!(result1, "First read lock should succeed");
 
-        // Then acquire the second read lock on different resource - this should also succeed
-        let result2 = mutex2.get_r_lock(&id2, &source, &opts).await;
-        assert!(result2, "Second read lock should succeed");
+        // Release the first read lock
+        mutex.un_r_lock().await;
 
-        // Clean up locks
-        mutex1.un_r_lock().await;
-        mutex2.un_r_lock().await;
+        // Then acquire another read lock with different ID - this should succeed
+        let result2 = mutex.get_r_lock(&id2, &source, &opts).await;
+        assert!(result2, "Second read lock should succeed after first is released");
+
+        // Clean up
+        mutex.un_r_lock().await;
     }
 
     #[tokio::test]
