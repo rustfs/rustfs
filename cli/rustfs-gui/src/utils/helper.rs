@@ -624,17 +624,17 @@ mod tests {
 
         // Test that commands can be created
         match start_cmd {
-            ServiceCommand::Start(_) => {},
+            ServiceCommand::Start(_) => {}
             _ => panic!("Expected Start command"),
         }
 
         match stop_cmd {
-            ServiceCommand::Stop => {},
+            ServiceCommand::Stop => {}
             _ => panic!("Expected Stop command"),
         }
 
         match restart_cmd {
-            ServiceCommand::Restart(_) => {},
+            ServiceCommand::Restart(_) => {}
             _ => panic!("Expected Restart command"),
         }
     }
@@ -680,7 +680,7 @@ mod tests {
         assert!(debug_str.contains("Test message"));
     }
 
-        #[test]
+    #[test]
     fn test_service_manager_creation() {
         // Test ServiceManager creation in a tokio runtime
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -714,17 +714,17 @@ mod tests {
         }
     }
 
-        #[test]
+    #[test]
     fn test_extract_port_invalid() {
         let invalid_cases = vec![
-            "127.0.0.1",           // Missing port
-            "127.0.0.1:",          // Empty port
-            "127.0.0.1:abc",       // Invalid port
-            "127.0.0.1:99999",     // Port out of range
-            "",                    // Empty string
-            "invalid",             // No colon
-            "host:-1",             // Negative port
-            "host:0.5",            // Decimal port
+            "127.0.0.1",       // Missing port
+            "127.0.0.1:",      // Empty port
+            "127.0.0.1:abc",   // Invalid port
+            "127.0.0.1:99999", // Port out of range
+            "",                // Empty string
+            "invalid",         // No colon
+            "host:-1",         // Negative port
+            "host:0.5",        // Decimal port
         ];
 
         for input in invalid_cases {
@@ -746,10 +746,10 @@ mod tests {
         assert_eq!(ServiceManager::extract_port("host:0"), Some(0));
         assert_eq!(ServiceManager::extract_port("host:65535"), Some(65535));
         assert_eq!(ServiceManager::extract_port("host:65536"), None); // Out of range
-        // IPv6-like address - extract_port takes the second part after split(':')
-        // For "::1:8080", split(':') gives ["", "", "1", "8080"], nth(1) gives ""
+                                                                      // IPv6-like address - extract_port takes the second part after split(':')
+                                                                      // For "::1:8080", split(':') gives ["", "", "1", "8080"], nth(1) gives ""
         assert_eq!(ServiceManager::extract_port("::1:8080"), None); // Second part is empty
-        // For "[::1]:8080", split(':') gives ["[", "", "1]", "8080"], nth(1) gives ""
+                                                                    // For "[::1]:8080", split(':') gives ["[", "", "1]", "8080"], nth(1) gives ""
         assert_eq!(ServiceManager::extract_port("[::1]:8080"), None); // Second part is empty
     }
 
@@ -844,7 +844,7 @@ mod tests {
             ServiceCommand::Start(config) => {
                 assert_eq!(config.address, "127.0.0.1:9000");
                 assert_eq!(config.access_key, "admin1");
-            },
+            }
             _ => panic!("Expected Start command"),
         }
 
@@ -852,7 +852,7 @@ mod tests {
             ServiceCommand::Restart(config) => {
                 assert_eq!(config.address, "192.168.1.100:8080");
                 assert_eq!(config.access_key, "admin2");
-            },
+            }
             _ => panic!("Expected Restart command"),
         }
     }

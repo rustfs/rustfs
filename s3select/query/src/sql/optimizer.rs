@@ -90,7 +90,10 @@ mod tests {
         let _builder = CascadeOptimizerBuilder::default();
 
         // Test that builder can be created successfully
-        assert!(std::mem::size_of::<CascadeOptimizerBuilder>() > 0, "Builder should be created successfully");
+        assert!(
+            std::mem::size_of::<CascadeOptimizerBuilder>() > 0,
+            "Builder should be created successfully"
+        );
     }
 
     #[test]
@@ -109,7 +112,10 @@ mod tests {
 
         // Test that we can call builder methods (even if we don't have mock implementations)
         // This tests the builder pattern itself
-        assert!(std::mem::size_of::<CascadeOptimizerBuilder>() > 0, "Builder should be created successfully");
+        assert!(
+            std::mem::size_of::<CascadeOptimizerBuilder>() > 0,
+            "Builder should be created successfully"
+        );
     }
 
     #[test]

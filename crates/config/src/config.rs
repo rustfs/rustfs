@@ -94,7 +94,10 @@ mod tests {
 
         // Test event config properties
         assert!(!config.event.store_path.is_empty(), "Store path should not be empty");
-        assert!(config.event.channel_capacity >= 1000, "Channel capacity should be reasonable for production");
+        assert!(
+            config.event.channel_capacity >= 1000,
+            "Channel capacity should be reasonable for production"
+        );
 
         // Test that store path is a valid path format
         let store_path = &config.event.store_path;
@@ -106,13 +109,13 @@ mod tests {
             match adapter {
                 crate::event::adapters::AdapterConfig::Webhook(_) => {
                     // Webhook adapter should be properly configured
-                },
+                }
                 crate::event::adapters::AdapterConfig::Kafka(_) => {
                     // Kafka adapter should be properly configured
-                },
+                }
                 crate::event::adapters::AdapterConfig::Mqtt(_) => {
                     // MQTT adapter should be properly configured
-                },
+                }
             }
         }
     }
@@ -153,7 +156,10 @@ mod tests {
         // Test that observability config has Debug trait
         let observability_debug = format!("{:?}", config.observability);
         assert!(!observability_debug.is_empty(), "Observability config should have debug output");
-        assert!(observability_debug.contains("ObservabilityConfig"), "Debug output should contain type name");
+        assert!(
+            observability_debug.contains("ObservabilityConfig"),
+            "Debug output should contain type name"
+        );
 
         // Test that event config has Debug trait
         let event_debug = format!("{:?}", config.event);
