@@ -997,10 +997,19 @@ mod tests {
             sqs_arn: Some(vec!["arn:aws:sqs:us-east-1:123456789012:test-queue".to_string()]),
             deployment_id: Some("deployment-123".to_string()),
             buckets: Some(Buckets { count: 5, error: None }),
-            objects: Some(Objects { count: 1000, error: None }),
-            versions: Some(Versions { count: 1200, error: None }),
+            objects: Some(Objects {
+                count: 1000,
+                error: None,
+            }),
+            versions: Some(Versions {
+                count: 1200,
+                error: None,
+            }),
             delete_markers: Some(DeleteMarkers { count: 50, error: None }),
-            usage: Some(Usage { size: 1000000000, error: None }),
+            usage: Some(Usage {
+                size: 1000000000,
+                error: None,
+            }),
             services: Some(Services::default()),
             backend: Some(ErasureBackend::default()),
             servers: Some(vec![ServerProperties::default()]),

@@ -960,9 +960,7 @@ impl S3 for FS {
             }
         };
 
-        let body = Box::new(StreamReader::new(
-            body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
-        ));
+        let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
 
         let mut reader = PutObjReader::new(body, content_length as usize);
 
@@ -1076,9 +1074,7 @@ impl S3 for FS {
             }
         };
 
-        let body = Box::new(StreamReader::new(
-            body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
-        ));
+        let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
 
         // mc cp step 4
         let mut data = PutObjReader::new(body, content_length as usize);

@@ -75,10 +75,10 @@ fn test_encrypt_decrypt_with_long_password() -> Result<(), crate::Error> {
 fn test_encrypt_decrypt_binary_data() -> Result<(), crate::Error> {
     // Test with various binary patterns
     let binary_patterns = [
-        vec![0x00; 100],                    // All zeros
-        vec![0xFF; 100],                    // All ones
+        vec![0x00; 100],                                     // All zeros
+        vec![0xFF; 100],                                     // All ones
         (0..=255u8).cycle().take(1000).collect::<Vec<u8>>(), // Sequential pattern
-        [0xAA, 0x55].repeat(500),       // Alternating pattern
+        [0xAA, 0x55].repeat(500),                            // Alternating pattern
     ];
 
     for pattern in &binary_patterns {
@@ -136,11 +136,11 @@ fn test_decrypt_with_truncated_data() {
 
     // Test truncation at various lengths
     let truncation_lengths = [
-        0,                          // Empty data
-        10,                         // Very short
-        32,                         // Salt length
-        44,                         // Just before nonce
-        encrypted.len() - 1,        // Missing last byte
+        0,                   // Empty data
+        10,                  // Very short
+        32,                  // Salt length
+        44,                  // Just before nonce
+        encrypted.len() - 1, // Missing last byte
     ];
 
     for &length in &truncation_lengths {
@@ -193,8 +193,12 @@ fn test_encrypted_data_structure() -> Result<(), crate::Error> {
 
     // Should have at least: 32 bytes salt + 1 byte ID + 12 bytes nonce + data + 16 bytes tag
     let min_expected_length = 32 + 1 + 12 + data.len() + 16;
-    assert!(encrypted.len() >= min_expected_length,
-        "Encrypted data length {} should be at least {}", encrypted.len(), min_expected_length);
+    assert!(
+        encrypted.len() >= min_expected_length,
+        "Encrypted data length {} should be at least {}",
+        encrypted.len(),
+        min_expected_length
+    );
 
     Ok(())
 }
@@ -204,12 +208,12 @@ fn test_password_variations() -> Result<(), crate::Error> {
     let data = b"test data";
 
     let password_variations = [
-        b"a".as_slice(),                    // Single character
-        b"12345".as_slice(),                // Numeric
-        b"!@#$%^&*()".as_slice(),          // Special characters
-        b"\x00\x01\x02\x03".as_slice(),    // Binary password
-        "密码测试".as_bytes(),               // Unicode password
-        &[0xFF; 64],                        // Long binary password
+        b"a".as_slice(),                // Single character
+        b"12345".as_slice(),            // Numeric
+        b"!@#$%^&*()".as_slice(),       // Special characters
+        b"\x00\x01\x02\x03".as_slice(), // Binary password
+        "密码测试".as_bytes(),          // Unicode password
+        &[0xFF; 64],                    // Long binary password
     ];
 
     for password in &password_variations {
@@ -238,8 +242,8 @@ fn test_deterministic_with_same_salt_and_nonce() {
 fn test_cross_platform_compatibility() -> Result<(), crate::Error> {
     // Test data that might behave differently on different platforms
     let test_cases = [
-        vec![0x00, 0x01, 0x02, 0x03],      // Low values
-        vec![0xFC, 0xFD, 0xFE, 0xFF],      // High values
+        vec![0x00, 0x01, 0x02, 0x03],                              // Low values
+        vec![0xFC, 0xFD, 0xFE, 0xFF],                              // High values
         (0..256u16).map(|x| (x % 256) as u8).collect::<Vec<u8>>(), // Full byte range
     ];
 
@@ -258,8 +262,8 @@ fn test_memory_safety_with_large_passwords() -> Result<(), crate::Error> {
 
     // Test with very large passwords
     let large_passwords = [
-        vec![b'a'; 1024],           // 1KB password
-        vec![b'x'; 10 * 1024],      // 10KB password
+        vec![b'a'; 1024],                                    // 1KB password
+        vec![b'x'; 10 * 1024],                               // 10KB password
         (0..=255u8).cycle().take(5000).collect::<Vec<u8>>(), // 5KB varied password
     ];
 
@@ -280,16 +284,18 @@ fn test_concurrent_encryption_safety() -> Result<(), crate::Error> {
     let data = Arc::new(b"concurrent test data".to_vec());
     let password = Arc::new(b"concurrent_password".to_vec());
 
-    let handles: Vec<_> = (0..10).map(|i| {
-        let data = Arc::clone(&data);
-        let password = Arc::clone(&password);
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            let data = Arc::clone(&data);
+            let password = Arc::clone(&password);
 
-        thread::spawn(move || {
-            let encrypted = encrypt_data(&password, &data).expect("Encryption should succeed");
-            let decrypted = decrypt_data(&password, &encrypted).expect("Decryption should succeed");
-            assert_eq!(**data, decrypted, "Thread {} failed", i);
+            thread::spawn(move || {
+                let encrypted = encrypt_data(&password, &data).expect("Encryption should succeed");
+                let decrypted = decrypt_data(&password, &encrypted).expect("Decryption should succeed");
+                assert_eq!(**data, decrypted, "Thread {} failed", i);
+            })
         })
-    }).collect();
+        .collect();
 
     for handle in handles {
         handle.join().expect("Thread should complete successfully");
