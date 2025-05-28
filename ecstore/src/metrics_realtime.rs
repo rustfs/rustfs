@@ -93,7 +93,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 
     if types.contains(&MetricType::SCANNER) {
         info!("start get scanner metrics");
-        let metrics = globalScannerMetrics.read().await.report().await;
+        let metrics = globalScannerMetrics.report().await;
         real_time_metrics.aggregated.scanner = Some(metrics);
     }
 
