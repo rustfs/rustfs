@@ -86,8 +86,8 @@ mod tests {
         // The actual result depends on the system configuration
         println!("Same disk result for temp dirs: {}", result);
 
-        // Just verify the function executes successfully
-        assert!(result == true || result == false);
+        // The function returns a boolean value as expected
+        let _: bool = result; // Type assertion to verify return type
     }
 
     #[test]

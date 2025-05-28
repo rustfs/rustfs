@@ -15,3 +15,5 @@ deploy/certs/*
 *jsonl
 .env
 .rustfs.sys
+.cargo
+profile.json

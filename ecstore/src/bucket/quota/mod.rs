@@ -2,16 +2,16 @@ use common::error::Result;
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 
-// 定义QuotaType枚举类型
+// 定义 QuotaType 枚举类型
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuotaType {
     Hard,
 }
 
-// 定义BucketQuota结构体
+// 定义 BucketQuota 结构体
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketQuota {
-    quota: Option<u64>, // 使用Option来表示可能不存在的字段
+    quota: Option<u64>, // 使用 Option 来表示可能不存在的字段
 
     size: u64,
 

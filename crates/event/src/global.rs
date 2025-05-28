@@ -1,5 +1,6 @@
+use std::cell::OnceCell;
 use crate::{create_adapters, Error, Event, NotifierConfig, NotifierSystem};
-use std::sync::{atomic, Arc};
+use std::sync::{atomic, Arc, Mutex};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::instrument;
 
@@ -173,15 +174,18 @@ async fn get_system() -> Result<Arc<Mutex<NotifierSystem>>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{AdapterCommon, AdapterConfig, NotifierConfig, WebhookConfig};
-    use std::collections::HashMap;
+    use crate::NotifierConfig;
+
+    fn init_tracing() {
+        // Use try_init to avoid panic if already initialized
+        let _ = tracing_subscriber::fmt::try_init();
+    }
 
     #[tokio::test]
     async fn test_initialize_success() {
-        tracing_subscriber::fmt::init();
+        init_tracing();
         let config = NotifierConfig::default(); // assume there is a default configuration
-        let result = initialize(&config).await;
+        let result = initialize(config).await;
         assert!(result.is_err(), "Initialization should not succeed");
         assert!(!is_initialized(), "System should not be marked as initialized");
         assert!(!is_ready(), "System should not be marked as ready");
@@ -189,56 +193,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_twice() {
-        tracing_subscriber::fmt::init();
+        init_tracing();
         let config = NotifierConfig::default();
-        let _ = initialize(&config.clone()).await; // first initialization
-        let result = initialize(&config).await; // second initialization
+        let _ = initialize(config.clone()).await; // first initialization
+        let result = initialize(config).await; // second initialization
         assert!(result.is_err(), "Initialization should succeed");
         assert!(result.is_err(), "Re-initialization should fail");
     }
 
     #[tokio::test]
     async fn test_initialize_failure_resets_state() {
-        tracing_subscriber::fmt::init();
-        // simulate wrong configuration
+        init_tracing();
+        // Test with empty adapters to force failure
         let config = NotifierConfig {
-            adapters: vec![
-                // assuming that the empty adapter will cause failure
-                AdapterConfig::Webhook(WebhookConfig {
-                    common: AdapterCommon {
-                        identifier: "empty".to_string(),
-                        comment: "empty".to_string(),
-                        enable: true,
-                        queue_dir: "".to_string(),
-                        queue_limit: 10,
-                    },
-                    endpoint: "http://localhost:8080/webhook".to_string(),
-                    auth_token: Some("secret-token".to_string()),
-                    custom_headers: Some(HashMap::from([("X-Custom".to_string(), "value".to_string())])),
-                    max_retries: 3,
-                    timeout: Some(10),
-                    retry_interval: Some(5),
-                    client_cert: None,
-                    client_key: None,
-                }),
-            ], // assuming that the empty adapter will cause failure
+            adapters: Vec::new(),
             ..Default::default()
         };
-        let result = initialize(&config).await;
-        assert!(result.is_ok(), "Initialization with invalid config should fail");
-        assert!(is_initialized(), "System should not be marked as initialized after failure");
-        assert!(is_ready(), "System should not be marked as ready after failure");
+        let result = initialize(config).await;
+        assert!(result.is_err(), "Initialization should fail with empty adapters");
+        assert!(!is_initialized(), "System should not be marked as initialized after failure");
+        assert!(!is_ready(), "System should not be marked as ready after failure");
     }
 
     #[tokio::test]
     async fn test_is_initialized_and_is_ready() {
-        tracing_subscriber::fmt::init();
+        init_tracing();
+        // Initially, the system should not be initialized or ready
         assert!(!is_initialized(), "System should not be initialized initially");
         assert!(!is_ready(), "System should not be ready initially");
 
-        let config = NotifierConfig::default();
-        let _ = initialize(&config).await;
-        assert!(!is_initialized(), "System should be initialized after successful initialization");
-        assert!(!is_ready(), "System should be ready after successful initialization");
+        // Test with empty adapters to ensure failure
+        let config = NotifierConfig {
+            adapters: Vec::new(),
+            ..Default::default()
+        };
+        let result = initialize(config).await;
+        assert!(result.is_err(), "Initialization should fail with empty adapters");
+        assert!(!is_initialized(), "System should not be initialized after failed init");
+        assert!(!is_ready(), "System should not be ready after failed init");
     }
 }

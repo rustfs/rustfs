@@ -64,7 +64,7 @@
 //                         //     content_length,
 //                         // );
 
-//                         // 填充0？
+//                         // 填充 0？
 //                         if !need_padding {
 //                             y.yield_ok(prev_bytes).await;
 //                             break;
@@ -129,7 +129,7 @@
 //                     combined.extend_from_slice(&data);
 
 //                     // debug!(
-//                     //     "取到的长度大于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}",
+//                     //     "取到的长度大于所需，取出需要的长度：{},与上一次合并得到：{}，bytes 剩余：{}",
 //                     //     need_size,
 //                     //     combined.len(),
 //                     //     bytes.len(),
@@ -142,7 +142,7 @@
 //                     combined.extend_from_slice(&bytes);
 
 //                     // debug!(
-//                     //     "取到的长度小于所需，取出需要的长度：{},与上一次合并得到：{}，bytes剩余：{}，直接返回",
+//                     //     "取到的长度小于所需，取出需要的长度：{},与上一次合并得到：{}，bytes 剩余：{}，直接返回",
 //                     //     need_size,
 //                     //     combined.len(),
 //                     //     bytes.len(),
@@ -152,14 +152,14 @@
 //                 }
 //             }
 
-//             // 取到的数据比需要的块大，从bytes中截取需要的块大小
+//             // 取到的数据比需要的块大，从 bytes 中截取需要的块大小
 //             if data_size <= bytes.len() {
 //                 let n = bytes.len() / data_size;
 
 //                 for _ in 0..n {
 //                     let data = bytes.split_to(data_size);
 
-//                     // println!("bytes_buffer.push: {}， 剩余：{}", data.len(), bytes.len());
+//                     // println!("bytes_buffer.push: {}，剩余：{}", data.len(), bytes.len());
 //                     bytes_buffer.push(data);
 //                 }
 

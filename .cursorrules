@@ -1,5 +1,19 @@
 # RustFS Project Cursor Rules
 
+## ⚠️ CRITICAL DEVELOPMENT RULES ⚠️
+
+### 🚨 NEVER COMMIT DIRECTLY TO MASTER/MAIN BRANCH 🚨
+- **This is the most important rule - NEVER modify code directly on main or master branch**
+- **Always work on feature branches and use pull requests for all changes**
+- **Any direct commits to master/main branch are strictly forbidden**
+- Before starting any development, always:
+  1. `git checkout main` (switch to main branch)
+  2. `git pull` (get latest changes)
+  3. `git checkout -b feat/your-feature-name` (create and switch to feature branch)
+  4. Make your changes on the feature branch
+  5. Commit and push to the feature branch
+  6. Create a pull request for review
+
 ## Project Overview
 RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API. The project adopts a modular architecture, supporting erasure coding storage, multi-tenant management, observability, and other enterprise-level features.
 
@@ -32,7 +46,104 @@ fn_call_width = 90
 single_line_let_else_max_width = 100
 ```
 
-### 2. Naming Conventions
+### 2. **🔧 MANDATORY Code Formatting Rules**
+
+**CRITICAL**: All code must be properly formatted before committing. This project enforces strict formatting standards to maintain code consistency and readability.
+
+#### Pre-commit Requirements (MANDATORY)
+
+Before every commit, you **MUST**:
+
+1. **Format your code**:
+   ```bash
+   cargo fmt --all
+   ```
+
+2. **Verify formatting**:
+   ```bash
+   cargo fmt --all --check
+   ```
+
+3. **Pass clippy checks**:
+   ```bash
+   cargo clippy --all-targets --all-features -- -D warnings
+   ```
+
+4. **Ensure compilation**:
+   ```bash
+   cargo check --all-targets
+   ```
+
+#### Quick Commands
+
+Use these convenient Makefile targets for common tasks:
+
+```bash
+# Format all code
+make fmt
+
+# Check if code is properly formatted
+make fmt-check
+
+# Run clippy checks
+make clippy
+
+# Run compilation check
+make check
+
+# Run tests
+make test
+
+# Run all pre-commit checks (format + clippy + check + test)
+make pre-commit
+
+# Setup git hooks (one-time setup)
+make setup-hooks
+```
+
+#### 🔒 Automated Pre-commit Hooks
+
+This project includes a pre-commit hook that automatically runs before each commit to ensure:
+
+- ✅ Code is properly formatted (`cargo fmt --all --check`)
+- ✅ No clippy warnings (`cargo clippy --all-targets --all-features -- -D warnings`)
+- ✅ Code compiles successfully (`cargo check --all-targets`)
+
+**Setting Up Pre-commit Hooks** (MANDATORY for all developers):
+
+Run this command once after cloning the repository:
+
+```bash
+make setup-hooks
+```
+
+Or manually:
+
+```bash
+chmod +x .git/hooks/pre-commit
+```
+
+#### 🚫 Commit Prevention
+
+If your code doesn't meet the formatting requirements, the pre-commit hook will:
+
+1. **Block the commit** and show clear error messages
+2. **Provide exact commands** to fix the issues
+3. **Guide you through** the resolution process
+
+Example output when formatting fails:
+
+```
+❌ Code formatting check failed!
+💡 Please run 'cargo fmt --all' to format your code before committing.
+
+🔧 Quick fix:
+   cargo fmt --all
+   git add .
+   git commit
+```
+
+### 3. Naming Conventions
 - Use `snake_case` for functions, variables, modules
 - Use `PascalCase` for types, traits, enums
 - Constants use `SCREAMING_SNAKE_CASE`
@@ -41,7 +152,47 @@ single_line_let_else_max_width = 100
 - Avoid meaningless names like `temp`, `data`, `foo`, `bar`, `test123`
 - Choose names that clearly express the purpose and intent
 
-### 3. Documentation Comments
+### 4. Type Declaration Guidelines
+- **Prefer type inference over explicit type declarations** when the type is obvious from context
+- Let the Rust compiler infer types whenever possible to reduce verbosity and improve maintainability
+- Only specify types explicitly when:
+  - The type cannot be inferred by the compiler
+  - Explicit typing improves code clarity and readability
+  - Required for API boundaries (function signatures, public struct fields)
+  - Needed to resolve ambiguity between multiple possible types
+
+**Good examples (prefer these):**
+```rust
+// Compiler can infer the type
+let items = vec![1, 2, 3, 4];
+let config = Config::default();
+let result = process_data(&input);
+
+// Iterator chains with clear context
+let filtered: Vec<_> = items.iter().filter(|&&x| x > 2).collect();
+```
+
+**Avoid unnecessary explicit types:**
+```rust
+// Unnecessary - type is obvious
+let items: Vec<i32> = vec![1, 2, 3, 4];
+let config: Config = Config::default();
+let result: ProcessResult = process_data(&input);
+```
+
+**When explicit types are beneficial:**
+```rust
+// API boundaries - always specify types
+pub fn process_data(input: &[u8]) -> Result<ProcessResult, Error> { ... }
+
+// Ambiguous cases - explicit type needed
+let value: f64 = "3.14".parse().unwrap();
+
+// Complex generic types - explicit for clarity
+let cache: HashMap<String, Arc<Mutex<CacheEntry>>> = HashMap::new();
+```
+
+### 5. Documentation Comments
 - Public APIs must have documentation comments
 - Use `///` for documentation comments
 - Complex functions add `# Examples` and `# Parameters` descriptions
@@ -49,7 +200,7 @@ single_line_let_else_max_width = 100
 - Always use English for all comments and documentation
 - Avoid meaningless comments like "debug 111" or placeholder text
 
-### 4. Import Guidelines
+### 6. Import Guidelines
 - Standard library imports first
 - Third-party crate imports in the middle
 - Project internal imports last
@@ -292,31 +443,33 @@ async fn health_check() -> Result<HealthStatus> {
 
 ## Code Review Checklist
 
-### 1. Functionality
+### 1. **Code Formatting and Quality (MANDATORY)**
+- [ ] **Code is properly formatted** (`cargo fmt --all --check` passes)
+- [ ] **All clippy warnings are resolved** (`cargo clippy --all-targets --all-features -- -D warnings` passes)
+- [ ] **Code compiles successfully** (`cargo check --all-targets` passes)
+- [ ] **Pre-commit hooks are working** and all checks pass
+- [ ] **No formatting-related changes** mixed with functional changes (separate commits)
+
+### 2. Functionality
 - [ ] Are all error cases properly handled?
 - [ ] Is there appropriate logging?
 - [ ] Is there necessary test coverage?
 
-### 2. Performance
+### 3. Performance
 - [ ] Are unnecessary memory allocations avoided?
 - [ ] Are async operations used correctly?
 - [ ] Are there potential deadlock risks?
 
-### 3. Security
+### 4. Security
 - [ ] Are input parameters properly validated?
 - [ ] Are there appropriate permission checks?
 - [ ] Is information leakage avoided?
 
-### 4. Cross-Platform Compatibility
+### 5. Cross-Platform Compatibility
 - [ ] Does the code work on different CPU architectures (x86_64, aarch64)?
 - [ ] Are platform-specific features properly gated with conditional compilation?
 - [ ] Is byte order handling correct for binary data?
 - [ ] Are there appropriate fallback implementations for unsupported platforms?
-
-### 5. Maintainability
-- [ ] Is the code clear and understandable?
-- [ ] Does it follow the project's architectural patterns?
-- [ ] Is there appropriate documentation?
 
 ### 6. Code Commits and Documentation
 - [ ] Does it comply with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)?
@@ -387,11 +540,20 @@ These rules should serve as guiding principles when developing the RustFS projec
 ### 4. Code Operations
 
 #### Branch Management
- - **NEVER modify code directly on main or master branch**
+ - **🚨 CRITICAL: NEVER modify code directly on main or master branch - THIS IS ABSOLUTELY FORBIDDEN 🚨**
+ - **⚠️ ANY DIRECT COMMITS TO MASTER/MAIN WILL BE REJECTED AND MUST BE REVERTED IMMEDIATELY ⚠️**
+ - **Always work on feature branches - NO EXCEPTIONS**
  - Always check the .cursorrules file before starting to ensure you understand the project guidelines
- - Before starting any change or requirement development, first git checkout to main branch, then git pull to get the latest code
- - For each feature or change to be developed, first create a branch, then git checkout to that branch
+ - **MANDATORY workflow for ALL changes:**
+   1. `git checkout main` (switch to main branch)
+   2. `git pull` (get latest changes)
+   3. `git checkout -b feat/your-feature-name` (create and switch to feature branch)
+   4. Make your changes ONLY on the feature branch
+   5. Test thoroughly before committing
+   6. Commit and push to the feature branch
+   7. Create a pull request for code review
  - Use descriptive branch names following the pattern: `feat/feature-name`, `fix/issue-name`, `refactor/component-name`, etc.
+ - **Double-check current branch before ANY commit: `git branch` to ensure you're NOT on main/master**
  - Ensure all changes are made on feature branches and merged through pull requests
 
 #### Development Workflow
@@ -402,6 +564,7 @@ These rules should serve as guiding principles when developing the RustFS projec
  - Ensure each change provides sufficient test cases to guarantee code correctness
  - Do not arbitrarily modify numbers and constants in test cases, carefully analyze their meaning to ensure test case correctness
  - When writing or modifying tests, check existing test cases to ensure they have scientific naming and rigorous logic testing, if not compliant, modify test cases to ensure scientific and rigorous testing
+ - **Before committing any changes, run `cargo clippy --all-targets --all-features -- -D warnings` to ensure all code passes Clippy checks**
  - After each development completion, first git add . then git commit -m "feat: feature description" or "fix: issue description", ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
  - **Keep commit messages concise and under 72 characters** for the title line, use body for detailed explanations if needed
  - After each development completion, first git push to remote repository

@@ -141,7 +141,7 @@ mod test {
 
         l_rw_lock.lock().await;
 
-        assert!(!(l_rw_lock.get_r_lock(id, source, &timeout).await));
+        assert!(!l_rw_lock.get_r_lock(id, source, &timeout).await);
         l_rw_lock.un_lock().await;
         assert!(l_rw_lock.get_r_lock(id, source, &timeout).await);
 
@@ -165,7 +165,7 @@ mod test {
         let two_fn = async {
             let two = Arc::clone(&l_rw_lock);
             let timeout = Duration::from_secs(2);
-            assert!(!(two.get_r_lock(id, source, &timeout).await));
+            assert!(!two.get_r_lock(id, source, &timeout).await);
             sleep(Duration::from_secs(5)).await;
             assert!(two.get_r_lock(id, source, &timeout).await);
             two.un_r_lock().await;

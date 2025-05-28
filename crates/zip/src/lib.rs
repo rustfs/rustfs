@@ -21,18 +21,13 @@ pub enum CompressionFormat {
     Unknown,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionLevel {
     Fastest,
     Best,
+    #[default]
     Default,
     Level(u32),
-}
-
-impl Default for CompressionLevel {
-    fn default() -> Self {
-        CompressionLevel::Default
-    }
 }
 
 impl CompressionFormat {
@@ -679,7 +674,7 @@ mod tests {
             async move {
                 if invocation_number == 0 {
                     // First invocation returns an error
-                    Err(io::Error::new(io::ErrorKind::Other, "Simulated callback error"))
+                    Err(io::Error::other("Simulated callback error"))
                 } else {
                     Ok(())
                 }
@@ -716,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_compression_format_clone_and_copy() {
-        // 测试CompressionFormat是否可以被复制
+        // 测试 CompressionFormat 是否可以被复制
         let format = CompressionFormat::Gzip;
         let format_copy = format;
 
@@ -729,7 +724,7 @@ mod tests {
 
     #[test]
     fn test_compression_format_match_exhaustiveness() {
-        // 测试match语句的完整性
+        // 测试 match 语句的完整性
         fn handle_format(format: CompressionFormat) -> &'static str {
             match format {
                 CompressionFormat::Gzip => "gzip",
@@ -765,8 +760,7 @@ mod tests {
             }
         }
 
-        // 如果能执行到这里，说明性能是可接受的
-        assert!(true, "Extension parsing performance test completed");
+        // Extension parsing performance test completed
     }
 
     #[test]
@@ -906,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_zip_entry_creation() {
-        // 测试ZIP条目信息创建
+        // 测试 ZIP 条目信息创建
         let entry = ZipEntry {
             name: "test.txt".to_string(),
             size: 1024,
@@ -934,7 +928,7 @@ mod tests {
         ];
 
         for level in levels {
-            // 验证每个级别都有对应的Debug实现
+            // 验证每个级别都有对应的 Debug 实现
             let _debug_str = format!("{:?}", level);
         }
     }
@@ -960,7 +954,7 @@ mod tests {
             // 验证支持状态检查
             let _supported = format.is_supported();
 
-            // 验证Debug实现
+            // 验证 Debug 实现
             let _debug = format!("{:?}", format);
         }
     }
@@ -991,7 +985,7 @@ mod tests {
 //     .await
 //     {
 //         Ok(_) => println!("解压成功！"),
-//         Err(e) => println!("解压失败: {}", e),
+//         Err(e) => println!("解压失败：{}", e),
 //     }
 
 //     Ok(())

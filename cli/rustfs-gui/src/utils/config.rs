@@ -198,10 +198,10 @@ impl RustFSConfig {
         Ok(())
     }
 
-    /// delete the stored configuration
+    /// Clear the stored configuration from the system keyring
     ///
-    /// # Errors
-    /// * If the configuration cannot be deleted from the keyring
+    /// # Returns
+    /// Returns `Ok(())` if the configuration was successfully cleared, or an error if the operation failed.
     ///
     /// # Example
     /// ```
@@ -213,4 +213,338 @@ impl RustFSConfig {
         entry.delete_credential()?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rustfs_config_default() {
+        let config = RustFSConfig::default();
+        assert!(config.address.is_empty());
+        assert!(config.host.is_empty());
+        assert!(config.port.is_empty());
+        assert!(config.access_key.is_empty());
+        assert!(config.secret_key.is_empty());
+        assert!(config.domain_name.is_empty());
+        assert!(config.volume_name.is_empty());
+        assert!(config.console_address.is_empty());
+    }
+
+    #[test]
+    fn test_rustfs_config_creation() {
+        let config = RustFSConfig {
+            address: "192.168.1.100:9000".to_string(),
+            host: "192.168.1.100".to_string(),
+            port: "9000".to_string(),
+            access_key: "testuser".to_string(),
+            secret_key: "testpass".to_string(),
+            domain_name: "test.rustfs.com".to_string(),
+            volume_name: "/data/rustfs".to_string(),
+            console_address: "192.168.1.100:9001".to_string(),
+        };
+
+        assert_eq!(config.address, "192.168.1.100:9000");
+        assert_eq!(config.host, "192.168.1.100");
+        assert_eq!(config.port, "9000");
+        assert_eq!(config.access_key, "testuser");
+        assert_eq!(config.secret_key, "testpass");
+        assert_eq!(config.domain_name, "test.rustfs.com");
+        assert_eq!(config.volume_name, "/data/rustfs");
+        assert_eq!(config.console_address, "192.168.1.100:9001");
+    }
+
+    #[test]
+    fn test_default_volume_name() {
+        let volume_name = RustFSConfig::default_volume_name();
+        assert!(!volume_name.is_empty());
+        // Should either be the home directory path or fallback to "data"
+        assert!(volume_name.contains("rustfs") || volume_name == "data");
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = RustFSConfig::default_config();
+        assert_eq!(config.address, RustFSConfig::DEFAULT_ADDRESS_VALUE);
+        assert_eq!(config.host, RustFSConfig::DEFAULT_HOST_VALUE);
+        assert_eq!(config.port, RustFSConfig::DEFAULT_PORT_VALUE);
+        assert_eq!(config.access_key, RustFSConfig::DEFAULT_ACCESS_KEY_VALUE);
+        assert_eq!(config.secret_key, RustFSConfig::DEFAULT_SECRET_KEY_VALUE);
+        assert_eq!(config.domain_name, RustFSConfig::DEFAULT_DOMAIN_NAME_VALUE);
+        assert_eq!(config.console_address, RustFSConfig::DEFAULT_CONSOLE_ADDRESS_VALUE);
+        assert!(!config.volume_name.is_empty());
+    }
+
+    #[test]
+    fn test_extract_host_port_valid() {
+        let test_cases = vec![
+            ("127.0.0.1:9000", Some(("127.0.0.1", 9000))),
+            ("localhost:8080", Some(("localhost", 8080))),
+            ("192.168.1.100:3000", Some(("192.168.1.100", 3000))),
+            ("0.0.0.0:80", Some(("0.0.0.0", 80))),
+            ("example.com:443", Some(("example.com", 443))),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = RustFSConfig::extract_host_port(input);
+            assert_eq!(result, expected, "Failed for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_extract_host_port_invalid() {
+        let invalid_cases = vec![
+            "127.0.0.1",            // Missing port
+            "127.0.0.1:",           // Empty port
+            "127.0.0.1:abc",        // Invalid port
+            "127.0.0.1:99999",      // Port out of range
+            "",                     // Empty string
+            "127.0.0.1:9000:extra", // Too many parts
+            "invalid",              // No colon
+        ];
+
+        for input in invalid_cases {
+            let result = RustFSConfig::extract_host_port(input);
+            assert_eq!(result, None, "Should be None for input: {}", input);
+        }
+
+        // Special case: empty host but valid port should still work
+        let result = RustFSConfig::extract_host_port(":9000");
+        assert_eq!(result, Some(("", 9000)));
+    }
+
+    #[test]
+    fn test_extract_host_port_edge_cases() {
+        // Test edge cases for port numbers
+        assert_eq!(RustFSConfig::extract_host_port("host:0"), Some(("host", 0)));
+        assert_eq!(RustFSConfig::extract_host_port("host:65535"), Some(("host", 65535)));
+        assert_eq!(RustFSConfig::extract_host_port("host:65536"), None); // Out of range
+    }
+
+    #[test]
+    fn test_serialization() {
+        let config = RustFSConfig {
+            address: "127.0.0.1:9000".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "9000".to_string(),
+            access_key: "admin".to_string(),
+            secret_key: "password".to_string(),
+            domain_name: "test.com".to_string(),
+            volume_name: "/data".to_string(),
+            console_address: "127.0.0.1:9001".to_string(),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("127.0.0.1:9000"));
+        assert!(json.contains("admin"));
+        assert!(json.contains("test.com"));
+    }
+
+    #[test]
+    fn test_deserialization() {
+        let json = r#"{
+            "address": "192.168.1.100:9000",
+            "host": "192.168.1.100",
+            "port": "9000",
+            "access_key": "testuser",
+            "secret_key": "testpass",
+            "domain_name": "example.com",
+            "volume_name": "/opt/data",
+            "console_address": "192.168.1.100:9001"
+        }"#;
+
+        let config: RustFSConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.address, "192.168.1.100:9000");
+        assert_eq!(config.host, "192.168.1.100");
+        assert_eq!(config.port, "9000");
+        assert_eq!(config.access_key, "testuser");
+        assert_eq!(config.secret_key, "testpass");
+        assert_eq!(config.domain_name, "example.com");
+        assert_eq!(config.volume_name, "/opt/data");
+        assert_eq!(config.console_address, "192.168.1.100:9001");
+    }
+
+    #[test]
+    fn test_serialization_deserialization_roundtrip() {
+        let original_config = RustFSConfig {
+            address: "10.0.0.1:8080".to_string(),
+            host: "10.0.0.1".to_string(),
+            port: "8080".to_string(),
+            access_key: "roundtrip_user".to_string(),
+            secret_key: "roundtrip_pass".to_string(),
+            domain_name: "roundtrip.test".to_string(),
+            volume_name: "/tmp/roundtrip".to_string(),
+            console_address: "10.0.0.1:8081".to_string(),
+        };
+
+        let json = serde_json::to_string(&original_config).unwrap();
+        let deserialized_config: RustFSConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original_config, deserialized_config);
+    }
+
+    #[test]
+    fn test_config_ordering() {
+        let config1 = RustFSConfig {
+            address: "127.0.0.1:9000".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "9000".to_string(),
+            access_key: "admin".to_string(),
+            secret_key: "password".to_string(),
+            domain_name: "test.com".to_string(),
+            volume_name: "/data".to_string(),
+            console_address: "127.0.0.1:9001".to_string(),
+        };
+
+        let config2 = RustFSConfig {
+            address: "127.0.0.1:9000".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "9000".to_string(),
+            access_key: "admin".to_string(),
+            secret_key: "password".to_string(),
+            domain_name: "test.com".to_string(),
+            volume_name: "/data".to_string(),
+            console_address: "127.0.0.1:9001".to_string(),
+        };
+
+        let config3 = RustFSConfig {
+            address: "127.0.0.1:9001".to_string(), // Different port
+            host: "127.0.0.1".to_string(),
+            port: "9001".to_string(),
+            access_key: "admin".to_string(),
+            secret_key: "password".to_string(),
+            domain_name: "test.com".to_string(),
+            volume_name: "/data".to_string(),
+            console_address: "127.0.0.1:9002".to_string(),
+        };
+
+        assert_eq!(config1, config2);
+        assert_ne!(config1, config3);
+        assert!(config1 < config3); // Lexicographic ordering
+    }
+
+    #[test]
+    fn test_clone() {
+        let original = RustFSConfig::default_config();
+        let cloned = original.clone();
+
+        assert_eq!(original, cloned);
+        assert_eq!(original.address, cloned.address);
+        assert_eq!(original.access_key, cloned.access_key);
+    }
+
+    #[test]
+    fn test_debug_format() {
+        let config = RustFSConfig::default_config();
+        let debug_str = format!("{:?}", config);
+
+        assert!(debug_str.contains("RustFSConfig"));
+        assert!(debug_str.contains("address"));
+        assert!(debug_str.contains("127.0.0.1:9000"));
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(RustFSConfig::SERVICE_NAME, "rustfs-service");
+        assert_eq!(RustFSConfig::SERVICE_KEY, "rustfs_key");
+        assert_eq!(RustFSConfig::DEFAULT_DOMAIN_NAME_VALUE, "demo.rustfs.com");
+        assert_eq!(RustFSConfig::DEFAULT_ADDRESS_VALUE, "127.0.0.1:9000");
+        assert_eq!(RustFSConfig::DEFAULT_PORT_VALUE, "9000");
+        assert_eq!(RustFSConfig::DEFAULT_HOST_VALUE, "127.0.0.1");
+        assert_eq!(RustFSConfig::DEFAULT_ACCESS_KEY_VALUE, "rustfsadmin");
+        assert_eq!(RustFSConfig::DEFAULT_SECRET_KEY_VALUE, "rustfsadmin");
+        assert_eq!(RustFSConfig::DEFAULT_CONSOLE_ADDRESS_VALUE, "127.0.0.1:9001");
+    }
+
+    #[test]
+    fn test_empty_strings() {
+        let config = RustFSConfig {
+            address: "".to_string(),
+            host: "".to_string(),
+            port: "".to_string(),
+            access_key: "".to_string(),
+            secret_key: "".to_string(),
+            domain_name: "".to_string(),
+            volume_name: "".to_string(),
+            console_address: "".to_string(),
+        };
+
+        assert!(config.address.is_empty());
+        assert!(config.host.is_empty());
+        assert!(config.port.is_empty());
+        assert!(config.access_key.is_empty());
+        assert!(config.secret_key.is_empty());
+        assert!(config.domain_name.is_empty());
+        assert!(config.volume_name.is_empty());
+        assert!(config.console_address.is_empty());
+    }
+
+    #[test]
+    fn test_very_long_strings() {
+        let long_string = "a".repeat(1000);
+        let config = RustFSConfig {
+            address: format!("{}:9000", long_string),
+            host: long_string.clone(),
+            port: "9000".to_string(),
+            access_key: long_string.clone(),
+            secret_key: long_string.clone(),
+            domain_name: format!("{}.com", long_string),
+            volume_name: format!("/data/{}", long_string),
+            console_address: format!("{}:9001", long_string),
+        };
+
+        assert_eq!(config.host.len(), 1000);
+        assert_eq!(config.access_key.len(), 1000);
+        assert_eq!(config.secret_key.len(), 1000);
+    }
+
+    #[test]
+    fn test_special_characters() {
+        let config = RustFSConfig {
+            address: "127.0.0.1:9000".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "9000".to_string(),
+            access_key: "user@domain.com".to_string(),
+            secret_key: "p@ssw0rd!#$%".to_string(),
+            domain_name: "test-domain.example.com".to_string(),
+            volume_name: "/data/rust-fs/storage".to_string(),
+            console_address: "127.0.0.1:9001".to_string(),
+        };
+
+        assert!(config.access_key.contains("@"));
+        assert!(config.secret_key.contains("!#$%"));
+        assert!(config.domain_name.contains("-"));
+        assert!(config.volume_name.contains("/"));
+    }
+
+    #[test]
+    fn test_unicode_strings() {
+        let config = RustFSConfig {
+            address: "127.0.0.1:9000".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: "9000".to_string(),
+            access_key: "用户名".to_string(),
+            secret_key: "密码123".to_string(),
+            domain_name: "测试.com".to_string(),
+            volume_name: "/数据/存储".to_string(),
+            console_address: "127.0.0.1:9001".to_string(),
+        };
+
+        assert_eq!(config.access_key, "用户名");
+        assert_eq!(config.secret_key, "密码123");
+        assert_eq!(config.domain_name, "测试.com");
+        assert_eq!(config.volume_name, "/数据/存储");
+    }
+
+    #[test]
+    fn test_memory_efficiency() {
+        // Test that the structure doesn't use excessive memory
+        assert!(std::mem::size_of::<RustFSConfig>() < 1000);
+    }
+
+    // Note: Keyring-related tests (load, save, clear) are not included here
+    // because they require actual keyring access and would be integration tests
+    // rather than unit tests. They should be tested separately in an integration
+    // test environment where keyring access can be properly mocked or controlled.
 }

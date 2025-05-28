@@ -22,11 +22,14 @@
 ///
 /// ## Usage
 ///
-/// ```rust
+/// ```no_run
 /// use rustfs_obs::{AppConfig, init_obs};
 ///
+/// # #[tokio::main]
+/// # async fn main() {
 /// let config = AppConfig::default();
-/// let (logger, guard) = init_obs(config);
+/// let (logger, guard) = init_obs(config).await;
+/// # }
 /// ```
 mod config;
 mod entry;
@@ -67,11 +70,14 @@ pub use metrics::request::*;
 /// A tuple containing the logger and the telemetry guard
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::{AppConfig, init_obs};
 ///
+/// # #[tokio::main]
+/// # async fn main() {
 /// let config = AppConfig::default();
-/// let (logger, guard) = init_obs(config);
+/// let (logger, guard) = init_obs(config).await;
+/// # }
 /// ```
 pub async fn init_obs(config: AppConfig) -> (Arc<Mutex<Logger>>, telemetry::OtelGuard) {
     let guard = init_telemetry(&config.observability);
@@ -100,7 +106,7 @@ pub async fn init_obs(config: AppConfig) -> (Arc<Mutex<Logger>>, telemetry::Otel
 /// A reference to the global logger instance
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::get_logger;
 ///
 /// let logger = get_logger();

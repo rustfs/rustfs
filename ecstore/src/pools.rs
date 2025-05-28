@@ -127,7 +127,7 @@ impl PoolMeta {
         }
 
         let mut buf = Deserializer::new(Cursor::new(&data[4..]));
-        let meta: PoolMeta = Deserialize::deserialize(&mut buf).unwrap();
+        let meta: PoolMeta = Deserialize::deserialize(&mut buf)?;
         *self = meta;
 
         if self.version != POOL_META_VERSION {
@@ -141,8 +141,8 @@ impl PoolMeta {
             return Ok(());
         }
         let mut data = Vec::new();
-        data.write_u16::<LittleEndian>(POOL_META_FORMAT).unwrap();
-        data.write_u16::<LittleEndian>(POOL_META_VERSION).unwrap();
+        data.write_u16::<LittleEndian>(POOL_META_FORMAT)?;
+        data.write_u16::<LittleEndian>(POOL_META_VERSION)?;
         let mut buf = Vec::new();
         self.serialize(&mut Serializer::new(&mut buf))?;
         data.write_all(&buf)?;
@@ -1220,7 +1220,7 @@ impl ECStore {
 
                 reader.read_exact(&mut chunk).await?;
 
-                // 每次从reader中读取一个part上传
+                // 每次从 reader 中读取一个 part 上传
                 let rd = Box::new(Cursor::new(chunk));
                 let mut data = PutObjReader::new(rd, part.size);
 

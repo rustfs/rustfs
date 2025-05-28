@@ -375,7 +375,7 @@ pub struct ChecksumInfo {
 pub const DEFAULT_BITROT_ALGO: BitrotAlgorithm = BitrotAlgorithm::HighwayHash256S;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone, Eq, Hash)]
-// BitrotAlgorithm specifies a algorithm used for bitrot protection.
+// BitrotAlgorithm specifies an algorithm used for bitrot protection.
 pub enum BitrotAlgorithm {
     // SHA256 represents the SHA-256 hash function
     SHA256,
@@ -465,23 +465,23 @@ impl GetObjectReader {
         if let Some(rs) = rs {
             let (off, length) = rs.get_offset_length(oi.size)?;
 
-            return Ok((
+            Ok((
                 GetObjectReader {
                     stream: reader,
                     object_info: oi.clone(),
                 },
                 off,
                 length,
-            ));
+            ))
         } else {
-            return Ok((
+            Ok((
                 GetObjectReader {
                     stream: reader,
                     object_info: oi.clone(),
                 },
                 0,
                 oi.size,
-            ));
+            ))
         }
     }
     pub async fn read_all(&mut self) -> Result<Vec<u8>> {
@@ -1058,6 +1058,7 @@ pub trait StorageAPI: ObjectIO {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1089,7 +1090,7 @@ mod tests {
         // Test distribution uniqueness
         let mut unique_values = std::collections::HashSet::new();
         for &val in &file_info.erasure.distribution {
-            assert!(val >= 1 && val <= 6, "Distribution value should be between 1 and 6");
+            assert!((1..=6).contains(&val), "Distribution value should be between 1 and 6");
             unique_values.insert(val);
         }
         assert_eq!(unique_values.len(), 6, "All distribution values should be unique");

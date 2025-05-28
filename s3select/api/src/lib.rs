@@ -12,8 +12,9 @@ pub type QueryResult<T> = Result<T, QueryError>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum QueryError {
+    #[snafu(display("DataFusion error: {}", source))]
     Datafusion {
-        source: DataFusionError,
+        source: Box<DataFusionError>,
         location: Location,
         backtrace: Backtrace,
     },
@@ -49,7 +50,7 @@ impl From<DataFusionError> for QueryError {
             DataFusionError::External(e) if e.downcast_ref::<QueryError>().is_some() => *e.downcast::<QueryError>().unwrap(),
 
             v => Self::Datafusion {
-                source: v,
+                source: Box::new(v),
                 location: Default::default(),
                 backtrace: Backtrace::capture(),
             },

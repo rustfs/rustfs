@@ -10,15 +10,15 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
     let stat = statfs(p.as_ref())?;
 
     let bsize = stat.block_size() as u64;
-    let bfree = stat.blocks_free() as u64;
-    let bavail = stat.blocks_available() as u64;
-    let blocks = stat.blocks() as u64;
+    let bfree = stat.blocks_free();
+    let bavail = stat.blocks_available();
+    let blocks = stat.blocks();
 
     let reserved = match bfree.checked_sub(bavail) {
         Some(reserved) => reserved,
         None => {
             return Err(Error::other(format!(
-                "detected f_bavail space ({}) > f_bfree space ({}), fs corruption at ({}). please run 'fsck'",
+                "detected f_bavail space ({}) > f_bfree space ({}), fs corruption at ({}). please run fsck",
                 bavail,
                 bfree,
                 p.as_ref().display()
@@ -30,7 +30,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
         Some(total) => total * bsize,
         None => {
             return Err(Error::other(format!(
-                "detected reserved space ({}) > blocks space ({}), fs corruption at ({}). please run 'fsck'",
+                "detected reserved space ({}) > blocks space ({}), fs corruption at ({}). please run fsck",
                 reserved,
                 blocks,
                 p.as_ref().display()
@@ -43,7 +43,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
         Some(used) => used,
         None => {
             return Err(Error::other(format!(
-                "detected free space ({}) > total drive space ({}), fs corruption at ({}). please run 'fsck'",
+                "detected free space ({}) > total drive space ({}), fs corruption at ({}). please run fsck",
                 free,
                 total,
                 p.as_ref().display()

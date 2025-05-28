@@ -226,13 +226,13 @@ impl<T: Store> IamSys<T> {
         };
 
         let mut m: HashMap<String, Value> = HashMap::new();
-        m.insert("parent".to_owned(), serde_json::Value::String(parent_user.to_owned()));
+        m.insert("parent".to_owned(), Value::String(parent_user.to_owned()));
 
         if !policy_buf.is_empty() {
-            m.insert(SESSION_POLICY_NAME.to_owned(), serde_json::Value::String(base64_encode(&policy_buf)));
-            m.insert(iam_policy_claim_name_sa(), serde_json::Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
+            m.insert(SESSION_POLICY_NAME.to_owned(), Value::String(base64_encode(&policy_buf)));
+            m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
         } else {
-            m.insert(iam_policy_claim_name_sa(), serde_json::Value::String(INHERITED_POLICY_TYPE.to_owned()));
+            m.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_owned()));
         }
 
         if let Some(claims) = opts.claims {

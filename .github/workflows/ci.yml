@@ -19,7 +19,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -30,20 +30,43 @@ jobs:
           cancel_others: true
           paths_ignore: '["*.md"]'
 
+  # Quality checks for pull requests
+  pr-checks:
+    name: Pull Request Quality Checks
+    if: github.event_name == 'pull_request'
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+
+      - name: Format Check
+        run: cargo fmt --all --check
+
+      - name: Lint Check
+        run: cargo check --all-targets
+
+      - name: Clippy Check
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit Tests
+        run: cargo test --all --exclude e2e_test
+
   develop:
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
 
       - name: Format
         run: cargo fmt --all --check
-  
+
       - name: Lint
         run: cargo check --all-targets
-        # TODO: cargo clippy
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
         run: cargo test --all --exclude e2e_test
@@ -65,11 +88,11 @@ jobs:
 
   s3s-e2e:
     name: E2E (s3s-e2e)
-    needs: 
+    needs:
       - skip-check
       - develop
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -72,6 +72,7 @@ const MI_B: usize = 1024 * 1024;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
 
@@ -80,6 +81,7 @@ fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
         _ => Err(Status::unauthenticated("No valid auth token")),
     }
 }
+
 #[instrument]
 fn print_server_info() {
     let cfg = CONSOLE_CONFIG.get().unwrap();
@@ -452,7 +454,8 @@ async fn run(opt: config::Opt) -> Result<()> {
                             let conn = http_server_clone.serve_connection(TokioIo::new(tls_socket), value_clone);
                             let conn = graceful_clone.watch(conn);
                             if let Err(err) = conn.await {
-                                error!("Https Connection error: {}", err);
+                                // Handle hyper::Error and low-level IO errors at a more granular level
+                                handle_connection_error(&*err);
                             }
                         });
                 });
@@ -467,7 +470,8 @@ async fn run(opt: config::Opt) -> Result<()> {
                     let conn = http_server_clone.serve_connection(TokioIo::new(socket), value_clone);
                     let conn = graceful_clone.watch(conn);
                     if let Err(err) = conn.await {
-                        error!("Http Connection error: {}", err);
+                        // Handle hyper::Error and low-level IO errors at a more granular level
+                        handle_connection_error(&*err);
                     }
                 });
                 debug!("Http handshake success");
@@ -590,4 +594,26 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     info!("server is stopped state: {:?}", state_manager.current_state());
     Ok(())
+}
+
+fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
+    if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+        if hyper_err.is_incomplete_message() {
+            warn!("The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err);
+        } else if hyper_err.is_closed() {
+            warn!("The HTTP connection is closed:{}", hyper_err);
+        } else if hyper_err.is_parse() {
+            error!("HTTP message parsing failed:{}", hyper_err);
+        } else if hyper_err.is_user() {
+            error!("HTTP user-custom error:{}", hyper_err);
+        } else if hyper_err.is_canceled() {
+            warn!("The HTTP connection is canceled:{}", hyper_err);
+        } else {
+            error!("Unknown hyper error:{:?}", hyper_err);
+        }
+    } else if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        error!("Unknown connection IO error:{}", io_err);
+    } else {
+        error!("Unknown connection error type:{:?}", err);
+    }
 }

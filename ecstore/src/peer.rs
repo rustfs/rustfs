@@ -5,7 +5,7 @@ use crate::global::GLOBAL_LOCAL_DISK_MAP;
 use crate::heal::heal_commands::{
     HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET,
 };
-use crate::heal::heal_ops::RUESTFS_RESERVED_BUCKET;
+use crate::heal::heal_ops::RUSTFS_RESERVED_BUCKET;
 use crate::quorum::{bucket_op_ignored_errs, reduce_write_quorum_errs};
 use crate::store::all_local_disk;
 use crate::utils::proto_err_to_err;
@@ -701,7 +701,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             bs_clone.write().await[index] = DRIVE_STATE_OK.to_string();
             as_clone.write().await[index] = DRIVE_STATE_OK.to_string();
 
-            if bucket == RUESTFS_RESERVED_BUCKET {
+            if bucket == RUSTFS_RESERVED_BUCKET {
                 return None;
             }
 

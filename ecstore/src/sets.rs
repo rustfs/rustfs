@@ -121,18 +121,15 @@ impl Sets {
                     disk = local_disk;
                 }
 
-                let has_disk_id = match disk.as_ref().unwrap().get_disk_id().await {
-                    Ok(res) => res,
-                    Err(err) => {
-                        if is_unformatted_disk(&err) {
-                            error!("get_disk_id err {:?}", err);
-                        } else {
-                            warn!("get_disk_id err {:?}", err);
-                        }
-
-                        None
+                let has_disk_id = disk.as_ref().unwrap().get_disk_id().await.unwrap_or_else(|err| {
+                    if is_unformatted_disk(&err) {
+                        error!("get_disk_id err {:?}", err);
+                    } else {
+                        warn!("get_disk_id err {:?}", err);
                     }
-                };
+
+                    None
+                });
 
                 if let Some(_disk_id) = has_disk_id {
                     set_drive.push(disk);
@@ -287,7 +284,7 @@ struct DelObj {
 
 #[async_trait::async_trait]
 impl ObjectIO for Sets {
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, object, h, opts))]
     async fn get_object_reader(
         &self,
         bucket: &str,
@@ -354,17 +351,54 @@ impl StorageAPI for Sets {
         }
     }
     #[tracing::instrument(skip(self))]
-    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+    async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
     }
     #[tracing::instrument(skip(self))]
-    async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
+    async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
         unimplemented!()
     }
 
     #[tracing::instrument(skip(self))]
-    async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+        _fetch_owner: bool,
+        _start_after: Option<String>,
+    ) -> Result<ListObjectsV2Info> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_versions(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -423,6 +457,16 @@ impl StorageAPI for Sets {
             src_object.to_owned(),
             "put_object_reader2 is none".to_owned(),
         )))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
+        if opts.delete_prefix && !opts.delete_prefix_object {
+            self.delete_prefix(bucket, object).await?;
+            return Ok(ObjectInfo::default());
+        }
+
+        self.get_disks_by_key(object).delete_object(bucket, object, opts).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -510,66 +554,22 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
-        if opts.delete_prefix && !opts.delete_prefix_object {
-            self.delete_prefix(bucket, object).await?;
-            return Ok(ObjectInfo::default());
-        }
-
-        self.get_disks_by_key(object).delete_object(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _continuation_token: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-        _fetch_owner: bool,
-        _start_after: Option<String>,
-    ) -> Result<ListObjectsV2Info> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_object_versions(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _marker: Option<String>,
-        _version_marker: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).put_object_metadata(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
-        self.get_disks_by_key(object).get_object_tags(bucket, object, opts).await
-    }
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object)
-            .put_object_tags(bucket, object, tags, opts)
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
+        max_uploads: usize,
+    ) -> Result<ListMultipartsInfo> {
+        self.get_disks_by_key(prefix)
+            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
             .await
     }
-
     #[tracing::instrument(skip(self))]
-    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).delete_object_tags(bucket, object, opts).await
+    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
+        self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -603,26 +603,6 @@ impl StorageAPI for Sets {
         self.get_disks_by_key(object)
             .put_object_part(bucket, object, upload_id, part_id, data, opts)
             .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_multipart_uploads(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        key_marker: Option<String>,
-        upload_id_marker: Option<String>,
-        delimiter: Option<String>,
-        max_uploads: usize,
-    ) -> Result<ListMultipartsInfo> {
-        self.get_disks_by_key(prefix)
-            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
-            .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
-        self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -670,8 +650,25 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
-        unimplemented!()
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).put_object_metadata(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
+        self.get_disks_by_key(object).get_object_tags(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object)
+            .put_object_tags(bucket, object, tags, opts)
+            .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).delete_object_tags(bucket, object, opts).await
     }
 
     #[tracing::instrument(skip(self))]
