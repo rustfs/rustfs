@@ -1,6 +1,5 @@
-use std::cell::OnceCell;
 use crate::{create_adapters, Error, Event, NotifierConfig, NotifierSystem};
-use std::sync::{atomic, Arc, Mutex};
+use std::sync::{atomic, Arc};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::instrument;
 
@@ -174,7 +173,7 @@ async fn get_system() -> Result<Arc<Mutex<NotifierSystem>>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use crate::NotifierConfig;
+    use crate::{initialize, is_initialized, is_ready, NotifierConfig};
 
     fn init_tracing() {
         // Use try_init to avoid panic if already initialized
@@ -185,7 +184,7 @@ mod tests {
     async fn test_initialize_success() {
         init_tracing();
         let config = NotifierConfig::default(); // assume there is a default configuration
-        let result = initialize(config).await;
+        let result = initialize(&config).await;
         assert!(result.is_err(), "Initialization should not succeed");
         assert!(!is_initialized(), "System should not be marked as initialized");
         assert!(!is_ready(), "System should not be marked as ready");
@@ -195,8 +194,8 @@ mod tests {
     async fn test_initialize_twice() {
         init_tracing();
         let config = NotifierConfig::default();
-        let _ = initialize(config.clone()).await; // first initialization
-        let result = initialize(config).await; // second initialization
+        let _ = initialize(&config.clone()).await; // first initialization
+        let result = initialize(&config).await; // second initialization
         assert!(result.is_err(), "Initialization should succeed");
         assert!(result.is_err(), "Re-initialization should fail");
     }
@@ -209,7 +208,7 @@ mod tests {
             adapters: Vec::new(),
             ..Default::default()
         };
-        let result = initialize(config).await;
+        let result = initialize(&config).await;
         assert!(result.is_err(), "Initialization should fail with empty adapters");
         assert!(!is_initialized(), "System should not be marked as initialized after failure");
         assert!(!is_ready(), "System should not be marked as ready after failure");
@@ -227,7 +226,7 @@ mod tests {
             adapters: Vec::new(),
             ..Default::default()
         };
-        let result = initialize(config).await;
+        let result = initialize(&config).await;
         assert!(result.is_err(), "Initialization should fail with empty adapters");
         assert!(!is_initialized(), "System should not be initialized after failed init");
         assert!(!is_ready(), "System should not be ready after failed init");
