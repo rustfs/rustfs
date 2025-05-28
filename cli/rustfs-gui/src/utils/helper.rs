@@ -758,7 +758,6 @@ mod tests {
         // Test that show_error function exists and can be called
         // We can't actually test the dialog in a test environment
         // so we just verify the function signature
-        assert!(true); // Function exists and compiles
     }
 
     #[test]
@@ -766,7 +765,6 @@ mod tests {
         // Test that show_info function exists and can be called
         // We can't actually test the dialog in a test environment
         // so we just verify the function signature
-        assert!(true); // Function exists and compiles
     }
 
     #[test]

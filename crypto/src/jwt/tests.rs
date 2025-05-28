@@ -143,10 +143,10 @@ fn test_jwt_with_different_secret_lengths() {
 
     for secret in &secrets {
         let jwt_token = encode(secret, &claims)
-            .expect(&format!("Failed to encode JWT with secret length {}", secret.len()));
+            .unwrap_or_else(|_| panic!("Failed to encode JWT with secret length {}", secret.len()));
 
         let decoded = decode(&jwt_token, secret)
-            .expect(&format!("Failed to decode JWT with secret length {}", secret.len()));
+            .unwrap_or_else(|_| panic!("Failed to decode JWT with secret length {}", secret.len()));
 
         assert_eq!(decoded.claims, claims);
     }

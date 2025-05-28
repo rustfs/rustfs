@@ -225,7 +225,7 @@ impl UpdateServiceAccountReq {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AccountInfo {
     pub account_name: String,
     pub server: BackendInfo,
@@ -233,7 +233,7 @@ pub struct AccountInfo {
     pub buckets: Vec<BucketAccessInfo>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BucketAccessInfo {
     pub name: String,
     pub size: u64,
@@ -247,7 +247,7 @@ pub struct BucketAccessInfo {
     pub access: AccountAccess,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BucketDetails {
     pub versioning: bool,
     pub versioning_suspended: bool,
@@ -256,7 +256,7 @@ pub struct BucketDetails {
     // pub tagging: Option<Tagging>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AccountAccess {
     pub read: bool,
     pub write: bool,

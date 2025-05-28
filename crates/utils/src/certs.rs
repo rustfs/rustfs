@@ -43,7 +43,7 @@ pub fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
 
 /// error function
 pub fn certs_error(err: String) -> Error {
-    Error::new(io::ErrorKind::Other, err)
+    Error::other(err)
 }
 
 /// Load all certificates and private keys in the directory

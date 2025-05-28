@@ -78,7 +78,7 @@ fn test_encrypt_decrypt_binary_data() -> Result<(), crate::Error> {
         vec![0x00; 100],                    // All zeros
         vec![0xFF; 100],                    // All ones
         (0..=255u8).cycle().take(1000).collect::<Vec<u8>>(), // Sequential pattern
-        vec![0xAA, 0x55].repeat(500),       // Alternating pattern
+        [0xAA, 0x55].repeat(500),       // Alternating pattern
     ];
 
     for pattern in &binary_patterns {

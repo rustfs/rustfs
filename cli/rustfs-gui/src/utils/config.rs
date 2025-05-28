@@ -198,15 +198,16 @@ impl RustFSConfig {
         Ok(())
     }
 
-    /// delete the stored configuration
+    /// Clear the stored configuration from the system keyring
     ///
-    /// # Errors
-    /// * If the configuration cannot be deleted from the keyring
+    /// # Returns
+    /// Returns `Ok(())` if the configuration was successfully cleared, or an error if the operation failed.
     ///
     /// # Example
     /// ```
     /// RustFSConfig::clear().unwrap();
     /// ```
+    #[allow(dead_code)]
     pub fn clear() -> Result<(), Box<dyn Error>> {
         let entry = Entry::new(Self::SERVICE_NAME, Self::SERVICE_KEY)?;
         entry.delete_credential()?;
