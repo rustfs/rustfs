@@ -15,6 +15,7 @@ use tonic::Request;
 const CLUSTER_ADDR: &str = "http://localhost:9000";
 
 #[tokio::test]
+#[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
     let args = LockArgs {
         uid: "1111".to_string(),
