@@ -1,5 +1,19 @@
 # RustFS Project Cursor Rules
 
+## ⚠️ CRITICAL DEVELOPMENT RULES ⚠️
+
+### 🚨 NEVER COMMIT DIRECTLY TO MASTER/MAIN BRANCH 🚨
+- **This is the most important rule - NEVER modify code directly on main or master branch**
+- **Always work on feature branches and use pull requests for all changes**
+- **Any direct commits to master/main branch are strictly forbidden**
+- Before starting any development, always:
+  1. `git checkout main` (switch to main branch)
+  2. `git pull` (get latest changes)
+  3. `git checkout -b feat/your-feature-name` (create and switch to feature branch)
+  4. Make your changes on the feature branch
+  5. Commit and push to the feature branch
+  6. Create a pull request for review
+
 ## Project Overview
 RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API. The project adopts a modular architecture, supporting erasure coding storage, multi-tenant management, observability, and other enterprise-level features.
 
@@ -387,11 +401,20 @@ These rules should serve as guiding principles when developing the RustFS projec
 ### 4. Code Operations
 
 #### Branch Management
- - **NEVER modify code directly on main or master branch**
+ - **🚨 CRITICAL: NEVER modify code directly on main or master branch - THIS IS ABSOLUTELY FORBIDDEN 🚨**
+ - **⚠️ ANY DIRECT COMMITS TO MASTER/MAIN WILL BE REJECTED AND MUST BE REVERTED IMMEDIATELY ⚠️**
+ - **Always work on feature branches - NO EXCEPTIONS**
  - Always check the .cursorrules file before starting to ensure you understand the project guidelines
- - Before starting any change or requirement development, first git checkout to main branch, then git pull to get the latest code
- - For each feature or change to be developed, first create a branch, then git checkout to that branch
+ - **MANDATORY workflow for ALL changes:**
+   1. `git checkout main` (switch to main branch)
+   2. `git pull` (get latest changes)
+   3. `git checkout -b feat/your-feature-name` (create and switch to feature branch)
+   4. Make your changes ONLY on the feature branch
+   5. Test thoroughly before committing
+   6. Commit and push to the feature branch
+   7. Create a pull request for code review
  - Use descriptive branch names following the pattern: `feat/feature-name`, `fix/issue-name`, `refactor/component-name`, etc.
+ - **Double-check current branch before ANY commit: `git branch` to ensure you're NOT on main/master**
  - Ensure all changes are made on feature branches and merged through pull requests
 
 #### Development Workflow
