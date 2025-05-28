@@ -10,14 +10,14 @@ pub struct AccElem {
 impl AccElem {
     pub fn add(&mut self, dur: &Duration) {
         let dur = dur.as_secs();
-        self.total += dur;
-        self.n += 1;
+        self.total = self.total.wrapping_add(dur);
+        self.n = self.n.wrapping_add(1);
     }
 
     pub fn merge(&mut self, b: &AccElem) {
-        self.n += b.n;
-        self.total += b.total;
-        self.size += b.size;
+        self.n = self.n.wrapping_add(b.n);
+        self.total = self.total.wrapping_add(b.total);
+        self.size = self.size.wrapping_add(b.size);
     }
 
     pub fn avg(&self) -> Duration {
@@ -101,6 +101,7 @@ impl LastMinuteLatency {
         }
         if t - self.last_sec >= 60 {
             self.totals = vec![AccElem::default(); 60];
+            self.last_sec = t;
             return;
         }
         while self.last_sec != t {
@@ -114,6 +115,7 @@ impl LastMinuteLatency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_acc_elem_default() {
@@ -124,118 +126,157 @@ mod tests {
     }
 
     #[test]
-    fn test_acc_elem_add() {
+    fn test_acc_elem_add_single_duration() {
         let mut elem = AccElem::default();
+        let duration = Duration::from_secs(5);
 
-        // Add first duration
-        let dur1 = Duration::from_secs(5);
-        elem.add(&dur1);
+        elem.add(&duration);
+
         assert_eq!(elem.total, 5);
         assert_eq!(elem.n, 1);
         assert_eq!(elem.size, 0); // size is not modified by add
-
-        // Add second duration
-        let dur2 = Duration::from_secs(10);
-        elem.add(&dur2);
-        assert_eq!(elem.total, 15);
-        assert_eq!(elem.n, 2);
     }
 
     #[test]
-    fn test_acc_elem_add_with_subsecond_duration() {
+    fn test_acc_elem_add_multiple_durations() {
         let mut elem = AccElem::default();
 
-        // Add duration less than 1 second (should be truncated to 0)
-        let dur = Duration::from_millis(500);
-        elem.add(&dur);
+        elem.add(&Duration::from_secs(3));
+        elem.add(&Duration::from_secs(7));
+        elem.add(&Duration::from_secs(2));
+
+        assert_eq!(elem.total, 12);
+        assert_eq!(elem.n, 3);
+        assert_eq!(elem.size, 0);
+    }
+
+    #[test]
+    fn test_acc_elem_add_zero_duration() {
+        let mut elem = AccElem::default();
+        let duration = Duration::from_secs(0);
+
+        elem.add(&duration);
+
         assert_eq!(elem.total, 0);
         assert_eq!(elem.n, 1);
     }
 
     #[test]
-    fn test_acc_elem_merge() {
+    fn test_acc_elem_add_subsecond_duration() {
+        let mut elem = AccElem::default();
+        // Duration less than 1 second should be truncated to 0
+        let duration = Duration::from_millis(500);
+
+        elem.add(&duration);
+
+        assert_eq!(elem.total, 0); // as_secs() truncates subsecond values
+        assert_eq!(elem.n, 1);
+    }
+
+    #[test]
+    fn test_acc_elem_merge_empty_elements() {
+        let mut elem1 = AccElem::default();
+        let elem2 = AccElem::default();
+
+        elem1.merge(&elem2);
+
+        assert_eq!(elem1.total, 0);
+        assert_eq!(elem1.size, 0);
+        assert_eq!(elem1.n, 0);
+    }
+
+    #[test]
+    fn test_acc_elem_merge_with_data() {
         let mut elem1 = AccElem {
             total: 10,
             size: 100,
             n: 2,
         };
-
         let elem2 = AccElem {
-            total: 20,
+            total: 15,
             size: 200,
             n: 3,
         };
 
         elem1.merge(&elem2);
-        assert_eq!(elem1.total, 30);
+
+        assert_eq!(elem1.total, 25);
         assert_eq!(elem1.size, 300);
         assert_eq!(elem1.n, 5);
     }
 
     #[test]
-    fn test_acc_elem_merge_with_empty() {
-        let mut elem = AccElem {
+    fn test_acc_elem_merge_one_empty() {
+        let mut elem1 = AccElem {
             total: 10,
             size: 100,
             n: 2,
         };
+        let elem2 = AccElem::default();
 
-        let empty_elem = AccElem::default();
-        elem.merge(&empty_elem);
+        elem1.merge(&elem2);
 
-        assert_eq!(elem.total, 10);
-        assert_eq!(elem.size, 100);
-        assert_eq!(elem.n, 2);
+        assert_eq!(elem1.total, 10);
+        assert_eq!(elem1.size, 100);
+        assert_eq!(elem1.n, 2);
     }
 
     #[test]
-    fn test_acc_elem_avg() {
-        // Test with valid data
+    fn test_acc_elem_avg_with_data() {
         let elem = AccElem {
             total: 15,
             size: 0,
             n: 3,
         };
-        assert_eq!(elem.avg(), Duration::from_secs(5));
 
-        // Test with zero count
-        let elem_zero_n = AccElem {
+        let avg = elem.avg();
+        assert_eq!(avg, Duration::from_secs(5)); // 15 / 3 = 5
+    }
+
+    #[test]
+    fn test_acc_elem_avg_zero_count() {
+        let elem = AccElem {
             total: 10,
             size: 0,
             n: 0,
         };
-        assert_eq!(elem_zero_n.avg(), Duration::from_secs(0));
 
-        // Test with zero total
-        let elem_zero_total = AccElem {
+        let avg = elem.avg();
+        assert_eq!(avg, Duration::from_secs(0));
+    }
+
+    #[test]
+    fn test_acc_elem_avg_zero_total() {
+        let elem = AccElem {
             total: 0,
             size: 0,
             n: 5,
         };
-        assert_eq!(elem_zero_total.avg(), Duration::from_secs(0));
 
-        // Test with both zero
-        let elem_both_zero = AccElem::default();
-        assert_eq!(elem_both_zero.avg(), Duration::from_secs(0));
+        let avg = elem.avg();
+        assert_eq!(avg, Duration::from_secs(0));
     }
 
     #[test]
-    fn test_acc_elem_avg_with_single_element() {
+    fn test_acc_elem_avg_rounding() {
         let elem = AccElem {
-            total: 7,
+            total: 10,
             size: 0,
-            n: 1,
+            n: 3,
         };
-        assert_eq!(elem.avg(), Duration::from_secs(7));
+
+        let avg = elem.avg();
+        assert_eq!(avg, Duration::from_secs(3)); // 10 / 3 = 3 (integer division)
     }
 
     #[test]
     fn test_last_minute_latency_default() {
         let latency = LastMinuteLatency::default();
+
         assert_eq!(latency.totals.len(), 60);
         assert_eq!(latency.last_sec, 0);
 
-        // All elements should be default
+        // All elements should be default (empty)
         for elem in &latency.totals {
             assert_eq!(elem.total, 0);
             assert_eq!(elem.size, 0);
@@ -244,48 +285,51 @@ mod tests {
     }
 
     #[test]
-    fn test_last_minute_latency_clone() {
-        let mut latency = LastMinuteLatency {
-            last_sec: 12345,
-            ..Default::default()
-        };
-        latency.totals[0].total = 100;
+    fn test_last_minute_latency_forward_to_same_time() {
+        let mut latency = LastMinuteLatency::default();
+        latency.last_sec = 100;
 
-        let cloned = latency.clone();
-        assert_eq!(cloned.last_sec, 12345);
-        assert_eq!(cloned.totals[0].total, 100);
-        assert_eq!(cloned.totals.len(), 60);
+        // Add some data to verify it's not cleared
+        latency.totals[0].total = 10;
+        latency.totals[0].n = 1;
+
+        latency.forward_to(100); // Same time
+
+        assert_eq!(latency.last_sec, 100);
+        assert_eq!(latency.totals[0].total, 10); // Data should remain
+        assert_eq!(latency.totals[0].n, 1);
     }
 
     #[test]
-    fn test_forward_to_same_time() {
-        let mut latency = LastMinuteLatency {
-            last_sec: 100,
-            ..Default::default()
-        };
+    fn test_last_minute_latency_forward_to_past_time() {
+        let mut latency = LastMinuteLatency::default();
+        latency.last_sec = 100;
 
-        // Forward to same time should not change anything
-        latency.forward_to(100);
-        assert_eq!(latency.last_sec, 100);
+        // Add some data to verify it's not cleared
+        latency.totals[0].total = 10;
+        latency.totals[0].n = 1;
 
-        // Forward to earlier time should not change anything
-        latency.forward_to(99);
-        assert_eq!(latency.last_sec, 100);
+        latency.forward_to(50); // Past time
+
+        assert_eq!(latency.last_sec, 100); // Should not change
+        assert_eq!(latency.totals[0].total, 10); // Data should remain
+        assert_eq!(latency.totals[0].n, 1);
     }
 
     #[test]
-    fn test_forward_to_large_gap() {
-        let mut latency = LastMinuteLatency {
-            last_sec: 100,
-            ..Default::default()
-        };
-        latency.totals[0].total = 999; // Set some data
+    fn test_last_minute_latency_forward_to_large_gap() {
+        let mut latency = LastMinuteLatency::default();
+        latency.last_sec = 100;
 
-        // Forward by more than 60 seconds should reset all totals
-        latency.forward_to(200);
-        assert_eq!(latency.last_sec, 100); // last_sec is not updated in this case
+        // Add some data to verify it's cleared
+        latency.totals[0].total = 10;
+        latency.totals[0].n = 1;
 
-        // All totals should be reset
+        latency.forward_to(200); // Gap >= 60 seconds
+
+        assert_eq!(latency.last_sec, 200); // last_sec should be updated to target time
+
+        // All data should be cleared
         for elem in &latency.totals {
             assert_eq!(elem.total, 0);
             assert_eq!(elem.size, 0);
@@ -294,141 +338,282 @@ mod tests {
     }
 
     #[test]
-    fn test_forward_to_small_gap() {
-        let mut latency = LastMinuteLatency {
-            last_sec: 100,
-            ..Default::default()
-        };
-        latency.totals[1].total = 999; // Set some data at index 1
+    fn test_last_minute_latency_forward_to_small_gap() {
+        let mut latency = LastMinuteLatency::default();
+        latency.last_sec = 100;
 
-        // Forward by 2 seconds
-        latency.forward_to(102);
+        // Add data at specific indices
+        latency.totals[41].total = 10; // (100 + 1) % 60 = 41
+        latency.totals[42].total = 20; // (100 + 2) % 60 = 42
+
+        latency.forward_to(102); // Forward by 2 seconds
+
         assert_eq!(latency.last_sec, 102);
 
-        // Index 1 should still have data
-        assert_eq!(latency.totals[1].total, 999);
-
-        // Indices that were cleared should be zero
-        assert_eq!(latency.totals[(101 % 60) as usize].total, 0);
-        assert_eq!(latency.totals[(102 % 60) as usize].total, 0);
+        // The slots that were advanced should be cleared
+        assert_eq!(latency.totals[41].total, 0); // Cleared during forward
+        assert_eq!(latency.totals[42].total, 0); // Cleared during forward
     }
 
     #[test]
-    fn test_add_all() {
+    fn test_last_minute_latency_add_all() {
         let mut latency = LastMinuteLatency::default();
         let acc_elem = AccElem {
-            total: 50,
-            size: 1000,
-            n: 5,
+            total: 15,
+            size: 100,
+            n: 3,
         };
 
-        let test_sec = 12345;
-        latency.add_all(test_sec, &acc_elem);
+        latency.add_all(1000, &acc_elem);
 
-        assert_eq!(latency.last_sec, test_sec);
-        let win_idx = (test_sec % 60) as usize;
-        assert_eq!(latency.totals[win_idx].total, 50);
-        assert_eq!(latency.totals[win_idx].size, 1000);
-        assert_eq!(latency.totals[win_idx].n, 5);
+        assert_eq!(latency.last_sec, 1000);
+        let idx = 1000 % 60; // Should be 40
+        assert_eq!(latency.totals[idx as usize].total, 15);
+        assert_eq!(latency.totals[idx as usize].size, 100);
+        assert_eq!(latency.totals[idx as usize].n, 3);
     }
 
     #[test]
-    fn test_add_all_multiple_times() {
+    fn test_last_minute_latency_add_all_multiple() {
         let mut latency = LastMinuteLatency::default();
 
         let acc_elem1 = AccElem {
             total: 10,
-            size: 100,
-            n: 1,
-        };
-
-        let acc_elem2 = AccElem {
-            total: 20,
-            size: 200,
+            size: 50,
             n: 2,
         };
+        let acc_elem2 = AccElem {
+            total: 20,
+            size: 100,
+            n: 4,
+        };
 
-        let test_sec = 12345;
-        latency.add_all(test_sec, &acc_elem1);
-        latency.add_all(test_sec, &acc_elem2);
+        latency.add_all(1000, &acc_elem1);
+        latency.add_all(1000, &acc_elem2); // Same second
 
-        let win_idx = (test_sec % 60) as usize;
-        assert_eq!(latency.totals[win_idx].total, 30);
-        assert_eq!(latency.totals[win_idx].size, 300);
-        assert_eq!(latency.totals[win_idx].n, 3);
+        let idx = 1000 % 60;
+        assert_eq!(latency.totals[idx as usize].total, 30); // 10 + 20
+        assert_eq!(latency.totals[idx as usize].size, 150); // 50 + 100
+        assert_eq!(latency.totals[idx as usize].n, 6); // 2 + 4
     }
 
     #[test]
-    fn test_merge_with_same_last_sec() {
+    fn test_last_minute_latency_merge_same_time() {
         let mut latency1 = LastMinuteLatency::default();
         let mut latency2 = LastMinuteLatency::default();
 
-        latency1.last_sec = 100;
-        latency2.last_sec = 100;
+        latency1.last_sec = 1000;
+        latency2.last_sec = 1000;
 
+        // Add data to both
         latency1.totals[0].total = 10;
-        latency1.totals[0].n = 1;
-
+        latency1.totals[0].n = 2;
         latency2.totals[0].total = 20;
-        latency2.totals[0].n = 2;
+        latency2.totals[0].n = 3;
 
         let merged = latency1.merge(&mut latency2);
 
-        assert_eq!(merged.last_sec, 100);
-        assert_eq!(merged.totals[0].total, 30);
-        assert_eq!(merged.totals[0].n, 3);
+        assert_eq!(merged.last_sec, 1000);
+        assert_eq!(merged.totals[0].total, 30); // 10 + 20
+        assert_eq!(merged.totals[0].n, 5); // 2 + 3
     }
 
     #[test]
-    fn test_merge_with_different_last_sec() {
+    fn test_last_minute_latency_merge_different_times() {
         let mut latency1 = LastMinuteLatency::default();
         let mut latency2 = LastMinuteLatency::default();
 
-        latency1.last_sec = 100;
-        latency2.last_sec = 105;
+        latency1.last_sec = 1000;
+        latency2.last_sec = 1010; // 10 seconds later
 
+        // Add data to both
         latency1.totals[0].total = 10;
-        latency2.totals[5].total = 20;
+        latency2.totals[0].total = 20;
 
         let merged = latency1.merge(&mut latency2);
 
-        // Should use the later timestamp
-        assert_eq!(merged.last_sec, 105);
+        assert_eq!(merged.last_sec, 1010); // Should use the later time
+        assert_eq!(merged.totals[0].total, 30);
     }
 
     #[test]
-    fn test_merge_all_slots() {
+    fn test_last_minute_latency_merge_empty() {
         let mut latency1 = LastMinuteLatency::default();
         let mut latency2 = LastMinuteLatency::default();
 
-        // Fill all slots with different values
-        for i in 0..60 {
-            latency1.totals[i].total = i as u64;
-            latency1.totals[i].n = 1;
-
-            latency2.totals[i].total = (i * 2) as u64;
-            latency2.totals[i].n = 2;
-        }
-
         let merged = latency1.merge(&mut latency2);
 
-        for i in 0..60 {
-            assert_eq!(merged.totals[i].total, (i + i * 2) as u64);
-            assert_eq!(merged.totals[i].n, 3);
+        assert_eq!(merged.last_sec, 0);
+        for elem in &merged.totals {
+            assert_eq!(elem.total, 0);
+            assert_eq!(elem.size, 0);
+            assert_eq!(elem.n, 0);
         }
     }
 
     #[test]
-    fn test_get_total_empty() {
+    fn test_last_minute_latency_window_wraparound() {
         let mut latency = LastMinuteLatency::default();
-        let total = latency.get_total();
 
-        assert_eq!(total.total, 0);
-        assert_eq!(total.size, 0);
-        assert_eq!(total.n, 0);
+        // Test that indices wrap around correctly
+        for sec in 0..120 { // Test for 2 minutes
+            let acc_elem = AccElem {
+                total: sec,
+                size: 0,
+                n: 1,
+            };
+            latency.add_all(sec, &acc_elem);
+
+            let expected_idx = sec % 60;
+            assert_eq!(latency.totals[expected_idx as usize].total, sec);
+        }
     }
 
-        #[test]
+    #[test]
+    fn test_last_minute_latency_time_progression() {
+        let mut latency = LastMinuteLatency::default();
+
+        // Add data at time 1000
+        latency.add_all(1000, &AccElem { total: 10, size: 0, n: 1 });
+
+        // Forward to time 1030 (30 seconds later)
+        latency.forward_to(1030);
+
+        // Original data should still be there
+        let idx_1000 = 1000 % 60;
+        assert_eq!(latency.totals[idx_1000 as usize].total, 10);
+
+        // Forward to time 1070 (70 seconds from original, > 60 seconds)
+        latency.forward_to(1070);
+
+        // All data should be cleared due to large gap
+        for elem in &latency.totals {
+            assert_eq!(elem.total, 0);
+            assert_eq!(elem.n, 0);
+        }
+    }
+
+    #[test]
+    fn test_last_minute_latency_realistic_scenario() {
+        let mut latency = LastMinuteLatency::default();
+        let base_time = 1000u64;
+
+        // Add data for exactly 60 seconds to fill the window
+        for i in 0..60 {
+            let current_time = base_time + i;
+            let duration_secs = i % 10 + 1; // Varying durations 1-10 seconds
+            let acc_elem = AccElem {
+                total: duration_secs,
+                size: 1024 * (i % 5 + 1), // Varying sizes
+                n: 1,
+            };
+
+            latency.add_all(current_time, &acc_elem);
+        }
+
+        // Count non-empty slots after filling the window
+        let mut non_empty_count = 0;
+        let mut total_n = 0;
+        let mut total_sum = 0;
+
+        for elem in &latency.totals {
+            if elem.n > 0 {
+                non_empty_count += 1;
+                total_n += elem.n;
+                total_sum += elem.total;
+            }
+        }
+
+        // We should have exactly 60 non-empty slots (one for each second in the window)
+        assert_eq!(non_empty_count, 60);
+        assert_eq!(total_n, 60); // 60 data points total
+        assert!(total_sum > 0);
+
+        // Test manual total calculation (get_total uses system time which interferes with test)
+        let mut manual_total = AccElem::default();
+        for elem in &latency.totals {
+            manual_total.merge(elem);
+        }
+        assert_eq!(manual_total.n, 60);
+        assert_eq!(manual_total.total, total_sum);
+    }
+
+    #[test]
+    fn test_acc_elem_clone_and_debug() {
+        let elem = AccElem {
+            total: 100,
+            size: 200,
+            n: 5,
+        };
+
+        let cloned = elem.clone();
+        assert_eq!(elem.total, cloned.total);
+        assert_eq!(elem.size, cloned.size);
+        assert_eq!(elem.n, cloned.n);
+
+        // Test Debug trait
+        let debug_str = format!("{:?}", elem);
+        assert!(debug_str.contains("100"));
+        assert!(debug_str.contains("200"));
+        assert!(debug_str.contains("5"));
+    }
+
+    #[test]
+    fn test_last_minute_latency_clone() {
+        let mut latency = LastMinuteLatency::default();
+        latency.last_sec = 1000;
+        latency.totals[0].total = 100;
+        latency.totals[0].n = 5;
+
+        let cloned = latency.clone();
+        assert_eq!(latency.last_sec, cloned.last_sec);
+        assert_eq!(latency.totals[0].total, cloned.totals[0].total);
+        assert_eq!(latency.totals[0].n, cloned.totals[0].n);
+    }
+
+    #[test]
+    fn test_edge_case_max_values() {
+        let mut elem = AccElem {
+            total: u64::MAX - 50,
+            size: u64::MAX - 50,
+            n: u64::MAX - 50,
+        };
+
+        let other = AccElem {
+            total: 100,
+            size: 100,
+            n: 100,
+        };
+
+        // This should not panic due to overflow, values will wrap around
+        elem.merge(&other);
+
+        // Values should wrap around due to overflow (wrapping_add behavior)
+        assert_eq!(elem.total, 49); // (u64::MAX - 50) + 100 wraps to 49
+        assert_eq!(elem.size, 49);
+        assert_eq!(elem.n, 49);
+    }
+
+    #[test]
+    fn test_forward_to_boundary_conditions() {
+        let mut latency = LastMinuteLatency::default();
+        latency.last_sec = 59;
+
+        // Add data at the last slot
+        latency.totals[59].total = 100;
+        latency.totals[59].n = 1;
+
+        // Forward exactly 60 seconds (boundary case)
+        latency.forward_to(119);
+
+        // All data should be cleared
+        for elem in &latency.totals {
+            assert_eq!(elem.total, 0);
+            assert_eq!(elem.n, 0);
+        }
+    }
+
+    #[test]
     fn test_get_total_with_data() {
         let mut latency = LastMinuteLatency::default();
 
@@ -479,22 +664,6 @@ mod tests {
 
             assert_eq!(test_latency.totals[expected_idx].n, 1,
                 "Failed for timestamp {} (expected index {})", timestamp, expected_idx);
-        }
-    }
-
-    #[test]
-    fn test_edge_case_boundary_conditions() {
-        let mut latency = LastMinuteLatency {
-            last_sec: 59,
-            ..Default::default()
-        };
-
-        // Test boundary at 60 seconds
-        latency.forward_to(119); // Exactly 60 seconds later
-
-        // Should reset all totals
-        for elem in &latency.totals {
-            assert_eq!(elem.total, 0);
         }
     }
 
