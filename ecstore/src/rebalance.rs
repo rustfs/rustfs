@@ -639,6 +639,7 @@ impl ECStore {
         false
     }
 
+    #[allow(unused_assignments)]
     #[tracing::instrument(skip(self, wk, set))]
     async fn rebalance_entry(
         &self,

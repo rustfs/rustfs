@@ -281,7 +281,7 @@ async fn start_server(server_addr: SocketAddr, tls_path: Option<String>, app: Ro
                     .handle(handle.clone())
                     .serve(app.into_make_service())
                     .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    .map_err(io::Error::other)?;
 
                 info!("HTTPS server running on https://{}", server_addr);
 
@@ -323,7 +323,7 @@ async fn start_http_server(addr: SocketAddr, app: Router, handle: axum_server::H
         .handle(handle)
         .serve(app.into_make_service())
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
 }
 
 async fn shutdown_signal() {

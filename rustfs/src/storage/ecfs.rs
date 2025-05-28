@@ -119,7 +119,7 @@ impl FS {
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))));
+        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
 
         // let etag_stream = EtagReader::new(body);
 
@@ -961,7 +961,7 @@ impl S3 for FS {
         };
 
         let body = Box::new(StreamReader::new(
-            body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+            body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
         ));
 
         let mut reader = PutObjReader::new(body, content_length as usize);
@@ -1077,7 +1077,7 @@ impl S3 for FS {
         };
 
         let body = Box::new(StreamReader::new(
-            body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
+            body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))),
         ));
 
         // mc cp step 4
