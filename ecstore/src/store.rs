@@ -827,7 +827,7 @@ impl ECStore {
                             }
                         }
                     });
-                    if let Err(err) = set
+                    if let Err(err) = set.clone()
                         .ns_scanner(&all_buckets_clone, want_cycle as u32, tx, heal_scan_mode)
                         .await
                     {
