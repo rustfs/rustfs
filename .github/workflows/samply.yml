@@ -17,7 +17,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo install samply
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: samply
       - run: echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
       - name: Create test volumes
         run: |
