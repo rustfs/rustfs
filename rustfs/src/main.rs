@@ -71,6 +71,7 @@ const MI_B: usize = 1024 * 1024;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
 
@@ -79,6 +80,7 @@ fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
         _ => Err(Status::unauthenticated("No valid auth token")),
     }
 }
+
 #[instrument]
 fn print_server_info() {
     let cfg = CONSOLE_CONFIG.get().unwrap();

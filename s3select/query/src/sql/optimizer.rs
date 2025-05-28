@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn test_cascade_optimizer_builder_default() {
-        let builder = CascadeOptimizerBuilder::default();
+        let _builder = CascadeOptimizerBuilder::default();
 
         // Test that builder can be created successfully
         assert!(std::mem::size_of::<CascadeOptimizerBuilder>() > 0, "Builder should be created successfully");
@@ -95,17 +95,17 @@ mod tests {
 
     #[test]
     fn test_cascade_optimizer_builder_build_with_defaults() {
-        let builder = CascadeOptimizerBuilder::default();
-        let optimizer = builder.build();
+        let _builder = CascadeOptimizerBuilder::default();
+        let optimizer = _builder.build();
 
         // Test that optimizer can be built with default components
         assert!(std::mem::size_of_val(&optimizer) > 0, "Optimizer should be built successfully");
     }
 
-        #[test]
+    #[test]
     fn test_cascade_optimizer_builder_basic_functionality() {
         // Test that builder methods can be called and return self
-        let builder = CascadeOptimizerBuilder::default();
+        let _builder = CascadeOptimizerBuilder::default();
 
         // Test that we can call builder methods (even if we don't have mock implementations)
         // This tests the builder pattern itself
@@ -114,23 +114,23 @@ mod tests {
 
     #[test]
     fn test_cascade_optimizer_builder_memory_efficiency() {
-        let builder = CascadeOptimizerBuilder::default();
+        let _builder = CascadeOptimizerBuilder::default();
 
         // Test that builder doesn't use excessive memory
-        let builder_size = std::mem::size_of_val(&builder);
+        let builder_size = std::mem::size_of_val(&_builder);
         assert!(builder_size < 1000, "Builder should not use excessive memory");
 
-        let optimizer = builder.build();
+        let optimizer = _builder.build();
         let optimizer_size = std::mem::size_of_val(&optimizer);
         assert!(optimizer_size < 1000, "Optimizer should not use excessive memory");
     }
 
-        #[test]
+    #[test]
     fn test_cascade_optimizer_builder_multiple_builds() {
-        let builder = CascadeOptimizerBuilder::default();
+        let _builder = CascadeOptimizerBuilder::default();
 
         // Test that we can build multiple optimizers from the same configuration
-        let optimizer1 = builder.build();
+        let optimizer1 = _builder.build();
         assert!(std::mem::size_of_val(&optimizer1) > 0, "First optimizer should be built successfully");
 
         // Note: builder is consumed by build(), so we can't build again from the same instance
@@ -139,15 +139,13 @@ mod tests {
 
     #[test]
     fn test_cascade_optimizer_builder_default_fallbacks() {
-        let builder = CascadeOptimizerBuilder::default();
-        let optimizer = builder.build();
+        let _builder = CascadeOptimizerBuilder::default();
+        let optimizer = _builder.build();
 
         // Test that default components are used when none are specified
         // We can't directly access the internal components, but we can verify the optimizer was built
         assert!(std::mem::size_of_val(&optimizer) > 0, "Optimizer should use default components");
     }
-
-
 
     #[test]
     fn test_cascade_optimizer_component_types() {
@@ -161,7 +159,7 @@ mod tests {
         // This is a basic structural test
     }
 
-        #[test]
+    #[test]
     fn test_cascade_optimizer_builder_consistency() {
         // Test that multiple builders with the same configuration produce equivalent optimizers
         let optimizer1 = CascadeOptimizerBuilder::default().build();

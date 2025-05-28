@@ -89,7 +89,7 @@ mod tests {
     fn test_id_clone_and_copy() {
         // Test Clone and Copy traits
         let original = ID::Argon2idAESGCM;
-        let cloned = original.clone();
+        let cloned = original;
         let copied = original;
 
         assert!(matches!(cloned, ID::Argon2idAESGCM));
@@ -106,13 +106,13 @@ mod tests {
         let result = id.get_key(password, salt);
         assert!(result.is_ok());
 
-        let key = result.unwrap();
+        let key = result.expect("PBKDF2 key generation should succeed");
         assert_eq!(key.len(), 32);
 
         // Verify deterministic behavior - same inputs should produce same output
         let result2 = id.get_key(password, salt);
         assert!(result2.is_ok());
-        assert_eq!(key, result2.unwrap());
+        assert_eq!(key, result2.expect("PBKDF2 key generation should succeed"));
     }
 
     #[test]
@@ -125,13 +125,13 @@ mod tests {
         let result = id.get_key(password, salt);
         assert!(result.is_ok());
 
-        let key = result.unwrap();
+        let key = result.expect("Argon2id key generation should succeed");
         assert_eq!(key.len(), 32);
 
         // Verify deterministic behavior
         let result2 = id.get_key(password, salt);
         assert!(result2.is_ok());
-        assert_eq!(key, result2.unwrap());
+        assert_eq!(key, result2.expect("Argon2id key generation should succeed"));
     }
 
     #[test]
@@ -144,7 +144,7 @@ mod tests {
         let result = id.get_key(password, salt);
         assert!(result.is_ok());
 
-        let key = result.unwrap();
+        let key = result.expect("Argon2id ChaCha20Poly1305 key generation should succeed");
         assert_eq!(key.len(), 32);
     }
 
@@ -154,8 +154,8 @@ mod tests {
         let id = ID::Pbkdf2AESGCM;
         let salt = b"same_salt_for_all";
 
-        let key1 = id.get_key(b"password1", salt).unwrap();
-        let key2 = id.get_key(b"password2", salt).unwrap();
+        let key1 = id.get_key(b"password1", salt).expect("Key generation with password1 should succeed");
+        let key2 = id.get_key(b"password2", salt).expect("Key generation with password2 should succeed");
 
         assert_ne!(key1, key2);
     }
@@ -166,8 +166,8 @@ mod tests {
         let id = ID::Pbkdf2AESGCM;
         let password = b"same_password";
 
-        let key1 = id.get_key(password, b"salt1_16_bytes__").unwrap();
-        let key2 = id.get_key(password, b"salt2_16_bytes__").unwrap();
+        let key1 = id.get_key(password, b"salt1_16_bytes__").expect("Key generation with salt1 should succeed");
+        let key2 = id.get_key(password, b"salt2_16_bytes__").expect("Key generation with salt2 should succeed");
 
         assert_ne!(key1, key2);
     }
@@ -199,7 +199,7 @@ mod tests {
             let result = algorithm.get_key(password, salt);
             assert!(result.is_ok(), "Algorithm {:?} should generate valid key", algorithm);
 
-            let key = result.unwrap();
+            let key = result.expect("Key generation should succeed for all algorithms");
             assert_eq!(key.len(), 32, "Key length should be 32 bytes for {:?}", algorithm);
 
             // Verify key is not all zeros (very unlikely with proper implementation)
@@ -214,7 +214,7 @@ mod tests {
 
         for original in &original_ids {
             let as_u8 = *original as u8;
-            let converted_back = ID::try_from(as_u8).unwrap();
+            let converted_back = ID::try_from(as_u8).expect("Round-trip conversion should succeed");
 
             assert!(matches!(
                 (original, converted_back),
@@ -231,9 +231,9 @@ mod tests {
         let password = b"consistent_password";
         let salt = b"consistent_salt_";
 
-        let key_argon2_aes = ID::Argon2idAESGCM.get_key(password, salt).unwrap();
-        let key_argon2_chacha = ID::Argon2idChaCHa20Poly1305.get_key(password, salt).unwrap();
-        let key_pbkdf2 = ID::Pbkdf2AESGCM.get_key(password, salt).unwrap();
+        let key_argon2_aes = ID::Argon2idAESGCM.get_key(password, salt).expect("Argon2id AES key generation should succeed");
+        let key_argon2_chacha = ID::Argon2idChaCHa20Poly1305.get_key(password, salt).expect("Argon2id ChaCha key generation should succeed");
+        let key_pbkdf2 = ID::Pbkdf2AESGCM.get_key(password, salt).expect("PBKDF2 key generation should succeed");
 
         // Different algorithms should produce different keys
         assert_ne!(key_argon2_aes, key_pbkdf2);

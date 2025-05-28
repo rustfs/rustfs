@@ -627,7 +627,7 @@ impl LocalDisk {
             };
 
             if let Some(dir) = data_dir {
-                let vid = fi.version_id.unwrap_or(Uuid::nil());
+                let vid = fi.version_id.unwrap_or_default();
                 let _ = fm.data.remove(vec![vid, dir]);
 
                 let dir_path = self.get_object_path(volume, format!("{}/{}", path, dir).as_str())?;
@@ -1194,7 +1194,6 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[must_use]
     #[tracing::instrument(skip(self))]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
@@ -2183,7 +2182,7 @@ impl DiskAPI for LocalDisk {
         let old_dir = meta.delete_version(&fi)?;
 
         if let Some(uuid) = old_dir {
-            let vid = fi.version_id.unwrap_or(Uuid::nil());
+            let vid = fi.version_id.unwrap_or_default();
             let _ = meta.data.remove(vec![vid, uuid])?;
 
             let old_path = file_path.join(Path::new(uuid.to_string().as_str()));
