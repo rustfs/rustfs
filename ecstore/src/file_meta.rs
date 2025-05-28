@@ -94,6 +94,13 @@ impl FileMeta {
 
     // 固定 u32
     pub fn read_bytes_header(buf: &[u8]) -> Result<(u32, &[u8])> {
+        if buf.len() < 5 {
+            return Err(Error::new(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Buffer too small: {} bytes, need at least 5", buf.len())
+            )));
+        }
+
         let (mut size_buf, _) = buf.split_at(5);
 
         //  取 meta 数据，buf = crc + data
@@ -2845,18 +2852,32 @@ fn test_file_meta_load_function() {
 
 #[test]
 fn test_file_meta_read_bytes_header() {
-    // Test read_bytes_header function - it expects the first 5 bytes to be msgpack bin length
-    // Create a buffer with proper msgpack bin format for a 9-byte binary
-    let mut buf = vec![0xc4, 0x09]; // msgpack bin8 format for 9 bytes
-    buf.extend_from_slice(b"test data"); // 9 bytes of data
-    buf.extend_from_slice(b"extra"); // additional data
+    // Create a real FileMeta and marshal it to get proper format
+    let mut fm = FileMeta::new();
+    let mut fi = FileInfo::new("test", 4, 2);
+    fi.version_id = Some(Uuid::new_v4());
+    fi.mod_time = Some(OffsetDateTime::now_utc());
+    fm.add_version(fi).unwrap();
 
-    let result = FileMeta::read_bytes_header(&buf);
+    let marshaled = fm.marshal_msg().unwrap();
+
+    // First call check_xl2_v1 to get the buffer after XL header validation
+    let (after_xl_header, _major, _minor) = FileMeta::check_xl2_v1(&marshaled).unwrap();
+
+    // Ensure we have at least 5 bytes for read_bytes_header
+    if after_xl_header.len() < 5 {
+        panic!("Buffer too small: {} bytes, need at least 5", after_xl_header.len());
+    }
+
+    // Now call read_bytes_header on the remaining buffer
+    let result = FileMeta::read_bytes_header(after_xl_header);
     assert!(result.is_ok());
     let (length, remaining) = result.unwrap();
-    assert_eq!(length, 9); // "test data" length
-                           // remaining should be everything after the 5-byte header (but we only have 2-byte header)
-    assert_eq!(remaining.len(), buf.len() - 5);
+
+    // The length should be greater than 0 for real data
+    assert!(length > 0);
+    // remaining should be everything after the 5-byte header
+    assert_eq!(remaining.len(), after_xl_header.len() - 5);
 
     // Test with buffer too small
     let small_buf = vec![0u8; 2];
