@@ -44,9 +44,9 @@ pub enum GlobalError {
 /// ```rust
 /// use rustfs_obs::{init_telemetry, load_config, set_global_guard};
 ///
-/// async fn init() -> Result<(), Box<dyn std::error::Error>> {
+/// fn init() -> Result<(), Box<dyn std::error::Error>> {
 ///     let config = load_config(None);
-///     let guard = init_telemetry(&config.observability).await?;
+///     let guard = init_telemetry(&config.observability);
 ///     set_global_guard(guard)?;
 ///     Ok(())
 /// }
