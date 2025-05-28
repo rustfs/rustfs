@@ -286,8 +286,10 @@ mod tests {
 
     #[test]
     fn test_last_minute_latency_forward_to_same_time() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 100;
+        let mut latency = LastMinuteLatency {
+            last_sec: 100,
+            ..Default::default()
+        };
 
         // Add some data to verify it's not cleared
         latency.totals[0].total = 10;
@@ -302,8 +304,10 @@ mod tests {
 
     #[test]
     fn test_last_minute_latency_forward_to_past_time() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 100;
+        let mut latency = LastMinuteLatency {
+            last_sec: 100,
+            ..Default::default()
+        };
 
         // Add some data to verify it's not cleared
         latency.totals[0].total = 10;
@@ -318,8 +322,10 @@ mod tests {
 
     #[test]
     fn test_last_minute_latency_forward_to_large_gap() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 100;
+        let mut latency = LastMinuteLatency {
+            last_sec: 100,
+            ..Default::default()
+        };
 
         // Add some data to verify it's cleared
         latency.totals[0].total = 10;
@@ -339,8 +345,10 @@ mod tests {
 
     #[test]
     fn test_last_minute_latency_forward_to_small_gap() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 100;
+        let mut latency = LastMinuteLatency {
+            last_sec: 100,
+            ..Default::default()
+        };
 
         // Add data at specific indices
         latency.totals[41].total = 10; // (100 + 1) % 60 = 41
@@ -560,8 +568,10 @@ mod tests {
 
     #[test]
     fn test_last_minute_latency_clone() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 1000;
+        let mut latency = LastMinuteLatency {
+            last_sec: 1000,
+            ..Default::default()
+        };
         latency.totals[0].total = 100;
         latency.totals[0].n = 5;
 
@@ -596,8 +606,10 @@ mod tests {
 
     #[test]
     fn test_forward_to_boundary_conditions() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 59;
+        let mut latency = LastMinuteLatency {
+            last_sec: 59,
+            ..Default::default()
+        };
 
         // Add data at the last slot
         latency.totals[59].total = 100;
