@@ -84,7 +84,7 @@ pub const DEFAULT_ADDRESS: &str = concat!(":", DEFAULT_PORT);
 
 /// Default port for rustfs console
 /// This is the default port for rustfs console.
-pub const DEFAULT_CONSOLE_PORT: u16 = 9002;
+pub const DEFAULT_CONSOLE_PORT: u16 = 9001;
 
 /// Default address for rustfs console
 /// This is the default address for rustfs console.

@@ -1,0 +1,37 @@
+name: Profile with Samply
+on:
+  push:
+    branches: [ main ]
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo install samply
+      - run: echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
+      - name: Create test volumes
+        run: |
+          for i in {0..4}; do
+          mkdir -p ./target/volume/test$i
+          done
+      - name: Set RUSTFS_VOLUMES
+        run: |
+          export RUSTFS_VOLUMES="./target/volume/test{0...4}"
+          echo "RUSTFS_VOLUMES=$RUSTFS_VOLUMES" >> $GITHUB_ENV
+      - run: echo "RUSTFS_VOLUMES is $RUSTFS_VOLUMES"  # Debug output
+      - run: RUSTFLAGS="-C force-frame-pointers=yes" cargo +nightly build --profile profiling -p rustfs --bins
+      - run: samply record --output profile.json ./target/profiling/rustfs ${RUSTFS_VOLUMES}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: samply-profile
+          path: profile.json
