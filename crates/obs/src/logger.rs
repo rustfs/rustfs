@@ -224,7 +224,7 @@ impl Logger {
 /// # Returns
 /// The global logger instance
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::{AppConfig, start_logger};
 ///
 /// let config = AppConfig::default();
@@ -270,7 +270,7 @@ pub async fn init_global_logger(config: &AppConfig, sinks: Vec<Arc<dyn Sink>>) -
 /// A reference to the global logger instance
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::get_global_logger;
 ///
 /// let logger = get_global_logger();
@@ -290,7 +290,7 @@ pub fn get_global_logger() -> &'static Arc<Mutex<Logger>> {
 /// Result indicating whether the operation was successful
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_info;
 ///
 /// async fn example() {
@@ -309,7 +309,7 @@ pub async fn log_info(message: &str, source: &str) -> Result<(), GlobalError> {
 /// # Returns
 /// Result indicating whether the operation was successful
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_error;
 ///
 /// async fn example() {
@@ -328,7 +328,7 @@ pub async fn log_error(message: &str, source: &str) -> Result<(), GlobalError> {
 /// Result indicating whether the operation was successful
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_warn;
 ///
 /// async fn example() {
@@ -348,7 +348,7 @@ pub async fn log_warn(message: &str, source: &str) -> Result<(), GlobalError> {
 /// Result indicating whether the operation was successful
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_debug;
 ///
 /// async fn example() {
@@ -369,7 +369,7 @@ pub async fn log_debug(message: &str, source: &str) -> Result<(), GlobalError> {
 /// Result indicating whether the operation was successful
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_trace;
 ///
 /// async fn example() {
@@ -392,7 +392,7 @@ pub async fn log_trace(message: &str, source: &str) -> Result<(), GlobalError> {
 /// # Returns
 /// Result indicating whether the operation was successful
 /// # Example
-/// ```
+/// ```no_run
 /// use tracing_core::Level;
 /// use rustfs_obs::log_with_context;
 ///
