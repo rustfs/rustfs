@@ -40,7 +40,7 @@ use crate::{
         ListObjectsV2Info, MakeBucketOptions, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo,
         PutObjReader, StorageAPI,
     },
-    store_init, utils,
+    store_init,
 };
 
 use common::error::{Error, Result};
@@ -2695,17 +2695,17 @@ mod tests {
     // Test validation functions
     #[test]
     fn test_is_valid_object_name() {
-        assert_eq!(is_valid_object_name("valid-object-name"), true);
-        assert_eq!(is_valid_object_name(""), false);
-        assert_eq!(is_valid_object_name("object/with/slashes"), true);
-        assert_eq!(is_valid_object_name("object with spaces"), true);
+        assert!(is_valid_object_name("valid-object-name"));
+        assert!(!is_valid_object_name(""));
+        assert!(is_valid_object_name("object/with/slashes"));
+        assert!(is_valid_object_name("object with spaces"));
     }
 
     #[test]
     fn test_is_valid_object_prefix() {
-        assert_eq!(is_valid_object_prefix("valid-prefix"), true);
-        assert_eq!(is_valid_object_prefix(""), true);
-        assert_eq!(is_valid_object_prefix("prefix/with/slashes"), true);
+        assert!(is_valid_object_prefix("valid-prefix"));
+        assert!(is_valid_object_prefix(""));
+        assert!(is_valid_object_prefix("prefix/with/slashes"));
     }
 
     #[test]

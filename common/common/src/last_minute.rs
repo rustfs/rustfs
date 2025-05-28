@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(latency.totals[0].n, 1);
     }
 
-        #[test]
+    #[test]
     fn test_last_minute_latency_forward_to_large_gap() {
         let mut latency = LastMinuteLatency::default();
         latency.last_sec = 100;
@@ -493,7 +493,7 @@ mod tests {
         }
     }
 
-                        #[test]
+    #[test]
     fn test_last_minute_latency_realistic_scenario() {
         let mut latency = LastMinuteLatency::default();
         let base_time = 1000u64;
@@ -511,7 +511,7 @@ mod tests {
             latency.add_all(current_time, &acc_elem);
         }
 
-                // Count non-empty slots after filling the window
+        // Count non-empty slots after filling the window
         let mut non_empty_count = 0;
         let mut total_n = 0;
         let mut total_sum = 0;
@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(latency.totals[0].n, cloned.totals[0].n);
     }
 
-        #[test]
+    #[test]
     fn test_edge_case_max_values() {
         let mut elem = AccElem {
             total: u64::MAX - 50,
@@ -611,5 +611,128 @@ mod tests {
             assert_eq!(elem.total, 0);
             assert_eq!(elem.n, 0);
         }
+    }
+
+    #[test]
+    fn test_get_total_with_data() {
+        let mut latency = LastMinuteLatency::default();
+
+        // Set a recent timestamp to avoid forward_to clearing data
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        latency.last_sec = current_time;
+
+        // Add data to multiple slots
+        latency.totals[0] = AccElem { total: 10, size: 100, n: 1 };
+        latency.totals[1] = AccElem { total: 20, size: 200, n: 2 };
+        latency.totals[59] = AccElem { total: 30, size: 300, n: 3 };
+
+        let total = latency.get_total();
+
+        assert_eq!(total.total, 60);
+        assert_eq!(total.size, 600);
+        assert_eq!(total.n, 6);
+    }
+
+    #[test]
+    fn test_window_index_calculation() {
+        // Test that window index calculation works correctly
+        let _latency = LastMinuteLatency::default();
+
+        let acc_elem = AccElem {
+            total: 1,
+            size: 1,
+            n: 1,
+        };
+
+        // Test various timestamps
+        let test_cases = [
+            (0, 0),
+            (1, 1),
+            (59, 59),
+            (60, 0),
+            (61, 1),
+            (119, 59),
+            (120, 0),
+        ];
+
+        for (timestamp, expected_idx) in test_cases {
+            let mut test_latency = LastMinuteLatency::default();
+            test_latency.add_all(timestamp, &acc_elem);
+
+            assert_eq!(test_latency.totals[expected_idx].n, 1,
+                "Failed for timestamp {} (expected index {})", timestamp, expected_idx);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_safety_simulation() {
+        // Simulate concurrent access patterns
+        let mut latency = LastMinuteLatency::default();
+
+        // Use current time to ensure data doesn't get cleared by get_total
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+
+        // Simulate rapid additions within a 60-second window
+        for i in 0..1000 {
+            let acc_elem = AccElem {
+                total: (i % 10) + 1, // Ensure non-zero values
+                size: (i % 100) + 1,
+                n: 1,
+            };
+            // Keep all timestamps within the current minute window
+            latency.add_all(current_time - (i % 60), &acc_elem);
+        }
+
+        let total = latency.get_total();
+        assert!(total.n > 0, "Total count should be greater than 0");
+        assert!(total.total > 0, "Total time should be greater than 0");
+    }
+
+    #[test]
+    fn test_acc_elem_debug_format() {
+        let elem = AccElem {
+            total: 123,
+            size: 456,
+            n: 789,
+        };
+
+        let debug_str = format!("{:?}", elem);
+        assert!(debug_str.contains("123"));
+        assert!(debug_str.contains("456"));
+        assert!(debug_str.contains("789"));
+    }
+
+    #[test]
+    fn test_large_values() {
+        let mut elem = AccElem::default();
+
+        // Test with large duration values
+        let large_duration = Duration::from_secs(u64::MAX / 2);
+        elem.add(&large_duration);
+
+        assert_eq!(elem.total, u64::MAX / 2);
+        assert_eq!(elem.n, 1);
+
+        // Test average calculation with large values
+        let avg = elem.avg();
+        assert_eq!(avg, Duration::from_secs(u64::MAX / 2));
+    }
+
+    #[test]
+    fn test_zero_duration_handling() {
+        let mut elem = AccElem::default();
+
+        let zero_duration = Duration::from_secs(0);
+        elem.add(&zero_duration);
+
+        assert_eq!(elem.total, 0);
+        assert_eq!(elem.n, 1);
+        assert_eq!(elem.avg(), Duration::from_secs(0));
     }
 }

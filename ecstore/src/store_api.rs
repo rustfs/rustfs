@@ -1058,6 +1058,7 @@ pub trait StorageAPI: ObjectIO {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1089,7 +1090,7 @@ mod tests {
         // Test distribution uniqueness
         let mut unique_values = std::collections::HashSet::new();
         for &val in &file_info.erasure.distribution {
-            assert!(val >= 1 && val <= 6, "Distribution value should be between 1 and 6");
+            assert!((1..=6).contains(&val), "Distribution value should be between 1 and 6");
             unique_values.insert(val);
         }
         assert_eq!(unique_values.len(), 6, "All distribution values should be unique");

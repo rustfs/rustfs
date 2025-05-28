@@ -84,7 +84,7 @@ impl NsLockMap {
                 nslk.lock.un_lock().await;
             }
 
-            nslk.reference -= 0;
+            nslk.reference -= 1;
 
             if nslk.reference == 0 {
                 w_lock_map.remove(&resource);

@@ -601,7 +601,7 @@ impl FileInfoVersions {
             return None;
         }
 
-        let vid = Uuid::parse_str(v).unwrap_or(Uuid::nil());
+        let vid = Uuid::parse_str(v).unwrap_or_default();
 
         self.versions.iter().position(|v| v.version_id == Some(vid))
     }

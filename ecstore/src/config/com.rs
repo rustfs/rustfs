@@ -1,5 +1,5 @@
 use super::error::{is_err_config_not_found, ConfigError};
-use super::{storageclass, Config, GLOBAL_StorageClass, KVS};
+use super::{storageclass, Config, GLOBAL_StorageClass};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use crate::store_err::is_err_object_not_found;
@@ -191,7 +191,7 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
     if subsys == STORAGE_CLASS_SUB_SYS {
         let kvs = cfg
             .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY)
-            .unwrap_or_else(|| KVS::new());
+            .unwrap_or_default();
 
         for (i, count) in set_drive_counts.iter().enumerate() {
             match storageclass::lookup_config(&kvs, *count) {

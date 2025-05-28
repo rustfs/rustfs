@@ -21,18 +21,13 @@ pub enum CompressionFormat {
     Unknown,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionLevel {
     Fastest,
     Best,
+    #[default]
     Default,
     Level(u32),
-}
-
-impl Default for CompressionLevel {
-    fn default() -> Self {
-        CompressionLevel::Default
-    }
 }
 
 impl CompressionFormat {
@@ -679,7 +674,7 @@ mod tests {
             async move {
                 if invocation_number == 0 {
                     // First invocation returns an error
-                    Err(io::Error::new(io::ErrorKind::Other, "Simulated callback error"))
+                    Err(io::Error::other("Simulated callback error"))
                 } else {
                     Ok(())
                 }
@@ -765,8 +760,7 @@ mod tests {
             }
         }
 
-        // 如果能执行到这里，说明性能是可接受的
-        assert!(true, "Extension parsing performance test completed");
+        // Extension parsing performance test completed
     }
 
     #[test]
