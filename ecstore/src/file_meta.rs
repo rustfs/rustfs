@@ -446,7 +446,7 @@ impl FileMeta {
         let vid = fi.version_id;
 
         if let Some(ref data) = fi.data {
-            let key = vid.unwrap_or(Uuid::nil()).to_string();
+            let key = vid.unwrap_or_default().to_string();
             self.data.replace(&key, data.clone())?;
         }
 
@@ -574,7 +574,7 @@ impl FileMeta {
                 fi.successor_mod_time = succ_mod_time;
             }
             if read_data {
-                fi.data = self.data.find(fi.version_id.unwrap_or(Uuid::nil()).to_string().as_str())?;
+                fi.data = self.data.find(fi.version_id.unwrap_or_default().to_string().as_str())?;
             }
 
             fi.num_versions = self.versions.len();
@@ -1004,7 +1004,7 @@ impl FileMetaVersionHeader {
         rmp::encode::write_array_len(&mut wr, 7)?;
 
         // version_id
-        rmp::encode::write_bin(&mut wr, self.version_id.unwrap_or(Uuid::nil()).as_bytes())?;
+        rmp::encode::write_bin(&mut wr, self.version_id.unwrap_or_default().as_bytes())?;
         // mod_time
         rmp::encode::write_i64(&mut wr, self.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp_nanos() as i64)?;
         // signature
@@ -1430,11 +1430,11 @@ impl MetaObject {
 
         // string "ID"
         rmp::encode::write_str(&mut wr, "ID")?;
-        rmp::encode::write_bin(&mut wr, self.version_id.unwrap_or(Uuid::nil()).as_bytes())?;
+        rmp::encode::write_bin(&mut wr, self.version_id.unwrap_or_default().as_bytes())?;
 
         // string "DDir"
         rmp::encode::write_str(&mut wr, "DDir")?;
-        rmp::encode::write_bin(&mut wr, self.data_dir.unwrap_or(Uuid::nil()).as_bytes())?;
+        rmp::encode::write_bin(&mut wr, self.data_dir.unwrap_or_default().as_bytes())?;
 
         // string "EcAlgo"
         rmp::encode::write_str(&mut wr, "EcAlgo")?;
@@ -1754,7 +1754,7 @@ impl MetaDeleteMarker {
 
         // string "ID"
         rmp::encode::write_str(&mut wr, "ID")?;
-        rmp::encode::write_bin(&mut wr, self.version_id.unwrap_or(Uuid::nil()).as_bytes())?;
+        rmp::encode::write_bin(&mut wr, self.version_id.unwrap_or_default().as_bytes())?;
 
         // string "MTime"
         rmp::encode::write_str(&mut wr, "MTime")?;
@@ -2174,6 +2174,7 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
     }
 }
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod test {
     use super::*;
 
@@ -2392,10 +2393,12 @@ mod test {
 
     #[test]
     fn test_file_meta_version_header_methods() {
-        let mut header = FileMetaVersionHeader::default();
-        header.ec_n = 4;
-        header.ec_m = 2;
-        header.flags = XL_FLAG_FREE_VERSION;
+        let mut header = FileMetaVersionHeader {
+            ec_n: 4,
+            ec_m: 2,
+            flags: XL_FLAG_FREE_VERSION,
+            ..Default::default()
+        };
 
         // Test has_ec
         assert!(header.has_ec());
@@ -2413,13 +2416,17 @@ mod test {
 
     #[test]
     fn test_file_meta_version_header_comparison() {
-        let mut header1 = FileMetaVersionHeader::default();
-        header1.mod_time = Some(OffsetDateTime::from_unix_timestamp(1000).unwrap());
-        header1.version_id = Some(Uuid::new_v4());
+        let mut header1 = FileMetaVersionHeader {
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(1000).unwrap()),
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
 
-        let mut header2 = FileMetaVersionHeader::default();
-        header2.mod_time = Some(OffsetDateTime::from_unix_timestamp(2000).unwrap());
-        header2.version_id = Some(Uuid::new_v4());
+        let mut header2 = FileMetaVersionHeader {
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(2000).unwrap()),
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
 
         // Test sorts_before - header2 should sort before header1 (newer mod_time)
         assert!(!header1.sorts_before(&header2));
@@ -2469,9 +2476,11 @@ mod test {
 
     #[test]
     fn test_meta_object_methods() {
-        let mut obj = MetaObject::default();
-        obj.data_dir = Some(Uuid::new_v4());
-        obj.size = 1024;
+        let mut obj = MetaObject {
+            data_dir: Some(Uuid::new_v4()),
+            size: 1024,
+            ..Default::default()
+        };
 
         // Test use_data_dir
         assert!(obj.use_data_dir());
@@ -2667,16 +2676,20 @@ mod test {
     fn test_decode_data_dir_from_meta() {
         // Test with valid metadata containing data_dir
         let data_dir = Some(Uuid::new_v4());
-        let mut obj = MetaObject::default();
-        obj.data_dir = data_dir;
-        obj.mod_time = Some(OffsetDateTime::now_utc());
-        obj.erasure_algorithm = ErasureAlgo::ReedSolomon;
-        obj.bitrot_checksum_algo = ChecksumAlgo::HighwayHash;
+        let obj = MetaObject {
+            data_dir,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            erasure_algorithm: ErasureAlgo::ReedSolomon,
+            bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+            ..Default::default()
+        };
 
         // Create a valid FileMetaVersion with the object
-        let mut version = FileMetaVersion::default();
-        version.version_type = VersionType::Object;
-        version.object = Some(obj);
+        let version = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(obj),
+            ..Default::default()
+        };
 
         let encoded = version.marshal_msg().unwrap();
         let result = FileMetaVersion::decode_data_dir_from_meta(&encoded);
@@ -2868,8 +2881,10 @@ fn test_file_meta_get_set_idx() {
     assert!(result.is_err());
 
     // Test set_idx
-    let mut new_version = FileMetaVersion::default();
-    new_version.version_type = VersionType::Object;
+    let new_version = FileMetaVersion {
+        version_type: VersionType::Object,
+        ..Default::default()
+    };
     let result = fm.set_idx(0, new_version);
     assert!(result.is_ok());
 
@@ -2983,10 +2998,12 @@ fn test_file_meta_version_header_from_version() {
 
 #[test]
 fn test_meta_object_into_fileinfo() {
-    let mut obj = MetaObject::default();
-    obj.version_id = Some(Uuid::new_v4());
-    obj.size = 1024;
-    obj.mod_time = Some(OffsetDateTime::now_utc());
+    let obj = MetaObject {
+        version_id: Some(Uuid::new_v4()),
+        size: 1024,
+        mod_time: Some(OffsetDateTime::now_utc()),
+        ..Default::default()
+    };
 
     let version_id = obj.version_id;
     let expected_version_id = version_id;
@@ -3014,9 +3031,11 @@ fn test_meta_object_from_fileinfo() {
 
 #[test]
 fn test_meta_delete_marker_into_fileinfo() {
-    let mut marker = MetaDeleteMarker::default();
-    marker.version_id = Some(Uuid::new_v4());
-    marker.mod_time = Some(OffsetDateTime::now_utc());
+    let marker = MetaDeleteMarker {
+        version_id: Some(Uuid::new_v4()),
+        mod_time: Some(OffsetDateTime::now_utc()),
+        ..Default::default()
+    };
 
     let version_id = marker.version_id;
     let expected_version_id = version_id;
@@ -3049,30 +3068,42 @@ fn test_flags_enum() {
 
 #[test]
 fn test_file_meta_version_header_user_data_dir() {
-    let mut header = FileMetaVersionHeader::default();
+    let header = FileMetaVersionHeader {
+        flags: 0,
+        ..Default::default()
+    };
 
     // Test without UsesDataDir flag
-    header.flags = 0;
     assert!(!header.user_data_dir());
 
     // Test with UsesDataDir flag
-    header.flags = Flags::UsesDataDir as u8;
+    let header = FileMetaVersionHeader {
+        flags: Flags::UsesDataDir as u8,
+        ..Default::default()
+    };
     assert!(header.user_data_dir());
 
     // Test with multiple flags including UsesDataDir
-    header.flags = Flags::UsesDataDir as u8 | Flags::FreeVersion as u8;
+    let header = FileMetaVersionHeader {
+        flags: Flags::UsesDataDir as u8 | Flags::FreeVersion as u8,
+        ..Default::default()
+    };
     assert!(header.user_data_dir());
 }
 
 #[test]
 fn test_file_meta_version_header_ordering() {
-    let mut header1 = FileMetaVersionHeader::default();
-    header1.mod_time = Some(OffsetDateTime::from_unix_timestamp(1000).unwrap());
-    header1.version_id = Some(Uuid::new_v4());
+    let header1 = FileMetaVersionHeader {
+        mod_time: Some(OffsetDateTime::from_unix_timestamp(1000).unwrap()),
+        version_id: Some(Uuid::new_v4()),
+        ..Default::default()
+    };
 
-    let mut header2 = FileMetaVersionHeader::default();
-    header2.mod_time = Some(OffsetDateTime::from_unix_timestamp(2000).unwrap());
-    header2.version_id = Some(Uuid::new_v4());
+    let header2 = FileMetaVersionHeader {
+        mod_time: Some(OffsetDateTime::from_unix_timestamp(2000).unwrap()),
+        version_id: Some(Uuid::new_v4()),
+        ..Default::default()
+    };
 
     // Test partial_cmp
     assert!(header1.partial_cmp(&header2).is_some());
@@ -3200,64 +3231,90 @@ async fn test_file_info_from_raw_edge_cases() {
 #[test]
 fn test_file_meta_version_invalid_cases() {
     // Test invalid version
-    let mut version = FileMetaVersion::default();
-    version.version_type = VersionType::Invalid;
+    let version = FileMetaVersion {
+        version_type: VersionType::Invalid,
+        ..Default::default()
+    };
     assert!(!version.valid());
 
     // Test version with neither object nor delete marker
-    version.version_type = VersionType::Object;
-    version.object = None;
-    version.delete_marker = None;
+    let version = FileMetaVersion {
+        version_type: VersionType::Object,
+        object: None,
+        delete_marker: None,
+        ..Default::default()
+    };
     assert!(!version.valid());
 }
 
 #[test]
 fn test_meta_object_edge_cases() {
-    let mut obj = MetaObject::default();
+    let obj = MetaObject {
+        data_dir: None,
+        ..Default::default()
+    };
 
     // Test use_data_dir with None (use_data_dir always returns true)
-    obj.data_dir = None;
     assert!(obj.use_data_dir());
 
     // Test use_inlinedata (always returns false in current implementation)
-    obj.size = 128 * 1024; // 128KB threshold
+    let obj = MetaObject {
+        size: 128 * 1024, // 128KB threshold
+        ..Default::default()
+    };
     assert!(!obj.use_inlinedata()); // Should be false
 
-    obj.size = 128 * 1024 - 1;
+    let obj = MetaObject {
+        size: 128 * 1024 - 1,
+        ..Default::default()
+    };
     assert!(!obj.use_inlinedata()); // Should also be false (always false)
 }
 
 #[test]
 fn test_file_meta_version_header_edge_cases() {
-    let mut header = FileMetaVersionHeader::default();
+    let header = FileMetaVersionHeader {
+        ec_n: 0,
+        ec_m: 0,
+        ..Default::default()
+    };
 
     // Test has_ec with zero values
-    header.ec_n = 0;
-    header.ec_m = 0;
     assert!(!header.has_ec());
 
     // Test matches_not_strict with different signatures but same version_id
-    let mut other = FileMetaVersionHeader::default();
     let version_id = Some(Uuid::new_v4());
-    header.version_id = version_id;
-    other.version_id = version_id;
-    header.version_type = VersionType::Object;
-    other.version_type = VersionType::Object;
-    header.signature = [1, 2, 3, 4];
-    other.signature = [5, 6, 7, 8];
+    let header = FileMetaVersionHeader {
+        version_id,
+        version_type: VersionType::Object,
+        signature: [1, 2, 3, 4],
+        ..Default::default()
+    };
+    let other = FileMetaVersionHeader {
+        version_id,
+        version_type: VersionType::Object,
+        signature: [5, 6, 7, 8],
+        ..Default::default()
+    };
     // Should match because they have same version_id and type
     assert!(header.matches_not_strict(&other));
 
     // Test sorts_before with same mod_time but different version_id
     let time = OffsetDateTime::from_unix_timestamp(1000).unwrap();
-    header.mod_time = Some(time);
-    other.mod_time = Some(time);
-    header.version_id = Some(Uuid::new_v4());
-    other.version_id = Some(Uuid::new_v4());
+    let header_time1 = FileMetaVersionHeader {
+        mod_time: Some(time),
+        version_id: Some(Uuid::new_v4()),
+        ..Default::default()
+    };
+    let header_time2 = FileMetaVersionHeader {
+        mod_time: Some(time),
+        version_id: Some(Uuid::new_v4()),
+        ..Default::default()
+    };
 
     // Should use version_id for comparison when mod_time is same
-    let sorts_before = header.sorts_before(&other);
-    assert!(sorts_before || other.sorts_before(&header)); // One should sort before the other
+    let sorts_before = header_time1.sorts_before(&header_time2);
+    assert!(sorts_before || header_time2.sorts_before(&header_time1)); // One should sort before the other
 }
 
 #[test]

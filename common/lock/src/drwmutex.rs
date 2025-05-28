@@ -696,12 +696,12 @@ mod tests {
         };
 
         // Test get_lock (result depends on local locker state)
-        let result = mutex.get_lock(&id, &source, &opts).await;
+        let _result = mutex.get_lock(&id, &source, &opts).await;
         // Just ensure the method doesn't panic and returns a boolean
-        assert!(result == true || result == false);
+        // assert!(result || !result); // This is always true, so removed
 
         // If lock was acquired, test unlock
-        if result {
+        if _result {
             assert!(mutex.is_locked(), "Mutex should be in locked state");
             mutex.un_lock().await;
             assert!(!mutex.is_locked(), "Mutex should be unlocked after un_lock");
@@ -722,12 +722,12 @@ mod tests {
         };
 
         // Test get_r_lock (result depends on local locker state)
-        let result = mutex.get_r_lock(&id, &source, &opts).await;
+        let _result = mutex.get_r_lock(&id, &source, &opts).await;
         // Just ensure the method doesn't panic and returns a boolean
-        assert!(result == true || result == false);
+        // assert!(result || !result); // This is always true, so removed
 
         // If read lock was acquired, test runlock
-        if result {
+        if _result {
             assert!(mutex.is_r_locked(), "Mutex should be in read locked state");
             mutex.un_r_lock().await;
             assert!(!mutex.is_r_locked(), "Mutex should be unlocked after un_r_lock");
@@ -752,10 +752,10 @@ mod tests {
         // quorum = 3 - 1 = 2
         // Since it's a write lock and quorum != tolerance, quorum stays 2
         // The result depends on the actual locker implementation
-        let result = mutex.get_lock(&id, &source, &opts).await;
+        let _result = mutex.get_lock(&id, &source, &opts).await;
         // We don't assert success/failure here since it depends on the local locker state
         // Just ensure the method doesn't panic and returns a boolean
-        assert!(result == true || result == false);
+        // assert!(result || !result); // This is always true, so removed
     }
 
     #[tokio::test]
@@ -795,10 +795,10 @@ mod tests {
             retry_interval: Duration::from_millis(10),
         };
 
-        let result = mutex.get_lock(&id, &source, &opts).await;
+        let _result = mutex.get_lock(&id, &source, &opts).await;
         // The result depends on the actual locker implementation
         // Just ensure the method doesn't panic and returns a boolean
-        assert!(result == true || result == false);
+        // assert!(result || !result); // This is always true, so removed
     }
 
     #[tokio::test]
@@ -1049,8 +1049,8 @@ mod tests {
         // tolerance = 0 / 2 = 0
         // quorum = 0 - 0 = 0
         // This should fail because we can't achieve any quorum
-        let result = mutex.get_lock(&id, &source, &opts).await;
-        assert!(!result, "Should fail with zero lockers");
+        let _result = mutex.get_lock(&id, &source, &opts).await;
+        assert!(!_result, "Should fail with zero lockers");
     }
 
     #[test]
@@ -1125,8 +1125,8 @@ mod tests {
         let mut some_locks = vec!["uid1".to_string(), "uid2".to_string()];
         let result = mutex.release_all(1, &mut some_locks, false).await;
         // This should attempt to release the locks and may succeed or fail
-        // depending on the local locker state
-        assert!(result || !result); // Just ensure it doesn't panic
+        // depending on the local locker state - just ensure it doesn't panic
+        let _ = result; // Suppress unused variable warning
     }
 
     #[test]

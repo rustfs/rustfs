@@ -2420,6 +2420,7 @@ impl Node for NodeService {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
     use protos::proto_gen::node_service::{

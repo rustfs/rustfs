@@ -317,7 +317,8 @@ mod tests {
     fn test_default_config_file_constant() {
         // Test that the constant is properly defined
         assert_eq!(DEFAULT_CONFIG_FILE, "event");
-        assert!(!DEFAULT_CONFIG_FILE.is_empty(), "Config file name should not be empty");
+        // DEFAULT_CONFIG_FILE is a const, so is_empty() check is redundant
+        // assert!(!DEFAULT_CONFIG_FILE.is_empty(), "Config file name should not be empty");
         assert!(!DEFAULT_CONFIG_FILE.contains('/'), "Config file name should not contain path separators");
         assert!(!DEFAULT_CONFIG_FILE.contains('\\'), "Config file name should not contain Windows path separators");
     }

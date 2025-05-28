@@ -1666,10 +1666,9 @@ mod tests {
         // In test environment, it might be None
         let key = get_token_signing_key();
         // Just verify it doesn't panic and returns an Option
-        match key {
-            Some(k) => assert!(!k.is_empty()),
-            None => {} // This is acceptable in test environment
-        }
+        if let Some(k) = key {
+            assert!(!k.is_empty());
+        } // This is acceptable in test environment when None
     }
 
     #[test]
@@ -1907,10 +1906,12 @@ mod tests {
 
     #[test]
     fn test_session_policy_constants() {
-        // Test session policy related constants
-        assert!(!SESSION_POLICY_NAME.is_empty());
-        assert!(!SESSION_POLICY_NAME_EXTRACTED.is_empty());
-        assert!(MAX_SVCSESSION_POLICY_SIZE > 0);
+        // Test session policy related constants - these are compile-time constants
+        // so we just verify they exist and have expected values
+        assert_eq!(SESSION_POLICY_NAME, "sessionPolicy");
+        assert_eq!(SESSION_POLICY_NAME_EXTRACTED, "sessionPolicy-extracted");
+        // MAX_SVCSESSION_POLICY_SIZE is a positive constant defined at compile time
+        assert_eq!(MAX_SVCSESSION_POLICY_SIZE, 4096); // Verify the actual expected value
     }
 
     #[test]
