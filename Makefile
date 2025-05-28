@@ -7,6 +7,42 @@ IMAGE_NAME ?= rustfs:v1.0.0
 CONTAINER_NAME ?= rustfs-dev
 DOCKERFILE_PATH = $(shell pwd)/.docker
 
+# Code quality and formatting targets
+.PHONY: fmt
+fmt:
+	@echo "🔧 Formatting code..."
+	cargo fmt --all
+
+.PHONY: fmt-check
+fmt-check:
+	@echo "📝 Checking code formatting..."
+	cargo fmt --all --check
+
+.PHONY: clippy
+clippy:
+	@echo "🔍 Running clippy checks..."
+	cargo clippy --all-targets --all-features -- -D warnings
+
+.PHONY: check
+check:
+	@echo "🔨 Running compilation check..."
+	cargo check --all-targets
+
+.PHONY: test
+test:
+	@echo "🧪 Running tests..."
+	cargo test --all --exclude e2e_test
+
+.PHONY: pre-commit
+pre-commit: fmt clippy check test
+	@echo "✅ All pre-commit checks passed!"
+
+.PHONY: setup-hooks
+setup-hooks:
+	@echo "🔧 Setting up git hooks..."
+	chmod +x .git/hooks/pre-commit
+	@echo "✅ Git hooks setup complete!"
+
 .PHONY: init-devenv
 init-devenv:
 	$(DOCKER_CLI) build -t $(IMAGE_NAME) -f $(DOCKERFILE_PATH)/Dockerfile.devenv .
@@ -20,7 +56,7 @@ start:
 
 .PHONY: stop
 stop:
-	$(DOCKER_CLI) stop $(CONTAINER_NAME)	
+	$(DOCKER_CLI) stop $(CONTAINER_NAME)
 
 .PHONY: e2e-server
 e2e-server:

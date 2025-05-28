@@ -295,13 +295,13 @@ mod tests {
     #[test]
     fn test_extract_host_port_invalid() {
         let invalid_cases = vec![
-            "127.0.0.1",           // Missing port
-            "127.0.0.1:",          // Empty port
-            "127.0.0.1:abc",       // Invalid port
-            "127.0.0.1:99999",     // Port out of range
-            "",                    // Empty string
+            "127.0.0.1",            // Missing port
+            "127.0.0.1:",           // Empty port
+            "127.0.0.1:abc",        // Invalid port
+            "127.0.0.1:99999",      // Port out of range
+            "",                     // Empty string
             "127.0.0.1:9000:extra", // Too many parts
-            "invalid",             // No colon
+            "invalid",              // No colon
         ];
 
         for input in invalid_cases {

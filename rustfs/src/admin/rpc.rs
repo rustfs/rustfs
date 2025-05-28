@@ -117,11 +117,7 @@ impl Operation for PutFile {
                 .map_err(|e| s3_error!(InternalError, "read file err {}", e))?
         };
 
-        let mut body = StreamReader::new(
-            req.input
-                .into_stream()
-                .map_err(std::io::Error::other),
-        );
+        let mut body = StreamReader::new(req.input.into_stream().map_err(std::io::Error::other));
 
         tokio::io::copy(&mut body, &mut file)
             .await

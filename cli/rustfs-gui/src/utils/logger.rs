@@ -58,9 +58,7 @@ mod tests {
     fn ensure_logger_init() {
         INIT.call_once(|| {
             // Initialize a simple test logger to avoid conflicts
-            let _ = tracing_subscriber::fmt()
-                .with_test_writer()
-                .try_init();
+            let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         });
     }
 
@@ -84,7 +82,7 @@ mod tests {
         assert!(logs_dir.to_string_lossy().contains("logs"));
     }
 
-        #[test]
+    #[test]
     fn test_rolling_file_appender_builder() {
         ensure_logger_init();
 
@@ -120,7 +118,7 @@ mod tests {
         assert!(!format!("{:?}", never).is_empty());
     }
 
-                        #[test]
+    #[test]
     fn test_fmt_layer_configuration() {
         ensure_logger_init();
 

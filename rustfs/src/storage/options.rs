@@ -630,7 +630,7 @@ mod tests {
             "x-amz-storage-class",
             "x-amz-tagging",
             "expires",
-            "x-amz-replication-status"
+            "x-amz-replication-status",
         ];
 
         assert_eq!(*SUPPORTED_HEADERS, expected_headers);
