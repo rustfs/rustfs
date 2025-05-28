@@ -218,3 +218,7 @@ strip = true      # strip symbol information to reduce binary size
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = true
