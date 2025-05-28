@@ -49,7 +49,7 @@ async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
 async fn test_lock_unlock_ns_lock() -> Result<(), Box<dyn Error>> {
     let url = url::Url::parse("http://127.0.0.1:9000/data")?;
     let locker = new_lock_api(false, Some(url));
-    let ns_mutex = Arc::new(RwLock::new(NsLockMap::new(true)));
+    let ns_mutex = Arc::new(RwLock::new(NsLockMap::new(false)));
     let ns = new_nslock(
         Arc::clone(&ns_mutex),
         "local".to_string(),
