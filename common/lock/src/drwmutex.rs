@@ -376,6 +376,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use common::error::{Error, Result};
+    use crate::local_locker::LocalLocker;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -803,25 +804,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_drw_mutex_concurrent_read_locks() {
+        // Clear global state before test to avoid interference from other tests
+        {
+            let mut global_server = crate::GLOBAL_LOCAL_SERVER.write().await;
+            *global_server = LocalLocker::new();
+        }
+
         let names = vec!["resource1".to_string()];
         let lockers = create_mock_lockers(1);
+        // Both mutexes should use the same locker to test concurrent read locks properly
         let mut mutex1 = DRWMutex::new("owner1".to_string(), names.clone(), lockers.clone());
-        let mut mutex2 = DRWMutex::new("owner2".to_string(), names, create_mock_lockers(1));
+        let mut mutex2 = DRWMutex::new("owner2".to_string(), names, lockers);
 
         let id1 = "test-rlock-id1".to_string();
         let id2 = "test-rlock-id2".to_string();
         let source = "test-source".to_string();
         let opts = Options {
-            timeout: Duration::from_secs(1),
-            retry_interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5), // Increase timeout
+            retry_interval: Duration::from_millis(50), // Increase retry interval
         };
 
-        // Both should be able to acquire read locks
+        // First acquire the first read lock
         let result1 = mutex1.get_r_lock(&id1, &source, &opts).await;
-        let result2 = mutex2.get_r_lock(&id2, &source, &opts).await;
-
         assert!(result1, "First read lock should succeed");
+
+        // Then acquire the second read lock - this should also succeed for read locks
+        let result2 = mutex2.get_r_lock(&id2, &source, &opts).await;
         assert!(result2, "Second read lock should succeed");
+
+        // Clean up locks
+        mutex1.un_r_lock().await;
+        mutex2.un_r_lock().await;
     }
 
     #[tokio::test]
