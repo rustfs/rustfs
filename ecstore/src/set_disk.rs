@@ -2893,7 +2893,7 @@ impl SetDisks {
     }
 
     pub async fn ns_scanner(
-        &self,
+        self: Arc<Self>,
         buckets: &[BucketInfo],
         want_cycle: u32,
         updates: Sender<DataUsageCache>,
@@ -2911,7 +2911,7 @@ impl SetDisks {
             return Ok(());
         }
 
-        let old_cache = DataUsageCache::load(self, DATA_USAGE_CACHE_NAME).await?;
+        let old_cache = DataUsageCache::load(&self, DATA_USAGE_CACHE_NAME).await?;
         let mut cache = DataUsageCache {
             info: DataUsageCacheInfo {
                 name: DATA_USAGE_ROOT.to_string(),
@@ -2934,6 +2934,7 @@ impl SetDisks {
             permutes.shuffle(&mut rng);
             permutes
         };
+
         // Add new buckets first
         for idx in permutes.iter() {
             let b = buckets[*idx].clone();
@@ -2954,6 +2955,7 @@ impl SetDisks {
             Duration::from_secs(30) + Duration::from_secs_f64(10.0 * rng.gen_range(0.0..1.0))
         };
         let mut ticker = interval(update_time);
+
         let task = tokio::spawn(async move {
             let last_save = Some(SystemTime::now());
             let mut need_loop = true;
@@ -2983,8 +2985,8 @@ impl SetDisks {
                 }
             }
         });
+
         // Restrict parallelism for disk usage scanner
-        // upto GOMAXPROCS if GOMAXPROCS is < len(disks)
         let max_procs = num_cpus::get();
         if max_procs < disks.len() {
             disks = disks[0..max_procs].to_vec();
@@ -2997,15 +2999,16 @@ impl SetDisks {
                 Some(disk) => disk.clone(),
                 None => continue,
             };
+            let self_clone = Arc::clone(&self);
             let bucket_rx_clone = bucket_rx.clone();
             let buckets_results_tx_clone = buckets_results_tx.clone();
-            futures.push(async move {
+            futures.push(tokio::spawn(async move {
                 loop {
                     match bucket_rx_clone.write().await.try_recv() {
                         Err(_) => return,
                         Ok(bucket_info) => {
                             let cache_name = Path::new(&bucket_info.name).join(DATA_USAGE_CACHE_NAME);
-                            let mut cache = match DataUsageCache::load(self, &cache_name.to_string_lossy()).await {
+                            let mut cache = match DataUsageCache::load(&self_clone, &cache_name.to_string_lossy()).await {
                                 Ok(cache) => cache,
                                 Err(_) => continue,
                             };
@@ -3022,6 +3025,7 @@ impl SetDisks {
                                     ..Default::default()
                                 };
                             }
+
                             // Collect updates.
                             let (tx, mut rx) = mpsc::channel(1);
                             let buckets_results_tx_inner_clone = buckets_results_tx_clone.clone();
@@ -3042,9 +3046,10 @@ impl SetDisks {
                                     }
                                 }
                             });
+
                             // Calc usage
                             let before = cache.info.last_update;
-                            let mut cache = match disk.clone().ns_scanner(&cache, tx, heal_scan_mode, None).await {
+                            let mut cache = match disk.ns_scanner(&cache, tx, heal_scan_mode, None).await {
                                 Ok(cache) => cache,
                                 Err(_) => {
                                     if cache.info.last_update > before {
@@ -3078,8 +3083,9 @@ impl SetDisks {
                     }
                     info!("continue scanner");
                 }
-            });
+            }));
         }
+
         info!("ns_scanner start");
         let _ = join_all(futures).await;
         drop(buckets_results_tx);
