@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn test_error_downcast() {
         // 测试错误的向下转型
-        let io_error = io::Error::new(io::ErrorKind::Other, "test error");
+        let io_error = io::Error::other("test error");
         let converted: Error = io_error.into();
 
         // 验证可以获取源错误
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn test_error_chain_depth() {
         // 测试错误链的深度
-        let root_cause = io::Error::new(io::ErrorKind::Other, "root cause");
+        let root_cause = io::Error::other("root cause");
         let converted: Error = root_cause.into();
 
         let mut depth = 0;
@@ -411,8 +411,8 @@ mod tests {
 
             // Debug 输出通常包含更多信息，但不是绝对的
             // 这里我们只验证两者都有内容即可
-            assert!(debug_str.len() > 0);
-            assert!(display_str.len() > 0);
+            assert!(!debug_str.is_empty());
+            assert!(!display_str.is_empty());
         }
     }
 }

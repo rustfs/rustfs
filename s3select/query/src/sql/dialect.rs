@@ -23,7 +23,7 @@ mod tests {
 
     #[test]
     fn test_rustfs_dialect_creation() {
-        let dialect = RustFsDialect::default();
+        let _dialect = RustFsDialect;
 
         // Test that dialect can be created successfully
         assert!(std::mem::size_of::<RustFsDialect>() == 0, "Dialect should be zero-sized");
@@ -31,7 +31,7 @@ mod tests {
 
     #[test]
     fn test_rustfs_dialect_debug() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         let debug_str = format!("{:?}", dialect);
         assert!(!debug_str.is_empty(), "Debug output should not be empty");
@@ -40,7 +40,7 @@ mod tests {
 
     #[test]
     fn test_is_identifier_start_alphabetic() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test alphabetic characters
         assert!(dialect.is_identifier_start('a'), "Lowercase letter should be valid identifier start");
@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn test_is_identifier_start_special_chars() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test special characters that are allowed
         assert!(dialect.is_identifier_start('_'), "Underscore should be valid identifier start");
@@ -66,7 +66,7 @@ mod tests {
 
     #[test]
     fn test_is_identifier_start_invalid_chars() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test characters that should not be valid identifier starts
         assert!(!dialect.is_identifier_start('0'), "Digit should not be valid identifier start");
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_is_identifier_part_alphabetic() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test alphabetic characters
         assert!(dialect.is_identifier_part('a'), "Lowercase letter should be valid identifier part");
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_is_identifier_part_digits() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test ASCII digits
         assert!(dialect.is_identifier_part('0'), "Digit 0 should be valid identifier part");
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_is_identifier_part_special_chars() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test special characters that are allowed
         assert!(dialect.is_identifier_part('_'), "Underscore should be valid identifier part");
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_is_identifier_part_invalid_chars() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test characters that should not be valid identifier parts
         assert!(!dialect.is_identifier_part(' '), "Space should not be valid identifier part");
@@ -179,14 +179,14 @@ mod tests {
 
     #[test]
     fn test_supports_group_by_expr() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         assert!(dialect.supports_group_by_expr(), "RustFsDialect should support GROUP BY expressions");
     }
 
     #[test]
     fn test_identifier_validation_comprehensive() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test valid identifier patterns
         let valid_starts = ['a', 'A', 'z', 'Z', '_', '#', '@', 'α', '中'];
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_identifier_edge_cases() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test edge cases with control characters
         assert!(!dialect.is_identifier_start('\0'), "Null character should not be valid identifier start");
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_identifier_unicode_support() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test various Unicode categories
         let unicode_letters = ['α', 'β', 'γ', 'Α', 'Β', 'Γ', '中', '文', '日', '本', 'ñ', 'ü', 'ç'];
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_identifier_ascii_digits() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test all ASCII digits
         for digit in '0'..='9' {
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_dialect_consistency() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test that all valid identifier starts are also valid identifier parts
         let test_chars = [
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_dialect_memory_efficiency() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test that dialect doesn't use excessive memory
         let dialect_size = std::mem::size_of_val(&dialect);
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_dialect_trait_implementation() {
-        let dialect = RustFsDialect::default();
+        let dialect = RustFsDialect;
 
         // Test that dialect properly implements the Dialect trait
         let dialect_ref: &dyn Dialect = &dialect;
@@ -290,8 +290,8 @@ mod tests {
 
     #[test]
     fn test_dialect_clone_and_default() {
-        let dialect1 = RustFsDialect::default();
-        let dialect2 = RustFsDialect::default();
+        let dialect1 = RustFsDialect;
+        let dialect2 = RustFsDialect;
 
         // Test that multiple instances behave the same
         let test_chars = ['a', 'A', '0', '_', '#', '@', '$', ' ', '.'];

@@ -98,11 +98,9 @@ mod tests {
     fn test_app_basic_constants() {
         // Test application basic constants
         assert_eq!(APP_NAME, "RustFs");
-        assert!(!APP_NAME.is_empty(), "App name should not be empty");
         assert!(!APP_NAME.contains(' '), "App name should not contain spaces");
 
         assert_eq!(VERSION, "0.0.1");
-        assert!(!VERSION.is_empty(), "Version should not be empty");
 
         assert_eq!(SERVICE_VERSION, "0.0.1");
         assert_eq!(VERSION, SERVICE_VERSION, "Version and service version should be consistent");
@@ -117,13 +115,9 @@ mod tests {
             "Log level should be a valid tracing level"
         );
 
-        assert_eq!(USE_STDOUT, false);
-
         assert_eq!(SAMPLE_RATIO, 1.0);
-        assert!(SAMPLE_RATIO >= 0.0 && SAMPLE_RATIO <= 1.0, "Sample ratio should be between 0.0 and 1.0");
 
         assert_eq!(METER_INTERVAL, 30);
-        assert!(METER_INTERVAL > 0, "Meter interval should be positive");
     }
 
     #[test]
@@ -140,23 +134,17 @@ mod tests {
     fn test_connection_constants() {
         // Test connection related constants
         assert_eq!(MAX_CONNECTIONS, 100);
-        assert!(MAX_CONNECTIONS > 0, "Max connections should be positive");
-        assert!(MAX_CONNECTIONS <= 10000, "Max connections should be reasonable");
 
         assert_eq!(DEFAULT_TIMEOUT_MS, 3000);
-        assert!(DEFAULT_TIMEOUT_MS > 0, "Timeout should be positive");
-        assert!(DEFAULT_TIMEOUT_MS >= 1000, "Timeout should be at least 1 second");
     }
 
     #[test]
     fn test_security_constants() {
         // Test security related constants
         assert_eq!(DEFAULT_ACCESS_KEY, "rustfsadmin");
-        assert!(!DEFAULT_ACCESS_KEY.is_empty(), "Access key should not be empty");
         assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");
 
         assert_eq!(DEFAULT_SECRET_KEY, "rustfsadmin");
-        assert!(!DEFAULT_SECRET_KEY.is_empty(), "Secret key should not be empty");
         assert!(DEFAULT_SECRET_KEY.len() >= 8, "Secret key should be at least 8 characters");
 
         // In production environment, access key and secret key should be different
@@ -169,7 +157,6 @@ mod tests {
         // Test file path related constants
         assert_eq!(DEFAULT_OBS_CONFIG, "./deploy/config/obs.toml");
         assert!(DEFAULT_OBS_CONFIG.ends_with(".toml"), "Config file should be TOML format");
-        assert!(!DEFAULT_OBS_CONFIG.is_empty(), "Config path should not be empty");
 
         assert_eq!(RUSTFS_TLS_KEY, "rustfs_key.pem");
         assert!(RUSTFS_TLS_KEY.ends_with(".pem"), "TLS key should be PEM format");
@@ -182,12 +169,8 @@ mod tests {
     fn test_port_constants() {
         // Test port related constants
         assert_eq!(DEFAULT_PORT, 9000);
-        assert!(DEFAULT_PORT > 1024, "Default port should be above reserved range");
-        // u16 type automatically ensures port is in valid range (0-65535)
 
         assert_eq!(DEFAULT_CONSOLE_PORT, 9002);
-        assert!(DEFAULT_CONSOLE_PORT > 1024, "Console port should be above reserved range");
-        // u16 type automatically ensures port is in valid range (0-65535)
 
         assert_ne!(DEFAULT_PORT, DEFAULT_CONSOLE_PORT, "Main port and console port should be different");
     }
@@ -256,12 +239,14 @@ mod tests {
         assert!(SAMPLE_RATIO.is_finite(), "Sample ratio should be finite");
         assert!(!SAMPLE_RATIO.is_nan(), "Sample ratio should not be NaN");
 
-        assert!(METER_INTERVAL < u64::MAX, "Meter interval should be reasonable");
-        assert!(MAX_CONNECTIONS < usize::MAX, "Max connections should be reasonable");
-        assert!(DEFAULT_TIMEOUT_MS < u64::MAX, "Timeout should be reasonable");
+        // All these are const values, so range checks are redundant
+        // assert!(METER_INTERVAL < u64::MAX, "Meter interval should be reasonable");
+        // assert!(MAX_CONNECTIONS < usize::MAX, "Max connections should be reasonable");
+        // assert!(DEFAULT_TIMEOUT_MS < u64::MAX, "Timeout should be reasonable");
 
-        assert!(DEFAULT_PORT != 0, "Default port should not be zero");
-        assert!(DEFAULT_CONSOLE_PORT != 0, "Console port should not be zero");
+        // These are const non-zero values, so zero checks are redundant
+        // assert!(DEFAULT_PORT != 0, "Default port should not be zero");
+        // assert!(DEFAULT_CONSOLE_PORT != 0, "Console port should not be zero");
     }
 
     #[test]

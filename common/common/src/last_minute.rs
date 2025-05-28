@@ -245,8 +245,10 @@ mod tests {
 
     #[test]
     fn test_last_minute_latency_clone() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 12345;
+        let mut latency = LastMinuteLatency {
+            last_sec: 12345,
+            ..Default::default()
+        };
         latency.totals[0].total = 100;
 
         let cloned = latency.clone();
@@ -257,8 +259,10 @@ mod tests {
 
     #[test]
     fn test_forward_to_same_time() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 100;
+        let mut latency = LastMinuteLatency {
+            last_sec: 100,
+            ..Default::default()
+        };
 
         // Forward to same time should not change anything
         latency.forward_to(100);
@@ -271,8 +275,10 @@ mod tests {
 
     #[test]
     fn test_forward_to_large_gap() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 100;
+        let mut latency = LastMinuteLatency {
+            last_sec: 100,
+            ..Default::default()
+        };
         latency.totals[0].total = 999; // Set some data
 
         // Forward by more than 60 seconds should reset all totals
@@ -289,8 +295,10 @@ mod tests {
 
     #[test]
     fn test_forward_to_small_gap() {
-        let mut latency = LastMinuteLatency::default();
-        latency.last_sec = 100;
+        let mut latency = LastMinuteLatency {
+            last_sec: 100,
+            ..Default::default()
+        };
         latency.totals[1].total = 999; // Set some data at index 1
 
         // Forward by 2 seconds
@@ -446,7 +454,7 @@ mod tests {
     #[test]
     fn test_window_index_calculation() {
         // Test that window index calculation works correctly
-        let mut latency = LastMinuteLatency::default();
+        let _latency = LastMinuteLatency::default();
 
         let acc_elem = AccElem {
             total: 1,
@@ -476,10 +484,12 @@ mod tests {
 
     #[test]
     fn test_edge_case_boundary_conditions() {
-        let mut latency = LastMinuteLatency::default();
+        let mut latency = LastMinuteLatency {
+            last_sec: 59,
+            ..Default::default()
+        };
 
         // Test boundary at 60 seconds
-        latency.last_sec = 59;
         latency.forward_to(119); // Exactly 60 seconds later
 
         // Should reset all totals

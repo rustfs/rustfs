@@ -279,8 +279,10 @@ mod tests {
         let result: Result<(), Error> = Err(error);
         assert!(result.is_err());
 
-        let err = result.unwrap_err();
-        assert!(err.is::<io::Error>());
+        // Test the error from the result
+        if let Err(err) = result {
+            assert!(err.is::<io::Error>());
+        }
     }
 
     #[test]

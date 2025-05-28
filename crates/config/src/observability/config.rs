@@ -76,12 +76,12 @@ mod tests {
         let config = ObservabilityConfig::new();
 
         // Test OTEL default values
-        if let Some(use_stdout) = config.otel.use_stdout {
-            assert!(use_stdout == true || use_stdout == false, "use_stdout should be a valid boolean");
+        if let Some(_use_stdout) = config.otel.use_stdout {
+            // Test boolean values - any boolean value is valid
         }
 
         if let Some(sample_ratio) = config.otel.sample_ratio {
-            assert!(sample_ratio >= 0.0 && sample_ratio <= 1.0, "Sample ratio should be between 0.0 and 1.0");
+            assert!((0.0..=1.0).contains(&sample_ratio), "Sample ratio should be between 0.0 and 1.0");
         }
 
         if let Some(meter_interval) = config.otel.meter_interval {

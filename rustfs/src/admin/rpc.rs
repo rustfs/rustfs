@@ -120,7 +120,7 @@ impl Operation for PutFile {
         let mut body = StreamReader::new(
             req.input
                 .into_stream()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+                .map_err(std::io::Error::other),
         );
 
         tokio::io::copy(&mut body, &mut file)

@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn test_default_parser_creation() {
-        let parser = DefaultParser::default();
+        let _parser = DefaultParser::default();
 
         // Test that parser can be created successfully
         assert!(std::mem::size_of::<DefaultParser>() == 0, "Parser should be zero-sized");
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn test_ext_parser_parse_sql_with_dialect() {
         let sql = "SELECT * FROM S3Object";
-        let dialect = &RustFsDialect::default();
+        let dialect = &RustFsDialect;
 
         let result = ExtParser::parse_sql_with_dialect(sql, dialect);
         assert!(result.is_ok(), "ExtParser::parse_sql_with_dialect should work");
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn test_ext_parser_new_with_dialect() {
         let sql = "SELECT * FROM S3Object";
-        let dialect = &RustFsDialect::default();
+        let dialect = &RustFsDialect;
 
         let result = ExtParser::new_with_dialect(sql, dialect);
         assert!(result.is_ok(), "ExtParser::new_with_dialect should work");
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn test_ext_parser_expected_method() {
         let sql = "SELECT * FROM S3Object";
-        let dialect = &RustFsDialect::default();
+        let dialect = &RustFsDialect;
         let parser = ExtParser::new_with_dialect(sql, dialect).unwrap();
 
         let result: Result<()> = parser.expected("test token", "found token");

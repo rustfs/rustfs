@@ -58,7 +58,7 @@ impl HttpFileWriter {
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                .map_err(io::Error::other)
             {
                 error!("HttpFileWriter put file err: {:?}", err);
 
@@ -111,7 +111,7 @@ impl HttpFileReader {
             ))
             .send()
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         let inner = Box::new(StreamReader::new(resp.bytes_stream().map_err(io::Error::other)));
 
@@ -202,7 +202,8 @@ mod tests {
     #[tokio::test]
     async fn test_constants() {
         assert_eq!(READ_BUFFER_SIZE, 1024 * 1024);
-        assert!(READ_BUFFER_SIZE > 0);
+        // READ_BUFFER_SIZE is a compile-time constant, no need to assert
+        // assert!(READ_BUFFER_SIZE > 0);
     }
 
     #[tokio::test]
@@ -463,7 +464,8 @@ mod tests {
         let _writer: FileWriter = Box::new(writer_rx);
 
         // If this compiles, the types are correctly defined
-        assert!(true);
+        // This is a placeholder test - remove meaningless assertion
+        // assert!(true);
     }
 
     #[tokio::test]
@@ -483,8 +485,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_buffer_size_constant() {
         assert_eq!(READ_BUFFER_SIZE, 1024 * 1024);
-        assert!(READ_BUFFER_SIZE > 0);
-        assert!(READ_BUFFER_SIZE % 1024 == 0, "Buffer size should be a multiple of 1024");
+        // READ_BUFFER_SIZE is a compile-time constant, no need to assert
+        // assert!(READ_BUFFER_SIZE > 0);
+        // assert!(READ_BUFFER_SIZE % 1024 == 0, "Buffer size should be a multiple of 1024");
     }
 
     #[tokio::test]
