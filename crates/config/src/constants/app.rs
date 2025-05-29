@@ -56,14 +56,13 @@ pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 /// Example: RUSTFS_SECRET_KEY=rustfsadmin
 /// Example: --secret-key rustfsadmin
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
-/// Default configuration file for observability
-/// Default value: config/obs.toml
-/// Environment variable: RUSTFS_OBS_CONFIG
-/// Command line argument: --obs-config
-/// Example: RUSTFS_OBS_CONFIG=config/obs.toml
-/// Example: --obs-config config/obs.toml
-/// Example: --obs-config /etc/rustfs/obs.toml
-pub const DEFAULT_OBS_CONFIG: &str = "./deploy/config/obs.toml";
+
+/// Default OBS configuration endpoint
+/// Environment variable: DEFAULT_OBS_ENDPOINT
+/// Command line argument: --obs-endpoint
+/// Example: DEFAULT_OBS_ENDPOINT="http://localost:4317"
+/// Example: --obs-endpoint http://localost:4317
+pub const DEFAULT_OBS_ENDPOINT: &str = "";
 
 /// Default TLS key for rustfs
 /// This is the default key for TLS.
@@ -89,6 +88,41 @@ pub const DEFAULT_CONSOLE_PORT: u16 = 9001;
 /// Default address for rustfs console
 /// This is the default address for rustfs console.
 pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
+
+/// Default log filename for rustfs
+/// This is the default log filename for rustfs.
+/// It is used to store the logs of the application.
+/// Default value: rustfs.log
+/// Environment variable: RUSTFS_OBSERVABILITY_LOG_FILENAME
+pub const DEFAULT_LOG_FILENAME: &str = "rustfs.log";
+
+/// Default log directory for rustfs
+/// This is the default log directory for rustfs.
+/// It is used to store the logs of the application.
+/// Default value: logs
+/// Environment variable: RUSTFS_OBSERVABILITY_LOG_DIRECTORY
+pub const DEFAULT_LOG_DIR: &str = "logs";
+
+/// Default log rotation size mb for rustfs
+/// This is the default log rotation size for rustfs.
+/// It is used to rotate the logs of the application.
+/// Default value: 100 MB
+/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_SIZE_MB
+pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
+
+/// Default log rotation time for rustfs
+/// This is the default log rotation time for rustfs.
+/// It is used to rotate the logs of the application.
+/// Default value: hour, eg: day,hour,minute,second
+/// Environment variable: RUSTFS_OBSERVABILITY_LOG_ROTATION_TIME
+pub const DEFAULT_LOG_ROTATION_TIME: &str = "day";
+
+/// Default log keep files for rustfs
+/// This is the default log keep files for rustfs.
+/// It is used to keep the logs of the application.
+/// Default value: 30
+/// Environment variable: RUSTFS_OBSERVABILITY_LOG_KEEP_FILES
+pub const DEFAULT_LOG_KEEP_FILES: u16 = 30;
 
 #[cfg(test)]
 mod tests {
@@ -154,10 +188,6 @@ mod tests {
 
     #[test]
     fn test_file_path_constants() {
-        // Test file path related constants
-        assert_eq!(DEFAULT_OBS_CONFIG, "./deploy/config/obs.toml");
-        assert!(DEFAULT_OBS_CONFIG.ends_with(".toml"), "Config file should be TOML format");
-
         assert_eq!(RUSTFS_TLS_KEY, "rustfs_key.pem");
         assert!(RUSTFS_TLS_KEY.ends_with(".pem"), "TLS key should be PEM format");
 
@@ -219,7 +249,6 @@ mod tests {
             ENVIRONMENT,
             DEFAULT_ACCESS_KEY,
             DEFAULT_SECRET_KEY,
-            DEFAULT_OBS_CONFIG,
             RUSTFS_TLS_KEY,
             RUSTFS_TLS_CERT,
             DEFAULT_ADDRESS,
