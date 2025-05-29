@@ -2384,16 +2384,16 @@ impl DiskAPI for LocalDisk {
                     }
                     let stop_fn = ScannerMetrics::log(ScannerMetric::ScanObject);
                     let mut res = HashMap::new();
-                    let done_sz = ScannerMetrics::time_size(ScannerMetric::ReadMetadata).await;
+                    let done_sz = ScannerMetrics::time_size(ScannerMetric::ReadMetadata);
                     let buf = match disk.read_metadata(item.path.clone()).await {
                         Ok(buf) => buf,
                         Err(err) => {
                             res.insert("err".to_string(), err.to_string());
-                            stop_fn(&res).await;
+                            stop_fn(&res);
                             return Err(Error::from_string(ERR_SKIP_FILE));
                         }
                     };
-                    done_sz(buf.len() as u64).await;
+                    done_sz(buf.len() as u64);
                     res.insert("metasize".to_string(), buf.len().to_string());
                     item.transform_meda_dir();
                     let meta_cache = MetaCacheEntry {
@@ -2405,7 +2405,7 @@ impl DiskAPI for LocalDisk {
                         Ok(fivs) => fivs,
                         Err(err) => {
                             res.insert("err".to_string(), err.to_string());
-                            stop_fn(&res).await;
+                            stop_fn(&res);
                             return Err(Error::from_string(ERR_SKIP_FILE));
                         }
                     };
@@ -2415,7 +2415,7 @@ impl DiskAPI for LocalDisk {
                         Ok(obj_infos) => obj_infos,
                         Err(err) => {
                             res.insert("err".to_string(), err.to_string());
-                            stop_fn(&res).await;
+                            stop_fn(&res);
                             return Err(Error::from_string(ERR_SKIP_FILE));
                         }
                     };
@@ -2431,7 +2431,7 @@ impl DiskAPI for LocalDisk {
                         let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);
                         let sz: usize;
                         (obj_deleted, sz) = item.apply_actions(info, &size_s).await;
-                        done().await;
+                        done();
 
                         if obj_deleted {
                             break;
@@ -2461,14 +2461,14 @@ impl DiskAPI for LocalDisk {
                         let _obj_info =
                             frer_version.to_object_info(&item.bucket, &item.object_path().to_string_lossy(), versioned);
                         let done = ScannerMetrics::time(ScannerMetric::TierObjSweep);
-                        done().await;
+                        done();
                     }
 
                     // todo: global trace
                     if obj_deleted {
                         return Err(Error::from_string(ERR_IGNORE_FILE_CONTRIB));
                     }
-                    done().await;
+                    done();
                     Ok(size_s)
                 })
             }),
