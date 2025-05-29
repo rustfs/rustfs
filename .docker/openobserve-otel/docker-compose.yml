@@ -6,11 +6,12 @@ services:
       ZO_ROOT_USER_EMAIL: "root@rustfs.com"
       ZO_ROOT_USER_PASSWORD: "rustfs123"
       ZO_TRACING_HEADER_KEY: "Authorization"
-      ZO_TRACING_HEADER_VALUE: "Bearer cm9vdEBydXN0ZnMuY29tOmxIV0RqQmZMWXJ6MnZOajU="
+      ZO_TRACING_HEADER_VALUE: "Basic cm9vdEBydXN0ZnMuY29tOmQ4SXlCSEJTUkk3RGVlcEQ="
       ZO_DATA_DIR: "/data"
       ZO_MEMORY_CACHE_ENABLED: "true"
       ZO_MEMORY_CACHE_MAX_SIZE: "256"
       RUST_LOG: "info"
+      TZ: Asia/Shanghai
     ports:
       - "5080:5080"
       - "5081:5081"
@@ -44,9 +45,11 @@ services:
       - "13133:13133" # Health check
       - "1777:1777" # pprof
       - "55679:55679" # zpages
+      - "1888:1888" # Metrics
+      - "8888:8888" # Prometheus metrics
+      - "8889:8889" # Additional metrics endpoint
     depends_on:
-      openobserve:
-        condition: service_healthy
+      - openobserve
     networks:
       - otel-network
     deploy:

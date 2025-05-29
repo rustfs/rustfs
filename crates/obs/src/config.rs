@@ -26,12 +26,18 @@ pub struct OtelConfig {
 
 /// Helper function: Extract observable configuration from environment variables
 fn extract_otel_config_from_env() -> OtelConfig {
+    let endpoint = env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string());
+    let mut use_stdout = env::var("RUSTFS_OBSERVABILITY_USE_STDOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or(Some(USE_STDOUT));
+    if endpoint.is_empty() {
+        use_stdout = Some(true);
+    }
+
     OtelConfig {
-        endpoint: env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string()),
-        use_stdout: env::var("RUSTFS_OBSERVABILITY_USE_STDOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(USE_STDOUT)),
+        endpoint,
+        use_stdout,
         sample_ratio: env::var("RUSTFS_OBSERVABILITY_SAMPLE_RATIO")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -308,7 +314,10 @@ pub fn load_config(config_dir: Option<String>) -> AppConfig {
     } else {
         // If no path provided, use current directory + default config file
         match env::current_dir() {
-            Ok(dir) => dir.join(DEFAULT_CONFIG_FILE).to_string_lossy().into_owned(),
+            Ok(dir) => {
+                println!("Current directory: {:?}", dir);
+                dir.join(DEFAULT_CONFIG_FILE).to_string_lossy().into_owned()
+            }
             Err(_) => {
                 eprintln!("Warning: Failed to get current directory, using default config file");
                 DEFAULT_CONFIG_FILE.to_string()
