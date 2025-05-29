@@ -60,7 +60,7 @@ export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9001"
 
 # Observability config
-export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
+export RUSTFS_OBS_ENDPOINT="http://localhost:4317"
 
 # Event message configuration
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.toml"
@@ -92,25 +92,3 @@ export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
 - Grafana: `http://localhost:3000` (credentials: `admin`/`admin`)
 - Jaeger: `http://localhost:16686`
 - Prometheus: `http://localhost:9090`
-
-#### Configuring Observability
-
-1. Copy the example configuration:
-   ```bash
-   cd deploy/config
-   cp obs.toml.example obs.toml
-   ```
-
-2. Edit `obs.toml` with the following parameters:
-
-| Parameter            | Description                       | Example               |
-|----------------------|-----------------------------------|-----------------------|
-| endpoint             | OpenTelemetry Collector address   | http://localhost:4317 |
-| service_name         | Service name                      | rustfs                |
-| service_version      | Service version                   | 1.0.0                 |
-| environment          | Runtime environment               | production            |
-| meter_interval       | Metrics export interval (seconds) | 30                    |
-| sample_ratio         | Sampling ratio                    | 1.0                   |
-| use_stdout           | Output to console                 | true/false            |
-| logger_level         | Log level                         | info                  |
-| local_logging_enable | stdout                            | true/false            |

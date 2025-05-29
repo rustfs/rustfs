@@ -37,14 +37,14 @@ impl OtelConfig {
     pub fn extract_otel_config_from_env(endpoint: Option<String>) -> OtelConfig {
         let endpoint = if let Some(endpoint) = endpoint {
             if endpoint.is_empty() {
-                env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string())
+                env::var("RUSTFS_OBS_ENDPOINT").unwrap_or_else(|_| "".to_string())
             } else {
                 endpoint
             }
         } else {
-            env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string())
+            env::var("RUSTFS_OBS_ENDPOINT").unwrap_or_else(|_| "".to_string())
         };
-        let mut use_stdout = env::var("RUSTFS_OBSERVABILITY_USE_STDOUT")
+        let mut use_stdout = env::var("RUSTFS_OBS_USE_STDOUT")
             .ok()
             .and_then(|v| v.parse().ok())
             .or(Some(USE_STDOUT));
@@ -55,51 +55,51 @@ impl OtelConfig {
         OtelConfig {
             endpoint,
             use_stdout,
-            sample_ratio: env::var("RUSTFS_OBSERVABILITY_SAMPLE_RATIO")
+            sample_ratio: env::var("RUSTFS_OBS_SAMPLE_RATIO")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(SAMPLE_RATIO)),
-            meter_interval: env::var("RUSTFS_OBSERVABILITY_METER_INTERVAL")
+            meter_interval: env::var("RUSTFS_OBS_METER_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(METER_INTERVAL)),
-            service_name: env::var("RUSTFS_OBSERVABILITY_SERVICE_NAME")
+            service_name: env::var("RUSTFS_OBS_SERVICE_NAME")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(APP_NAME.to_string())),
-            service_version: env::var("RUSTFS_OBSERVABILITY_SERVICE_VERSION")
+            service_version: env::var("RUSTFS_OBS_SERVICE_VERSION")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(SERVICE_VERSION.to_string())),
-            environment: env::var("RUSTFS_OBSERVABILITY_ENVIRONMENT")
+            environment: env::var("RUSTFS_OBS_ENVIRONMENT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(ENVIRONMENT.to_string())),
-            logger_level: env::var("RUSTFS_OBSERVABILITY_LOGGER_LEVEL")
+            logger_level: env::var("RUSTFS_OBS_LOGGER_LEVEL")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_LEVEL.to_string())),
-            local_logging_enabled: env::var("RUSTFS_OBSERVABILITY_LOCAL_LOGGING_ENABLED")
+            local_logging_enabled: env::var("RUSTFS_OBS_LOCAL_LOGGING_ENABLED")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(false)),
-            log_directory: env::var("RUSTFS_OBSERVABILITY_LOG_DIRECTORY")
+            log_directory: env::var("RUSTFS_OBS_LOG_DIRECTORY")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_DIR.to_string())),
-            log_filename: env::var("RUSTFS_OBSERVABILITY_LOG_FILENAME")
+            log_filename: env::var("RUSTFS_OBS_LOG_FILENAME")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_FILENAME.to_string())),
-            log_rotation_size_mb: env::var("RUSTFS_OBSERVABILITY_LOG_ROTATION_SIZE_MB")
+            log_rotation_size_mb: env::var("RUSTFS_OBS_LOG_ROTATION_SIZE_MB")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_ROTATION_SIZE_MB)), // Default to 100 MB
-            log_rotation_time: env::var("RUSTFS_OBSERVABILITY_LOG_ROTATION_TIME")
+            log_rotation_time: env::var("RUSTFS_OBS_LOG_ROTATION_TIME")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_ROTATION_TIME.to_string())), // Default to "Day"
-            log_keep_files: env::var("RUSTFS_OBSERVABILITY_LOG_KEEP_FILES")
+            log_keep_files: env::var("RUSTFS_OBS_LOG_KEEP_FILES")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .or(Some(DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
