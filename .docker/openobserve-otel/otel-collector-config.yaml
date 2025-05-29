@@ -25,16 +25,24 @@ exporters:
       Authorization: "Bearer cm9vdEBydXN0ZnMuY29tOmxIV0RqQmZMWXJ6MnZOajU="
       stream-name: default
       organization: default
-    tls:
-      insecure: true
     compression: gzip
     retry_on_failure:
       enabled: true
       initial_interval: 5s
       max_interval: 30s
       max_elapsed_time: 300s
+    timeout: 10s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
 
 service:
+  extensions: [ health_check, pprof, zpages ]
   pipelines:
     traces:
       receivers: [ otlp ]
@@ -48,11 +56,8 @@ service:
       receivers: [ otlp, filelog ]
       processors: [ memory_limiter, batch ]
       exporters: [ otlphttp/openobserve ]
-  extensions:
-    health_check:
-      endpoint: 0.0.0.0:13133
-    pprof:
-      endpoint: 0.0.0.0:1777
-    zpages:
-      endpoint: 0.0.0.0:55679
-
+  telemetry:
+    logs:
+      level: "info"  # Collector 日志级别
+    metrics:
+      address: "0.0.0.0:8888"  # Collector 自身指标暴露
