@@ -330,6 +330,17 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         // Parsing the log level
         let log_spec = LogSpecification::parse(logger_level).unwrap_or(LogSpecification::info());
 
+        // Convert the logger_level string to the corresponding LevelFilter
+        let level_filter = match logger_level.to_lowercase().as_str() {
+            "trace" => flexi_logger::Duplicate::Trace,
+            "debug" => flexi_logger::Duplicate::Debug,
+            "info" => flexi_logger::Duplicate::Info,
+            "warn" | "warning" => flexi_logger::Duplicate::Warn,
+            "error" => flexi_logger::Duplicate::Error,
+            "off" => flexi_logger::Duplicate::None,
+            _ => flexi_logger::Duplicate::Info, // the default is info
+        };
+
         // Configure the flexi_logger
         let flexi_logger_result = flexi_logger::Logger::with(log_spec)
             .log_to_file(
@@ -340,7 +351,7 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             )
             .rotate(rotation_criterion, Naming::Timestamps, Cleanup::KeepLogFiles(keep_files.into()))
             .format_for_files(format_for_file) // Add a custom formatting function for file output
-            .duplicate_to_stdout(flexi_logger::Duplicate::Info)
+            .duplicate_to_stdout(level_filter) // Use dynamic levels
             .format_for_stdout(format_with_color) // Add a custom formatting function for terminal output
             .write_mode(WriteMode::Async)
             .start();
