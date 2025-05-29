@@ -1,4 +1,7 @@
+// Added flexi_logger related dependencies
 use crate::OtelConfig;
+use flexi_logger::{style, Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode};
+use nu_ansi_term::Color;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -13,7 +16,9 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
     SCHEMA_URL,
 };
-use rustfs_config::{APP_NAME, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT};
+use rustfs_config::{
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+};
 use rustfs_utils::get_local_ip_with_default;
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -47,23 +52,44 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// // When it's dropped, all telemetry components are properly shut down
 /// drop(otel_guard);
 /// ```
-#[derive(Debug)]
+// Implement Debug trait correctly, rather than using derive, as some fields may not have implemented Debug
 pub struct OtelGuard {
-    tracer_provider: SdkTracerProvider,
-    meter_provider: SdkMeterProvider,
-    logger_provider: SdkLoggerProvider,
+    tracer_provider: Option<SdkTracerProvider>,
+    meter_provider: Option<SdkMeterProvider>,
+    logger_provider: Option<SdkLoggerProvider>,
+    // Add a flexi_logger handle to keep the logging alive
+    _flexi_logger_handles: Option<flexi_logger::LoggerHandle>,
+}
+
+// Implement debug manually and avoid relying on all fields to implement debug
+impl std::fmt::Debug for OtelGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtelGuard")
+            .field("tracer_provider", &self.tracer_provider.is_some())
+            .field("meter_provider", &self.meter_provider.is_some())
+            .field("logger_provider", &self.logger_provider.is_some())
+            .field("_flexi_logger_handles", &self._flexi_logger_handles.is_some())
+            .finish()
+    }
 }
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        if let Err(err) = self.tracer_provider.shutdown() {
-            eprintln!("Tracer shutdown error: {:?}", err);
+        if let Some(provider) = self.tracer_provider.take() {
+            if let Err(err) = provider.shutdown() {
+                eprintln!("Tracer shutdown error: {:?}", err);
+            }
         }
-        if let Err(err) = self.meter_provider.shutdown() {
-            eprintln!("Meter shutdown error: {:?}", err);
+
+        if let Some(provider) = self.meter_provider.take() {
+            if let Err(err) = provider.shutdown() {
+                eprintln!("Meter shutdown error: {:?}", err);
+            }
         }
-        if let Err(err) = self.logger_provider.shutdown() {
-            eprintln!("Logger shutdown error: {:?}", err);
+        if let Some(provider) = self.logger_provider.take() {
+            if let Err(err) = provider.shutdown() {
+                eprintln!("Logger shutdown error: {:?}", err);
+            }
         }
     }
 }
@@ -106,156 +132,247 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
     let environment = config.environment.as_deref().unwrap_or(ENVIRONMENT);
 
-    // Pre-create resource objects to avoid repeated construction
-    let res = resource(config);
+    // Configure flexi_logger to cut by time and size
+    let mut flexi_logger_handle = None;
+    if !endpoint.is_empty() {
+        // Pre-create resource objects to avoid repeated construction
+        let res = resource(config);
 
-    // initialize tracer provider
-    let tracer_provider = {
-        let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
-        let sampler = if sample_ratio > 0.0 && sample_ratio < 1.0 {
-            Sampler::TraceIdRatioBased(sample_ratio)
-        } else {
-            Sampler::AlwaysOn
+        // initialize tracer provider
+        let tracer_provider = {
+            let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
+            let sampler = if sample_ratio > 0.0 && sample_ratio < 1.0 {
+                Sampler::TraceIdRatioBased(sample_ratio)
+            } else {
+                Sampler::AlwaysOn
+            };
+
+            let builder = SdkTracerProvider::builder()
+                .with_sampler(sampler)
+                .with_id_generator(RandomIdGenerator::default())
+                .with_resource(res.clone());
+
+            let tracer_provider = if endpoint.is_empty() {
+                builder
+                    .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
+                    .build()
+            } else {
+                let exporter = opentelemetry_otlp::SpanExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint)
+                    .build()
+                    .unwrap();
+
+                let builder = if use_stdout {
+                    builder
+                        .with_batch_exporter(exporter)
+                        .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
+                } else {
+                    builder.with_batch_exporter(exporter)
+                };
+
+                builder.build()
+            };
+
+            global::set_tracer_provider(tracer_provider.clone());
+            tracer_provider
         };
 
-        let builder = SdkTracerProvider::builder()
-            .with_sampler(sampler)
-            .with_id_generator(RandomIdGenerator::default())
-            .with_resource(res.clone());
+        // initialize meter provider
+        let meter_provider = {
+            let mut builder = MeterProviderBuilder::default().with_resource(res.clone());
 
-        let tracer_provider = if endpoint.is_empty() {
-            builder
-                .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
-                .build()
-        } else {
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .build()
-                .unwrap();
-
-            let builder = if use_stdout {
-                builder
-                    .with_batch_exporter(exporter)
-                    .with_batch_exporter(opentelemetry_stdout::SpanExporter::default())
+            if endpoint.is_empty() {
+                builder = builder.with_reader(create_periodic_reader(meter_interval));
             } else {
-                builder.with_batch_exporter(exporter)
-            };
+                let exporter = opentelemetry_otlp::MetricExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint)
+                    .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
+                    .build()
+                    .unwrap();
+
+                builder = builder.with_reader(
+                    PeriodicReader::builder(exporter)
+                        .with_interval(std::time::Duration::from_secs(meter_interval))
+                        .build(),
+                );
+
+                if use_stdout {
+                    builder = builder.with_reader(create_periodic_reader(meter_interval));
+                }
+            }
+
+            let meter_provider = builder.build();
+            global::set_meter_provider(meter_provider.clone());
+            meter_provider
+        };
+
+        // initialize logger provider
+        let logger_provider = {
+            let mut builder = SdkLoggerProvider::builder().with_resource(res);
+
+            if endpoint.is_empty() {
+                builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
+            } else {
+                let exporter = opentelemetry_otlp::LogExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint)
+                    .build()
+                    .unwrap();
+
+                builder = builder.with_batch_exporter(exporter);
+
+                if use_stdout {
+                    builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
+                }
+            }
 
             builder.build()
         };
 
-        global::set_tracer_provider(tracer_provider.clone());
-        tracer_provider
-    };
+        // configuring tracing
+        {
+            // configure the formatting layer
+            let fmt_layer = {
+                let enable_color = std::io::stdout().is_terminal();
+                let mut layer = tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_ansi(enable_color)
+                    .with_thread_names(true)
+                    .with_thread_ids(true)
+                    .with_file(true)
+                    .with_line_number(true);
 
-    // initialize meter provider
-    let meter_provider = {
-        let mut builder = MeterProviderBuilder::default().with_resource(res.clone());
+                // Only add full span events tracking in the development environment
+                if environment != ENVIRONMENT {
+                    layer = layer.with_span_events(FmtSpan::FULL);
+                }
 
-        if endpoint.is_empty() {
-            builder = builder.with_reader(create_periodic_reader(meter_interval));
-        } else {
-            let exporter = opentelemetry_otlp::MetricExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
-                .build()
-                .unwrap();
+                layer.with_filter(build_env_filter(logger_level, None))
+            };
 
-            builder = builder.with_reader(
-                PeriodicReader::builder(exporter)
-                    .with_interval(std::time::Duration::from_secs(meter_interval))
-                    .build(),
-            );
+            let filter = build_env_filter(logger_level, None);
+            let otel_filter = build_env_filter(logger_level, None);
+            let otel_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_filter);
+            let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
 
-            if use_stdout {
-                builder = builder.with_reader(create_periodic_reader(meter_interval));
+            // Configure registry to avoid repeated calls to filter methods
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(ErrorLayer::default())
+                .with(if config.local_logging_enabled.unwrap_or(false) {
+                    Some(fmt_layer)
+                } else {
+                    None
+                })
+                .with(OpenTelemetryLayer::new(tracer))
+                .with(otel_layer)
+                .with(MetricsLayer::new(meter_provider.clone()))
+                .init();
+
+            if !endpoint.is_empty() {
+                info!(
+                    "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {},RUST_LOG env: {}",
+                    endpoint,
+                    logger_level,
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
+                );
             }
         }
 
-        let meter_provider = builder.build();
-        global::set_meter_provider(meter_provider.clone());
-        meter_provider
-    };
-
-    // initialize logger provider
-    let logger_provider = {
-        let mut builder = SdkLoggerProvider::builder().with_resource(res);
-
-        if endpoint.is_empty() {
-            builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
-        } else {
-            let exporter = opentelemetry_otlp::LogExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .build()
-                .unwrap();
-
-            builder = builder.with_batch_exporter(exporter);
-
-            if use_stdout {
-                builder = builder.with_batch_exporter(opentelemetry_stdout::LogExporter::default());
-            }
+        OtelGuard {
+            tracer_provider: Some(tracer_provider),
+            meter_provider: Some(meter_provider),
+            logger_provider: Some(logger_provider),
+            _flexi_logger_handles: flexi_logger_handle,
         }
+    } else {
+        // Obtain the log directory and file name configuration
+        let log_directory = config.log_directory.as_deref().unwrap_or("logs");
+        let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
 
-        builder.build()
-    };
-
-    // configuring tracing
-    {
-        // configure the formatting layer
-        let fmt_layer = {
-            let enable_color = std::io::stdout().is_terminal();
-            let mut layer = tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_ansi(enable_color)
-                .with_thread_names(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true);
-
-            // Only add full span events tracking in the development environment
-            if environment != ENVIRONMENT {
-                layer = layer.with_span_events(FmtSpan::FULL);
+        // Build log cutting conditions
+        let rotation_criterion = match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
+            // Cut by time and size at the same time
+            (Some(time), Some(size)) => {
+                let age = match time.to_lowercase().as_str() {
+                    "hour" => Age::Hour,
+                    "day" => Age::Day,
+                    "minute" => Age::Minute,
+                    "second" => Age::Second,
+                    _ => Age::Day, // The default is by day
+                };
+                Criterion::AgeOrSize(age, size * 1024 * 1024) // Convert to bytes
             }
-
-            layer.with_filter(build_env_filter(logger_level, None))
+            // Cut by time only
+            (Some(time), None) => {
+                let age = match time.to_lowercase().as_str() {
+                    "hour" => Age::Hour,
+                    "day" => Age::Day,
+                    "minute" => Age::Minute,
+                    "second" => Age::Second,
+                    _ => Age::Day, // The default is by day
+                };
+                Criterion::Age(age)
+            }
+            // Cut by size only
+            (None, Some(size)) => {
+                Criterion::Size(size * 1024 * 1024) // Convert to bytes
+            }
+            // By default, it is cut by the day
+            _ => Criterion::Age(Age::Day),
         };
 
-        let filter = build_env_filter(logger_level, None);
-        let otel_filter = build_env_filter(logger_level, None);
-        let otel_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_filter);
-        let tracer = tracer_provider.tracer(Cow::Borrowed(service_name).to_string());
+        // The number of log files retained
+        let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
 
-        // Configure registry to avoid repeated calls to filter methods
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(ErrorLayer::default())
-            .with(if config.local_logging_enabled.unwrap_or(false) {
-                Some(fmt_layer)
-            } else {
-                None
-            })
-            .with(OpenTelemetryLayer::new(tracer))
-            .with(otel_layer)
-            .with(MetricsLayer::new(meter_provider.clone()))
-            .init();
+        // Parsing the log level
+        let log_spec = LogSpecification::parse(logger_level).unwrap_or(LogSpecification::info());
 
-        if !endpoint.is_empty() {
-            info!(
-                "OpenTelemetry telemetry initialized with OTLP endpoint: {}, logger_level: {},RUST_LOG env: {}",
-                endpoint,
-                logger_level,
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "Not set".to_string())
-            );
+        // Configure the flexi_logger
+        let flexi_logger_result = flexi_logger::Logger::with(log_spec)
+            .log_to_file(
+                FileSpec::default()
+                    .directory(log_directory)
+                    .basename(log_filename)
+                    .suffix("log"),
+            )
+            .rotate(rotation_criterion, Naming::Timestamps, Cleanup::KeepLogFiles(keep_files.into()))
+            .format_for_files(format_for_file) // Add a custom formatting function for file output
+            .duplicate_to_stdout(flexi_logger::Duplicate::Info)
+            .format_for_stdout(format_with_color) // Add a custom formatting function for terminal output
+            .write_mode(WriteMode::Async)
+            .start();
+
+        if let Ok(logger) = flexi_logger_result {
+            // Save the logger handle to keep the logging
+            flexi_logger_handle = Some(logger);
+
+            info!("Flexi logger initialized with file logging to {}/{}.log", log_directory, log_filename);
+
+            // Log logging of log cutting conditions
+            match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
+                (Some(time), Some(size)) => info!(
+                    "Log rotation configured for: every {} or when size exceeds {}MB, keeping {} files",
+                    time, size, keep_files
+                ),
+                (Some(time), None) => info!("Log rotation configured for: every {}, keeping {} files", time, keep_files),
+                (None, Some(size)) => {
+                    info!("Log rotation configured for: when size exceeds {}MB, keeping {} files", size, keep_files)
+                }
+                _ => info!("Log rotation configured for: daily, keeping {} files", keep_files),
+            }
+        } else {
+            eprintln!("Failed to initialize flexi_logger: {:?}", flexi_logger_result.err());
         }
-    }
 
-    OtelGuard {
-        tracer_provider,
-        meter_provider,
-        logger_provider,
+        OtelGuard {
+            tracer_provider: None,
+            meter_provider: None,
+            logger_provider: None,
+            _flexi_logger_handles: flexi_logger_handle,
+        }
     }
 }
 
@@ -270,4 +387,51 @@ fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilte
     }
 
     filter
+}
+
+/// Custom Log Formatter Function - Terminal Output (with Color)
+fn format_with_color(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &Record) -> Result<(), std::io::Error> {
+    let level = record.level();
+    let level_style = style(level);
+
+    // Get the current thread information
+    let binding = std::thread::current();
+    let thread_name = binding.name().unwrap_or("unnamed");
+    let thread_id = format!("{:?}", std::thread::current().id());
+
+    writeln!(
+        w,
+        "{} {} [{}] [{}:{}] [{}:{}] {}",
+        now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
+        level_style.paint(level.to_string()),
+        Color::Magenta.paint(record.target()),
+        Color::Blue.paint(record.file().unwrap_or("unknown")),
+        Color::Blue.paint(record.line().unwrap_or(0).to_string()),
+        Color::Green.paint(thread_name),
+        Color::Green.paint(thread_id),
+        record.args()
+    )
+}
+
+/// Custom Log Formatter - File Output (No Color)
+fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &Record) -> Result<(), std::io::Error> {
+    let level = record.level();
+
+    // Get the current thread information
+    let binding = std::thread::current();
+    let thread_name = binding.name().unwrap_or("unnamed");
+    let thread_id = format!("{:?}", std::thread::current().id());
+
+    writeln!(
+        w,
+        "{} {} [{}] [{}:{}] [{}:{}] {}",
+        now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
+        level,
+        record.target(),
+        record.file().unwrap_or("unknown"),
+        record.line().unwrap_or(0),
+        thread_name,
+        thread_id,
+        record.args()
+    )
 }

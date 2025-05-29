@@ -1,5 +1,7 @@
-use config::{Config, File, FileFormat};
-use rustfs_config::{APP_NAME, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT};
+use rustfs_config::{
+    APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_FILENAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_SIZE_MB,
+    DEFAULT_LOG_ROTATION_TIME, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -22,54 +24,94 @@ pub struct OtelConfig {
     pub environment: Option<String>,         // Environment
     pub logger_level: Option<String>,        // Logger level
     pub local_logging_enabled: Option<bool>, // Local logging enabled
-}
-
-/// Helper function: Extract observable configuration from environment variables
-fn extract_otel_config_from_env() -> OtelConfig {
-    OtelConfig {
-        endpoint: env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string()),
-        use_stdout: env::var("RUSTFS_OBSERVABILITY_USE_STDOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(USE_STDOUT)),
-        sample_ratio: env::var("RUSTFS_OBSERVABILITY_SAMPLE_RATIO")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(SAMPLE_RATIO)),
-        meter_interval: env::var("RUSTFS_OBSERVABILITY_METER_INTERVAL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(METER_INTERVAL)),
-        service_name: env::var("RUSTFS_OBSERVABILITY_SERVICE_NAME")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(APP_NAME.to_string())),
-        service_version: env::var("RUSTFS_OBSERVABILITY_SERVICE_VERSION")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(SERVICE_VERSION.to_string())),
-        environment: env::var("RUSTFS_OBSERVABILITY_ENVIRONMENT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(ENVIRONMENT.to_string())),
-        logger_level: env::var("RUSTFS_OBSERVABILITY_LOGGER_LEVEL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(DEFAULT_LOG_LEVEL.to_string())),
-        local_logging_enabled: env::var("RUSTFS_OBSERVABILITY_LOCAL_LOGGING_ENABLED")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(Some(false)),
-    }
+    // 新增 flexi_logger 相关配置
+    pub log_directory: Option<String>,     // 日志文件目录
+    pub log_filename: Option<String>,      // 日志文件名称
+    pub log_rotation_size_mb: Option<u64>, // 日志文件大小切割阈值 (MB)
+    pub log_rotation_time: Option<String>, // 日志按时间切割 (Hour, Day)
+    pub log_keep_files: Option<u16>,       // 保留日志文件数量
 }
 
 impl OtelConfig {
+    /// Helper function: Extract observable configuration from environment variables
+    pub fn extract_otel_config_from_env(endpoint: Option<String>) -> OtelConfig {
+        let endpoint = if let Some(endpoint) = endpoint {
+            if endpoint.is_empty() {
+                env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string())
+            } else {
+                endpoint
+            }
+        } else {
+            env::var("RUSTFS_OBSERVABILITY_ENDPOINT").unwrap_or_else(|_| "".to_string())
+        };
+        let mut use_stdout = env::var("RUSTFS_OBSERVABILITY_USE_STDOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(Some(USE_STDOUT));
+        if endpoint.is_empty() {
+            use_stdout = Some(true);
+        }
+
+        OtelConfig {
+            endpoint,
+            use_stdout,
+            sample_ratio: env::var("RUSTFS_OBSERVABILITY_SAMPLE_RATIO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(SAMPLE_RATIO)),
+            meter_interval: env::var("RUSTFS_OBSERVABILITY_METER_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(METER_INTERVAL)),
+            service_name: env::var("RUSTFS_OBSERVABILITY_SERVICE_NAME")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(APP_NAME.to_string())),
+            service_version: env::var("RUSTFS_OBSERVABILITY_SERVICE_VERSION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(SERVICE_VERSION.to_string())),
+            environment: env::var("RUSTFS_OBSERVABILITY_ENVIRONMENT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(ENVIRONMENT.to_string())),
+            logger_level: env::var("RUSTFS_OBSERVABILITY_LOGGER_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_LOG_LEVEL.to_string())),
+            local_logging_enabled: env::var("RUSTFS_OBSERVABILITY_LOCAL_LOGGING_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(false)),
+            log_directory: env::var("RUSTFS_OBSERVABILITY_LOG_DIRECTORY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_LOG_DIR.to_string())),
+            log_filename: env::var("RUSTFS_OBSERVABILITY_LOG_FILENAME")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_LOG_FILENAME.to_string())),
+            log_rotation_size_mb: env::var("RUSTFS_OBSERVABILITY_LOG_ROTATION_SIZE_MB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_LOG_ROTATION_SIZE_MB)), // Default to 100 MB
+            log_rotation_time: env::var("RUSTFS_OBSERVABILITY_LOG_ROTATION_TIME")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_LOG_ROTATION_TIME.to_string())), // Default to "Day"
+            log_keep_files: env::var("RUSTFS_OBSERVABILITY_LOG_KEEP_FILES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_LOG_KEEP_FILES)), // Default to keeping 30 log files
+        }
+    }
+
     /// Create a new instance of OtelConfig with default values
     ///
     /// # Returns
     /// A new instance of OtelConfig
     pub fn new() -> Self {
-        extract_otel_config_from_env()
+        Self::extract_otel_config_from_env(None)
     }
 }
 
@@ -122,6 +164,12 @@ pub struct WebhookSinkConfig {
 
 impl WebhookSinkConfig {
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for WebhookSinkConfig {
+    fn default() -> Self {
         Self {
             endpoint: env::var("RUSTFS_SINKS_WEBHOOK_ENDPOINT")
                 .ok()
@@ -134,12 +182,6 @@ impl WebhookSinkConfig {
             max_retries: Some(3),
             retry_delay_ms: Some(100),
         }
-    }
-}
-
-impl Default for WebhookSinkConfig {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -160,7 +202,6 @@ impl FileSinkConfig {
             eprintln!("Failed to create log directory: {}", e);
             return "rustfs/rustfs.log".to_string();
         }
-        println!("Using log directory: {:?}", temp_dir);
         temp_dir
             .join("rustfs.log")
             .to_str()
@@ -173,9 +214,18 @@ impl FileSinkConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(Self::get_default_log_path),
-            buffer_size: Some(8192),
-            flush_interval_ms: Some(1000),
-            flush_threshold: Some(100),
+            buffer_size: env::var("RUSTFS_SINKS_FILE_BUFFER_SIZE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(8192)),
+            flush_interval_ms: env::var("RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(1000)),
+            flush_threshold: env::var("RUSTFS_SINKS_FILE_FLUSH_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(100)),
         }
     }
 }
@@ -260,6 +310,14 @@ impl AppConfig {
             logger: Some(LoggerConfig::default()),
         }
     }
+
+    pub fn new_with_endpoint(endpoint: Option<String>) -> Self {
+        Self {
+            observability: OtelConfig::extract_otel_config_from_env(endpoint),
+            sinks: vec![SinkConfig::new()],
+            logger: Some(LoggerConfig::new()),
+        }
+    }
 }
 
 // implement default for AppConfig
@@ -268,9 +326,6 @@ impl Default for AppConfig {
         Self::new()
     }
 }
-
-/// Default configuration file name
-const DEFAULT_CONFIG_FILE: &str = "obs";
 
 /// Loading the configuration file
 /// Supports TOML, YAML and .env formats, read in order by priority
@@ -288,51 +343,6 @@ const DEFAULT_CONFIG_FILE: &str = "obs";
 ///
 /// let config = load_config(None);
 /// ```
-pub fn load_config(config_dir: Option<String>) -> AppConfig {
-    let config_dir = if let Some(path) = config_dir {
-        // If a path is provided, check if it's empty
-        if path.is_empty() {
-            // If empty, use the default config file name
-            DEFAULT_CONFIG_FILE.to_string()
-        } else {
-            // Use the provided path
-            let path = std::path::Path::new(&path);
-            if path.extension().is_some() {
-                // If path has extension, use it as is (extension will be added by Config::builder)
-                path.with_extension("").to_string_lossy().into_owned()
-            } else {
-                // If path is a directory, append the default config file name
-                path.to_string_lossy().into_owned()
-            }
-        }
-    } else {
-        // If no path provided, use current directory + default config file
-        match env::current_dir() {
-            Ok(dir) => dir.join(DEFAULT_CONFIG_FILE).to_string_lossy().into_owned(),
-            Err(_) => {
-                eprintln!("Warning: Failed to get current directory, using default config file");
-                DEFAULT_CONFIG_FILE.to_string()
-            }
-        }
-    };
-
-    // Log using proper logging instead of println when possible
-    println!("Using config file base: {}", config_dir);
-
-    let app_config = Config::builder()
-        .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Toml).required(false))
-        .add_source(File::with_name(config_dir.as_str()).format(FileFormat::Yaml).required(false))
-        .build()
-        .unwrap_or_default();
-
-    match app_config.try_deserialize::<AppConfig>() {
-        Ok(app_config) => {
-            println!("Parsed AppConfig: {:?}", app_config);
-            app_config
-        }
-        Err(e) => {
-            println!("Failed to deserialize config: {}", e);
-            AppConfig::default()
-        }
-    }
+pub fn load_config(config: Option<String>) -> AppConfig {
+    AppConfig::new_with_endpoint(config)
 }

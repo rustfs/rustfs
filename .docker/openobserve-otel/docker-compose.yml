@@ -1,0 +1,73 @@
+services:
+  openobserve:
+    image: public.ecr.aws/zinclabs/openobserve:latest
+    restart: unless-stopped
+    environment:
+      ZO_ROOT_USER_EMAIL: "root@rustfs.com"
+      ZO_ROOT_USER_PASSWORD: "rustfs123"
+      ZO_TRACING_HEADER_KEY: "Authorization"
+      ZO_TRACING_HEADER_VALUE: "Basic cm9vdEBydXN0ZnMuY29tOmQ4SXlCSEJTUkk3RGVlcEQ="
+      ZO_DATA_DIR: "/data"
+      ZO_MEMORY_CACHE_ENABLED: "true"
+      ZO_MEMORY_CACHE_MAX_SIZE: "256"
+      RUST_LOG: "info"
+      TZ: Asia/Shanghai
+    ports:
+      - "5080:5080"
+      - "5081:5081"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:5080/health" ]
+      start_period: 60s
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - otel-network
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+        reservations:
+          memory: 512M
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "13133:13133" # Health check
+      - "1777:1777" # pprof
+      - "55679:55679" # zpages
+      - "1888:1888" # Metrics
+      - "8888:8888" # Prometheus metrics
+      - "8889:8889" # Additional metrics endpoint
+    depends_on:
+      - openobserve
+    networks:
+      - otel-network
+    deploy:
+      resources:
+        limits:
+          memory: 10240M
+        reservations:
+          memory: 512M
+
+networks:
+  otel-network:
+    driver: bridge
+    name: otel-network
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+    labels:
+      com.example.description: "Network for OpenObserve and OpenTelemetry Collector"
+volumes:
+  data:
