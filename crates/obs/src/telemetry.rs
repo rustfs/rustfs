@@ -399,9 +399,9 @@ fn format_with_color(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: 
     let thread_name = binding.name().unwrap_or("unnamed");
     let thread_id = format!("{:?}", std::thread::current().id());
 
-    write!(
+    writeln!(
         w,
-        "{} {} [{}] [{}:{}] [{}:{}] {}\n",
+        "{} {} [{}] [{}:{}] [{}:{}] {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
         level_style.paint(level.to_string()),
         Color::Magenta.paint(record.target()),
@@ -422,11 +422,11 @@ fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &R
     let thread_name = binding.name().unwrap_or("unnamed");
     let thread_id = format!("{:?}", std::thread::current().id());
 
-    write!(
+    writeln!(
         w,
-        "{} {} [{}] [{}:{}] [{}:{}] {}\n",
+        "{} {} [{}] [{}:{}] [{}:{}] {}",
         now.now().format("%Y-%m-%d %H:%M:%S%.6f"),
-        level.to_string(),
+        level,
         record.target(),
         record.file().unwrap_or("unknown"),
         record.line().unwrap_or(0),
