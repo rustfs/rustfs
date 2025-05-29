@@ -37,7 +37,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9002"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考 其中 `RUSTFS_OBS_CONFIG` 和下面变量二选一
-export RUSTFS_OBS_CONFIG="./deploy/config/obs.example.toml"
+# export RUSTFS_OBS_CONFIG="./deploy/config/obs.example.toml"
 
 # 如下变量需要必须参数都有值才可以，以及会覆盖配置文件中的值
 #export RUSTFS__OBSERVABILITY__ENDPOINT=http://localhost:4317
