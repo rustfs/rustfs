@@ -7,6 +7,7 @@
 /data
 .devcontainer
 rustfs/static/*
+!rustfs/static/.gitkeep
 vendor
 cli/rustfs-gui/embedded-rustfs/rustfs
 deploy/config/obs.toml
