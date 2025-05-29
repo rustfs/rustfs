@@ -3002,7 +3002,7 @@ impl SetDisks {
             let self_clone = Arc::clone(&self);
             let bucket_rx_clone = bucket_rx.clone();
             let buckets_results_tx_clone = buckets_results_tx.clone();
-            futures.push(tokio::spawn(async move {
+            futures.push(async move {
                 loop {
                     match bucket_rx_clone.write().await.try_recv() {
                         Err(_) => return,
@@ -3083,12 +3083,11 @@ impl SetDisks {
                     }
                     info!("continue scanner");
                 }
-            }));
+            });
         }
 
         info!("ns_scanner start");
         let _ = join_all(futures).await;
-        drop(buckets_results_tx);
         let _ = task.await;
         info!("ns_scanner completed");
         Ok(())

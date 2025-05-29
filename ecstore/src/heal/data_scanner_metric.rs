@@ -4,12 +4,12 @@ use lazy_static::lazy_static;
 use madmin::metrics::ScannerMetrics as M_ScannerMetrics;
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, SystemTime},
-    pin::Pin,
 };
 use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
@@ -86,7 +86,7 @@ impl ScannerMetric {
             Self::Last => "last",
         }
     }
-    
+
     /// Convert from index back to enum (safe version)
     pub fn from_index(index: usize) -> Option<Self> {
         if index >= Self::Last as usize {
@@ -154,7 +154,7 @@ impl LockedLastMinuteLatency {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         let elem = AccElem {
             n: 1,
             total: duration.as_secs(),
@@ -206,10 +206,8 @@ pub struct ScannerMetrics {
 
 impl ScannerMetrics {
     pub fn new() -> Self {
-        let operations = (0..ScannerMetric::Last as usize)
-            .map(|_| AtomicU64::new(0))
-            .collect();
-        
+        let operations = (0..ScannerMetric::Last as usize).map(|_| AtomicU64::new(0)).collect();
+
         let latency = (0..ScannerMetric::LastRealtime as usize)
             .map(|_| LockedLastMinuteLatency::new())
             .collect();
@@ -227,10 +225,10 @@ impl ScannerMetrics {
         let start_time = SystemTime::now();
         move |_custom: &HashMap<String, String>| {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
-            
+
             // Update operation count
             globalScannerMetrics.operations[metric as usize].fetch_add(1, Ordering::Relaxed);
-            
+
             // Update latency for realtime metrics (spawn async task for this)
             if (metric as usize) < ScannerMetric::LastRealtime as usize {
                 let metric_index = metric as usize;
@@ -241,11 +239,7 @@ impl ScannerMetrics {
 
             // Log trace metrics
             if metric as u8 > ScannerMetric::StartTrace as u8 {
-                debug!(
-                    metric = metric.as_str(),
-                    duration_ms = duration.as_millis(),
-                    "Scanner trace metric"
-                );
+                debug!(metric = metric.as_str(), duration_ms = duration.as_millis(), "Scanner trace metric");
             }
         }
     }
@@ -255,10 +249,10 @@ impl ScannerMetrics {
         let start_time = SystemTime::now();
         move |size: u64| {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
-            
+
             // Update operation count
             globalScannerMetrics.operations[metric as usize].fetch_add(1, Ordering::Relaxed);
-            
+
             // Update latency for realtime metrics with size (spawn async task)
             if (metric as usize) < ScannerMetric::LastRealtime as usize {
                 let metric_index = metric as usize;
@@ -274,10 +268,10 @@ impl ScannerMetrics {
         let start_time = SystemTime::now();
         move || {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
-            
+
             // Update operation count
             globalScannerMetrics.operations[metric as usize].fetch_add(1, Ordering::Relaxed);
-            
+
             // Update latency for realtime metrics (spawn async task)
             if (metric as usize) < ScannerMetric::LastRealtime as usize {
                 let metric_index = metric as usize;
@@ -294,10 +288,10 @@ impl ScannerMetrics {
         Box::new(move |count: usize| {
             Box::new(move || {
                 let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
-                
+
                 // Update operation count
                 globalScannerMetrics.operations[metric as usize].fetch_add(count as u64, Ordering::Relaxed);
-                
+
                 // Update latency for realtime metrics (spawn async task)
                 if (metric as usize) < ScannerMetric::LastRealtime as usize {
                     let metric_index = metric as usize;
@@ -313,7 +307,7 @@ impl ScannerMetrics {
     pub async fn inc_time(metric: ScannerMetric, duration: Duration) {
         // Update operation count
         globalScannerMetrics.operations[metric as usize].fetch_add(1, Ordering::Relaxed);
-        
+
         // Update latency for realtime metrics
         if (metric as usize) < ScannerMetric::LastRealtime as usize {
             globalScannerMetrics.latency[metric as usize].add(duration).await;
@@ -350,12 +344,12 @@ impl ScannerMetrics {
     pub async fn get_current_paths(&self) -> Vec<String> {
         let mut result = Vec::new();
         let paths = self.current_paths.read().await;
-        
+
         for (disk, tracker) in paths.iter() {
             let path = tracker.get_path().await;
             result.push(format!("{}/{}", disk, path));
         }
-        
+
         result
     }
 
@@ -367,17 +361,17 @@ impl ScannerMetrics {
     /// Generate metrics report
     pub async fn report(&self) -> M_ScannerMetrics {
         let mut metrics = M_ScannerMetrics::default();
-        
+
         // Set cycle information
         if let Some(cycle) = self.get_cycle().await {
             metrics.current_cycle = cycle.current;
             metrics.cycles_completed_at = cycle.cycle_completed;
             metrics.current_started = cycle.started;
         }
-        
+
         metrics.collected_at = Utc::now();
         metrics.active_paths = self.get_current_paths().await;
-        
+
         // Lifetime operations
         for i in 0..ScannerMetric::Last as usize {
             let count = self.operations[i].load(Ordering::Relaxed);
@@ -387,7 +381,7 @@ impl ScannerMetrics {
                 }
             }
         }
-        
+
         // Last minute statistics for realtime metrics
         for i in 0..ScannerMetric::LastRealtime as usize {
             let last_min = self.latency[i].total().await;
@@ -398,7 +392,7 @@ impl ScannerMetrics {
                 }
             }
         }
-        
+
         metrics
     }
 }
@@ -408,13 +402,10 @@ pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn std::future::Futu
 pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Create a current path updater for tracking scan progress
-pub fn current_path_updater(
-    disk: &str, 
-    initial: &str
-) -> (UpdateCurrentPathFn, CloseDiskFn) {
+pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
     let tracker = Arc::new(CurrentPathTracker::new(initial.to_string()));
     let disk_name = disk.to_string();
-    
+
     // Store the tracker in global metrics
     let tracker_clone = Arc::clone(&tracker);
     let disk_clone = disk_name.clone();
@@ -442,11 +433,7 @@ pub fn current_path_updater(
         Arc::new(move || -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
             let disk_name = disk_name.clone();
             Box::pin(async move {
-                globalScannerMetrics
-                    .current_paths
-                    .write()
-                    .await
-                    .remove(&disk_name);
+                globalScannerMetrics.current_paths.write().await.remove(&disk_name);
             })
         })
     };
@@ -458,4 +445,4 @@ impl Default for ScannerMetrics {
     fn default() -> Self {
         Self::new()
     }
-} 
+}
