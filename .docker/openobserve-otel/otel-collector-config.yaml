@@ -1,0 +1,63 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  filelog:
+    include: [ "/var/log/app/*.log" ]
+    start_at: end
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+
+exporters:
+  otlphttp/openobserve:
+    endpoint: http://openobserve:5080/api/default
+    headers:
+      Authorization: "Bearer cm9vdEBydXN0ZnMuY29tOmxIV0RqQmZMWXJ6MnZOajU="
+      stream-name: default
+      organization: default
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    timeout: 10s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [ health_check, pprof, zpages ]
+  pipelines:
+    traces:
+      receivers: [ otlp ]
+      processors: [ memory_limiter, batch ]
+      exporters: [ otlphttp/openobserve ]
+    metrics:
+      receivers: [ otlp ]
+      processors: [ memory_limiter, batch ]
+      exporters: [ otlphttp/openobserve ]
+    logs:
+      receivers: [ otlp, filelog ]
+      processors: [ memory_limiter, batch ]
+      exporters: [ otlphttp/openobserve ]
+  telemetry:
+    logs:
+      level: "info"  # Collector 日志级别
+    metrics:
+      address: "0.0.0.0:8888"  # Collector 自身指标暴露
