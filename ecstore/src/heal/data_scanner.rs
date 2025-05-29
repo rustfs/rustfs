@@ -144,16 +144,16 @@ fn new_dynamic_sleeper(factor: f64, max_wait: Duration, is_scanner: bool) -> Dyn
 }
 
 /// Initialize and start the data scanner in the background
-/// 
+///
 /// This function starts a background task that continuously runs the data scanner
 /// with randomized intervals between cycles to avoid resource contention.
-/// 
+///
 /// # Features
 /// - Graceful shutdown support via cancellation token
 /// - Randomized sleep intervals to prevent synchronized scanning across nodes
 /// - Minimum sleep duration to avoid excessive CPU usage
 /// - Proper error handling and logging
-/// 
+///
 /// # Architecture
 /// 1. Initialize with random seed for sleep intervals
 /// 2. Run scanner cycles in a loop
@@ -161,33 +161,25 @@ fn new_dynamic_sleeper(factor: f64, max_wait: Duration, is_scanner: bool) -> Dyn
 /// 4. Ensure minimum sleep duration to prevent CPU thrashing
 pub async fn init_data_scanner() {
     info!("Initializing data scanner background task");
-    
+
     tokio::spawn(async move {
         loop {
             // Run the data scanner
             run_data_scanner().await;
-            
+
             // Calculate randomized sleep duration
             // Use random factor (0.0 to 1.0) multiplied by the scanner cycle duration
             let random_factor: f64 = {
                 let mut rng = rand::thread_rng();
-                rng.gen_range(0.0..1.0)
+                rng.gen_range(1.0..10.0)
             };
             let base_cycle_duration = SCANNER_CYCLE.load(Ordering::SeqCst) as f64;
             let sleep_duration_secs = random_factor * base_cycle_duration;
-            
-            // Ensure minimum sleep duration of 1 second to avoid high CPU usage
-            let sleep_duration = if sleep_duration_secs < 1.0 {
-                Duration::from_secs(1)
-            } else {
-                Duration::from_secs_f64(sleep_duration_secs)
-            };
 
-            info!(
-                duration_secs = sleep_duration.as_secs(),
-                "Data scanner sleeping before next cycle"
-            );
-            
+            let sleep_duration = Duration::from_secs_f64(sleep_duration_secs);
+
+            info!(duration_secs = sleep_duration.as_secs(), "Data scanner sleeping before next cycle");
+
             // Sleep with the calculated duration
             sleep(sleep_duration).await;
         }
@@ -195,20 +187,20 @@ pub async fn init_data_scanner() {
 }
 
 /// Run a single data scanner cycle
-/// 
+///
 /// This function performs one complete scan cycle, including:
 /// - Loading and updating cycle information
 /// - Determining scan mode based on healing configuration
 /// - Running the namespace scanner
 /// - Saving cycle completion state
-/// 
+///
 /// # Error Handling
 /// - Gracefully handles missing object layer
 /// - Continues operation even if individual steps fail
 /// - Logs errors appropriately without terminating the scanner
 async fn run_data_scanner() {
     info!("Starting data scanner cycle");
-    
+
     // Get the object layer, return early if not available
     let Some(store) = new_object_layer_fn() else {
         error!("Object layer not initialized, skipping scanner cycle");
@@ -235,7 +227,7 @@ async fn run_data_scanner() {
 
     // Start metrics collection for this cycle
     let stop_fn = ScannerMetrics::log(ScannerMetric::ScanCycle);
-    
+
     // Update cycle information
     cycle_info.current = cycle_info.next;
     cycle_info.started = Utc::now();
@@ -245,12 +237,8 @@ async fn run_data_scanner() {
 
     // Read background healing information and determine scan mode
     let bg_heal_info = read_background_heal_info(store.clone()).await;
-    let scan_mode = get_cycle_scan_mode(
-        cycle_info.current,
-        bg_heal_info.bitrot_start_cycle,
-        bg_heal_info.bitrot_start_time,
-    )
-    .await;
+    let scan_mode =
+        get_cycle_scan_mode(cycle_info.current, bg_heal_info.bitrot_start_cycle, bg_heal_info.bitrot_start_time).await;
 
     // Update healing info if scan mode changed
     if bg_heal_info.current_scan_mode != scan_mode {
@@ -280,19 +268,15 @@ async fn run_data_scanner() {
     );
 
     // Run the namespace scanner
-    match store
-        .clone()
-        .ns_scanner(tx, cycle_info.current as usize, scan_mode)
-        .await
-    {
+    match store.clone().ns_scanner(tx, cycle_info.current as usize, scan_mode).await {
         Ok(_) => {
             info!(cycle = cycle_info.current, "Namespace scanner completed successfully");
-            
+
             // Update cycle completion information
             cycle_info.next += 1;
             cycle_info.current = 0;
             cycle_info.cycle_completed.push(Utc::now());
-            
+
             // Maintain cycle completion history (keep only recent cycles)
             if cycle_info.cycle_completed.len() > DATA_USAGE_UPDATE_DIR_CYCLES as usize {
                 let _ = cycle_info.cycle_completed.remove(0);
