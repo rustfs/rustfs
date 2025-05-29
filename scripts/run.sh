@@ -36,22 +36,19 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 # HTTPS 证书目录
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
-# 具体路径修改为配置文件真实路径，obs.example.toml 仅供参考 其中 `RUSTFS_OBS_CONFIG` 和下面变量二选一
-# export RUSTFS_OBS_ENDPOINT=http://localhost:4317
-
-# 如下变量需要必须参数都有值才可以，以及会覆盖配置文件中的值
-#export RUSTFS_OBSERVABILITY_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的地址
-#export RUSTFS_OBSERVABILITY_USE_STDOUT=false # 是否使用标准输出
-#export RUSTFS_OBSERVABILITY_SAMPLE_RATIO=2.0 # 采样率，0.0-1.0之间，0.0表示不采样，1.0表示全部采样
-#export RUSTFS_OBSERVABILITY_METER_INTERVAL=1 # 采样间隔，单位为秒
-#export RUSTFS_OBSERVABILITY_SERVICE_NAME=rustfs # 服务名称
-#export RUSTFS_OBSERVABILITY_SERVICE_VERSION=0.1.0 # 服务版本
-#export RUSTFS_OBSERVABILITY_ENVIRONMENT=develop # 环境名称
-#export RUSTFS_OBSERVABILITY_LOGGER_LEVEL=debug # 日志级别，支持 trace, debug, info, warn, error
-export RUSTFS_OBSERVABILITY_LOCAL_LOGGING_ENABLED=true # 是否启用本地日志记录
-export RUSTFS_OBSERVABILITY_LOG_DIRECTORY="./deploy/logs" # Log directory
-export RUSTFS_OBSERVABILITY_LOG_ROTATION_TIME="minute" # Log rotation time unit, can be "second", "minute", "hour", "day"
-export RUSTFS_OBSERVABILITY_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
+# 可观测性 相关配置信息
+#export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的地址
+#export RUSTFS_OBS_USE_STDOUT=false # 是否使用标准输出
+#export RUSTFS_OBS_SAMPLE_RATIO=2.0 # 采样率，0.0-1.0之间，0.0表示不采样，1.0表示全部采样
+#export RUSTFS_OBS_METER_INTERVAL=1 # 采样间隔，单位为秒
+#export RUSTFS_OBS_SERVICE_NAME=rustfs # 服务名称
+#export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # 服务版本
+#export RUSTFS_OBS_ENVIRONMENT=develop # 环境名称
+#export RUSTFS_OBS_LOGGER_LEVEL=debug # 日志级别，支持 trace, debug, info, warn, error
+export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # 是否启用本地日志记录
+export RUSTFS_OBS_LOG_DIRECTORY="./deploy/logs" # Log directory
+export RUSTFS_OBS_LOG_ROTATION_TIME="minute" # Log rotation time unit, can be "second", "minute", "hour", "day"
+export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
 
 #
 #export RUSTFS_SINKS_FILE_PATH=./deploy/logs/rustfs.log
