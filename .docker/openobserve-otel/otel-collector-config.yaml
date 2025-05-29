@@ -20,9 +20,9 @@ processors:
 
 exporters:
   otlphttp/openobserve:
-    endpoint: http://openobserve:5080/api/default
+    endpoint: http://openobserve:5080/api/default # http://127.0.0.1:5080/api/default
     headers:
-      Authorization: "Bearer cm9vdEBydXN0ZnMuY29tOmxIV0RqQmZMWXJ6MnZOajU="
+      Authorization: "Basic cm9vdEBydXN0ZnMuY29tOmQ4SXlCSEJTUkk3RGVlcEQ="
       stream-name: default
       organization: default
     compression: gzip
@@ -32,6 +32,21 @@ exporters:
       max_interval: 30s
       max_elapsed_time: 300s
     timeout: 10s
+  otlp/openobserve:
+    endpoint: openobserve:5081 # http://127.0.0.1:5080/api/default
+    headers:
+      Authorization: "Basic cm9vdEBydXN0ZnMuY29tOmQ4SXlCSEJTUkk3RGVlcEQ="
+      stream-name: default
+      organization: default
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    timeout: 10s
+    tls:
+      insecure: true
 
 extensions:
   health_check:
@@ -47,15 +62,15 @@ service:
     traces:
       receivers: [ otlp ]
       processors: [ memory_limiter, batch ]
-      exporters: [ otlphttp/openobserve ]
+      exporters: [ otlp/openobserve ]
     metrics:
       receivers: [ otlp ]
       processors: [ memory_limiter, batch ]
-      exporters: [ otlphttp/openobserve ]
+      exporters: [ otlp/openobserve ]
     logs:
       receivers: [ otlp, filelog ]
       processors: [ memory_limiter, batch ]
-      exporters: [ otlphttp/openobserve ]
+      exporters: [ otlp/openobserve ]
   telemetry:
     logs:
       level: "info"  # Collector 日志级别
