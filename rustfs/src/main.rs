@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
     init_license(opt.license.clone());
 
     // Load the configuration file
-    let config = load_config(Some(opt.clone().obs_config));
+    let config = load_config(Some(opt.clone().obs_endpoint));
 
     // Initialize Observability
     let (_logger, guard) = init_obs(config.clone()).await;

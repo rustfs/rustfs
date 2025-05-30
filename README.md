@@ -60,7 +60,7 @@ export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9001"
 
 # Observability config
-export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
+export RUSTFS_OBS_ENDPOINT="http://localhost:4317"
 
 # Event message configuration
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.toml"
@@ -73,9 +73,9 @@ export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
 ./rustfs /data/rustfs
 ```
 
-### Observability Stack
+## Observability Stack Otel and OpenObserve
 
-#### Deployment
+### OpenTelemetry Collector 和 Jaeger、Grafana、Prometheus、Loki
 
 1. Navigate to the observability directory:
    ```bash
@@ -93,24 +93,29 @@ export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
 - Jaeger: `http://localhost:16686`
 - Prometheus: `http://localhost:9090`
 
-#### Configuring Observability
+#### Configure observability
 
-1. Copy the example configuration:
+```
+OpenTelemetry Collector address(endpoint):  http://localhost:4317 
+```
+
+---
+
+### OpenObserve and OpenTelemetry Collector
+
+1. Navigate to the OpenObserve and OpenTelemetry directory:
    ```bash
-   cd deploy/config
-   cp obs.example.toml obs.toml
+   cd .docker/openobserve-otel
    ```
-
-2. Edit `obs.toml` with the following parameters:
-
-| Parameter            | Description                       | Example               |
-|----------------------|-----------------------------------|-----------------------|
-| endpoint             | OpenTelemetry Collector address   | http://localhost:4317 |
-| service_name         | Service name                      | rustfs                |
-| service_version      | Service version                   | 1.0.0                 |
-| environment          | Runtime environment               | production            |
-| meter_interval       | Metrics export interval (seconds) | 30                    |
-| sample_ratio         | Sampling ratio                    | 1.0                   |
-| use_stdout           | Output to console                 | true/false            |
-| logger_level         | Log level                         | info                  |
-| local_logging_enable | stdout                            | true/false            |
+2. Start the OpenObserve and OpenTelemetry Collector services:
+   ```bash
+    docker compose -f docker-compose.yml up -d
+    ```
+3. Access the OpenObserve UI:
+   OpenObserve UI: `http://localhost:5080`
+    - Default credentials:
+        - Username: `root@rustfs.com`
+        - Password: `rustfs123`
+    - Exposed ports:
+        - 5080: HTTP API and UI
+        - 5081: OTLP gRPC

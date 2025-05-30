@@ -20,9 +20,8 @@ kafka = ["dep:rdkafka"]
 rustfs-config = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-config = { workspace = true }
-lazy_static = { workspace = true }
-local-ip-address = { workspace = true }
+flexi_logger = { workspace = true, features = ["trc", "kv"] }
+nu-ansi-term = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }

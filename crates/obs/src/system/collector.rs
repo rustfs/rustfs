@@ -23,7 +23,7 @@ pub struct Collector {
 
 impl Collector {
     pub fn new(pid: Pid, meter: opentelemetry::metrics::Meter, interval_ms: u64) -> Result<Self, GlobalError> {
-        let mut system = System::new_all();
+        let mut system = System::new();
         let attributes = ProcessAttributes::new(pid, &mut system)?;
         let core_count = System::physical_core_count().ok_or(GlobalError::CoreCountError)?;
         let metrics = Metrics::new(&meter);
@@ -52,7 +52,7 @@ impl Collector {
 
     fn collect(&mut self) -> Result<(), GlobalError> {
         self.system
-            .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.pid]), true);
+            .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[self.pid]), false);
 
         // refresh the network interface list and statistics
         self.networks.refresh(false);

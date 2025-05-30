@@ -60,7 +60,7 @@ export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9001"
 
 # 可观测性配置
-export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
+export RUSTFS_OBS_ENDPOINT="http://localhost:4317"
 
 # 事件消息配置
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.toml"
@@ -72,9 +72,9 @@ export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
 ./rustfs /data/rustfs
 ```
 
-### 可观测性系统
+## 可观测性系统 Otel 和 OpenObserve
 
-#### 部署
+### OpenTelemetry Collector 和 Jaeger、Grafana、Prometheus、Loki
 
 1. 进入可观测性目录：
    ```bash
@@ -94,22 +94,28 @@ export RUSTFS_OBS_CONFIG="./deploy/config/obs.toml"
 
 #### 配置可观测性
 
-1. 复制示例配置：
+```
+OpenTelemetry Collector 地址(endpoint):  http://localhost:4317 
+```
+
+--- 
+
+### OpenObserve 和 OpenTelemetry Collector
+
+1. 进入 OpenObserve 和 OpenTelemetry 目录：
    ```bash
-   cd deploy/config
-   cp obs.example.toml obs.toml
+   cd .docker/openobserve-otel
    ```
+2. 启动 OpenObserve 和 OpenTelemetry Collector 服务：
+   ```bash
+   docker compose -f docker-compose.yml up -d
+   ```
+3. 访问 OpenObserve UI：
+   OpenObserve UI: `http://localhost:5080`
+    - 默认凭据：
+        - 用户名：`root@rustfs.com`
+        - 密码：`rustfs123`
+    - 开放端口：
+        - 5080：HTTP API 和 UI
+        - 5081：OTLP gRPC
 
-2. 编辑 `obs.toml` 配置文件，参数如下：
-
-| 配置项                  | 说明                         | 示例值                   |
-|----------------------|----------------------------|-----------------------|
-| endpoint             | OpenTelemetry Collector 地址 | http://localhost:4317 |
-| service_name         | 服务名称                       | rustfs                |
-| service_version      | 服务版本                       | 1.0.0                 |
-| environment          | 运行环境                       | production            |
-| meter_interval       | 指标导出间隔 (秒)                 | 30                    |
-| sample_ratio         | 采样率                        | 1.0                   |
-| use_stdout           | 是否输出到控制台                   | true/false            |
-| logger_level         | 日志级别                       | info                  |
-| local_logging_enable | 控制台是否答应日志                  | true/false            |
