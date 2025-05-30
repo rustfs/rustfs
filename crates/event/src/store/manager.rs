@@ -25,18 +25,17 @@ pub static GLOBAL_EVENT_CONFIG: Lazy<Mutex<Option<EventNotifierConfig>>> = Lazy:
 
 /// EventManager Responsible for managing all operations of the event system
 #[derive(Debug)]
-pub struct EventManager<S: StorageAPI> {
-    api: Arc<S>,
+pub struct EventManager {
+    api: Arc<ECStore>,
 }
 
-impl<S: StorageAPI> EventManager {
+impl EventManager {
     /// Create a new Event Manager
-    pub async fn new(api: Arc<S>) -> Self {
-        // Update the global access point at the same time
-        if let Ok(mut global_api) = GLOBAL_STORE_API.lock() {
-            if let Some(store) = api.as_any().downcast_ref::<ECStore>() {
-                *global_api = Some(Arc::new(store.clone()));
-            }
+    pub async fn new(api: Arc<ECStore>) -> Self {
+        // Set the global storage API
+        {
+            let mut global_api = GLOBAL_STORE_API.lock().await;
+            *global_api = Some(api.clone());
         }
 
         Self { api }
@@ -82,10 +81,7 @@ impl<S: StorageAPI> EventManager {
         }
 
         save_event_config(self.api.clone(), cfg).await?;
-        *GLOBAL_EVENT_CONFIG
-            .lock()
-            .await
-            .map_err(|e| Error::msg(format!("Failed to acquire global config lock: {}", e)))? = Some(cfg.clone());
+        *GLOBAL_EVENT_CONFIG.lock().await = Some(cfg.clone());
 
         Ok(())
     }
@@ -199,7 +195,7 @@ async fn save_event_config<S: StorageAPI>(api: Arc<S>, config: &EventNotifierCon
     let config_file = get_event_config_file();
     let data = config.marshal()?;
 
-    save_config(api, &config_file, data).await;
+    save_config(api, &config_file, data).await
 }
 
 /// Get the event profile path

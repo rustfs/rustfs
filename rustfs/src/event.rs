@@ -10,7 +10,7 @@ pub(crate) async fn init_event_notifier(notifier_config: Option<String>) {
         NotifierConfig::event_load_config(notifier_config)
     } else {
         info!("event_config is empty");
-        rustfs_event::get_event_notifier_config().clone()
+        // rustfs_event::get_event_notifier_config().clone()
     };
 
     info!("using event_config: {:?}", config);

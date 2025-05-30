@@ -15,7 +15,7 @@ use uuid::Uuid;
 pub struct Key {
     /// Key name
     pub name: String,
-    /// Whether or not to compress
+    /// Whether to compress
     pub compress: bool,
     /// filename extension
     pub extension: String,
@@ -35,6 +35,7 @@ impl Key {
     }
 
     /// Convert to string form
+    #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         let mut key_str = self.name.clone();
         if self.item_count > 1 {
@@ -47,6 +48,7 @@ impl Key {
 }
 
 /// Parse key from file name
+#[allow(clippy::redundant_closure)]
 pub fn parse_key(filename: &str) -> Key {
     let compress = filename.ends_with(".snappy");
     let filename = if compress {

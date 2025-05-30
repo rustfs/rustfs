@@ -6,7 +6,6 @@ mod event;
 mod global;
 mod notifier;
 mod store;
-mod target;
 
 pub use adapter::create_adapters;
 #[cfg(all(feature = "kafka", target_os = "linux"))]

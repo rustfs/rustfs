@@ -48,7 +48,6 @@ use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_event::GLOBAL_EventSys;
 use rustfs_obs::{init_obs, set_global_guard, SystemObserver};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
@@ -511,7 +510,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     GLOBAL_ConfigSys.init(store.clone()).await?;
 
     // event system configuration
-    GLOBAL_EventSys.init(store.clone()).await?;
+    // GLOBAL_EventSys.init(store.clone()).await?;
 
     // Initialize event notifier
     event::init_event_notifier(opt.event_config).await;

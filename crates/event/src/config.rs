@@ -424,21 +424,21 @@ impl EventNotifierConfig {
         let mut adapters = Vec::new();
 
         // Add all enabled webhook configurations
-        for (_, webhook) in &self.webhook {
+        for webhook in self.webhook.values() {
             if webhook.common.enable {
                 adapters.push(AdapterConfig::Webhook(webhook.clone()));
             }
         }
 
         // Add all enabled Kafka configurations
-        for (_, kafka) in &self.kafka {
+        for kafka in self.kafka.values() {
             if kafka.common.enable {
                 adapters.push(AdapterConfig::Kafka(kafka.clone()));
             }
         }
 
         // Add all enabled MQTT configurations
-        for (_, mqtt) in &self.mqtt {
+        for mqtt in self.mqtt.values() {
             if mqtt.common.enable {
                 adapters.push(AdapterConfig::Mqtt(mqtt.clone()));
             }
