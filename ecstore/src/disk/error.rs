@@ -301,8 +301,8 @@ pub fn clone_disk_err(e: &DiskError) -> Error {
 
 pub fn os_err_to_file_err(e: io::Error) -> Error {
     match e.kind() {
-        io::ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
-        io::ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
+        ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
+        ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
         // io::ErrorKind::ConnectionRefused => todo!(),
         // io::ErrorKind::ConnectionReset => todo!(),
         // io::ErrorKind::HostUnreachable => todo!(),
@@ -341,7 +341,7 @@ pub fn os_err_to_file_err(e: io::Error) -> Error {
         // io::ErrorKind::UnexpectedEof => todo!(),
         // io::ErrorKind::OutOfMemory => todo!(),
         // io::ErrorKind::Other => todo!(),
-        // TODO: 把不支持的king用字符串处理
+        // TODO: 把不支持的 king 用字符串处理
         _ => Error::new(e),
     }
 }
@@ -350,12 +350,12 @@ pub fn os_err_to_file_err(e: io::Error) -> Error {
 pub struct FileAccessDeniedWithContext {
     pub path: PathBuf,
     #[source]
-    pub source: std::io::Error,
+    pub source: io::Error,
 }
 
 impl std::fmt::Display for FileAccessDeniedWithContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "访问文件 '{}' 被拒绝: {}", self.path.display(), self.source)
+        write!(f, "访问文件 '{}' 被拒绝：{}", self.path.display(), self.source)
     }
 }
 

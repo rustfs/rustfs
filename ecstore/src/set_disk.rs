@@ -36,7 +36,6 @@ use crate::{
     store_err::{is_err_object_not_found, to_object_err, StorageError},
     store_init::{load_format_erasure, ErasureError},
     utils::{
-        self,
         crypto::{base64_decode, base64_encode, hex},
         path::{encode_dir_object, has_suffix, SLASH_SEPARATOR},
     },
@@ -174,7 +173,7 @@ impl SetDisks {
             let mut rng = thread_rng();
             disks.shuffle(&mut rng);
 
-            numbers.shuffle(&mut rand::thread_rng());
+            numbers.shuffle(&mut thread_rng());
         }
 
         for &i in numbers.iter() {
@@ -395,7 +394,7 @@ impl SetDisks {
     }
 
     fn reduce_common_data_dir(data_dirs: &Vec<Option<Uuid>>, write_quorum: usize) -> Option<Uuid> {
-        let mut data_dirs_count = std::collections::HashMap::new();
+        let mut data_dirs_count = HashMap::new();
 
         for ddir in data_dirs {
             *data_dirs_count.entry(ddir).or_insert(0) += 1;
@@ -454,10 +453,7 @@ impl SetDisks {
         let errs: Vec<Option<Error>> = join_all(futures)
             .await
             .into_iter()
-            .map(|e| match e {
-                Ok(e) => e,
-                Err(_) => Some(Error::new(DiskError::Unexpected)),
-            })
+            .map(|e| e.unwrap_or_else(|_| Some(Error::new(DiskError::Unexpected))))
             .collect();
 
         if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
@@ -726,7 +722,7 @@ impl SetDisks {
         }
 
         if max_occ == 0 {
-            // Did not found anything useful
+            // Did not find anything useful
             return -1;
         }
         cparity
@@ -1039,7 +1035,7 @@ impl SetDisks {
 
                 hasher.flush()?;
 
-                meta_hashs[i] = Some(utils::crypto::hex(hasher.clone().finalize().as_slice()));
+                meta_hashs[i] = Some(hex(hasher.clone().finalize().as_slice()));
 
                 hasher.reset();
             }
@@ -1452,7 +1448,7 @@ impl SetDisks {
             }
         };
 
-        // check endpoint是否一致
+        // check endpoint 是否一致
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
 
@@ -2331,7 +2327,7 @@ impl SetDisks {
 
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
-                            match self
+                            return match self
                                 .delete_if_dang_ling(
                                     bucket,
                                     object,
@@ -2355,10 +2351,7 @@ impl SetDisks {
                                     for _ in 0..errs.len() {
                                         t_errs.push(None);
                                     }
-                                    return Ok((
-                                        self.default_heal_result(m, &t_errs, bucket, object, version_id).await,
-                                        Some(derr),
-                                    ));
+                                    Ok((self.default_heal_result(m, &t_errs, bucket, object, version_id).await, Some(derr)))
                                 }
                                 Err(err) => {
                                     // t_errs = vec![Some(err.clone()); errs.len()];
@@ -2367,13 +2360,13 @@ impl SetDisks {
                                         t_errs.push(Some(clone_err(&err)));
                                     }
 
-                                    return Ok((
+                                    Ok((
                                         self.default_heal_result(FileInfo::default(), &t_errs, bucket, object, version_id)
                                             .await,
                                         Some(err),
-                                    ));
+                                    ))
                                 }
-                            }
+                            };
                         }
 
                         if !lastest_meta.deleted && lastest_meta.erasure.distribution.len() != available_disks.len() {
@@ -2900,7 +2893,7 @@ impl SetDisks {
     }
 
     pub async fn ns_scanner(
-        &self,
+        self: Arc<Self>,
         buckets: &[BucketInfo],
         want_cycle: u32,
         updates: Sender<DataUsageCache>,
@@ -2908,6 +2901,7 @@ impl SetDisks {
     ) -> Result<()> {
         info!("ns_scanner");
         if buckets.is_empty() {
+            info!("data-scanner: no buckets to scan, skipping scanner cycle");
             return Ok(());
         }
 
@@ -2917,7 +2911,7 @@ impl SetDisks {
             return Ok(());
         }
 
-        let old_cache = DataUsageCache::load(self, DATA_USAGE_CACHE_NAME).await?;
+        let old_cache = DataUsageCache::load(&self, DATA_USAGE_CACHE_NAME).await?;
         let mut cache = DataUsageCache {
             info: DataUsageCacheInfo {
                 name: DATA_USAGE_ROOT.to_string(),
@@ -2930,7 +2924,7 @@ impl SetDisks {
         // Put all buckets into channel.
         let (bucket_tx, bucket_rx) = mpsc::channel(buckets.len());
         // Shuffle buckets to ensure total randomness of buckets, being scanned.
-        // Otherwise same set of buckets get scanned across erasure sets always.
+        // Otherwise, same set of buckets get scanned across erasure sets always.
         // at any given point in time. This allows different buckets to be scanned
         // in different order per erasure set, this wider spread is needed when
         // there are lots of buckets with different order of objects in them.
@@ -2940,6 +2934,7 @@ impl SetDisks {
             permutes.shuffle(&mut rng);
             permutes
         };
+
         // Add new buckets first
         for idx in permutes.iter() {
             let b = buckets[*idx].clone();
@@ -2960,6 +2955,7 @@ impl SetDisks {
             Duration::from_secs(30) + Duration::from_secs_f64(10.0 * rng.gen_range(0.0..1.0))
         };
         let mut ticker = interval(update_time);
+
         let task = tokio::spawn(async move {
             let last_save = Some(SystemTime::now());
             let mut need_loop = true;
@@ -2989,8 +2985,8 @@ impl SetDisks {
                 }
             }
         });
+
         // Restrict parallelism for disk usage scanner
-        // upto GOMAXPROCS if GOMAXPROCS is < len(disks)
         let max_procs = num_cpus::get();
         if max_procs < disks.len() {
             disks = disks[0..max_procs].to_vec();
@@ -3003,6 +2999,7 @@ impl SetDisks {
                 Some(disk) => disk.clone(),
                 None => continue,
             };
+            let self_clone = Arc::clone(&self);
             let bucket_rx_clone = bucket_rx.clone();
             let buckets_results_tx_clone = buckets_results_tx.clone();
             futures.push(async move {
@@ -3011,7 +3008,7 @@ impl SetDisks {
                         Err(_) => return,
                         Ok(bucket_info) => {
                             let cache_name = Path::new(&bucket_info.name).join(DATA_USAGE_CACHE_NAME);
-                            let mut cache = match DataUsageCache::load(self, &cache_name.to_string_lossy()).await {
+                            let mut cache = match DataUsageCache::load(&self_clone, &cache_name.to_string_lossy()).await {
                                 Ok(cache) => cache,
                                 Err(_) => continue,
                             };
@@ -3028,6 +3025,7 @@ impl SetDisks {
                                     ..Default::default()
                                 };
                             }
+
                             // Collect updates.
                             let (tx, mut rx) = mpsc::channel(1);
                             let buckets_results_tx_inner_clone = buckets_results_tx_clone.clone();
@@ -3048,9 +3046,10 @@ impl SetDisks {
                                     }
                                 }
                             });
+
                             // Calc usage
                             let before = cache.info.last_update;
-                            let mut cache = match disk.clone().ns_scanner(&cache, tx, heal_scan_mode, None).await {
+                            let mut cache = match disk.ns_scanner(&cache, tx, heal_scan_mode, None).await {
                                 Ok(cache) => cache,
                                 Err(_) => {
                                     if cache.info.last_update > before {
@@ -3086,9 +3085,9 @@ impl SetDisks {
                 }
             });
         }
+
         info!("ns_scanner start");
         let _ = join_all(futures).await;
-        drop(buckets_results_tx);
         let _ = task.await;
         info!("ns_scanner completed");
         Ok(())
@@ -5205,7 +5204,7 @@ impl StorageAPI for SetDisks {
                 _ => {}
             }
         }
-        return Ok((result, err));
+        Ok((result, err))
     }
 
     #[tracing::instrument(skip(self))]
@@ -5505,7 +5504,7 @@ async fn disks_with_all_parts(
             if let Some(data) = &meta.data {
                 let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
                 let data_len = data.len();
-                let verify_err = (bitrot_verify(
+                let verify_err = bitrot_verify(
                     Box::new(Cursor::new(data.clone())),
                     data_len,
                     meta.erasure.shard_file_size(meta.size),
@@ -5513,8 +5512,8 @@ async fn disks_with_all_parts(
                     checksum_info.hash,
                     meta.erasure.shard_size(meta.erasure.block_size),
                 )
-                .await)
-                    .err();
+                .await
+                .err();
 
                 if let Some(vec) = data_errs_by_part.get_mut(&0) {
                     if index < vec.len() {
@@ -5745,4 +5744,438 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     let _ = hasher.write(&buf);
 
     format!("{:x}-{}", hasher.finalize(), parts.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::error::DiskError;
+    use crate::store_api::{CompletePart, ErasureInfo, FileInfo};
+    use common::error::Error;
+    use std::collections::HashMap;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn test_check_part_constants() {
+        // Test that all CHECK_PART constants have expected values
+        assert_eq!(CHECK_PART_UNKNOWN, 0);
+        assert_eq!(CHECK_PART_SUCCESS, 1);
+        assert_eq!(CHECK_PART_DISK_NOT_FOUND, 2);
+        assert_eq!(CHECK_PART_VOLUME_NOT_FOUND, 3);
+        assert_eq!(CHECK_PART_FILE_NOT_FOUND, 4);
+        assert_eq!(CHECK_PART_FILE_CORRUPT, 5);
+    }
+
+    #[test]
+    fn test_is_min_allowed_part_size() {
+        // Test minimum part size validation
+        assert!(!is_min_allowed_part_size(0));
+        assert!(!is_min_allowed_part_size(1024)); // 1KB - too small
+        assert!(!is_min_allowed_part_size(1024 * 1024)); // 1MB - too small
+        assert!(is_min_allowed_part_size(5 * 1024 * 1024)); // 5MB - minimum allowed
+        assert!(is_min_allowed_part_size(10 * 1024 * 1024)); // 10MB - allowed
+        assert!(is_min_allowed_part_size(100 * 1024 * 1024)); // 100MB - allowed
+    }
+
+    #[test]
+    fn test_get_complete_multipart_md5() {
+        // Test MD5 calculation for multipart upload
+        let parts = vec![
+            CompletePart {
+                part_num: 1,
+                e_tag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            },
+            CompletePart {
+                part_num: 2,
+                e_tag: Some("098f6bcd4621d373cade4e832627b4f6".to_string()),
+            },
+        ];
+
+        let md5 = get_complete_multipart_md5(&parts);
+        assert!(md5.ends_with("-2")); // Should end with part count
+        assert!(md5.len() > 10); // Should have reasonable length
+
+        // Test with empty parts
+        let empty_parts = vec![];
+        let empty_result = get_complete_multipart_md5(&empty_parts);
+        assert!(empty_result.ends_with("-0"));
+
+        // Test with single part
+        let single_part = vec![CompletePart {
+            part_num: 1,
+            e_tag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+        }];
+        let single_result = get_complete_multipart_md5(&single_part);
+        assert!(single_result.ends_with("-1"));
+    }
+
+    #[test]
+    fn test_get_upload_id_dir() {
+        // Test upload ID directory path generation
+        let dir = SetDisks::get_upload_id_dir("bucket", "object", "upload-id");
+        // The function returns SHA256 hash of bucket/object + upload_id processing
+        assert!(dir.len() > 64); // Should be longer than just SHA256 hash
+        assert!(dir.contains("/")); // Should contain path separator
+
+        // Test with base64 encoded upload ID
+        let result2 = SetDisks::get_upload_id_dir("bucket", "object", "dXBsb2FkLWlk"); // base64 for "upload-id"
+        assert!(!result2.is_empty());
+        assert!(result2.len() > 10);
+    }
+
+    #[test]
+    fn test_get_multipart_sha_dir() {
+        // Test multipart SHA directory path generation
+        let dir = SetDisks::get_multipart_sha_dir("bucket", "object");
+        // The function returns SHA256 hash of "bucket/object"
+        assert_eq!(dir.len(), 64); // SHA256 hash length
+        assert!(!dir.contains("bucket")); // Should be hash, not original text
+        assert!(!dir.contains("object")); // Should be hash, not original text
+
+        // Test with empty strings
+        let result2 = SetDisks::get_multipart_sha_dir("", "");
+        assert!(!result2.is_empty());
+        assert_eq!(result2.len(), 64); // SHA256 hex string length
+
+        // Test that different inputs produce different hashes
+        let result3 = SetDisks::get_multipart_sha_dir("bucket1", "object1");
+        let result4 = SetDisks::get_multipart_sha_dir("bucket2", "object2");
+        assert_ne!(result3, result4);
+    }
+
+    #[test]
+    fn test_common_parity() {
+        // Test common parity calculation
+        // For parities [2, 2, 2, 3] with n=4, default_parity_count=1:
+        // - parity=2: read_quorum = 4-2 = 2, occ=3 >= 2, so valid
+        // - parity=3: read_quorum = 4-3 = 1, occ=1 >= 1, so valid
+        // - max_occ=3 for parity=2, so returns 2
+        let parities = vec![2, 2, 2, 3];
+        assert_eq!(SetDisks::common_parity(&parities, 1), 2);
+
+        // For parities [1, 2, 3] with n=3, default_parity_count=2:
+        // - parity=1: read_quorum = 3-1 = 2, occ=1 < 2, so invalid
+        // - parity=2: read_quorum = 3-2 = 1, occ=1 >= 1, so valid
+        // - parity=3: read_quorum = 3-3 = 0, occ=1 >= 0, so valid
+        // - max_occ=1, both parity=2 and parity=3 have same occurrence
+        // - HashMap iteration order is not guaranteed, so result could be either 2 or 3
+        let parities = vec![1, 2, 3];
+        let result = SetDisks::common_parity(&parities, 2);
+        assert!(result == 2 || result == 3); // Either 2 or 3 is valid
+
+        let empty_parities = vec![];
+        assert_eq!(SetDisks::common_parity(&empty_parities, 3), -1); // Empty returns -1
+
+        let invalid_parities = vec![-1, -1, -1];
+        assert_eq!(SetDisks::common_parity(&invalid_parities, 2), -1); // all invalid
+
+        let single_parity = vec![4];
+        assert_eq!(SetDisks::common_parity(&single_parity, 1), 4);
+
+        // Test with -1 values (ignored)
+        let parities_with_invalid = vec![-1, 2, 2, -1];
+        assert_eq!(SetDisks::common_parity(&parities_with_invalid, 1), 2);
+    }
+
+    #[test]
+    fn test_common_time() {
+        // Test common time calculation
+        let now = OffsetDateTime::now_utc();
+        let later = now + Duration::from_secs(60);
+
+        let times = vec![Some(now), Some(now), Some(later)];
+        assert_eq!(SetDisks::common_time(&times, 2), Some(now));
+
+        let times2 = vec![Some(now), Some(later), Some(later)];
+        assert_eq!(SetDisks::common_time(&times2, 2), Some(later));
+
+        let times_with_none = vec![Some(now), None, Some(now)];
+        assert_eq!(SetDisks::common_time(&times_with_none, 2), Some(now));
+
+        let times = vec![None, None, None];
+        assert_eq!(SetDisks::common_time(&times, 2), None);
+
+        let empty_times = vec![];
+        assert_eq!(SetDisks::common_time(&empty_times, 1), None);
+    }
+
+    #[test]
+    fn test_common_time_and_occurrence() {
+        // Test common time with occurrence count
+        let now = OffsetDateTime::now_utc();
+        let times = vec![Some(now), Some(now), None];
+        let (time, count) = SetDisks::common_time_and_occurrence(&times);
+        assert_eq!(time, Some(now));
+        assert_eq!(count, 2);
+
+        let times = vec![None, None, None];
+        let (time, count) = SetDisks::common_time_and_occurrence(&times);
+        assert_eq!(time, None);
+        assert_eq!(count, 0); // No valid times, so count is 0
+    }
+
+    #[test]
+    fn test_common_etag() {
+        // Test common etag calculation
+        let etags = vec![Some("etag1".to_string()), Some("etag1".to_string()), None];
+        assert_eq!(SetDisks::common_etag(&etags, 2), Some("etag1".to_string()));
+
+        let etags = vec![None, None, None];
+        assert_eq!(SetDisks::common_etag(&etags, 2), None);
+    }
+
+    #[test]
+    fn test_common_etags() {
+        // Test common etags with occurrence count
+        let etags = vec![Some("etag1".to_string()), Some("etag1".to_string()), None];
+        let (etag, count) = SetDisks::common_etags(&etags);
+        assert_eq!(etag, Some("etag1".to_string()));
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_list_object_modtimes() {
+        // Test extracting modification times from file info
+        let now = OffsetDateTime::now_utc();
+        let file_info = FileInfo {
+            mod_time: Some(now),
+            ..Default::default()
+        };
+        let parts_metadata = vec![file_info];
+        let errs = vec![None];
+
+        let modtimes = SetDisks::list_object_modtimes(&parts_metadata, &errs);
+        assert_eq!(modtimes.len(), 1);
+        assert_eq!(modtimes[0], Some(now));
+    }
+
+    #[test]
+    fn test_list_object_etags() {
+        // Test extracting etags from file info metadata
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), "test-etag".to_string());
+
+        let file_info = FileInfo {
+            metadata: Some(metadata),
+            ..Default::default()
+        };
+        let parts_metadata = vec![file_info];
+        let errs = vec![None];
+
+        let etags = SetDisks::list_object_etags(&parts_metadata, &errs);
+        assert_eq!(etags.len(), 1);
+        assert_eq!(etags[0], Some("test-etag".to_string()));
+    }
+
+    #[test]
+    fn test_list_object_parities() {
+        // Test extracting parity counts from file info
+        let file_info1 = FileInfo {
+            erasure: ErasureInfo {
+                data_blocks: 4,
+                parity_blocks: 2,
+                index: 1,                             // Must be > 0 for is_valid() to return true
+                distribution: vec![1, 2, 3, 4, 5, 6], // Must match data_blocks + parity_blocks
+                ..Default::default()
+            },
+            size: 100, // Non-zero size
+            deleted: false,
+            ..Default::default()
+        };
+        let file_info2 = FileInfo {
+            erasure: ErasureInfo {
+                data_blocks: 6,
+                parity_blocks: 3,
+                index: 1,                                      // Must be > 0 for is_valid() to return true
+                distribution: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], // Must match data_blocks + parity_blocks
+                ..Default::default()
+            },
+            size: 200, // Non-zero size
+            deleted: false,
+            ..Default::default()
+        };
+        let file_info3 = FileInfo {
+            erasure: ErasureInfo {
+                data_blocks: 2,
+                parity_blocks: 1,
+                index: 1,                    // Must be > 0 for is_valid() to return true
+                distribution: vec![1, 2, 3], // Must match data_blocks + parity_blocks
+                ..Default::default()
+            },
+            size: 0, // Zero size - function returns half of total shards
+            deleted: false,
+            ..Default::default()
+        };
+
+        let parts_metadata = vec![file_info1, file_info2, file_info3];
+        let errs = vec![None, None, None];
+
+        let parities = SetDisks::list_object_parities(&parts_metadata, &errs);
+        assert_eq!(parities.len(), 3);
+        assert_eq!(parities[0], 2); // parity_blocks from first file
+        assert_eq!(parities[1], 3); // parity_blocks from second file
+        assert_eq!(parities[2], 1); // half of total shards (3/2 = 1) for zero size file
+    }
+
+    #[test]
+    fn test_conv_part_err_to_int() {
+        // Test error conversion to integer codes
+        assert_eq!(conv_part_err_to_int(&None), CHECK_PART_SUCCESS);
+
+        let disk_err = Error::new(DiskError::FileNotFound);
+        assert_eq!(conv_part_err_to_int(&Some(disk_err)), CHECK_PART_FILE_NOT_FOUND);
+
+        let other_err = Error::from_string("other error");
+        assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_SUCCESS);
+    }
+
+    #[test]
+    fn test_has_part_err() {
+        // Test checking for part errors
+        let no_errors = vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS];
+        assert!(!has_part_err(&no_errors));
+
+        let with_errors = vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_NOT_FOUND];
+        assert!(has_part_err(&with_errors));
+
+        let unknown_errors = vec![CHECK_PART_UNKNOWN, CHECK_PART_SUCCESS];
+        assert!(has_part_err(&unknown_errors));
+    }
+
+    #[test]
+    fn test_should_heal_object_on_disk() {
+        // Test healing decision logic
+        let meta = FileInfo::default();
+        let latest_meta = FileInfo::default();
+
+        // Test with file not found error
+        let err = Some(Error::new(DiskError::FileNotFound));
+        let (should_heal, _) = should_heal_object_on_disk(&err, &[], &meta, &latest_meta);
+        assert!(should_heal);
+
+        // Test with no error and no part errors
+        let (should_heal, _) = should_heal_object_on_disk(&None, &[CHECK_PART_SUCCESS], &meta, &latest_meta);
+        assert!(!should_heal);
+
+        // Test with part corruption
+        let (should_heal, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
+        assert!(should_heal);
+    }
+
+    #[test]
+    fn test_dang_ling_meta_errs_count() {
+        // Test counting dangling metadata errors
+        let errs = vec![None, Some(Error::new(DiskError::FileNotFound)), None];
+        let (not_found_count, non_actionable_count) = dang_ling_meta_errs_count(&errs);
+        assert_eq!(not_found_count, 1); // One FileNotFound error
+        assert_eq!(non_actionable_count, 0); // No other errors
+    }
+
+    #[test]
+    fn test_dang_ling_part_errs_count() {
+        // Test counting dangling part errors
+        let results = vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS];
+        let (not_found_count, non_actionable_count) = dang_ling_part_errs_count(&results);
+        assert_eq!(not_found_count, 1); // One FILE_NOT_FOUND error
+        assert_eq!(non_actionable_count, 0); // No other errors
+    }
+
+    #[test]
+    fn test_is_object_dir_dang_ling() {
+        // Test object directory dangling detection
+        let errs = vec![
+            Some(Error::new(DiskError::FileNotFound)),
+            Some(Error::new(DiskError::FileNotFound)),
+            None,
+        ];
+        assert!(is_object_dir_dang_ling(&errs));
+
+        let errs2 = vec![None, None, None];
+        assert!(!is_object_dir_dang_ling(&errs2));
+
+        let errs3 = vec![
+            Some(Error::new(DiskError::FileCorrupt)),
+            Some(Error::new(DiskError::FileNotFound)),
+        ];
+        assert!(!is_object_dir_dang_ling(&errs3)); // Mixed errors, not all not found
+    }
+
+    #[test]
+    fn test_join_errs() {
+        // Test joining error messages
+        let errs = vec![None, Some(Error::from_string("error1")), Some(Error::from_string("error2"))];
+        let joined = join_errs(&errs);
+        assert!(joined.contains("<nil>"));
+        assert!(joined.contains("error1"));
+        assert!(joined.contains("error2"));
+    }
+
+    #[test]
+    fn test_reduce_common_data_dir() {
+        // Test reducing common data directory
+        use uuid::Uuid;
+
+        let uuid1 = Uuid::new_v4();
+        let uuid2 = Uuid::new_v4();
+
+        let data_dirs = vec![Some(uuid1), Some(uuid1), Some(uuid2)];
+        let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
+        assert_eq!(result, Some(uuid1)); // uuid1 appears twice, meets quorum
+
+        let data_dirs = vec![Some(uuid1), Some(uuid2), None];
+        let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
+        assert_eq!(result, None); // No UUID meets quorum of 2
+    }
+
+    #[test]
+    fn test_shuffle_parts_metadata() {
+        // Test metadata shuffling
+        let metadata = vec![
+            FileInfo {
+                name: "file1".to_string(),
+                ..Default::default()
+            },
+            FileInfo {
+                name: "file2".to_string(),
+                ..Default::default()
+            },
+            FileInfo {
+                name: "file3".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        // Distribution uses 1-based indexing
+        let distribution = vec![3, 1, 2]; // 1-based shuffle order
+        let result = SetDisks::shuffle_parts_metadata(&metadata, &distribution);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].name, "file2"); // distribution[1] = 1, so metadata[1] goes to index 0
+        assert_eq!(result[1].name, "file3"); // distribution[2] = 2, so metadata[2] goes to index 1
+        assert_eq!(result[2].name, "file1"); // distribution[0] = 3, so metadata[0] goes to index 2
+
+        // Test with empty distribution
+        let empty_distribution = vec![];
+        let result2 = SetDisks::shuffle_parts_metadata(&metadata, &empty_distribution);
+        assert_eq!(result2.len(), 3);
+        assert_eq!(result2[0].name, "file1"); // Should return original order
+    }
+
+    #[test]
+    fn test_shuffle_disks() {
+        // Test disk shuffling
+        let disks = vec![None, None, None]; // Mock disks
+        let distribution = vec![3, 1, 2]; // 1-based indexing
+
+        let result = SetDisks::shuffle_disks(&disks, &distribution);
+        assert_eq!(result.len(), 3);
+        // All disks are None, so result should be all None
+        assert!(result.iter().all(|d| d.is_none()));
+
+        // Test with empty distribution
+        let empty_distribution = vec![];
+        let result2 = SetDisks::shuffle_disks(&disks, &empty_distribution);
+        assert_eq!(result2.len(), 3);
+        assert!(result2.iter().all(|d| d.is_none()));
+    }
 }

@@ -76,21 +76,21 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    fn is_local(&self) -> bool {
+    async fn is_online(&self) -> bool {
+        // TODO: 连接状态
+        if node_service_time_out_client(&self.addr).await.is_ok() {
+            return true;
+        }
         false
     }
 
     #[tracing::instrument(skip(self))]
-    fn host_name(&self) -> String {
-        self.endpoint.host_port()
+    fn is_local(&self) -> bool {
+        false
     }
     #[tracing::instrument(skip(self))]
-    async fn is_online(&self) -> bool {
-        // TODO: 连接状态
-        if (node_service_time_out_client(&self.addr).await).is_ok() {
-            return true;
-        }
-        false
+    fn host_name(&self) -> String {
+        self.endpoint.host_port()
     }
     #[tracing::instrument(skip(self))]
     fn endpoint(&self) -> Endpoint {
@@ -100,6 +100,19 @@ impl DiskAPI for RemoteDisk {
     async fn close(&self) -> Result<()> {
         Ok(())
     }
+    #[tracing::instrument(skip(self))]
+    async fn get_disk_id(&self) -> Result<Option<Uuid>> {
+        Ok(*self.id.lock().await)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
+        let mut lock = self.id.lock().await;
+        *lock = id;
+
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
         self.root.clone()
@@ -133,53 +146,564 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn get_disk_id(&self) -> Result<Option<Uuid>> {
-        Ok(*self.id.lock().await)
-    }
+    async fn make_volume(&self, volume: &str) -> Result<()> {
+        info!("make_volume");
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(MakeVolumeRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+        });
 
-    #[tracing::instrument(skip(self))]
-    async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
-        let mut lock = self.id.lock().await;
-        *lock = id;
+        let response = client.make_volume(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
 
         Ok(())
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
-        info!("read_all {}/{}", volume, path);
+    async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
+        info!("make_volumes");
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(ReadAllRequest {
+        let request = Request::new(MakeVolumesRequest {
             disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
+            volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
         });
 
-        let response = client.read_all(request).await?.into_inner();
+        let response = client.make_volumes(request).await?.into_inner();
 
         if !response.success {
-            return Err(Error::new(DiskError::FileNotFound));
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
         }
 
-        Ok(response.data)
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
-    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
-        info!("write_all");
+    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
+        info!("list_volumes");
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(WriteAllRequest {
+        let request = Request::new(ListVolumesRequest {
+            disk: self.endpoint.to_string(),
+        });
+
+        let response = client.list_volumes(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        let infos = response
+            .volume_infos
+            .into_iter()
+            .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
+            .collect();
+
+        Ok(infos)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
+        info!("stat_volume");
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(StatVolumeRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+        });
+
+        let response = client.stat_volume(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        let volume_info = serde_json::from_str::<VolumeInfo>(&response.volume_info)?;
+
+        Ok(volume_info)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_volume(&self, volume: &str) -> Result<()> {
+        info!("delete_volume {}/{}", self.endpoint.to_string(), volume);
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(DeleteVolumeRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+        });
+
+        let response = client.delete_volume(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        Ok(())
+    }
+
+    // FIXME: TODO: use writer
+    #[tracing::instrument(skip(self, wr))]
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        let now = std::time::SystemTime::now();
+        info!("walk_dir {}/{}/{:?}", self.endpoint.to_string(), opts.bucket, opts.filter_prefix);
+        let mut wr = wr;
+        let mut out = MetacacheWriter::new(&mut wr);
+        let mut buf = Vec::new();
+        opts.serialize(&mut Serializer::new(&mut buf))?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(WalkDirRequest {
+            disk: self.endpoint.to_string(),
+            walk_dir_options: buf,
+        });
+        let mut response = client.walk_dir(request).await?.into_inner();
+
+        loop {
+            match response.next().await {
+                Some(Ok(resp)) => {
+                    if !resp.success {
+                        return Err(Error::from_string(resp.error_info.unwrap_or("".to_string())));
+                    }
+                    let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
+                        .map_err(|_| Error::from_string(format!("Unexpected response: {:?}", response)))?;
+                    out.write_obj(&entry).await?;
+                }
+                None => break,
+                _ => return Err(Error::from_string(format!("Unexpected response: {:?}", response))),
+            }
+        }
+
+        info!(
+            "walk_dir {}/{:?} done {:?}",
+            opts.bucket,
+            opts.filter_prefix,
+            now.elapsed().unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_version(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> Result<()> {
+        info!("delete_version");
+        let file_info = serde_json::to_string(&fi)?;
+        let opts = serde_json::to_string(&opts)?;
+
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(DeleteVersionRequest {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
-            data,
+            file_info,
+            force_del_marker,
+            opts,
         });
 
-        let response = client.write_all(request).await?.into_inner();
+        let response = client.delete_version(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        // let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_versions(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Result<Vec<Option<Error>>> {
+        info!("delete_versions");
+        let opts = serde_json::to_string(&opts)?;
+        let mut versions_str = Vec::with_capacity(versions.len());
+        for file_info_versions in versions.iter() {
+            versions_str.push(serde_json::to_string(file_info_versions)?);
+        }
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(DeleteVersionsRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+            versions: versions_str,
+            opts,
+        });
+
+        let response = client.delete_versions(request).await?.into_inner();
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+        let errors = response
+            .errors
+            .iter()
+            .map(|error| {
+                if error.is_empty() {
+                    None
+                } else {
+                    Some(Error::from_string(error))
+                }
+            })
+            .collect();
+
+        Ok(errors)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
+        info!("delete_paths");
+        let paths = paths.to_owned();
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(DeletePathsRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+            paths,
+        });
+
+        let response = client.delete_paths(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        info!("write_metadata {}/{}", volume, path);
+        let file_info = serde_json::to_string(&fi)?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(WriteMetadataRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+            path: path.to_string(),
+            file_info,
+        });
+
+        let response = client.write_metadata(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
+        info!("update_metadata");
+        let file_info = serde_json::to_string(&fi)?;
+        let opts = serde_json::to_string(&opts)?;
+
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(UpdateMetadataRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+            path: path.to_string(),
+            file_info,
+            opts,
+        });
+
+        let response = client.update_metadata(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn read_version(
+        &self,
+        _org_volume: &str,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        opts: &ReadOptions,
+    ) -> Result<FileInfo> {
+        info!("read_version");
+        let opts = serde_json::to_string(opts)?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(ReadVersionRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+            path: path.to_string(),
+            version_id: version_id.to_string(),
+            opts,
+        });
+
+        let response = client.read_version(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        let file_info = serde_json::from_str::<FileInfo>(&response.file_info)?;
+
+        Ok(file_info)
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
+        info!("read_xl {}/{}/{}", self.endpoint.to_string(), volume, path);
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(ReadXlRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+            path: path.to_string(),
+            read_data,
+        });
+
+        let response = client.read_xl(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
+
+        Ok(raw_file_info)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn rename_data(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        info!("rename_data {}/{}/{}/{}", self.addr, self.endpoint.to_string(), dst_volume, dst_path);
+        let file_info = serde_json::to_string(&fi)?;
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(RenameDataRequest {
+            disk: self.endpoint.to_string(),
+            src_volume: src_volume.to_string(),
+            src_path: src_path.to_string(),
+            file_info,
+            dst_volume: dst_volume.to_string(),
+            dst_path: dst_path.to_string(),
+        });
+
+        let response = client.rename_data(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        let rename_data_resp = serde_json::from_str::<RenameDataResp>(&response.rename_data_resp)?;
+
+        Ok(rename_data_resp)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
+        info!("list_dir {}/{}", volume, _dir_path);
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(ListDirRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+        });
+
+        let response = client.list_dir(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        Ok(response.volumes)
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
+        info!("read_file {}/{}", volume, path);
+        Ok(Box::new(
+            HttpFileReader::new(self.endpoint.grid_host().as_str(), self.endpoint.to_string().as_str(), volume, path, 0, 0)
+                .await?,
+        ))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        info!("read_file_stream {}/{}/{}", self.endpoint.to_string(), volume, path);
+        Ok(Box::new(
+            HttpFileReader::new(
+                self.endpoint.grid_host().as_str(),
+                self.endpoint.to_string().as_str(),
+                volume,
+                path,
+                offset,
+                length,
+            )
+            .await?,
+        ))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
+        info!("append_file {}/{}", volume, path);
+        Ok(Box::new(HttpFileWriter::new(
+            self.endpoint.grid_host().as_str(),
+            self.endpoint.to_string().as_str(),
+            volume,
+            path,
+            0,
+            true,
+        )?))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter> {
+        info!("create_file {}/{}/{}", self.endpoint.to_string(), volume, path);
+        Ok(Box::new(HttpFileWriter::new(
+            self.endpoint.grid_host().as_str(),
+            self.endpoint.to_string().as_str(),
+            volume,
+            path,
+            file_size,
+            false,
+        )?))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        info!("rename_file");
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(RenameFileRequst {
+            disk: self.endpoint.to_string(),
+            src_volume: src_volume.to_string(),
+            src_path: src_path.to_string(),
+            dst_volume: dst_volume.to_string(),
+            dst_path: dst_path.to_string(),
+        });
+
+        let response = client.rename_file(request).await?.into_inner();
+
+        if !response.success {
+            return if let Some(err) = &response.error {
+                Err(proto_err_to_err(err))
+            } else {
+                Err(Error::from_string(""))
+            };
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
+        info!("rename_part {}/{}", src_volume, src_path);
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(RenamePartRequst {
+            disk: self.endpoint.to_string(),
+            src_volume: src_volume.to_string(),
+            src_path: src_path.to_string(),
+            dst_volume: dst_volume.to_string(),
+            dst_path: dst_path.to_string(),
+            meta,
+        });
+
+        let response = client.rename_part(request).await?.into_inner();
 
         if !response.success {
             return if let Some(err) = &response.error {
@@ -278,553 +802,6 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
-        info!("rename_part {}/{}", src_volume, src_path);
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(RenamePartRequst {
-            disk: self.endpoint.to_string(),
-            src_volume: src_volume.to_string(),
-            src_path: src_path.to_string(),
-            dst_volume: dst_volume.to_string(),
-            dst_path: dst_path.to_string(),
-            meta,
-        });
-
-        let response = client.rename_part(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
-        info!("rename_file");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(RenameFileRequst {
-            disk: self.endpoint.to_string(),
-            src_volume: src_volume.to_string(),
-            src_path: src_path.to_string(),
-            dst_volume: dst_volume.to_string(),
-            dst_path: dst_path.to_string(),
-        });
-
-        let response = client.rename_file(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter> {
-        info!("create_file {}/{}/{}", self.endpoint.to_string(), volume, path);
-        Ok(Box::new(HttpFileWriter::new(
-            self.endpoint.grid_host().as_str(),
-            self.endpoint.to_string().as_str(),
-            volume,
-            path,
-            file_size,
-            false,
-        )?))
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        info!("append_file {}/{}", volume, path);
-        Ok(Box::new(HttpFileWriter::new(
-            self.endpoint.grid_host().as_str(),
-            self.endpoint.to_string().as_str(),
-            volume,
-            path,
-            0,
-            true,
-        )?))
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        info!("read_file {}/{}", volume, path);
-        Ok(Box::new(
-            HttpFileReader::new(self.endpoint.grid_host().as_str(), self.endpoint.to_string().as_str(), volume, path, 0, 0)
-                .await?,
-        ))
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        info!("read_file_stream {}/{}/{}", self.endpoint.to_string(), volume, path);
-        Ok(Box::new(
-            HttpFileReader::new(
-                self.endpoint.grid_host().as_str(),
-                self.endpoint.to_string().as_str(),
-                volume,
-                path,
-                offset,
-                length,
-            )
-            .await?,
-        ))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
-        info!("list_dir {}/{}", volume, _dir_path);
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(ListDirRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-        });
-
-        let response = client.list_dir(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        Ok(response.volumes)
-    }
-
-    // FIXME: TODO: use writer
-    #[tracing::instrument(skip(self, wr))]
-    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
-        let now = std::time::SystemTime::now();
-        info!("walk_dir {}/{}/{:?}", self.endpoint.to_string(), opts.bucket, opts.filter_prefix);
-        let mut wr = wr;
-        let mut out = MetacacheWriter::new(&mut wr);
-        let mut buf = Vec::new();
-        opts.serialize(&mut Serializer::new(&mut buf))?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(WalkDirRequest {
-            disk: self.endpoint.to_string(),
-            walk_dir_options: buf,
-        });
-        let mut response = client.walk_dir(request).await?.into_inner();
-
-        loop {
-            match response.next().await {
-                Some(Ok(resp)) => {
-                    if !resp.success {
-                        return Err(Error::from_string(resp.error_info.unwrap_or("".to_string())));
-                    }
-                    let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-                        .map_err(|_| Error::from_string(format!("Unexpected response: {:?}", response)))?;
-                    out.write_obj(&entry).await?;
-                }
-                None => break,
-                _ => return Err(Error::from_string(format!("Unexpected response: {:?}", response))),
-            }
-        }
-
-        info!(
-            "walk_dir {}/{:?} done {:?}",
-            opts.bucket,
-            opts.filter_prefix,
-            now.elapsed().unwrap_or_default()
-        );
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn rename_data(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        fi: FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-    ) -> Result<RenameDataResp> {
-        info!("rename_data {}/{}/{}/{}", self.addr, self.endpoint.to_string(), dst_volume, dst_path);
-        let file_info = serde_json::to_string(&fi)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(RenameDataRequest {
-            disk: self.endpoint.to_string(),
-            src_volume: src_volume.to_string(),
-            src_path: src_path.to_string(),
-            file_info,
-            dst_volume: dst_volume.to_string(),
-            dst_path: dst_path.to_string(),
-        });
-
-        let response = client.rename_data(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        let rename_data_resp = serde_json::from_str::<RenameDataResp>(&response.rename_data_resp)?;
-
-        Ok(rename_data_resp)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
-        info!("make_volumes");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(MakeVolumesRequest {
-            disk: self.endpoint.to_string(),
-            volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
-        });
-
-        let response = client.make_volumes(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn make_volume(&self, volume: &str) -> Result<()> {
-        info!("make_volume");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(MakeVolumeRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-        });
-
-        let response = client.make_volume(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
-        info!("list_volumes");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(ListVolumesRequest {
-            disk: self.endpoint.to_string(),
-        });
-
-        let response = client.list_volumes(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        let infos = response
-            .volume_infos
-            .into_iter()
-            .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
-            .collect();
-
-        Ok(infos)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
-        info!("stat_volume");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(StatVolumeRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-        });
-
-        let response = client.stat_volume(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        let volume_info = serde_json::from_str::<VolumeInfo>(&response.volume_info)?;
-
-        Ok(volume_info)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
-        info!("delete_paths");
-        let paths = paths.to_owned();
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(DeletePathsRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            paths,
-        });
-
-        let response = client.delete_paths(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
-        info!("update_metadata");
-        let file_info = serde_json::to_string(&fi)?;
-        let opts = serde_json::to_string(&opts)?;
-
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(UpdateMetadataRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            file_info,
-            opts,
-        });
-
-        let response = client.update_metadata(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
-        info!("write_metadata {}/{}", volume, path);
-        let file_info = serde_json::to_string(&fi)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(WriteMetadataRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            file_info,
-        });
-
-        let response = client.write_metadata(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn read_version(
-        &self,
-        _org_volume: &str,
-        volume: &str,
-        path: &str,
-        version_id: &str,
-        opts: &ReadOptions,
-    ) -> Result<FileInfo> {
-        info!("read_version");
-        let opts = serde_json::to_string(opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(ReadVersionRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            version_id: version_id.to_string(),
-            opts,
-        });
-
-        let response = client.read_version(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        let file_info = serde_json::from_str::<FileInfo>(&response.file_info)?;
-
-        Ok(file_info)
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
-        info!("read_xl {}/{}/{}", self.endpoint.to_string(), volume, path);
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(ReadXlRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            read_data,
-        });
-
-        let response = client.read_xl(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
-
-        Ok(raw_file_info)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_version(
-        &self,
-        volume: &str,
-        path: &str,
-        fi: FileInfo,
-        force_del_marker: bool,
-        opts: DeleteOptions,
-    ) -> Result<()> {
-        info!("delete_version");
-        let file_info = serde_json::to_string(&fi)?;
-        let opts = serde_json::to_string(&opts)?;
-
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(DeleteVersionRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            file_info,
-            force_del_marker,
-            opts,
-        });
-
-        let response = client.delete_version(request).await?.into_inner();
-
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-
-        // let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_versions(
-        &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>> {
-        info!("delete_versions");
-        let opts = serde_json::to_string(&opts)?;
-        let mut versions_str = Vec::with_capacity(versions.len());
-        for file_info_versions in versions.iter() {
-            versions_str.push(serde_json::to_string(file_info_versions)?);
-        }
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(DeleteVersionsRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            versions: versions_str,
-            opts,
-        });
-
-        let response = client.delete_versions(request).await?.into_inner();
-        if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
-            } else {
-                Err(Error::from_string(""))
-            };
-        }
-        let errors = response
-            .errors
-            .iter()
-            .map(|error| {
-                if error.is_empty() {
-                    None
-                } else {
-                    Some(Error::from_string(error))
-                }
-            })
-            .collect();
-
-        Ok(errors)
-    }
-
-    #[tracing::instrument(skip(self))]
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
         info!("read_multiple {}/{}/{}", self.endpoint.to_string(), req.bucket, req.prefix);
         let read_multiple_req = serde_json::to_string(&req)?;
@@ -856,17 +833,19 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
-        info!("delete_volume {}/{}", self.endpoint.to_string(), volume);
+    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
+        info!("write_all");
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(DeleteVolumeRequest {
+        let request = Request::new(WriteAllRequest {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
+            path: path.to_string(),
+            data,
         });
 
-        let response = client.delete_volume(request).await?.into_inner();
+        let response = client.write_all(request).await?.into_inner();
 
         if !response.success {
             return if let Some(err) = &response.error {
@@ -877,6 +856,27 @@ impl DiskAPI for RemoteDisk {
         }
 
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
+        info!("read_all {}/{}", volume, path);
+        let mut client = node_service_time_out_client(&self.addr)
+            .await
+            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+        let request = Request::new(ReadAllRequest {
+            disk: self.endpoint.to_string(),
+            volume: volume.to_string(),
+            path: path.to_string(),
+        });
+
+        let response = client.read_all(request).await?.into_inner();
+
+        if !response.success {
+            return Err(Error::new(DiskError::FileNotFound));
+        }
+
+        Ok(response.data)
     }
 
     #[tracing::instrument(skip(self))]

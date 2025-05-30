@@ -94,7 +94,7 @@ where
         self.clone().save_iam_formatter().await?;
         self.clone().load().await?;
 
-        // 后台线程开启定时更新或者接收到信号更新
+        // Background thread starts periodic updates or receives signal updates
         tokio::spawn({
             let s = Arc::clone(&self);
             async move {
@@ -142,7 +142,7 @@ where
         Ok(())
     }
 
-    // todo, 判断是否存在，是否可以重试
+    // TODO: Check if exists, whether retry is possible
     #[tracing::instrument(level = "debug", skip(self))]
     async fn save_iam_formatter(self: Arc<Self>) -> Result<()> {
         let path = get_iam_format_file_path();
@@ -1621,4 +1621,350 @@ fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (Stri
     }
 
     (policies.join(","), Policy::merge_policies(to_merge))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use policy::policy::{Policy, PolicyDoc};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_iam_format_new_version_1() {
+        let format = IAMFormat::new_version_1();
+        assert_eq!(format.version, IAM_FORMAT_VERSION_1);
+        assert_eq!(format.version, 1);
+    }
+
+    #[test]
+    fn test_get_iam_format_file_path() {
+        let path = get_iam_format_file_path();
+        assert!(path.contains(IAM_FORMAT_FILE));
+        assert!(path.contains(&*IAM_CONFIG_PREFIX));
+        assert_eq!(path, format!("{}/{}", *IAM_CONFIG_PREFIX, IAM_FORMAT_FILE));
+    }
+
+    #[test]
+    fn test_get_default_policies() {
+        let policies = get_default_policyes();
+
+        // Should contain some default policies
+        assert!(!policies.is_empty());
+
+        // Check that all values are PolicyDoc
+        for (name, policy_doc) in &policies {
+            assert!(!name.is_empty());
+            // PolicyDoc.version is i64, not String
+            assert!(policy_doc.version >= 0);
+        }
+    }
+
+    #[test]
+    fn test_get_token_signing_key() {
+        // This function returns the global action credential's secret key
+        // In test environment, it might be None
+        let key = get_token_signing_key();
+        // Just verify it doesn't panic and returns an Option
+        if let Some(k) = key {
+            assert!(!k.is_empty());
+        } // This is acceptable in test environment when None
+    }
+
+    #[test]
+    fn test_extract_jwt_claims_basic() {
+        let user_identity = UserIdentity {
+            version: 1,
+            credentials: Credentials {
+                access_key: "test-access-key".to_string(),
+                secret_key: "test-secret-key".to_string(),
+                session_token: "invalid-token".to_string(), // Invalid token for testing error handling
+                expiration: None,
+                status: "enabled".to_string(),
+                parent_user: "".to_string(),
+                groups: None,
+                claims: Some({
+                    let mut claims = HashMap::new();
+                    claims.insert("sub".to_string(), json!("test-user"));
+                    claims.insert("aud".to_string(), json!("test-audience"));
+                    claims
+                }),
+                name: None,
+                description: None,
+            },
+            update_at: Some(OffsetDateTime::now_utc()),
+        };
+
+        let result = extract_jwt_claims(&user_identity);
+        // In test environment without proper JWT setup, this should fail
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_jwt_claims_no_claims() {
+        let user_identity = UserIdentity {
+            version: 1,
+            credentials: Credentials {
+                access_key: "test-access-key".to_string(),
+                secret_key: "test-secret-key".to_string(),
+                session_token: "".to_string(), // Empty token
+                expiration: None,
+                status: "enabled".to_string(),
+                parent_user: "".to_string(),
+                groups: None,
+                claims: None,
+                name: None,
+                description: None,
+            },
+            update_at: Some(OffsetDateTime::now_utc()),
+        };
+
+        let result = extract_jwt_claims(&user_identity);
+        // Should fail with empty session token
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_filter_policies_empty_bucket() {
+        let cache = Cache::default();
+        let policy_name = "test-policy";
+        let bucket_name = "";
+
+        let (name, policy) = filter_policies(&cache, policy_name, bucket_name);
+
+        // When cache is empty, should return empty name and empty policy
+        assert_eq!(name, "");
+        assert!(policy.statements.is_empty());
+    }
+
+    #[test]
+    fn test_filter_policies_with_bucket() {
+        let cache = Cache::default();
+        let policy_name = "test-policy";
+        let bucket_name = "test-bucket";
+
+        let (name, policy) = filter_policies(&cache, policy_name, bucket_name);
+
+        // When cache is empty, should return empty name and empty policy regardless of bucket
+        assert_eq!(name, "");
+        assert!(policy.statements.is_empty());
+    }
+
+    #[test]
+    fn test_constants() {
+        // Test that constants are properly defined
+        assert_eq!(IAM_FORMAT_FILE, "format.json");
+        assert_eq!(IAM_FORMAT_VERSION_1, 1);
+    }
+
+    #[test]
+    fn test_iam_format_serialization() {
+        let format = IAMFormat::new_version_1();
+
+        // Test serialization
+        let serialized = serde_json::to_string(&format).unwrap();
+        assert!(serialized.contains("\"version\":1"));
+
+        // Test deserialization
+        let deserialized: IAMFormat = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.version, format.version);
+    }
+
+    #[test]
+    fn test_mapped_policy_operations() {
+        let policy_name = "test-policy";
+        let mapped_policy = MappedPolicy::new(policy_name);
+
+        // Test that MappedPolicy can be created
+        let policies = mapped_policy.to_slice();
+        assert!(!policies.is_empty());
+        assert!(policies.iter().any(|p| p.contains(policy_name)));
+    }
+
+    #[test]
+    fn test_user_identity_structure() {
+        let credentials = Credentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: "".to_string(),
+            expiration: None,
+            status: "enabled".to_string(),
+            parent_user: "parent-user".to_string(),
+            groups: Some(vec!["group1".to_string(), "group2".to_string()]),
+            claims: None,
+            name: None,
+            description: None,
+        };
+
+        let user_identity = UserIdentity {
+            version: 1,
+            credentials,
+            update_at: Some(OffsetDateTime::now_utc()),
+        };
+
+        // Test basic structure
+        assert_eq!(user_identity.version, 1);
+        assert_eq!(user_identity.credentials.access_key, "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(user_identity.credentials.secret_key, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert_eq!(user_identity.credentials.status, "enabled");
+        assert_eq!(user_identity.credentials.parent_user, "parent-user");
+        assert_eq!(user_identity.credentials.groups, Some(vec!["group1".to_string(), "group2".to_string()]));
+    }
+
+    #[test]
+    fn test_policy_structure() {
+        let policy = Policy {
+            id: Default::default(),
+            version: "2012-10-17".to_string(),
+            statements: vec![],
+        };
+
+        // Test basic structure
+        assert_eq!(policy.version, "2012-10-17");
+        assert_eq!(policy.statements.len(), 0);
+        assert!(policy.is_empty());
+    }
+
+    #[test]
+    fn test_policy_doc_structure() {
+        let policy = Policy {
+            id: Default::default(),
+            version: "2012-10-17".to_string(),
+            statements: vec![],
+        };
+
+        let policy_doc = PolicyDoc {
+            version: 1,
+            policy,
+            create_date: Some(OffsetDateTime::now_utc()),
+            update_date: Some(OffsetDateTime::now_utc()),
+        };
+
+        // Test basic structure
+        assert_eq!(policy_doc.version, 1);
+        assert_eq!(policy_doc.policy.version, "2012-10-17");
+        assert!(policy_doc.policy.statements.is_empty());
+    }
+
+    #[test]
+    fn test_group_info_basic() {
+        // Test that GroupInfo can be created and used
+        let group_info = GroupInfo {
+            version: 1,
+            status: STATUS_ENABLED.to_string(),
+            members: vec!["user1".to_string(), "user2".to_string()],
+            update_at: Some(OffsetDateTime::now_utc()),
+        };
+
+        assert_eq!(group_info.version, 1);
+        assert_eq!(group_info.status, STATUS_ENABLED);
+        assert_eq!(group_info.members.len(), 2);
+        assert!(group_info.members.contains(&"user1".to_string()));
+        assert!(group_info.members.contains(&"user2".to_string()));
+    }
+
+    #[test]
+    fn test_update_service_account_opts() {
+        let policy = Policy {
+            id: Default::default(),
+            version: "2012-10-17".to_string(),
+            statements: vec![],
+        };
+
+        let opts = UpdateServiceAccountOpts {
+            secret_key: Some("new-secret-key".to_string()),
+            status: Some(STATUS_ENABLED.to_string()),
+            name: Some("service-account-name".to_string()),
+            description: Some("Updated service account".to_string()),
+            expiration: None,
+            session_policy: Some(policy.clone()),
+        };
+
+        assert_eq!(opts.secret_key, Some("new-secret-key".to_string()));
+        assert_eq!(opts.status, Some(STATUS_ENABLED.to_string()));
+        assert_eq!(opts.name, Some("service-account-name".to_string()));
+        assert_eq!(opts.description, Some("Updated service account".to_string()));
+        assert!(opts.session_policy.is_some());
+        assert!(opts.expiration.is_none());
+    }
+
+    #[test]
+    fn test_status_constants() {
+        // Test that status constants are properly defined
+        assert_eq!(STATUS_ENABLED, "enabled");
+        assert_eq!(STATUS_DISABLED, "disabled");
+    }
+
+    #[test]
+    fn test_session_policy_constants() {
+        // Test session policy related constants - these are compile-time constants
+        // so we just verify they exist and have expected values
+        assert_eq!(SESSION_POLICY_NAME, "sessionPolicy");
+        assert_eq!(SESSION_POLICY_NAME_EXTRACTED, "sessionPolicy-extracted");
+        // MAX_SVCSESSION_POLICY_SIZE is a positive constant defined at compile time
+        assert_eq!(MAX_SVCSESSION_POLICY_SIZE, 4096); // Verify the actual expected value
+    }
+
+    #[test]
+    fn test_credentials_validation() {
+        let credentials = Credentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: "".to_string(),
+            expiration: None,
+            status: "on".to_string(),
+            parent_user: "".to_string(),
+            groups: None,
+            claims: None,
+            name: None,
+            description: None,
+        };
+
+        // Test validation methods
+        assert!(credentials.is_valid());
+        assert!(!credentials.is_expired());
+        assert!(!credentials.is_temp());
+        assert!(!credentials.is_service_account());
+    }
+
+    #[test]
+    fn test_credentials_with_session_token() {
+        let credentials = Credentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: "session-token".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            status: "on".to_string(),
+            parent_user: "".to_string(),
+            groups: None,
+            claims: None,
+            name: None,
+            description: None,
+        };
+
+        // Test temp credentials
+        assert!(credentials.is_valid());
+        assert!(!credentials.is_expired());
+        assert!(credentials.is_temp());
+    }
+
+    #[test]
+    fn test_policy_merge() {
+        let policy1 = Policy {
+            id: Default::default(),
+            version: "2012-10-17".to_string(),
+            statements: vec![],
+        };
+
+        let policy2 = Policy {
+            id: Default::default(),
+            version: "2012-10-17".to_string(),
+            statements: vec![],
+        };
+
+        let merged = Policy::merge_policies(vec![policy1, policy2]);
+        assert_eq!(merged.version, "2012-10-17");
+        assert!(merged.statements.is_empty());
+        assert!(merged.is_empty());
+    }
 }

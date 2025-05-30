@@ -21,6 +21,7 @@ use tonic::Request;
 const CLUSTER_ADDR: &str = "http://localhost:9000";
 
 #[tokio::test]
+#[ignore = "requires running RustFS server at localhost:9000"]
 async fn ping() -> Result<(), Box<dyn Error>> {
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
     let payload = fbb.create_vector(b"hello world");
@@ -35,19 +36,19 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
     assert!(decoded_payload.is_ok());
 
-    // 创建客户端
+    // Create client
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
 
-    // 构造 PingRequest
+    // Construct PingRequest
     let request = Request::new(PingRequest {
         version: 1,
         body: finished_data.to_vec(),
     });
 
-    // 发送请求并获取响应
+    // Send request and get response
     let response: PingResponse = client.ping(request).await?.into_inner();
 
-    // 打印响应
+    // Print response
     let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
     if let Err(e) = ping_response_body {
         eprintln!("{}", e);
@@ -59,6 +60,7 @@ async fn ping() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+#[ignore = "requires running RustFS server at localhost:9000"]
 async fn make_volume() -> Result<(), Box<dyn Error>> {
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(MakeVolumeRequest {
@@ -76,6 +78,7 @@ async fn make_volume() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+#[ignore = "requires running RustFS server at localhost:9000"]
 async fn list_volumes() -> Result<(), Box<dyn Error>> {
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(ListVolumesRequest {
@@ -94,6 +97,7 @@ async fn list_volumes() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+#[ignore = "requires running RustFS server at localhost:9000"]
 async fn walk_dir() -> Result<(), Box<dyn Error>> {
     println!("walk_dir");
     // TODO: use writer
@@ -150,6 +154,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+#[ignore = "requires running RustFS server at localhost:9000"]
 async fn read_all() -> Result<(), Box<dyn Error>> {
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(ReadAllRequest {
@@ -167,6 +172,7 @@ async fn read_all() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+#[ignore = "requires running RustFS server at localhost:9000"]
 async fn storage_info() -> Result<(), Box<dyn Error>> {
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(LocalStorageInfoRequest { metrics: true });

@@ -187,7 +187,7 @@ fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec
             if (offline_host.is_empty() && ep.is_local) || offline_host == ep.host_port() {
                 offline_disks.push(madmin::Disk {
                     endpoint: ep.to_string(),
-                    state: madmin::ItemState::Offline.to_string().to_owned(),
+                    state: ItemState::Offline.to_string().to_owned(),
                     pool_index: ep.pool_idx,
                     set_index: ep.set_idx,
                     disk_index: ep.disk_idx,

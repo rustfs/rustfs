@@ -209,12 +209,12 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
     let mut versions = madmin::Versions::default();
     let mut delete_markers = madmin::DeleteMarkers::default();
     let mut usage = madmin::Usage::default();
-    let mut mode = madmin::ITEM_INITIALIZING;
+    let mut mode = ITEM_INITIALIZING;
     let mut backend = madmin::ErasureBackend::default();
-    let mut pools: HashMap<i32, HashMap<i32, madmin::ErasureSetInfo>> = HashMap::new();
+    let mut pools: HashMap<i32, HashMap<i32, ErasureSetInfo>> = HashMap::new();
 
     if let Some(store) = new_object_layer_fn() {
-        mode = madmin::ITEM_ONLINE;
+        mode = ITEM_ONLINE;
         match load_data_usage_from_backend(store.clone()).await {
             Ok(res) => {
                 buckets.count = res.buckets_count;
@@ -242,7 +242,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
 
         warn!("backend_info end {:?}", after4 - after3);
 
-        let mut all_disks: Vec<madmin::Disk> = Vec::new();
+        let mut all_disks: Vec<Disk> = Vec::new();
         for server in servers.iter() {
             all_disks.extend(server.disks.clone());
         }

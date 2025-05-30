@@ -49,7 +49,7 @@ use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_obs::{init_obs, init_process_observer, load_config, set_global_guard};
+use rustfs_obs::{init_obs, set_global_guard, SystemObserver};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
@@ -72,6 +72,7 @@ const MI_B: usize = 1024 * 1024;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
 
@@ -80,6 +81,7 @@ fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
         _ => Err(Status::unauthenticated("No valid auth token")),
     }
 }
+
 #[instrument]
 fn print_server_info() {
     let cfg = CONSOLE_CONFIG.get().unwrap();
@@ -101,11 +103,8 @@ async fn main() -> Result<()> {
     // Initialize the configuration
     init_license(opt.license.clone());
 
-    // Load the configuration file
-    let config = load_config(Some(opt.clone().obs_config));
-
     // Initialize Observability
-    let (_logger, guard) = init_obs(config.clone()).await;
+    let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
 
     // Store in global storage
     set_global_guard(guard)?;
@@ -139,7 +138,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // let local_ip = utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
     let local_ip = rustfs_utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
-    // 用于 rpc
+    // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
         .map_err(|err| Error::from_string(err.to_string()))?;
 
@@ -232,7 +231,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     tokio::spawn(async move {
         // Record the PID-related metrics of the current process
         let meter = opentelemetry::global::meter("system");
-        let obs_result = init_process_observer(meter).await;
+        let obs_result = SystemObserver::init_process_observer(meter).await;
         match obs_result {
             Ok(_) => {
                 info!("Process observer initialized successfully");
@@ -452,7 +451,8 @@ async fn run(opt: config::Opt) -> Result<()> {
                             let conn = http_server_clone.serve_connection(TokioIo::new(tls_socket), value_clone);
                             let conn = graceful_clone.watch(conn);
                             if let Err(err) = conn.await {
-                                error!("Https Connection error: {}", err);
+                                // Handle hyper::Error and low-level IO errors at a more granular level
+                                handle_connection_error(&*err);
                             }
                         });
                 });
@@ -467,7 +467,8 @@ async fn run(opt: config::Opt) -> Result<()> {
                     let conn = http_server_clone.serve_connection(TokioIo::new(socket), value_clone);
                     let conn = graceful_clone.watch(conn);
                     if let Err(err) = conn.await {
-                        error!("Http Connection error: {}", err);
+                        // Handle hyper::Error and low-level IO errors at a more granular level
+                        handle_connection_error(&*err);
                     }
                 });
                 debug!("Http handshake success");
@@ -592,4 +593,26 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     info!("server is stopped state: {:?}", state_manager.current_state());
     Ok(())
+}
+
+fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
+    if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+        if hyper_err.is_incomplete_message() {
+            warn!("The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err);
+        } else if hyper_err.is_closed() {
+            warn!("The HTTP connection is closed:{}", hyper_err);
+        } else if hyper_err.is_parse() {
+            error!("HTTP message parsing failed:{}", hyper_err);
+        } else if hyper_err.is_user() {
+            error!("HTTP user-custom error:{}", hyper_err);
+        } else if hyper_err.is_canceled() {
+            warn!("The HTTP connection is canceled:{}", hyper_err);
+        } else {
+            error!("Unknown hyper error:{:?}", hyper_err);
+        }
+    } else if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        error!("Unknown connection IO error:{}", io_err);
+    } else {
+        error!("Unknown connection error type:{:?}", err);
+    }
 }

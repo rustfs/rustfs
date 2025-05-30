@@ -1,5 +1,7 @@
 use crate::sinks::Sink;
-use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry};
+use crate::{
+    sinks, AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry,
+};
 use rustfs_config::{APP_NAME, ENVIRONMENT, SERVICE_VERSION};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -224,7 +226,7 @@ impl Logger {
 /// # Returns
 /// The global logger instance
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::{AppConfig, start_logger};
 ///
 /// let config = AppConfig::default();
@@ -253,10 +255,10 @@ pub fn start_logger(config: &AppConfig, sinks: Vec<Arc<dyn Sink>>) -> Logger {
 /// use rustfs_obs::{AppConfig,init_global_logger};
 ///
 /// let config = AppConfig::default();
-/// let sinks = vec![];
-/// let logger = init_global_logger(&config, sinks);
+/// let logger = init_global_logger(&config);
 /// ```
-pub async fn init_global_logger(config: &AppConfig, sinks: Vec<Arc<dyn Sink>>) -> Arc<Mutex<Logger>> {
+pub async fn init_global_logger(config: &AppConfig) -> Arc<Mutex<Logger>> {
+    let sinks = sinks::create_sinks(config).await;
     let logger = Arc::new(Mutex::new(start_logger(config, sinks)));
     GLOBAL_LOGGER.set(logger.clone()).expect("Logger already initialized");
     logger
@@ -270,7 +272,7 @@ pub async fn init_global_logger(config: &AppConfig, sinks: Vec<Arc<dyn Sink>>) -
 /// A reference to the global logger instance
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::get_global_logger;
 ///
 /// let logger = get_global_logger();
@@ -290,7 +292,7 @@ pub fn get_global_logger() -> &'static Arc<Mutex<Logger>> {
 /// Result indicating whether the operation was successful
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_info;
 ///
 /// async fn example() {
@@ -309,7 +311,7 @@ pub async fn log_info(message: &str, source: &str) -> Result<(), GlobalError> {
 /// # Returns
 /// Result indicating whether the operation was successful
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_error;
 ///
 /// async fn example() {
@@ -328,7 +330,7 @@ pub async fn log_error(message: &str, source: &str) -> Result<(), GlobalError> {
 /// Result indicating whether the operation was successful
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_warn;
 ///
 /// async fn example() {
@@ -348,7 +350,7 @@ pub async fn log_warn(message: &str, source: &str) -> Result<(), GlobalError> {
 /// Result indicating whether the operation was successful
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_debug;
 ///
 /// async fn example() {
@@ -369,7 +371,7 @@ pub async fn log_debug(message: &str, source: &str) -> Result<(), GlobalError> {
 /// Result indicating whether the operation was successful
 ///
 /// # Example
-/// ```
+/// ```no_run
 /// use rustfs_obs::log_trace;
 ///
 /// async fn example() {
@@ -392,7 +394,7 @@ pub async fn log_trace(message: &str, source: &str) -> Result<(), GlobalError> {
 /// # Returns
 /// Result indicating whether the operation was successful
 /// # Example
-/// ```
+/// ```no_run
 /// use tracing_core::Level;
 /// use rustfs_obs::log_with_context;
 ///

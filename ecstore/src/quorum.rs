@@ -75,7 +75,7 @@ fn is_err_ignored(err: &Error, ignored_errs: &[Box<dyn CheckErrorFn>]) -> bool {
 // 减少错误数量并返回出现次数最多的错误
 fn reduce_errs(errs: &[Option<Error>], ignored_errs: &[Box<dyn CheckErrorFn>]) -> (usize, Option<Error>) {
     let mut error_counts: HashMap<String, usize> = HashMap::new();
-    let mut error_map: HashMap<String, usize> = HashMap::new(); // 存err位置
+    let mut error_map: HashMap<String, usize> = HashMap::new(); // 存 err 位置
     let nil = "nil".to_string();
     for (i, operr) in errs.iter().enumerate() {
         if let Some(err) = operr {
@@ -120,7 +120,7 @@ fn reduce_errs(errs: &[Option<Error>], ignored_errs: &[Box<dyn CheckErrorFn>]) -
     }
 }
 
-// 根据quorum验证错误数量
+// 根据 quorum 验证错误数量
 fn reduce_quorum_errs(
     errs: &[Option<Error>],
     ignored_errs: &[Box<dyn CheckErrorFn>],
@@ -135,8 +135,8 @@ fn reduce_quorum_errs(
     }
 }
 
-// 根据读quorum验证错误数量
-// 返回最大错误数量的下标，或QuorumError
+// 根据读 quorum 验证错误数量
+// 返回最大错误数量的下标，或 QuorumError
 pub fn reduce_read_quorum_errs(
     errs: &[Option<Error>],
     ignored_errs: &[Box<dyn CheckErrorFn>],
@@ -145,8 +145,8 @@ pub fn reduce_read_quorum_errs(
     reduce_quorum_errs(errs, ignored_errs, read_quorum, QuorumError::Read)
 }
 
-// 根据写quorum验证错误数量
-// 返回最大错误数量的下标，或QuorumError
+// 根据写 quorum 验证错误数量
+// 返回最大错误数量的下标，或 QuorumError
 #[tracing::instrument(level = "info", skip_all)]
 pub fn reduce_write_quorum_errs(
     errs: &[Option<Error>],

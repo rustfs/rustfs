@@ -139,7 +139,7 @@ pub struct DiskStat {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RebalanceMeta {
     #[serde(skip)]
-    pub cancel: Option<tokio::sync::broadcast::Sender<bool>>, // To be invoked on rebalance-stop
+    pub cancel: Option<broadcast::Sender<bool>>, // To be invoked on rebalance-stop
     #[serde(skip)]
     pub last_refreshed_at: Option<SystemTime>,
     #[serde(rename = "stopTs")]
@@ -639,6 +639,7 @@ impl ECStore {
         false
     }
 
+    #[allow(unused_assignments)]
     #[tracing::instrument(skip(self, wk, set))]
     async fn rebalance_entry(
         &self,
@@ -858,13 +859,13 @@ impl ECStore {
             let mut reader = rd.stream;
 
             for (i, part) in object_info.parts.iter().enumerate() {
-                // 每次从reader中读取一个part上传
+                // 每次从 reader 中读取一个 part 上传
 
                 let mut chunk = vec![0u8; part.size];
 
                 reader.read_exact(&mut chunk).await?;
 
-                // 每次从reader中读取一个part上传
+                // 每次从 reader 中读取一个 part 上传
                 let rd = Box::new(Cursor::new(chunk));
                 let mut data = PutObjReader::new(rd, part.size);
 

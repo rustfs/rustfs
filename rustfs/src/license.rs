@@ -34,7 +34,7 @@ pub fn get_license() -> Option<Token> {
 #[allow(unreachable_code)]
 pub fn license_check() -> Result<()> {
     return Ok(());
-    let inval_license = LICENSE.get().map(|token| {
+    let invalid_license = LICENSE.get().map(|token| {
         if token.expired < SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() {
             error!("License expired");
             return Err(Error::from_string("Incorrect license, please contact RustFS.".to_string()));
@@ -43,7 +43,7 @@ pub fn license_check() -> Result<()> {
         Ok(())
     });
 
-    // let inval_license = config::get_config().license.as_ref().map(|license| {
+    // let invalid_license = config::get_config().license.as_ref().map(|license| {
     //     if license.is_empty() {
     //         error!("License is empty");
     //         return Err(Error::from_string("Incorrect license, please contact RustFS.".to_string()));
@@ -58,7 +58,7 @@ pub fn license_check() -> Result<()> {
     //     Ok(())
     // });
 
-    if inval_license.is_none() || inval_license.is_some_and(|v| v.is_err()) {
+    if invalid_license.is_none() || invalid_license.is_some_and(|v| v.is_err()) {
         return Err(Error::from_string("Incorrect license, please contact RustFS.".to_string()));
     }
 

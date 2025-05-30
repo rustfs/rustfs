@@ -50,7 +50,7 @@ impl Operation for AssumeRoleHandle {
         let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &user.access_key).await?;
 
-        // // TODO: 判断权限, 不允许sts访问
+        // // TODO: Check permissions, do not allow STS access
         if cred.is_temp() || cred.is_service_account() {
             return Err(s3_error!(InvalidRequest, "AccessDenied"));
         }

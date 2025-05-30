@@ -17,7 +17,7 @@ pub enum EndpointType {
 /// any type of endpoint.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct Endpoint {
-    pub url: url::Url,
+    pub url: Url,
     pub is_local: bool,
 
     pub pool_idx: i32,
@@ -179,8 +179,8 @@ impl Endpoint {
     }
 }
 
-/// parse a file path into an URL.
-fn url_parse_from_file_path(value: &str) -> Result<url::Url> {
+/// parse a file path into a URL.
+fn url_parse_from_file_path(value: &str) -> Result<Url> {
     // Only check if the arg is an ip address and ask for scheme since its absent.
     // localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
     // /mnt/export1. So we go ahead and start the rustfs server in FS modes in these cases.
@@ -202,7 +202,6 @@ fn url_parse_from_file_path(value: &str) -> Result<url::Url> {
 
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     #[test]
@@ -215,10 +214,10 @@ mod test {
             expected_err: Option<Error>,
         }
 
-        let u2 = url::Url::parse("https://example.org/path").unwrap();
-        let u4 = url::Url::parse("http://192.168.253.200/path").unwrap();
-        let u6 = url::Url::parse("http://server:/path").unwrap();
-        let root_slash_foo = url::Url::from_file_path("/foo").unwrap();
+        let u2 = Url::parse("https://example.org/path").unwrap();
+        let u4 = Url::parse("http://192.168.253.200/path").unwrap();
+        let u6 = Url::parse("http://server:/path").unwrap();
+        let root_slash_foo = Url::from_file_path("/foo").unwrap();
 
         let test_cases = [
             TestCase {

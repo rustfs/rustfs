@@ -1,4 +1,6 @@
-use crate::telemetry::OtelGuard;
+use crate::logger::InitLogStatus;
+use crate::telemetry::{init_telemetry, OtelGuard};
+use crate::{get_global_logger, init_global_logger, AppConfig, Logger};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, SetError};
 use tracing::{error, info};
@@ -31,6 +33,62 @@ pub enum GlobalError {
     Timeout(&'static str),
 }
 
+/// Initialize the observability module
+///
+/// # Parameters
+/// - `config`: Configuration information
+///
+/// # Returns
+/// A tuple containing the logger and the telemetry guard
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::init_obs;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let (logger, guard) = init_obs(None).await;
+/// # }
+/// ```
+pub async fn init_obs(endpoint: Option<String>) -> (Arc<tokio::sync::Mutex<Logger>>, OtelGuard) {
+    // Load the configuration file
+    let config = AppConfig::new_with_endpoint(endpoint);
+
+    let guard = init_telemetry(&config.observability);
+
+    let logger = init_global_logger(&config).await;
+    let obs_config = config.observability.clone();
+    tokio::spawn(async move {
+        let result = InitLogStatus::init_start_log(&obs_config).await;
+        match result {
+            Ok(_) => {
+                info!("Logger initialized successfully");
+            }
+            Err(e) => {
+                error!("Failed to initialize logger: {}", e);
+            }
+        }
+    });
+
+    (logger, guard)
+}
+
+/// Get the global logger instance
+/// This function returns a reference to the global logger instance.
+///
+/// # Returns
+/// A reference to the global logger instance
+///
+/// # Example
+/// ```no_run
+/// use rustfs_obs::get_logger;
+///
+/// let logger = get_logger();
+/// ```
+pub fn get_logger() -> &'static Arc<tokio::sync::Mutex<Logger>> {
+    get_global_logger()
+}
+
 /// Set the global guard for OpenTelemetry
 ///
 /// # Arguments
@@ -42,11 +100,10 @@ pub enum GlobalError {
 ///
 /// # Example
 /// ```rust
-/// use rustfs_obs::{init_telemetry, load_config, set_global_guard};
+/// use rustfs_obs::{ init_obs, set_global_guard};
 ///
-/// async fn init() -> Result<(), Box<dyn std::error::Error>> {
-///     let config = load_config(None);
-///     let guard = init_telemetry(&config.observability).await?;
+/// fn init() -> Result<(), Box<dyn std::error::Error>> {
+///     let guard = init_obs(None);
 ///     set_global_guard(guard)?;
 ///     Ok(())
 /// }

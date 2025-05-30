@@ -94,13 +94,10 @@ impl DisksLayout {
 
         let is_ellipses = args.iter().any(|v| has_ellipses(&[v]));
 
-        let set_drive_count_env = match env::var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT) {
-            Ok(res) => res,
-            Err(err) => {
-                debug!("{} not set use default:0, {:?}", ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, err);
-                "0".to_string()
-            }
-        };
+        let set_drive_count_env = env::var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT).unwrap_or_else(|err| {
+            debug!("{} not set use default:0, {:?}", ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, err);
+            "0".to_string()
+        });
         let set_drive_count: usize = set_drive_count_env.parse()?;
 
         // None of the args have ellipses use the old style.
@@ -290,7 +287,7 @@ impl EndpointSet {
     }
 }
 
-/// returns a greatest common divisor of all the ellipses sizes.
+/// returns the greatest common divisor of all the ellipses sizes.
 fn get_divisible_size(total_sizes: &[usize]) -> usize {
     fn gcd(mut x: usize, mut y: usize) -> usize {
         while y != 0 {
@@ -446,7 +443,6 @@ fn get_total_sizes(arg_patterns: &[ArgPattern]) -> Vec<usize> {
 
 #[cfg(test)]
 mod test {
-
     use super::*;
 
     impl PartialEq for EndpointSet {
@@ -868,7 +864,7 @@ mod test {
                 },
                 success: true,
             },
-            // More than 1 ellipses per argument for standalone setup.
+            // More than an ellipse per argument for standalone setup.
             TestCase {
                 num: 15,
                 arg: "/export{1...10}/disk{1...10}",

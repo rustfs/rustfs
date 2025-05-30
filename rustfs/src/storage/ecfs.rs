@@ -58,6 +58,7 @@ use policy::policy::BucketPolicy;
 use policy::policy::BucketPolicyArgs;
 use policy::policy::Validator;
 use query::instance::make_rustfsms;
+use rustfs_zip::CompressionFormat;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::S3Error;
@@ -83,7 +84,6 @@ use tracing::info;
 use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
-use zip::CompressionFormat;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -119,7 +119,7 @@ impl FS {
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))));
+        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
 
         // let etag_stream = EtagReader::new(body);
 
@@ -129,7 +129,7 @@ impl FS {
 
         let ext = ext.to_owned();
 
-        // TODO: spport zip
+        // TODO: support zip
         let decoder = CompressionFormat::from_extension(&ext).get_decoder(body).map_err(|e| {
             error!("get_decoder err {:?}", e);
             s3_error!(InvalidArgument, "get_decoder err")
@@ -204,8 +204,8 @@ impl FS {
         // )
         // .await
         // {
-        //     Ok(_) => println!("解压成功！"),
-        //     Err(e) => println!("解压失败: {}", e),
+        //     Ok(_) => println!("Decompression successful!"),
+        //     Err(e) => println!("Decompression failed: {}", e),
         // }
 
         // TODO: etag
@@ -341,7 +341,7 @@ impl S3 for FS {
     #[tracing::instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
-        // TODO: DeleteBucketInput 没有 force 参数？
+        // TODO: DeleteBucketInput doesn't have force parameter?
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -960,9 +960,7 @@ impl S3 for FS {
             }
         };
 
-        let body = Box::new(StreamReader::new(
-            body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
-        ));
+        let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
 
         let mut reader = PutObjReader::new(body, content_length as usize);
 
@@ -1076,9 +1074,7 @@ impl S3 for FS {
             }
         };
 
-        let body = Box::new(StreamReader::new(
-            body.map(|f| f.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))),
-        ));
+        let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
 
         // mc cp step 4
         let mut data = PutObjReader::new(body, content_length as usize);
