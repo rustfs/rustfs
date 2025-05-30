@@ -7749,6 +7749,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "flexi_logger",
+ "lazy_static",
  "nu-ansi-term 0.50.1",
  "nvml-wrapper",
  "opentelemetry",

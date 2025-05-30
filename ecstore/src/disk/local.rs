@@ -1195,7 +1195,6 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    #[must_use]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let format_info = self.format_info.read().await;
