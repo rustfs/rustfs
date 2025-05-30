@@ -53,6 +53,7 @@ use madmin::heal_commands::HealResultItem;
 use rand::Rng;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;
+use std::net::SocketAddr;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
@@ -101,7 +102,7 @@ pub struct ECStore {
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
     #[tracing::instrument(level = "debug", skip(endpoint_pools))]
-    pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<Arc<Self>> {
+    pub async fn new(address: SocketAddr, endpoint_pools: EndpointServerPools) -> Result<Arc<Self>> {
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
         let mut deployment_id = None;
@@ -115,12 +116,17 @@ impl ECStore {
 
         let mut local_disks = Vec::new();
 
-        init_local_peer(
-            &endpoint_pools,
-            &GLOBAL_Rustfs_Host.read().await.to_string(),
-            &GLOBAL_Rustfs_Port.read().await.to_string(),
-        )
-        .await;
+        info!("ECStore new address: {}", address.to_string());
+        let mut host = address.ip().to_string();
+        if host.is_empty() {
+            host = GLOBAL_Rustfs_Host.read().await.to_string()
+        }
+        let mut port = address.port().to_string();
+        if port.is_empty() {
+            port = GLOBAL_Rustfs_Port.read().await.to_string()
+        }
+        info!("ECStore new host: {}, port: {}", host, port);
+        init_local_peer(&endpoint_pools, &host, &port).await;
 
         // debug!("endpoint_pools: {:?}", endpoint_pools);
 

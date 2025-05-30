@@ -49,7 +49,7 @@ use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_event::GLOBAL_EventSys;
-use rustfs_obs::{init_obs, init_process_observer, load_config, set_global_guard};
+use rustfs_obs::{init_obs, set_global_guard, SystemObserver};
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
@@ -103,11 +103,8 @@ async fn main() -> Result<()> {
     // Initialize the configuration
     init_license(opt.license.clone());
 
-    // Load the configuration file
-    let config = load_config(Some(opt.clone().obs_endpoint));
-
     // Initialize Observability
-    let (_logger, guard) = init_obs(config.clone()).await;
+    let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
 
     // Store in global storage
     set_global_guard(guard)?;
@@ -234,7 +231,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     tokio::spawn(async move {
         // Record the PID-related metrics of the current process
         let meter = opentelemetry::global::meter("system");
-        let obs_result = init_process_observer(meter).await;
+        let obs_result = SystemObserver::init_process_observer(meter).await;
         match obs_result {
             Ok(_) => {
                 info!("Process observer initialized successfully");

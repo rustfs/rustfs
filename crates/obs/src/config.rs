@@ -24,12 +24,12 @@ pub struct OtelConfig {
     pub environment: Option<String>,         // Environment
     pub logger_level: Option<String>,        // Logger level
     pub local_logging_enabled: Option<bool>, // Local logging enabled
-    // 新增 flexi_logger 相关配置
-    pub log_directory: Option<String>,     // 日志文件目录
-    pub log_filename: Option<String>,      // 日志文件名称
-    pub log_rotation_size_mb: Option<u64>, // 日志文件大小切割阈值 (MB)
-    pub log_rotation_time: Option<String>, // 日志按时间切割 (Hour, Day)
-    pub log_keep_files: Option<u16>,       // 保留日志文件数量
+    // Added flexi_logger related configurations
+    pub log_directory: Option<String>,     // LOG FILE DIRECTORY
+    pub log_filename: Option<String>,      // The name of the log file
+    pub log_rotation_size_mb: Option<u64>, // Log file size cut threshold (MB)
+    pub log_rotation_time: Option<String>, // Logs are cut by time (Hour， Day，Minute， Second)
+    pub log_keep_files: Option<u16>,       // Number of log files to be retained
 }
 
 impl OtelConfig {
@@ -132,6 +132,12 @@ pub struct KafkaSinkConfig {
 
 impl KafkaSinkConfig {
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for KafkaSinkConfig {
+    fn default() -> Self {
         Self {
             brokers: env::var("RUSTFS_SINKS_KAFKA_BROKERS")
                 .ok()
@@ -140,16 +146,10 @@ impl KafkaSinkConfig {
             topic: env::var("RUSTFS_SINKS_KAFKA_TOPIC")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "default_topic".to_string()),
+                .unwrap_or_else(|| "rustfs_sink".to_string()),
             batch_size: Some(100),
             batch_timeout_ms: Some(1000),
         }
-    }
-}
-
-impl Default for KafkaSinkConfig {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -178,7 +178,7 @@ impl Default for WebhookSinkConfig {
             auth_token: env::var("RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "default_token".to_string()),
+                .unwrap_or_else(|| "rustfs_webhook_token".to_string()),
             max_retries: Some(3),
             retry_delay_ms: Some(100),
         }
@@ -209,6 +209,12 @@ impl FileSinkConfig {
             .to_string()
     }
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for FileSinkConfig {
+    fn default() -> Self {
         Self {
             path: env::var("RUSTFS_SINKS_FILE_PATH")
                 .ok()
@@ -227,12 +233,6 @@ impl FileSinkConfig {
                 .and_then(|v| v.parse().ok())
                 .or(Some(100)),
         }
-    }
-}
-
-impl Default for FileSinkConfig {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -287,9 +287,8 @@ impl Default for LoggerConfig {
 /// # Example
 /// ```
 /// use rustfs_obs::AppConfig;
-/// use rustfs_obs::load_config;
 ///
-/// let config = load_config(None);
+/// let config = AppConfig::new_with_endpoint(None);
 /// ```
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
@@ -325,24 +324,4 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Loading the configuration file
-/// Supports TOML, YAML and .env formats, read in order by priority
-///
-/// # Parameters
-/// - `config_dir`: Configuration file path
-///
-/// # Returns
-/// Configuration information
-///
-/// # Example
-/// ```
-/// use rustfs_obs::AppConfig;
-/// use rustfs_obs::load_config;
-///
-/// let config = load_config(None);
-/// ```
-pub fn load_config(config: Option<String>) -> AppConfig {
-    AppConfig::new_with_endpoint(config)
 }

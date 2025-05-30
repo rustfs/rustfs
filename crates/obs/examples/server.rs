@@ -1,5 +1,5 @@
 use opentelemetry::global;
-use rustfs_obs::{get_logger, init_obs, init_process_observer, load_config, log_info, BaseLogEntry, ServerLogEntry};
+use rustfs_obs::{get_logger, init_obs, log_info, BaseLogEntry, ServerLogEntry, SystemObserver};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use tracing::{error, info, instrument};
@@ -8,8 +8,7 @@ use tracing_core::Level;
 #[tokio::main]
 async fn main() {
     let obs_conf = Some("crates/obs/examples/config.toml".to_string());
-    let config = load_config(obs_conf);
-    let (_logger, _guard) = init_obs(config.clone()).await;
+    let (_logger, _guard) = init_obs(obs_conf).await;
     let span = tracing::span!(Level::INFO, "main");
     let _enter = span.enter();
     info!("Program starts");
@@ -38,12 +37,10 @@ async fn run(bucket: String, object: String, user: String, service_name: String)
         &[opentelemetry::KeyValue::new("operation", "run")],
     );
 
-    tokio::spawn(async move {
-        match init_process_observer(meter).await {
-            Ok(_) => info!("Process observer initialized successfully"),
-            Err(e) => error!("Failed to initialize process observer: {:?}", e),
-        }
-    });
+    match SystemObserver::init_process_observer(meter).await {
+        Ok(_) => info!("Process observer initialized successfully"),
+        Err(e) => error!("Failed to initialize process observer: {:?}", e),
+    }
 
     let base_entry = BaseLogEntry::new()
         .message(Some("run logger api_handler info".to_string()))
