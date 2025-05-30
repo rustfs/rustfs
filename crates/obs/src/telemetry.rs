@@ -1,4 +1,3 @@
-// Added flexi_logger related dependencies
 use crate::OtelConfig;
 use flexi_logger::{style, Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode};
 use nu_ansi_term::Color;
@@ -17,7 +16,8 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
+    APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
+    SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::get_local_ip_with_default;
 use smallvec::SmallVec;
@@ -39,19 +39,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// - The tracer provider (for distributed tracing)
 /// - The meter provider (for metrics collection)
 /// - The logger provider (for structured logging)
-///
-/// # Example
-///
-/// ```
-/// use rustfs_obs::{init_telemetry, OtelConfig};
-///
-/// let config = OtelConfig::default();
-/// let otel_guard = init_telemetry(&config);
-///
-/// // The guard is kept alive for the duration of the application
-/// // When it's dropped, all telemetry components are properly shut down
-/// drop(otel_guard);
-/// ```
 // Implement Debug trait correctly, rather than using derive, as some fields may not have implemented Debug
 pub struct OtelGuard {
     tracer_provider: Option<SdkTracerProvider>,
@@ -123,7 +110,7 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
 }
 
 /// Initialize Telemetry
-pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
+pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
     // avoid repeated access to configuration fields
     let endpoint = &config.endpoint;
     let use_stdout = config.use_stdout.unwrap_or(USE_STDOUT);
@@ -289,7 +276,7 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         }
     } else {
         // Obtain the log directory and file name configuration
-        let log_directory = config.log_directory.as_deref().unwrap_or("logs");
+        let log_directory = config.log_directory.as_deref().unwrap_or(DEFAULT_LOG_DIR);
         let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
 
         // Build log cutting conditions
@@ -349,7 +336,7 @@ pub fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                     .basename(log_filename)
                     .suffix("log"),
             )
-            .rotate(rotation_criterion, Naming::Timestamps, Cleanup::KeepLogFiles(keep_files.into()))
+            .rotate(rotation_criterion, Naming::TimestampsDirect, Cleanup::KeepLogFiles(keep_files.into()))
             .format_for_files(format_for_file) // Add a custom formatting function for file output
             .duplicate_to_stdout(level_filter) // Use dynamic levels
             .format_for_stdout(format_with_color) // Add a custom formatting function for terminal output
