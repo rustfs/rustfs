@@ -1,5 +1,7 @@
 use crate::sinks::Sink;
-use crate::{AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry};
+use crate::{
+    sinks, AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry,
+};
 use rustfs_config::{APP_NAME, ENVIRONMENT, SERVICE_VERSION};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -253,10 +255,10 @@ pub fn start_logger(config: &AppConfig, sinks: Vec<Arc<dyn Sink>>) -> Logger {
 /// use rustfs_obs::{AppConfig,init_global_logger};
 ///
 /// let config = AppConfig::default();
-/// let sinks = vec![];
-/// let logger = init_global_logger(&config, sinks);
+/// let logger = init_global_logger(&config);
 /// ```
-pub async fn init_global_logger(config: &AppConfig, sinks: Vec<Arc<dyn Sink>>) -> Arc<Mutex<Logger>> {
+pub async fn init_global_logger(config: &AppConfig) -> Arc<Mutex<Logger>> {
+    let sinks = sinks::create_sinks(config).await;
     let logger = Arc::new(Mutex::new(start_logger(config, sinks)));
     GLOBAL_LOGGER.set(logger.clone()).expect("Logger already initialized");
     logger
