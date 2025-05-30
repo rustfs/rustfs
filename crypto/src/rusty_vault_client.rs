@@ -59,10 +59,6 @@ pub struct Client {
 }
 
 impl Client {
-    // 创建一个新的客户端构建器
-    pub fn new() -> ClientBuilder {
-        ClientBuilder::default()
-    }
 
     // 执行 GET 请求
     pub async fn read(&self, path: &str, query: Option<HashMap<String, String>>) -> Result<VaultResponse, ClientError> {

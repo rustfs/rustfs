@@ -5,13 +5,16 @@ use crate::{Error, sse::{SSE, Algorithm}};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use uuid::Uuid;
+use base64::{Engine as _, engine::general_purpose};
 
 // Metadata header constants
 pub const CRYPTO_IV: &str = "X-Rustfs-Crypto-Iv";
 pub const CRYPTO_KEY: &str = "X-Rustfs-Crypto-Key";
 pub const CRYPTO_KEY_ID: &str = "X-Rustfs-Crypto-Key-Id";
 pub const CRYPTO_ALGORITHM: &str = "X-Rustfs-Crypto-Algorithm";
+#[allow(dead_code)]
 pub const CRYPTO_SEAL_ALGORITHM: &str = "X-Rustfs-Crypto-Seal-Algorithm";
+#[allow(dead_code)]
 pub const CRYPTO_KMS_KEY_NAME: &str = "X-Rustfs-Crypto-Kms-Key-Name";
 pub const CRYPTO_KMS_CONTEXT: &str = "X-Rustfs-Crypto-Kms-Context";
 pub const CRYPTO_META_PREFIX: &str = "X-Rustfs-Crypto-";
@@ -93,7 +96,7 @@ impl EncryptionInfo {
         
         // Common fields
         metadata.insert(CRYPTO_ALGORITHM.to_string(), self.algorithm.to_string());
-        metadata.insert(CRYPTO_IV.to_string(), base64::encode(&self.iv));
+        metadata.insert(CRYPTO_IV.to_string(), general_purpose::STANDARD.encode(&self.iv));
         
         // Type-specific fields
         match self.sse_type {
@@ -102,12 +105,12 @@ impl EncryptionInfo {
             }
             SSE::SSES3 => {
                 if let Some(key) = &self.key {
-                    metadata.insert(CRYPTO_KEY.to_string(), base64::encode(key));
+                    metadata.insert(CRYPTO_KEY.to_string(), general_purpose::STANDARD.encode(key));
                 }
             }
             SSE::SSEKMS => {
                 if let Some(key) = &self.key {
-                    metadata.insert(CRYPTO_KEY.to_string(), base64::encode(key));
+                    metadata.insert(CRYPTO_KEY.to_string(), general_purpose::STANDARD.encode(key));
                 }
                 if let Some(key_id) = &self.key_id {
                     metadata.insert(CRYPTO_KEY_ID.to_string(), key_id.clone());
@@ -128,8 +131,10 @@ impl EncryptionInfo {
             return Ok(None);
         }
         
-        let algorithm_str = metadata.get(CRYPTO_ALGORITHM).unwrap();
-        let iv_base64 = metadata.get(CRYPTO_IV).unwrap();
+        let algorithm_str = metadata.get(CRYPTO_ALGORITHM)
+            .ok_or(Error::ErrInvalidEncryptionMetadata)?;
+        let iv_base64 = metadata.get(CRYPTO_IV)
+            .ok_or(Error::ErrInvalidEncryptionMetadata)?;
         
         let algorithm = match algorithm_str.as_str() {
             "AES256" => Algorithm::AES256,
@@ -137,7 +142,7 @@ impl EncryptionInfo {
             _ => return Err(Error::ErrInvalidSSEAlgorithm),
         };
         
-        let iv = base64::decode(iv_base64).map_err(|_| Error::ErrInvalidEncryptionMetadata)?;
+        let iv = general_purpose::STANDARD.decode(iv_base64).map_err(|_| Error::ErrInvalidEncryptionMetadata)?;
         
         // Determine SSE type and parse additional fields
         let mut sse_type = SSE::SSES3; // Default assuming SSE-S3
@@ -146,8 +151,9 @@ impl EncryptionInfo {
         let mut context = None;
         
         if metadata.contains_key(CRYPTO_KEY) {
-            let key_base64 = metadata.get(CRYPTO_KEY).unwrap();
-            key = Some(base64::decode(key_base64).map_err(|_| Error::ErrInvalidEncryptionMetadata)?);
+            let key_base64 = metadata.get(CRYPTO_KEY)
+                .ok_or(Error::ErrInvalidEncryptionMetadata)?;
+            key = Some(general_purpose::STANDARD.decode(key_base64).map_err(|_| Error::ErrInvalidEncryptionMetadata)?);
         }
         
         if metadata.contains_key(CRYPTO_KEY_ID) {
@@ -217,8 +223,8 @@ mod tests {
         
         let metadata = info.to_metadata();
         
-        assert_eq!(metadata.get(CRYPTO_ALGORITHM).unwrap(), "AES256");
-        assert_eq!(metadata.get(CRYPTO_IV).unwrap(), &base64::encode(&iv));
+        assert_eq!(metadata.get(CRYPTO_ALGORITHM).expect(), "AES256");
+        assert_eq!(metadata.get(CRYPTO_IV).expect(), &general_purpose::STANDARD.encode(&iv));
         assert!(!metadata.contains_key(CRYPTO_KEY));
         assert!(!metadata.contains_key(CRYPTO_KEY_ID));
     }
@@ -231,9 +237,9 @@ mod tests {
         
         let metadata = info.to_metadata();
         
-        assert_eq!(metadata.get(CRYPTO_ALGORITHM).unwrap(), "AES256");
-        assert_eq!(metadata.get(CRYPTO_IV).unwrap(), &base64::encode(&iv));
-        assert_eq!(metadata.get(CRYPTO_KEY).unwrap(), &base64::encode(&key));
+        assert_eq!(metadata.get(CRYPTO_ALGORITHM).expect(), "AES256");
+        assert_eq!(metadata.get(CRYPTO_IV).expect(), &general_purpose::STANDARD.encode(&iv));
+        assert_eq!(metadata.get(CRYPTO_KEY).expect(), &general_purpose::STANDARD.encode(&key));
         assert!(!metadata.contains_key(CRYPTO_KEY_ID));
     }
     
@@ -253,11 +259,11 @@ mod tests {
         
         let metadata = info.to_metadata();
         
-        assert_eq!(metadata.get(CRYPTO_ALGORITHM).unwrap(), "aws:kms");
-        assert_eq!(metadata.get(CRYPTO_IV).unwrap(), &base64::encode(&iv));
-        assert_eq!(metadata.get(CRYPTO_KEY).unwrap(), &base64::encode(&key));
-        assert_eq!(metadata.get(CRYPTO_KEY_ID).unwrap(), key_id);
-        assert_eq!(metadata.get(CRYPTO_KMS_CONTEXT).unwrap(), context);
+        assert_eq!(metadata.get(CRYPTO_ALGORITHM).expect(), "aws:kms");
+        assert_eq!(metadata.get(CRYPTO_IV).expect(), &general_purpose::STANDARD.encode(&iv));
+        assert_eq!(metadata.get(CRYPTO_KEY).expect(), &general_purpose::STANDARD.encode(&key));
+        assert_eq!(metadata.get(CRYPTO_KEY_ID).expect(), key_id);
+        assert_eq!(metadata.get(CRYPTO_KMS_CONTEXT).expect(), context);
     }
     
     #[test]
@@ -269,19 +275,19 @@ mod tests {
         
         let mut metadata = HashMap::new();
         metadata.insert(CRYPTO_ALGORITHM.to_string(), "aws:kms".to_string());
-        metadata.insert(CRYPTO_IV.to_string(), base64::encode(&iv));
-        metadata.insert(CRYPTO_KEY.to_string(), base64::encode(&key));
+        metadata.insert(CRYPTO_IV.to_string(), general_purpose::STANDARD.encode(&iv));
+        metadata.insert(CRYPTO_KEY.to_string(), general_purpose::STANDARD.encode(&key));
         metadata.insert(CRYPTO_KEY_ID.to_string(), key_id.to_string());
         metadata.insert(CRYPTO_KMS_CONTEXT.to_string(), context.to_string());
         
-        let info = EncryptionInfo::from_metadata(&metadata).unwrap().unwrap();
+        let info = EncryptionInfo::from_metadata(&metadata).expect().expect();
         
         assert_eq!(info.sse_type, SSE::SSEKMS);
         assert_eq!(info.algorithm, Algorithm::AWSKMS);
         assert_eq!(info.iv, iv);
-        assert_eq!(info.key.unwrap(), key);
-        assert_eq!(info.key_id.unwrap(), key_id);
-        assert_eq!(info.context.unwrap(), context);
+        assert_eq!(info.key.expect(), key);
+        assert_eq!(info.key_id.expect(), key_id);
+        assert_eq!(info.context.expect(), context);
     }
     
     #[test]

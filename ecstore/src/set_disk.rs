@@ -4432,25 +4432,25 @@ impl StorageAPI for SetDisks {
                 
                 // Initialize SSE-KMS encryption with RustyVault
                 use crypto::sse_kms::SSEKMSEncryption;
-                use crypto::rusty_vault_client::ClientBuilder as RustyVaultClient;
+                use crypto::sse_kms::RustyVaultKMSClient;
                 
                 let vault_endpoint = std::env::var("RUSTYVAULT_ENDPOINT")
                     .unwrap_or_else(|_| "http://localhost:8200".to_string());
                 let vault_token = std::env::var("RUSTYVAULT_TOKEN")
                     .unwrap_or_else(|_| "root".to_string());
+                let key_name = user_defined.get("x-amz-server-side-encryption-aws-kms-key-id")
+                    .unwrap_or(&"default".to_string())
+                    .clone();
                 
-                let vault_client = RustyVaultClient::new()
-                    .with_addr(&vault_endpoint)
-                    .with_token(&vault_token)
-                    .with_key_name(
-                        user_defined.get("x-amz-server-side-encryption-aws-kms-key-id")
-                            .unwrap_or(&"default".to_string())
-                            .clone()
-                    );
+                let vault_client = RustyVaultKMSClient::new(
+                    vault_endpoint,
+                    vault_token,
+                    key_name
+                );
                 
                 // Initialize the global KMS client
-                if let Ok(built_client) = vault_client.build() {
-                    let _ = crypto::sse_kms::RustyVaultKMSClient::set_global_client(built_client);
+                if let Ok(()) = RustyVaultKMSClient::set_global_client(vault_client) {
+                    // KMS client initialized successfully
                 }
                 
                 // Create SSE-KMS encryption instance
@@ -4934,6 +4934,7 @@ impl StorageAPI for SetDisks {
                 Error::new(ErasureError::InvalidPart(part_id))
             })?;
             let part = &part_fi.parts[0];
+
             let part_num = part.number;
 
             // debug!("complete part {} file info {:?}", part_num, &part_fi);
@@ -6164,7 +6165,8 @@ mod tests {
     #[test]
     fn test_shuffle_disks() {
         // Test disk shuffling
-        let disks = vec![None, None, None]; // Mock disks
+        // Mock disks
+        let disks = vec![None, None, None];
         let distribution = vec![3, 1, 2]; // 1-based indexing
 
         let result = SetDisks::shuffle_disks(&disks, &distribution);

@@ -5,7 +5,6 @@ use crate::{
     EncryptionInfo, extract_encryption_metadata, remove_encryption_metadata
 };
 use rand::RngCore;
-use std::collections::HashMap;
 
 #[cfg(test)]
 mod tests {

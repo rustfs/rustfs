@@ -7,8 +7,8 @@ use crate::{
     sse::{SSEOptions, Encryptable}
 };
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit},
-    Aes256Gcm, Key, Nonce
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
 };
 use rand::RngCore;
 
@@ -54,7 +54,7 @@ impl Encryptable for SSECEncryption {
         
         // Encrypt the data
         let ciphertext = cipher.encrypt(nonce, data)
-            .map_err(|e| Error::ErrEncryptFailed(e))?;
+            .map_err(Error::ErrEncryptFailed)?;
         
         // Create encryption metadata to store with the encrypted data
         let info = EncryptionInfo::new_ssec(iv);
@@ -124,7 +124,7 @@ impl Encryptable for SSECEncryption {
         
         // Decrypt the data
         let plaintext = cipher.decrypt(nonce, ciphertext)
-            .map_err(|e| Error::ErrDecryptFailed(e))?;
+            .map_err(Error::ErrDecryptFailed)?;
         
         Ok(plaintext)
     }
@@ -150,10 +150,10 @@ mod tests {
         
         // Encrypt
         let ssec = SSECEncryption::new();
-        let encrypted = ssec.encrypt(data, &options).unwrap();
+        let encrypted = ssec.encrypt(data, &options).expect();
         
         // Decrypt
-        let decrypted = ssec.decrypt(&encrypted, &options).unwrap();
+        let decrypted = ssec.decrypt(&encrypted, &options).expect();
         
         // Verify
         assert_eq!(decrypted, data);
@@ -175,7 +175,7 @@ mod tests {
         
         // Encrypt
         let ssec = SSECEncryption::new();
-        let encrypted = ssec.encrypt(data, &options).unwrap();
+        let encrypted = ssec.encrypt(data, &options).expect();
         
         // Attempt to decrypt with wrong key
         let mut wrong_key = vec![0u8; 32];

@@ -8,11 +8,12 @@ use std::fmt;
 use std::sync::{Once, RwLock};
 use tracing::debug;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use std::sync::OnceLock;
 
 #[cfg(feature = "kms")]
-use tracing::{info, error};
+use std::sync::OnceLock;
 
+// KMS client initialization - only available with kms feature
+#[cfg(feature = "kms")]
 static INIT_KMS_CLIENT: OnceLock<()> = OnceLock::new();
 
 /// SSE specifies the type of server-side encryption used
@@ -232,6 +233,7 @@ impl Default for DefaultKMSConfig {
     }
 }
 
+#[allow(dead_code)]
 // KMS initialization status tracking - using thread-safe RwLock instead of unsafe
 static INIT_KMS: Once = Once::new();
 static KMS_INIT_ERROR: RwLock<Option<String>> = RwLock::new(None);

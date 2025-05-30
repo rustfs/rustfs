@@ -29,7 +29,7 @@ pub use sse_s3::{SSES3Encryption, init_master_key};
 
 // KMS 功能导出
 #[cfg(feature = "kms")]
-pub use sse_kms::{KMSClient, SSEKMSEncryption, RustyVaultClient};
+pub use sse_kms::{KMSClient, SSEKMSEncryption, RustyVaultKMSClient};
 
 /// Encryption factory: Create appropriate encryptor based on encryption type
 pub struct CryptoFactory;

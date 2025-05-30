@@ -12,19 +12,19 @@ use aes_gcm::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use rand::RngCore;
-use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
 };
-use tracing::{debug, error};
-use uuid::Uuid;
+use tracing::debug;
 
 // Lazily initialized KMS client
+#[allow(dead_code)]
 static INIT_KMS_CLIENT: OnceLock<()> = OnceLock::new();
 static KMS_CLIENT: Mutex<Option<Arc<RustyVaultKMSClient>>> = Mutex::new(None);
 
 /// RustyVaultKMSClient wraps the RustyVault client for direct key management operations
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct RustyVaultKMSClient {
     endpoint: String,
@@ -71,7 +71,7 @@ impl RustyVaultKMSClient {
     }
     
     /// Generate a data encryption key using RustyVault's transit engine
-    pub async fn generate_data_key(&self, context: Option<HashMap<String, String>>) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    pub async fn generate_data_key(&self, _context: Option<HashMap<String, String>>) -> Result<(Vec<u8>, Vec<u8>), Error> {
         // For now, generate a random key and return it
         // In a real implementation, this would call RustyVault's API
         let mut key = vec![0u8; 32]; // AES-256 key
@@ -84,7 +84,7 @@ impl RustyVaultKMSClient {
     }
     
     /// Encrypt data using RustyVault's transit engine
-    pub async fn encrypt(&self, data: &[u8], context: Option<HashMap<String, String>>) -> Result<Vec<u8>, Error> {
+    pub async fn encrypt(&self, data: &[u8], _context: Option<HashMap<String, String>>) -> Result<Vec<u8>, Error> {
         // Mock implementation - in practice this would call RustyVault
         let plaintext_b64 = general_purpose::STANDARD.encode(data);
         let ciphertext = format!("vault:v1:{}", plaintext_b64);
@@ -92,13 +92,12 @@ impl RustyVaultKMSClient {
     }
     
     /// Decrypt data using RustyVault's transit engine
-    pub async fn decrypt(&self, ciphertext: &[u8], context: Option<HashMap<String, String>>) -> Result<Vec<u8>, Error> {
+    pub async fn decrypt(&self, ciphertext: &[u8], _context: Option<HashMap<String, String>>) -> Result<Vec<u8>, Error> {
         // Mock implementation - in practice this would call RustyVault
         let ciphertext_str = std::str::from_utf8(ciphertext)
             .map_err(|_| Error::ErrInvalidEncryptedDataFormat)?;
             
-        if ciphertext_str.starts_with("vault:v1:") {
-            let data_b64 = &ciphertext_str[9..]; // Remove "vault:v1:" prefix
+        if let Some(data_b64) = ciphertext_str.strip_prefix("vault:v1:") {
             if data_b64.len() == 44 { // Base64 encoded 32-byte key
                 // This is a data key, decode it directly
                 general_purpose::STANDARD.decode(data_b64)
@@ -176,7 +175,7 @@ impl SSEKMSEncryption {
         let nonce = Nonce::from_slice(&iv);
         
         let ciphertext = cipher.encrypt(nonce, data)
-            .map_err(|e| Error::ErrEncryptFailed(e))?;
+            .map_err(Error::ErrEncryptFailed)?;
         
         // Create encryption metadata for storage in HTTP headers (MinIO方式)
         let info = EncryptionInfo::new_sse_kms(
@@ -212,7 +211,7 @@ impl SSEKMSEncryption {
         let nonce = Nonce::from_slice(&info.iv);
         
         let plaintext = cipher.decrypt(nonce, data)
-            .map_err(|e| Error::ErrDecryptFailed(e))?;
+            .map_err(Error::ErrDecryptFailed)?;
         
         Ok(plaintext)
     }
@@ -279,7 +278,7 @@ impl SSEKMSEncryption {
 #[cfg(feature = "kms")]
 impl Encryptable for SSEKMSEncryption {
     /// Encrypt data using RustyVault KMS (legacy interface for backward compatibility)
-    fn encrypt(&self, data: &[u8], options: &SSEOptions) -> Result<Vec<u8>, Error> {
+    fn encrypt(&self, data: &[u8], _options: &SSEOptions) -> Result<Vec<u8>, Error> {
         // 对于完整对象加密，使用async runtime
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| Error::ErrKMS(format!("Failed to create tokio runtime: {}", e)))?;
