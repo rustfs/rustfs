@@ -7,6 +7,7 @@ mod metacache;
 
 pub mod test_data;
 
+pub use error::*;
 pub use fileinfo::*;
 pub use filemeta::*;
 pub use filemeta_inline::*;

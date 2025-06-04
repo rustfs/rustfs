@@ -16,6 +16,7 @@ use super::{
     heal_commands::HealOpts,
     heal_ops::{new_bg_heal_sequence, HealSequence},
 };
+use crate::error::{Error, Result};
 use crate::global::GLOBAL_MRFState;
 use crate::heal::error::ERR_RETRY_HEALING;
 use crate::heal::heal_commands::{HealScanMode, HEAL_ITEM_BUCKET};
@@ -35,7 +36,6 @@ use crate::{
     store_api::{BucketInfo, BucketOptions, StorageAPI},
     utils::path::{path_join, SLASH_SEPARATOR},
 };
-use common::error::{Error, Result};
 
 pub static DEFAULT_MONITOR_NEW_DISK_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -72,7 +72,7 @@ pub async fn get_local_disks_to_heal() -> Vec<Endpoint> {
     for (_, disk) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
         if let Some(disk) = disk {
             if let Err(err) = disk.disk_info(&DiskInfoOptions::default()).await {
-                if let Some(DiskError::UnformattedDisk) = err.downcast_ref() {
+                if err == DiskError::UnformattedDisk {
                     info!("get_local_disks_to_heal, disk is unformatted: {}", err);
                     disks_to_heal.push(disk.endpoint());
                 }
@@ -111,7 +111,7 @@ async fn monitor_local_disks_and_heal() {
         let store = new_object_layer_fn().expect("errServerNotInitialized");
         if let (_result, Some(err)) = store.heal_format(false).await.expect("heal format failed") {
             error!("heal local disk format error: {}", err);
-            if let Some(DiskError::NoHealRequired) = err.downcast_ref::<DiskError>() {
+            if err == Error::NoHealRequired {
             } else {
                 info!("heal format err: {}", err.to_string());
                 interval.reset();
@@ -146,7 +146,7 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
     let disk = match get_disk_via_endpoint(endpoint).await {
         Some(disk) => disk,
         None => {
-            return Err(Error::from_string(format!(
+            return Err(Error::other(format!(
                 "Unexpected error disk must be initialized by now after formatting: {}",
                 endpoint
             )))
@@ -154,13 +154,13 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
     };
 
     if let Err(err) = disk.disk_info(&DiskInfoOptions::default()).await {
-        match err.downcast_ref() {
-            Some(DiskError::DriveIsRoot) => {
+        match err {
+            DiskError::DriveIsRoot => {
                 return Ok(());
             }
-            Some(DiskError::UnformattedDisk) => {}
+            DiskError::UnformattedDisk => {}
             _ => {
-                return Err(err);
+                return Err(err.into());
             }
         }
     }
@@ -168,8 +168,8 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
     let mut tracker = match load_healing_tracker(&Some(disk.clone())).await {
         Ok(tracker) => tracker,
         Err(err) => {
-            match err.downcast_ref() {
-                Some(DiskError::FileNotFound) => {
+            match err {
+                DiskError::FileNotFound => {
                     return Ok(());
                 }
                 _ => {
@@ -189,7 +189,9 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
         endpoint.to_string()
     );
 
-    let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+    let Some(store) = new_object_layer_fn() else {
+        return Err(Error::other("errServerNotInitialized"));
+    };
 
     let mut buckets = store.list_bucket(&BucketOptions::default()).await?;
     buckets.push(BucketInfo {
@@ -238,7 +240,7 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
         if let Err(err) = tracker_w.update().await {
             info!("update tracker failed: {}", err.to_string());
         }
-        return Err(Error::from_string(ERR_RETRY_HEALING));
+        return Err(Error::other(ERR_RETRY_HEALING));
     }
 
     if tracker_w.items_failed > 0 {
@@ -272,7 +274,9 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
             error!("delete tracker failed: {}", err.to_string());
         }
     }
-    let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+    let Some(store) = new_object_layer_fn() else {
+        return Err(Error::other("errServerNotInitialized"));
+    };
     let disks = store.get_disks(pool_idx, set_idx).await?;
     for disk in disks.into_iter() {
         if disk.is_none() {
@@ -281,8 +285,8 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
         let mut tracker = match load_healing_tracker(&disk).await {
             Ok(tracker) => tracker,
             Err(err) => {
-                match err.downcast_ref() {
-                    Some(DiskError::FileNotFound) => {}
+                match err {
+                    DiskError::FileNotFound => {}
                     _ => {
                         info!("Unable to load healing tracker on '{:?}': {}, re-initializing..", disk, err.to_string());
                     }
@@ -362,7 +366,7 @@ impl HealRoutine {
                 Some(task) => {
                     info!("got task: {:?}", task);
                     if task.bucket == NOP_HEAL {
-                        d_err = Some(Error::from_string("skip file"));
+                        d_err = Some(Error::other("skip file"));
                     } else if task.bucket == SLASH_SEPARATOR {
                         match heal_disk_format(task.opts).await {
                             Ok((res, err)) => {
@@ -426,7 +430,9 @@ impl HealRoutine {
 // }
 
 async fn heal_disk_format(opts: HealOpts) -> Result<(HealResultItem, Option<Error>)> {
-    let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+    let Some(store) = new_object_layer_fn() else {
+        return Err(Error::other("errServerNotInitialized"));
+    };
 
     let (res, err) = store.heal_format(opts.dry_run).await?;
     // return any error, ignore error returned when disks have

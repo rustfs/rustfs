@@ -1,6 +1,7 @@
+use super::error::{Error, Result};
 use crate::utils::net;
-use common::error::{Error, Result};
 use path_absolutize::Absolutize;
+use rustfs_utils::is_local_host;
 use std::{fmt::Display, path::Path};
 use url::{ParseError, Url};
 
@@ -40,10 +41,10 @@ impl TryFrom<&str> for Endpoint {
     type Error = Error;
 
     /// Performs the conversion.
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
         // check whether given path is not empty.
         if ["", "/", "\\"].iter().any(|&v| v.eq(value)) {
-            return Err(Error::from_string("empty or root endpoint is not supported"));
+            return Err(Error::other("empty or root endpoint is not supported"));
         }
 
         let mut is_local = false;
@@ -59,7 +60,7 @@ impl TryFrom<&str> for Endpoint {
                     && url.fragment().is_none()
                     && url.query().is_none())
                 {
-                    return Err(Error::from_string("invalid URL endpoint format"));
+                    return Err(Error::other("invalid URL endpoint format"));
                 }
 
                 let path = url.path().to_string();
@@ -76,12 +77,12 @@ impl TryFrom<&str> for Endpoint {
                 let path = Path::new(&path[1..]).absolutize()?;
 
                 if path.parent().is_none() || Path::new("").eq(&path) {
-                    return Err(Error::from_string("empty or root path is not supported in URL endpoint"));
+                    return Err(Error::other("empty or root path is not supported in URL endpoint"));
                 }
 
                 match path.to_str() {
                     Some(v) => url.set_path(v),
-                    None => return Err(Error::from_string("invalid path")),
+                    None => return Err(Error::other("invalid path")),
                 }
 
                 url
@@ -93,15 +94,15 @@ impl TryFrom<&str> for Endpoint {
             }
             Err(e) => match e {
                 ParseError::InvalidPort => {
-                    return Err(Error::from_string("invalid URL endpoint format: port number must be between 1 to 65535"))
+                    return Err(Error::other("invalid URL endpoint format: port number must be between 1 to 65535"))
                 }
-                ParseError::EmptyHost => return Err(Error::from_string("invalid URL endpoint format: empty host name")),
+                ParseError::EmptyHost => return Err(Error::other("invalid URL endpoint format: empty host name")),
                 ParseError::RelativeUrlWithoutBase => {
                     // like /foo
                     is_local = true;
                     url_parse_from_file_path(value)?
                 }
-                _ => return Err(Error::from_string(format!("invalid URL endpoint format: {}", e))),
+                _ => return Err(Error::other(format!("invalid URL endpoint format: {}", e))),
             },
         };
 
@@ -144,7 +145,7 @@ impl Endpoint {
     pub fn update_is_local(&mut self, local_port: u16) -> Result<()> {
         match (self.url.scheme(), self.url.host()) {
             (v, Some(host)) if v != "file" => {
-                self.is_local = net::is_local_host(host, self.url.port().unwrap_or_default(), local_port)?;
+                self.is_local = is_local_host(host, self.url.port().unwrap_or_default(), local_port)?;
             }
             _ => {}
         }
@@ -186,17 +187,17 @@ fn url_parse_from_file_path(value: &str) -> Result<Url> {
     // /mnt/export1. So we go ahead and start the rustfs server in FS modes in these cases.
     let addr: Vec<&str> = value.splitn(2, '/').collect();
     if net::is_socket_addr(addr[0]) {
-        return Err(Error::from_string("invalid URL endpoint format: missing scheme http or https"));
+        return Err(Error::other("invalid URL endpoint format: missing scheme http or https"));
     }
 
     let file_path = match Path::new(value).absolutize() {
         Ok(path) => path,
-        Err(err) => return Err(Error::from_string(format!("absolute path failed: {}", err))),
+        Err(err) => return Err(Error::other(format!("absolute path failed: {}", err))),
     };
 
     match Url::from_file_path(file_path) {
         Ok(url) => Ok(url),
-        Err(_) => Err(Error::from_string("Convert a file path into an URL failed")),
+        Err(_) => Err(Error::other("Convert a file path into an URL failed")),
     }
 }
 
@@ -260,49 +261,49 @@ mod test {
                 arg: "",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+                expected_err: Some(Error::other("empty or root endpoint is not supported")),
             },
             TestCase {
                 arg: "/",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+                expected_err: Some(Error::other("empty or root endpoint is not supported")),
             },
             TestCase {
                 arg: "\\",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("empty or root endpoint is not supported")),
+                expected_err: Some(Error::other("empty or root endpoint is not supported")),
             },
             TestCase {
                 arg: "c://foo",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+                expected_err: Some(Error::other("invalid URL endpoint format")),
             },
             TestCase {
                 arg: "ftp://foo",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+                expected_err: Some(Error::other("invalid URL endpoint format")),
             },
             TestCase {
                 arg: "http://server/path?location",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format")),
+                expected_err: Some(Error::other("invalid URL endpoint format")),
             },
             TestCase {
                 arg: "http://:/path",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format: empty host name")),
+                expected_err: Some(Error::other("invalid URL endpoint format: empty host name")),
             },
             TestCase {
                 arg: "http://:8080/path",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format: empty host name")),
+                expected_err: Some(Error::other("invalid URL endpoint format: empty host name")),
             },
             TestCase {
                 arg: "http://server:/path",
@@ -320,25 +321,25 @@ mod test {
                 arg: "https://93.184.216.34:808080/path",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format: port number must be between 1 to 65535")),
+                expected_err: Some(Error::other("invalid URL endpoint format: port number must be between 1 to 65535")),
             },
             TestCase {
                 arg: "http://server:8080//",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("empty or root path is not supported in URL endpoint")),
+                expected_err: Some(Error::other("empty or root path is not supported in URL endpoint")),
             },
             TestCase {
                 arg: "http://server:8080/",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("empty or root path is not supported in URL endpoint")),
+                expected_err: Some(Error::other("empty or root path is not supported in URL endpoint")),
             },
             TestCase {
                 arg: "192.168.1.210:9000",
                 expected_endpoint: None,
                 expected_type: None,
-                expected_err: Some(Error::from_string("invalid URL endpoint format: missing scheme http or https")),
+                expected_err: Some(Error::other("invalid URL endpoint format: missing scheme http or https")),
             },
         ];
 

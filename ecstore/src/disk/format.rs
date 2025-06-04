@@ -1,5 +1,5 @@
+use super::error::{Error, Result};
 use super::{error::DiskError, DiskInfo};
-use common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use uuid::Uuid;
@@ -110,7 +110,7 @@ pub struct FormatV3 {
 impl TryFrom<&[u8]> for FormatV3 {
     type Error = JsonError;
 
-    fn try_from(data: &[u8]) -> Result<Self, JsonError> {
+    fn try_from(data: &[u8]) -> std::result::Result<Self, Self::Error> {
         serde_json::from_slice(data)
     }
 }
@@ -118,7 +118,7 @@ impl TryFrom<&[u8]> for FormatV3 {
 impl TryFrom<&str> for FormatV3 {
     type Error = JsonError;
 
-    fn try_from(data: &str) -> Result<Self, JsonError> {
+    fn try_from(data: &str) -> std::result::Result<Self, Self::Error> {
         serde_json::from_str(data)
     }
 }
@@ -155,7 +155,7 @@ impl FormatV3 {
         self.erasure.sets.iter().map(|v| v.len()).sum()
     }
 
-    pub fn to_json(&self) -> Result<String, JsonError> {
+    pub fn to_json(&self) -> std::result::Result<String, JsonError> {
         serde_json::to_string(self)
     }
 
@@ -169,7 +169,7 @@ impl FormatV3 {
             return Err(Error::from(DiskError::DiskNotFound));
         }
         if disk_id == Uuid::max() {
-            return Err(Error::msg("disk offline"));
+            return Err(Error::other("disk offline"));
         }
 
         for (i, set) in self.erasure.sets.iter().enumerate() {
@@ -180,7 +180,7 @@ impl FormatV3 {
             }
         }
 
-        Err(Error::msg(format!("disk id not found {}", disk_id)))
+        Err(Error::other(format!("disk id not found {}", disk_id)))
     }
 
     pub fn check_other(&self, other: &FormatV3) -> Result<()> {
@@ -189,7 +189,7 @@ impl FormatV3 {
         tmp.erasure.this = Uuid::nil();
 
         if self.erasure.sets.len() != other.erasure.sets.len() {
-            return Err(Error::from_string(format!(
+            return Err(Error::other(format!(
                 "Expected number of sets {}, got {}",
                 self.erasure.sets.len(),
                 other.erasure.sets.len()
@@ -198,7 +198,7 @@ impl FormatV3 {
 
         for i in 0..self.erasure.sets.len() {
             if self.erasure.sets[i].len() != other.erasure.sets[i].len() {
-                return Err(Error::from_string(format!(
+                return Err(Error::other(format!(
                     "Each set should be of same size, expected {}, got {}",
                     self.erasure.sets[i].len(),
                     other.erasure.sets[i].len()
@@ -207,7 +207,7 @@ impl FormatV3 {
 
             for j in 0..self.erasure.sets[i].len() {
                 if self.erasure.sets[i][j] != other.erasure.sets[i][j] {
-                    return Err(Error::from_string(format!(
+                    return Err(Error::other(format!(
                         "UUID on positions {}:{} do not match with, expected {:?} got {:?}: (%w)",
                         i,
                         j,
@@ -226,7 +226,7 @@ impl FormatV3 {
             }
         }
 
-        Err(Error::msg(format!(
+        Err(Error::other(format!(
             "DriveID {:?} not found in any drive sets {:?}",
             this, other.erasure.sets
         )))

@@ -9,7 +9,6 @@ use crate::{
     },
 };
 use common::error::{Error, Result};
-use ecstore::config::error::is_err_config_not_found;
 use ecstore::utils::{crypto::base64_encode, path::path_join_buf};
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use policy::{

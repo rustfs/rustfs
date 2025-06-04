@@ -1,11 +1,10 @@
 use crate::config::com::save_config;
-use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
 use crate::set_disk::SetDisks;
 use crate::store_api::{BucketInfo, ObjectIO, ObjectOptions};
 use bytesize::ByteSize;
-use common::error::{Error, Result};
 use http::HeaderMap;
 use path_clean::PathClean;
 use rand::Rng;
@@ -402,8 +401,8 @@ impl DataUsageCache {
                 }
                 Err(err) => {
                     // warn!("Failed to load data usage cache from backend: {}", &err);
-                    match err.downcast_ref::<DiskError>() {
-                        Some(DiskError::FileNotFound) | Some(DiskError::VolumeNotFound) => {
+                    match err {
+                        Error::FileNotFound | Error::VolumeNotFound => {
                             match store
                                 .get_object_reader(
                                     RUSTFS_META_BUCKET,
@@ -423,8 +422,8 @@ impl DataUsageCache {
                                     }
                                     break;
                                 }
-                                Err(_) => match err.downcast_ref::<DiskError>() {
-                                    Some(DiskError::FileNotFound) | Some(DiskError::VolumeNotFound) => {
+                                Err(_) => match err {
+                                    Error::FileNotFound | Error::VolumeNotFound => {
                                         break;
                                     }
                                     _ => {}
@@ -448,7 +447,9 @@ impl DataUsageCache {
     }
 
     pub async fn save(&self, name: &str) -> Result<()> {
-        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+        let Some(store) = new_object_layer_fn() else {
+            return Err(Error::other("errServerNotInitialized"));
+        };
         let buf = self.marshal_msg()?;
         let buf_clone = buf.clone();
 
@@ -460,7 +461,8 @@ impl DataUsageCache {
         tokio::spawn(async move {
             let _ = save_config(store_clone, &format!("{}{}", &name_clone, ".bkp"), buf_clone).await;
         });
-        save_config(store, &name, buf).await
+        save_config(store, &name, buf).await?;
+        Ok(())
     }
 
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {

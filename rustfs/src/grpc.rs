@@ -7,6 +7,7 @@ use ecstore::{
     disk::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
     },
+    error::StorageError,
     heal::{
         data_usage_cache::DataUsageCache,
         heal_commands::{get_local_background_heal_status, HealOpts},
@@ -16,7 +17,6 @@ use ecstore::{
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions, StorageAPI},
-    store_err::StorageError,
     utils::err_to_proto_err,
 };
 use futures::{Stream, StreamExt};
@@ -295,7 +295,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ReadAllResponse {
                     success: false,
                     data: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("read all failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -320,7 +320,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(WriteAllResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("write all failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -360,7 +360,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(DeleteResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("delete failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -418,7 +418,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(VerifyFileResponse {
                     success: false,
                     check_parts_resp: "".to_string(),
-                    error: Some(err_to_proto_err(&err, &format!("verify file failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -477,7 +477,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(CheckPartsResponse {
                     success: false,
                     check_parts_resp: "".to_string(),
-                    error: Some(err_to_proto_err(&err, &format!("check parts failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -511,7 +511,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(RenamePartResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("rename part failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -538,7 +538,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(RenameFileResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("rename file failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -805,7 +805,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ListDirResponse {
                     success: false,
                     volumes: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("list dir failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -937,7 +937,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
-                    error: Some(err_to_proto_err(&err, &format!("rename data failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -962,7 +962,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(MakeVolumesResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("make volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -986,7 +986,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(MakeVolumeResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("make volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1018,7 +1018,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ListVolumesResponse {
                     success: false,
                     volume_infos: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("list volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1055,7 +1055,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(StatVolumeResponse {
                     success: false,
                     volume_info: String::new(),
-                    error: Some(err_to_proto_err(&err, &format!("state volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1080,7 +1080,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(DeletePathsResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("delte paths failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1137,7 +1137,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(UpdateMetadataResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("update metadata failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1177,7 +1177,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(WriteMetadataResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("write metadata failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1233,7 +1233,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ReadVersionResponse {
                     success: false,
                     file_info: String::new(),
-                    error: Some(err_to_proto_err(&err, &format!("read version failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1270,7 +1270,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ReadXlResponse {
                     success: false,
                     raw_file_info: String::new(),
-                    error: Some(err_to_proto_err(&err, &format!("read xl failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1344,7 +1344,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(DeleteVersionResponse {
                     success: false,
                     raw_file_info: "".to_string(),
-                    error: Some(err_to_proto_err(&err, &format!("read version failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1418,7 +1418,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(DeleteVersionsResponse {
                     success: false,
                     errors: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("delete version failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1469,7 +1469,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ReadMultipleResponse {
                     success: false,
                     read_multiple_resps: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("read multiple failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1494,7 +1494,7 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(DeleteVolumeResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("delete volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1547,7 +1547,7 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
                     success: false,
                     disk_info: "".to_string(),
-                    error: Some(err_to_proto_err(&err, &format!("disk info failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
@@ -1634,7 +1634,7 @@ impl Node for NodeService {
                                     success: false,
                                     update: "".to_string(),
                                     data_usage_cache: "".to_string(),
-                                    error: Some(err_to_proto_err(&err, &format!("scanner failed: {}", err))),
+                                    error: Some(err.into()),
                                 }))
                                 .await
                                 .expect("working rx");

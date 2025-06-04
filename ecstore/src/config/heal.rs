@@ -1,7 +1,6 @@
-use std::time::Duration;
-
+use crate::error::{Error, Result};
 use crate::utils::bool_flag::parse_bool;
-use common::error::{Error, Result};
+use std::time::Duration;
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -42,13 +41,13 @@ fn parse_bitrot_config(s: &str) -> Result<Duration> {
         }
         Err(_) => {
             if !s.ends_with("m") {
-                return Err(Error::from_string("unknown format"));
+                return Err(Error::other("unknown format"));
             }
 
             match s.trim_end_matches('m').parse::<u64>() {
                 Ok(months) => {
                     if months < RUSTFS_BITROT_CYCLE_IN_MONTHS {
-                        return Err(Error::from_string(format!(
+                        return Err(Error::other(format!(
                             "minimum bitrot cycle is {} month(s)",
                             RUSTFS_BITROT_CYCLE_IN_MONTHS
                         )));
@@ -56,7 +55,7 @@ fn parse_bitrot_config(s: &str) -> Result<Duration> {
 
                     Ok(Duration::from_secs(months * 30 * 24 * 60))
                 }
-                Err(err) => Err(err.into()),
+                Err(err) => Err(Error::other(err)),
             }
         }
     }

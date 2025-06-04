@@ -1,7 +1,7 @@
 #![cfg(test)]
 
-use ecstore::disk::{MetaCacheEntry, VolumeInfo, WalkDirOptions};
-use ecstore::metacache::writer::{MetacacheReader, MetacacheWriter};
+use ecstore::disk::{VolumeInfo, WalkDirOptions};
+
 use futures::future::join_all;
 use protos::proto_gen::node_service::WalkDirRequest;
 use protos::{
@@ -12,6 +12,7 @@ use protos::{
     },
 };
 use rmp_serde::{Deserializer, Serializer};
+use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, MetacacheWriter};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, io::Cursor};
 use tokio::spawn;

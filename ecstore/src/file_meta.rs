@@ -1,7 +1,7 @@
 use crate::disk::FileInfoVersions;
 use crate::file_meta_inline::InlineData;
 use crate::store_api::RawFileInfo;
-use crate::store_err::StorageError;
+use crate::error::StorageError;
 use crate::{
     disk::error::DiskError,
     store_api::{ErasureInfo, FileInfo, ObjectPartInfo, ERASURE_ALGORITHM},

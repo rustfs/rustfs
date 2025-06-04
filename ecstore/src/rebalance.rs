@@ -4,19 +4,20 @@ use std::time::SystemTime;
 
 use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
 use crate::config::com::{read_config_with_metadata, save_config_with_opts};
-use crate::config::error::is_err_config_not_found;
-use crate::disk::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use crate::disk::error::DiskError;
+use crate::error::{is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
+use crate::error::{Error, Result};
 use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
 use crate::set_disk::SetDisks;
 use crate::store::ECStore;
-use crate::store_api::{CompletePart, FileInfo, GetObjectReader, ObjectIO, ObjectOptions, PutObjReader};
-use crate::store_err::{is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
+use crate::store_api::{CompletePart, GetObjectReader, ObjectIO, ObjectOptions, PutObjReader};
 use crate::utils::path::encode_dir_object;
 use crate::StorageAPI;
 use common::defer;
-use common::error::{Error, Result};
 use http::HeaderMap;
+use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_rio::HashReader;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
@@ -167,17 +168,17 @@ impl RebalanceMeta {
             return Ok(());
         }
         if data.len() <= 4 {
-            return Err(Error::msg("rebalanceMeta: no data"));
+            return Err(Error::other("rebalanceMeta: no data"));
         }
 
         // Read header
         match u16::from_le_bytes([data[0], data[1]]) {
             REBAL_META_FMT => {}
-            fmt => return Err(Error::msg(format!("rebalanceMeta: unknown format: {}", fmt))),
+            fmt => return Err(Error::other(format!("rebalanceMeta: unknown format: {}", fmt))),
         }
         match u16::from_le_bytes([data[2], data[3]]) {
             REBAL_META_VER => {}
-            ver => return Err(Error::msg(format!("rebalanceMeta: unknown version: {}", ver))),
+            ver => return Err(Error::other(format!("rebalanceMeta: unknown version: {}", ver))),
         }
 
         let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))?;
@@ -238,7 +239,7 @@ impl ECStore {
                 }
             }
             Err(err) => {
-                if !is_err_config_not_found(&err) {
+                if err != Error::ConfigNotFound {
                     error!("rebalanceMeta: load rebalance meta err {:?}", &err);
                     return Err(err);
                 }
@@ -866,8 +867,7 @@ impl ECStore {
                 reader.read_exact(&mut chunk).await?;
 
                 // 每次从 reader 中读取一个 part 上传
-                let rd = Box::new(Cursor::new(chunk));
-                let mut data = PutObjReader::new(rd, part.size);
+                let mut data = PutObjReader::from_vec(chunk);
 
                 let pi = match self
                     .put_object_part(
@@ -877,7 +877,7 @@ impl ECStore {
                         part.number,
                         &mut data,
                         &ObjectOptions {
-                            preserve_etag: part.e_tag.clone(),
+                            preserve_etag: Some(part.etag.clone()),
                             ..Default::default()
                         },
                     )
@@ -892,7 +892,7 @@ impl ECStore {
 
                 parts[i] = CompletePart {
                     part_num: pi.part_num,
-                    e_tag: pi.etag,
+                    etag: pi.etag,
                 };
             }
 
@@ -917,7 +917,8 @@ impl ECStore {
             return Ok(());
         }
 
-        let mut data = PutObjReader::new(rd.stream, object_info.size);
+        let hrd = HashReader::new(rd.stream, object_info.size as i64, object_info.size as i64, None, false)?;
+        let mut data = PutObjReader::new(hrd, object_info.size);
 
         if let Err(err) = self
             .put_object(
@@ -956,7 +957,7 @@ impl ECStore {
 
         let pool = self.pools[pool_index].clone();
 
-        let wk = Workers::new(pool.disk_set.len() * 2).map_err(|v| Error::from_string(v))?;
+        let wk = Workers::new(pool.disk_set.len() * 2).map_err(|v| Error::other(v))?;
 
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
             wk.clone().take().await;
@@ -1054,7 +1055,7 @@ impl SetDisks {
         // Placeholder for actual object listing logic
         let (disks, _) = self.get_online_disks_with_healing(false).await;
         if disks.is_empty() {
-            return Err(Error::msg("errNoDiskAvailable"));
+            return Err(Error::other("errNoDiskAvailable"));
         }
 
         let listing_quorum = self.set_drive_count.div_ceil(2);
@@ -1075,7 +1076,7 @@ impl SetDisks {
                 recursice: true,
                 min_disks: listing_quorum,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                     // let cb = cb.clone();
                     let resolver = resolver.clone();
                     let cb = cb.clone();

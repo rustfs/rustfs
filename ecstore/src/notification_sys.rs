@@ -1,9 +1,9 @@
 use crate::admin_server_info::get_commit_id;
+use crate::error::{Error, Result};
 use crate::global::{get_global_endpoints, GLOBAL_BOOT_TIME};
 use crate::peer_rest_client::PeerRestClient;
 use crate::StorageAPI;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
-use common::error::{Error, Result};
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use madmin::{ItemState, ServerProperties};
@@ -18,7 +18,7 @@ lazy_static! {
 pub async fn new_global_notification_sys(eps: EndpointServerPools) -> Result<()> {
     let _ = GLOBAL_NotificationSys
         .set(NotificationSys::new(eps).await)
-        .map_err(|_| Error::msg("init notification_sys fail"));
+        .map_err(|_| Error::other("init notification_sys fail"));
     Ok(())
 }
 

@@ -6,14 +6,12 @@ use std::{collections::HashMap, sync::Arc};
 use crate::bucket::error::BucketMetadataError;
 use crate::bucket::metadata::{load_bucket_metadata_parse, BUCKET_LIFECYCLE_CONFIG};
 use crate::bucket::utils::is_meta_bucketname;
-use crate::config::error::ConfigError;
-use crate::disk::error::DiskError;
+use crate::error::{is_err_bucket_not_found, Error, Result};
 use crate::global::{is_dist_erasure, is_erasure, new_object_layer_fn, GLOBAL_Endpoints};
 use crate::heal::heal_commands::HealOpts;
 use crate::store::ECStore;
 use crate::utils::xml::deserialize;
-use crate::{config, StorageAPI};
-use common::error::{Error, Result};
+use crate::StorageAPI;
 use futures::future::join_all;
 use policy::policy::BucketPolicy;
 use s3s::dto::{
@@ -49,7 +47,7 @@ pub(super) fn get_bucket_metadata_sys() -> Result<Arc<RwLock<BucketMetadataSys>>
     if let Some(sys) = GLOBAL_BucketMetadataSys.get() {
         Ok(sys.clone())
     } else {
-        Err(Error::msg("GLOBAL_BucketMetadataSys not init"))
+        Err(Error::other("GLOBAL_BucketMetadataSys not init"))
     }
 }
 
@@ -167,7 +165,7 @@ impl BucketMetadataSys {
             if let Some(endpoints) = GLOBAL_Endpoints.get() {
                 endpoints.es_count() * 10
             } else {
-                return Err(Error::msg("GLOBAL_Endpoints not init"));
+                return Err(Error::other("GLOBAL_Endpoints not init"));
             }
         };
 
@@ -245,14 +243,14 @@ impl BucketMetadataSys {
 
     pub async fn get(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         if is_meta_bucketname(bucket) {
-            return Err(Error::new(ConfigError::NotFound));
+            return Err(Error::ConfigNotFound);
         }
 
         let map = self.metadata_map.read().await;
         if let Some(bm) = map.get(bucket) {
             Ok(bm.clone())
         } else {
-            Err(Error::new(ConfigError::NotFound))
+            Err(Error::ConfigNotFound)
         }
     }
 
@@ -277,7 +275,7 @@ impl BucketMetadataSys {
             let meta = match self.get_config_from_disk(bucket).await {
                 Ok(res) => res,
                 Err(err) => {
-                    if !config::error::is_err_config_not_found(&err) {
+                    if err != Error::ConfigNotFound {
                         return Err(err);
                     } else {
                         BucketMetadata::new(bucket)
@@ -301,16 +299,18 @@ impl BucketMetadataSys {
     }
 
     async fn update_and_parse(&mut self, bucket: &str, config_file: &str, data: Vec<u8>, parse: bool) -> Result<OffsetDateTime> {
-        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+        let Some(store) = new_object_layer_fn() else {
+            return Err(Error::other("errServerNotInitialized"));
+        };
 
         if is_meta_bucketname(bucket) {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("errInvalidArgument"));
         }
 
         let mut bm = match load_bucket_metadata_parse(store, bucket, parse).await {
             Ok(res) => res,
             Err(err) => {
-                if !is_erasure().await && !is_dist_erasure().await && DiskError::VolumeNotFound.is(&err) {
+                if !is_erasure().await && !is_dist_erasure().await && is_err_bucket_not_found(&err) {
                     BucketMetadata::new(bucket)
                 } else {
                     return Err(err);
@@ -327,7 +327,7 @@ impl BucketMetadataSys {
 
     async fn save(&self, bm: BucketMetadata) -> Result<()> {
         if is_meta_bucketname(&bm.name) {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("errInvalidArgument"));
         }
 
         let mut bm = bm;
@@ -341,7 +341,7 @@ impl BucketMetadataSys {
 
     pub async fn get_config_from_disk(&self, bucket: &str) -> Result<BucketMetadata> {
         if is_meta_bucketname(bucket) {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("errInvalidArgument"));
         }
 
         load_bucket_metadata(self.api.clone(), bucket).await
@@ -360,7 +360,7 @@ impl BucketMetadataSys {
                 Ok(res) => res,
                 Err(err) => {
                     return if *self.initialized.read().await {
-                        Err(Error::msg("errBucketMetadataNotInitialized"))
+                        Err(Error::other("errBucketMetadataNotInitialized"))
                     } else {
                         Err(err)
                     }
@@ -381,7 +381,7 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_versioning_config err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
+                return if err == Error::ConfigNotFound {
                     Ok((VersioningConfiguration::default(), OffsetDateTime::UNIX_EPOCH))
                 } else {
                     Err(err)
@@ -401,8 +401,8 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_bucket_policy err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
-                    Err(Error::new(BucketMetadataError::BucketPolicyNotFound))
+                return if err == Error::ConfigNotFound {
+                    Err(BucketMetadataError::BucketPolicyNotFound.into())
                 } else {
                     Err(err)
                 };
@@ -412,7 +412,7 @@ impl BucketMetadataSys {
         if let Some(config) = &bm.policy_config {
             Ok((config.clone(), bm.policy_config_updated_at))
         } else {
-            Err(Error::new(BucketMetadataError::BucketPolicyNotFound))
+            Err(BucketMetadataError::BucketPolicyNotFound.into())
         }
     }
 
@@ -421,8 +421,8 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_tagging_config err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
-                    Err(Error::new(BucketMetadataError::TaggingNotFound))
+                return if err == Error::ConfigNotFound {
+                    Err(BucketMetadataError::TaggingNotFound.into())
                 } else {
                     Err(err)
                 };
@@ -432,7 +432,7 @@ impl BucketMetadataSys {
         if let Some(config) = &bm.tagging_config {
             Ok((config.clone(), bm.tagging_config_updated_at))
         } else {
-            Err(Error::new(BucketMetadataError::TaggingNotFound))
+            Err(BucketMetadataError::TaggingNotFound.into())
         }
     }
 
@@ -441,8 +441,8 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_object_lock_config err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
-                    Err(Error::new(BucketMetadataError::BucketObjectLockConfigNotFound))
+                return if err == Error::ConfigNotFound {
+                    Err(BucketMetadataError::BucketObjectLockConfigNotFound.into())
                 } else {
                     Err(err)
                 };
@@ -452,7 +452,7 @@ impl BucketMetadataSys {
         if let Some(config) = &bm.object_lock_config {
             Ok((config.clone(), bm.object_lock_config_updated_at))
         } else {
-            Err(Error::new(BucketMetadataError::BucketObjectLockConfigNotFound))
+            Err(BucketMetadataError::BucketObjectLockConfigNotFound.into())
         }
     }
 
@@ -461,8 +461,8 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_lifecycle_config err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
-                    Err(Error::new(BucketMetadataError::BucketLifecycleNotFound))
+                return if err == Error::ConfigNotFound {
+                    Err(BucketMetadataError::BucketLifecycleNotFound.into())
                 } else {
                     Err(err)
                 };
@@ -471,12 +471,12 @@ impl BucketMetadataSys {
 
         if let Some(config) = &bm.lifecycle_config {
             if config.rules.is_empty() {
-                Err(Error::new(BucketMetadataError::BucketLifecycleNotFound))
+                Err(BucketMetadataError::BucketLifecycleNotFound.into())
             } else {
                 Ok((config.clone(), bm.lifecycle_config_updated_at))
             }
         } else {
-            Err(Error::new(BucketMetadataError::BucketLifecycleNotFound))
+            Err(BucketMetadataError::BucketLifecycleNotFound.into())
         }
     }
 
@@ -485,7 +485,7 @@ impl BucketMetadataSys {
             Ok((bm, _)) => bm.notification_config.clone(),
             Err(err) => {
                 warn!("get_notification_config err {:?}", &err);
-                if config::error::is_err_config_not_found(&err) {
+                if err == Error::ConfigNotFound {
                     None
                 } else {
                     return Err(err);
@@ -501,8 +501,8 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_sse_config err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
-                    Err(Error::new(BucketMetadataError::BucketSSEConfigNotFound))
+                return if err == Error::ConfigNotFound {
+                    Err(BucketMetadataError::BucketSSEConfigNotFound.into())
                 } else {
                     Err(err)
                 };
@@ -512,7 +512,7 @@ impl BucketMetadataSys {
         if let Some(config) = &bm.sse_config {
             Ok((config.clone(), bm.encryption_config_updated_at))
         } else {
-            Err(Error::new(BucketMetadataError::BucketSSEConfigNotFound))
+            Err(BucketMetadataError::BucketSSEConfigNotFound.into())
         }
     }
 
@@ -532,8 +532,8 @@ impl BucketMetadataSys {
             Ok((res, _)) => res,
             Err(err) => {
                 warn!("get_quota_config err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
-                    Err(Error::new(BucketMetadataError::BucketQuotaConfigNotFound))
+                return if err == Error::ConfigNotFound {
+                    Err(BucketMetadataError::BucketQuotaConfigNotFound.into())
                 } else {
                     Err(err)
                 };
@@ -543,7 +543,7 @@ impl BucketMetadataSys {
         if let Some(config) = &bm.quota_config {
             Ok((config.clone(), bm.quota_config_updated_at))
         } else {
-            Err(Error::new(BucketMetadataError::BucketQuotaConfigNotFound))
+            Err(BucketMetadataError::BucketQuotaConfigNotFound.into())
         }
     }
 
@@ -552,8 +552,8 @@ impl BucketMetadataSys {
             Ok(res) => res,
             Err(err) => {
                 warn!("get_replication_config err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
-                    Err(Error::new(BucketMetadataError::BucketReplicationConfigNotFound))
+                return if err == Error::ConfigNotFound {
+                    Err(BucketMetadataError::BucketReplicationConfigNotFound.into())
                 } else {
                     Err(err)
                 };
@@ -567,7 +567,7 @@ impl BucketMetadataSys {
 
             Ok((config.clone(), bm.replication_config_updated_at))
         } else {
-            Err(Error::new(BucketMetadataError::BucketReplicationConfigNotFound))
+            Err(BucketMetadataError::BucketReplicationConfigNotFound.into())
         }
     }
 
@@ -576,8 +576,8 @@ impl BucketMetadataSys {
             Ok(res) => res,
             Err(err) => {
                 warn!("get_replication_config err {:?}", &err);
-                return if config::error::is_err_config_not_found(&err) {
-                    Err(Error::new(BucketMetadataError::BucketRemoteTargetNotFound))
+                return if err == Error::ConfigNotFound {
+                    Err(BucketMetadataError::BucketRemoteTargetNotFound.into())
                 } else {
                     Err(err)
                 };
@@ -591,7 +591,7 @@ impl BucketMetadataSys {
 
             Ok(config.clone())
         } else {
-            Err(Error::new(BucketMetadataError::BucketRemoteTargetNotFound))
+            Err(BucketMetadataError::BucketRemoteTargetNotFound.into())
         }
     }
 }

@@ -1,17 +1,15 @@
-use crate::disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions};
-use crate::{
-    disk::error::{is_err_eof, is_err_file_not_found, is_err_volume_not_found, DiskError},
-    metacache::writer::MetacacheReader,
-};
-use common::error::{Error, Result};
+use crate::disk::error::DiskError;
+use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
 use futures::future::join_all;
+use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader};
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::{spawn, sync::broadcast::Receiver as B_Receiver};
 use tracing::error;
 
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
-pub type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
-type FinishedFn = Box<dyn Fn(&[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+pub type PartialFn =
+    Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 
 #[derive(Default)]
 pub struct ListPathRawOptions {
@@ -51,13 +49,13 @@ impl Clone for ListPathRawOptions {
     }
 }
 
-pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> Result<()> {
+pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> disk::error::Result<()> {
     // println!("list_path_raw {},{}", &opts.bucket, &opts.path);
     if opts.disks.is_empty() {
-        return Err(Error::from_string("list_path_raw: 0 drives provided"));
+        return Err(DiskError::other("list_path_raw: 0 drives provided"));
     }
 
-    let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), Error>>> = Vec::new();
+    let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = Arc::new(opts.fallback_disks.clone());
 
@@ -137,7 +135,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
     }
 
     let revjob = spawn(async move {
-        let mut errs: Vec<Option<Error>> = Vec::with_capacity(readers.len());
+        let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
             errs.push(None);
         }
@@ -146,7 +144,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
             let mut current = MetaCacheEntry::default();
 
             if rx.try_recv().is_ok() {
-                return Err(Error::from_string("canceled"));
+                return Err(DiskError::other("canceled"));
             }
             let mut top_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
 
@@ -175,21 +173,21 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                         }
                     }
                     Err(err) => {
-                        if is_err_eof(&err) {
+                        if err == rustfs_filemeta::Error::Unexpected {
                             at_eof += 1;
                             continue;
-                        } else if is_err_file_not_found(&err) {
+                        } else if err == rustfs_filemeta::Error::FileNotFound {
                             at_eof += 1;
                             fnf += 1;
                             continue;
-                        } else if is_err_volume_not_found(&err) {
+                        } else if err == rustfs_filemeta::Error::VolumeNotFound {
                             at_eof += 1;
                             fnf += 1;
                             vnf += 1;
                             continue;
                         } else {
                             has_err += 1;
-                            errs[i] = Some(err);
+                            errs[i] = Some(err.into());
                             continue;
                         }
                     }
@@ -230,11 +228,11 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
             }
 
             if vnf > 0 && vnf >= (readers.len() - opts.min_disks) {
-                return Err(Error::new(DiskError::VolumeNotFound));
+                return Err(DiskError::VolumeNotFound);
             }
 
             if fnf > 0 && fnf >= (readers.len() - opts.min_disks) {
-                return Err(Error::new(DiskError::FileNotFound));
+                return Err(DiskError::FileNotFound);
             }
 
             if has_err > 0 && has_err > opts.disks.len() - opts.min_disks {
@@ -252,7 +250,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                     _ => {}
                 });
 
-                return Err(Error::from_string(combined_err.join(", ")));
+                return Err(DiskError::other(combined_err.join(", ")));
             }
 
             // Break if all at EOF or error.

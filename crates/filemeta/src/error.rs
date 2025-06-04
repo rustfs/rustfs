@@ -1,11 +1,14 @@
 pub type Result<T> = core::result::Result<T, Error>;
 
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("File not found")]
     FileNotFound,
     #[error("File version not found")]
     FileVersionNotFound,
+
+    #[error("Volume not found")]
+    VolumeNotFound,
 
     #[error("File corrupt")]
     FileCorrupt,
@@ -16,8 +19,11 @@ pub enum Error {
     #[error("Method not allowed")]
     MethodNotAllowed,
 
+    #[error("Unexpected error")]
+    Unexpected,
+
     #[error("I/O error: {0}")]
-    Io(String),
+    Io(std::io::Error),
 
     #[error("rmp serde decode error: {0}")]
     RmpSerdeDecode(String),
@@ -64,7 +70,8 @@ impl PartialEq for Error {
             (Error::MethodNotAllowed, Error::MethodNotAllowed) => true,
             (Error::FileNotFound, Error::FileNotFound) => true,
             (Error::FileVersionNotFound, Error::FileVersionNotFound) => true,
-            (Error::Io(e1), Error::Io(e2)) => e1 == e2,
+            (Error::VolumeNotFound, Error::VolumeNotFound) => true,
+            (Error::Io(e1), Error::Io(e2)) => e1.kind() == e2.kind() && e1.to_string() == e2.to_string(),
             (Error::RmpSerdeDecode(e1), Error::RmpSerdeDecode(e2)) => e1 == e2,
             (Error::RmpSerdeEncode(e1), Error::RmpSerdeEncode(e2)) => e1 == e2,
             (Error::RmpDecodeValueRead(e1), Error::RmpDecodeValueRead(e2)) => e1 == e2,
@@ -72,14 +79,39 @@ impl PartialEq for Error {
             (Error::RmpDecodeNumValueRead(e1), Error::RmpDecodeNumValueRead(e2)) => e1 == e2,
             (Error::TimeComponentRange(e1), Error::TimeComponentRange(e2)) => e1 == e2,
             (Error::UuidParse(e1), Error::UuidParse(e2)) => e1 == e2,
+            (Error::Unexpected, Error::Unexpected) => true,
             (a, b) => a.to_string() == b.to_string(),
+        }
+    }
+}
+
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Error::FileNotFound => Error::FileNotFound,
+            Error::FileVersionNotFound => Error::FileVersionNotFound,
+            Error::FileCorrupt => Error::FileCorrupt,
+            Error::DoneForNow => Error::DoneForNow,
+            Error::MethodNotAllowed => Error::MethodNotAllowed,
+            Error::VolumeNotFound => Error::VolumeNotFound,
+            Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
+            Error::RmpSerdeDecode(s) => Error::RmpSerdeDecode(s.clone()),
+            Error::RmpSerdeEncode(s) => Error::RmpSerdeEncode(s.clone()),
+            Error::FromUtf8(s) => Error::FromUtf8(s.clone()),
+            Error::RmpDecodeValueRead(s) => Error::RmpDecodeValueRead(s.clone()),
+            Error::RmpEncodeValueWrite(s) => Error::RmpEncodeValueWrite(s.clone()),
+            Error::RmpDecodeNumValueRead(s) => Error::RmpDecodeNumValueRead(s.clone()),
+            Error::RmpDecodeMarkerRead(s) => Error::RmpDecodeMarkerRead(s.clone()),
+            Error::TimeComponentRange(s) => Error::TimeComponentRange(s.clone()),
+            Error::UuidParse(s) => Error::UuidParse(s.clone()),
+            Error::Unexpected => Error::Unexpected,
         }
     }
 }
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::Io(e.to_string())
+        Error::Io(e)
     }
 }
 

@@ -1,16 +1,13 @@
+use crate::error::{Error, Result};
 use crate::{
     bucket::metadata_sys::get_replication_config,
-    config::{
-        com::{read_config, save_config},
-        error::is_err_config_not_found,
-    },
+    config::com::{read_config, save_config},
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    error::to_object_err,
     new_object_layer_fn,
     store::ECStore,
-    store_err::to_object_err,
     utils::path::SLASH_SEPARATOR,
 };
-use common::error::Result;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
@@ -146,7 +143,7 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
         Ok(data) => data,
         Err(e) => {
             error!("Failed to read data usage info from backend: {}", e);
-            if is_err_config_not_found(&e) {
+            if e == Error::ConfigNotFound {
                 return Ok(DataUsageInfo::default());
             }
 

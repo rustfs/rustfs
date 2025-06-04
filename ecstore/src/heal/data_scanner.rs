@@ -20,6 +20,7 @@ use super::{
 };
 use crate::{
     bucket::{versioning::VersioningApi, versioning_sys::BucketVersioningSys},
+    disk,
     heal::data_usage::DATA_USAGE_ROOT,
 };
 use crate::{
@@ -28,7 +29,7 @@ use crate::{
         com::{read_config, save_config},
         heal::Config,
     },
-    disk::{error::DiskError, DiskInfoOptions, DiskStore, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams},
+    disk::{DiskInfoOptions, DiskStore},
     global::{GLOBAL_BackgroundHealState, GLOBAL_IsErasure, GLOBAL_IsErasureSD},
     heal::{
         data_usage::BACKGROUND_HEAL_INFO_PATH,
@@ -42,16 +43,17 @@ use crate::{
     store::ECStore,
     utils::path::{path_join, path_to_bucket_object, path_to_bucket_object_with_base_path, SLASH_SEPARATOR},
 };
-use crate::{disk::local::LocalDisk, heal::data_scanner_metric::current_path_updater};
 use crate::{
-    disk::DiskAPI,
-    store_api::{FileInfo, ObjectInfo},
+    disk::error::DiskError,
+    error::{Error, Result},
 };
+use crate::{disk::local::LocalDisk, heal::data_scanner_metric::current_path_updater};
+use crate::{disk::DiskAPI, store_api::ObjectInfo};
 use chrono::{DateTime, Utc};
-use common::error::{Error, Result};
 use lazy_static::lazy_static;
 use rand::Rng;
 use rmp_serde::{Deserializer, Serializer};
+use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, ReplicationConfiguration, ReplicationRuleStatus};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -460,7 +462,7 @@ impl CurrentScannerCycle {
                         Deserialize::deserialize(&mut Deserializer::new(&buf[..])).expect("Deserialization failed");
                     self.cycle_completed = u;
                 }
-                name => return Err(Error::msg(format!("not support field name {}", name))),
+                name => return Err(Error::other(format!("not support field name {}", name))),
             }
         }
 
@@ -540,7 +542,12 @@ impl ScannerItem {
 
         if self.lifecycle.is_none() {
             for info in fives.iter() {
-                object_infos.push(info.to_object_info(&self.bucket, &self.object_path().to_string_lossy(), versioned));
+                object_infos.push(ObjectInfo::from_file_info(
+                    info,
+                    &self.bucket,
+                    &self.object_path().to_string_lossy(),
+                    versioned,
+                ));
             }
             return Ok(object_infos);
         }
@@ -594,7 +601,7 @@ struct CachedFolder {
 }
 
 pub type GetSizeFn =
-    Box<dyn Fn(&ScannerItem) -> Pin<Box<dyn Future<Output = Result<SizeSummary>> + Send>> + Send + Sync + 'static>;
+    Box<dyn Fn(&ScannerItem) -> Pin<Box<dyn Future<Output = std::io::Result<SizeSummary>> + Send>> + Send + Sync + 'static>;
 pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type ShouldSleepFn = Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>;
 
@@ -929,7 +936,7 @@ impl FolderScanner {
                             }
                         })
                     })),
-                    partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                    partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                         Box::pin({
                             let update_current_path_partial = update_current_path_partial.clone();
                             // let tx_partial = tx_partial.clone();
@@ -973,8 +980,8 @@ impl FolderScanner {
                                             )
                                             .await
                                         {
-                                            match err.downcast_ref() {
-                                                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                                            match err {
+                                                Error::FileNotFound | Error::FileVersionNotFound => {}
                                                 _ => {
                                                     info!("{}", err.to_string());
                                                 }
@@ -1018,7 +1025,7 @@ impl FolderScanner {
                             }
                         })
                     })),
-                    finished: Some(Box::new(move |_: &[Option<Error>]| {
+                    finished: Some(Box::new(move |_: &[Option<DiskError>]| {
                         Box::pin({
                             let tx_finished = tx_finished.clone();
                             async move {
@@ -1077,7 +1084,7 @@ impl FolderScanner {
         if !into.compacted {
             self.new_cache.reduce_children_of(
                 &this_hash,
-                DATA_SCANNER_COMPACT_AT_CHILDREN.try_into()?,
+                DATA_SCANNER_COMPACT_AT_CHILDREN as usize,
                 self.new_cache.info.name != folder.name,
             );
         }
@@ -1234,9 +1241,9 @@ pub async fn scan_data_folder(
     get_size_fn: GetSizeFn,
     heal_scan_mode: HealScanMode,
     should_sleep: ShouldSleepFn,
-) -> Result<DataUsageCache> {
+) -> disk::error::Result<DataUsageCache> {
     if cache.info.name.is_empty() || cache.info.name == DATA_USAGE_ROOT {
-        return Err(Error::from_string("internal error: root scan attempted"));
+        return Err(DiskError::other("internal error: root scan attempted"));
     }
 
     let base_path = drive.to_string();

@@ -1,27 +1,26 @@
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
-use crate::disk::error::{is_all_not_found, is_all_volume_not_found, is_err_eof, DiskError};
-use crate::disk::{
-    DiskInfo, DiskStore, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
-    MetadataResolutionParams,
+use crate::disk::error::DiskError;
+use crate::disk::{DiskInfo, DiskStore};
+use crate::error::{
+    is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found, to_object_err, Error, Result, StorageError,
 };
-use crate::error::clone_err;
-use crate::file_meta::merge_file_meta_versions;
 use crate::peer::is_reserved_or_invalid_bucket;
 use crate::set_disk::SetDisks;
 use crate::store::check_list_objs_args;
-use crate::store_api::{FileInfo, ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectOptions};
-use crate::store_err::{is_err_bucket_not_found, to_object_err, StorageError};
+use crate::store_api::{ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectOptions};
 use crate::utils::path::{self, base_dir_from_prefix, SLASH_SEPARATOR};
 use crate::StorageAPI;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
-use common::error::{Error, Result};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use rustfs_filemeta::{
+    merge_file_meta_versions, FileInfo, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
+    MetadataResolutionParams,
+};
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -281,13 +280,13 @@ impl ECStore {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err),
+                err: Some(err.into()),
                 ..Default::default()
             });
 
-        if let Some(err) = &list_result.err {
-            if !is_err_eof(err) {
-                return Err(to_object_err(list_result.err.unwrap(), vec![bucket, prefix]));
+        if let Some(err) = list_result.err.clone() {
+            if err != rustfs_filemeta::Error::Unexpected {
+                return Err(to_object_err(err.into(), vec![bucket, prefix]));
             }
         }
 
@@ -297,11 +296,13 @@ impl ECStore {
 
         // contextCanceled
 
-        let mut get_objects = list_result
-            .entries
-            .unwrap_or_default()
-            .file_infos(bucket, prefix, delimiter.clone())
-            .await;
+        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted(
+            &list_result.entries.unwrap_or_default(),
+            bucket,
+            prefix,
+            delimiter.clone(),
+        )
+        .await;
 
         let is_truncated = {
             if max_keys > 0 && get_objects.len() > max_keys as usize {
@@ -364,7 +365,7 @@ impl ECStore {
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
         if marker.is_none() && version_marker.is_some() {
-            return Err(Error::new(StorageError::NotImplemented));
+            return Err(StorageError::NotImplemented);
         }
 
         // if marker set, limit +1
@@ -383,14 +384,14 @@ impl ECStore {
         let mut list_result = match self.list_path(&opts).await {
             Ok(res) => res,
             Err(err) => MetaCacheEntriesSortedResult {
-                err: Some(err),
+                err: Some(err.into()),
                 ..Default::default()
             },
         };
 
-        if let Some(err) = &list_result.err {
-            if !is_err_eof(err) {
-                return Err(to_object_err(list_result.err.unwrap(), vec![bucket, prefix]));
+        if let Some(err) = list_result.err.clone() {
+            if err != rustfs_filemeta::Error::Unexpected {
+                return Err(to_object_err(err.into(), vec![bucket, prefix]));
             }
         }
 
@@ -398,11 +399,13 @@ impl ECStore {
             result.forward_past(opts.marker);
         }
 
-        let mut get_objects = list_result
-            .entries
-            .unwrap_or_default()
-            .file_info_versions(bucket, prefix, delimiter.clone(), version_marker)
-            .await;
+        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted(
+            &list_result.entries.unwrap_or_default(),
+            bucket,
+            prefix,
+            delimiter.clone(),
+        )
+        .await;
 
         let is_truncated = {
             if max_keys > 0 && get_objects.len() > max_keys as usize {
@@ -472,16 +475,16 @@ impl ECStore {
 
         if let Some(marker) = &o.marker {
             if !o.prefix.is_empty() && !marker.starts_with(&o.prefix) {
-                return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
+                return Err(Error::Unexpected);
             }
         }
 
         if o.limit == 0 {
-            return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
+            return Err(Error::Unexpected);
         }
 
         if o.prefix.starts_with(SLASH_SEPARATOR) {
-            return Err(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
+            return Err(Error::Unexpected);
         }
 
         let slash_separator = Some(SLASH_SEPARATOR.to_owned());
@@ -546,12 +549,12 @@ impl ECStore {
                 match res{
                     Ok(o) => {
                         error!("list_path err_rx.recv() ok {:?}", &o);
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(clone_err(o.as_ref())) }
+                        MetaCacheEntriesSortedResult{ entries: None, err: Some(o.as_ref().clone().into()) }
                     },
                     Err(err) => {
                         error!("list_path err_rx.recv() err {:?}", &err);
 
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(Error::new(err)) }
+                        MetaCacheEntriesSortedResult{ entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
                     },
                 }
                },
@@ -562,7 +565,7 @@ impl ECStore {
         };
 
         // cancel call exit spawns
-        cancel_tx.send(true)?;
+        cancel_tx.send(true).map_err(Error::other)?;
 
         // wait spawns exit
         join_all(vec![job1, job2]).await;
@@ -584,7 +587,7 @@ impl ECStore {
             }
 
             if !truncated {
-                result.err = Some(Error::new(std::io::Error::from(ErrorKind::UnexpectedEof)));
+                result.err = Some(Error::Unexpected.into());
             }
         }
 
@@ -644,7 +647,7 @@ impl ECStore {
 
         if is_all_not_found(&errs) {
             if is_all_volume_not_found(&errs) {
-                return Err(Error::new(DiskError::VolumeNotFound));
+                return Err(StorageError::VolumeNotFound);
             }
 
             return Ok(Vec::new());
@@ -656,11 +659,11 @@ impl ECStore {
 
         for err in errs.iter() {
             if let Some(err) = err {
-                if is_err_eof(err) {
+                if err == &Error::Unexpected {
                     continue;
                 }
 
-                return Err(clone_err(err));
+                return Err(err.clone());
             } else {
                 all_at_eof = false;
                 continue;
@@ -773,7 +776,7 @@ impl ECStore {
                                     }
                                 })
                             })),
-                            partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                            partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                                 Box::pin({
                                     let value = tx2.clone();
                                     let resolver = resolver.clone();
@@ -814,7 +817,7 @@ impl ECStore {
                             if !sent_err {
                                 let item = ObjectInfoOrErr {
                                     item: None,
-                                    err: Some(err),
+                                    err: Some(err.into()),
                                 };
 
                                 if let Err(err) = result.send(item).await {
@@ -833,7 +836,7 @@ impl ECStore {
                     if let Some(fiter) = opts.filter {
                         if fiter(&fi) {
                             let item = ObjectInfoOrErr {
-                                item: Some(fi.to_object_info(&bucket, &fi.name, {
+                                item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
                                     if let Some(v) = &vcf {
                                         v.versioned(&fi.name)
                                     } else {
@@ -849,7 +852,7 @@ impl ECStore {
                         }
                     } else {
                         let item = ObjectInfoOrErr {
-                            item: Some(fi.to_object_info(&bucket, &fi.name, {
+                            item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
                                 if let Some(v) = &vcf {
                                     v.versioned(&fi.name)
                                 } else {
@@ -871,7 +874,7 @@ impl ECStore {
                     Err(err) => {
                         let item = ObjectInfoOrErr {
                             item: None,
-                            err: Some(err),
+                            err: Some(err.into()),
                         };
 
                         if let Err(err) = result.send(item).await {
@@ -889,7 +892,7 @@ impl ECStore {
                     if let Some(fiter) = opts.filter {
                         if fiter(fi) {
                             let item = ObjectInfoOrErr {
-                                item: Some(fi.to_object_info(&bucket, &fi.name, {
+                                item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
                                     if let Some(v) = &vcf {
                                         v.versioned(&fi.name)
                                     } else {
@@ -905,7 +908,7 @@ impl ECStore {
                         }
                     } else {
                         let item = ObjectInfoOrErr {
-                            item: Some(fi.to_object_info(&bucket, &fi.name, {
+                            item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
                                 if let Some(v) = &vcf {
                                     v.versioned(&fi.name)
                                 } else {
@@ -1013,7 +1016,8 @@ async fn gather_results(
                     }),
                     err: None,
                 })
-                .await?;
+                .await
+                .map_err(Error::other)?;
 
                 returned = true;
                 sender = None;
@@ -1032,9 +1036,10 @@ async fn gather_results(
                 o: MetaCacheEntries(entrys.clone()),
                 ..Default::default()
             }),
-            err: Some(Error::new(std::io::Error::new(ErrorKind::UnexpectedEof, "Unexpected EOF"))),
+            err: Some(Error::Unexpected.into()),
         })
-        .await?;
+        .await
+        .map_err(Error::other)?;
     }
 
     Ok(())
@@ -1073,12 +1078,12 @@ async fn merge_entry_channels(
                 has_entry = in_channels[0].recv()=>{
                     if let Some(entry) = has_entry{
                         // warn!("merge_entry_channels entry {}", &entry.name);
-                        out_channel.send(entry).await?;
+                        out_channel.send(entry).await.map_err(Error::other)?;
                     } else {
                         return Ok(())
                     }
                 },
-                _ = rx.recv()=>return Err(Error::msg("cancel")),
+                _ = rx.recv()=>return Err(Error::other("cancel")),
             }
         }
     }
@@ -1208,7 +1213,7 @@ async fn merge_entry_channels(
 
         if let Some(best_entry) = &best {
             if best_entry.name > last {
-                out_channel.send(best_entry.clone()).await?;
+                out_channel.send(best_entry.clone()).await.map_err(Error::other)?;
                 last = best_entry.name.clone();
             }
             top[best_idx] = None; // Replace entry we just sent
@@ -1291,7 +1296,7 @@ impl SetDisks {
                         }
                     })
                 })),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                     Box::pin({
                         let value = tx2.clone();
                         let resolver = resolver.clone();
@@ -1309,6 +1314,7 @@ impl SetDisks {
             },
         )
         .await
+        .map_err(Error::other)
     }
 }
 

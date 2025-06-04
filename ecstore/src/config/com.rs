@@ -1,14 +1,11 @@
-use super::error::{is_err_config_not_found, ConfigError};
 use super::{storageclass, Config, GLOBAL_StorageClass};
 use crate::disk::RUSTFS_META_BUCKET;
+use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
-use crate::store_err::is_err_object_not_found;
 use crate::utils::path::SLASH_SEPARATOR;
-use common::error::{Error, Result};
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -41,8 +38,8 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
         .get_object_reader(RUSTFS_META_BUCKET, file, None, h, opts)
         .await
         .map_err(|err| {
-            if is_err_object_not_found(&err) {
-                Error::new(ConfigError::NotFound)
+            if err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _)) {
+                Error::ConfigNotFound
             } else {
                 err
             }
@@ -51,7 +48,7 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
     let data = rd.read_all().await?;
 
     if data.is_empty() {
-        return Err(Error::new(ConfigError::NotFound));
+        return Err(Error::ConfigNotFound);
     }
 
     Ok((data, rd.object_info))
@@ -85,8 +82,8 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
     {
         Ok(_) => Ok(()),
         Err(err) => {
-            if is_err_object_not_found(&err) {
-                Err(Error::new(ConfigError::NotFound))
+            if err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _)) {
+                Err(Error::ConfigNotFound)
             } else {
                 Err(err)
             }
@@ -95,9 +92,8 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
 }
 
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
-    let size = data.len();
     let _ = api
-        .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::new(Box::new(Cursor::new(data)), size), opts)
+        .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data), opts)
         .await?;
     Ok(())
 }
@@ -119,7 +115,7 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
     let data = match read_config(api.clone(), config_file.as_str()).await {
         Ok(res) => res,
         Err(err) => {
-            return if is_err_config_not_found(&err) {
+            return if err == Error::ConfigNotFound {
                 warn!("config not found, start to init");
                 let cfg = new_and_save_server_config(api).await?;
                 warn!("config init done");
@@ -141,7 +137,7 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
             let cfg_data = match read_config(api.clone(), config_file.as_str()).await {
                 Ok(res) => res,
                 Err(err) => {
-                    return if is_err_config_not_found(&err) {
+                    return if err == Error::ConfigNotFound {
                         warn!("config not found init start");
                         let cfg = new_and_save_server_config(api).await?;
                         warn!("config not found init done");

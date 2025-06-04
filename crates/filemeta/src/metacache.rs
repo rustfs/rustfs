@@ -732,7 +732,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
     }
 }
 
-pub type UpdateFn<T> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<T>> + Send>> + Send + Sync + 'static>;
+pub type UpdateFn<T> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>> + Send + Sync + 'static>;
 
 #[derive(Clone, Debug, Default)]
 pub struct Opts {
@@ -763,7 +763,7 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
     }
 
     #[allow(unsafe_code)]
-    pub async fn get(self: Arc<Self>) -> Result<T> {
+    pub async fn get(self: Arc<Self>) -> std::io::Result<T> {
         let v_ptr = self.val.load(AtomicOrdering::SeqCst);
         let v = if v_ptr.is_null() {
             None
@@ -816,7 +816,7 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
         }
     }
 
-    async fn update(&self) -> Result<()> {
+    async fn update(&self) -> std::io::Result<()> {
         match (self.update_fn)().await {
             Ok(val) => {
                 self.val.store(Box::into_raw(Box::new(val)), AtomicOrdering::SeqCst);

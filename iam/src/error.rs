@@ -1,4 +1,3 @@
-use ecstore::disk::error::clone_disk_err;
 use ecstore::disk::error::DiskError;
 use policy::policy::Error as PolicyError;
 
@@ -146,17 +145,17 @@ pub fn is_err_no_such_service_account(err: &common::error::Error) -> bool {
     }
 }
 
-pub fn clone_err(e: &common::error::Error) -> common::error::Error {
-    if let Some(e) = e.downcast_ref::<DiskError>() {
-        clone_disk_err(e)
-    } else if let Some(e) = e.downcast_ref::<std::io::Error>() {
-        if let Some(code) = e.raw_os_error() {
-            common::error::Error::new(std::io::Error::from_raw_os_error(code))
-        } else {
-            common::error::Error::new(std::io::Error::new(e.kind(), e.to_string()))
-        }
-    } else {
-        //TODO: Optimize other types
-        common::error::Error::msg(e.to_string())
-    }
-}
+// pub fn clone_err(e: &common::error::Error) -> common::error::Error {
+//     if let Some(e) = e.downcast_ref::<DiskError>() {
+//         clone_disk_err(e)
+//     } else if let Some(e) = e.downcast_ref::<std::io::Error>() {
+//         if let Some(code) = e.raw_os_error() {
+//             common::error::Error::new(std::io::Error::from_raw_os_error(code))
+//         } else {
+//             common::error::Error::new(std::io::Error::new(e.kind(), e.to_string()))
+//         }
+//     } else {
+//         //TODO: Optimize other types
+//         common::error::Error::msg(e.to_string())
+//     }
+// }

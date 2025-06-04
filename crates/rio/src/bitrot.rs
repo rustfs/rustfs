@@ -181,7 +181,7 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     let mut left = want_size;
 
     if left != bitrot_shard_file_size(part_size, shard_size, algo.clone()) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot shard file size mismatch"));
+        return Err(std::io::Error::other("bitrot shard file size mismatch"));
     }
 
     while left > 0 {
@@ -197,7 +197,7 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
 
         let actual_hash = algo.hash_encode(&buf);
         if actual_hash != hash_buf[0..n] {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+            return Err(std::io::Error::other("bitrot hash mismatch"));
         }
 
         left -= read;

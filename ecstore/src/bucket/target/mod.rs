@@ -1,4 +1,4 @@
-use common::error::Result;
+use crate::error::Result;
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

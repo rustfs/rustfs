@@ -1,11 +1,9 @@
-use std::env;
-
-use crate::config::KV;
-use common::error::{Error, Result};
-
 use super::KVS;
+use crate::config::KV;
+use crate::error::{Error, Result};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::env;
 use tracing::warn;
 
 // default_parity_count 默认配置，根据磁盘总数分配校验磁盘数量
@@ -199,7 +197,7 @@ pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
                 }
                 block.as_u64() as usize
             } else {
-                return Err(Error::msg(format!("parse {} format failed", INLINE_BLOCK_ENV)));
+                return Err(Error::other(format!("parse {} format failed", INLINE_BLOCK_ENV)));
             }
         } else {
             DEFAULT_INLINE_BLOCK
@@ -220,7 +218,7 @@ pub fn parse_storage_class(env: &str) -> Result<StorageClass> {
 
     // only two elements allowed in the string - "scheme" and "number of parity drives"
     if s.len() != 2 {
-        return Err(Error::msg(format!(
+        return Err(Error::other(format!(
             "Invalid storage class format: {}. Expected 'Scheme:Number of parity drives'.",
             env
         )));
@@ -228,13 +226,13 @@ pub fn parse_storage_class(env: &str) -> Result<StorageClass> {
 
     // only allowed scheme is "EC"
     if s[0] != SCHEME_PREFIX {
-        return Err(Error::msg(format!("Unsupported scheme {}. Supported scheme is EC.", s[0])));
+        return Err(Error::other(format!("Unsupported scheme {}. Supported scheme is EC.", s[0])));
     }
 
     // Number of parity drives should be integer
     let parity_drives: usize = match s[1].parse() {
         Ok(num) => num,
-        Err(_) => return Err(Error::msg(format!("Failed to parse parity value: {}.", s[1]))),
+        Err(_) => return Err(Error::other(format!("Failed to parse parity value: {}.", s[1]))),
     };
 
     Ok(StorageClass { parity: parity_drives })
@@ -243,14 +241,14 @@ pub fn parse_storage_class(env: &str) -> Result<StorageClass> {
 // ValidateParity validates standard storage class parity.
 pub fn validate_parity(ss_parity: usize, set_drive_count: usize) -> Result<()> {
     // if ss_parity > 0 && ss_parity < MIN_PARITY_DRIVES {
-    //     return Err(Error::msg(format!(
+    //     return Err(Error::other(format!(
     //         "parity {} should be greater than or equal to {}",
     //         ss_parity, MIN_PARITY_DRIVES
     //     )));
     // }
 
     if ss_parity > set_drive_count / 2 {
-        return Err(Error::msg(format!(
+        return Err(Error::other(format!(
             "parity {} should be less than or equal to {}",
             ss_parity,
             set_drive_count / 2
@@ -263,7 +261,7 @@ pub fn validate_parity(ss_parity: usize, set_drive_count: usize) -> Result<()> {
 // Validates the parity drives.
 pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_count: usize) -> Result<()> {
     // if ss_parity > 0 && ss_parity < MIN_PARITY_DRIVES {
-    //     return Err(Error::msg(format!(
+    //     return Err(Error::other(format!(
     //         "Standard storage class parity {} should be greater than or equal to {}",
     //         ss_parity, MIN_PARITY_DRIVES
     //     )));
@@ -272,7 +270,7 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
     // RRS parity drives should be greater than or equal to minParityDrives.
     // Parity below minParityDrives is not supported.
     // if rrs_parity > 0 && rrs_parity < MIN_PARITY_DRIVES {
-    //     return Err(Error::msg(format!(
+    //     return Err(Error::other(format!(
     //         "Reduced redundancy storage class parity {} should be greater than or equal to {}",
     //         rrs_parity, MIN_PARITY_DRIVES
     //     )));
@@ -280,7 +278,7 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
 
     if set_drive_count > 2 {
         if ss_parity > set_drive_count / 2 {
-            return Err(Error::msg(format!(
+            return Err(Error::other(format!(
                 "Standard storage class parity {} should be less than or equal to {}",
                 ss_parity,
                 set_drive_count / 2
@@ -288,7 +286,7 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
         }
 
         if rrs_parity > set_drive_count / 2 {
-            return Err(Error::msg(format!(
+            return Err(Error::other(format!(
                 "Reduced redundancy storage class parity {} should be less than or equal to {}",
                 rrs_parity,
                 set_drive_count / 2
@@ -297,7 +295,7 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
     }
 
     if ss_parity > 0 && rrs_parity > 0 && ss_parity < rrs_parity {
-        return Err(Error::msg(format!("Standard storage class parity drives {} should be greater than or equal to Reduced redundancy storage class parity drives {}", ss_parity, rrs_parity)));
+        return Err(Error::other(format!("Standard storage class parity drives {} should be greater than or equal to Reduced redundancy storage class parity drives {}", ss_parity, rrs_parity)));
     }
     Ok(())
 }

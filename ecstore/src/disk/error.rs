@@ -1,11 +1,11 @@
-use std::io::{self, ErrorKind};
+// use crate::quorum::CheckErrorFn;
+use std::hash::{Hash, Hasher};
+use std::io::{self};
 use std::path::PathBuf;
-
 use tracing::error;
 
-use crate::quorum::CheckErrorFn;
-use crate::utils::ERROR_TYPE_MASK;
-use common::error::{Error, Result};
+pub type Error = DiskError;
+pub type Result<T> = core::result::Result<T, Error>;
 
 // DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
@@ -91,6 +91,9 @@ pub enum DiskError {
     #[error("file is corrupted")]
     FileCorrupt,
 
+    #[error("short write")]
+    ShortWrite,
+
     #[error("bit-rot hash algorithm is invalid")]
     BitrotHashAlgoInvalid,
 
@@ -111,58 +114,238 @@ pub enum DiskError {
 
     #[error("No healing is required")]
     NoHealRequired,
+
+    #[error("method not allowed")]
+    MethodNotAllowed,
+
+    #[error("erasure write quorum")]
+    ErasureWriteQuorum,
+
+    #[error("erasure read quorum")]
+    ErasureReadQuorum,
+
+    #[error("io error")]
+    Io(io::Error),
 }
 
 impl DiskError {
-    /// Checks if the given array of errors contains fatal disk errors.
-    /// If all errors are of the same fatal disk error type, returns the corresponding error.
-    /// Otherwise, returns Ok.
-    ///
-    /// # Parameters
-    /// - `errs`: A slice of optional errors.
-    ///
-    /// # Returns
-    /// If all errors are of the same fatal disk error type, returns the corresponding error.
-    /// Otherwise, returns Ok.
-    pub fn check_disk_fatal_errs(errs: &[Option<Error>]) -> Result<()> {
-        if DiskError::UnsupportedDisk.count_errs(errs) == errs.len() {
-            return Err(DiskError::UnsupportedDisk.into());
+    pub fn other<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        DiskError::Io(std::io::Error::other(error))
+    }
+
+    pub fn is_all_not_found(errs: &[Option<DiskError>]) -> bool {
+        for err in errs.iter() {
+            if let Some(err) = err {
+                if err == &DiskError::FileNotFound || err == &DiskError::FileVersionNotFound {
+                    continue;
+                }
+
+                return false;
+            }
+
+            return false;
         }
 
-        if DiskError::FileAccessDenied.count_errs(errs) == errs.len() {
-            return Err(DiskError::FileAccessDenied.into());
+        !errs.is_empty()
+    }
+
+    pub fn is_err_object_not_found(err: &DiskError) -> bool {
+        matches!(err, &DiskError::FileNotFound) || matches!(err, &DiskError::VolumeNotFound)
+    }
+
+    pub fn is_err_version_not_found(err: &DiskError) -> bool {
+        matches!(err, &DiskError::FileVersionNotFound)
+    }
+
+    // /// If all errors are of the same fatal disk error type, returns the corresponding error.
+    // /// Otherwise, returns Ok.
+    // pub fn check_disk_fatal_errs(errs: &[Option<Error>]) -> Result<()> {
+    //     if DiskError::UnsupportedDisk.count_errs(errs) == errs.len() {
+    //         return Err(DiskError::UnsupportedDisk.into());
+    //     }
+
+    //     if DiskError::FileAccessDenied.count_errs(errs) == errs.len() {
+    //         return Err(DiskError::FileAccessDenied.into());
+    //     }
+
+    //     if DiskError::DiskNotDir.count_errs(errs) == errs.len() {
+    //         return Err(DiskError::DiskNotDir.into());
+    //     }
+
+    //     Ok(())
+    // }
+
+    // pub fn count_errs(&self, errs: &[Option<Error>]) -> usize {
+    //     errs.iter()
+    //         .filter(|&err| match err {
+    //             None => false,
+    //             Some(e) => self.is(e),
+    //         })
+    //         .count()
+    // }
+
+    // pub fn quorum_unformatted_disks(errs: &[Option<Error>]) -> bool {
+    //     DiskError::UnformattedDisk.count_errs(errs) > (errs.len() / 2)
+    // }
+
+    // pub fn should_init_erasure_disks(errs: &[Option<Error>]) -> bool {
+    //     DiskError::UnformattedDisk.count_errs(errs) == errs.len()
+    // }
+
+    // // Check if the error is a disk error
+    // pub fn is(&self, err: &DiskError) -> bool {
+    //     if let Some(e) = err.downcast_ref::<DiskError>() {
+    //         e == self
+    //     } else {
+    //         false
+    //     }
+    // }
+}
+
+impl From<rustfs_filemeta::Error> for DiskError {
+    fn from(e: rustfs_filemeta::Error) -> Self {
+        match e {
+            rustfs_filemeta::Error::Io(e) => DiskError::other(e),
+            rustfs_filemeta::Error::FileNotFound => DiskError::FileNotFound,
+            rustfs_filemeta::Error::FileVersionNotFound => DiskError::FileVersionNotFound,
+            rustfs_filemeta::Error::FileCorrupt => DiskError::FileCorrupt,
+            rustfs_filemeta::Error::MethodNotAllowed => DiskError::MethodNotAllowed,
+            e => DiskError::other(e),
         }
+    }
+}
 
-        if DiskError::DiskNotDir.count_errs(errs) == errs.len() {
-            return Err(DiskError::DiskNotDir.into());
+impl From<std::io::Error> for DiskError {
+    fn from(e: std::io::Error) -> Self {
+        e.downcast::<DiskError>().unwrap_or_else(DiskError::Io)
+    }
+}
+
+impl From<DiskError> for std::io::Error {
+    fn from(e: DiskError) -> Self {
+        match e {
+            DiskError::Io(io_error) => io_error,
+            e => std::io::Error::other(e),
         }
-
-        Ok(())
     }
+}
 
-    pub fn count_errs(&self, errs: &[Option<Error>]) -> usize {
-        errs.iter()
-            .filter(|&err| match err {
-                None => false,
-                Some(e) => self.is(e),
-            })
-            .count()
+impl From<tonic::Status> for DiskError {
+    fn from(e: tonic::Status) -> Self {
+        DiskError::other(e.message().to_string())
     }
+}
 
-    pub fn quorum_unformatted_disks(errs: &[Option<Error>]) -> bool {
-        DiskError::UnformattedDisk.count_errs(errs) > (errs.len() / 2)
-    }
-
-    pub fn should_init_erasure_disks(errs: &[Option<Error>]) -> bool {
-        DiskError::UnformattedDisk.count_errs(errs) == errs.len()
-    }
-
-    /// Check if the error is a disk error
-    pub fn is(&self, err: &Error) -> bool {
-        if let Some(e) = err.downcast_ref::<DiskError>() {
-            e == self
+impl From<protos::proto_gen::node_service::Error> for DiskError {
+    fn from(e: protos::proto_gen::node_service::Error) -> Self {
+        if let Some(err) = DiskError::from_u32(e.code) {
+            if matches!(err, DiskError::Io(_)) {
+                DiskError::other(e.error_info)
+            } else {
+                err
+            }
         } else {
-            false
+            DiskError::other(e.error_info)
+        }
+    }
+}
+
+impl Into<protos::proto_gen::node_service::Error> for DiskError {
+    fn into(self) -> protos::proto_gen::node_service::Error {
+        protos::proto_gen::node_service::Error {
+            code: self.to_u32(),
+            error_info: self.to_string(),
+        }
+    }
+}
+
+impl From<serde_json::Error> for DiskError {
+    fn from(e: serde_json::Error) -> Self {
+        DiskError::other(e)
+    }
+}
+
+impl From<rmp_serde::encode::Error> for DiskError {
+    fn from(e: rmp_serde::encode::Error) -> Self {
+        DiskError::other(e)
+    }
+}
+
+impl From<rmp::encode::ValueWriteError> for DiskError {
+    fn from(e: rmp::encode::ValueWriteError) -> Self {
+        DiskError::other(e)
+    }
+}
+
+impl From<rmp::decode::ValueReadError> for DiskError {
+    fn from(e: rmp::decode::ValueReadError) -> Self {
+        DiskError::other(e)
+    }
+}
+
+impl From<std::string::FromUtf8Error> for DiskError {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        DiskError::other(e)
+    }
+}
+
+impl From<rmp::decode::NumValueReadError> for DiskError {
+    fn from(e: rmp::decode::NumValueReadError) -> Self {
+        DiskError::other(e)
+    }
+}
+
+impl From<tokio::task::JoinError> for DiskError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        DiskError::other(e)
+    }
+}
+
+impl Clone for DiskError {
+    fn clone(&self) -> Self {
+        match self {
+            DiskError::Io(io_error) => DiskError::Io(std::io::Error::new(io_error.kind(), io_error.to_string())),
+            DiskError::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
+            DiskError::Unexpected => DiskError::Unexpected,
+            DiskError::CorruptedFormat => DiskError::CorruptedFormat,
+            DiskError::CorruptedBackend => DiskError::CorruptedBackend,
+            DiskError::UnformattedDisk => DiskError::UnformattedDisk,
+            DiskError::InconsistentDisk => DiskError::InconsistentDisk,
+            DiskError::UnsupportedDisk => DiskError::UnsupportedDisk,
+            DiskError::DiskFull => DiskError::DiskFull,
+            DiskError::DiskNotDir => DiskError::DiskNotDir,
+            DiskError::DiskNotFound => DiskError::DiskNotFound,
+            DiskError::DiskOngoingReq => DiskError::DiskOngoingReq,
+            DiskError::DriveIsRoot => DiskError::DriveIsRoot,
+            DiskError::FaultyRemoteDisk => DiskError::FaultyRemoteDisk,
+            DiskError::FaultyDisk => DiskError::FaultyDisk,
+            DiskError::DiskAccessDenied => DiskError::DiskAccessDenied,
+            DiskError::FileNotFound => DiskError::FileNotFound,
+            DiskError::FileVersionNotFound => DiskError::FileVersionNotFound,
+            DiskError::TooManyOpenFiles => DiskError::TooManyOpenFiles,
+            DiskError::FileNameTooLong => DiskError::FileNameTooLong,
+            DiskError::VolumeExists => DiskError::VolumeExists,
+            DiskError::IsNotRegular => DiskError::IsNotRegular,
+            DiskError::PathNotFound => DiskError::PathNotFound,
+            DiskError::VolumeNotFound => DiskError::VolumeNotFound,
+            DiskError::VolumeNotEmpty => DiskError::VolumeNotEmpty,
+            DiskError::VolumeAccessDenied => DiskError::VolumeAccessDenied,
+            DiskError::FileAccessDenied => DiskError::FileAccessDenied,
+            DiskError::FileCorrupt => DiskError::FileCorrupt,
+            DiskError::BitrotHashAlgoInvalid => DiskError::BitrotHashAlgoInvalid,
+            DiskError::CrossDeviceLink => DiskError::CrossDeviceLink,
+            DiskError::LessData => DiskError::LessData,
+            DiskError::MoreData => DiskError::MoreData,
+            DiskError::OutdatedXLMeta => DiskError::OutdatedXLMeta,
+            DiskError::PartMissingOrCorrupt => DiskError::PartMissingOrCorrupt,
+            DiskError::NoHealRequired => DiskError::NoHealRequired,
+            DiskError::MethodNotAllowed => DiskError::MethodNotAllowed,
+            DiskError::ErasureWriteQuorum => DiskError::ErasureWriteQuorum,
+            DiskError::ErasureReadQuorum => DiskError::ErasureReadQuorum,
+            DiskError::ShortWrite => DiskError::ShortWrite,
         }
     }
 }
@@ -204,11 +387,16 @@ impl DiskError {
             DiskError::OutdatedXLMeta => 0x20,
             DiskError::PartMissingOrCorrupt => 0x21,
             DiskError::NoHealRequired => 0x22,
+            DiskError::MethodNotAllowed => 0x23,
+            DiskError::Io(_) => 0x24,
+            DiskError::ErasureWriteQuorum => 0x25,
+            DiskError::ErasureReadQuorum => 0x26,
+            DiskError::ShortWrite => 0x27,
         }
     }
 
     pub fn from_u32(error: u32) -> Option<Self> {
-        match error & ERROR_TYPE_MASK {
+        match error {
             0x01 => Some(DiskError::MaxVersionsExceeded),
             0x02 => Some(DiskError::Unexpected),
             0x03 => Some(DiskError::CorruptedFormat),
@@ -243,6 +431,11 @@ impl DiskError {
             0x20 => Some(DiskError::OutdatedXLMeta),
             0x21 => Some(DiskError::PartMissingOrCorrupt),
             0x22 => Some(DiskError::NoHealRequired),
+            0x23 => Some(DiskError::MethodNotAllowed),
+            0x24 => Some(DiskError::Io(std::io::Error::other(String::new()))),
+            0x25 => Some(DiskError::ErasureWriteQuorum),
+            0x26 => Some(DiskError::ErasureReadQuorum),
+            0x27 => Some(DiskError::ShortWrite),
             _ => None,
         }
     }
@@ -250,101 +443,116 @@ impl DiskError {
 
 impl PartialEq for DiskError {
     fn eq(&self, other: &Self) -> bool {
-        core::mem::discriminant(self) == core::mem::discriminant(other)
+        match (self, other) {
+            (DiskError::Io(e1), DiskError::Io(e2)) => e1.kind() == e2.kind() && e1.to_string() == e2.to_string(),
+            _ => self.to_u32() == other.to_u32(),
+        }
     }
 }
 
-impl CheckErrorFn for DiskError {
-    fn is(&self, e: &Error) -> bool {
-        self.is(e)
+impl Eq for DiskError {}
+
+impl Hash for DiskError {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            DiskError::Io(e) => e.to_string().hash(state),
+            _ => self.to_u32().hash(state),
+        }
     }
 }
 
-pub fn clone_disk_err(e: &DiskError) -> Error {
-    match e {
-        DiskError::MaxVersionsExceeded => Error::new(DiskError::MaxVersionsExceeded),
-        DiskError::Unexpected => Error::new(DiskError::Unexpected),
-        DiskError::CorruptedFormat => Error::new(DiskError::CorruptedFormat),
-        DiskError::CorruptedBackend => Error::new(DiskError::CorruptedBackend),
-        DiskError::UnformattedDisk => Error::new(DiskError::UnformattedDisk),
-        DiskError::InconsistentDisk => Error::new(DiskError::InconsistentDisk),
-        DiskError::UnsupportedDisk => Error::new(DiskError::UnsupportedDisk),
-        DiskError::DiskFull => Error::new(DiskError::DiskFull),
-        DiskError::DiskNotDir => Error::new(DiskError::DiskNotDir),
-        DiskError::DiskNotFound => Error::new(DiskError::DiskNotFound),
-        DiskError::DiskOngoingReq => Error::new(DiskError::DiskOngoingReq),
-        DiskError::DriveIsRoot => Error::new(DiskError::DriveIsRoot),
-        DiskError::FaultyRemoteDisk => Error::new(DiskError::FaultyRemoteDisk),
-        DiskError::FaultyDisk => Error::new(DiskError::FaultyDisk),
-        DiskError::DiskAccessDenied => Error::new(DiskError::DiskAccessDenied),
-        DiskError::FileNotFound => Error::new(DiskError::FileNotFound),
-        DiskError::FileVersionNotFound => Error::new(DiskError::FileVersionNotFound),
-        DiskError::TooManyOpenFiles => Error::new(DiskError::TooManyOpenFiles),
-        DiskError::FileNameTooLong => Error::new(DiskError::FileNameTooLong),
-        DiskError::VolumeExists => Error::new(DiskError::VolumeExists),
-        DiskError::IsNotRegular => Error::new(DiskError::IsNotRegular),
-        DiskError::PathNotFound => Error::new(DiskError::PathNotFound),
-        DiskError::VolumeNotFound => Error::new(DiskError::VolumeNotFound),
-        DiskError::VolumeNotEmpty => Error::new(DiskError::VolumeNotEmpty),
-        DiskError::VolumeAccessDenied => Error::new(DiskError::VolumeAccessDenied),
-        DiskError::FileAccessDenied => Error::new(DiskError::FileAccessDenied),
-        DiskError::FileCorrupt => Error::new(DiskError::FileCorrupt),
-        DiskError::BitrotHashAlgoInvalid => Error::new(DiskError::BitrotHashAlgoInvalid),
-        DiskError::CrossDeviceLink => Error::new(DiskError::CrossDeviceLink),
-        DiskError::LessData => Error::new(DiskError::LessData),
-        DiskError::MoreData => Error::new(DiskError::MoreData),
-        DiskError::OutdatedXLMeta => Error::new(DiskError::OutdatedXLMeta),
-        DiskError::PartMissingOrCorrupt => Error::new(DiskError::PartMissingOrCorrupt),
-        DiskError::NoHealRequired => Error::new(DiskError::NoHealRequired),
-    }
-}
+// impl CheckErrorFn for DiskError {
+//     fn is(&self, e: &DiskError) -> bool {
 
-pub fn os_err_to_file_err(e: io::Error) -> Error {
-    match e.kind() {
-        ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
-        ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
-        // io::ErrorKind::ConnectionRefused => todo!(),
-        // io::ErrorKind::ConnectionReset => todo!(),
-        // io::ErrorKind::HostUnreachable => todo!(),
-        // io::ErrorKind::NetworkUnreachable => todo!(),
-        // io::ErrorKind::ConnectionAborted => todo!(),
-        // io::ErrorKind::NotConnected => todo!(),
-        // io::ErrorKind::AddrInUse => todo!(),
-        // io::ErrorKind::AddrNotAvailable => todo!(),
-        // io::ErrorKind::NetworkDown => todo!(),
-        // io::ErrorKind::BrokenPipe => todo!(),
-        // io::ErrorKind::AlreadyExists => todo!(),
-        // io::ErrorKind::WouldBlock => todo!(),
-        // io::ErrorKind::NotADirectory => DiskError::FileNotFound,
-        // io::ErrorKind::IsADirectory => DiskError::FileNotFound,
-        // io::ErrorKind::DirectoryNotEmpty => DiskError::VolumeNotEmpty,
-        // io::ErrorKind::ReadOnlyFilesystem => todo!(),
-        // io::ErrorKind::FilesystemLoop => todo!(),
-        // io::ErrorKind::StaleNetworkFileHandle => todo!(),
-        // io::ErrorKind::InvalidInput => todo!(),
-        // io::ErrorKind::InvalidData => todo!(),
-        // io::ErrorKind::TimedOut => todo!(),
-        // io::ErrorKind::WriteZero => todo!(),
-        // io::ErrorKind::StorageFull => DiskError::DiskFull,
-        // io::ErrorKind::NotSeekable => todo!(),
-        // io::ErrorKind::FilesystemQuotaExceeded => todo!(),
-        // io::ErrorKind::FileTooLarge => todo!(),
-        // io::ErrorKind::ResourceBusy => todo!(),
-        // io::ErrorKind::ExecutableFileBusy => todo!(),
-        // io::ErrorKind::Deadlock => todo!(),
-        // io::ErrorKind::CrossesDevices => todo!(),
-        // io::ErrorKind::TooManyLinks =>DiskError::TooManyOpenFiles,
-        // io::ErrorKind::InvalidFilename => todo!(),
-        // io::ErrorKind::ArgumentListTooLong => todo!(),
-        // io::ErrorKind::Interrupted => todo!(),
-        // io::ErrorKind::Unsupported => todo!(),
-        // io::ErrorKind::UnexpectedEof => todo!(),
-        // io::ErrorKind::OutOfMemory => todo!(),
-        // io::ErrorKind::Other => todo!(),
-        // TODO: 把不支持的 king 用字符串处理
-        _ => Error::new(e),
-    }
-}
+//     }
+// }
+
+// pub fn clone_disk_err(e: &DiskError) -> Error {
+//     match e {
+//         DiskError::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
+//         DiskError::Unexpected => DiskError::Unexpected,
+//         DiskError::CorruptedFormat => DiskError::CorruptedFormat,
+//         DiskError::CorruptedBackend => DiskError::CorruptedBackend,
+//         DiskError::UnformattedDisk => DiskError::UnformattedDisk,
+//         DiskError::InconsistentDisk => DiskError::InconsistentDisk,
+//         DiskError::UnsupportedDisk => DiskError::UnsupportedDisk,
+//         DiskError::DiskFull => DiskError::DiskFull,
+//         DiskError::DiskNotDir => DiskError::DiskNotDir,
+//         DiskError::DiskNotFound => DiskError::DiskNotFound,
+//         DiskError::DiskOngoingReq => DiskError::DiskOngoingReq,
+//         DiskError::DriveIsRoot => DiskError::DriveIsRoot,
+//         DiskError::FaultyRemoteDisk => DiskError::FaultyRemoteDisk,
+//         DiskError::FaultyDisk => DiskError::FaultyDisk,
+//         DiskError::DiskAccessDenied => DiskError::DiskAccessDenied,
+//         DiskError::FileNotFound => DiskError::FileNotFound,
+//         DiskError::FileVersionNotFound => DiskError::FileVersionNotFound,
+//         DiskError::TooManyOpenFiles => DiskError::TooManyOpenFiles,
+//         DiskError::FileNameTooLong => DiskError::FileNameTooLong,
+//         DiskError::VolumeExists => DiskError::VolumeExists,
+//         DiskError::IsNotRegular => DiskError::IsNotRegular,
+//         DiskError::PathNotFound => DiskError::PathNotFound,
+//         DiskError::VolumeNotFound => DiskError::VolumeNotFound,
+//         DiskError::VolumeNotEmpty => DiskError::VolumeNotEmpty,
+//         DiskError::VolumeAccessDenied => DiskError::VolumeAccessDenied,
+//         DiskError::FileAccessDenied => DiskError::FileAccessDenied,
+//         DiskError::FileCorrupt => DiskError::FileCorrupt,
+//         DiskError::BitrotHashAlgoInvalid => DiskError::BitrotHashAlgoInvalid,
+//         DiskError::CrossDeviceLink => DiskError::CrossDeviceLink,
+//         DiskError::LessData => DiskError::LessData,
+//         DiskError::MoreData => DiskError::MoreData,
+//         DiskError::OutdatedXLMeta => DiskError::OutdatedXLMeta,
+//         DiskError::PartMissingOrCorrupt => DiskError::PartMissingOrCorrupt,
+//         DiskError::NoHealRequired => DiskError::NoHealRequired,
+//         DiskError::Other(s) => DiskError::Other(s.clone()),
+//     }
+// }
+
+// pub fn os_err_to_file_err(e: io::Error) -> Error {
+//     match e.kind() {
+//         ErrorKind::NotFound => Error::new(DiskError::FileNotFound),
+//         ErrorKind::PermissionDenied => Error::new(DiskError::FileAccessDenied),
+//         // io::ErrorKind::ConnectionRefused => todo!(),
+//         // io::ErrorKind::ConnectionReset => todo!(),
+//         // io::ErrorKind::HostUnreachable => todo!(),
+//         // io::ErrorKind::NetworkUnreachable => todo!(),
+//         // io::ErrorKind::ConnectionAborted => todo!(),
+//         // io::ErrorKind::NotConnected => todo!(),
+//         // io::ErrorKind::AddrInUse => todo!(),
+//         // io::ErrorKind::AddrNotAvailable => todo!(),
+//         // io::ErrorKind::NetworkDown => todo!(),
+//         // io::ErrorKind::BrokenPipe => todo!(),
+//         // io::ErrorKind::AlreadyExists => todo!(),
+//         // io::ErrorKind::WouldBlock => todo!(),
+//         // io::ErrorKind::NotADirectory => DiskError::FileNotFound,
+//         // io::ErrorKind::IsADirectory => DiskError::FileNotFound,
+//         // io::ErrorKind::DirectoryNotEmpty => DiskError::VolumeNotEmpty,
+//         // io::ErrorKind::ReadOnlyFilesystem => todo!(),
+//         // io::ErrorKind::FilesystemLoop => todo!(),
+//         // io::ErrorKind::StaleNetworkFileHandle => todo!(),
+//         // io::ErrorKind::InvalidInput => todo!(),
+//         // io::ErrorKind::InvalidData => todo!(),
+//         // io::ErrorKind::TimedOut => todo!(),
+//         // io::ErrorKind::WriteZero => todo!(),
+//         // io::ErrorKind::StorageFull => DiskError::DiskFull,
+//         // io::ErrorKind::NotSeekable => todo!(),
+//         // io::ErrorKind::FilesystemQuotaExceeded => todo!(),
+//         // io::ErrorKind::FileTooLarge => todo!(),
+//         // io::ErrorKind::ResourceBusy => todo!(),
+//         // io::ErrorKind::ExecutableFileBusy => todo!(),
+//         // io::ErrorKind::Deadlock => todo!(),
+//         // io::ErrorKind::CrossesDevices => todo!(),
+//         // io::ErrorKind::TooManyLinks =>DiskError::TooManyOpenFiles,
+//         // io::ErrorKind::InvalidFilename => todo!(),
+//         // io::ErrorKind::ArgumentListTooLong => todo!(),
+//         // io::ErrorKind::Interrupted => todo!(),
+//         // io::ErrorKind::Unsupported => todo!(),
+//         // io::ErrorKind::UnexpectedEof => todo!(),
+//         // io::ErrorKind::OutOfMemory => todo!(),
+//         // io::ErrorKind::Other => todo!(),
+//         // TODO: 把不支持的 king 用字符串处理
+//         _ => Error::new(e),
+//     }
+// }
 
 #[derive(Debug, thiserror::Error)]
 pub struct FileAccessDeniedWithContext {
@@ -359,235 +567,235 @@ impl std::fmt::Display for FileAccessDeniedWithContext {
     }
 }
 
-pub fn is_unformatted_disk(err: &Error) -> bool {
-    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::UnformattedDisk))
-}
+// pub fn is_unformatted_disk(err: &Error) -> bool {
+//     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::UnformattedDisk))
+// }
 
-pub fn is_err_file_not_found(err: &Error) -> bool {
-    if let Some(ioerr) = err.downcast_ref::<io::Error>() {
-        return ioerr.kind() == ErrorKind::NotFound;
-    }
+// pub fn is_err_file_not_found(err: &Error) -> bool {
+//     if let Some(ioerr) = err.downcast_ref::<io::Error>() {
+//         return ioerr.kind() == ErrorKind::NotFound;
+//     }
 
-    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileNotFound))
-}
+//     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileNotFound))
+// }
 
-pub fn is_err_file_version_not_found(err: &Error) -> bool {
-    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileVersionNotFound))
-}
+// pub fn is_err_file_version_not_found(err: &Error) -> bool {
+//     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::FileVersionNotFound))
+// }
 
-pub fn is_err_volume_not_found(err: &Error) -> bool {
-    matches!(err.downcast_ref::<DiskError>(), Some(DiskError::VolumeNotFound))
-}
+// pub fn is_err_volume_not_found(err: &Error) -> bool {
+//     matches!(err.downcast_ref::<DiskError>(), Some(DiskError::VolumeNotFound))
+// }
 
-pub fn is_err_eof(err: &Error) -> bool {
-    if let Some(ioerr) = err.downcast_ref::<io::Error>() {
-        return ioerr.kind() == ErrorKind::UnexpectedEof;
-    }
-    false
-}
+// pub fn is_err_eof(err: &Error) -> bool {
+//     if let Some(ioerr) = err.downcast_ref::<io::Error>() {
+//         return ioerr.kind() == ErrorKind::UnexpectedEof;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_no_space(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 28;
-    }
-    false
-}
+// pub fn is_sys_err_no_space(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 28;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_invalid_arg(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 22;
-    }
-    false
-}
+// pub fn is_sys_err_invalid_arg(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 22;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_io(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 5;
-    }
-    false
-}
+// pub fn is_sys_err_io(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 5;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_is_dir(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 21;
-    }
-    false
-}
+// pub fn is_sys_err_is_dir(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 21;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_not_dir(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 20;
-    }
-    false
-}
+// pub fn is_sys_err_not_dir(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 20;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_too_long(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 63;
-    }
-    false
-}
+// pub fn is_sys_err_too_long(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 63;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_too_many_symlinks(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 62;
-    }
-    false
-}
+// pub fn is_sys_err_too_many_symlinks(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 62;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_not_empty(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        if no == 66 {
-            return true;
-        }
+// pub fn is_sys_err_not_empty(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         if no == 66 {
+//             return true;
+//         }
 
-        if cfg!(target_os = "solaris") && no == 17 {
-            return true;
-        }
+//         if cfg!(target_os = "solaris") && no == 17 {
+//             return true;
+//         }
 
-        if cfg!(target_os = "windows") && no == 145 {
-            return true;
-        }
-    }
-    false
-}
+//         if cfg!(target_os = "windows") && no == 145 {
+//             return true;
+//         }
+//     }
+//     false
+// }
 
-pub fn is_sys_err_path_not_found(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        if cfg!(target_os = "windows") {
-            if no == 3 {
-                return true;
-            }
-        } else if no == 2 {
-            return true;
-        }
-    }
-    false
-}
+// pub fn is_sys_err_path_not_found(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         if cfg!(target_os = "windows") {
+//             if no == 3 {
+//                 return true;
+//             }
+//         } else if no == 2 {
+//             return true;
+//         }
+//     }
+//     false
+// }
 
-pub fn is_sys_err_handle_invalid(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        if cfg!(target_os = "windows") {
-            if no == 6 {
-                return true;
-            }
-        } else {
-            return false;
-        }
-    }
-    false
-}
+// pub fn is_sys_err_handle_invalid(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         if cfg!(target_os = "windows") {
+//             if no == 6 {
+//                 return true;
+//             }
+//         } else {
+//             return false;
+//         }
+//     }
+//     false
+// }
 
-pub fn is_sys_err_cross_device(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 18;
-    }
-    false
-}
+// pub fn is_sys_err_cross_device(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 18;
+//     }
+//     false
+// }
 
-pub fn is_sys_err_too_many_files(e: &io::Error) -> bool {
-    if let Some(no) = e.raw_os_error() {
-        return no == 23 || no == 24;
-    }
-    false
-}
+// pub fn is_sys_err_too_many_files(e: &io::Error) -> bool {
+//     if let Some(no) = e.raw_os_error() {
+//         return no == 23 || no == 24;
+//     }
+//     false
+// }
 
-pub fn os_is_not_exist(e: &io::Error) -> bool {
-    e.kind() == ErrorKind::NotFound
-}
+// pub fn os_is_not_exist(e: &io::Error) -> bool {
+//     e.kind() == ErrorKind::NotFound
+// }
 
-pub fn os_is_permission(e: &io::Error) -> bool {
-    if e.kind() == ErrorKind::PermissionDenied {
-        return true;
-    }
-    if let Some(no) = e.raw_os_error() {
-        if no == 30 {
-            return true;
-        }
-    }
+// pub fn os_is_permission(e: &io::Error) -> bool {
+//     if e.kind() == ErrorKind::PermissionDenied {
+//         return true;
+//     }
+//     if let Some(no) = e.raw_os_error() {
+//         if no == 30 {
+//             return true;
+//         }
+//     }
 
-    false
-}
+//     false
+// }
 
-pub fn os_is_exist(e: &io::Error) -> bool {
-    e.kind() == ErrorKind::AlreadyExists
-}
+// pub fn os_is_exist(e: &io::Error) -> bool {
+//     e.kind() == ErrorKind::AlreadyExists
+// }
 
-// map_err_not_exists
-pub fn map_err_not_exists(e: io::Error) -> Error {
-    if os_is_not_exist(&e) {
-        return Error::new(DiskError::VolumeNotEmpty);
-    } else if is_sys_err_io(&e) {
-        return Error::new(DiskError::FaultyDisk);
-    }
+// // map_err_not_exists
+// pub fn map_err_not_exists(e: io::Error) -> Error {
+//     if os_is_not_exist(&e) {
+//         return Error::new(DiskError::VolumeNotEmpty);
+//     } else if is_sys_err_io(&e) {
+//         return Error::new(DiskError::FaultyDisk);
+//     }
 
-    Error::new(e)
-}
+//     Error::new(e)
+// }
 
-pub fn convert_access_error(e: io::Error, per_err: DiskError) -> Error {
-    if os_is_not_exist(&e) {
-        return Error::new(DiskError::VolumeNotEmpty);
-    } else if is_sys_err_io(&e) {
-        return Error::new(DiskError::FaultyDisk);
-    } else if os_is_permission(&e) {
-        return Error::new(per_err);
-    }
+// pub fn convert_access_error(e: io::Error, per_err: DiskError) -> Error {
+//     if os_is_not_exist(&e) {
+//         return Error::new(DiskError::VolumeNotEmpty);
+//     } else if is_sys_err_io(&e) {
+//         return Error::new(DiskError::FaultyDisk);
+//     } else if os_is_permission(&e) {
+//         return Error::new(per_err);
+//     }
 
-    Error::new(e)
-}
+//     Error::new(e)
+// }
 
-pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
-    for err in errs.iter() {
-        if let Some(err) = err {
-            if let Some(err) = err.downcast_ref::<DiskError>() {
-                match err {
-                    DiskError::FileNotFound | DiskError::VolumeNotFound | &DiskError::FileVersionNotFound => {
-                        continue;
-                    }
-                    _ => return false,
-                }
-            }
-        }
-        return false;
-    }
+// pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
+//     for err in errs.iter() {
+//         if let Some(err) = err {
+//             if let Some(err) = err.downcast_ref::<DiskError>() {
+//                 match err {
+//                     DiskError::FileNotFound | DiskError::VolumeNotFound | &DiskError::FileVersionNotFound => {
+//                         continue;
+//                     }
+//                     _ => return false,
+//                 }
+//             }
+//         }
+//         return false;
+//     }
 
-    !errs.is_empty()
-}
+//     !errs.is_empty()
+// }
 
-pub fn is_all_volume_not_found(errs: &[Option<Error>]) -> bool {
-    DiskError::VolumeNotFound.count_errs(errs) == errs.len()
-}
+// pub fn is_all_volume_not_found(errs: &[Option<Error>]) -> bool {
+//     DiskError::VolumeNotFound.count_errs(errs) == errs.len()
+// }
 
-pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
-    if errs.is_empty() {
-        return false;
-    }
-    let mut not_found_count = 0;
-    for err in errs.iter().flatten() {
-        match err.downcast_ref() {
-            Some(DiskError::VolumeNotFound) | Some(DiskError::DiskNotFound) => {
-                not_found_count += 1;
-            }
-            _ => {}
-        }
-    }
-    errs.len() == not_found_count
-}
+// pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
+//     if errs.is_empty() {
+//         return false;
+//     }
+//     let mut not_found_count = 0;
+//     for err in errs.iter().flatten() {
+//         match err.downcast_ref() {
+//             Some(DiskError::VolumeNotFound) | Some(DiskError::DiskNotFound) => {
+//                 not_found_count += 1;
+//             }
+//             _ => {}
+//         }
+//     }
+//     errs.len() == not_found_count
+// }
 
-pub fn is_err_os_not_exist(err: &Error) -> bool {
-    if let Some(os_err) = err.downcast_ref::<io::Error>() {
-        os_is_not_exist(os_err)
-    } else {
-        false
-    }
-}
+// pub fn is_err_os_not_exist(err: &Error) -> bool {
+//     if let Some(os_err) = err.downcast_ref::<io::Error>() {
+//         os_is_not_exist(os_err)
+//     } else {
+//         false
+//     }
+// }
 
-pub fn is_err_os_disk_full(err: &Error) -> bool {
-    if let Some(os_err) = err.downcast_ref::<io::Error>() {
-        is_sys_err_no_space(os_err)
-    } else if let Some(e) = err.downcast_ref::<DiskError>() {
-        e == &DiskError::DiskFull
-    } else {
-        false
-    }
-}
+// pub fn is_err_os_disk_full(err: &Error) -> bool {
+//     if let Some(os_err) = err.downcast_ref::<io::Error>() {
+//         is_sys_err_no_space(os_err)
+//     } else if let Some(e) = err.downcast_ref::<DiskError>() {
+//         e == &DiskError::DiskFull
+//     } else {
+//         false
+//     }
+// }

@@ -101,3 +101,11 @@ impl<R> Reader for crate::DecryptReader<R> where R: Reader {}
 impl<R> Reader for crate::CompressReader<R> where R: Reader {}
 
 impl<R> Reader for crate::DecompressReader<R> where R: Reader {}
+
+impl Reader for tokio::fs::File {}
+impl HashReaderDetector for tokio::fs::File {}
+impl EtagResolvable for tokio::fs::File {}
+
+impl Reader for tokio::io::DuplexStream {}
+impl HashReaderDetector for tokio::io::DuplexStream {}
+impl EtagResolvable for tokio::io::DuplexStream {}

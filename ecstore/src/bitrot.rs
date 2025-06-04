@@ -1,15 +1,15 @@
+use crate::disk::error::{Error, Result};
 use crate::{
     disk::{error::DiskError, Disk, DiskAPI},
     erasure::{ReadAt, Writer},
     io::{FileReader, FileWriter},
-    store_api::BitrotAlgorithm,
 };
 use blake2::Blake2b512;
 use blake2::Digest as _;
 use bytes::Bytes;
-use common::error::{Error, Result};
 use highway::{HighwayHash, HighwayHasher, Key};
 use lazy_static::lazy_static;
+use rustfs_utils::HashAlgorithm;
 use sha2::{digest::core_api::BlockSizeUser, Digest, Sha256};
 use std::{any::Any, collections::HashMap, io::Cursor, sync::Arc};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
@@ -576,7 +576,7 @@ pub async fn new_bitrot_filewriter(
     volume: &str,
     path: &str,
     inline: bool,
-    algo: BitrotAlgorithm,
+    algo: HashAlgorithm,
     shard_size: usize,
 ) -> Result<BitrotWriter> {
     let w = BitrotFileWriter::new(disk, volume, path, inline, algo, shard_size).await?;
