@@ -2105,13 +2105,15 @@ impl S3 for FS {
             None
         };
 
-        if legal_hold.is_none() {
-            return Err(s3_error!(InvalidRequest, "Object does not have legal hold"));
-        }
+        let status = if let Some(v) = legal_hold {
+            v
+        } else {
+            ObjectLockLegalHoldStatus::OFF.to_string()
+        };
 
         Ok(S3Response::new(GetObjectLegalHoldOutput {
             legal_hold: Some(ObjectLockLegalHold {
-                status: Some(ObjectLockLegalHoldStatus::from(legal_hold.unwrap_or_default())),
+                status: Some(ObjectLockLegalHoldStatus::from(status)),
             }),
         }))
     }
@@ -2172,6 +2174,20 @@ impl S3 for FS {
         Ok(S3Response::new(PutObjectLegalHoldOutput {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         }))
+    }
+
+    async fn get_object_retention(
+        &self,
+        _req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        Err(s3_error!(NotImplemented, "GetObjectRetention is not implemented yet"))
+    }
+
+    async fn put_object_retention(
+        &self,
+        _req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        Err(s3_error!(NotImplemented, "PutObjectRetention is not implemented yet"))
     }
 }
 
