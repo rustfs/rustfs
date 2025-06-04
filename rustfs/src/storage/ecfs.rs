@@ -2178,16 +2178,99 @@ impl S3 for FS {
 
     async fn get_object_retention(
         &self,
-        _req: S3Request<GetObjectRetentionInput>,
+        req: S3Request<GetObjectRetentionInput>,
     ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
-        Err(s3_error!(NotImplemented, "GetObjectRetention is not implemented yet"))
+        let GetObjectRetentionInput {
+            bucket, key, version_id, ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        // check object lock
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
+            .await
+            .map_err(to_s3_error)?;
+
+        let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
+            error!("get_object_info failed, {}", e.to_string());
+            s3_error!(InternalError, "{}", e.to_string())
+        })?;
+
+        let mode = if let Some(ref ud) = object_info.user_defined {
+            ud.get("x-amz-object-lock-mode")
+                .map(|v| ObjectLockRetentionMode::from(v.as_str().to_string()))
+        } else {
+            None
+        };
+
+        let retain_until_date = if let Some(ref ud) = object_info.user_defined {
+            ud.get("x-amz-object-lock-retain-until-date")
+                .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
+                .map(Timestamp::from)
+        } else {
+            None
+        };
+
+        Ok(S3Response::new(GetObjectRetentionOutput {
+            retention: Some(ObjectLockRetention { mode, retain_until_date }),
+        }))
     }
 
     async fn put_object_retention(
         &self,
-        _req: S3Request<PutObjectRetentionInput>,
+        req: S3Request<PutObjectRetentionInput>,
     ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
-        Err(s3_error!(NotImplemented, "PutObjectRetention is not implemented yet"))
+        let PutObjectRetentionInput {
+            bucket,
+            key,
+            retention,
+            version_id,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        // check object lock
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+
+        // TODO: check allow
+
+        let mut eval_metadata = HashMap::new();
+
+        if let Some(v) = retention {
+            let mode = v.mode.map(|v| v.as_str().to_string()).unwrap_or_default();
+            let retain_until_date = v
+                .retain_until_date
+                .map(|v| OffsetDateTime::from(v).format(&Rfc3339).unwrap())
+                .unwrap_or_default();
+            let now = OffsetDateTime::now_utc();
+            eval_metadata.insert("x-amz-object-lock-mode".to_string(), mode);
+            eval_metadata.insert("x-amz-object-lock-retain-until-date".to_string(), retain_until_date);
+            eval_metadata.insert(
+                format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
+                format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+            );
+        }
+
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
+            .await
+            .map_err(to_s3_error)?;
+        opts.eval_metadata = Some(eval_metadata);
+
+        store.put_object_metadata(&bucket, &key, &opts).await.map_err(|e| {
+            error!("put_object_metadata failed, {}", e.to_string());
+            s3_error!(InternalError, "{}", e.to_string())
+        })?;
+
+        Ok(S3Response::new(PutObjectRetentionOutput {
+            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+        }))
     }
 }
 
