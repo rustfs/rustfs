@@ -60,6 +60,7 @@ Help all of humanity reduce storage costs and achieve data security.
 
 | RustFS | Other object storage|
 | - | - |
+| Powerful Console | Simple and useless Console |
 | Developed based on Rust language, memory is safer | Developed in Go or C, with potential issues like memory GC/leaks |
 | Does not report logs to third-party countries	 | Reporting logs to other third countries may violate national security laws |
 | Licensed under Apache, more business-friendly	 | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
