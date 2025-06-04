@@ -19,6 +19,14 @@ lazy_static! {
     pub static ref GLOBAL_ConfigSys: ConfigSys = ConfigSys::new();
 }
 
+/// Standard config keys and values.
+pub const ENABLE_KEY: &str = "enable";
+pub const COMMENT_KEY: &str = "comment";
+
+/// Enable values
+pub const ENABLE_ON: &str = "on";
+pub const ENABLE_OFF: &str = "off";
+
 pub const ENV_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 pub const ENV_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
 pub const ENV_ROOT_USER: &str = "RUSTFS_ROOT_USER";

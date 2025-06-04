@@ -1,6 +1,5 @@
-use crate::AdapterConfig;
-use crate::Error;
-use crate::Event;
+use crate::config::adapter::AdapterConfig;
+use crate::{Error, Event};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -10,6 +9,26 @@ pub(crate) mod kafka;
 pub(crate) mod mqtt;
 #[cfg(feature = "webhook")]
 pub(crate) mod webhook;
+
+#[allow(dead_code)]
+const NOTIFY_KAFKA_SUB_SYS: &str = "notify_kafka";
+#[allow(dead_code)]
+const NOTIFY_MQTT_SUB_SYS: &str = "notify_mqtt";
+#[allow(dead_code)]
+const NOTIFY_MY_SQL_SUB_SYS: &str = "notify_mysql";
+#[allow(dead_code)]
+const NOTIFY_NATS_SUB_SYS: &str = "notify_nats";
+#[allow(dead_code)]
+const NOTIFY_NSQ_SUB_SYS: &str = "notify_nsq";
+#[allow(dead_code)]
+const NOTIFY_ES_SUB_SYS: &str = "notify_elasticsearch";
+#[allow(dead_code)]
+const NOTIFY_AMQP_SUB_SYS: &str = "notify_amqp";
+#[allow(dead_code)]
+const NOTIFY_POSTGRES_SUB_SYS: &str = "notify_postgres";
+#[allow(dead_code)]
+const NOTIFY_REDIS_SUB_SYS: &str = "notify_redis";
+const NOTIFY_WEBHOOK_SUB_SYS: &str = "notify_webhook";
 
 /// The `ChannelAdapterType` enum represents the different types of channel adapters.
 ///
@@ -68,7 +87,7 @@ pub trait ChannelAdapter: Send + Sync + 'static {
 }
 
 /// Creates channel adapters based on the provided configuration.
-pub fn create_adapters(configs: &[AdapterConfig]) -> Result<Vec<Arc<dyn ChannelAdapter>>, Error> {
+pub fn create_adapters(configs: Vec<AdapterConfig>) -> Result<Vec<Arc<dyn ChannelAdapter>>, Error> {
     let mut adapters: Vec<Arc<dyn ChannelAdapter>> = Vec::new();
 
     for config in configs {

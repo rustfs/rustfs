@@ -1,8 +1,7 @@
-use crate::config::{default_queue_limit, STORE_PREFIX};
-use crate::KafkaConfig;
+use crate::config::kafka::KafkaConfig;
+use crate::config::{default_queue_limit, DEFAULT_RETRY_INTERVAL, STORE_PREFIX};
 use crate::{ChannelAdapter, ChannelAdapterType};
-use crate::{Error, QueueStore};
-use crate::{Event, DEFAULT_RETRY_INTERVAL};
+use crate::{Error, Event, QueueStore};
 use async_trait::async_trait;
 use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};

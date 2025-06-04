@@ -1,17 +1,18 @@
 use common::error::{Error, Result};
+use ecstore::utils::path::dir;
 use serde::{de::DeserializeOwned, Serialize};
 use snap::raw::{Decoder, Encoder};
 use std::collections::HashMap;
 use std::io::Read;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 use uuid::Uuid;
 
 /// Keys in storage
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     /// Key name
     pub name: String,
@@ -42,7 +43,7 @@ impl Key {
             key_str = format!("{}:{}", self.item_count, self.name);
         }
 
-        let compress_ext = if self.compress { ".snappy" } else { "" };
+        let compress_ext = if self.compress { COMPRESS_EXT } else { "" };
         format!("{}{}{}", key_str, self.extension, compress_ext)
     }
 }
@@ -50,7 +51,7 @@ impl Key {
 /// Parse key from file name
 #[allow(clippy::redundant_closure)]
 pub fn parse_key(filename: &str) -> Key {
-    let compress = filename.ends_with(".snappy");
+    let compress = filename.ends_with(COMPRESS_EXT);
     let filename = if compress {
         &filename[..filename.len() - 7] // 移除 ".snappy"
     } else {
@@ -85,7 +86,7 @@ pub fn parse_key(filename: &str) -> Key {
 /// Store the characteristics of the project
 pub trait Store<T>: Send + Sync
 where
-    T: Serialize + DeserializeOwned + Send + Sync,
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Store a single item
     fn put(&self, item: T) -> Result<Key>;
@@ -142,24 +143,86 @@ pub struct QueueStore<T> {
     entries: Arc<RwLock<HashMap<String, i64>>>,
     /// Type tags
     _phantom: PhantomData<T>,
+    /// Whether to compress
+    compress: bool,
+    /// Store name
+    name: String,
 }
 
 impl<T> QueueStore<T>
 where
-    T: Serialize + DeserializeOwned + Send + Sync,
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     /// Create a new queue store
-    pub fn new(directory: impl Into<PathBuf>, limit: u64, ext: Option<String>) -> Self {
+    pub fn new<P: AsRef<Path>>(directory: P, name: String, limit: u64, ext: Option<String>) -> Self {
         let limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
         let ext = ext.unwrap_or_else(|| DEFAULT_EXT.to_string());
+        let mut path = PathBuf::from(directory.as_ref());
+        path.push(&name);
+
+        // Create a directory (if it doesn't exist)
+        if !path.exists() {
+            if let Err(e) = fs::create_dir_all(&path) {
+                tracing::error!("创建存储目录失败 {}: {}", path.display(), e);
+            }
+        }
 
         Self {
             directory: directory.into(),
+            name,
             entry_limit: limit,
             file_ext: ext,
+            compress: true, // Default to compressing
             entries: Arc::new(RwLock::new(HashMap::with_capacity(limit as usize))),
             _phantom: PhantomData,
         }
+    }
+
+    /// Set the file extension
+    pub fn with_file_ext(mut self, file_ext: &str) -> Self {
+        self.file_ext = file_ext.to_string();
+        self
+    }
+
+    /// Set whether to compress or not
+    pub fn with_compression(mut self, compress: bool) -> Self {
+        self.compress = compress;
+        self
+    }
+
+    /// Get the file path
+    fn get_file_path(&self, key: &Key) -> PathBuf {
+        let mut filename = key.to_string();
+        filename.push_str(if self.compress { COMPRESS_EXT } else { &self.file_ext });
+        self.directory.join(filename)
+    }
+
+    /// Serialize the project
+    fn serialize_item(&self, item: &T) -> Result<Vec<u8>> {
+        let data = serde_json::to_vec(item).map_err(|e| Error::msg(format!("Serialization failed: {}", e)))?;
+
+        if self.compress {
+            let mut encoder = Encoder::new();
+            Ok(encoder
+                .compress_vec(&data)
+                .map_err(|e| Error::msg(format!("Compression failed: {}", e)))?)
+        } else {
+            Ok(data)
+        }
+    }
+
+    /// Deserialize the project
+    fn deserialize_item(&self, data: &[u8], is_compressed: bool) -> Result<T> {
+        let data = if is_compressed {
+            let mut decoder = Decoder::new();
+            decoder
+                .decompress_vec(data)
+                .map_err(|e| Error::msg(format!("Unzipping failed: {}", e)))?
+        } else {
+            data.to_vec()
+        };
+
+        serde_json::from_slice(&data).map_err(|e| Error::msg(format!("Deserialization failed: {}", e)))
     }
 
     /// Lists all files in the directory, sorted by modification time (oldest takes precedence.)）
@@ -264,7 +327,7 @@ where
 
 impl<T> Store<T> for QueueStore<T>
 where
-    T: Serialize + DeserializeOwned + Send + Sync + Clone,
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     fn open(&self) -> Result<()> {
         // Create a directory (if it doesn't exist)

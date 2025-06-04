@@ -510,7 +510,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     GLOBAL_ConfigSys.init(store.clone()).await?;
 
     // event system configuration
-    // GLOBAL_EventSys.init(store.clone()).await?;
+    // GLOBAL_EVENT_SYS.init(store.clone()).await?;
 
     // Initialize event notifier
     event::init_event_notifier(opt.event_config).await;

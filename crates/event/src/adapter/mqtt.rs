@@ -1,7 +1,6 @@
-use crate::Error;
-use crate::Event;
-use crate::MqttConfig;
+use crate::config::mqtt::MqttConfig;
 use crate::{ChannelAdapter, ChannelAdapterType};
+use crate::{Error, Event};
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use std::time::Duration;
