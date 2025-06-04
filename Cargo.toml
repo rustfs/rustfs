@@ -19,6 +19,9 @@ members = [
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
     "crates/zip",
+    "crates/filemeta",
+    "crates/rio",
+
 ]
 resolver = "2"
 
@@ -53,6 +56,8 @@ rustfs-config = { path = "./crates/config", version = "0.0.1" }
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
 rustfs-utils = { path = "crates/utils", version = "0.0.1" }
+rustfs-rio = { path = "crates/rio", version = "0.0.1" }
+rustfs-filemeta = { path = "crates/filemeta", version = "0.0.1" }
 workers = { path = "./common/workers", version = "0.0.1" }
 tokio-tar = "0.3.1"
 atoi = "2.0.0"

@@ -1,0 +1,438 @@
+use crate::error::{Error, Result};
+use rmp_serde::Serializer;
+use rustfs_utils::HashAlgorithm;
+use serde::Deserialize;
+use serde::Serialize;
+use std::collections::HashMap;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use crate::headers::RESERVED_METADATA_PREFIX;
+use crate::headers::RUSTFS_HEALING;
+use crate::headers::X_RUSTFS_INLINE_DATA;
+
+pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
+pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
+
+// Additional constants from Go version
+pub const NULL_VERSION_ID: &str = "null";
+// pub const RUSTFS_ERASURE_UPGRADED: &str = "x-rustfs-internal-erasure-upgraded";
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+pub struct ObjectPartInfo {
+    pub etag: String,
+    pub number: usize,
+    pub size: usize,
+    pub actual_size: usize, // Original data size
+    pub mod_time: Option<OffsetDateTime>,
+    // Index holds the index of the part in the erasure coding
+    pub index: Option<Vec<u8>>,
+    // Checksums holds checksums of the part
+    pub checksums: Option<HashMap<String, String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
+// ChecksumInfo - carries checksums of individual scattered parts per disk.
+pub struct ChecksumInfo {
+    pub part_number: usize,
+    pub algorithm: HashAlgorithm,
+    pub hash: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Default, Clone)]
+pub enum ErasureAlgo {
+    #[default]
+    Invalid = 0,
+    ReedSolomon = 1,
+}
+
+impl ErasureAlgo {
+    pub fn valid(&self) -> bool {
+        *self > ErasureAlgo::Invalid
+    }
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            ErasureAlgo::Invalid => 0,
+            ErasureAlgo::ReedSolomon => 1,
+        }
+    }
+
+    pub fn from_u8(u: u8) -> Self {
+        match u {
+            1 => ErasureAlgo::ReedSolomon,
+            _ => ErasureAlgo::Invalid,
+        }
+    }
+}
+
+impl std::fmt::Display for ErasureAlgo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErasureAlgo::Invalid => write!(f, "Invalid"),
+            ErasureAlgo::ReedSolomon => write!(f, "{}", ERASURE_ALGORITHM),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
+// ErasureInfo holds erasure coding and bitrot related information.
+pub struct ErasureInfo {
+    // Algorithm is the String representation of erasure-coding-algorithm
+    pub algorithm: String,
+    // DataBlocks is the number of data blocks for erasure-coding
+    pub data_blocks: usize,
+    // ParityBlocks is the number of parity blocks for erasure-coding
+    pub parity_blocks: usize,
+    // BlockSize is the size of one erasure-coded block
+    pub block_size: usize,
+    // Index is the index of the current disk
+    pub index: usize,
+    // Distribution is the distribution of the data and parity blocks
+    pub distribution: Vec<usize>,
+    // Checksums holds all bitrot checksums of all erasure encoded blocks
+    pub checksums: Vec<ChecksumInfo>,
+}
+
+impl ErasureInfo {
+    pub fn get_checksum_info(&self, part_number: usize) -> ChecksumInfo {
+        for sum in &self.checksums {
+            if sum.part_number == part_number {
+                return sum.clone();
+            }
+        }
+
+        ChecksumInfo {
+            algorithm: HashAlgorithm::HighwayHash256S,
+            ..Default::default()
+        }
+    }
+
+    /// Calculate the size of each shard.
+    pub fn shard_size(&self) -> usize {
+        self.block_size.div_ceil(self.data_blocks)
+    }
+    /// Calculate the total erasure file size for a given original size.
+    // Returns the final erasure size from the original size
+    pub fn shard_file_size(&self, total_length: usize) -> usize {
+        if total_length == 0 {
+            return 0;
+        }
+
+        let num_shards = total_length / self.block_size;
+        let last_block_size = total_length % self.block_size;
+        let last_shard_size = last_block_size.div_ceil(self.data_blocks);
+        num_shards * self.shard_size() + last_shard_size
+    }
+
+    /// Check if this ErasureInfo equals another ErasureInfo
+    pub fn equals(&self, other: &ErasureInfo) -> bool {
+        self.algorithm == other.algorithm
+            && self.data_blocks == other.data_blocks
+            && self.parity_blocks == other.parity_blocks
+            && self.block_size == other.block_size
+            && self.index == other.index
+            && self.distribution == other.distribution
+    }
+}
+
+// #[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+pub struct FileInfo {
+    pub volume: String,
+    pub name: String,
+    pub version_id: Option<Uuid>,
+    pub is_latest: bool,
+    pub deleted: bool,
+    // Transition related fields
+    pub transition_status: Option<String>,
+    pub transitioned_obj_name: Option<String>,
+    pub transition_tier: Option<String>,
+    pub transition_version_id: Option<String>,
+    pub expire_restored: bool,
+    pub data_dir: Option<Uuid>,
+    pub mod_time: Option<OffsetDateTime>,
+    pub size: usize,
+    // File mode bits
+    pub mode: Option<u32>,
+    // WrittenByVersion is the unix time stamp of the version that created this version of the object
+    pub written_by_version: Option<u64>,
+    pub metadata: HashMap<String, String>,
+    pub parts: Vec<ObjectPartInfo>,
+    pub erasure: ErasureInfo,
+    // MarkDeleted marks this version as deleted
+    pub mark_deleted: bool,
+    // ReplicationState - Internal replication state to be passed back in ObjectInfo
+    // pub replication_state: Option<ReplicationState>, // TODO: implement ReplicationState
+    pub data: Option<Vec<u8>>,
+    pub num_versions: usize,
+    pub successor_mod_time: Option<OffsetDateTime>,
+    pub fresh: bool,
+    pub idx: usize,
+    // Combined checksum when object was uploaded
+    pub checksum: Option<Vec<u8>>,
+    pub versioned: bool,
+}
+
+impl FileInfo {
+    pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
+        let indexs = {
+            let cardinality = data_blocks + parity_blocks;
+            let mut nums = vec![0; cardinality];
+            let key_crc = crc32fast::hash(object.as_bytes());
+
+            let start = key_crc as usize % cardinality;
+            for i in 1..=cardinality {
+                nums[i - 1] = 1 + ((start + i) % cardinality);
+            }
+
+            nums
+        };
+        Self {
+            erasure: ErasureInfo {
+                algorithm: String::from(ERASURE_ALGORITHM),
+                data_blocks,
+                parity_blocks,
+                block_size: BLOCK_SIZE_V2,
+                distribution: indexs,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        if self.deleted {
+            return true;
+        }
+
+        let data_blocks = self.erasure.data_blocks;
+        let parity_blocks = self.erasure.parity_blocks;
+
+        (data_blocks >= parity_blocks)
+            && (data_blocks > 0)
+            && (self.erasure.index > 0
+                && self.erasure.index <= data_blocks + parity_blocks
+                && self.erasure.distribution.len() == (data_blocks + parity_blocks))
+    }
+
+    pub fn get_etag(&self) -> Option<String> {
+        self.metadata.get("etag").cloned()
+    }
+
+    pub fn write_quorum(&self, quorum: usize) -> usize {
+        if self.deleted {
+            return quorum;
+        }
+
+        if self.erasure.data_blocks == self.erasure.parity_blocks {
+            return self.erasure.data_blocks + 1;
+        }
+
+        self.erasure.data_blocks
+    }
+
+    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        self.serialize(&mut Serializer::new(&mut buf))?;
+
+        Ok(buf)
+    }
+
+    pub fn unmarshal(buf: &[u8]) -> Result<Self> {
+        let t: FileInfo = rmp_serde::from_slice(buf)?;
+        Ok(t)
+    }
+
+    pub fn add_object_part(
+        &mut self,
+        num: usize,
+        etag: String,
+        part_size: usize,
+        mod_time: Option<OffsetDateTime>,
+        actual_size: usize,
+    ) {
+        let part = ObjectPartInfo {
+            etag,
+            number: num,
+            size: part_size,
+            mod_time,
+            actual_size,
+            index: None,
+            checksums: None,
+        };
+
+        for p in self.parts.iter_mut() {
+            if p.number == num {
+                *p = part;
+                return;
+            }
+        }
+
+        self.parts.push(part);
+
+        self.parts.sort_by(|a, b| a.number.cmp(&b.number));
+    }
+
+    // to_part_offset gets the part index where offset is located, returns part index and offset
+    pub fn to_part_offset(&self, offset: usize) -> Result<(usize, usize)> {
+        if offset == 0 {
+            return Ok((0, 0));
+        }
+
+        let mut part_offset = offset;
+        for (i, part) in self.parts.iter().enumerate() {
+            let part_index = i;
+            if part_offset < part.size {
+                return Ok((part_index, part_offset));
+            }
+
+            part_offset -= part.size
+        }
+
+        Err(Error::other("part not found"))
+    }
+
+    pub fn set_healing(&mut self) {
+        self.metadata.insert(RUSTFS_HEALING.to_string(), "true".to_string());
+    }
+
+    pub fn set_inline_data(&mut self) {
+        self.metadata.insert(X_RUSTFS_INLINE_DATA.to_owned(), "true".to_owned());
+    }
+    pub fn inline_data(&self) -> bool {
+        self.metadata.get(X_RUSTFS_INLINE_DATA).is_some_and(|v| v == "true")
+    }
+
+    /// Check if the object is compressed
+    pub fn is_compressed(&self) -> bool {
+        self.metadata
+            .contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX))
+    }
+
+    /// Check if the object is remote (transitioned to another tier)
+    pub fn is_remote(&self) -> bool {
+        !self.transition_tier.as_ref().map_or(true, |s| s.is_empty())
+    }
+
+    /// Get the data directory for this object
+    pub fn get_data_dir(&self) -> String {
+        if self.deleted {
+            return "delete-marker".to_string();
+        }
+        self.data_dir.map_or("".to_string(), |dir| dir.to_string())
+    }
+
+    /// Read quorum returns expected read quorum for this FileInfo
+    pub fn read_quorum(&self, dquorum: usize) -> usize {
+        if self.deleted {
+            return dquorum;
+        }
+        self.erasure.data_blocks
+    }
+
+    /// Create a shallow copy with minimal information for READ MRF checks
+    pub fn shallow_copy(&self) -> Self {
+        Self {
+            volume: self.volume.clone(),
+            name: self.name.clone(),
+            version_id: self.version_id,
+            deleted: self.deleted,
+            erasure: self.erasure.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Check if this FileInfo equals another FileInfo
+    pub fn equals(&self, other: &FileInfo) -> bool {
+        // Check if both are compressed or both are not compressed
+        if self.is_compressed() != other.is_compressed() {
+            return false;
+        }
+
+        // Check transition info
+        if !self.transition_info_equals(other) {
+            return false;
+        }
+
+        // Check mod time
+        if self.mod_time != other.mod_time {
+            return false;
+        }
+
+        // Check erasure info
+        self.erasure.equals(&other.erasure)
+    }
+
+    /// Check if transition related information are equal
+    pub fn transition_info_equals(&self, other: &FileInfo) -> bool {
+        self.transition_status == other.transition_status
+            && self.transition_tier == other.transition_tier
+            && self.transitioned_obj_name == other.transitioned_obj_name
+            && self.transition_version_id == other.transition_version_id
+    }
+
+    /// Check if metadata maps are equal
+    pub fn metadata_equals(&self, other: &FileInfo) -> bool {
+        if self.metadata.len() != other.metadata.len() {
+            return false;
+        }
+        for (k, v) in &self.metadata {
+            if other.metadata.get(k) != Some(v) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Check if replication related fields are equal
+    pub fn replication_info_equals(&self, other: &FileInfo) -> bool {
+        self.mark_deleted == other.mark_deleted
+        // TODO: Add replication_state comparison when implemented
+        // && self.replication_state == other.replication_state
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FileInfoVersions {
+    // Name of the volume.
+    pub volume: String,
+
+    // Name of the file.
+    pub name: String,
+
+    // Represents the latest mod time of the
+    // latest version.
+    pub latest_mod_time: Option<OffsetDateTime>,
+
+    pub versions: Vec<FileInfo>,
+    pub free_versions: Vec<FileInfo>,
+}
+
+impl FileInfoVersions {
+    pub fn find_version_index(&self, v: &str) -> Option<usize> {
+        if v.is_empty() {
+            return None;
+        }
+
+        let vid = Uuid::parse_str(v).unwrap_or_default();
+
+        self.versions.iter().position(|v| v.version_id == Some(vid))
+    }
+
+    /// Calculate the total size of all versions for this object
+    pub fn size(&self) -> usize {
+        self.versions.iter().map(|v| v.size).sum()
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct RawFileInfo {
+    pub buf: Vec<u8>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct FilesInfo {
+    pub files: Vec<FileInfo>,
+    pub is_truncated: bool,
+}
