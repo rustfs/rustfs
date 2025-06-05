@@ -16,6 +16,7 @@ use s3s::S3Result;
 
 use super::rpc::RPC_PREFIX;
 use super::ADMIN_PREFIX;
+use super::MINIO_ADMIN_PREFIX;
 
 pub struct S3Router<T> {
     router: Router<T>,
@@ -64,7 +65,7 @@ where
             }
         }
 
-        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX)
+        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || uri.path().starts_with(MINIO_ADMIN_PREFIX)
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {

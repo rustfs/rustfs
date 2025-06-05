@@ -1,6 +1,7 @@
 pub mod error;
 pub mod globals;
 pub mod last_minute;
+pub mod bucket_stats;
 
 // is ','
 pub static DEFAULT_DELIMITER: u8 = 44;
