@@ -1,7 +1,7 @@
-use crate::disk::error_reduce::{reduce_read_quorum_errs, reduce_write_quorum_errs, OBJECT_OP_IGNORED_ERRS};
+use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
 use crate::disk::{
-    self, conv_part_err_to_int, has_part_err, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND,
-    CHECK_PART_SUCCESS,
+    self, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS,
+    conv_part_err_to_int, has_part_err,
 };
 use crate::erasure_coding;
 use crate::error::{Error, Result};
@@ -9,24 +9,24 @@ use crate::global::GLOBAL_MRFState;
 use crate::heal::data_usage_cache::DataUsageCache;
 use crate::store_api::ObjectToDelete;
 use crate::{
-    cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
-    config::{storageclass, GLOBAL_StorageClass},
+    cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
+    config::{GLOBAL_StorageClass, storageclass},
     disk::{
-        endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo,
-        DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+        CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
+        RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+        UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
-    error::{to_object_err, StorageError},
+    error::{StorageError, to_object_err},
     global::{
-        get_global_deployment_id, is_dist_erasure, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP,
-        GLOBAL_LOCAL_DISK_SET_DRIVES,
+        GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id,
+        is_dist_erasure,
     },
     heal::{
         data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT},
         data_usage_cache::{DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo},
         heal_commands::{
-            HealOpts, HealScanMode, HealingTracker, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE,
-            DRIVE_STATE_OK, HEAL_DEEP_SCAN, HEAL_ITEM_OBJECT, HEAL_NORMAL_SCAN,
+            DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_DEEP_SCAN, HEAL_ITEM_OBJECT,
+            HEAL_NORMAL_SCAN, HealOpts, HealScanMode, HealingTracker,
         },
         heal_ops::BG_HEALING_UUID,
     },
@@ -39,13 +39,13 @@ use crate::{
     store_init::load_format_erasure,
     utils::{
         crypto::{base64_decode, base64_encode, hex},
-        path::{encode_dir_object, has_suffix, SLASH_SEPARATOR},
+        path::{SLASH_SEPARATOR, encode_dir_object, has_suffix},
     },
     xhttp,
 };
 use crate::{disk::STORAGE_FORMAT_FILE, heal::mrf::PartialOperation};
 use crate::{
-    heal::data_scanner::{globalHealConfig, HEAL_DELETE_DANGLING},
+    heal::data_scanner::{HEAL_DELETE_DANGLING, globalHealConfig},
     store_api::ListObjectVersionsInfo,
 };
 use crate::{
@@ -57,18 +57,18 @@ use chrono::Utc;
 use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
-use lock::{namespace_lock::NsLockMap, LockApi};
+use lock::{LockApi, namespace_lock::NsLockMap};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use md5::{Digest as Md5Digest, Md5};
 use rand::{
     thread_rng,
-    {seq::SliceRandom, Rng},
+    {Rng, seq::SliceRandom},
 };
 use rustfs_filemeta::{
-    file_info_from_raw, merge_file_meta_versions, FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry,
-    MetadataResolutionParams, ObjectPartInfo, RawFileInfo,
+    FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
+    RawFileInfo, file_info_from_raw, merge_file_meta_versions,
 };
-use rustfs_rio::{bitrot_verify, BitrotReader, BitrotWriter, EtagResolvable, HashReader, Writer};
+use rustfs_rio::{BitrotReader, BitrotWriter, EtagResolvable, HashReader, Writer, bitrot_verify};
 use rustfs_utils::HashAlgorithm;
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
@@ -84,8 +84,8 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::{
-    io::{empty, AsyncWrite},
-    sync::{broadcast, RwLock},
+    io::{AsyncWrite, empty},
+    sync::{RwLock, broadcast},
 };
 use tokio::{
     select,
@@ -406,11 +406,7 @@ impl SetDisks {
             }
         }
 
-        if max >= write_quorum {
-            data_dir
-        } else {
-            None
-        }
+        if max >= write_quorum { data_dir } else { None }
     }
 
     #[allow(dead_code)]
@@ -741,11 +737,7 @@ impl SetDisks {
 
     fn common_time(times: &[Option<OffsetDateTime>], quorum: usize) -> Option<OffsetDateTime> {
         let (time, count) = Self::common_time_and_occurrence(times);
-        if count >= quorum {
-            time
-        } else {
-            None
-        }
+        if count >= quorum { time } else { None }
     }
 
     fn common_time_and_occurrence(times: &[Option<OffsetDateTime>]) -> (Option<OffsetDateTime>, usize) {
@@ -786,11 +778,7 @@ impl SetDisks {
 
     fn common_etag(etags: &[Option<String>], quorum: usize) -> Option<String> {
         let (etag, count) = Self::common_etags(etags);
-        if count >= quorum {
-            etag
-        } else {
-            None
-        }
+        if count >= quorum { etag } else { None }
     }
 
     fn common_etags(etags: &[Option<String>]) -> (Option<String>, usize) {
@@ -1837,13 +1825,7 @@ impl SetDisks {
 
         let total_size = fi.size;
 
-        let length = {
-            if length == 0 {
-                total_size - offset
-            } else {
-                length
-            }
-        };
+        let length = { if length == 0 { total_size - offset } else { length } };
 
         if offset > total_size || offset + length > total_size {
             return Err(Error::other("offset out of range"));
@@ -1896,12 +1878,16 @@ impl SetDisks {
                     readers.push(Some(reader));
                     errors.push(None);
                 } else if let Some(disk) = disk_op {
+                    // Calculate ceiling division of till_offset by shard_size
+                    let till_offset =
+                        till_offset.div_ceil(erasure.shard_size()) * HashAlgorithm::HighwayHash256.size() + till_offset;
+
                     let rd = disk
                         .read_file_stream(
                             bucket,
                             &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or(Uuid::nil()), part_number),
+                            part_offset,
                             till_offset,
-                            part_length,
                         )
                         .await?;
                     let reader = BitrotReader::new(rd, erasure.shard_size(), HashAlgorithm::HighwayHash256);
@@ -2403,8 +2389,10 @@ impl SetDisks {
                         }
 
                         if !lastest_meta.deleted && lastest_meta.erasure.distribution.len() != available_disks.len() {
-                            let err_str = format!("unexpected file distribution ({:?}) from available disks ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
-                                lastest_meta.erasure.distribution, available_disks, bucket, object, version_id);
+                            let err_str = format!(
+                                "unexpected file distribution ({:?}) from available disks ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
+                                lastest_meta.erasure.distribution, available_disks, bucket, object, version_id
+                            );
                             warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
@@ -2416,8 +2404,10 @@ impl SetDisks {
 
                         let latest_disks = Self::shuffle_disks(&available_disks, &lastest_meta.erasure.distribution);
                         if !lastest_meta.deleted && lastest_meta.erasure.distribution.len() != outdate_disks.len() {
-                            let err_str = format!("unexpected file distribution ({:?}) from outdated disks ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
-                                lastest_meta.erasure.distribution, outdate_disks, bucket, object, version_id);
+                            let err_str = format!(
+                                "unexpected file distribution ({:?}) from outdated disks ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
+                                lastest_meta.erasure.distribution, outdate_disks, bucket, object, version_id
+                            );
                             warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
@@ -2428,8 +2418,14 @@ impl SetDisks {
                         }
 
                         if !lastest_meta.deleted && lastest_meta.erasure.distribution.len() != parts_metadata.len() {
-                            let err_str = format!("unexpected file distribution ({:?}) from metadata entries ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
-                                lastest_meta.erasure.distribution, parts_metadata.len(), bucket, object, version_id);
+                            let err_str = format!(
+                                "unexpected file distribution ({:?}) from metadata entries ({:?}), looks like backend disks have been manually modified refusing to heal {}/{}({})",
+                                lastest_meta.erasure.distribution,
+                                parts_metadata.len(),
+                                bucket,
+                                object,
+                                version_id
+                            );
                             warn!(err_str);
                             let err = DiskError::other(err_str);
                             return Ok((
@@ -3907,6 +3903,7 @@ impl ObjectIO for SetDisks {
                 };
 
                 writers.push(Some(writer));
+                errors.push(None);
             } else {
                 errors.push(Some(DiskError::DiskNotFound));
                 writers.push(None);
@@ -3915,6 +3912,7 @@ impl ObjectIO for SetDisks {
 
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
         if nil_count < write_quorum {
+            error!("not enough disks to write: {:?}", errors);
             if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
                 return Err(to_object_err(write_err.into(), vec![bucket, object]));
             }
@@ -3926,7 +3924,7 @@ impl ObjectIO for SetDisks {
 
         let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录
 
-        mem::replace(&mut data.stream, reader);
+        let _ = mem::replace(&mut data.stream, reader);
         // if let Err(err) = close_bitrot_writers(&mut writers).await {
         //     error!("close_bitrot_writers err {:?}", err);
         // }
@@ -4549,25 +4547,11 @@ impl StorageAPI for SetDisks {
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
-        let is_inline_buffer = {
-            if let Some(sc) = GLOBAL_StorageClass.get() {
-                sc.should_inline(erasure.shard_file_size(data.content_length), opts.versioned)
-            } else {
-                false
-            }
-        };
-
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
             if let Some(disk) = disk_op {
-                let writer = if is_inline_buffer {
-                    BitrotWriter::new(
-                        Writer::from_cursor(Cursor::new(Vec::new())),
-                        erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256,
-                    )
-                } else {
+                let writer = {
                     let f = match disk
                         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, erasure.shard_file_size(data.content_length))
                         .await
@@ -4584,6 +4568,7 @@ impl StorageAPI for SetDisks {
                 };
 
                 writers.push(Some(writer));
+                errors.push(None);
             } else {
                 errors.push(Some(DiskError::DiskNotFound));
                 writers.push(None);
@@ -4601,8 +4586,9 @@ impl StorageAPI for SetDisks {
 
         let stream = mem::replace(&mut data.stream, HashReader::new(Box::new(Cursor::new(Vec::new())), 0, 0, None, false)?);
 
-        let (mut reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录
-        mem::replace(&mut data.stream, reader);
+        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录
+
+        let _ = mem::replace(&mut data.stream, reader);
 
         let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 
@@ -5755,9 +5741,9 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::error::DiskError;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
+    use crate::disk::error::DiskError;
     use crate::store_api::CompletePart;
     use rustfs_filemeta::ErasureInfo;
     use std::collections::HashMap;

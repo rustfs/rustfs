@@ -7,7 +7,7 @@ use serde_urlencoded::from_bytes;
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use crate::{admin::router::Operation, storage::error::to_s3_error};
+use crate::{admin::router::Operation, error::ApiError};
 
 pub struct ListPools {}
 
@@ -33,7 +33,7 @@ impl Operation for ListPools {
         let mut pools_status = Vec::new();
 
         for (idx, _) in endpoints.as_ref().iter().enumerate() {
-            let state = store.status(idx).await.map_err(to_s3_error)?;
+            let state = store.status(idx).await.map_err(ApiError::from)?;
 
             pools_status.push(state);
         }
@@ -103,7 +103,7 @@ impl Operation for StatusPool {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let pools_status = store.status(idx).await.map_err(to_s3_error)?;
+        let pools_status = store.status(idx).await.map_err(ApiError::from)?;
 
         let data = serde_json::to_vec(&pools_status)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
@@ -191,7 +191,7 @@ impl Operation for StartDecommission {
         }
 
         if !pools_indices.is_empty() {
-            store.decommission(ctx_rx, pools_indices).await.map_err(to_s3_error)?;
+            store.decommission(ctx_rx, pools_indices).await.map_err(ApiError::from)?;
         }
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))
@@ -245,7 +245,7 @@ impl Operation for CancelDecommission {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        store.decommission_cancel(idx).await.map_err(to_s3_error)?;
+        store.decommission_cancel(idx).await.map_err(ApiError::from)?;
 
         Ok(S3Response::new((StatusCode::OK, Body::default())))
     }

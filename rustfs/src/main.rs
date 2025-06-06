@@ -73,7 +73,7 @@ const MI_B: usize = 1024 * 1024;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[allow(clippy::result_large_err)]
-fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
+fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
 
     match req.metadata().get("authorization") {
@@ -120,7 +120,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize event notifier
     event::init_event_notifier(opt.event_config).await;
 
-    let server_addr = net::parse_and_resolve_address(opt.address.as_str())?;
+    let server_addr = net::parse_and_resolve_address(opt.address.as_str()).map_err(|err| Error::other(err))?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
@@ -140,7 +140,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
-        .map_err(|err| Error::from_string(err.to_string()))?;
+        .map_err(|err| Error::other(err.to_string()))?;
 
     // Print RustFS-style logging for pool formatting
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
@@ -189,7 +189,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone())
         .await
-        .map_err(|err| Error::from_string(err.to_string()))?;
+        .map_err(|err| Error::other(err))?;
 
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
@@ -518,7 +518,7 @@ async fn run(opt: config::Opt) -> Result<()> {
             ..Default::default()
         })
         .await
-        .map_err(|err| Error::from_string(err.to_string()))?;
+        .map_err(|err| Error::other(err))?;
 
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
 
@@ -528,7 +528,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
         error!("new_global_notification_sys failed {:?}", &err);
-        Error::from_string(err.to_string())
+        Error::other(err)
     })?;
 
     // init scanner
@@ -549,7 +549,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         if console_address.is_empty() {
             error!("console_address is empty");
-            return Err(Error::from_string("console_address is empty".to_string()));
+            return Err(Error::other("console_address is empty".to_string()));
         }
 
         tokio::spawn(async move {
@@ -571,7 +571,7 @@ async fn run(opt: config::Opt) -> Result<()> {
                 // stop event notifier
                 rustfs_event_notifier::shutdown().await.map_err(|err| {
                     error!("Failed to shut down the notification system: {}", err);
-                    Error::from_string(err.to_string())
+                    Error::other(err)
                 })?;
             }
 

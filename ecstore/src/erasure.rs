@@ -1,6 +1,6 @@
 use crate::bitrot::{BitrotReader, BitrotWriter};
 use crate::disk::error::{Error, Result};
-use crate::disk::error_reduce::{reduce_write_quorum_errs, OBJECT_OP_IGNORED_ERRS};
+use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
 use crate::io::Etag;
 use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
@@ -72,11 +72,7 @@ impl Erasure {
                 if total_size > 0 {
                     let new_len = {
                         let remain = total_size - total;
-                        if remain > self.block_size {
-                            self.block_size
-                        } else {
-                            remain
-                        }
+                        if remain > self.block_size { self.block_size } else { remain }
                     };
 
                     if new_len == 0 && total > 0 {

@@ -164,6 +164,9 @@ pub enum StorageError {
     #[error("first disk wiat")]
     FirstDiskWait,
 
+    #[error("Bucket policy not found")]
+    BucketPolicyNotFound,
+
     #[error("Io error: {0}")]
     Io(std::io::Error),
 }
@@ -376,6 +379,7 @@ impl Clone for StorageError {
             StorageError::FirstDiskWait => StorageError::FirstDiskWait,
             StorageError::TooManyOpenFiles => StorageError::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageError::NoHealRequired,
+            StorageError::BucketPolicyNotFound => StorageError::BucketPolicyNotFound,
         }
     }
 }
@@ -438,6 +442,7 @@ impl StorageError {
             StorageError::ConfigNotFound => 0x35,
             StorageError::TooManyOpenFiles => 0x36,
             StorageError::NoHealRequired => 0x37,
+            StorageError::BucketPolicyNotFound => 0x38,
         }
     }
 
@@ -502,6 +507,7 @@ impl StorageError {
             0x35 => Some(StorageError::ConfigNotFound),
             0x36 => Some(StorageError::TooManyOpenFiles),
             0x37 => Some(StorageError::NoHealRequired),
+            0x38 => Some(StorageError::BucketPolicyNotFound),
             _ => None,
         }
     }

@@ -2,8 +2,7 @@
 
 use super::IOStats;
 use crate::disk::Info;
-use common::error::Result;
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Result};
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;

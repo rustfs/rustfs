@@ -1,8 +1,8 @@
 use crate::utils::ellipses::*;
-use common::error::{Error, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::env;
+use std::io::{Error, Result};
 use tracing::debug;
 
 /// Supported set sizes this is used to find the optimal
@@ -89,7 +89,7 @@ pub struct DisksLayout {
 impl DisksLayout {
     pub fn from_volumes<T: AsRef<str>>(args: &[T]) -> Result<Self> {
         if args.is_empty() {
-            return Err(Error::from_string("Invalid argument"));
+            return Err(Error::other("Invalid argument"));
         }
 
         let is_ellipses = args.iter().any(|v| has_ellipses(&[v]));
@@ -98,7 +98,7 @@ impl DisksLayout {
             debug!("{} not set use default:0, {:?}", ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, err);
             "0".to_string()
         });
-        let set_drive_count: usize = set_drive_count_env.parse()?;
+        let set_drive_count: usize = set_drive_count_env.parse().map_err(Error::other)?;
 
         // None of the args have ellipses use the old style.
         if !is_ellipses {
@@ -116,7 +116,7 @@ impl DisksLayout {
         let mut layout = Vec::with_capacity(args.len());
         for arg in args.iter() {
             if !has_ellipses(&[arg]) && args.len() > 1 {
-                return Err(Error::from_string(
+                return Err(Error::other(
                     "all args must have ellipses for pool expansion (Invalid arguments specified)",
                 ));
             }
@@ -189,7 +189,7 @@ fn get_all_sets<T: AsRef<str>>(set_drive_count: usize, is_ellipses: bool, args: 
     for args in set_args.iter() {
         for arg in args {
             if unique_args.contains(arg) {
-                return Err(Error::from_string(format!("Input args {} has duplicate ellipses", arg)));
+                return Err(Error::other(format!("Input args {} has duplicate ellipses", arg)));
             }
             unique_args.insert(arg);
         }
@@ -245,7 +245,7 @@ impl EndpointSet {
         }
     }
 
-    pub fn from_volumes<T: AsRef<str>>(args: &[T], set_drive_count: usize) -> Result<Self, Error> {
+    pub fn from_volumes<T: AsRef<str>>(args: &[T], set_drive_count: usize) -> Result<Self> {
         let mut arg_patterns = Vec::with_capacity(args.len());
         for arg in args {
             arg_patterns.push(find_ellipses_patterns(arg.as_ref())?);
@@ -377,20 +377,20 @@ fn get_set_indexes<T: AsRef<str>>(
     arg_patterns: &[ArgPattern],
 ) -> Result<Vec<Vec<usize>>> {
     if args.is_empty() || total_sizes.is_empty() {
-        return Err(Error::from_string("Invalid argument"));
+        return Err(Error::other("Invalid argument"));
     }
 
     for &size in total_sizes {
         // Check if total_sizes has minimum range upto set_size
         if size < SET_SIZES[0] || size < set_drive_count {
-            return Err(Error::from_string(format!("Incorrect number of endpoints provided, size {}", size)));
+            return Err(Error::other(format!("Incorrect number of endpoints provided, size {}", size)));
         }
     }
 
     let common_size = get_divisible_size(total_sizes);
     let mut set_counts = possible_set_counts(common_size);
     if set_counts.is_empty() {
-        return Err(Error::from_string(format!(
+        return Err(Error::other(format!(
             "Incorrect number of endpoints provided, number of drives {} is not divisible by any supported erasure set sizes {}",
             common_size, 0
         )));
@@ -399,7 +399,7 @@ fn get_set_indexes<T: AsRef<str>>(
     // Returns possible set counts with symmetry.
     set_counts = possible_set_counts_with_symmetry(&set_counts, arg_patterns);
     if set_counts.is_empty() {
-        return Err(Error::from_string("No symmetric distribution detected with input endpoints provided"));
+        return Err(Error::other("No symmetric distribution detected with input endpoints provided"));
     }
 
     let set_size = {
@@ -407,7 +407,7 @@ fn get_set_indexes<T: AsRef<str>>(
             let has_set_drive_count = set_counts.contains(&set_drive_count);
 
             if !has_set_drive_count {
-                return Err(Error::from_string(format!(
+                return Err(Error::other(format!(
                     "Invalid set drive count {}. Acceptable values for {:?} number drives are {:?}",
                     set_drive_count, common_size, &set_counts
                 )));
@@ -416,7 +416,7 @@ fn get_set_indexes<T: AsRef<str>>(
         } else {
             set_counts = possible_set_counts_with_symmetry(&set_counts, arg_patterns);
             if set_counts.is_empty() {
-                return Err(Error::from_string(format!(
+                return Err(Error::other(format!(
                     "No symmetric distribution detected with input endpoints , drives {} cannot be spread symmetrically by any supported erasure set sizes {:?}",
                     common_size, &set_counts
                 )));
@@ -427,7 +427,7 @@ fn get_set_indexes<T: AsRef<str>>(
     };
 
     if !is_valid_set_size(set_size) {
-        return Err(Error::from_string("Incorrect number of endpoints provided3"));
+        return Err(Error::other("Incorrect number of endpoints provided3"));
     }
 
     Ok(total_sizes

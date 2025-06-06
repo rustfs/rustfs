@@ -1,29 +1,29 @@
 use super::error::{Error, Result};
 use super::os::{is_root_disk, rename_all};
-use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use super::{
-    os, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, Info,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE_BACKUP,
+    BUCKET_META_PREFIX, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
+    FileInfoVersions, Info, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+    STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, os,
 };
+use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 
 use crate::bucket::metadata_sys::{self};
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::disk::STORAGE_FORMAT_FILE;
 use crate::disk::error::FileAccessDeniedWithContext;
 use crate::disk::error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error};
 use crate::disk::fs::{
-    access, lstat, lstat_std, remove, remove_all_std, remove_std, rename, O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY,
+    O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename,
 };
 use crate::disk::os::{check_path_length, is_empty_dir};
-use crate::disk::STORAGE_FORMAT_FILE;
 use crate::disk::{
-    conv_part_err_to_int, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
-    CHECK_PART_VOLUME_NOT_FOUND,
+    CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN, CHECK_PART_VOLUME_NOT_FOUND,
+    conv_part_err_to_int,
 };
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::heal::data_scanner::{
-    lc_has_active_rules, rep_has_active_rules, scan_data_folder, ScannerItem, ShouldSleepFn, SizeSummary,
+    ScannerItem, ShouldSleepFn, SizeSummary, lc_has_active_rules, rep_has_active_rules, scan_data_folder,
 };
 use crate::heal::data_scanner_metric::{ScannerMetric, ScannerMetrics};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
@@ -35,23 +35,23 @@ use crate::new_object_layer_fn;
 use crate::store_api::{ObjectInfo, StorageAPI};
 use crate::utils::os::get_info;
 use crate::utils::path::{
-    clean, decode_dir_object, encode_dir_object, has_suffix, path_join, path_join_buf, GLOBAL_DIR_SUFFIX,
-    GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR,
+    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
+    path_join, path_join_buf,
 };
 
 use common::defer;
 use path_absolutize::Absolutize;
 use rustfs_filemeta::{
-    get_file_info, read_xl_meta_no_data, Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, Opts,
-    RawFileInfo, UpdateFn,
+    Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, Opts, RawFileInfo, UpdateFn, get_file_info,
+    read_xl_meta_no_data,
 };
-use rustfs_rio::{bitrot_verify, Reader};
+use rustfs_rio::{Reader, bitrot_verify};
 use rustfs_utils::HashAlgorithm;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::io::SeekFrom;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 use std::{
     fs::Metadata,
@@ -60,8 +60,8 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
-use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -1550,7 +1550,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "debug", skip(self, fi))]
     async fn rename_data(
         &self,
         src_volume: &str,

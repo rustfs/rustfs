@@ -115,6 +115,15 @@ impl From<ecstore::error::StorageError> for Error {
     }
 }
 
+impl From<Error> for ecstore::error::StorageError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::ConfigNotFound => ecstore::error::StorageError::ConfigNotFound,
+            _ => ecstore::error::StorageError::other(e),
+        }
+    }
+}
+
 impl From<policy::error::Error> for Error {
     fn from(e: policy::error::Error) -> Self {
         match e {
@@ -149,6 +158,12 @@ impl From<policy::error::Error> for Error {
             policy::error::Error::CryptoError(e) => Error::CryptoError(e),
             policy::error::Error::ErrCredMalformed => Error::ErrCredMalformed,
         }
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        std::io::Error::other(e)
     }
 }
 

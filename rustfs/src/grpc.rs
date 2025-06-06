@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Cursor, pin::Pin};
 
-use common::error::Error as EcsError;
+// use common::error::Error as EcsError;
 use ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},

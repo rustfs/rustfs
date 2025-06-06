@@ -1,6 +1,6 @@
-use common::error::{Error, Result};
 use lazy_static::*;
 use regex::Regex;
+use std::io::{Error, Result};
 
 lazy_static! {
     static ref ELLIPSES_RE: Regex = Regex::new(r"(.*)(\{[0-9a-z]*\.\.\.[0-9a-z]*\})(.*)").unwrap();
@@ -107,7 +107,10 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
     let mut parts = match ELLIPSES_RE.captures(arg) {
         Some(caps) => caps,
         None => {
-            return Err(Error::from_string(format!("Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4", arg)));
+            return Err(Error::other(format!(
+                "Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4",
+                arg
+            )));
         }
     };
 
@@ -144,7 +147,10 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
             || p.suffix.contains(OPEN_BRACES)
             || p.suffix.contains(CLOSE_BRACES)
         {
-            return Err(Error::from_string(format!("Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4", arg)));
+            return Err(Error::other(format!(
+                "Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4",
+                arg
+            )));
         }
     }
 
@@ -165,10 +171,10 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
 /// {33...64}
 pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
     if !pattern.contains(OPEN_BRACES) {
-        return Err(Error::from_string("Invalid argument"));
+        return Err(Error::other("Invalid argument"));
     }
     if !pattern.contains(OPEN_BRACES) {
-        return Err(Error::from_string("Invalid argument"));
+        return Err(Error::other("Invalid argument"));
     }
 
     let ellipses_range: Vec<&str> = pattern
@@ -178,15 +184,15 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
         .collect();
 
     if ellipses_range.len() != 2 {
-        return Err(Error::from_string("Invalid argument"));
+        return Err(Error::other("Invalid argument"));
     }
 
     // TODO: Add support for hexadecimals.
-    let start = ellipses_range[0].parse::<usize>()?;
-    let end = ellipses_range[1].parse::<usize>()?;
+    let start = ellipses_range[0].parse::<usize>().map_err(|e| Error::other(e))?;
+    let end = ellipses_range[1].parse::<usize>().map_err(|e| Error::other(e))?;
 
     if start > end {
-        return Err(Error::from_string("Invalid argument:range start cannot be bigger than end"));
+        return Err(Error::other("Invalid argument:range start cannot be bigger than end"));
     }
 
     let mut ret: Vec<String> = Vec::with_capacity(end - start + 1);

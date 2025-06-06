@@ -1,8 +1,7 @@
 use super::IOStats;
 use crate::disk::Info;
-use common::error::Result;
 use nix::sys::{stat::stat, statfs::statfs};
-use std::io::Error;
+use std::io::{Error, Result};
 use std::path::Path;
 
 /// returns total and free bytes available in a directory, e.g. `/`.
@@ -22,7 +21,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
                 bavail,
                 bfree,
                 p.as_ref().display()
-            )))
+            )));
         }
     };
 
@@ -34,7 +33,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
                 reserved,
                 blocks,
                 p.as_ref().display()
-            )))
+            )));
         }
     };
 
@@ -47,7 +46,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
                 free,
                 total,
                 p.as_ref().display()
-            )))
+            )));
         }
     };
 
