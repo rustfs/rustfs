@@ -142,7 +142,7 @@ reqwest = { version = "0.12.19", default-features = false, features = [
     "rustls-tls",
     "charset",
     "http2",
-    "macos-system-configuration",
+    "system-proxy",
     "stream",
     "json",
     "blocking",
