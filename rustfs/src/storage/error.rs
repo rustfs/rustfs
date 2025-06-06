@@ -1,6 +1,6 @@
 use common::error::Error;
-use ecstore::{disk::error::is_err_file_not_found, error::StorageError};
-use s3s::{s3_error, S3Error, S3ErrorCode};
+use ecstore::error::StorageError;
+use s3s::{S3Error, S3ErrorCode, s3_error};
 pub fn to_s3_error(err: Error) -> S3Error {
     if let Some(storage_err) = err.downcast_ref::<StorageError>() {
         return match storage_err {
@@ -55,18 +55,6 @@ pub fn to_s3_error(err: Error) -> S3Error {
             // extended
             StorageError::ObjectExistsAsDirectory(bucket, object) => {
                 s3_error!(InvalidArgument, "Object exists on :{} as directory {}", bucket, object)
-            }
-            StorageError::InsufficientReadQuorum => {
-                s3_error!(SlowDown, "Storage resources are insufficient for the read operation")
-            }
-            StorageError::InsufficientWriteQuorum => {
-                s3_error!(SlowDown, "Storage resources are insufficient for the write operation")
-            }
-            StorageError::DecommissionNotStarted => s3_error!(InvalidArgument, "Decommission Not Started"),
-            StorageError::DecommissionAlreadyRunning => s3_error!(InternalError, "Decommission already running"),
-
-            StorageError::VolumeNotFound(bucket) => {
-                s3_error!(NoSuchBucket, "bucket not found {}", bucket)
             }
             StorageError::InvalidPart(bucket, object, version_id) => {
                 s3_error!(
@@ -187,10 +175,12 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::ServiceUnavailable);
-        assert!(s3_err
-            .message()
-            .unwrap()
-            .contains("Storage reached its minimum free drive threshold"));
+        assert!(
+            s3_err
+                .message()
+                .unwrap()
+                .contains("Storage reached its minimum free drive threshold")
+        );
     }
 
     #[test]
@@ -257,10 +247,12 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::InvalidArgument);
-        assert!(s3_err
-            .message()
-            .unwrap()
-            .contains("Object name contains forward slash as prefix"));
+        assert!(
+            s3_err
+                .message()
+                .unwrap()
+                .contains("Object name contains forward slash as prefix")
+        );
         assert!(s3_err.message().unwrap().contains("test-bucket"));
         assert!(s3_err.message().unwrap().contains("/invalid-object"));
     }
@@ -358,10 +350,12 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::SlowDown);
-        assert!(s3_err
-            .message()
-            .unwrap()
-            .contains("Storage resources are insufficient for the read operation"));
+        assert!(
+            s3_err
+                .message()
+                .unwrap()
+                .contains("Storage resources are insufficient for the read operation")
+        );
     }
 
     #[test]
@@ -371,10 +365,12 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::SlowDown);
-        assert!(s3_err
-            .message()
-            .unwrap()
-            .contains("Storage resources are insufficient for the write operation"));
+        assert!(
+            s3_err
+                .message()
+                .unwrap()
+                .contains("Storage resources are insufficient for the write operation")
+        );
     }
 
     #[test]

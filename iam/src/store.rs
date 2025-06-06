@@ -1,7 +1,7 @@
 pub mod object;
 
 use crate::cache::Cache;
-use common::error::Result;
+use crate::error::Result;
 use policy::{auth::UserIdentity, policy::PolicyDoc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

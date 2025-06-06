@@ -1,6 +1,6 @@
 use super::key_name::KeyName;
+use crate::error::Error;
 use crate::policy::{Error as PolicyError, Validator};
-use common::error::Error;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

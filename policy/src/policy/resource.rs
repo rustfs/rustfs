@@ -1,4 +1,4 @@
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -101,7 +101,7 @@ impl Resource {
 
 impl TryFrom<&str> for Resource {
     type Error = Error;
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
         let resource = if value.starts_with(Self::S3_PREFIX) {
             Resource::S3(value.strip_prefix(Self::S3_PREFIX).unwrap().into())
         } else {
@@ -115,7 +115,7 @@ impl TryFrom<&str> for Resource {
 
 impl Validator for Resource {
     type Error = Error;
-    fn is_valid(&self) -> Result<(), Error> {
+    fn is_valid(&self) -> std::result::Result<(), Error> {
         match self {
             Self::S3(pattern) => {
                 if pattern.is_empty() || pattern.starts_with('/') {
@@ -139,7 +139,7 @@ impl Validator for Resource {
 }
 
 impl Serialize for Resource {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -151,7 +151,7 @@ impl Serialize for Resource {
 }
 
 impl<'de> Deserialize<'de> for Resource {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {

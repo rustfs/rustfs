@@ -169,3 +169,10 @@ impl From<rmp::decode::MarkerReadError> for Error {
         Error::RmpDecodeMarkerRead(serr)
     }
 }
+
+pub fn is_io_eof(e: &Error) -> bool {
+    match e {
+        Error::Io(e) => e.kind() == std::io::ErrorKind::UnexpectedEof,
+        _ => false,
+    }
+}

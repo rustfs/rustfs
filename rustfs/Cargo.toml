@@ -86,6 +86,8 @@ tower-http = { workspace = true, features = [
     "cors",
 ] }
 uuid = { workspace = true }
+rustfs-filemeta.workspace = true
+thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true

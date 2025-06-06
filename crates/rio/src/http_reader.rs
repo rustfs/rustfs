@@ -176,7 +176,7 @@ impl Stream for ReceiverStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = Pin::new(&mut self.receiver).poll_recv(cx);
         match &poll {
-            Poll::Ready(Some(Some(ref bytes))) => {
+            Poll::Ready(Some(Some(bytes))) => {
                 http_log!("[ReceiverStream] poll_next: got {} bytes", bytes.len());
             }
             Poll::Ready(Some(None)) => {

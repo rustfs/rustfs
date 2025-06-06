@@ -1,15 +1,14 @@
 use super::{GroupInfo, MappedPolicy, Store, UserType};
+use crate::error::{is_err_config_not_found, Error, Result};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
     get_global_action_cred,
     manager::{extract_jwt_claims, get_default_policyes},
 };
-use common::error::{Error, Result};
 use ecstore::{
     config::{
         com::{delete_config, read_config, read_config_with_metadata, save_config},
-        error::is_err_config_not_found,
         RUSTFS_CONFIG_PREFIX,
     },
     store::ECStore,
@@ -153,7 +152,7 @@ impl ObjectStore {
                     let _ = sender
                         .send(StringOrErr {
                             item: None,
-                            err: Some(err),
+                            err: Some(err.into()),
                         })
                         .await;
                     return;
@@ -213,7 +212,7 @@ impl ObjectStore {
                     Ok(p) => Ok(p),
                     Err(err) => {
                         if !is_err_no_such_policy(&err) {
-                            Err(Error::msg(std::format!("load policy doc failed: {}", err)))
+                            Err(Error::other(format!("load policy doc failed: {}", err)))
                         } else {
                             Ok(PolicyDoc::default())
                         }
@@ -245,7 +244,7 @@ impl ObjectStore {
                     Ok(res) => Ok(res),
                     Err(err) => {
                         if !is_err_no_such_user(&err) {
-                            Err(Error::msg(std::format!("load user failed: {}", err)))
+                            Err(Error::other(format!("load user failed: {}", err)))
                         } else {
                             Ok(UserIdentity::default())
                         }
@@ -272,7 +271,7 @@ impl ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
-                    Error::new(crate::error::Error::NoSuchPolicy)
+                    Error::NoSuchPolicy
                 } else {
                     err
                 }
@@ -296,7 +295,7 @@ impl ObjectStore {
                     Ok(p) => Ok(p),
                     Err(err) => {
                         if !is_err_no_such_policy(&err) {
-                            Err(Error::msg(std::format!("load mapped policy failed: {}", err)))
+                            Err(Error::other(format!("load mapped policy failed: {}", err)))
                         } else {
                             Ok(MappedPolicy::default())
                         }
@@ -369,10 +368,12 @@ impl Store for ObjectStore {
         let mut data = serde_json::to_vec(&item)?;
         data = Self::encrypt_data(&data)?;
 
-        save_config(self.object_api.clone(), path.as_ref(), data).await
+        save_config(self.object_api.clone(), path.as_ref(), data).await?;
+        Ok(())
     }
     async fn delete_iam_config(&self, path: impl AsRef<str> + Send) -> Result<()> {
-        delete_config(self.object_api.clone(), path.as_ref()).await
+        delete_config(self.object_api.clone(), path.as_ref()).await?;
+        Ok(())
     }
 
     async fn save_user_identity(
@@ -390,7 +391,7 @@ impl Store for ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
-                    Error::new(crate::error::Error::NoSuchPolicy)
+                    Error::NoSuchPolicy
                 } else {
                     err
                 }
@@ -403,7 +404,7 @@ impl Store for ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
-                    Error::new(crate::error::Error::NoSuchUser(name.to_owned()))
+                    Error::NoSuchUser(name.to_owned())
                 } else {
                     err
                 }
@@ -412,7 +413,7 @@ impl Store for ObjectStore {
         if u.credentials.is_expired() {
             let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
             let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
-            return Err(Error::new(crate::error::Error::NoSuchUser(name.to_owned())));
+            return Err(Error::NoSuchUser(name.to_owned()));
         }
 
         if u.credentials.access_key.is_empty() {
@@ -430,7 +431,7 @@ impl Store for ObjectStore {
                         let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
                     }
                     warn!("extract_jwt_claims failed: {}", err);
-                    return Err(Error::new(crate::error::Error::NoSuchUser(name.to_owned())));
+                    return Err(Error::NoSuchUser(name.to_owned()));
                 }
             }
         }
@@ -476,7 +477,7 @@ impl Store for ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
-                    Error::new(crate::error::Error::NoSuchUser(name.to_owned()))
+                    Error::NoSuchUser(name.to_owned())
                 } else {
                     err
                 }
@@ -491,7 +492,7 @@ impl Store for ObjectStore {
     async fn delete_group_info(&self, name: &str) -> Result<()> {
         self.delete_iam_config(get_group_info_path(name)).await.map_err(|err| {
             if is_err_config_not_found(&err) {
-                Error::new(crate::error::Error::NoSuchPolicy)
+                Error::NoSuchPolicy
             } else {
                 err
             }
@@ -501,7 +502,7 @@ impl Store for ObjectStore {
     async fn load_group(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
         let u: GroupInfo = self.load_iam_config(get_group_info_path(name)).await.map_err(|err| {
             if is_err_config_not_found(&err) {
-                Error::new(crate::error::Error::NoSuchPolicy)
+                Error::NoSuchPolicy
             } else {
                 err
             }
@@ -539,7 +540,7 @@ impl Store for ObjectStore {
     async fn delete_policy_doc(&self, name: &str) -> Result<()> {
         self.delete_iam_config(get_policy_doc_path(name)).await.map_err(|err| {
             if is_err_config_not_found(&err) {
-                Error::new(crate::error::Error::NoSuchPolicy)
+                Error::NoSuchPolicy
             } else {
                 err
             }
@@ -552,7 +553,7 @@ impl Store for ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
-                    Error::new(crate::error::Error::NoSuchPolicy)
+                    Error::NoSuchPolicy
                 } else {
                     err
                 }
@@ -613,7 +614,7 @@ impl Store for ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
-                    Error::new(crate::error::Error::NoSuchPolicy)
+                    Error::NoSuchPolicy
                 } else {
                     err
                 }
@@ -766,7 +767,7 @@ impl Store for ObjectStore {
                 let name = ecstore::utils::path::dir(item);
                 info!("load group: {}", name);
                 if let Err(err) = self.load_group(&name, &mut items_cache).await {
-                    return Err(Error::msg(std::format!("load group failed: {}", err)));
+                    return Err(Error::other(format!("load group failed: {}", err)));
                 };
             }
 
@@ -827,7 +828,7 @@ impl Store for ObjectStore {
                 info!("load group policy: {}", name);
                 if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await {
                     if !is_err_no_such_policy(&err) {
-                        return Err(Error::msg(std::format!("load group policy failed: {}", err)));
+                        return Err(Error::other(format!("load group policy failed: {}", err)));
                     }
                 };
             }
@@ -846,7 +847,7 @@ impl Store for ObjectStore {
                 info!("load svc user: {}", name);
                 if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await {
                     if !is_err_no_such_user(&err) {
-                        return Err(Error::msg(std::format!("load svc user failed: {}", err)));
+                        return Err(Error::other(format!("load svc user failed: {}", err)));
                     }
                 };
             }
@@ -860,7 +861,7 @@ impl Store for ObjectStore {
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
-                            return Err(Error::msg(std::format!("load_mapped_policy failed: {}", err)));
+                            return Err(Error::other(format!("load_mapped_policy failed: {}", err)));
                         }
                     }
                 }

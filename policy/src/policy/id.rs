@@ -1,4 +1,4 @@
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 

@@ -26,10 +26,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.75"
+rust-version = "1.85"
 version = "0.0.1"
 
 [workspace.lints.rust]

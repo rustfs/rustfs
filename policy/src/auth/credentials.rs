@@ -1,8 +1,8 @@
 use crate::error::Error as IamError;
+use crate::error::{Error, Result};
 use crate::policy::{iam_policy_claim_name_sa, Policy, Validator, INHERITED_POLICY_TYPE};
 use crate::utils;
 use crate::utils::extract_claims;
-use common::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -54,41 +54,41 @@ pub fn is_secret_key_valid(secret_key: &str) -> bool {
 //     fn try_from(value: &str) -> Result<Self, Self::Error> {
 //         let mut elem = value.trim().splitn(2, '=');
 //         let (Some(h), Some(cred_elems)) = (elem.next(), elem.next()) else {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         };
 
 //         if h != "Credential" {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         }
 
 //         let mut cred_elems = cred_elems.trim().rsplitn(5, '/');
 
 //         let Some(request) = cred_elems.next() else {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         };
 
 //         let Some(service) = cred_elems.next() else {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         };
 
 //         let Some(region) = cred_elems.next() else {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         };
 
 //         let Some(date) = cred_elems.next() else {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         };
 
 //         let Some(ak) = cred_elems.next() else {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         };
 
 //         if ak.len() < 3 {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         }
 
 //         if request != "aws4_request" {
-//             return Err(Error::new(IamError::ErrCredMalformed));
+//             return Err(IamError::ErrCredMalformed));
 //         }
 
 //         Ok(CredentialHeader {
@@ -98,7 +98,7 @@ pub fn is_secret_key_valid(secret_key: &str) -> bool {
 //                     const FORMATTER: LazyCell<Vec<BorrowedFormatItem<'static>>> =
 //                         LazyCell::new(|| time::format_description::parse("[year][month][day]").unwrap());
 
-//                     Date::parse(date, &FORMATTER).map_err(|_| Error::new(IamError::ErrCredMalformed))?
+//                     Date::parse(date, &FORMATTER).map_err(|_| IamError::ErrCredMalformed))?
 //                 },
 //                 region: region.to_owned(),
 //                 service: service.try_into()?,
@@ -199,11 +199,11 @@ pub fn create_new_credentials_with_metadata(
     token_secret: &str,
 ) -> Result<Credentials> {
     if ak.len() < ACCESS_KEY_MIN_LEN || ak.len() > ACCESS_KEY_MAX_LEN {
-        return Err(Error::new(IamError::InvalidAccessKeyLength));
+        return Err(IamError::InvalidAccessKeyLength);
     }
 
     if sk.len() < SECRET_KEY_MIN_LEN || sk.len() > SECRET_KEY_MAX_LEN {
-        return Err(Error::new(IamError::InvalidAccessKeyLength));
+        return Err(IamError::InvalidAccessKeyLength);
     }
 
     if token_secret.is_empty() {
@@ -326,23 +326,23 @@ impl CredentialsBuilder {
 
 impl TryFrom<CredentialsBuilder> for Credentials {
     type Error = Error;
-    fn try_from(mut value: CredentialsBuilder) -> Result<Self, Self::Error> {
+    fn try_from(mut value: CredentialsBuilder) -> std::result::Result<Self, Self::Error> {
         if value.parent_user.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(IamError::InvalidArgument);
         }
 
         if (value.access_key.is_empty() && !value.secret_key.is_empty())
             || (!value.access_key.is_empty() && value.secret_key.is_empty())
         {
-            return Err(Error::msg("Either ak or sk is empty"));
+            return Err(Error::other("Either ak or sk is empty"));
         }
 
         if value.parent_user == value.access_key.as_str() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(IamError::InvalidArgument);
         }
 
         if value.access_key == "site-replicator-0" && !value.allow_site_replicator_account {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(IamError::InvalidArgument);
         }
 
         let mut claim = serde_json::json!({
@@ -351,9 +351,9 @@ impl TryFrom<CredentialsBuilder> for Credentials {
 
         if let Some(p) = value.session_policy {
             p.is_valid()?;
-            let policy_buf = serde_json::to_vec(&p).map_err(|_| Error::new(IamError::InvalidArgument))?;
+            let policy_buf = serde_json::to_vec(&p).map_err(|_| IamError::InvalidArgument)?;
             if policy_buf.len() > 4096 {
-                return Err(Error::msg("session policy is too large"));
+                return Err(Error::other("session policy is too large"));
             }
             claim["sessionPolicy"] = serde_json::json!(base64_simd::STANDARD.encode_to_string(&policy_buf));
             claim["sa-policy"] = serde_json::json!("embedded-policy");
@@ -390,8 +390,8 @@ impl TryFrom<CredentialsBuilder> for Credentials {
         };
 
         if !value.secret_key.is_empty() {
-            let session_token =
-                crypto::jwt_encode(value.access_key.as_bytes(), &claim).map_err(|_| Error::msg("session policy is too large"))?;
+            let session_token = crypto::jwt_encode(value.access_key.as_bytes(), &claim)
+                .map_err(|_| Error::other("session policy is too large"))?;
             cred.session_token = session_token;
             // cred.expiration = Some(
             //     OffsetDateTime::from_unix_timestamp(

@@ -1,4 +1,4 @@
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use regex::Regex;
 
 const ARN_PREFIX_ARN: &str = "arn";
@@ -19,7 +19,7 @@ impl ARN {
     pub fn new_iam_role_arn(resource_id: &str, server_region: &str) -> Result<Self> {
         let valid_resource_id_regex = Regex::new(r"^[A-Za-z0-9_/\.-]+$")?;
         if !valid_resource_id_regex.is_match(resource_id) {
-            return Err(Error::msg("ARN resource ID invalid"));
+            return Err(Error::other("ARN resource ID invalid"));
         }
         Ok(ARN {
             partition: ARN_PARTITION_RUSTFS.to_string(),
@@ -33,33 +33,33 @@ impl ARN {
     pub fn parse(arn_str: &str) -> Result<Self> {
         let ps: Vec<&str> = arn_str.split(':').collect();
         if ps.len() != 6 || ps[0] != ARN_PREFIX_ARN {
-            return Err(Error::msg("ARN format invalid"));
+            return Err(Error::other("ARN format invalid"));
         }
 
         if ps[1] != ARN_PARTITION_RUSTFS {
-            return Err(Error::msg("ARN partition invalid"));
+            return Err(Error::other("ARN partition invalid"));
         }
 
         if ps[2] != ARN_SERVICE_IAM {
-            return Err(Error::msg("ARN service invalid"));
+            return Err(Error::other("ARN service invalid"));
         }
 
         if !ps[4].is_empty() {
-            return Err(Error::msg("ARN account-id invalid"));
+            return Err(Error::other("ARN account-id invalid"));
         }
 
         let res: Vec<&str> = ps[5].splitn(2, '/').collect();
         if res.len() != 2 {
-            return Err(Error::msg("ARN resource invalid"));
+            return Err(Error::other("ARN resource invalid"));
         }
 
         if res[0] != ARN_RESOURCE_TYPE_ROLE {
-            return Err(Error::msg("ARN resource type invalid"));
+            return Err(Error::other("ARN resource type invalid"));
         }
 
         let valid_resource_id_regex = Regex::new(r"^[A-Za-z0-9_/\.-]+$")?;
         if !valid_resource_id_regex.is_match(res[1]) {
-            return Err(Error::msg("ARN resource ID invalid"));
+            return Err(Error::other("ARN resource ID invalid"));
         }
 
         Ok(ARN {

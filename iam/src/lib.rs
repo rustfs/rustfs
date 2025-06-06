@@ -1,6 +1,5 @@
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use ecstore::store::ECStore;
-use error::Error as IamError;
 use manager::IamCache;
 use policy::auth::Credentials;
 use std::sync::{Arc, OnceLock};
@@ -62,8 +61,5 @@ pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
 
 #[inline]
 pub fn get() -> Result<Arc<IamSys<ObjectStore>>> {
-    IAM_SYS
-        .get()
-        .map(Arc::clone)
-        .ok_or(Error::new(IamError::IamSysNotInitialized))
+    IAM_SYS.get().map(Arc::clone).ok_or(Error::IamSysNotInitialized)
 }

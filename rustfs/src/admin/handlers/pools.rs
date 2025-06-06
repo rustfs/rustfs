@@ -1,7 +1,7 @@
-use ecstore::{new_object_layer_fn, GLOBAL_Endpoints};
+use ecstore::{GLOBAL_Endpoints, new_object_layer_fn};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tokio::sync::broadcast;
@@ -88,11 +88,7 @@ impl Operation for StatusPool {
         let has_idx = {
             if is_byid {
                 let a = query.pool.parse::<usize>().unwrap_or_default();
-                if a < endpoints.as_ref().len() {
-                    Some(a)
-                } else {
-                    None
-                }
+                if a < endpoints.as_ref().len() { Some(a) } else { None }
             } else {
                 endpoints.get_pool_idx(&query.pool)
             }
@@ -234,11 +230,7 @@ impl Operation for CancelDecommission {
         let has_idx = {
             if is_byid {
                 let a = query.pool.parse::<usize>().unwrap_or_default();
-                if a < endpoints.as_ref().len() {
-                    Some(a)
-                } else {
-                    None
-                }
+                if a < endpoints.as_ref().len() { Some(a) } else { None }
             } else {
                 endpoints.get_pool_idx(&query.pool)
             }

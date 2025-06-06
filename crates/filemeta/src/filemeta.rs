@@ -515,11 +515,7 @@ impl FileMeta {
         let has_vid = {
             if !version_id.is_empty() {
                 let id = Uuid::parse_str(version_id)?;
-                if !id.is_nil() {
-                    Some(id)
-                } else {
-                    None
-                }
+                if !id.is_nil() { Some(id) } else { None }
             } else {
                 None
             }
@@ -569,6 +565,16 @@ impl FileMeta {
             file_version.unmarshal_msg(&version.meta)?;
             let fi = file_version.into_fileinfo(volume, path, all_parts);
             versions.push(fi);
+        }
+
+        let mut prev_mod_time = None;
+        for (i, fi) in versions.iter_mut().enumerate() {
+            if i == 0 {
+                fi.is_latest = true;
+            } else {
+                fi.successor_mod_time = prev_mod_time;
+            }
+            prev_mod_time = fi.mod_time;
         }
 
         Ok(FileInfoVersions {
@@ -1225,11 +1231,7 @@ impl FileMetaVersionHeader {
         cur.read_exact(&mut buf)?;
         self.version_id = {
             let id = Uuid::from_bytes(buf);
-            if id.is_nil() {
-                None
-            } else {
-                Some(id)
-            }
+            if id.is_nil() { None } else { Some(id) }
         };
 
         // mod_time
@@ -1403,11 +1405,7 @@ impl MetaObject {
                     cur.read_exact(&mut buf)?;
                     self.version_id = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
                 "DDir" => {
@@ -1416,11 +1414,7 @@ impl MetaObject {
                     cur.read_exact(&mut buf)?;
                     self.data_dir = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
                 "EcAlgo" => {
@@ -1986,11 +1980,7 @@ impl MetaDeleteMarker {
                     cur.read_exact(&mut buf)?;
                     self.version_id = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
 

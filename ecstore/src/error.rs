@@ -443,7 +443,7 @@ impl StorageError {
 
     pub fn from_u32(error: u32) -> Option<Self> {
         match error {
-            0x01 => Some(StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Io error"))),
+            0x01 => Some(StorageError::Io(std::io::Error::other("Io error"))),
             0x02 => Some(StorageError::FaultyDisk),
             0x03 => Some(StorageError::DiskFull),
             0x04 => Some(StorageError::VolumeNotFound),

@@ -2,7 +2,7 @@ use super::{
     action::Action, ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, Principal, ResourceSet, Validator,
     ID,
 };
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]

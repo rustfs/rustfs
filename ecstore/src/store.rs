@@ -2,22 +2,22 @@
 
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
-use crate::config::storageclass;
 use crate::config::GLOBAL_StorageClass;
+use crate::config::storageclass;
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{
-    is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum, is_err_version_not_found,
-    to_object_err, StorageError,
+    StorageError, is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum,
+    is_err_version_not_found, to_object_err,
 };
 use crate::global::{
-    get_global_endpoints, is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE,
-    DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP,
-    GLOBAL_LOCAL_DISK_SET_DRIVES,
+    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_endpoints, is_dist_erasure, is_erasure_sd,
+    set_global_deployment_id, set_object_layer,
 };
-use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
+use crate::heal::data_usage::{DATA_USAGE_ROOT, DataUsageInfo};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
-use crate::heal::heal_commands::{HealOpts, HealScanMode, HEAL_ITEM_METADATA};
+use crate::heal::heal_commands::{HEAL_ITEM_METADATA, HealOpts, HealScanMode};
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
@@ -26,11 +26,11 @@ use crate::rebalance::RebalanceMeta;
 use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::utils::crypto::base64_decode;
-use crate::utils::path::{decode_dir_object, encode_dir_object, path_join_buf, SLASH_SEPARATOR};
+use crate::utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
 use crate::utils::xml;
 use crate::{
     bucket::metadata::BucketMetadata,
-    disk::{new_disk, DiskOption, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
     endpoints::EndpointServerPools,
     peer::S3PeerSys,
     sets::Sets,
@@ -60,7 +60,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::{interval, sleep};
 use tracing::{debug, info};
 use tracing::{error, warn};
@@ -502,8 +502,7 @@ impl ECStore {
             return None;
         }
 
-        let mut rng = rand::thread_rng();
-        let random_u64: u64 = rng.gen();
+        let random_u64: u64 = rand::random();
 
         let choose = random_u64 % total;
         let mut at_total = 0;
@@ -1965,11 +1964,7 @@ impl StorageAPI for ECStore {
                 Ok(_) => return Ok(()),
                 Err(err) => {
                     //
-                    if is_err_invalid_upload_id(&err) {
-                        None
-                    } else {
-                        Some(err)
-                    }
+                    if is_err_invalid_upload_id(&err) { None } else { Some(err) }
                 }
             };
 
@@ -2010,11 +2005,7 @@ impl StorageAPI for ECStore {
                 Ok(res) => return Ok(res),
                 Err(err) => {
                     //
-                    if is_err_invalid_upload_id(&err) {
-                        None
-                    } else {
-                        Some(err)
-                    }
+                    if is_err_invalid_upload_id(&err) { None } else { Some(err) }
                 }
             };
 
@@ -2251,7 +2242,7 @@ impl StorageAPI for ECStore {
                             HealSequence::heal_meta_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await
                         } else {
                             HealSequence::heal_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await
-                        }
+                        };
                     }
                 };
 
@@ -2624,13 +2615,7 @@ impl ServerPoolsAvailableSpace {
 }
 
 pub async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> {
-    let size = {
-        if size < 0 {
-            DISK_ASSUME_UNKNOWN_SIZE
-        } else {
-            size as u64 * 2
-        }
-    };
+    let size = { if size < 0 { DISK_ASSUME_UNKNOWN_SIZE } else { size as u64 * 2 } };
 
     let mut available = 0;
     let mut total = 0;

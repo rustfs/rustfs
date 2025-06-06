@@ -3,14 +3,14 @@ use crate::auth::check_key_valid;
 use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
 use bytes::Bytes;
-use common::error::Error as ec_Error;
 use ecstore::admin_server_info::get_server_info;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
+use ecstore::error::StorageError;
 use ecstore::global::GLOBAL_ALlHealState;
 use ecstore::heal::data_usage::load_data_usage_from_backend;
 use ecstore::heal::heal_commands::HealOpts;
 use ecstore::heal::heal_ops::new_heal_sequence;
-use ecstore::metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType};
+use ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use ecstore::new_object_layer_fn;
 use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
@@ -26,14 +26,14 @@ use iam::store::MappedPolicy;
 use madmin::metrics::RealtimeMetrics;
 use madmin::utils::parse_duration;
 use matchit::Params;
+use policy::policy::Args;
+use policy::policy::BucketPolicy;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
 use policy::policy::default::DEFAULT_POLICIES;
-use policy::policy::Args;
-use policy::policy::BucketPolicy;
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{s3_error, Body, S3Error, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -656,7 +656,7 @@ impl Operation for HealHandler {
         #[derive(Default)]
         struct HealResp {
             resp_bytes: Vec<u8>,
-            _api_err: Option<ec_Error>,
+            _api_err: Option<StorageError>,
             _err_body: String,
         }
 

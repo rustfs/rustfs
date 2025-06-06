@@ -1,5 +1,5 @@
 use super::{action::Action, statement::BPStatement, Effect, Error as IamError, Statement, ID};
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -449,7 +449,7 @@ pub mod default {
 #[cfg(test)]
 mod test {
     use super::*;
-    use common::error::Result;
+    use crate::error::Result;
 
     #[tokio::test]
     async fn test_parse_policy() -> Result<()> {

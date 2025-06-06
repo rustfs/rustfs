@@ -1,12 +1,11 @@
 use crate::policy;
 
+pub type Result<T> = core::result::Result<T, Error>;
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error(transparent)]
     PolicyError(#[from] policy::Error),
-
-    #[error("ecsotre error: {0}")]
-    EcstoreError(common::error::Error),
 
     #[error("{0}")]
     StringError(String),
@@ -66,7 +65,7 @@ pub enum Error {
     GroupNameContainsReservedChars,
 
     #[error("jwt err {0}")]
-    JWTError(jsonwebtoken::errors::Error),
+    JWTError(#[from] jsonwebtoken::errors::Error),
 
     #[error("no access key")]
     NoAccessKey,
@@ -90,56 +89,74 @@ pub enum Error {
 
     #[error("policy too large")]
     PolicyTooLarge,
+
+    #[error("io error: {0}")]
+    Io(std::io::Error),
+}
+
+impl Error {
+    pub fn other<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Error::Io(std::io::Error::other(error))
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+impl From<time::error::ComponentRange> for Error {
+    fn from(e: time::error::ComponentRange) -> Self {
+        Error::other(e)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::other(e)
+    }
+}
+
+// impl From<jsonwebtoken::errors::Error> for Error {
+//     fn from(e: jsonwebtoken::errors::Error) -> Self {
+//         Error::JWTError(e)
+//     }
+// }
+
+impl From<regex::Error> for Error {
+    fn from(e: regex::Error) -> Self {
+        Error::other(e)
+    }
 }
 
 // pub fn is_err_no_such_user(e: &Error) -> bool {
 //     matches!(e, Error::NoSuchUser(_))
 // }
 
-pub fn is_err_no_such_policy(err: &common::error::Error) -> bool {
-    if let Some(e) = err.downcast_ref::<Error>() {
-        matches!(e, Error::NoSuchPolicy)
-    } else {
-        false
-    }
+pub fn is_err_no_such_policy(err: &Error) -> bool {
+    matches!(err, Error::NoSuchPolicy)
 }
 
-pub fn is_err_no_such_user(err: &common::error::Error) -> bool {
-    if let Some(e) = err.downcast_ref::<Error>() {
-        matches!(e, Error::NoSuchUser(_))
-    } else {
-        false
-    }
+pub fn is_err_no_such_user(err: &Error) -> bool {
+    matches!(err, Error::NoSuchUser(_))
 }
 
-pub fn is_err_no_such_account(err: &common::error::Error) -> bool {
-    if let Some(e) = err.downcast_ref::<Error>() {
-        matches!(e, Error::NoSuchAccount(_))
-    } else {
-        false
-    }
+pub fn is_err_no_such_account(err: &Error) -> bool {
+    matches!(err, Error::NoSuchAccount(_))
 }
 
-pub fn is_err_no_such_temp_account(err: &common::error::Error) -> bool {
-    if let Some(e) = err.downcast_ref::<Error>() {
-        matches!(e, Error::NoSuchTempAccount(_))
-    } else {
-        false
-    }
+pub fn is_err_no_such_temp_account(err: &Error) -> bool {
+    matches!(err, Error::NoSuchTempAccount(_))
 }
 
-pub fn is_err_no_such_group(err: &common::error::Error) -> bool {
-    if let Some(e) = err.downcast_ref::<Error>() {
-        matches!(e, Error::NoSuchGroup(_))
-    } else {
-        false
-    }
+pub fn is_err_no_such_group(err: &Error) -> bool {
+    matches!(err, Error::NoSuchGroup(_))
 }
 
-pub fn is_err_no_such_service_account(err: &common::error::Error) -> bool {
-    if let Some(e) = err.downcast_ref::<Error>() {
-        matches!(e, Error::NoSuchServiceAccount(_))
-    } else {
-        false
-    }
+pub fn is_err_no_such_service_account(err: &Error) -> bool {
+    matches!(err, Error::NoSuchServiceAccount(_))
 }
