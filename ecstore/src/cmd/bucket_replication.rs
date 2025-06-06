@@ -1,12 +1,5 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
-use aws_sdk_s3::config::BehaviorVersion;
-use aws_sdk_s3::config::Credentials;
-use aws_sdk_s3::config::Region;
-use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::Config;
-use bytes::Bytes;
-use uuid::Uuid;
 // use error::Error;
 use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::versioning_sys::BucketVersioningSys;
@@ -19,6 +12,12 @@ use crate::store_api::ObjectInfo;
 use crate::store_api::ObjectOptions;
 use crate::store_api::ObjectToDelete;
 use crate::StorageAPI;
+use aws_sdk_s3::config::BehaviorVersion;
+use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::Region;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::Config;
+use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
@@ -28,6 +27,8 @@ use futures::StreamExt;
 use http::HeaderMap;
 use http::Method;
 use lazy_static::lazy_static;
+// use std::time::SystemTime;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use rustfs_rsc::provider::StaticProvider;
 use rustfs_rsc::Minio;
@@ -47,14 +48,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
-use tokio::task;
-use tracing::{debug, error, warn, info};
-use xxhash_rust::xxh3::xxh3_64;
-// use std::time::SystemTime;
-use once_cell::sync::Lazy;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::task;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+use xxhash_rust::xxh3::xxh3_64;
 // use bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -222,9 +222,7 @@ pub async fn queue_replication_heal(
         return None;
     }
 
-    if oi.replication_status == ReplicationStatusType::Completed
-        && !roi.existing_obj_resync.must_resync()
-    {
+    if oi.replication_status == ReplicationStatusType::Completed && !roi.existing_obj_resync.must_resync() {
         return None;
     }
 
@@ -340,10 +338,7 @@ pub async fn check_replicate_delete(
         user_tags: Some(oi.user_tags.clone()),
         delete_marker: oi.delete_marker,
         //version_id: dobj.version_id.clone().map(|v| v.to_string()),
-        version_id: oi
-            .version_id
-            .map(|uuid| uuid.to_string())
-            .unwrap_or_default(),
+        version_id: oi.version_id.map(|uuid| uuid.to_string()).unwrap_or_default(),
         op_type: ReplicationType::DeleteReplicationType,
         target_arn: None,
         replica: true,
@@ -455,9 +450,9 @@ pub async fn get_heal_replicate_object_info(
             &oi.bucket,
             &ObjectToDelete {
                 object_name: oi.name.clone(),
-                version_id: oi.version_id.clone(),
+                version_id: oi.version_id,
             },
-            &oi,
+            oi,
             &ObjectOptions {
                 // versioned: global_bucket_versioning_sys::prefix_enabled(&oi.bucket, &oi.name),
                 // version_suspended: global_bucket_versioning_sys::prefix_suspended(&oi.bucket, &oi.name),
@@ -466,7 +461,8 @@ pub async fn get_heal_replicate_object_info(
                 ..Default::default()
             },
             None,
-        ).await
+        )
+        .await
     } else {
         // let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(mt))
         // .await
@@ -480,8 +476,13 @@ pub async fn get_heal_replicate_object_info(
             mod_time: oi.mod_time,
             ..Default::default()
         };
-        let repoptions =
-                    get_must_replicate_options(mt2.as_ref().unwrap_or(&HashMap::new()), "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+        let repoptions = get_must_replicate_options(
+            mt2.as_ref().unwrap_or(&HashMap::new()),
+            "",
+            ReplicationStatusType::Unknown,
+            ReplicationType::ObjectReplicationType,
+            &opts,
+        );
 
         let decision = must_replicate(&oi.bucket, &oi.name, &repoptions).await;
         error!("decision:");
@@ -509,7 +510,10 @@ pub async fn get_heal_replicate_object_info(
     let asz = oi.get_actual_size().unwrap_or(0);
 
     let key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, REPLICATION_TIMESTAMP);
-    let tm: Option<DateTime<Utc>> = user_defined.as_ref().unwrap().get(&key)
+    let tm: Option<DateTime<Utc>> = user_defined
+        .as_ref()
+        .unwrap()
+        .get(&key)
         .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
@@ -536,7 +540,7 @@ pub async fn get_heal_replicate_object_info(
         existing_obj_resync: Default::default(),
         target_statuses: tgt_statuses,
         target_purge_statuses: purge_statuses,
-        replication_timestamp: tm.unwrap_or_else(|| chrono::Utc::now()),
+        replication_timestamp: tm.unwrap_or_else(|| Utc::now),
         //ssec: crypto::is_encrypted(&oi.user_defined),
         ssec: false,
         user_tags: oi.user_tags.clone(),
@@ -551,7 +555,10 @@ pub async fn get_heal_replicate_object_info(
         result.checksum = oi.checksum.clone();
     }
 
-    warn!("Replication heal for object {} in bucket {} is configured {:?}", oi.name, oi.bucket, oi.version_id);
+    warn!(
+        "Replication heal for object {} in bucket {} is configured {:?}",
+        oi.name, oi.bucket, oi.version_id
+    );
 
     result
 }
@@ -691,7 +698,7 @@ impl ReplicationPool {
             mrf_worker_size: workers,
             priority,
             max_workers,
-            obj_layer: obj_layer,
+            obj_layer,
         };
 
         warn!("work size is: {}", workers);
@@ -932,7 +939,7 @@ impl ReplicationPool {
                     let max_workers = max_workers.min(WORKER_MAX_LIMIT);
                     if worker_count < max_workers as i32 {
                         //self.resize_workers((worker_count + 1 as usize).try_into().unwrap(), worker_count).await;
-                        self.resize_workers(worker_count as usize + 1 as usize, Some(worker_count as usize))
+                        self.resize_workers(worker_count as usize + 1_usize, Some(worker_count as usize))
                             .await;
                     }
 
@@ -948,6 +955,12 @@ impl ReplicationPool {
 }
 
 pub struct ReplicationResyncer;
+
+impl Default for ReplicationResyncer {
+    fn default() -> Self {
+        Self
+    }
+}
 
 impl ReplicationResyncer {
     pub fn new() -> Self {
@@ -967,6 +980,7 @@ pub async fn init_bucket_replication_pool() {
         warn!("init bucket replication pool");
         ReplicationPool::init_bucket_replication_pool(store, opts, stat).await;
     } else {
+        // TODO: to be added
     }
 }
 
@@ -1736,10 +1750,10 @@ impl TraitForObjectInfo for ObjectInfo {
 
 fn convert_offsetdatetime_to_chrono(offset_dt: Option<OffsetDateTime>) -> Option<DateTime<Utc>> {
     //offset_dt.map(|odt| {
-        let tm = offset_dt.unwrap().unix_timestamp();
-        //let naive = NaiveDateTime::from_timestamp_opt(tm, 0).expect("Invalid timestamp");
-        DateTime::<Utc>::from_timestamp(tm, 0)
-        //DateTime::from_naive_utc_and_offset(naive, Utc) // Convert to Utc first
+    let tm = offset_dt.unwrap().unix_timestamp();
+    //let naive = NaiveDateTime::from_timestamp_opt(tm, 0).expect("Invalid timestamp");
+    DateTime::<Utc>::from_timestamp(tm, 0)
+    //DateTime::from_naive_utc_and_offset(naive, Utc) // Convert to Utc first
     //})
 }
 
@@ -1860,8 +1874,8 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: &MustReplicateOpt
         //decision.set(ReplicateTargetDecision::new(replicate,synchronous));
         info!("targe decision arn is:{}", tgt_arn.clone());
         decision.set(ReplicateTargetDecision {
-            replicate: replicate,
-            synchronous: synchronous,
+            replicate,
+            synchronous,
             arn: tgt_arn.clone(),
             id: 0.to_string(),
         });
@@ -2227,7 +2241,7 @@ async fn replicate_object_with_multipart(
             return Err(err.into());
         }
     }
-    return Ok(());
+    Ok(())
 }
 
 impl ReplicateObjectInfo {
@@ -2374,7 +2388,7 @@ impl ReplicateObjectInfo {
                                 .await;
                             match ret {
                                 Ok(_res) => {
-                                    warn!("replicate suc: {} {} {}",  self.bucket, self.name, self.version_id);
+                                    warn!("replicate suc: {} {} {}", self.bucket, self.name, self.version_id);
                                     rinfo.replication_status = ReplicationStatusType::Completed;
                                 }
                                 Err(err) => {
@@ -2465,7 +2479,7 @@ pub fn get_must_replicate_options(
 
     MustReplicateOptions {
         meta,
-        status: status,
+        status,
         op_type: op,
         replication_request: opts.replication_request,
     }
@@ -2560,7 +2574,6 @@ impl ReplicatedInfos {
         }
     }
 }
-
 
 impl ReplicatedTargetInfo {
     fn empty(&self) -> bool {
