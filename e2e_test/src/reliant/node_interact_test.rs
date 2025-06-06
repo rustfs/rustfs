@@ -16,8 +16,8 @@ use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, MetacacheWriter};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, io::Cursor};
 use tokio::spawn;
-use tonic::codegen::tokio_stream::StreamExt;
 use tonic::Request;
+use tonic::codegen::tokio_stream::StreamExt;
 
 const CLUSTER_ADDR: &str = "http://localhost:9000";
 
@@ -127,7 +127,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
                         println!("{}", resp.error_info.unwrap_or("".to_string()));
                     }
                     let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-                        .map_err(|_e| common::error::Error::from_string(format!("Unexpected response: {:?}", response)))
+                        .map_err(|_e| std::io::Error::other(format!("Unexpected response: {:?}", response)))
                         .unwrap();
                     out.write_obj(&entry).await.unwrap();
                 }

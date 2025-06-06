@@ -20,7 +20,7 @@ mkdir -p ./target/volume/test{0..4}
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
 #    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
-    export RUST_LOG="rustfs=info,ecstore=info,s3s=info,iam=info,rustfs-obs=info"
+    export RUST_LOG="rustfs=info,ecstore=info,s3s=debug"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
