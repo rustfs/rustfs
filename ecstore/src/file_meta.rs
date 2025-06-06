@@ -606,6 +606,26 @@ impl FileMeta {
             versions.push(fi);
         }
 
+        let mut prev_mod_time = None;
+        for (i, fi) in versions.iter_mut().enumerate() {
+            if i == 0 {
+                fi.is_latest = true;
+            } else {
+                fi.successor_mod_time = prev_mod_time;
+            }
+            prev_mod_time = fi.mod_time;
+        }
+
+        if versions.is_empty() {
+            versions.push(FileInfo {
+                name: path.to_string(),
+                volume: volume.to_string(),
+                deleted: true,
+                is_latest: true,
+                ..Default::default()
+            });
+        }
+
         Ok(FileInfoVersions {
             volume: volume.to_string(),
             name: path.to_string(),
