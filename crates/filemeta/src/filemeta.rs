@@ -567,6 +567,7 @@ impl FileMeta {
             versions.push(fi);
         }
 
+        let num = versions.len();
         let mut prev_mod_time = None;
         for (i, fi) in versions.iter_mut().enumerate() {
             if i == 0 {
@@ -574,6 +575,7 @@ impl FileMeta {
             } else {
                 fi.successor_mod_time = prev_mod_time;
             }
+            fi.num_versions = num;
             prev_mod_time = fi.mod_time;
         }
 
