@@ -434,7 +434,7 @@ impl PeerS3Client for LocalPeerS3Client {
         // TODO: reduceWriteQuorumErrs
         let mut versioned = false;
         if let Ok(sys) = metadata_sys::get(bucket).await {
-            versioned = sys.versioning(); 
+            versioned = sys.versioning();
         }
 
         ress.iter()
@@ -505,13 +505,13 @@ impl RemotePeerS3Client {
         let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default().to_string();
         Self { node, pools, addr }
     }
-    pub fn get_addr(&self)->String {
-        return self.addr.clone();
+    pub fn get_addr(&self) -> String {
+        self.addr.clone()
     }
 }
 
 #[async_trait]
-impl PeerS3Client for RemotePeerS3Client { 
+impl PeerS3Client for RemotePeerS3Client {
     fn get_pools(&self) -> Option<Vec<usize>> {
         self.pools.clone()
     }

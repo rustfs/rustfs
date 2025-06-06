@@ -1,4 +1,4 @@
-use std::{time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[allow(dead_code)]
 #[derive(Debug, Default)]
@@ -60,18 +60,18 @@ enum SizeCategory {
     SizeLastElemMarker,
 }
 
-#[allow(dead_code)]
-impl SizeCategory {
-    fn to_string(&self) -> String {
-        match *self {
-            SizeCategory::SizeLessThan1KiB => "SizeLessThan1KiB".to_string(),
-            SizeCategory::SizeLessThan1MiB => "SizeLessThan1MiB".to_string(),
-            SizeCategory::SizeLessThan10MiB => "SizeLessThan10MiB".to_string(),
-            SizeCategory::SizeLessThan100MiB => "SizeLessThan100MiB".to_string(),
-            SizeCategory::SizeLessThan1GiB => "SizeLessThan1GiB".to_string(),
-            SizeCategory::SizeGreaterThan1GiB => "SizeGreaterThan1GiB".to_string(),
-	    SizeCategory::SizeLastElemMarker => "SizeLastElemMarker".to_string(),
-        }
+impl std::fmt::Display for SizeCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match *self {
+            SizeCategory::SizeLessThan1KiB => "SizeLessThan1KiB",
+            SizeCategory::SizeLessThan1MiB => "SizeLessThan1MiB",
+            SizeCategory::SizeLessThan10MiB => "SizeLessThan10MiB",
+            SizeCategory::SizeLessThan100MiB => "SizeLessThan100MiB",
+            SizeCategory::SizeLessThan1GiB => "SizeLessThan1GiB",
+            SizeCategory::SizeGreaterThan1GiB => "SizeGreaterThan1GiB",
+            SizeCategory::SizeLastElemMarker => "SizeLastElemMarker",
+        };
+        write!(f, "{}", s)
     }
 }
 
@@ -490,7 +490,7 @@ mod tests {
         latency2.totals[0].total = 20;
         latency2.totals[0].n = 3;
 
-        let merged = latency1.merge(&mut latency2);
+        let merged = latency1.merge(&latency2);
 
         assert_eq!(merged.last_sec, 1000);
         assert_eq!(merged.totals[0].total, 30); // 10 + 20
@@ -509,7 +509,7 @@ mod tests {
         latency1.totals[0].total = 10;
         latency2.totals[0].total = 20;
 
-        let merged = latency1.merge(&mut latency2);
+        let merged = latency1.merge(&latency2);
 
         assert_eq!(merged.last_sec, 1010); // Should use the later time
         assert_eq!(merged.totals[0].total, 30);
@@ -518,9 +518,9 @@ mod tests {
     #[test]
     fn test_last_minute_latency_merge_empty() {
         let mut latency1 = LastMinuteLatency::default();
-        let mut latency2 = LastMinuteLatency::default();
+        let latency2 = LastMinuteLatency::default();
 
-        let merged = latency1.merge(&mut latency2);
+        let merged = latency1.merge(&latency2);
 
         assert_eq!(merged.last_sec, 0);
         for elem in &merged.totals {
@@ -633,7 +633,7 @@ mod tests {
             n: 5,
         };
 
-        let cloned = elem.clone();
+        let cloned = elem;
         assert_eq!(elem.total, cloned.total);
         assert_eq!(elem.size, cloned.size);
         assert_eq!(elem.n, cloned.n);
@@ -831,10 +831,7 @@ mod tests {
     }
 }
 
-
-
 const SIZE_LAST_ELEM_MARKER: usize = 10; // 这里假设你的 marker 是 10，请根据实际情况修改
-
 
 #[allow(dead_code)]
 #[derive(Debug, Default)]
@@ -842,7 +839,6 @@ pub struct LastMinuteHistogram {
     histogram: Vec<LastMinuteLatency>,
     size: u32,
 }
-
 
 impl LastMinuteHistogram {
     pub fn merge(&mut self, other: &LastMinuteHistogram) {
@@ -867,11 +863,11 @@ impl LastMinuteHistogram {
 
 fn size_to_tag(size: i64) -> usize {
     match size {
-        _ if size < 1024 => 0, // sizeLessThan1KiB
-        _ if size < 1024 * 1024 => 1, // sizeLessThan1MiB
-        _ if size < 10 * 1024 * 1024 => 2, // sizeLessThan10MiB
-        _ if size < 100 * 1024 * 1024 => 3, // sizeLessThan100MiB
+        _ if size < 1024 => 0,               // sizeLessThan1KiB
+        _ if size < 1024 * 1024 => 1,        // sizeLessThan1MiB
+        _ if size < 10 * 1024 * 1024 => 2,   // sizeLessThan10MiB
+        _ if size < 100 * 1024 * 1024 => 3,  // sizeLessThan100MiB
         _ if size < 1024 * 1024 * 1024 => 4, // sizeLessThan1GiB
-        _ => 5, // sizeGreaterThan1GiB
+        _ => 5,                              // sizeGreaterThan1GiB
     }
 }

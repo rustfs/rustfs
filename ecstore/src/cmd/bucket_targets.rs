@@ -1,26 +1,27 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 use crate::{
+    bucket::{self, target::BucketTargets},
+    new_object_layer_fn, peer, store_api,
+};
+use crate::{
     bucket::{metadata_sys, target::BucketTarget},
     endpoints::Node,
     peer::{PeerS3Client, RemotePeerS3Client},
     StorageAPI,
 };
-use crate::{
-    bucket::{self, target::BucketTargets},
-    new_object_layer_fn, peer, store_api,
-};
+//use tokio::sync::RwLock;
+use aws_sdk_s3::Client as S3Client;
 use chrono::Utc;
+use futures::future::err;
 use lazy_static::lazy_static;
+use std::sync::Arc;
 use std::{
     collections::HashMap,
     time::{Duration, SystemTime},
 };
-//use tokio::sync::RwLock;
-use aws_sdk_s3::Client as S3Client;
-use std::sync::{Arc};
-use tokio::sync::RwLock;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 pub struct TClient {
     pub s3cli: S3Client,
@@ -78,21 +79,21 @@ pub struct ArnTarget {
     last_refresh: chrono::DateTime<Utc>,
 }
 impl ArnTarget {
-    pub fn new(bucket: String, endpoint: String, ak:String, sk:String) -> Self {
+    pub fn new(bucket: String, endpoint: String, ak: String, sk: String) -> Self {
         Self {
             client: TargetClient {
-                bucket: bucket,
+                bucket,
                 storage_class: "STANDRD".to_string(),
                 disable_proxy: false,
                 health_check_duration: Duration::from_secs(100),
-                endpoint: endpoint,
+                endpoint,
                 reset_id: "0".to_string(),
                 replicate_sync: false,
                 secure: false,
                 arn: "".to_string(),
                 client: reqwest::Client::new(),
-                ak:ak,
-                sk:sk,
+                ak,
+                sk,
             },
             last_refresh: Utc::now(),
         }
@@ -149,9 +150,9 @@ pub struct BucketRemoteTargetNotFound {
 pub async fn init_bucket_targets(bucket: &str, meta: Arc<bucket::metadata::BucketMetadata>) {
     println!("140 {}", bucket);
     if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
-        if let  Some(tgts) = meta.bucket_target_config.clone() {
+        if let Some(tgts) = meta.bucket_target_config.clone() {
             for tgt in tgts.targets {
-                warn!("ak and sk is:{:?}",tgt.credentials);
+                warn!("ak and sk is:{:?}", tgt.credentials);
                 let _ = sys.set_target(bucket, &tgt, false, true).await;
                 //sys.targets_map.
             }
@@ -159,12 +160,17 @@ pub async fn init_bucket_targets(bucket: &str, meta: Arc<bucket::metadata::Bucke
     }
 }
 
-pub async fn remove_bucket_target(bucket: &str, arn_str:&str) {
+pub async fn remove_bucket_target(bucket: &str, arn_str: &str) {
     if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
         let _ = sys.remove_target(bucket, arn_str).await;
     }
 }
 
+impl Default for BucketTargetSys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BucketTargetSys {
     pub fn new() -> Self {
@@ -238,7 +244,7 @@ impl BucketTargetSys {
         targets
     }
 
-    pub async fn remove_target(&self, bucket:&str, arn_str:&str) -> Result<(), SetTargetError> {
+    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<(), SetTargetError> {
         //to do need lock;
         let mut targets_map = self.targets_map.write().await;
         let tgts = targets_map.get(bucket);
@@ -263,13 +269,12 @@ impl BucketTargetSys {
 
         // 如果没有找到匹配的 ARN，则返回错误
         if !found {
-             return Ok(());
+            return Ok(());
         }
 
         // 更新 targets_map
         targets_map.insert(bucket.to_string(), targets);
         arn_remotes_map.remove(arn_str);
-
 
         let targets = self.list_targets(Some(&bucket), None).await;
         println!("targets is {}", targets.len());
@@ -376,11 +381,11 @@ impl BucketTargetSys {
         match store.get_bucket_info(_bucket, &store_api::BucketOptions::default()).await {
             Ok(info) => {
                 println!("Bucket Info: {:?}", info);
-                return info.versionning;
+                info.versionning
             }
             Err(err) => {
                 eprintln!("Error: {:?}", err);
-                return false;
+                false
             }
         }
     }
@@ -419,13 +424,11 @@ impl BucketTargetSys {
         // }
 
         //let client = self.get_remote_target_client(tgt).await?;
-        if tgt.type_ == Some("replication".to_string()) {
-            if !fromdisk {
-                let versioning_config = self.local_is_bucket_versioned(bucket).await;
-                if !versioning_config {
-                    // println!("111111111");
-                    return Err(SetTargetError::TargetNotVersioned(bucket.to_string()));
-                }
+        if tgt.type_ == Some("replication".to_string()) && !fromdisk {
+            let versioning_config = self.local_is_bucket_versioned(bucket).await;
+            if !versioning_config {
+                // println!("111111111");
+                return Err(SetTargetError::TargetNotVersioned(bucket.to_string()));
             }
         }
 
@@ -502,7 +505,12 @@ impl BucketTargetSys {
             println!("437 exist:{}", tgt.arn.clone().unwrap());
             targets.push(tgt.clone());
         }
-        let arntgt: ArnTarget = ArnTarget::new(tgt.target_bucket.clone(), tgt.endpoint.clone(),tgt.credentials.clone().unwrap().access_key.clone(), tgt.credentials.clone().unwrap().secret_key);
+        let arntgt: ArnTarget = ArnTarget::new(
+            tgt.target_bucket.clone(),
+            tgt.endpoint.clone(),
+            tgt.credentials.clone().unwrap().access_key.clone(),
+            tgt.credentials.clone().unwrap().secret_key,
+        );
 
         arn_remotes_map.insert(tgt.arn.clone().unwrap().clone(), arntgt);
         //self.update_bandwidth_limit(bucket, &tgt.arn, tgt.bandwidth_limit).await;
@@ -523,8 +531,8 @@ pub struct TargetClient {
     pub reset_id: String,
     pub endpoint: String,
     pub secure: bool,
-    pub ak:String,
-    pub sk:String,
+    pub ak: String,
+    pub sk: String,
 }
 
 impl TargetClient {
@@ -539,8 +547,8 @@ impl TargetClient {
         reset_id: String,
         endpoint: String,
         secure: bool,
-        ak:String,
-        sk:String,
+        ak: String,
+        sk: String,
     ) -> Self {
         TargetClient {
             client,
@@ -561,7 +569,7 @@ impl TargetClient {
         Ok(true) // Mocked implementation
     }
 }
-use tracing::{error, warn, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -613,7 +621,7 @@ impl ARN {
     /// 检查 ARN 是否为空
     pub fn is_empty(&self) -> bool {
         //!self.arn_type.is_valid()
-        return false;
+        false
     }
 
     /// 将 ARN 转为字符串格式
@@ -625,12 +633,12 @@ impl ARN {
     pub fn parse(s: &str) -> Result<Self, String> {
         // ARN 必须是格式 arn:minio:<Type>:<REGION>:<ID>:<remote-bucket>
         if !s.starts_with("arn:minio:") {
-            return Err(format!("Invalid ARN {}", s).into());
+            return Err(format!("Invalid ARN {}", s));
         }
 
         let tokens: Vec<&str> = s.split(':').collect();
         if tokens.len() != 6 || tokens[4].is_empty() || tokens[5].is_empty() {
-            return Err(format!("Invalid ARN {}", s).into());
+            return Err(format!("Invalid ARN {}", s));
         }
 
         Ok(ARN {
@@ -661,7 +669,7 @@ fn must_get_uuid() -> String {
 }
 fn generate_arn(target: BucketTarget, depl_id: String) -> String {
     let mut uuid: String = depl_id;
-    if uuid == "" {
+    if uuid.is_empty() {
         uuid = must_get_uuid();
     }
 
@@ -671,7 +679,7 @@ fn generate_arn(target: BucketTarget, depl_id: String) -> String {
         region: "us-east-1".to_string(),
         bucket: (target.target_bucket),
     };
-    return arn.to_string();
+    arn.to_string()
 }
 
 // use std::collections::HashMap;

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, i64, u64};
+use std::collections::HashMap;
 
 use crate::last_minute::{self};
 pub struct ReplicationLatency {
@@ -10,7 +10,7 @@ impl ReplicationLatency {
     // 合并两个 ReplicationLatency
     pub fn merge(&mut self, other: &mut ReplicationLatency) -> &ReplicationLatency {
         self.upload_histogram.merge(&other.upload_histogram);
-        return self;
+        self
     }
 
     // 获取上传延迟（按对象大小区间分类）
