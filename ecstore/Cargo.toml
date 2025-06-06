@@ -71,7 +71,7 @@ reqwest = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 once_cell = { workspace = true }
 aws-smithy-types = "1.2.13"
-rustfs-rsc = "2025.220.3"
+rustfs-rsc = "2025.506.1"
 hyper.workspace = true
 urlencoding = { workspace = true }
 smallvec = { workspace = true }
