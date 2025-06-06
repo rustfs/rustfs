@@ -62,7 +62,7 @@ use tokio::{
     },
     time::sleep,
 };
-use tracing::{error, info, debug};
+use tracing::{error, info};
 
 const DATA_SCANNER_SLEEP_PER_FOLDER: Duration = Duration::from_millis(1); // Time to wait between folders.
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16; // Visit all folders every n cycles.

@@ -22,6 +22,7 @@ api = { workspace = true }
 appauth = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 axum.workspace = true
 axum-extra = { workspace = true }
 axum-server = { workspace = true }
@@ -43,14 +44,18 @@ hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
 iam = { workspace = true }
+include_dir = { workspace = true }
+jsonwebtoken = { workspace = true }
 lock.workspace = true
 matchit = { workspace = true }
 mime.workspace = true
 mime_guess = { workspace = true }
 opentelemetry = { workspace = true }
+percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 protos.workspace = true
 query = { workspace = true }
+regex = { workspace = true }
 rmp-serde.workspace = true
 rustfs-config = { workspace = true }
 rustfs-event-notifier = { workspace = true }
@@ -64,6 +69,7 @@ serde_json.workspace = true
 serde_urlencoded = { workspace = true }
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
 socket2 = { workspace = true }
+thiserror = { workspace = true }
 tracing.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 tokio-util.workspace = true
@@ -85,6 +91,7 @@ tower-http = { workspace = true, features = [
     "compression-gzip",
     "cors",
 ] }
+urlencoding = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -92,26 +99,6 @@ libsystemd.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = "0.6"
-uuid = "1.12.1"
-url.workspace = true
-#admin = { path = "../api/admin" }
-axum.workspace = true
-matchit = "0.8.3"
-shadow-rs = "0.38.0"
-const-str = { version = "0.6.1", features = ["std", "proc"] }
-atoi = "2.0.0"
-serde_urlencoded = "0.7.1"
-crypto = { path = "../crypto" }
-iam = { path = "../iam" }
-jsonwebtoken = "9.3.0"
-tower-http = { version = "0.6.2", features = ["cors"] }
-chrono.workspace = true
-thiserror.workspace = true
-regex = "1.11.1"
-aws-sdk-s3 = "1.29.0"
-include_dir = "0.7.4"
-percent-encoding = "2.3.1"
-urlencoding = "2.1.3"
 
 [build-dependencies]
 prost-build.workspace = true
