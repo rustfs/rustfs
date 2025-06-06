@@ -346,7 +346,7 @@ impl BucketMetadata {
         }
         //let temp = self.bucket_targets_config_json.clone();
         if !self.bucket_targets_config_json.is_empty() {
-            let arr:Vec<BucketTarget> = serde_json::from_slice(&self.bucket_targets_config_json)?;
+            let arr: Vec<BucketTarget> = serde_json::from_slice(&self.bucket_targets_config_json)?;
             self.bucket_target_config = Some(BucketTargets { targets: arr });
         } else {
             self.bucket_target_config = Some(BucketTargets::default())

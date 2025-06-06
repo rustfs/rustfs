@@ -17,12 +17,12 @@ use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, Shutdo
 use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
-use ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use common::{
     error::{Error, Result},
     globals::set_global_addr,
 };
 use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+use ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use ecstore::config as ecconfig;
 use ecstore::config::GLOBAL_ConfigSys;
 use ecstore::heal::background_heal_ops::init_auto_heal;

@@ -11,7 +11,7 @@ use handlers::{
     sts, user,
 };
 
-use handlers::{ListRemoteTargetHandler, SetRemoteTargetHandler, RemoveRemoteTargetHandler, GetReplicationMetricsHandler};
+use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::regist_rpc_route;
@@ -231,51 +231,49 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
     )?;
 
     r.insert(
-        Method::GET, 
-        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/list-remote-targets").as_str(), 
+        Method::GET,
+        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
         AdminOperation(&ListRemoteTargetHandler {}),
     )?;
 
     r.insert(
-        Method::GET, 
-        format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(), 
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
         AdminOperation(&ListRemoteTargetHandler {}),
     )?;
 
     r.insert(
-        Method::GET, 
+        Method::GET,
         format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
         AdminOperation(&GetReplicationMetricsHandler {}),
     )?;
 
     r.insert(
-        Method::GET, 
+        Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
         AdminOperation(&GetReplicationMetricsHandler {}),
     )?;
 
-
     r.insert(
-        Method::PUT, 
-        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/set-remote-target").as_str(), 
+        Method::PUT,
+        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/set-remote-target").as_str(),
         AdminOperation(&SetRemoteTargetHandler {}),
     )?;
     r.insert(
-        Method::PUT, 
-        format!("{}{}", ADMIN_PREFIX, "/v3/set-remote-target").as_str(), 
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-remote-target").as_str(),
         AdminOperation(&SetRemoteTargetHandler {}),
     )?;
 
-
     r.insert(
-        Method::DELETE, 
-        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/remove-remote-target").as_str(), 
+        Method::DELETE,
+        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
     r.insert(
-        Method::DELETE, 
-        format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(), 
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 

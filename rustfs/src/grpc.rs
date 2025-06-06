@@ -249,8 +249,7 @@ impl Node for NodeService {
                 }))
             }
 
-           // println!("vuc")
-
+            // println!("vuc")
             Err(err) => Ok(tonic::Response::new(GetBucketInfoResponse {
                 success: false,
                 bucket_info: String::new(),
