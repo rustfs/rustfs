@@ -32,6 +32,7 @@ pub mod store_list_objects;
 mod store_utils;
 pub mod utils;
 pub mod xhttp;
+pub mod cmd;
 
 pub use global::new_object_layer_fn;
 pub use global::set_global_endpoints;

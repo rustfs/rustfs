@@ -1,3 +1,17 @@
+use async_trait::async_trait;
+use futures::future::join_all;
+use madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use protos::node_service_time_out_client;
+use protos::proto_gen::node_service::{
+    DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
+};
+use regex::Regex;
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use tokio::sync::RwLock;
+use tonic::Request;
+use tracing::info;
+
+use crate::bucket::metadata_sys;
 use crate::disk::error::is_all_buckets_not_found;
 use crate::disk::{DiskAPI, DiskStore};
 use crate::error::clone_err;
@@ -15,19 +29,7 @@ use crate::{
     endpoints::{EndpointServerPools, Node},
     store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
 };
-use async_trait::async_trait;
 use common::error::{Error, Result};
-use futures::future::join_all;
-use madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use protos::node_service_time_out_client;
-use protos::proto_gen::node_service::{
-    DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
-};
-use regex::Regex;
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
-use tokio::sync::RwLock;
-use tonic::Request;
-use tracing::info;
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
@@ -430,14 +432,17 @@ impl PeerS3Client for LocalPeerS3Client {
         }
 
         // TODO: reduceWriteQuorumErrs
-
-        // debug!("get_bucket_info errs:{:?}", errs);
+        let mut versioned = false;
+        if let Ok(sys) = metadata_sys::get(bucket).await {
+            versioned = sys.versioning(); 
+        }
 
         ress.iter()
             .find_map(|op| {
                 op.as_ref().map(|v| BucketInfo {
                     name: v.name.clone(),
                     created: v.created,
+                    versionning: versioned,
                     ..Default::default()
                 })
             })
@@ -496,14 +501,17 @@ pub struct RemotePeerS3Client {
 }
 
 impl RemotePeerS3Client {
-    fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
+    pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default().to_string();
         Self { node, pools, addr }
+    }
+    pub fn get_addr(&self)->String {
+        return self.addr.clone();
     }
 }
 
 #[async_trait]
-impl PeerS3Client for RemotePeerS3Client {
+impl PeerS3Client for RemotePeerS3Client { 
     fn get_pools(&self) -> Option<Vec<usize>> {
         self.pools.clone()
     }

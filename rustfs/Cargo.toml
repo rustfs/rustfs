@@ -92,6 +92,26 @@ libsystemd.workspace = true
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = "0.6"
+uuid = "1.12.1"
+url.workspace = true
+#admin = { path = "../api/admin" }
+axum.workspace = true
+matchit = "0.8.3"
+shadow-rs = "0.38.0"
+const-str = { version = "0.6.1", features = ["std", "proc"] }
+atoi = "2.0.0"
+serde_urlencoded = "0.7.1"
+crypto = { path = "../crypto" }
+iam = { path = "../iam" }
+jsonwebtoken = "9.3.0"
+tower-http = { version = "0.6.2", features = ["cors"] }
+chrono.workspace = true
+thiserror.workspace = true
+regex = "1.11.1"
+aws-sdk-s3 = "1.29.0"
+include_dir = "0.7.4"
+percent-encoding = "2.3.1"
+urlencoding = "2.1.3"
 
 [build-dependencies]
 prost-build.workspace = true

@@ -240,12 +240,16 @@ impl Node for NodeService {
                         }));
                     }
                 };
+
+                println!("bucket info {}", bucket_info.clone());
                 Ok(tonic::Response::new(GetBucketInfoResponse {
                     success: true,
                     bucket_info,
                     error: None,
                 }))
             }
+
+           // println!("vuc")
 
             Err(err) => Ok(tonic::Response::new(GetBucketInfoResponse {
                 success: false,
