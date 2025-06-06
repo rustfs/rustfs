@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tokio::{sync::mpsc::Sender, time::sleep};
 use tracing::{info, warn};
 
-use crate::{lock_args::LockArgs, LockApi, Locker};
+use crate::{LockApi, Locker, lock_args::LockArgs};
 
 const DRW_MUTEX_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const LOCK_RETRY_MIN_INTERVAL: Duration = Duration::from_millis(250);
@@ -117,7 +117,10 @@ impl DRWMutex {
                 quorum += 1;
             }
         }
-        info!("lockBlocking {}/{} for {:?}: lockType readLock({}), additional opts: {:?}, quorum: {}, tolerance: {}, lockClients: {}\n", id, source, self.names, is_read_lock, opts, quorum, tolerance, locker_len);
+        info!(
+            "lockBlocking {}/{} for {:?}: lockType readLock({}), additional opts: {:?}, quorum: {}, tolerance: {}, lockClients: {}\n",
+            id, source, self.names, is_read_lock, opts, quorum, tolerance, locker_len
+        );
 
         // Recalculate tolerance after potential quorum adjustment
         // Use saturating_sub to prevent underflow
@@ -376,8 +379,8 @@ mod tests {
     use super::*;
     use crate::local_locker::LocalLocker;
     use async_trait::async_trait;
-    use common::error::{Error, Result};
     use std::collections::HashMap;
+    use std::io::{Error, Result};
     use std::sync::{Arc, Mutex};
 
     // Mock locker for testing
@@ -436,10 +439,10 @@ mod tests {
         async fn lock(&mut self, args: &LockArgs) -> Result<bool> {
             let mut state = self.state.lock().unwrap();
             if state.should_fail {
-                return Err(Error::from_string("Mock lock failure"));
+                return Err(Error::other("Mock lock failure"));
             }
             if !state.is_online {
-                return Err(Error::from_string("Mock locker offline"));
+                return Err(Error::other("Mock locker offline"));
             }
 
             // Check if already locked
@@ -454,7 +457,7 @@ mod tests {
         async fn unlock(&mut self, args: &LockArgs) -> Result<bool> {
             let mut state = self.state.lock().unwrap();
             if state.should_fail {
-                return Err(Error::from_string("Mock unlock failure"));
+                return Err(Error::other("Mock unlock failure"));
             }
 
             Ok(state.locks.remove(&args.uid).is_some())
@@ -463,10 +466,10 @@ mod tests {
         async fn rlock(&mut self, args: &LockArgs) -> Result<bool> {
             let mut state = self.state.lock().unwrap();
             if state.should_fail {
-                return Err(Error::from_string("Mock rlock failure"));
+                return Err(Error::other("Mock rlock failure"));
             }
             if !state.is_online {
-                return Err(Error::from_string("Mock locker offline"));
+                return Err(Error::other("Mock locker offline"));
             }
 
             // Check if write lock exists
@@ -481,7 +484,7 @@ mod tests {
         async fn runlock(&mut self, args: &LockArgs) -> Result<bool> {
             let mut state = self.state.lock().unwrap();
             if state.should_fail {
-                return Err(Error::from_string("Mock runlock failure"));
+                return Err(Error::other("Mock runlock failure"));
             }
 
             Ok(state.read_locks.remove(&args.uid).is_some())
@@ -490,7 +493,7 @@ mod tests {
         async fn refresh(&mut self, _args: &LockArgs) -> Result<bool> {
             let state = self.state.lock().unwrap();
             if state.should_fail {
-                return Err(Error::from_string("Mock refresh failure"));
+                return Err(Error::other("Mock refresh failure"));
             }
             Ok(true)
         }
@@ -880,8 +883,8 @@ mod tests {
         // Case 1: Even number of lockers
         let locks = vec!["uid1".to_string(), "uid2".to_string(), "uid3".to_string(), "uid4".to_string()];
         let tolerance = 2; // locks.len() / 2 = 4 / 2 = 2
-                           // locks.len() - tolerance = 4 - 2 = 2, which equals tolerance
-                           // So the special case applies: un_locks_failed >= tolerance
+        // locks.len() - tolerance = 4 - 2 = 2, which equals tolerance
+        // So the special case applies: un_locks_failed >= tolerance
 
         // All 4 failed unlocks
         assert!(check_failed_unlocks(&locks, tolerance)); // 4 >= 2 = true
@@ -897,8 +900,8 @@ mod tests {
         // Case 2: Odd number of lockers
         let locks = vec!["uid1".to_string(), "uid2".to_string(), "uid3".to_string()];
         let tolerance = 1; // locks.len() / 2 = 3 / 2 = 1
-                           // locks.len() - tolerance = 3 - 1 = 2, which does NOT equal tolerance (1)
-                           // So the normal case applies: un_locks_failed > tolerance
+        // locks.len() - tolerance = 3 - 1 = 2, which does NOT equal tolerance (1)
+        // So the normal case applies: un_locks_failed > tolerance
 
         // 3 failed unlocks
         assert!(check_failed_unlocks(&locks, tolerance)); // 3 > 1 = true

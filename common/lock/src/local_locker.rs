@@ -1,11 +1,11 @@
 use async_trait::async_trait;
-use common::error::{Error, Result};
+use std::io::{Error, Result};
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
 };
 
-use crate::{lock_args::LockArgs, Locker};
+use crate::{Locker, lock_args::LockArgs};
 
 const MAX_DELETE_LIST: usize = 1000;
 
@@ -116,7 +116,7 @@ impl LocalLocker {
 impl Locker for LocalLocker {
     async fn lock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() > MAX_DELETE_LIST {
-            return Err(Error::from_string(format!(
+            return Err(Error::other(format!(
                 "internal error: LocalLocker.lock called with more than {} resources",
                 MAX_DELETE_LIST
             )));
@@ -152,7 +152,7 @@ impl Locker for LocalLocker {
 
     async fn unlock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() > MAX_DELETE_LIST {
-            return Err(Error::from_string(format!(
+            return Err(Error::other(format!(
                 "internal error: LocalLocker.unlock called with more than {} resources",
                 MAX_DELETE_LIST
             )));
@@ -197,7 +197,7 @@ impl Locker for LocalLocker {
 
     async fn rlock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() != 1 {
-            return Err(Error::from_string("internal error: localLocker.RLock called with more than one resource"));
+            return Err(Error::other("internal error: localLocker.RLock called with more than one resource"));
         }
 
         let resource = &args.resources[0];
@@ -241,7 +241,7 @@ impl Locker for LocalLocker {
 
     async fn runlock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() != 1 {
-            return Err(Error::from_string("internal error: localLocker.RLock called with more than one resource"));
+            return Err(Error::other("internal error: localLocker.RLock called with more than one resource"));
         }
 
         let mut reply = false;
@@ -249,7 +249,7 @@ impl Locker for LocalLocker {
         match self.lock_map.get_mut(resource) {
             Some(lris) => {
                 if is_write_lock(lris) {
-                    return Err(Error::from_string(format!("runlock attempted on a write locked entity: {}", resource)));
+                    return Err(Error::other(format!("runlock attempted on a write locked entity: {}", resource)));
                 } else {
                     lris.retain(|lri| {
                         if lri.uid == args.uid && (args.owner.is_empty() || lri.owner == args.owner) {
@@ -389,8 +389,8 @@ fn format_uuid(s: &mut String, idx: &usize) {
 #[cfg(test)]
 mod test {
     use super::LocalLocker;
-    use crate::{lock_args::LockArgs, Locker};
-    use common::error::Result;
+    use crate::{Locker, lock_args::LockArgs};
+    use std::io::Result;
     use tokio;
 
     #[tokio::test]

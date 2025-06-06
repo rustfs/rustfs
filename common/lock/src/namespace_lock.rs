@@ -5,11 +5,11 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
+    LockApi,
     drwmutex::{DRWMutex, Options},
     lrwmutex::LRWMutex,
-    LockApi,
 };
-use common::error::Result;
+use std::io::Result;
 
 pub type RWLockerImpl = Box<dyn RWLocker + Send + Sync>;
 
@@ -258,12 +258,12 @@ impl RWLocker for LocalLockInstance {
 mod test {
     use std::{sync::Arc, time::Duration};
 
-    use common::error::Result;
+    use std::io::Result;
     use tokio::sync::RwLock;
 
     use crate::{
         drwmutex::Options,
-        namespace_lock::{new_nslock, NsLockMap},
+        namespace_lock::{NsLockMap, new_nslock},
     };
 
     #[tokio::test]

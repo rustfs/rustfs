@@ -19,7 +19,7 @@ use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
 use common::{
-    error::{Error, Result},
+    // error::{Error, Result},
     globals::set_global_addr,
 };
 use ecstore::StorageAPI;
@@ -54,6 +54,7 @@ use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
 use socket2::SockRef;
+use std::io::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,7 +108,7 @@ async fn main() -> Result<()> {
     let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
 
     // Store in global storage
-    set_global_guard(guard)?;
+    set_global_guard(guard).map_err(Error::other)?;
 
     // Run parameters
     run(opt).await
@@ -211,7 +212,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         if !opt.server_domains.is_empty() {
             info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
-            b.set_host(MultiDomain::new(&opt.server_domains)?);
+            b.set_host(MultiDomain::new(&opt.server_domains).map_err(Error::other)?);
         }
 
         // // Enable parsing virtual-hosted-style requests
@@ -506,7 +507,7 @@ async fn run(opt: config::Opt) -> Result<()> {
         .await
         .map_err(|err| {
             error!("ECStore::new {:?}", &err);
-            Error::from_string(err.to_string())
+            err
         })?;
 
     ecconfig::init();
