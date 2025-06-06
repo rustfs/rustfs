@@ -1,5 +1,5 @@
 [package]
-name = "rustfs-event"
+name = "rustfs-notify"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

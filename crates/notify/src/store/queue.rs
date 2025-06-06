@@ -1,5 +1,4 @@
 use common::error::{Error, Result};
-use ecstore::utils::path::dir;
 use serde::{de::DeserializeOwned, Serialize};
 use snap::raw::{Decoder, Encoder};
 use std::collections::HashMap;
@@ -168,7 +167,7 @@ where
         }
 
         Self {
-            directory: directory.into(),
+            directory: directory.as_ref().to_path_buf(),
             name,
             entry_limit: limit,
             file_ext: ext,
@@ -298,7 +297,10 @@ where
         // Update the item mapping
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
 
-        let mut entries = self.entries.write().map_err(|_| Error::msg("获取写锁失败"))?;
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| Error::msg("Failed to obtain a write lock"))?;
         entries.insert(key.to_string(), now);
 
         Ok(())
@@ -323,48 +325,24 @@ where
             Ok(data)
         }
     }
+
+    /// Check whether the storage limit is reached
+    fn check_entry_limit(&self) -> Result<()> {
+        let entries = self.entries.read().map_err(|_| Error::msg("Failed to obtain a read lock"))?;
+        if entries.len() as u64 >= self.entry_limit {
+            return Err(Error::msg("The storage limit has been reached"));
+        }
+        Ok(())
+    }
 }
 
 impl<T> Store<T> for QueueStore<T>
 where
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    fn open(&self) -> Result<()> {
-        // Create a directory (if it doesn't exist)
-        fs::create_dir_all(&self.directory)?;
-
-        // Read existing files
-        let files = self.list_files()?;
-
-        let mut entries = self
-            .entries
-            .write()
-            .map_err(|_| Error::msg("Failed to obtain a write lock"))?;
-
-        for file in files {
-            if let Ok(meta) = file.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(since_epoch) = modified.duration_since(UNIX_EPOCH) {
-                        entries.insert(file.file_name().to_string_lossy().to_string(), since_epoch.as_nanos() as i64);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn delete(&self) -> Result<()> {
-        fs::remove_dir_all(&self.directory)?;
-        Ok(())
-    }
-
     fn put(&self, item: T) -> Result<Key> {
         {
-            let entries = self.entries.read().map_err(|_| Error::msg("Failed to obtain a read lock"))?;
-            if entries.len() as u64 >= self.entry_limit {
-                return Err(Error::msg("The storage limit has been reached"));
-            }
+            self.check_entry_limit()?;
         }
 
         // generate a new uuid
@@ -375,17 +353,13 @@ where
 
         Ok(key)
     }
-
     fn put_multiple(&self, items: Vec<T>) -> Result<Key> {
         if items.is_empty() {
             return Err(Error::msg("The list of items is empty"));
         }
 
         {
-            let entries = self.entries.read().map_err(|_| Error::msg("Failed to obtain a read lock"))?;
-            if entries.len() as u64 >= self.entry_limit {
-                return Err(Error::msg("The storage limit has been reached"));
-            }
+            self.check_entry_limit()?;
         }
 
         // Generate a new UUID
@@ -419,19 +393,19 @@ where
         // if the read fails try parsing it once
         if reader.read_to_end(&mut buffer).is_err() {
             // Try to parse the entire data as a single object
-            match serde_json::from_slice::<T>(&data) {
+            return match serde_json::from_slice::<T>(&data) {
                 Ok(item) => {
                     items.push(item);
-                    return Ok(items);
+                    Ok(items)
                 }
                 Err(_) => {
                     // An attempt was made to resolve to an array of objects
                     match serde_json::from_slice::<Vec<T>>(&data) {
-                        Ok(array_items) => return Ok(array_items),
-                        Err(e) => return Err(Error::msg(format!("Failed to parse the data:{}", e))),
+                        Ok(array_items) => Ok(array_items),
+                        Err(e) => Err(Error::msg(format!("Failed to parse the data:{}", e))),
                     }
                 }
-            }
+            };
         }
 
         // Read JSON objects by row
@@ -515,6 +489,36 @@ where
             .map_err(|_| Error::msg("Failed to obtain a write lock"))?;
         entries.remove(&key.to_string());
 
+        Ok(())
+    }
+
+    fn open(&self) -> Result<()> {
+        // Create a directory (if it doesn't exist)
+        fs::create_dir_all(&self.directory)?;
+
+        // Read existing files
+        let files = self.list_files()?;
+
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| Error::msg("Failed to obtain a write lock"))?;
+
+        for file in files {
+            if let Ok(meta) = file.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(since_epoch) = modified.duration_since(UNIX_EPOCH) {
+                        entries.insert(file.file_name().to_string_lossy().to_string(), since_epoch.as_nanos() as i64);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<()> {
+        fs::remove_dir_all(&self.directory)?;
         Ok(())
     }
 }

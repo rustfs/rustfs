@@ -1,4 +1,5 @@
-use rustfs_event::NotifierConfig;
+use rustfs_config::NotifierConfig;
+use rustfs_event::EventNotifierConfig;
 use tracing::{error, info, instrument};
 
 #[instrument]
@@ -7,26 +8,26 @@ pub(crate) async fn init_event_notifier(notifier_config: Option<String>) {
     let notifier_config_present = notifier_config.is_some();
     let config = if notifier_config_present {
         info!("event_config is not empty, path: {:?}", notifier_config);
-        NotifierConfig::event_load_config(notifier_config)
+        EventNotifierConfig::event_load_config(notifier_config)
     } else {
         info!("event_config is empty");
         // rustfs_event::get_event_notifier_config().clone()
-        NotifierConfig::default()
+        EventNotifierConfig::default()
     };
 
     info!("using event_config: {:?}", config);
     tokio::spawn(async move {
-        let result = rustfs_event::initialize(&config).await;
-        match result {
-            Ok(_) => info!(
-                "event notifier initialized successfully {}",
-                if notifier_config_present {
-                    "by config file"
-                } else {
-                    "by sys config"
-                }
-            ),
-            Err(e) => error!("Failed to initialize event notifier: {}", e),
-        }
+        // let result = rustfs_event::initialize(&config).await;
+        // match result {
+        //     Ok(_) => info!(
+        //         "event notifier initialized successfully {}",
+        //         if notifier_config_present {
+        //             "by config file"
+        //         } else {
+        //             "by sys config"
+        //         }
+        //     ),
+        //     Err(e) => error!("Failed to initialize event notifier: {}", e),
+        // }
     });
 }

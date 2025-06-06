@@ -7,6 +7,7 @@ use crate::{Event, DEFAULT_RETRY_INTERVAL};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{self, Client, Identity, RequestBuilder};
+use serde_json::to_string;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -105,7 +106,8 @@ impl WebhookAdapter {
             } else {
                 crate::config::default_queue_limit()
             };
-            let store = QueueStore::new(store_path, queue_limit, Some(".event".to_string()));
+            let name = config.common.identifier.clone();
+            let store = QueueStore::new(store_path, name, queue_limit, Some(".event".to_string()));
             if let Err(e) = store.open() {
                 tracing::error!("Unable to open queue storage: {}", e);
                 None

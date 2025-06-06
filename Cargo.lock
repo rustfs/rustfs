@@ -7655,7 +7655,7 @@ dependencies = [
  "rmp-serde",
  "rust-embed",
  "rustfs-config",
- "rustfs-event",
+ "rustfs-notify",
  "rustfs-obs",
  "rustfs-utils",
  "rustfs-zip",
@@ -7693,7 +7693,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustfs-event"
+name = "rustfs-gui"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "dioxus",
+ "dirs",
+ "hex",
+ "keyring",
+ "lazy_static",
+ "rfd 0.15.3",
+ "rust-embed",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rustfs-notify"
 version = "0.0.1"
 dependencies = [
  "async-trait",
@@ -7719,27 +7740,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "rustfs-gui"
-version = "0.0.1"
-dependencies = [
- "chrono",
- "dioxus",
- "dirs",
- "hex",
- "keyring",
- "lazy_static",
- "rfd 0.15.3",
- "rust-embed",
- "rust-i18n",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tracing-appender",
- "tracing-subscriber",
 ]
 
 [[package]]

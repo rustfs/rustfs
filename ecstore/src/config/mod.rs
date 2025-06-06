@@ -78,11 +78,7 @@ impl KVS {
         KVS(Vec::new())
     }
     pub fn get(&self, key: &str) -> String {
-        if let Some(v) = self.lookup(key) {
-            v
-        } else {
-            "".to_owned()
-        }
+        if let Some(v) = self.lookup(key) { v } else { "".to_owned() }
     }
     pub fn lookup(&self, key: &str) -> Option<String> {
         for kv in self.0.iter() {
