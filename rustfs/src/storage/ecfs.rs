@@ -4,14 +4,12 @@ use super::options::extract_metadata;
 use super::options::put_opts;
 use crate::auth::get_condition_values;
 use crate::storage::access::ReqInfo;
-use crate::storage::error::to_s3_error;
-use crate::storage::options::copy_dst_opts;
-use crate::storage::options::copy_src_opts;
-use crate::storage::options::{extract_metadata_from_mime, get_opts};
 use api::query::Context;
 use api::query::Query;
 use api::server::dbms::DatabaseManagerSystem;
 use bytes::Bytes;
+use chrono::DateTime;
+use chrono::Utc;
 use common::error::Result;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
@@ -30,6 +28,9 @@ use ecstore::bucket::policy_sys::PolicySys;
 use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
+use ecstore::cmd::bucket_replication::get_must_replicate_options;
+use ecstore::cmd::bucket_replication::must_replicate;
+use ecstore::cmd::bucket_replication::schedule_replication;
 use ecstore::io::READ_BUFFER_SIZE;
 use ecstore::new_object_layer_fn;
 use ecstore::store_api::BucketOptions;
@@ -43,6 +44,7 @@ use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
+// use ecstore::store_api::RESERVED_METADATA_PREFIX;
 use ecstore::store_api::RESERVED_METADATA_PREFIX_LOWER;
 use ecstore::utils::path::path_join_buf;
 use ecstore::utils::xml;
@@ -84,6 +86,13 @@ use tracing::info;
 use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
+
+use crate::storage::error::to_s3_error;
+use crate::storage::options::copy_dst_opts;
+use crate::storage::options::copy_src_opts;
+use crate::storage::options::{extract_metadata_from_mime, get_opts};
+use ecstore::cmd::bucket_replication::ReplicationStatusType;
+use ecstore::cmd::bucket_replication::ReplicationType;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -924,6 +933,7 @@ impl S3 for FS {
             return self.put_object_extract(req).await;
         }
 
+        info!("put object");
         let input = req.input;
 
         if let Some(ref storage_class) = input.storage_class {
@@ -976,9 +986,26 @@ impl S3 for FS {
             metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
+        let mt = metadata.clone();
+        let mt2 = metadata.clone();
+
+        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(mt))
             .await
             .map_err(to_s3_error)?;
+
+        let repoptions =
+            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+
+        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+        warn!("dsc {}", &dsc.replicate_any().clone());
+        if dsc.replicate_any() {
+            let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
+            let now: DateTime<Utc> = Utc::now();
+            let formatted_time = now.to_rfc3339();
+            metadata.insert(k, formatted_time);
+            let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
+            metadata.insert(k, dsc.pending_status());
+        }
 
         debug!("put_object opts {:?}", &opts);
 
@@ -987,9 +1014,17 @@ impl S3 for FS {
             .await
             .map_err(to_s3_error)?;
 
-        let e_tag = obj_info.etag;
+        let e_tag = obj_info.etag.clone();
 
-        // store.put_object(bucket, object, data, opts);
+        let repoptions =
+            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
+
+        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+
+        if dsc.replicate_any() {
+            let objectlayer = new_object_layer_fn();
+            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+        }
 
         let output = PutObjectOutput {
             e_tag,
@@ -1152,17 +1187,30 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let oi = store
+        let obj_info = store
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
             .map_err(to_s3_error)?;
 
         let output = CompleteMultipartUploadOutput {
-            bucket: Some(bucket),
-            key: Some(key),
-            e_tag: oi.etag,
+            bucket: Some(bucket.clone()),
+            key: Some(key.clone()),
+            e_tag: obj_info.etag.clone(),
+            location: Some("us-east-1".to_string()),
             ..Default::default()
         };
+
+        let mt2 = HashMap::new();
+        let repoptions =
+            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, opts);
+
+        let dsc = must_replicate(&bucket, &key, &repoptions).await;
+
+        if dsc.replicate_any() {
+            warn!("need multipart replication");
+            let objectlayer = new_object_layer_fn();
+            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+        }
         Ok(S3Response::new(output))
     }
 
@@ -1725,17 +1773,35 @@ impl S3 for FS {
             .await
             .map_err(to_s3_error)?;
 
-        let replication_configuration = match metadata_sys::get_replication_config(&bucket).await {
+        let rcfg = match metadata_sys::get_replication_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
-                warn!("get_object_lock_config err {:?}", err);
-                None
+                error!("get_replication_config err {:?}", err);
+                return Err(to_s3_error(err));
             }
         };
 
-        Ok(S3Response::new(GetBucketReplicationOutput {
-            replication_configuration,
-        }))
+        if rcfg.is_none() {
+            return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "replication not found".to_string()));
+        }
+
+        // Ok(S3Response::new(GetBucketReplicationOutput {
+        //     replication_configuration: rcfg,
+        // }))
+
+        if rcfg.is_some() {
+            Ok(S3Response::new(GetBucketReplicationOutput {
+                replication_configuration: rcfg,
+            }))
+        } else {
+            let rep = ReplicationConfiguration {
+                role: "".to_string(),
+                rules: vec![],
+            };
+            Ok(S3Response::new(GetBucketReplicationOutput {
+                replication_configuration: Some(rep),
+            }))
+        }
     }
 
     async fn put_bucket_replication(
@@ -1747,6 +1813,7 @@ impl S3 for FS {
             replication_configuration,
             ..
         } = req.input;
+        warn!("put bucket replication");
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1786,6 +1853,7 @@ impl S3 for FS {
             .map_err(to_s3_error)?;
 
         // TODO: remove targets
+        error!("delete bucket");
 
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
@@ -2105,13 +2173,15 @@ impl S3 for FS {
             None
         };
 
-        if legal_hold.is_none() {
-            return Err(s3_error!(InvalidRequest, "Object does not have legal hold"));
-        }
+        let status = if let Some(v) = legal_hold {
+            v
+        } else {
+            ObjectLockLegalHoldStatus::OFF.to_string()
+        };
 
         Ok(S3Response::new(GetObjectLegalHoldOutput {
             legal_hold: Some(ObjectLockLegalHold {
-                status: Some(ObjectLockLegalHoldStatus::from(legal_hold.unwrap_or_default())),
+                status: Some(ObjectLockLegalHoldStatus::from(status)),
             }),
         }))
     }
@@ -2170,6 +2240,103 @@ impl S3 for FS {
         })?;
 
         Ok(S3Response::new(PutObjectLegalHoldOutput {
+            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+        }))
+    }
+
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        let GetObjectRetentionInput {
+            bucket, key, version_id, ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        // check object lock
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
+            .await
+            .map_err(to_s3_error)?;
+
+        let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
+            error!("get_object_info failed, {}", e.to_string());
+            s3_error!(InternalError, "{}", e.to_string())
+        })?;
+
+        let mode = if let Some(ref ud) = object_info.user_defined {
+            ud.get("x-amz-object-lock-mode")
+                .map(|v| ObjectLockRetentionMode::from(v.as_str().to_string()))
+        } else {
+            None
+        };
+
+        let retain_until_date = if let Some(ref ud) = object_info.user_defined {
+            ud.get("x-amz-object-lock-retain-until-date")
+                .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
+                .map(Timestamp::from)
+        } else {
+            None
+        };
+
+        Ok(S3Response::new(GetObjectRetentionOutput {
+            retention: Some(ObjectLockRetention { mode, retain_until_date }),
+        }))
+    }
+
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        let PutObjectRetentionInput {
+            bucket,
+            key,
+            retention,
+            version_id,
+            ..
+        } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        // check object lock
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+
+        // TODO: check allow
+
+        let mut eval_metadata = HashMap::new();
+
+        if let Some(v) = retention {
+            let mode = v.mode.map(|v| v.as_str().to_string()).unwrap_or_default();
+            let retain_until_date = v
+                .retain_until_date
+                .map(|v| OffsetDateTime::from(v).format(&Rfc3339).unwrap())
+                .unwrap_or_default();
+            let now = OffsetDateTime::now_utc();
+            eval_metadata.insert("x-amz-object-lock-mode".to_string(), mode);
+            eval_metadata.insert("x-amz-object-lock-retain-until-date".to_string(), retain_until_date);
+            eval_metadata.insert(
+                format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
+                format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+            );
+        }
+
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
+            .await
+            .map_err(to_s3_error)?;
+        opts.eval_metadata = Some(eval_metadata);
+
+        store.put_object_metadata(&bucket, &key, &opts).await.map_err(|e| {
+            error!("put_object_metadata failed, {}", e.to_string());
+            s3_error!(InternalError, "{}", e.to_string())
+        })?;
+
+        Ok(S3Response::new(PutObjectRetentionOutput {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         }))
     }

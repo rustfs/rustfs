@@ -1,3 +1,4 @@
+use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use crate::heal::heal_ops::HealSequence;
 use crate::io::FileReader;
 use crate::store_utils::clean_metadata;
@@ -175,7 +176,6 @@ impl FileInfo {
                 let content_type = meta.get("content-type").cloned();
                 let content_encoding = meta.get("content-encoding").cloned();
                 let etag = meta.get("etag").cloned();
-
                 (content_type, content_encoding, etag)
             } else {
                 (None, None, None)
@@ -686,6 +686,11 @@ pub struct ObjectInfo {
     pub inlined: bool,
     pub metadata_only: bool,
     pub version_only: bool,
+    pub replication_status_internal: String,
+    pub replication_status: ReplicationStatusType,
+    pub version_purge_status_internal: String,
+    pub version_purge_status: VersionPurgeStatusType,
+    pub checksum: Vec<u8>,
 }
 
 impl Clone for ObjectInfo {
@@ -714,6 +719,11 @@ impl Clone for ObjectInfo {
             inlined: self.inlined,
             metadata_only: self.metadata_only,
             version_only: self.version_only,
+            replication_status_internal: self.replication_status_internal.clone(),
+            replication_status: self.replication_status.clone(),
+            version_purge_status_internal: self.version_purge_status_internal.clone(),
+            version_purge_status: self.version_purge_status.clone(),
+            checksum: Default::default(),
         }
     }
 }

@@ -16,6 +16,7 @@ async-trait.workspace = true
 backon.workspace = true
 blake2 = { workspace = true }
 bytes.workspace = true
+byteorder = { workspace = true }
 common.workspace = true
 policy.workspace = true
 chrono.workspace = true
@@ -56,19 +57,18 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
 tokio-stream = { workspace = true }
 tonic.workspace = true
-tower.workspace = true
-byteorder = "1.5.0"
-xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
-num = "0.4.3"
+xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 num_cpus = { workspace = true }
-s3s-policy.workspace = true
 rand.workspace = true
 pin-project-lite.workspace = true
 md-5.workspace = true
 madmin.workspace = true
 workers.workspace = true
 reqwest = { workspace = true }
-urlencoding = "2.1.3"
+aws-sdk-s3 = { workspace = true }
+once_cell = { workspace = true }
+rustfs-rsc = { workspace = true }
+urlencoding = { workspace = true }
 smallvec = { workspace = true }
 shadow-rs.workspace = true
 

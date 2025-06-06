@@ -1,6 +1,81 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct TimedAction {
+    count: u64,
+    acc_time: u64,
+    min_time: Option<u64>,
+    max_time: Option<u64>,
+    bytes: u64,
+}
+
+#[allow(dead_code)]
+impl TimedAction {
+    // Avg returns the average time spent on the action.
+    pub fn avg(&self) -> Option<std::time::Duration> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(std::time::Duration::from_nanos(self.acc_time / self.count))
+    }
+
+    // AvgBytes returns the average bytes processed.
+    pub fn avg_bytes(&self) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        self.bytes / self.count
+    }
+
+    // Merge other into t.
+    pub fn merge(&mut self, other: TimedAction) {
+        self.count += other.count;
+        self.acc_time += other.acc_time;
+        self.bytes += other.bytes;
+
+        if self.count == 0 {
+            self.min_time = other.min_time;
+        }
+        if let Some(other_min) = other.min_time {
+            self.min_time = self.min_time.map_or(Some(other_min), |min| Some(min.min(other_min)));
+        }
+
+        self.max_time = self
+            .max_time
+            .map_or(other.max_time, |max| Some(max.max(other.max_time.unwrap_or(0))));
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum SizeCategory {
+    SizeLessThan1KiB = 0,
+    SizeLessThan1MiB,
+    SizeLessThan10MiB,
+    SizeLessThan100MiB,
+    SizeLessThan1GiB,
+    SizeGreaterThan1GiB,
+    // Add new entries here
+    SizeLastElemMarker,
+}
+
+impl std::fmt::Display for SizeCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match *self {
+            SizeCategory::SizeLessThan1KiB => "SizeLessThan1KiB",
+            SizeCategory::SizeLessThan1MiB => "SizeLessThan1MiB",
+            SizeCategory::SizeLessThan10MiB => "SizeLessThan10MiB",
+            SizeCategory::SizeLessThan100MiB => "SizeLessThan100MiB",
+            SizeCategory::SizeLessThan1GiB => "SizeLessThan1GiB",
+            SizeCategory::SizeGreaterThan1GiB => "SizeGreaterThan1GiB",
+            SizeCategory::SizeLastElemMarker => "SizeLastElemMarker",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+#[derive(Clone, Debug, Default, Copy)]
 pub struct AccElem {
     pub total: u64,
     pub size: u64,
@@ -28,7 +103,7 @@ impl AccElem {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LastMinuteLatency {
     pub totals: Vec<AccElem>,
     pub last_sec: u64,
@@ -44,10 +119,11 @@ impl Default for LastMinuteLatency {
 }
 
 impl LastMinuteLatency {
-    pub fn merge(&mut self, o: &mut LastMinuteLatency) -> LastMinuteLatency {
+    pub fn merge(&mut self, o: &LastMinuteLatency) -> LastMinuteLatency {
         let mut merged = LastMinuteLatency::default();
+        let mut x = o.clone();
         if self.last_sec > o.last_sec {
-            o.forward_to(self.last_sec);
+            x.forward_to(self.last_sec);
             merged.last_sec = self.last_sec;
         } else {
             self.forward_to(o.last_sec);
@@ -111,7 +187,6 @@ impl LastMinuteLatency {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,7 +490,7 @@ mod tests {
         latency2.totals[0].total = 20;
         latency2.totals[0].n = 3;
 
-        let merged = latency1.merge(&mut latency2);
+        let merged = latency1.merge(&latency2);
 
         assert_eq!(merged.last_sec, 1000);
         assert_eq!(merged.totals[0].total, 30); // 10 + 20
@@ -434,7 +509,7 @@ mod tests {
         latency1.totals[0].total = 10;
         latency2.totals[0].total = 20;
 
-        let merged = latency1.merge(&mut latency2);
+        let merged = latency1.merge(&latency2);
 
         assert_eq!(merged.last_sec, 1010); // Should use the later time
         assert_eq!(merged.totals[0].total, 30);
@@ -443,9 +518,9 @@ mod tests {
     #[test]
     fn test_last_minute_latency_merge_empty() {
         let mut latency1 = LastMinuteLatency::default();
-        let mut latency2 = LastMinuteLatency::default();
+        let latency2 = LastMinuteLatency::default();
 
-        let merged = latency1.merge(&mut latency2);
+        let merged = latency1.merge(&latency2);
 
         assert_eq!(merged.last_sec, 0);
         for elem in &merged.totals {
@@ -558,7 +633,7 @@ mod tests {
             n: 5,
         };
 
-        let cloned = elem.clone();
+        let cloned = elem;
         assert_eq!(elem.total, cloned.total);
         assert_eq!(elem.size, cloned.size);
         assert_eq!(elem.n, cloned.n);
@@ -753,5 +828,46 @@ mod tests {
         assert_eq!(elem.total, 0);
         assert_eq!(elem.n, 1);
         assert_eq!(elem.avg(), Duration::from_secs(0));
+    }
+}
+
+const SIZE_LAST_ELEM_MARKER: usize = 10; // 这里假设你的 marker 是 10，请根据实际情况修改
+
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct LastMinuteHistogram {
+    histogram: Vec<LastMinuteLatency>,
+    size: u32,
+}
+
+impl LastMinuteHistogram {
+    pub fn merge(&mut self, other: &LastMinuteHistogram) {
+        for i in 0..self.histogram.len() {
+            self.histogram[i].merge(&other.histogram[i]);
+        }
+    }
+
+    pub fn add(&mut self, size: i64, t: std::time::Duration) {
+        let index = size_to_tag(size);
+        self.histogram[index].add(&t);
+    }
+
+    pub fn get_avg_data(&mut self) -> [AccElem; SIZE_LAST_ELEM_MARKER] {
+        let mut res = [AccElem::default(); SIZE_LAST_ELEM_MARKER];
+        for (i, elem) in self.histogram.iter_mut().enumerate() {
+            res[i] = elem.get_total();
+        }
+        res
+    }
+}
+
+fn size_to_tag(size: i64) -> usize {
+    match size {
+        _ if size < 1024 => 0,               // sizeLessThan1KiB
+        _ if size < 1024 * 1024 => 1,        // sizeLessThan1MiB
+        _ if size < 10 * 1024 * 1024 => 2,   // sizeLessThan10MiB
+        _ if size < 100 * 1024 * 1024 => 3,  // sizeLessThan100MiB
+        _ if size < 1024 * 1024 * 1024 => 4, // sizeLessThan1GiB
+        _ => 5,                              // sizeGreaterThan1GiB
     }
 }

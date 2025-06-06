@@ -2430,7 +2430,7 @@ impl DiskAPI for LocalDisk {
                     for info in obj_infos.iter() {
                         let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);
                         let sz: usize;
-                        (obj_deleted, sz) = item.apply_actions(info, &size_s).await;
+                        (obj_deleted, sz) = item.apply_actions(info, &mut size_s).await;
                         done();
 
                         if obj_deleted {

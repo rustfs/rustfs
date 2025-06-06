@@ -22,6 +22,7 @@ use common::{
     globals::set_global_addr,
 };
 use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
+use ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use ecstore::config as ecconfig;
 use ecstore::config::GLOBAL_ConfigSys;
 use ecstore::heal::background_heal_ops::init_auto_heal;
@@ -538,6 +539,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_data_scanner().await;
     // init auto heal
     init_auto_heal().await;
+
+    init_console_cfg(local_ip, server_port);
+
+    print_server_info();
+    init_bucket_replication_pool().await;
 
     init_console_cfg(local_ip, server_port);
 

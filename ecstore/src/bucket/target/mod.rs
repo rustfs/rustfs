@@ -1,15 +1,16 @@
 use common::error::Result;
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use time::OffsetDateTime;
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Credentials {
-    access_key: String,
-    secret_key: String,
-    session_token: Option<String>,
-    expiration: Option<OffsetDateTime>,
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
+    pub session_token: Option<String>,
+    pub expiration: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -20,52 +21,53 @@ pub enum ServiceType {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct LatencyStat {
-    curr: Duration, // 当前延迟
-    avg: Duration,  // 平均延迟
-    max: Duration,  // 最大延迟
+    curr: u64, // 当前延迟
+    avg: u64,  // 平均延迟
+    max: u64,  // 最大延迟
 }
 
 // 定义 BucketTarget 结构体
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct BucketTarget {
-    source_bucket: String,
+    #[serde(rename = "sourcebucket")]
+    pub source_bucket: String,
 
-    endpoint: String,
+    pub endpoint: String,
 
-    credentials: Option<Credentials>,
-
-    target_bucket: String,
+    pub credentials: Option<Credentials>,
+    #[serde(rename = "targetbucket")]
+    pub target_bucket: String,
 
     secure: bool,
-
-    path: Option<String>,
+    pub path: Option<String>,
 
     api: Option<String>,
 
-    arn: Option<String>,
+    pub arn: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
 
-    type_: ServiceType,
-
-    region: Option<String>,
+    pub region: Option<String>,
 
     bandwidth_limit: Option<i64>,
 
+    #[serde(rename = "replicationSync")]
     replication_sync: bool,
 
     storage_class: Option<String>,
-
-    health_check_duration: Option<Duration>,
-
+    #[serde(rename = "healthCheckDuration")]
+    health_check_duration: u64,
+    #[serde(rename = "disableProxy")]
     disable_proxy: bool,
 
-    reset_before_date: Option<OffsetDateTime>,
-
+    #[serde(rename = "resetBeforeDate")]
+    reset_before_date: String,
     reset_id: Option<String>,
-
-    total_downtime: Duration,
+    #[serde(rename = "totalDowntime")]
+    total_downtime: u64,
 
     last_online: Option<OffsetDateTime>,
-
+    #[serde(rename = "isOnline")]
     online: bool,
 
     latency: LatencyStat,
@@ -73,6 +75,15 @@ pub struct BucketTarget {
     deployment_id: Option<String>,
 
     edge: bool,
+    #[serde(rename = "edgeSyncBeforeExpiry")]
+    edge_sync_before_expiry: bool,
+}
+
+impl BucketTarget {
+    pub fn is_empty(self) -> bool {
+        //self.target_bucket.is_empty() && self.endpoint.is_empty() && self.arn.is_empty()
+        self.target_bucket.is_empty() && self.endpoint.is_empty() && self.arn.is_none()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -92,5 +103,19 @@ impl BucketTargets {
     pub fn unmarshal(buf: &[u8]) -> Result<Self> {
         let t: BucketTargets = rmp_serde::from_slice(buf)?;
         Ok(t)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        if self.targets.is_empty() {
+            return true;
+        }
+
+        for target in &self.targets {
+            if !target.clone().is_empty() {
+                return false;
+            }
+        }
+
+        true
     }
 }

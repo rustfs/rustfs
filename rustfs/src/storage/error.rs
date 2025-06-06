@@ -1,5 +1,5 @@
 use common::error::Error;
-use ecstore::{disk::error::is_err_file_not_found, store_err::StorageError};
+use ecstore::{bucket::error::BucketMetadataError, disk::error::is_err_file_not_found, store_err::StorageError};
 use s3s::{s3_error, S3Error, S3ErrorCode};
 pub fn to_s3_error(err: Error) -> S3Error {
     if let Some(storage_err) = err.downcast_ref::<StorageError>() {
@@ -78,6 +78,15 @@ pub fn to_s3_error(err: Error) -> S3Error {
                 )
             }
             StorageError::DoneForNow => s3_error!(InternalError, "DoneForNow"),
+        };
+    }
+    //需要添加 not found bucket replication config
+    if let Some(meta_err) = err.downcast_ref::<BucketMetadataError>() {
+        return match meta_err {
+            BucketMetadataError::BucketReplicationConfigNotFound => {
+                S3Error::with_message(S3ErrorCode::ReplicationConfigurationNotFoundError, format!("{}", err))
+            }
+            _ => S3Error::with_message(S3ErrorCode::InternalError, format!("{}", err)), // 处理其他情况
         };
     }
 
