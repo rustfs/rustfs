@@ -17,6 +17,7 @@ use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, Shutdo
 use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
+use ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use common::{
     error::{Error, Result},
     globals::set_global_addr,
@@ -531,6 +532,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     init_data_scanner().await;
     // init auto heal
     init_auto_heal().await;
+
+    init_console_cfg(local_ip, server_port);
+
+    print_server_info();
+    init_bucket_replication_pool().await;
 
     init_console_cfg(local_ip, server_port);
 

@@ -11,12 +11,14 @@ use handlers::{
     sts, user,
 };
 
+use handlers::{ListRemoteTargetHandler, SetRemoteTargetHandler, RemoveRemoteTargetHandler, GetReplicationMetricsHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::regist_rpc_route;
 use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
+const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin";
 
 pub fn make_admin_route() -> Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new();
@@ -226,6 +228,55 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/add-service-accounts").as_str(),
         AdminOperation(&AddServiceAccount {}),
+    )?;
+
+    r.insert(
+        Method::GET, 
+        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/list-remote-targets").as_str(), 
+        AdminOperation(&ListRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET, 
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(), 
+        AdminOperation(&ListRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET, 
+        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
+        AdminOperation(&GetReplicationMetricsHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET, 
+        format!("{}{}", ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
+        AdminOperation(&GetReplicationMetricsHandler {}),
+    )?;
+
+
+    r.insert(
+        Method::PUT, 
+        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/set-remote-target").as_str(), 
+        AdminOperation(&SetRemoteTargetHandler {}),
+    )?;
+    r.insert(
+        Method::PUT, 
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-remote-target").as_str(), 
+        AdminOperation(&SetRemoteTargetHandler {}),
+    )?;
+
+
+    r.insert(
+        Method::DELETE, 
+        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/remove-remote-target").as_str(), 
+        AdminOperation(&RemoveRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE, 
+        format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(), 
+        AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
     // list-canned-policies?bucket=xxx
