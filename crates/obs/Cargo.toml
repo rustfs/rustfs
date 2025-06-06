@@ -27,7 +27,7 @@ opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-stdout = { workspace = true }
-opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic"] }
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic", "gzip-tonic", "trace", "metrics", "logs", "internal-logs"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 rustfs-utils = { workspace = true, features = ["ip"] }
 serde = { workspace = true }
