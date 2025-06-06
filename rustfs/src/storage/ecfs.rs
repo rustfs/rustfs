@@ -28,10 +28,10 @@ use ecstore::bucket::policy_sys::PolicySys;
 use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
-use ecstore::io::READ_BUFFER_SIZE;
 use ecstore::cmd::bucket_replication::get_must_replicate_options;
 use ecstore::cmd::bucket_replication::must_replicate;
 use ecstore::cmd::bucket_replication::schedule_replication;
+use ecstore::io::READ_BUFFER_SIZE;
 use ecstore::new_object_layer_fn;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
@@ -53,7 +53,6 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use tracing::debug;
 use policy::auth;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
@@ -81,6 +80,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -993,7 +993,8 @@ impl S3 for FS {
             .await
             .map_err(to_s3_error)?;
 
-        let repoptions =  get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType , &opts);
+        let repoptions =
+            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
 
         let dsc = must_replicate(&bucket, &key, &repoptions).await;
         warn!("dsc {}", &dsc.replicate_any().clone());
@@ -1001,13 +1002,10 @@ impl S3 for FS {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
             let now: DateTime<Utc> = Utc::now();
             let formatted_time = now.to_rfc3339();
-            metadata.insert(k, formatted_time);    
+            metadata.insert(k, formatted_time);
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
             metadata.insert(k, dsc.pending_status());
         }
-
-
-        
 
         debug!("put_object opts {:?}", &opts);
 
@@ -1018,8 +1016,8 @@ impl S3 for FS {
 
         let e_tag = obj_info.etag.clone();
 
-
-        let repoptions =  get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType , &opts);
+        let repoptions =
+            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
 
         let dsc = must_replicate(&bucket, &key, &repoptions).await;
 
@@ -1197,21 +1195,21 @@ impl S3 for FS {
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
-            e_tag:obj_info.etag.clone(),
+            e_tag: obj_info.etag.clone(),
             location: Some("us-east-1".to_string()),
             ..Default::default()
         };
 
-
         let mt2 = HashMap::new();
-        let repoptions =  get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType , &opts);
+        let repoptions =
+            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, opts);
 
         let dsc = must_replicate(&bucket, &key, &repoptions).await;
-    
+
         if dsc.replicate_any() {
-                warn!("need multipart replication");
-                let objectlayer = new_object_layer_fn();
-                schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
+            warn!("need multipart replication");
+            let objectlayer = new_object_layer_fn();
+            schedule_replication(obj_info, objectlayer.unwrap(), dsc, 1).await;
         }
         Ok(S3Response::new(output))
     }
@@ -1783,32 +1781,27 @@ impl S3 for FS {
             }
         };
 
-        if let None = rcfg {
-            return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "replication not found".to_string())); 
+        if rcfg.is_none() {
+            return Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "replication not found".to_string()));
         }
-        
-
 
         // Ok(S3Response::new(GetBucketReplicationOutput {
         //     replication_configuration: rcfg,
         // }))
-
 
         if rcfg.is_some() {
             Ok(S3Response::new(GetBucketReplicationOutput {
                 replication_configuration: rcfg,
             }))
         } else {
-            let rep = ReplicationConfiguration{
+            let rep = ReplicationConfiguration {
                 role: "".to_string(),
                 rules: vec![],
             };
             Ok(S3Response::new(GetBucketReplicationOutput {
                 replication_configuration: Some(rep),
-            })) 
+            }))
         }
-
-        
     }
 
     async fn put_bucket_replication(
