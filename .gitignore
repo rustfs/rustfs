@@ -19,3 +19,4 @@ deploy/certs/*
 .cargo
 profile.json
 .docker/openobserve-otel/data
+rustfs

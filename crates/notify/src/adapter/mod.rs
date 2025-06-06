@@ -43,7 +43,7 @@ const NOTIFY_WEBHOOK_SUB_SYS: &str = "notify_webhook";
 /// # Example
 ///
 /// ```
-/// use rustfs_event::ChannelAdapterType;
+/// use rustfs_notify::ChannelAdapterType;
 ///
 /// let adapter_type = ChannelAdapterType::Webhook;
 /// match adapter_type {
