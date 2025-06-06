@@ -18,10 +18,12 @@ use super::{
     data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
     heal_commands::{HealScanMode, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
 };
-use crate::{
-    bucket::{metadata_sys, versioning::VersioningApi, versioning_sys::BucketVersioningSys}, cmd::bucket_replication::{ReplicationStatusType}, heal::data_usage::DATA_USAGE_ROOT
-};
 use crate::cmd::bucket_replication::queue_replication_heal;
+use crate::{
+    bucket::{metadata_sys, versioning::VersioningApi, versioning_sys::BucketVersioningSys},
+    cmd::bucket_replication::ReplicationStatusType,
+    heal::data_usage::DATA_USAGE_ROOT,
+};
 use crate::{
     cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
     config::{
@@ -553,7 +555,13 @@ impl ScannerItem {
     pub async fn apply_actions(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) -> (bool, usize) {
         let done = ScannerMetrics::time(ScannerMetric::Ilm);
         //todo: lifecycle
-        info!("apply_actions {} {} {:?} {:?}", oi.bucket.clone(), oi.name.clone(), oi.version_id.clone(), oi.user_defined.clone());
+        info!(
+            "apply_actions {} {} {:?} {:?}",
+            oi.bucket.clone(),
+            oi.name.clone(),
+            oi.version_id.clone(),
+            oi.user_defined.clone()
+        );
 
         // Create a mutable clone if you need to modify fields
         let mut oi = oi.clone();
@@ -561,7 +569,7 @@ impl ScannerItem {
             oi.user_defined
                 .as_ref()
                 .and_then(|map| map.get("x-amz-bucket-replication-status"))
-                .unwrap_or(&"PENDING".to_string())
+                .unwrap_or(&"PENDING".to_string()),
         );
         info!("apply status is: {:?}", oi.replication_status);
         self.heal_replication(&oi, _size_s).await;
@@ -572,10 +580,14 @@ impl ScannerItem {
 
     pub async fn heal_replication(&mut self, oi: &ObjectInfo, size_s: &mut SizeSummary) {
         if oi.version_id.is_none() {
-            error!("heal_replication: no version_id or replication config {} {} {}", oi.bucket, oi.name, oi.version_id.is_none());
+            error!(
+                "heal_replication: no version_id or replication config {} {} {}",
+                oi.bucket,
+                oi.name,
+                oi.version_id.is_none()
+            );
             return;
         }
-
 
         //let config = s3s::dto::ReplicationConfiguration{ role: todo!(), rules: todo!() };
         // Use the provided variable instead of borrowing self mutably.
@@ -597,15 +609,16 @@ impl ScannerItem {
 
         //if oi.delete_marker || !oi.version_purge_status.is_empty() {
         if oi.delete_marker {
-            error!("heal_replication: delete marker or version purge status {} {} {:?} {} {:?}", oi.bucket, oi.name, oi.version_id, oi.delete_marker, oi.version_purge_status);
+            error!(
+                "heal_replication: delete marker or version purge status {} {} {:?} {} {:?}",
+                oi.bucket, oi.name, oi.version_id, oi.delete_marker, oi.version_purge_status
+            );
             return;
         }
-
 
         if oi.replication_status == ReplicationStatusType::Completed {
             return;
         }
-
 
         info!("replication status is: {:?} and user define {:?}", oi.replication_status, oi.user_defined);
 
@@ -617,10 +630,7 @@ impl ScannerItem {
         }
 
         for (arn, tgt_status) in &roi.unwrap().target_statuses {
-            let tgt_size_s = size_s
-                .repl_target_stats
-                .entry(arn.clone())
-                .or_default();
+            let tgt_size_s = size_s.repl_target_stats.entry(arn.clone()).or_default();
 
             match tgt_status {
                 ReplicationStatusType::Pending => {
@@ -650,7 +660,6 @@ impl ScannerItem {
             size_s.replica_size += oi.size;
         }
     }
-
 }
 
 #[derive(Debug, Default)]

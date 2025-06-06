@@ -1374,7 +1374,7 @@ impl StorageAPI for ECStore {
             info.versionning = sys.versioning();
             info.object_locking = sys.object_locking();
         }
-        
+
         Ok(info)
     }
     #[tracing::instrument(skip(self))]

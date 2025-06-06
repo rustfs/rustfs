@@ -6,7 +6,6 @@ use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::new_object_layer_fn;
 use crate::peer::RemotePeerS3Client;
 use crate::store;
-use crate::store_api;
 use crate::store_api::ObjectIO;
 use crate::store_api::ObjectInfo;
 use crate::store_api::ObjectOptions;

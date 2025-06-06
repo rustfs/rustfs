@@ -13,7 +13,6 @@ use crate::{
 //use tokio::sync::RwLock;
 use aws_sdk_s3::Client as S3Client;
 use chrono::Utc;
-use futures::future::err;
 use lazy_static::lazy_static;
 use std::sync::Arc;
 use std::{

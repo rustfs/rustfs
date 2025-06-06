@@ -686,12 +686,11 @@ pub struct ObjectInfo {
     pub inlined: bool,
     pub metadata_only: bool,
     pub version_only: bool,
-    pub replication_status_internal:String,
-    pub replication_status:ReplicationStatusType,
+    pub replication_status_internal: String,
+    pub replication_status: ReplicationStatusType,
     pub version_purge_status_internal: String,
     pub version_purge_status: VersionPurgeStatusType,
-    pub checksum:Vec<u8>,
-
+    pub checksum: Vec<u8>,
 }
 
 impl Clone for ObjectInfo {
@@ -724,10 +723,9 @@ impl Clone for ObjectInfo {
             replication_status: self.replication_status.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
-            checksum:Default::default(),
+            checksum: Default::default(),
         }
     }
-    
 }
 
 impl ObjectInfo {

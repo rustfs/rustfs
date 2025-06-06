@@ -106,7 +106,7 @@ pub fn decrypt_data(password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Erro
 //                 .map_err(|_| DecryptError::DecryptionError)?
 //         }
 //         0x03 => {
-            
+
 //             let cipher = Aes256Gcm::new(Key::from_slice(&key));
 //             let nonce = Nonce::from_slice(nonce);
 //             cipher

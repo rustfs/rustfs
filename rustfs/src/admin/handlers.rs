@@ -2,15 +2,15 @@ use super::router::Operation;
 use crate::auth::check_key_valid;
 use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
+//use ecstore::error::Error as ec_Error;
+use crate::storage::error::to_s3_error;
 use bytes::Bytes;
 use common::error::Error as ec_Error;
 use ecstore::admin_server_info::get_server_info;
-use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::bucket::metadata_sys::{self, get_replication_config};
-use ecstore::bucket::target::{BucketTarget};
+use ecstore::bucket::target::BucketTarget;
+use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
-//use ecstore::error::Error as ec_Error;
-use crate::storage::error::to_s3_error;
 use ecstore::global::GLOBAL_ALlHealState;
 use ecstore::heal::data_usage::load_data_usage_from_backend;
 use ecstore::heal::heal_commands::HealOpts;
@@ -21,7 +21,7 @@ use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::BucketOptions;
-use ecstore::store_api::{StorageAPI};
+use ecstore::store_api::StorageAPI;
 use ecstore::utils::path::path_join;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
@@ -32,12 +32,12 @@ use iam::store::MappedPolicy;
 use madmin::metrics::RealtimeMetrics;
 use madmin::utils::parse_duration;
 use matchit::Params;
+use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
 use policy::policy::default::DEFAULT_POLICIES;
 use policy::policy::Args;
 use policy::policy::BucketPolicy;
-use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{s3_error, Body, S3Error, S3Request, S3Response, S3Result};
@@ -773,7 +773,7 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
 
 #[allow(dead_code)]
 fn is_local_host(_host: String) -> bool {
-    return false;
+    false
 }
 
 //awscurl --service s3 --region us-east-1 --access_key rustfsadmin --secret_key rustfsadmin "http://:9000/minio/admin/v3/replicationmetrics?bucket=1"
@@ -804,7 +804,7 @@ impl Operation for SetRemoteTargetHandler {
             error!("credentials null");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
-        let _is_owner = true; // 先按true处理，后期根据请求决定
+        let _is_owner = true; // 先按 true 处理，后期根据请求决定
         let body = _req.input.store_all_unlimited().await.unwrap();
         //println!("body: {}", std::str::from_utf8(&body.clone()).unwrap());
 
@@ -846,7 +846,7 @@ impl Operation for SetRemoteTargetHandler {
             }
 
             if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
-                let (arn, exist) = sys.get_remote_arn(&bucket, Some(&remote_target), "").await;
+                let (arn, exist) = sys.get_remote_arn(bucket, Some(&remote_target), "").await;
                 info!("exist: {} {}", exist, arn.clone().unwrap_or_default());
                 if exist && arn.is_some() {
                     let jsonarn = serde_json::to_string(&arn).expect("failed to serialize");
@@ -858,7 +858,7 @@ impl Operation for SetRemoteTargetHandler {
                         Ok(_) => {
                             {
                                 //todo 各种持久化的工作
-                                let targets = sys.list_targets(Some(&bucket), None).await;
+                                let targets = sys.list_targets(Some(bucket), None).await;
                                 info!("targets is {}", targets.len());
                                 match serde_json::to_vec(&targets) {
                                     Ok(json) => {
@@ -950,7 +950,7 @@ impl Operation for ListRemoteTargetHandler {
             }
 
             if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
-                let targets = sys.list_targets(Some(&bucket), None).await;
+                let targets = sys.list_targets(Some(bucket), None).await;
                 error!("target sys len {}", targets.len());
                 if targets.is_empty() {
                     return Ok(S3Response::new((
@@ -994,11 +994,11 @@ impl Operation for RemoveRemoteTargetHandler {
             if let Some(bucket) = querys.get("bucket") {
                 if bucket.is_empty() {
                     error!("bucket parameter is empty");
-                    return Ok(S3Response::new((StatusCode::NOT_FOUND, Body::from("bucket not found".to_string())))); 
+                    return Ok(S3Response::new((StatusCode::NOT_FOUND, Body::from("bucket not found".to_string()))));
                 }
-                let _arn = bucket_targets::ARN::parse(&arnstr);
+                let _arn = bucket_targets::ARN::parse(arnstr);
 
-                match get_replication_config(&bucket).await {
+                match get_replication_config(bucket).await {
                     Ok((conf, _ts)) => {
                         for ru in conf.rules {
                             let encoded = percent_encode(ru.destination.bucket.as_bytes(), &COLON);
@@ -1017,7 +1017,7 @@ impl Operation for RemoveRemoteTargetHandler {
                 }
                 //percent_decode_str(&arnstr);
                 let decoded_str = decode(arnstr).unwrap();
-                error!("need delete target is {}" , decoded_str);
+                error!("need delete target is {}", decoded_str);
                 bucket_targets::remove_bucket_target(bucket, arnstr).await;
             }
         }

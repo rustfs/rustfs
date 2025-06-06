@@ -558,7 +558,7 @@ impl BucketMetadataSys {
                     return Err(Error::new(BucketMetadataError::BucketReplicationConfigNotFound));
                 }
                 res
-            },
+            }
             Err(err) => {
                 warn!("get_replication_config err {:?}", &err);
                 return if config::error::is_err_config_not_found(&err) {
@@ -592,7 +592,6 @@ impl BucketMetadataSys {
                 };
             }
         };
-
 
         println!("573");
 
