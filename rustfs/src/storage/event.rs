@@ -1,4 +1,4 @@
-use rustfs_event::{Event, Metadata};
+use rustfs_notify::{Event, Metadata};
 
 /// Create a new metadata object
 #[allow(dead_code)]
@@ -13,6 +13,6 @@ pub(crate) fn create_metadata() -> Metadata {
 /// Create a new event object
 #[allow(dead_code)]
 pub(crate) async fn send_event(event: Event) -> Result<(), Box<dyn std::error::Error>> {
-    // rustfs_event::send_event(event).await.map_err(|e| e.into())
+    // rustfs_notify::send_event(event).await.map_err(|e| e.into())
     Ok(())
 }

@@ -1,6 +1,5 @@
-use rustfs_config::NotifierConfig;
-use rustfs_event::EventNotifierConfig;
-use tracing::{error, info, instrument};
+use rustfs_notify::EventNotifierConfig;
+use tracing::{info, instrument};
 
 #[instrument]
 pub(crate) async fn init_event_notifier(notifier_config: Option<String>) {
@@ -11,13 +10,13 @@ pub(crate) async fn init_event_notifier(notifier_config: Option<String>) {
         EventNotifierConfig::event_load_config(notifier_config)
     } else {
         info!("event_config is empty");
-        // rustfs_event::get_event_notifier_config().clone()
+        // rustfs_notify::get_event_notifier_config().clone()
         EventNotifierConfig::default()
     };
 
     info!("using event_config: {:?}", config);
     tokio::spawn(async move {
-        // let result = rustfs_event::initialize(&config).await;
+        // let result = rustfs_notify::initialize(&config).await;
         // match result {
         //     Ok(_) => info!(
         //         "event notifier initialized successfully {}",

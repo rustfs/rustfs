@@ -7,7 +7,6 @@ use crate::{Event, DEFAULT_RETRY_INTERVAL};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{self, Client, Identity, RequestBuilder};
-use serde_json::to_string;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
