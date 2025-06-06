@@ -540,7 +540,7 @@ pub async fn get_heal_replicate_object_info(
         existing_obj_resync: Default::default(),
         target_statuses: tgt_statuses,
         target_purge_statuses: purge_statuses,
-        replication_timestamp: tm.unwrap_or_else(|| Utc::now),
+        replication_timestamp: tm.unwrap_or_else(|| Utc::now()),
         //ssec: crypto::is_encrypted(&oi.user_defined),
         ssec: false,
         user_tags: oi.user_tags.clone(),
@@ -751,7 +751,7 @@ impl ReplicationPool {
             tokio::spawn(async move {
                 while let Some(operation) = receiver.recv().await {
                     println!("resize workers 1");
-                    active_workers_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    active_workers_clone.fetch_add(1, Ordering::SeqCst);
 
                     if let Some(info) = operation.as_any().downcast_ref::<ReplicateObjectInfo>() {
                         replicate_object(info.clone(), obj_layer_clone.clone()).await;
@@ -761,7 +761,7 @@ impl ReplicationPool {
                         eprintln!("Unknown replication type");
                     }
 
-                    active_workers_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    active_workers_clone.fetch_sub(1, Ordering::SeqCst);
                 }
             });
         }
@@ -799,7 +799,7 @@ impl ReplicationPool {
             tokio::spawn(async move {
                 while let Some(operation) = receiver.recv().await {
                     // Simulate work being processed
-                    active_workers_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    active_workers_clone.fetch_add(1, Ordering::SeqCst);
 
                     if let Some(info) = operation.as_any().downcast_ref::<ReplicateObjectInfo>() {
                         //self.stats.inc_q(&info.bucket, info.size, info.delete_marker, &info.op_type);
@@ -813,7 +813,7 @@ impl ReplicationPool {
                         eprintln!("Unknown replication type");
                     }
 
-                    active_workers_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    active_workers_clone.fetch_sub(1, Ordering::SeqCst);
                 }
             });
         }
@@ -1614,7 +1614,7 @@ impl ConfigProcess for s3s::dto::ReplicationConfiguration {
         debug!("rule size is {}", &self.rules.len());
 
         for rule in &self.rules {
-            if rule.status.as_str() == s3s::dto::ReplicationRuleStatus::DISABLED {
+            if rule.status.as_str() == ReplicationRuleStatus::DISABLED {
                 debug!("rule size is");
                 continue;
             }
@@ -1724,10 +1724,10 @@ impl TraitForObjectInfo for ObjectInfo {
             targets: HashMap::new(),
             purge_targets: HashMap::new(),
             reset_statuses_map: HashMap::new(),
-            replica_timestamp: chrono::Utc::now(),
+            replica_timestamp: Utc::now(),
             replica_status: ReplicationStatusType::Pending,
             delete_marker: false,
-            replication_timestamp: chrono::Utc::now(),
+            replication_timestamp: Utc::now(),
         };
 
         // Set targets and purge_targets using respective functions
@@ -1760,7 +1760,7 @@ fn convert_offsetdatetime_to_chrono(offset_dt: Option<OffsetDateTime>) -> Option
 pub async fn schedule_replication(oi: ObjectInfo, o: Arc<store::ECStore>, dsc: ReplicateDecision, op_type: i32) {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal);
     // //let purge_statuses = version_purge_statuses_map(&oi.);
-    let replication_timestamp = chrono::Utc::now(); // Placeholder for timestamp parsing
+    let replication_timestamp = Utc::now(); // Placeholder for timestamp parsing
     let replication_state = oi.replication_state();
 
     let actual_size = oi.actual_size.unwrap_or(0);
@@ -1960,7 +1960,7 @@ pub trait ObjectInfoExt {
     fn is_multipart(&self) -> bool;
 }
 
-impl ObjectInfoExt for store_api::ObjectInfo {
+impl ObjectInfoExt for ObjectInfo {
     fn target_replication_status(&self, arn: String) -> ReplicationStatusType {
         let rep_stat_matches = REPL_STATUS_REGEX.captures_iter(&self.replication_status_internal);
         for matched in rep_stat_matches {
@@ -2144,8 +2144,7 @@ async fn replicate_object_with_multipart(
         .endpoint(target_info.endpoint.clone())
         .provider(provider)
         .secure(false)
-        .build()
-        .unwrap();
+        .build()?;
 
     let ret = minio_cli
         .create_multipart_upload_with_versionid(tgt_cli.bucket.clone(), local_obj_info.name.clone(), rep_obj.version_id.clone())
@@ -2264,7 +2263,7 @@ impl ReplicateObjectInfo {
     }
 
     async fn replicate_object(&self, target: &TargetClient, _arn: String) -> ReplicatedTargetInfo {
-        let _start_time = chrono::Utc::now();
+        let _start_time = Utc::now();
 
         // 初始化 ReplicatedTargetInfo
         warn!("replicate is {}", _arn.clone());
@@ -2277,7 +2276,7 @@ impl ReplicateObjectInfo {
             replication_action: ReplicationAction::ReplicateAll,
             endpoint: target.endpoint.clone(),
             secure: target.endpoint.clone().contains("https://"),
-            resync_timestamp: chrono::Utc::now().to_string(),
+            resync_timestamp: Utc::now().to_string(),
             replication_resynced: false,
             duration: Duration::default(),
             err: None,
@@ -2309,7 +2308,7 @@ impl ReplicateObjectInfo {
         // versionSuspended := globalBucketVersioningSys.PrefixSuspended(bucket, object)
 
         // 模拟对象获取和元数据检查
-        let mut opt = store_api::ObjectOptions::default();
+        let mut opt = ObjectOptions::default();
         opt.version_id = Some(self.version_id.clone());
         opt.versioned = true;
         opt.version_suspended = false;
@@ -2410,7 +2409,7 @@ impl ReplicateObjectInfo {
                 }
             }
         }
-        return rinfo;
+        rinfo
     }
 
     fn is_target_offline(&self, endpoint: &str) -> bool {
@@ -2419,11 +2418,11 @@ impl ReplicateObjectInfo {
         false
     }
 
-    async fn get_object_info(&self, opts: store_api::ObjectOptions) -> Result<ObjectInfo, Error> {
+    async fn get_object_info(&self, opts: ObjectOptions) -> Result<ObjectInfo, Error> {
         let objectlayer = new_object_layer_fn();
         //let opts = ecstore::store_api::ObjectOptions { max_parity: (), mod_time: (), part_number: (), delete_prefix: (), version_id: (), no_lock: (), versioned: (), version_suspended: (), skip_decommissioned: (), skip_rebalancing: (), data_movement: (), src_pool_idx: (), user_defined: (), preserve_etag: (), metadata_chg: (), replication_request: (), delete_marker: () }
         let res = objectlayer.unwrap().get_object_info(&self.bucket, &self.name, &opts).await;
-        return res;
+        res
     }
 
     fn perform_replication(&self, target: &RemotePeerS3Client, object_info: &ObjectInfo) -> Result<(), String> {
@@ -2618,7 +2617,7 @@ pub async fn replicate_object(ri: ReplicateObjectInfo, object_api: Arc<store::EC
 
             let rinfos = Arc::new(Mutex::new(ReplicatedInfos::default()));
             let cri = Arc::new(ri.clone());
-            let mut tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
+            let mut tasks: Vec<task::JoinHandle<()>> = vec![];
 
             for tgt_arn in tgt_arns {
                 let tgt = bucket_targets::get_bucket_target_client(&ri.bucket, &tgt_arn).await;
