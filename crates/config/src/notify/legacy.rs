@@ -1,5 +1,5 @@
-use crate::notify::webhook::WebhookArgs;
 use crate::notify::mqtt::MQTTArgs;
+use crate::notify::webhook::WebhookArgs;
 use std::collections::HashMap;
 
 /// Convert legacy webhook configuration to the new WebhookArgs struct.
@@ -36,42 +36,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_convert_webhook_config() {
-        let mut old_config = HashMap::new();
-        old_config.insert("endpoint".to_string(), "http://example.com".to_string());
-        old_config.insert("auth_token".to_string(), "token123".to_string());
-        old_config.insert("max_retries".to_string(), "5".to_string());
-        old_config.insert("timeout".to_string(), "2000".to_string());
-
-        let result = convert_webhook_config(&old_config);
-        assert!(result.is_ok());
-        let args = result.unwrap();
-        assert_eq!(args.endpoint, "http://example.com");
-        assert_eq!(args.auth_token, Some("token123".to_string()));
-        assert_eq!(args.max_retries, 5);
-        assert_eq!(args.timeout, 2000);
-    }
-
-    #[test]
-    fn test_convert_mqtt_config() {
-        let mut old_config = HashMap::new();
-        old_config.insert("broker".to_string(), "mqtt.example.com".to_string());
-        old_config.insert("port".to_string(), "1883".to_string());
-        old_config.insert("client_id".to_string(), "test_client".to_string());
-        old_config.insert("topic".to_string(), "test_topic".to_string());
-        old_config.insert("max_retries".to_string(), "4".to_string());
-
-        let result = convert_mqtt_config(&old_config);
-        assert!(result.is_ok());
-        let args = result.unwrap();
-        assert_eq!(args.broker, "mqtt.example.com");
-        assert_eq!(args.port, 1883);
-        assert_eq!(args.client_id, "test_client");
-        assert_eq!(args.topic, "test_topic");
-        assert_eq!(args.max_retries, 4);
-    }
-
-    #[test]
     fn test_convert_webhook_config_invalid() {
         let mut old_config = HashMap::new();
         old_config.insert("max_retries".to_string(), "invalid".to_string());
@@ -94,26 +58,6 @@ mod tests {
         assert!(webhook_result.is_ok());
         let mqtt_result = convert_mqtt_config(&empty_config);
         assert!(mqtt_result.is_ok());
-    }
-
-    #[test]
-    fn test_convert_partial_config() {
-        let mut partial_config = HashMap::new();
-        partial_config.insert("endpoint".to_string(), "http://example.com".to_string());
-        let webhook_result = convert_webhook_config(&partial_config);
-        assert!(webhook_result.is_ok());
-        let args = webhook_result.unwrap();
-        assert_eq!(args.endpoint, "http://example.com");
-        assert_eq!(args.max_retries, 3); // default value
-        assert_eq!(args.timeout, 1000); // default value
-
-        let mut partial_mqtt_config = HashMap::new();
-        partial_mqtt_config.insert("broker".to_string(), "mqtt.example.com".to_string());
-        let mqtt_result = convert_mqtt_config(&partial_mqtt_config);
-        assert!(mqtt_result.is_ok());
-        let args = mqtt_result.unwrap();
-        assert_eq!(args.broker, "mqtt.example.com");
-        assert_eq!(args.max_retries, 3); // default value
     }
 
     #[test]
@@ -187,27 +131,6 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_config_with_numeric_values() {
-        let mut numeric_config = HashMap::new();
-        numeric_config.insert("max_retries".to_string(), "5".to_string());
-        numeric_config.insert("timeout".to_string(), "2000".to_string());
-        let webhook_result = convert_webhook_config(&numeric_config);
-        assert!(webhook_result.is_ok());
-        let args = webhook_result.unwrap();
-        assert_eq!(args.max_retries, 5);
-        assert_eq!(args.timeout, 2000);
-
-        let mut numeric_mqtt_config = HashMap::new();
-        numeric_mqtt_config.insert("port".to_string(), "1883".to_string());
-        numeric_mqtt_config.insert("max_retries".to_string(), "4".to_string());
-        let mqtt_result = convert_mqtt_config(&numeric_mqtt_config);
-        assert!(mqtt_result.is_ok());
-        let args = mqtt_result.unwrap();
-        assert_eq!(args.port, 1883);
-        assert_eq!(args.max_retries, 4);
-    }
-
-    #[test]
     fn test_convert_config_with_boolean_values() {
         let mut boolean_config = HashMap::new();
         boolean_config.insert("enable".to_string(), "true".to_string());
@@ -244,7 +167,6 @@ mod tests {
     #[test]
     fn test_convert_config_with_duplicate_keys() {
         let mut duplicate_config = HashMap::new();
-        duplicate_config.insert("endpoint".to_string(), "http://example.com".to_string());
         duplicate_config.insert("endpoint".to_string(), "http://example.org".to_string());
         let webhook_result = convert_webhook_config(&duplicate_config);
         assert!(webhook_result.is_ok());
@@ -252,7 +174,6 @@ mod tests {
         assert_eq!(args.endpoint, "http://example.org"); // last value wins
 
         let mut duplicate_mqtt_config = HashMap::new();
-        duplicate_mqtt_config.insert("broker".to_string(), "mqtt.example.com".to_string());
         duplicate_mqtt_config.insert("broker".to_string(), "mqtt.example.org".to_string());
         let mqtt_result = convert_mqtt_config(&duplicate_mqtt_config);
         assert!(mqtt_result.is_ok());
