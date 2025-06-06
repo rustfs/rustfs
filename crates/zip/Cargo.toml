@@ -18,7 +18,7 @@ async-compression = { version = "0.4.0", features = [
 ] }
 async_zip = { version = "0.0.17", features = ["tokio"] }
 zip = "2.2.0"
-tokio = { version = "1.45.0", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 tokio-stream = "0.1.17"
 tokio-tar = { workspace = true }
 xz2 = { version = "0.1", optional = true, features = ["static"] }
