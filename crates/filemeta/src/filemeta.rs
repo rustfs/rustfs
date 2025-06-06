@@ -577,6 +577,16 @@ impl FileMeta {
             prev_mod_time = fi.mod_time;
         }
 
+        if versions.is_empty() {
+            versions.push(FileInfo {
+                name: path.to_string(),
+                volume: volume.to_string(),
+                deleted: true,
+                is_latest: true,
+                ..Default::default()
+            });
+        }
+
         Ok(FileInfoVersions {
             volume: volume.to_string(),
             name: path.to_string(),
