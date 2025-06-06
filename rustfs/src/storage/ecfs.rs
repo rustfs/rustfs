@@ -30,8 +30,8 @@ use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::error::StorageError;
-use ecstore::io::READ_BUFFER_SIZE;
 use ecstore::new_object_layer_fn;
+use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
 use ecstore::store_api::DeleteBucketOptions;
@@ -575,7 +575,7 @@ impl S3 for FS {
         let last_modified = info.mod_time.map(Timestamp::from);
 
         let body = Some(StreamingBlob::wrap(bytes_stream(
-            ReaderStream::with_capacity(reader.stream, READ_BUFFER_SIZE),
+            ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
             info.size,
         )));
 

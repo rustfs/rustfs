@@ -108,7 +108,7 @@ pub async fn rename_all(
 ) -> Result<()> {
     reliable_rename(src_file_path, dst_file_path.as_ref(), base_dir)
         .await
-        .map_err(|e| to_file_error(e))?;
+        .map_err(to_file_error)?;
 
     Ok(())
 }

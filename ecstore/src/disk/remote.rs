@@ -13,30 +13,33 @@ use protos::{
 };
 use rmp_serde::Serializer;
 use rustfs_filemeta::{FileInfo, MetaCacheEntry, MetacacheWriter, RawFileInfo};
-use rustfs_rio::{HttpReader, Reader};
+use rustfs_rio::{HttpReader, HttpWriter};
 use serde::Serialize;
 use tokio::{
     io::AsyncWrite,
     sync::mpsc::{self, Sender},
 };
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::Request;
 use tracing::info;
 use uuid::Uuid;
 
 use super::error::{Error, Result};
 use super::{
-    endpoint::Endpoint, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
-    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
-    WalkDirOptions,
+    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    endpoint::Endpoint,
 };
 
-use crate::heal::{
-    data_scanner::ShouldSleepFn,
-    data_usage_cache::{DataUsageCache, DataUsageEntry},
-    heal_commands::{HealScanMode, HealingTracker},
+use crate::{
+    disk::{FileReader, FileWriter},
+    heal::{
+        data_scanner::ShouldSleepFn,
+        data_usage_cache::{DataUsageCache, DataUsageEntry},
+        heal_commands::{HealScanMode, HealingTracker},
+    },
 };
-use crate::io::{FileWriter, HttpFileWriter};
+
 use protos::proto_gen::node_service::RenamePartRequst;
 
 #[derive(Debug)]
@@ -552,7 +555,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file(&self, volume: &str, path: &str) -> Result<Box<dyn Reader>> {
+    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         info!("read_file {}/{}", volume, path);
 
         let url = format!(
@@ -569,7 +572,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Box<dyn Reader>> {
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         info!("read_file_stream {}/{}/{}", self.endpoint.to_string(), volume, path);
         let url = format!(
             "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
@@ -587,27 +590,35 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         info!("append_file {}/{}", volume, path);
-        Ok(Box::new(HttpFileWriter::new(
-            self.endpoint.grid_host().as_str(),
-            self.endpoint.to_string().as_str(),
-            volume,
-            path,
-            0,
+
+        let url = format!(
+            "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
+            self.endpoint.grid_host(),
+            urlencoding::encode(self.endpoint.to_string().as_str()),
+            urlencoding::encode(volume),
+            urlencoding::encode(path),
             true,
-        )?))
+            0
+        );
+
+        Ok(Box::new(HttpWriter::new(url, Method::PUT, HeaderMap::new()).await?))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter> {
         info!("create_file {}/{}/{}", self.endpoint.to_string(), volume, path);
-        Ok(Box::new(HttpFileWriter::new(
-            self.endpoint.grid_host().as_str(),
-            self.endpoint.to_string().as_str(),
-            volume,
-            path,
-            file_size,
+
+        let url = format!(
+            "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
+            self.endpoint.grid_host(),
+            urlencoding::encode(self.endpoint.to_string().as_str()),
+            urlencoding::encode(volume),
+            urlencoding::encode(path),
             false,
-        )?))
+            file_size
+        );
+
+        Ok(Box::new(HttpWriter::new(url, Method::PUT, HeaderMap::new()).await?))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]

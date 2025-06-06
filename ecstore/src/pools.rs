@@ -1,13 +1,13 @@
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
-use crate::config::com::{read_config, save_config, CONFIG_PREFIX};
+use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
+use crate::config::com::{CONFIG_PREFIX, read_config, save_config};
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use crate::error::{
-    is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
-    is_err_version_not_found, StorageError,
-};
 use crate::error::{Error, Result};
+use crate::error::{
+    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
+    is_err_version_not_found,
+};
 use crate::heal::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
@@ -16,7 +16,7 @@ use crate::set_disk::SetDisks;
 use crate::store_api::{
     BucketOptions, CompletePart, GetObjectReader, MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI,
 };
-use crate::utils::path::{encode_dir_object, path_join, SLASH_SEPARATOR};
+use crate::utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use crate::{sets::Sets, store::ECStore};
 use ::workers::workers::Workers;
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
@@ -25,7 +25,7 @@ use futures::future::BoxFuture;
 use http::HeaderMap;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::{HashReader, Reader};
+use rustfs_rio::HashReader;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -306,7 +306,7 @@ impl PoolMeta {
     }
 
     pub fn track_current_bucket_object(&mut self, idx: usize, bucket: String, object: String) {
-        if !self.pools.get(idx).is_some_and(|v| v.decommission.is_some()) {
+        if self.pools.get(idx).is_none_or(|v| v.decommission.is_none()) {
             return;
         }
 
@@ -319,7 +319,7 @@ impl PoolMeta {
     }
 
     pub async fn update_after(&mut self, idx: usize, pools: Vec<Arc<Sets>>, duration: Duration) -> Result<bool> {
-        if !self.pools.get(idx).is_some_and(|v| v.decommission.is_some()) {
+        if self.pools.get(idx).is_none_or(|v| v.decommission.is_none()) {
             return Err(Error::other("InvalidArgument"));
         }
 
@@ -882,7 +882,7 @@ impl ECStore {
         pool: Arc<Sets>,
         bi: DecomBucketInfo,
     ) -> Result<()> {
-        let wk = Workers::new(pool.disk_set.len() * 2).map_err(|v| Error::other(v))?;
+        let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
 
         // let mut vc = None;
         // replication

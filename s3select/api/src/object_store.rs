@@ -2,17 +2,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use common::DEFAULT_DELIMITER;
-use ecstore::io::READ_BUFFER_SIZE;
+use ecstore::StorageAPI;
 use ecstore::new_object_layer_fn;
+use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use ecstore::store::ECStore;
 use ecstore::store_api::ObjectIO;
 use ecstore::store_api::ObjectOptions;
-use ecstore::StorageAPI;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use futures_core::stream::BoxStream;
 use http::HeaderMap;
-use object_store::path::Path;
 use object_store::Attributes;
 use object_store::GetOptions;
 use object_store::GetResult;
@@ -24,16 +23,17 @@ use object_store::PutMultipartOpts;
 use object_store::PutOptions;
 use object_store::PutPayload;
 use object_store::PutResult;
+use object_store::path::Path;
 use object_store::{Error as o_Error, Result};
 use pin_project_lite::pin_project;
+use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
 use s3s::s3_error;
-use s3s::S3Result;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::ready;
 use std::task::Poll;
+use std::task::ready;
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 use tracing::info;
@@ -117,14 +117,21 @@ impl ObjectStore for EcObjectStore {
         let payload = if self.need_convert {
             object_store::GetResultPayload::Stream(
                 bytes_stream(
-                    ReaderStream::with_capacity(ConvertStream::new(reader.stream, self.delimiter.clone()), READ_BUFFER_SIZE),
+                    ReaderStream::with_capacity(
+                        ConvertStream::new(reader.stream, self.delimiter.clone()),
+                        DEFAULT_READ_BUFFER_SIZE,
+                    ),
                     reader.object_info.size,
                 )
                 .boxed(),
             )
         } else {
             object_store::GetResultPayload::Stream(
-                bytes_stream(ReaderStream::with_capacity(reader.stream, READ_BUFFER_SIZE), reader.object_info.size).boxed(),
+                bytes_stream(
+                    ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
+                    reader.object_info.size,
+                )
+                .boxed(),
             )
         };
         Ok(GetResult {

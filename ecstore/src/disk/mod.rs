@@ -17,13 +17,10 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
-use crate::{
-    heal::{
-        data_scanner::ShouldSleepFn,
-        data_usage_cache::{DataUsageCache, DataUsageEntry},
-        heal_commands::{HealScanMode, HealingTracker},
-    },
-    io::FileWriter,
+use crate::heal::{
+    data_scanner::ShouldSleepFn,
+    data_usage_cache::{DataUsageCache, DataUsageEntry},
+    heal_commands::{HealScanMode, HealingTracker},
 };
 use endpoint::Endpoint;
 use error::DiskError;
@@ -32,15 +29,20 @@ use local::LocalDisk;
 use madmin::info_commands::DiskMetrics;
 use remote::RemoteDisk;
 use rustfs_filemeta::{FileInfo, RawFileInfo};
-use rustfs_rio::Reader;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc};
 use time::OffsetDateTime;
-use tokio::{io::AsyncWrite, sync::mpsc::Sender};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::mpsc::Sender,
+};
 use tracing::warn;
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Disk>;
+
+pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
+pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
 #[derive(Debug)]
 pub enum Disk {
@@ -277,7 +279,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_file(&self, volume: &str, path: &str) -> Result<Box<dyn Reader>> {
+    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         match self {
             Disk::Local(local_disk) => local_disk.read_file(volume, path).await,
             Disk::Remote(remote_disk) => remote_disk.read_file(volume, path).await,
@@ -285,7 +287,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Box<dyn Reader>> {
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         match self {
             Disk::Local(local_disk) => local_disk.read_file_stream(volume, path, offset, length).await,
             Disk::Remote(remote_disk) => remote_disk.read_file_stream(volume, path, offset, length).await,
@@ -485,8 +487,8 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // File operations.
     // 读目录下的所有文件、目录
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
-    async fn read_file(&self, volume: &str, path: &str) -> Result<Box<dyn Reader>>;
-    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Box<dyn Reader>>;
+    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
     // ReadFileStream

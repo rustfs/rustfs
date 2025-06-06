@@ -30,7 +30,6 @@ use crate::{
         },
         heal_ops::BG_HEALING_UUID,
     },
-    io::READ_BUFFER_SIZE,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
         ListMultipartsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectIO, ObjectInfo,
@@ -77,14 +76,13 @@ use std::time::SystemTime;
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
-    mem::replace,
     path::Path,
     sync::Arc,
     time::Duration,
 };
 use time::OffsetDateTime;
 use tokio::{
-    io::{AsyncWrite, empty},
+    io::AsyncWrite,
     sync::{RwLock, broadcast},
 };
 use tokio::{
@@ -96,6 +94,8 @@ use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use workers::workers::Workers;
+
+pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct SetDisks {
@@ -146,12 +146,10 @@ impl SetDisks {
 
         disks.shuffle(&mut rng);
 
-        let disks = disks
+        disks
             .into_iter()
             .filter(|v| v.as_ref().is_some_and(|d| d.is_local()))
-            .collect();
-
-        disks
+            .collect()
     }
 
     pub async fn get_online_disks_with_healing(&self, incl_healing: bool) -> (Vec<DiskStore>, bool) {
@@ -248,12 +246,10 @@ impl SetDisks {
 
         disks.shuffle(&mut rng);
 
-        let disks = disks
+        disks
             .into_iter()
             .filter(|v| v.as_ref().is_some_and(|d| d.is_local()))
-            .collect();
-
-        disks
+            .collect()
     }
     fn default_write_quorum(&self) -> usize {
         let mut data_count = self.set_drive_count - self.default_parity_count;
@@ -446,7 +442,7 @@ impl SetDisks {
         let errs: Vec<Option<DiskError>> = join_all(futures)
             .await
             .into_iter()
-            .map(|e| e.unwrap_or_else(|_| Some(DiskError::Unexpected)))
+            .map(|e| e.unwrap_or(Some(DiskError::Unexpected)))
             .collect();
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
@@ -1890,7 +1886,11 @@ impl SetDisks {
                             till_offset,
                         )
                         .await?;
-                    let reader = BitrotReader::new(rd, erasure.shard_size(), HashAlgorithm::HighwayHash256);
+                    let reader = BitrotReader::new(
+                        Box::new(rustfs_rio::WarpReader::new(rd)),
+                        erasure.shard_size(),
+                        HashAlgorithm::HighwayHash256,
+                    );
                     readers.push(Some(reader));
                     errors.push(None);
                 } else {
@@ -1928,9 +1928,10 @@ impl SetDisks {
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
             // );
-            let (written, mut err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
+            let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
             if let Some(e) = err {
                 let de_err: DiskError = e.into();
+                let mut has_err = true;
                 if written == part_length {
                     match de_err {
                         DiskError::FileNotFound | DiskError::FileCorrupt => {
@@ -1947,14 +1948,16 @@ impl SetDisks {
                                     ..Default::default()
                                 })
                                 .await;
-                            err = None;
+                            has_err = false;
                         }
                         _ => {}
                     }
                 }
 
-                error!("erasure.decode err {} {:?}", written, &de_err);
-                return Err(de_err.into());
+                if has_err {
+                    error!("erasure.decode err {} {:?}", written, &de_err);
+                    return Err(de_err.into());
+                }
             }
 
             // debug!("ec decode {} writed size {}", part_number, n);
@@ -2500,27 +2503,35 @@ impl SetDisks {
 
                                         if let Some(ref data) = metadata.data {
                                             let rd = Cursor::new(data.clone());
-                                            let reader = BitrotReader::new(
-                                                Box::new(rd),
-                                                erasure.shard_size(),
-                                                HashAlgorithm::HighwayHash256,
-                                            );
+                                            let reader =
+                                                BitrotReader::new(Box::new(rd), erasure.shard_size(), checksum_algo.clone());
                                             readers.push(Some(reader));
                                             // errors.push(None);
                                         } else {
+                                            let length =
+                                                till_offset.div_ceil(erasure.shard_size()) * checksum_algo.size() + till_offset;
                                             let rd = match disk
-                                                .read_file(bucket, &format!("{}/{}/part.{}", object, src_data_dir, part.number))
+                                                .read_file_stream(
+                                                    bucket,
+                                                    &format!("{}/{}/part.{}", object, src_data_dir, part.number),
+                                                    0,
+                                                    length,
+                                                )
                                                 .await
                                             {
                                                 Ok(rd) => rd,
                                                 Err(e) => {
                                                     // errors.push(Some(e.into()));
+                                                    error!("heal_object read_file err: {:?}", e);
                                                     writers.push(None);
                                                     continue;
                                                 }
                                             };
-                                            let reader =
-                                                BitrotReader::new(rd, erasure.shard_size(), HashAlgorithm::HighwayHash256);
+                                            let reader = BitrotReader::new(
+                                                Box::new(rustfs_rio::WarpReader::new(rd)),
+                                                erasure.shard_size(),
+                                                HashAlgorithm::HighwayHash256,
+                                            );
                                             readers.push(Some(reader));
                                             // errors.push(None);
                                         }
@@ -3694,7 +3705,7 @@ impl SetDisks {
 
         let errs = join_all(futures).await.into_iter().map(|v| v.err()).collect::<Vec<_>>();
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS.as_ref(), write_quorum) {
+        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
             return Err(err);
         }
 
@@ -3749,7 +3760,7 @@ impl ObjectIO for SetDisks {
 
         // TODO: remote
 
-        let (rd, wd) = tokio::io::duplex(READ_BUFFER_SIZE);
+        let (rd, wd) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
 
         let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
 
@@ -5950,7 +5961,7 @@ mod tests {
         metadata.insert("etag".to_string(), "test-etag".to_string());
 
         let file_info = FileInfo {
-            metadata: metadata,
+            metadata,
             ..Default::default()
         };
         let parts_metadata = vec![file_info];

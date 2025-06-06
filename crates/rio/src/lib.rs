@@ -21,6 +21,7 @@ pub use hash_reader::*;
 pub mod compress;
 
 pub mod reader;
+pub use reader::WarpReader;
 
 mod writer;
 use tokio::io::{AsyncRead, BufReader};

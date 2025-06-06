@@ -29,11 +29,7 @@ pub fn reduce_read_quorum_errs(errors: &[Option<Error>], ignored_errs: &[Error],
 
 pub fn reduce_quorum_errs(errors: &[Option<Error>], ignored_errs: &[Error], quorun: usize, quorun_err: Error) -> Option<Error> {
     let (max_count, err) = reduce_errs(errors, ignored_errs);
-    if max_count >= quorun {
-        err
-    } else {
-        Some(quorun_err)
-    }
+    if max_count >= quorun { err } else { Some(quorun_err) }
 }
 
 pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, Option<Error>) {
@@ -59,7 +55,7 @@ pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, 
                 match (e1.to_string().as_str(), e2.to_string().as_str()) {
                     ("nil", _) => std::cmp::Ordering::Greater,
                     (_, "nil") => std::cmp::Ordering::Less,
-                    (a, b) => a.cmp(&b),
+                    (a, b) => a.cmp(b),
                 }
             } else {
                 count_cmp

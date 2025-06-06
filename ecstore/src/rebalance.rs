@@ -2,18 +2,18 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
+use crate::StorageAPI;
+use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{read_config_with_metadata, save_config_with_opts};
 use crate::disk::error::DiskError;
-use crate::error::{is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
 use crate::error::{Error, Result};
+use crate::error::{is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
 use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
 use crate::set_disk::SetDisks;
 use crate::store::ECStore;
 use crate::store_api::{CompletePart, GetObjectReader, ObjectIO, ObjectOptions, PutObjReader};
 use crate::utils::path::encode_dir_object;
-use crate::StorageAPI;
 use common::defer;
 use http::HeaderMap;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
@@ -500,7 +500,7 @@ impl ECStore {
             if get_global_endpoints()
                 .as_ref()
                 .get(idx)
-                .map_or(true, |v| v.endpoints.as_ref().first().map_or(true, |e| e.is_local))
+                .is_none_or(|v| v.endpoints.as_ref().first().map_or(true, |e| e.is_local))
             {
                 warn!("start_rebalance: pool {} is not local, skipping", idx);
                 continue;
@@ -957,7 +957,7 @@ impl ECStore {
 
         let pool = self.pools[pool_index].clone();
 
-        let wk = Workers::new(pool.disk_set.len() * 2).map_err(|v| Error::other(v))?;
+        let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
 
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
             wk.clone().take().await;

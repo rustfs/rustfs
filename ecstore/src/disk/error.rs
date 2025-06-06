@@ -253,11 +253,11 @@ impl From<protos::proto_gen::node_service::Error> for DiskError {
     }
 }
 
-impl Into<protos::proto_gen::node_service::Error> for DiskError {
-    fn into(self) -> protos::proto_gen::node_service::Error {
+impl From<DiskError> for protos::proto_gen::node_service::Error {
+    fn from(e: DiskError) -> Self {
         protos::proto_gen::node_service::Error {
-            code: self.to_u32(),
-            error_info: self.to_string(),
+            code: e.to_u32(),
+            error_info: e.to_string(),
         }
     }
 }

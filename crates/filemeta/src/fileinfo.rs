@@ -312,7 +312,7 @@ impl FileInfo {
 
     /// Check if the object is remote (transitioned to another tier)
     pub fn is_remote(&self) -> bool {
-        !self.transition_tier.as_ref().map_or(true, |s| s.is_empty())
+        !self.transition_tier.as_ref().is_none_or(|s| s.is_empty())
     }
 
     /// Get the data directory for this object

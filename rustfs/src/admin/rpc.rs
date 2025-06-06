@@ -3,7 +3,7 @@ use super::router::Operation;
 use super::router::S3Router;
 use crate::storage::ecfs::bytes_stream;
 use ecstore::disk::DiskAPI;
-use ecstore::io::READ_BUFFER_SIZE;
+use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use ecstore::store::find_local_disk;
 use futures::TryStreamExt;
 use http::StatusCode;
@@ -72,7 +72,7 @@ impl Operation for ReadFile {
         Ok(S3Response::new((
             StatusCode::OK,
             Body::from(StreamingBlob::wrap(bytes_stream(
-                ReaderStream::with_capacity(file, READ_BUFFER_SIZE),
+                ReaderStream::with_capacity(file, DEFAULT_READ_BUFFER_SIZE),
                 query.length,
             ))),
         )))

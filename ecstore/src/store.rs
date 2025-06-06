@@ -49,7 +49,6 @@ use glob::Pattern;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use madmin::heal_commands::HealResultItem;
-use rand::Rng;
 use rustfs_filemeta::MetaCacheEntry;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;

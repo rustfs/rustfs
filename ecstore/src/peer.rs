@@ -1,9 +1,9 @@
 use crate::disk::error::{Error, Result};
-use crate::disk::error_reduce::{is_all_buckets_not_found, reduce_write_quorum_errs, BUCKET_OP_IGNORED_ERRS};
+use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
 use crate::heal::heal_commands::{
-    HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET,
+    DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET, HealOpts,
 };
 use crate::heal::heal_ops::RUSTFS_RESERVED_BUCKET;
 use crate::store::all_local_disk;
@@ -137,7 +137,7 @@ impl S3PeerSys {
                 return Ok(heal_bucket_results.read().await[i].clone());
             }
         }
-        Err(Error::VolumeNotFound.into())
+        Err(Error::VolumeNotFound)
     }
 
     pub async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
@@ -771,7 +771,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let bucket = bucket.to_string();
             let bs_clone = before_state.clone();
             let as_clone = after_state.clone();
-            let errs_clone = errs.iter().map(|e| e.as_ref().map(|e| e.clone())).collect::<Vec<_>>();
+            let errs_clone = errs.iter().map(|e| e.clone()).collect::<Vec<_>>();
             futures.push(async move {
                 if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
                     info!("bucket not find, will recreate");
@@ -785,7 +785,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
                         }
                     }
                 }
-                errs_clone[idx].as_ref().map(|e| e.clone())
+                errs_clone[idx].clone()
             });
         }
 

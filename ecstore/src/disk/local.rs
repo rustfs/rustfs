@@ -10,7 +10,6 @@ use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 use crate::bucket::metadata_sys::{self};
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::disk::STORAGE_FORMAT_FILE;
 use crate::disk::error::FileAccessDeniedWithContext;
 use crate::disk::error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error};
 use crate::disk::fs::{
@@ -19,8 +18,9 @@ use crate::disk::fs::{
 use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{
     CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN, CHECK_PART_VOLUME_NOT_FOUND,
-    conv_part_err_to_int,
+    FileReader, conv_part_err_to_int,
 };
+use crate::disk::{FileWriter, STORAGE_FORMAT_FILE};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use crate::heal::data_scanner::{
     ScannerItem, ShouldSleepFn, SizeSummary, lc_has_active_rules, rep_has_active_rules, scan_data_folder,
@@ -30,7 +30,6 @@ use crate::heal::data_usage_cache::{DataUsageCache, DataUsageEntry};
 use crate::heal::error::{ERR_IGNORE_FILE_CONTRIB, ERR_SKIP_FILE};
 use crate::heal::heal_commands::{HealScanMode, HealingTracker};
 use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
-use crate::io::FileWriter;
 use crate::new_object_layer_fn;
 use crate::store_api::{ObjectInfo, StorageAPI};
 use crate::utils::os::get_info;
@@ -45,7 +44,7 @@ use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, Opts, RawFileInfo, UpdateFn, get_file_info,
     read_xl_meta_no_data,
 };
-use rustfs_rio::{Reader, bitrot_verify};
+use rustfs_rio::bitrot_verify;
 use rustfs_utils::HashAlgorithm;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -1299,7 +1298,7 @@ impl DiskAPI for LocalDisk {
                 }
             }
 
-            remove_std(&dst_file_path).map_err(|e| to_file_error(e))?;
+            remove_std(&dst_file_path).map_err(to_file_error)?;
         }
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
@@ -1356,11 +1355,11 @@ impl DiskAPI for LocalDisk {
 
             if let Some(meta) = meta_op {
                 if !meta.is_dir() {
-                    return Err(DiskError::FileAccessDenied.into());
+                    return Err(DiskError::FileAccessDenied);
                 }
             }
 
-            remove(&dst_file_path).await.map_err(|e| to_file_error(e))?;
+            remove(&dst_file_path).await.map_err(to_file_error)?;
         }
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
@@ -1425,7 +1424,7 @@ impl DiskAPI for LocalDisk {
 
     // TODO: io verifier
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file(&self, volume: &str, path: &str) -> Result<Box<dyn Reader>> {
+    async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         // warn!("disk read_file: volume: {}, path: {}", volume, path);
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
@@ -1443,7 +1442,7 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Box<dyn Reader>> {
+    async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         // warn!(
         //     "disk read_file_stream: volume: {}, path: {}, offset: {}, length: {}",
         //     volume, path, offset, length
@@ -1615,7 +1614,7 @@ impl DiskAPI for LocalDisk {
                 let e: DiskError = to_file_error(e).into();
 
                 if e != DiskError::FileNotFound {
-                    return Err(e.into());
+                    return Err(e);
                 }
 
                 None
