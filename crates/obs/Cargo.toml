@@ -38,7 +38,7 @@ tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
-reqwest = { workspace = true, optional = true, default-features = false }
+reqwest = { workspace = true, optional = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
