@@ -36,7 +36,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - uses: ./.github/actions/setup
 
       - name: Format Check
@@ -56,7 +56,7 @@ jobs:
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - uses: ./.github/actions/setup
 
       - name: Format
@@ -94,7 +94,7 @@ jobs:
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

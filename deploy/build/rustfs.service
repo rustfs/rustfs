@@ -24,7 +24,7 @@ ExecStart=/usr/local/bin/rustfs \
     --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
     --obs-config /etc/rustfs/obs.yaml \
     --console-enable \
-    --console-address 0.0.0.0:9002
+    --console-address 0.0.0.0:9001
 
 # environment variable configuration (Option 2: Use environment variables)
 # rustfs example file see: `../config/rustfs.env`

@@ -42,22 +42,22 @@ lock.workspace = true
 regex = { workspace = true }
 netif = { workspace = true }
 nix = { workspace = true }
-path-absolutize = "3.1.1"
+path-absolutize = { workspace = true }
 protos.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
-crc32fast = "1.4.2"
-siphasher = "1.0.1"
-base64-simd = "0.8.0"
+crc32fast = { workspace = true }
+siphasher = { workspace = true }
+base64-simd = { workspace = true }
 sha2 = { version = "0.11.0-pre.4" }
-hex-simd = "0.8.0"
-path-clean = "1.0.1"
+hex-simd = { workspace = true }
+path-clean = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
 tokio-stream = { workspace = true }
 tonic.workspace = true
-xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
+xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 num_cpus = { workspace = true }
 rand.workspace = true
 pin-project-lite.workspace = true

@@ -81,7 +81,7 @@ jobs:
         uses: actions/cache@v4.2.3
         with:
           path: /Users/runner/hostedtoolcache/protoc
-          key: protoc-${{ runner.os }}-30.2
+          key: protoc-${{ runner.os }}-31.1
           restore-keys: |
             protoc-${{ runner.os }}-
 
@@ -89,7 +89,7 @@ jobs:
         if: steps.cache-protoc.outputs.cache-hit != 'true'
         uses: arduino/setup-protoc@v3
         with:
-          version: '30.2'
+          version: '31.1'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Flatc

@@ -136,9 +136,10 @@ pub struct ReplicationPool {
     mrf_worker_size: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u8)] // 明确表示底层值为 u8
 pub enum ReplicationType {
+    #[default]
     UnsetReplicationType = 0,
     ObjectReplicationType = 1,
     DeleteReplicationType = 2,
@@ -147,12 +148,6 @@ pub enum ReplicationType {
     ExistingObjectReplicationType = 5,
     ResyncReplicationType = 6,
     AllReplicationType = 7,
-}
-
-impl Default for ReplicationType {
-    fn default() -> Self {
-        ReplicationType::UnsetReplicationType
-    }
 }
 
 impl ReplicationType {
@@ -400,7 +395,7 @@ pub async fn check_replicate_delete(
 // use crate::global::*;
 
 fn target_reset_header(arn: &str) -> String {
-    format!("{}-{}", format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, REPLICATION_RESET), arn)
+    format!("{}{}-{}", RESERVED_METADATA_PREFIX_LOWER, REPLICATION_RESET, arn)
 }
 
 pub async fn get_heal_replicate_object_info(
@@ -461,7 +456,7 @@ pub async fn get_heal_replicate_object_info(
             },
             None,
         )
-        .await
+            .await
     } else {
         // let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(mt))
         // .await
@@ -839,7 +834,7 @@ impl ReplicationPool {
 
     fn get_worker_ch(&self, bucket: &str, object: &str, _sz: i64) -> Option<&Sender<Box<dyn ReplicationWorkerOperation>>> {
         let h = xxh3_64(format!("{}{}", bucket, object).as_bytes()); // 计算哈希值
-                                                                     //need lock;
+        //need lock;
         let workers = &self.workers_sender; // 读锁
 
         if workers.is_empty() {
@@ -1177,7 +1172,7 @@ pub fn get_replication_action(oi1: &ObjectInfo, oi2: &ObjectInfo, op_type: &str)
     let _null_version_id = "null";
 
     // 如果是现有对象复制，判断是否需要跳过同步
-    if op_type == "existing" && oi1.mod_time > oi2.mod_time && oi1.version_id == None {
+    if op_type == "existing" && oi1.mod_time > oi2.mod_time && oi1.version_id.is_none() {
         return ReplicationAction::ReplicateNone;
     }
 
@@ -1532,7 +1527,7 @@ impl ConfigProcess for s3s::dto::ReplicationConfiguration {
                 continue;
             }
 
-            if self.role != "" {
+            if !self.role.is_empty() {
                 debug!("rule");
                 arns.push(self.role.clone()); // use legacy RoleArn if present
                 return arns;
@@ -1559,7 +1554,7 @@ impl ConfigProcess for s3s::dto::ReplicationConfiguration {
             if obj.existing_object
                 && rule.existing_object_replication.is_some()
                 && rule.existing_object_replication.unwrap().status
-                    == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+                == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
             {
                 warn!("need replicate failed");
                 return false;
@@ -1595,7 +1590,7 @@ impl ConfigProcess for s3s::dto::ReplicationConfiguration {
             return obj.replica
                 && rule.source_selection_criteria.is_some()
                 && rule.source_selection_criteria.unwrap().replica_modifications.unwrap().status
-                    == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED);
+                == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED);
         }
         warn!("need replicate failed");
         false
@@ -1869,7 +1864,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: &MustReplicateOpt
         let replicate = cfg.replicate(&opts);
         info!("need replicate {}", &replicate);
 
-        let synchronous = tgt.map_or(false, |t| t.replicate_sync);
+        let synchronous = tgt.is_ok_and(|t| t.replicate_sync);
         //decision.set(ReplicateTargetDecision::new(replicate,synchronous));
         info!("targe decision arn is:{}", tgt_arn.clone());
         decision.set(ReplicateTargetDecision {
@@ -1976,7 +1971,7 @@ impl ObjectInfoExt for ObjectInfo {
     }
     fn is_multipart(&self) -> bool {
         match &self.etag {
-            Some(etgval) => etgval.len() != 32 && etgval.len() > 0,
+            Some(etgval) => etgval.len() != 32 && etgval.is_empty(),
             None => false,
         }
     }
@@ -2086,7 +2081,7 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             object: self.name.clone(),
             version_id: self.version_id.clone(), // 直接使用计算后的 version_id
             retry_count: 0,
-            sz: self.size.clone(),
+            sz: self.size,
         }
     }
     fn as_any(&self) -> &dyn Any {
@@ -2469,7 +2464,7 @@ pub fn get_must_replicate_options(
     op: ReplicationType,           // 假设 `op` 是字符串类型
     opts: &ObjectOptions,
 ) -> MustReplicateOptions {
-    let mut meta = clone_mss(&user_defined);
+    let mut meta = clone_mss(user_defined);
 
     if !user_tags.is_empty() {
         meta.insert("xhttp.AmzObjectTagging".to_string(), user_tags.to_string());
@@ -2621,7 +2616,7 @@ pub async fn replicate_object(ri: ReplicateObjectInfo, object_api: Arc<store::EC
             for tgt_arn in tgt_arns {
                 let tgt = bucket_targets::get_bucket_target_client(&ri.bucket, &tgt_arn).await;
 
-                if !tgt.is_ok() {
+                if tgt.is_err() {
                     // repl_log_once_if(ctx, format!("failed to get target for bucket: {} arn: {}", bucket, tgt_arn), &tgt_arn).await;
                     // send_event(event_args {
                     //     event_name: "ObjectReplicationNotTracked".to_string(),
