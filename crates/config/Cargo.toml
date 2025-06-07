@@ -11,7 +11,18 @@ config = { workspace = true }
 const-str = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt"] }
+once_cell = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = [
+    "sync",
+    "rt",
+    "macros",
+    "rt-multi-thread",
+] }
 
 [lints]
 workspace = true

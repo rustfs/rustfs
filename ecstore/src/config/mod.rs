@@ -3,6 +3,7 @@ pub mod error;
 #[allow(dead_code)]
 pub mod heal;
 pub mod storageclass;
+pub mod kms;
 
 use crate::store::ECStore;
 use com::{lookup_configs, read_config_without_migrate, STORAGE_CLASS_SUB_SYS};
@@ -14,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 lazy_static! {
     pub static ref GLOBAL_StorageClass: OnceLock<storageclass::Config> = OnceLock::new();
+    pub static ref GLOBAL_KmsConfig: OnceLock<kms::Config> = OnceLock::new();
     pub static ref DefaultKVS: OnceLock<HashMap<String, KVS>> = OnceLock::new();
     pub static ref GLOBAL_ServerConfig: OnceLock<Config> = OnceLock::new();
     pub static ref GLOBAL_ConfigSys: ConfigSys = ConfigSys::new();
@@ -158,6 +160,7 @@ pub fn register_default_kvs(kvs: HashMap<String, KVS>) {
 pub fn init() {
     let mut kvs = HashMap::new();
     kvs.insert(STORAGE_CLASS_SUB_SYS.to_owned(), storageclass::DefaultKVS.clone());
+    kvs.insert(kms::KMS_SUB_SYS.to_owned(), kms::DefaultKVS.clone());
     // TODO: other default
     register_default_kvs(kvs)
 }

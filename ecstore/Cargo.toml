@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+kms = ["crypto/kms"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lints]
 workspace = true
@@ -35,7 +39,7 @@ tracing-error.workspace = true
 s3s.workspace = true
 http.workspace = true
 highway = { workspace = true }
-url.workspace = true
+url = "2.5"
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
 reed-solomon-erasure = { workspace = true }
 transform-stream = "0.3.1"

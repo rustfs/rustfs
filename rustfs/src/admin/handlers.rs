@@ -67,6 +67,7 @@ pub mod sts;
 pub mod trace;
 pub mod user;
 use urlencoding::decode;
+use rustfs_config::ConfigManager;  // 使用真正的 ConfigManager
 
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
@@ -1024,6 +1025,85 @@ impl Operation for RemoveRemoteTargetHandler {
         //return Err(s3_error!(InvalidArgument, "Invalid bucket name"));
         //Ok(S3Response::with_headers((StatusCode::OK, Body::from()), header))
         return Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))));
+    }
+}
+
+pub struct GetConfigHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetConfigHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle GetConfigHandler");
+        
+        let Some(_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let config_manager = ConfigManager::global();
+        let all_configs = config_manager.get_all_configs().await;
+
+        let data = serde_json::to_vec(&all_configs)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize config failed: {}", e)))?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+    }
+}
+
+pub struct SetConfigHandler {}
+
+#[async_trait::async_trait]
+impl Operation for SetConfigHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        warn!("handle SetConfigHandler");
+        
+        let Some(_cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        // 解析查询参数
+        let _query_params = extract_query_params(&req.uri);
+        
+        let mut input = req.input;
+        let body = match input.store_all_unlimited().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("get body failed, e: {:?}", e);
+                return Err(s3_error!(InvalidRequest, "get body failed"));
+            }
+        };
+
+        // 根据路径识别配置类型和操作
+        let path = req.uri.path();
+        if path.contains("/config/") {
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() >= 4 {
+                let subsystem = parts[parts.len() - 2];
+                let target = parts[parts.len() - 1];
+                
+                match subsystem {
+                    "kms_vault" => {
+                        let config_manager = ConfigManager::global();
+                        
+                        // 解析KMS配置
+                        let kms_config: serde_json::Value = serde_json::from_slice(&body)
+                            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid json: {}", e)))?;
+                        
+                        config_manager.set_kms_config(target, kms_config).await
+                            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+                        
+                        return Ok(S3Response::new((StatusCode::OK, Body::from("Configuration updated successfully".to_string()))));
+                    },
+                    _ => {
+                        return Err(s3_error!(InvalidRequest, "unsupported subsystem"));
+                    }
+                }
+            }
+        }
+
+        Err(s3_error!(InvalidRequest, "invalid config path"))
     }
 }
 

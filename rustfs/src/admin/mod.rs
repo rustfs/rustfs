@@ -11,7 +11,7 @@ use handlers::{
     sts, user,
 };
 
-use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
+use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler, GetConfigHandler, SetConfigHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
 use rpc::regist_rpc_route;
@@ -310,6 +310,34 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
         AdminOperation(&policys::SetPolicyForUserOrGroup {}),
+    )?;
+
+    // KMS配置管理路由 - 兼容minio格式
+    // GET /minio/admin/v3/config - 获取所有配置
+    r.insert(
+        Method::GET,
+        format!("{}{}", MINIO_ADMIN_PREFIX, "/v3/config").as_str(),
+        AdminOperation(&GetConfigHandler {}),
+    )?;
+
+    // POST /minio/admin/v3/config/{subsystem}/{target} - 设置配置
+    r.insert(
+        Method::POST,
+        format!("{}{}", MINIO_ADMIN_PREFIX, "/v3/config/{subsystem}/{target}").as_str(),
+        AdminOperation(&SetConfigHandler {}),
+    )?;
+
+    // rustfs专用配置路由
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/config").as_str(),
+        AdminOperation(&GetConfigHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/config/{subsystem}/{target}").as_str(),
+        AdminOperation(&SetConfigHandler {}),
     )?;
 
     Ok(())

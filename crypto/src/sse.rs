@@ -300,8 +300,102 @@ pub fn get_kms_init_error() -> Option<String> {
 /// Initialize KMS client on system startup
 #[cfg(feature = "kms")]
 pub fn init_kms() {
-    // 改为延迟初始化，不在启动时强制初始化KMS
-    debug!("KMS initialization deferred until first use");
+    use ecstore::config::{GLOBAL_KmsConfig, kms};
+    use crate::sse_kms::RustyVaultKMSClient;
+    
+    // Get KMS configuration from global config
+    if let Some(kms_config) = GLOBAL_KmsConfig.get() {
+        if kms_config.enabled {
+            info!("Initializing KMS client with configuration");
+            
+            // Test KMS configuration
+            let rt = tokio::runtime::Handle::try_current();
+            let test_result = if let Ok(handle) = rt {
+                // We're in an async context
+                handle.block_on(async {
+                    kms_config.test_connection().await
+                })
+            } else {
+                // We're not in an async context, create a new runtime
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    kms_config.test_connection().await
+                })
+            };
+            
+            match test_result {
+                Ok(_) => {
+                    // Create and set global KMS client
+                    let client = RustyVaultKMSClient::new(
+                        kms_config.endpoint.clone(),
+                        kms_config.token.clone(),
+                        kms_config.key_name.clone(),
+                    );
+                    
+                    if let Err(e) = RustyVaultKMSClient::set_global_client(client) {
+                        let error_msg = format!("Failed to set global KMS client: {}", e);
+                        error!("{}", error_msg);
+                        if let Ok(mut kms_error) = KMS_INIT_ERROR.write() {
+                            *kms_error = Some(error_msg);
+                        }
+                    } else {
+                        info!("KMS client initialized successfully");
+                        // Clear any previous errors
+                        if let Ok(mut kms_error) = KMS_INIT_ERROR.write() {
+                            *kms_error = None;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("KMS connection test failed: {}", e);
+                    error!("{}", error_msg);
+                    if let Ok(mut kms_error) = KMS_INIT_ERROR.write() {
+                        *kms_error = Some(error_msg);
+                    }
+                }
+            }
+        } else {
+            debug!("KMS is disabled in configuration");
+        }
+    } else {
+        // Check environment variables for KMS configuration
+        if std::env::var("RUSTFS_KMS_ENABLED").unwrap_or_default() == "true" {
+            warn!("KMS enabled via environment variable but no configuration found");
+            
+            // Try to initialize with environment variables
+            let kvs = kms::KVS::new(); // Empty KVS to trigger env var fallback
+            match kms::lookup_config(&kvs) {
+                Ok(config) => {
+                    if config.enabled {
+                        let client = RustyVaultKMSClient::new(
+                            config.endpoint,
+                            config.token,
+                            config.key_name,
+                        );
+                        
+                        if let Err(e) = RustyVaultKMSClient::set_global_client(client) {
+                            let error_msg = format!("Failed to set global KMS client from env vars: {}", e);
+                            error!("{}", error_msg);
+                            if let Ok(mut kms_error) = KMS_INIT_ERROR.write() {
+                                *kms_error = Some(error_msg);
+                            }
+                        } else {
+                            info!("KMS client initialized from environment variables");
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to parse KMS config from environment: {}", e);
+                    error!("{}", error_msg);
+                    if let Ok(mut kms_error) = KMS_INIT_ERROR.write() {
+                        *kms_error = Some(error_msg);
+                    }
+                }
+            }
+        } else {
+            debug!("KMS not enabled");
+        }
+    }
 }
 
 /// Lazy initialize KMS client when needed

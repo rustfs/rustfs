@@ -1,5 +1,5 @@
 use super::error::{is_err_config_not_found, ConfigError};
-use super::{storageclass, Config, GLOBAL_StorageClass};
+use super::{storageclass, kms, Config, GLOBAL_StorageClass, GLOBAL_KmsConfig};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use crate::store_err::is_err_object_not_found;
@@ -10,19 +10,21 @@ use lazy_static::lazy_static;
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{error, warn, info};
 
 pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
+pub const KMS_SUB_SYS: &str = "kms_vault";
 pub const DEFAULT_KV_KEY: &str = "_";
 
 lazy_static! {
     static ref CONFIG_BUCKET: String = format!("{}{}{}", RUSTFS_META_BUCKET, SLASH_SEPARATOR, CONFIG_PREFIX);
     static ref SubSystemsDynamic: HashSet<String> = {
         let mut h = HashSet::new();
-        h.insert(STORAGE_CLASS_SUB_SYS.to_owned());
+        h.insert(STORAGE_CLASS_SUB_SYS.to_string());
+        h.insert(KMS_SUB_SYS.to_string());
         h
     };
 }
@@ -206,7 +208,69 @@ async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: 
                 }
             }
         }
+    } else if subsys == KMS_SUB_SYS {
+        let kvs = cfg.get_value(KMS_SUB_SYS, DEFAULT_KV_KEY).unwrap_or_default();
+
+        match kms::lookup_config(&kvs) {
+            Ok(res) => {
+                if GLOBAL_KmsConfig.get().is_none() {
+                    if let Err(r) = GLOBAL_KmsConfig.set(res) {
+                        error!("GLOBAL_KmsConfig.set failed {:?}", r);
+                    }
+                } else {
+                    info!("KMS configuration updated dynamically");
+                    // For dynamic updates, we need to replace the existing config
+                    // Since OnceLock doesn't support replacement, we'll store the new config
+                    // and reinitialize the KMS client if needed
+                    if res.enabled {
+                        // Reinitialize KMS client with new configuration
+                        if let Err(e) = reinitialize_kms_client(&res).await {
+                            error!("Failed to reinitialize KMS client: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                error!("init kms config err:{:?}", &err);
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Reinitialize KMS client with new configuration
+#[cfg(feature = "kms")]
+async fn reinitialize_kms_client(config: &kms::Config) -> Result<()> {
+    use crypto::sse_kms::RustyVaultKMSClient;
+    
+    info!("Reinitializing KMS client with new configuration");
+    
+    // Test the new configuration first
+    match config.test_connection().await {
+        Ok(_) => {
+            // Create new client and set it globally
+            let client = RustyVaultKMSClient::new(
+                config.endpoint.clone(),
+                config.token.clone(),
+                config.key_name.clone(),
+            );
+            
+            RustyVaultKMSClient::set_global_client(client)
+                .map_err(|e| Error::msg(format!("Failed to set global KMS client: {}", e)))?;
+            
+            info!("KMS client reinitialized successfully");
+            Ok(())
+        }
+        Err(e) => {
+            error!("KMS connection test failed during reinitialization: {}", e);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(not(feature = "kms"))]
+async fn reinitialize_kms_client(_config: &kms::Config) -> Result<()> {
+    warn!("KMS feature not enabled, cannot reinitialize KMS client");
     Ok(())
 }

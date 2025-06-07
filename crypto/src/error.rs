@@ -63,4 +63,10 @@ pub enum Error {
     // Feature not supported error
     #[error("feature not supported: {0}")]
     ErrNotSupported(String),
+
+    #[error("Missing encrypted key")]
+    ErrMissingEncryptedKey,
+    
+    #[error("Invalid data format: {0}")]
+    ErrInvalidDataFormat(String),
 }

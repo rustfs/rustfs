@@ -42,3 +42,6 @@ pub use global::update_erasure_type;
 
 pub use global::GLOBAL_Endpoints;
 pub use store_api::StorageAPI;
+
+// Remove unused imports for now - they will be used when KMS functionality is integrated
+// use crate::config::{com, kms};
