@@ -1,3 +1,4 @@
+pub mod bucket_stats;
 pub mod error;
 pub mod globals;
 pub mod last_minute;

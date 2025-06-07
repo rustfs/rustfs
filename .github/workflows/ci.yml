@@ -19,7 +19,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
