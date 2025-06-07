@@ -53,10 +53,7 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> Result<boo
     let local_set: HashSet<IpAddr> = LOCAL_IPS.iter().copied().collect();
     let is_local_host = match host {
         Host::Domain(domain) => {
-            let ips = match (domain, 0).to_socket_addrs().map(|v| v.map(|v| v.ip()).collect::<Vec<_>>()) {
-                Ok(ips) => ips,
-                Err(err) => return Err(err),
-            };
+            let ips = (domain, 0).to_socket_addrs().map(|v| v.map(|v| v.ip()).collect::<Vec<_>>())?;
 
             ips.iter().any(|ip| local_set.contains(ip))
         }

@@ -226,9 +226,9 @@ impl From<DiskError> for StorageError {
     }
 }
 
-impl Into<DiskError> for StorageError {
-    fn into(self) -> DiskError {
-        match self {
+impl From<StorageError> for DiskError {
+    fn from(val: StorageError) -> Self {
+        match val {
             StorageError::Io(io_error) => io_error.into(),
             StorageError::Unexpected => DiskError::Unexpected,
             StorageError::FileNotFound => DiskError::FileNotFound,
@@ -250,7 +250,7 @@ impl Into<DiskError> for StorageError {
             StorageError::VolumeNotFound => DiskError::VolumeNotFound,
             StorageError::VolumeExists => DiskError::VolumeExists,
             StorageError::FileNameTooLong => DiskError::FileNameTooLong,
-            _ => DiskError::other(self),
+            _ => DiskError::other(val),
         }
     }
 }
@@ -292,9 +292,9 @@ impl From<rustfs_filemeta::Error> for StorageError {
     }
 }
 
-impl Into<rustfs_filemeta::Error> for StorageError {
-    fn into(self) -> rustfs_filemeta::Error {
-        match self {
+impl From<StorageError> for rustfs_filemeta::Error {
+    fn from(val: StorageError) -> Self {
+        match val {
             StorageError::Unexpected => rustfs_filemeta::Error::Unexpected,
             StorageError::FileNotFound => rustfs_filemeta::Error::FileNotFound,
             StorageError::FileVersionNotFound => rustfs_filemeta::Error::FileVersionNotFound,
@@ -303,7 +303,7 @@ impl Into<rustfs_filemeta::Error> for StorageError {
             StorageError::MethodNotAllowed => rustfs_filemeta::Error::MethodNotAllowed,
             StorageError::VolumeNotFound => rustfs_filemeta::Error::VolumeNotFound,
             StorageError::Io(io_error) => io_error.into(),
-            _ => rustfs_filemeta::Error::other(self),
+            _ => rustfs_filemeta::Error::other(val),
         }
     }
 }
@@ -372,7 +372,7 @@ impl Clone for StorageError {
             StorageError::DecommissionNotStarted => StorageError::DecommissionNotStarted,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
             StorageError::DoneForNow => StorageError::DoneForNow,
-            StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(a.clone(), b.clone(), c.clone()),
+            StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(*a, b.clone(), c.clone()),
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageError::NotFirstDisk,
@@ -717,7 +717,7 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
             let bucket = params.first().cloned().unwrap_or_default().to_owned();
             let object = params.get(1).cloned().map(decode_dir_object).unwrap_or_default();
 
-            return StorageError::PrefixAccessDenied(bucket, object);
+            StorageError::PrefixAccessDenied(bucket, object)
         }
 
         _ => err,

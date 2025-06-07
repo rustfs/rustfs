@@ -1,9 +1,6 @@
 use ecstore::error::StorageError;
 use s3s::{S3Error, S3ErrorCode};
 
-pub type Error = ApiError;
-pub type Result<T> = core::result::Result<T, Error>;
-
 #[derive(Debug)]
 pub struct ApiError {
     pub code: S3ErrorCode,

@@ -2828,22 +2828,17 @@ impl SetDisks {
             return Ok((result, None));
         }
         for (index, (err, disk)) in errs.iter().zip(disks.iter()).enumerate() {
-            if let (Some(err), Some(disk)) = (err, disk) {
-                match err {
-                    DiskError::VolumeNotFound | DiskError::FileNotFound => {
-                        let vol_path = Path::new(bucket).join(object);
-                        let drive_state = match disk.make_volume(vol_path.to_str().unwrap()).await {
-                            Ok(_) => DRIVE_STATE_OK,
-                            Err(merr) => match merr {
-                                DiskError::VolumeExists => DRIVE_STATE_OK,
-                                DiskError::DiskNotFound => DRIVE_STATE_OFFLINE,
-                                _ => DRIVE_STATE_CORRUPT,
-                            },
-                        };
-                        result.after.drives[index].state = drive_state.to_string();
-                    }
-                    _ => {}
-                }
+            if let (Some(DiskError::VolumeNotFound | DiskError::FileNotFound), Some(disk)) = (err, disk) {
+                let vol_path = Path::new(bucket).join(object);
+                let drive_state = match disk.make_volume(vol_path.to_str().unwrap()).await {
+                    Ok(_) => DRIVE_STATE_OK,
+                    Err(merr) => match merr {
+                        DiskError::VolumeExists => DRIVE_STATE_OK,
+                        DiskError::DiskNotFound => DRIVE_STATE_OFFLINE,
+                        _ => DRIVE_STATE_CORRUPT,
+                    },
+                };
+                result.after.drives[index].state = drive_state.to_string();
             }
         }
 
@@ -5563,7 +5558,7 @@ async fn disks_with_all_parts(
                 if index < vec.len() {
                     if verify_err.is_some() {
                         info!("verify_err");
-                        vec[index] = conv_part_err_to_int(&verify_err.as_ref().map(|e| e.clone().into()));
+                        vec[index] = conv_part_err_to_int(&verify_err.clone());
                     } else {
                         info!("verify_resp, verify_resp.results {}", verify_resp.results[p]);
                         vec[index] = verify_resp.results[p];
@@ -5620,7 +5615,7 @@ pub fn should_heal_object_on_disk(
             }
         }
     }
-    (false, err.as_ref().map(|e| e.clone()))
+    (false, err.clone())
 }
 
 async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<madmin::Disk> {

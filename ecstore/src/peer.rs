@@ -771,7 +771,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let bucket = bucket.to_string();
             let bs_clone = before_state.clone();
             let as_clone = after_state.clone();
-            let errs_clone = errs.iter().map(|e| e.clone()).collect::<Vec<_>>();
+            let errs_clone = errs.to_vec();
             futures.push(async move {
                 if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
                     info!("bucket not find, will recreate");

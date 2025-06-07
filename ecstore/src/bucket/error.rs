@@ -53,8 +53,7 @@ impl From<Error> for BucketMetadataError {
 
 impl From<std::io::Error> for BucketMetadataError {
     fn from(e: std::io::Error) -> Self {
-        e.downcast::<BucketMetadataError>()
-            .unwrap_or_else(|e| BucketMetadataError::other(e))
+        e.downcast::<BucketMetadataError>().unwrap_or_else(BucketMetadataError::other)
     }
 }
 

@@ -8,7 +8,6 @@ use ecstore::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
         error::DiskError,
     },
-    error::StorageError,
     heal::{
         data_usage_cache::DataUsageCache,
         heal_commands::{HealOpts, get_local_background_heal_status},

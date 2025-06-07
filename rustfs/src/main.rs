@@ -121,7 +121,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize event notifier
     event::init_event_notifier(opt.event_config).await;
 
-    let server_addr = net::parse_and_resolve_address(opt.address.as_str()).map_err(|err| Error::other(err))?;
+    let server_addr = net::parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
@@ -140,8 +140,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     let local_ip = rustfs_utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
     // For RPC
-    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
-        .map_err(|err| Error::other(err.to_string()))?;
+    let (endpoint_pools, setup_type) =
+        EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone()).map_err(Error::other)?;
 
     // Print RustFS-style logging for pool formatting
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
@@ -188,9 +188,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     update_erasure_type(setup_type).await;
 
     // Initialize the local disk
-    init_local_disks(endpoint_pools.clone())
-        .await
-        .map_err(|err| Error::other(err))?;
+    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
 
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
@@ -505,9 +503,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     // init store
     let store = ECStore::new(server_address.clone(), endpoint_pools.clone())
         .await
-        .map_err(|err| {
-            error!("ECStore::new {:?}", &err);
-            err
+        .inspect_err(|err| {
+            error!("ECStore::new {:?}", err);
         })?;
 
     ecconfig::init();
@@ -519,7 +516,7 @@ async fn run(opt: config::Opt) -> Result<()> {
             ..Default::default()
         })
         .await
-        .map_err(|err| Error::other(err))?;
+        .map_err(Error::other)?;
 
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
 

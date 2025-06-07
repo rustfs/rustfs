@@ -1319,7 +1319,7 @@ impl StorageAPI for ECStore {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         if !is_meta_bucketname(bucket) {
             if let Err(err) = check_valid_bucket_name_strict(bucket) {
-                return Err(StorageError::BucketNameInvalid(err.to_string()).into());
+                return Err(StorageError::BucketNameInvalid(err.to_string()));
             }
 
             // TODO: nslock
@@ -1390,11 +1390,11 @@ impl StorageAPI for ECStore {
     #[tracing::instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         if is_meta_bucketname(bucket) {
-            return Err(StorageError::BucketNameInvalid(bucket.to_string()).into());
+            return Err(StorageError::BucketNameInvalid(bucket.to_string()));
         }
 
         if let Err(err) = check_valid_bucket_name(bucket) {
-            return Err(StorageError::BucketNameInvalid(err.to_string()).into());
+            return Err(StorageError::BucketNameInvalid(err.to_string()));
         }
 
         // TODO: nslock
@@ -2186,7 +2186,7 @@ impl StorageAPI for ECStore {
         for (index, err) in errs.iter().enumerate() {
             match err {
                 Some(err) => {
-                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    if is_err_object_not_found(err) || is_err_version_not_found(err) {
                         continue;
                     }
                     return Ok((ress.remove(index), Some(err.clone())));

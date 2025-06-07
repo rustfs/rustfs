@@ -188,8 +188,8 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
     }
 
     // TODO: Add support for hexadecimals.
-    let start = ellipses_range[0].parse::<usize>().map_err(|e| Error::other(e))?;
-    let end = ellipses_range[1].parse::<usize>().map_err(|e| Error::other(e))?;
+    let start = ellipses_range[0].parse::<usize>().map_err(Error::other)?;
+    let end = ellipses_range[1].parse::<usize>().map_err(Error::other)?;
 
     if start > end {
         return Err(Error::other("Invalid argument:range start cannot be bigger than end"));

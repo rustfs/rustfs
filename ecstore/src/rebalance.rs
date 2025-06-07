@@ -500,7 +500,7 @@ impl ECStore {
             if get_global_endpoints()
                 .as_ref()
                 .get(idx)
-                .is_none_or(|v| v.endpoints.as_ref().first().map_or(true, |e| e.is_local))
+                .is_none_or(|v| v.endpoints.as_ref().first().is_none_or(|e| e.is_local))
             {
                 warn!("start_rebalance: pool {} is not local, skipping", idx);
                 continue;

@@ -4,7 +4,6 @@ use super::options::extract_metadata;
 use super::options::put_opts;
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
-use crate::error::Result;
 use crate::storage::access::ReqInfo;
 use crate::storage::options::copy_dst_opts;
 use crate::storage::options::copy_src_opts;

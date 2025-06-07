@@ -32,7 +32,7 @@ impl<T: Operation> S3Router<T> {
 
         // warn!("set uri {}", &path);
 
-        self.router.insert(path, operation).map_err(|e| std::io::Error::other(e))?;
+        self.router.insert(path, operation).map_err(std::io::Error::other)?;
 
         Ok(())
     }
