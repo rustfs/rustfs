@@ -7,7 +7,7 @@
 | 软件包    | 版本     | 下载链接                                                                                                                             |
 |--------|--------|----------------------------------------------------------------------------------------------------------------------------------|
 | Rust   | 1.8.5+ | [rust-lang.org/tools/install](https://www.rust-lang.org/tools/install)                                                           |
-| protoc | 30.2+  | [protoc-30.2-linux-x86_64.zip](https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip) |
+| protoc | 31.1+  | [protoc-31.1-linux-x86_64.zip](https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protoc-31.1-linux-x86_64.zip) |
 | flatc  | 24.0+  | [Linux.flatc.binary.g++-13.zip](https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.flatc.binary.g++-13.zip)  |
 
 ### 构建 RustFS

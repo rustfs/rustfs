@@ -1,10 +1,10 @@
 #!/bin/bash
 clear
 
-# 获取当前平台架构
+# Get the current platform architecture
 ARCH=$(uname -m)
 
-# 根据架构设置 target 目录
+# Set the target directory according to the schema
 if [ "$ARCH" == "x86_64" ]; then
     TARGET_DIR="target/x86_64"
 elif [ "$ARCH" == "aarch64" ]; then
@@ -13,7 +13,7 @@ else
     TARGET_DIR="target/unknown"
 fi
 
-# 设置 CARGO_TARGET_DIR 并构建项目
+# Set CARGO_TARGET_DIR and build the project
 CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --package rustfs
 
 echo -e "\a"

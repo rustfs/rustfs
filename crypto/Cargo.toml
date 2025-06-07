@@ -10,12 +10,12 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-aes-gcm = { version = "0.10.3", features = ["std"], optional = true }
-argon2 = { version = "0.5.3", features = ["std"], optional = true }
-cfg-if = "1.0.0"
-chacha20poly1305 = { version = "0.10.1", optional = true }
+aes-gcm = { workspace = true, features = ["std"], optional = true }
+argon2 = { workspace = true, features = ["std"], optional = true }
+cfg-if = { workspace = true }
+chacha20poly1305 = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
-pbkdf2 = { version = "0.12.2", optional = true }
+pbkdf2 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 thiserror.workspace = true

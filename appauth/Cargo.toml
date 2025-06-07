@@ -7,11 +7,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-base64-simd = "0.8.0"
+base64-simd = { workspace = true }
 common.workspace = true
-hex-simd = "0.8.0"
+hex-simd = { workspace = true }
 rand.workspace = true
-rsa = "0.9.8"
+rsa = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 

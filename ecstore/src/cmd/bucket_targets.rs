@@ -275,7 +275,7 @@ impl BucketTargetSys {
         targets_map.insert(bucket.to_string(), targets);
         arn_remotes_map.remove(arn_str);
 
-        let targets = self.list_targets(Some(&bucket), None).await;
+        let targets = self.list_targets(Some(bucket), None).await;
         println!("targets is {}", targets.len());
         match serde_json::to_vec(&targets) {
             Ok(json) => {
@@ -390,7 +390,7 @@ impl BucketTargetSys {
     }
 
     async fn is_bucket_versioned(&self, _bucket: &str) -> bool {
-        return true;
+        true
         // let url_str = "http://127.0.0.1:9001";
 
         // // 转换为 Url 类型

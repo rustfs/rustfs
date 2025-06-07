@@ -35,9 +35,7 @@ managing and monitoring the system.
 |      ├── rustfs_cert.pem
 |      └── rustfs_key.pem
 |--config
-|  |--obs.example.yaml // example config
 |  |--rustfs.env // env config
 |  |--rustfs-zh.env // env config in Chinese
-|  |--.example.obs.env // example env config
 |  |--event.example.toml // event config
 ```

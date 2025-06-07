@@ -1,6 +1,6 @@
 services:
   otel-collector:
-    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.124.0
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.127.0
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -16,7 +16,7 @@ services:
     networks:
       - rustfs-network
   jaeger:
-    image: jaegertracing/jaeger:2.5.0
+    image: jaegertracing/jaeger:2.6.0
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -26,7 +26,7 @@ services:
     networks:
       - rustfs-network
   prometheus:
-    image: prom/prometheus:v3.3.0
+    image: prom/prometheus:v3.4.1
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -36,7 +36,7 @@ services:
     networks:
       - rustfs-network
   loki:
-    image: grafana/loki:3.5.0
+    image: grafana/loki:3.5.1
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -47,7 +47,7 @@ services:
     networks:
       - rustfs-network
   grafana:
-    image: grafana/grafana:11.6.1
+    image: grafana/grafana:12.0.1
     ports:
       - "3000:3000"  # Web UI
     environment:

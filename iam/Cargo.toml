@@ -18,19 +18,19 @@ policy.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
-strum = { version = "0.27.1", features = ["derive"] }
-arc-swap = "1.7.1"
+strum = { workspace = true, features = ["derive"] }
+arc-swap = { workspace = true }
 crypto = { path = "../crypto" }
-ipnetwork = { version = "0.21.1", features = ["serde"] }
-itertools = "0.14.0"
+ipnetwork = { workspace = true, features = ["serde"] }
+itertools = { workspace = true }
 futures.workspace = true
 rand.workspace = true
-base64-simd = "0.8.0"
+base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true }
 tracing.workspace = true
 madmin.workspace = true
 lazy_static.workspace = true
-regex = "1.11.1"
+regex = { workspace = true }
 common.workspace = true
 
 [dev-dependencies]
