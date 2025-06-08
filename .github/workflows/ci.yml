@@ -34,7 +34,7 @@ jobs:
   pr-checks:
     name: Pull Request Quality Checks
     if: github.event_name == 'pull_request'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4.2.2
       - uses: ./.github/actions/setup
@@ -54,7 +54,7 @@ jobs:
   develop:
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4.2.2
       - uses: ./.github/actions/setup
@@ -92,7 +92,7 @@ jobs:
       - skip-check
       - develop
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4.2.2
       - uses: dtolnay/rust-toolchain@stable
