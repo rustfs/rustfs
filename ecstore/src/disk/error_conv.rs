@@ -85,9 +85,9 @@ pub fn to_unformatted_disk_error(io_err: std::io::Error) -> std::io::Error {
                 DiskError::DiskAccessDenied => DiskError::DiskAccessDenied.into(),
                 _ => DiskError::CorruptedBackend.into(),
             },
-            Err(err) => to_unformatted_disk_error(err),
+            Err(_err) => DiskError::CorruptedBackend.into(),
         },
-        _ => to_unformatted_disk_error(io_err),
+        _ => DiskError::CorruptedBackend.into(),
     }
 }
 
@@ -363,11 +363,10 @@ mod tests {
 
     #[test]
     fn test_to_unformatted_disk_error_recursive_behavior() {
-        // Test recursive call with non-Other error kind
+        // Test with non-Other error kind that should be handled without infinite recursion
         let result = to_unformatted_disk_error(create_io_error(ErrorKind::Interrupted));
-        // This should recursively call to_unformatted_disk_error, which should then
-        // treat it as Other kind and eventually produce CorruptedBackend or similar
-        assert!(result.downcast::<DiskError>().is_ok());
+        // This should not cause infinite recursion and should produce CorruptedBackend
+        assert!(contains_disk_error(result, DiskError::CorruptedBackend));
     }
 
     #[test]

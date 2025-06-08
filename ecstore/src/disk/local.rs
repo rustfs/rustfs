@@ -2384,4 +2384,273 @@ mod test {
 
         let _ = fs::remove_dir_all(&p).await;
     }
+
+    #[tokio::test]
+    async fn test_local_disk_basic_operations() {
+        let test_dir = "./test_local_disk_basic";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Test basic properties
+        assert!(disk.is_local());
+        // Note: host_name() for local disks might be empty or contain localhost/hostname
+        // assert!(!disk.host_name().is_empty());
+        assert!(!disk.to_string().is_empty());
+
+        // Test path resolution
+        let abs_path = disk.resolve_abs_path("test/path").unwrap();
+        assert!(abs_path.is_absolute());
+
+        // Test bucket path
+        let bucket_path = disk.get_bucket_path("test-bucket").unwrap();
+        assert!(bucket_path.to_string_lossy().contains("test-bucket"));
+
+        // Test object path
+        let object_path = disk.get_object_path("test-bucket", "test-object").unwrap();
+        assert!(object_path.to_string_lossy().contains("test-bucket"));
+        assert!(object_path.to_string_lossy().contains("test-object"));
+
+        // 清理测试目录
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_disk_file_operations() {
+        let test_dir = "./test_local_disk_file_ops";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Create test volume
+        disk.make_volume("test-volume").await.unwrap();
+
+        // Test write and read operations
+        let test_data = vec![1, 2, 3, 4, 5];
+        disk.write_all("test-volume", "test-file.txt", test_data.clone())
+            .await
+            .unwrap();
+
+        let read_data = disk.read_all("test-volume", "test-file.txt").await.unwrap();
+        assert_eq!(read_data, test_data);
+
+        // Test file deletion
+        let delete_opts = DeleteOptions {
+            recursive: false,
+            immediate: true,
+            undo_write: false,
+            old_data_dir: None,
+        };
+        disk.delete("test-volume", "test-file.txt", delete_opts).await.unwrap();
+
+        // Clean up
+        disk.delete_volume("test-volume").await.unwrap();
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_disk_volume_operations() {
+        let test_dir = "./test_local_disk_volumes";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        // Test creating multiple volumes
+        let volumes = vec!["vol1", "vol2", "vol3"];
+        disk.make_volumes(volumes.clone()).await.unwrap();
+
+        // Test listing volumes
+        let volume_list = disk.list_volumes().await.unwrap();
+        assert!(!volume_list.is_empty());
+
+        // Test volume stats
+        for vol in &volumes {
+            let vol_info = disk.stat_volume(vol).await.unwrap();
+            assert_eq!(vol_info.name, *vol);
+        }
+
+        // Test deleting volumes
+        for vol in &volumes {
+            disk.delete_volume(vol).await.unwrap();
+        }
+
+        // 清理测试目录
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_disk_disk_info() {
+        let test_dir = "./test_local_disk_info";
+        fs::create_dir_all(&test_dir).await.unwrap();
+
+        let endpoint = Endpoint::try_from(test_dir).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let disk_info_opts = DiskInfoOptions {
+            disk_id: "test-disk".to_string(),
+            metrics: true,
+            noop: false,
+        };
+
+        let disk_info = disk.disk_info(&disk_info_opts).await.unwrap();
+
+        // Basic checks on disk info
+        assert!(!disk_info.fs_type.is_empty());
+        assert!(disk_info.total > 0);
+
+        // 清理测试目录
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[test]
+    fn test_is_valid_volname() {
+        // Valid volume names (length >= 3)
+        assert!(LocalDisk::is_valid_volname("valid-name"));
+        assert!(LocalDisk::is_valid_volname("test123"));
+        assert!(LocalDisk::is_valid_volname("my-bucket"));
+
+        // Test minimum length requirement
+        assert!(!LocalDisk::is_valid_volname(""));
+        assert!(!LocalDisk::is_valid_volname("a"));
+        assert!(!LocalDisk::is_valid_volname("ab"));
+        assert!(LocalDisk::is_valid_volname("abc"));
+
+        // Note: The current implementation doesn't check for system volume names
+        // It only checks length and platform-specific special characters
+        // System volume names are valid according to the current implementation
+        assert!(LocalDisk::is_valid_volname(RUSTFS_META_BUCKET));
+        assert!(LocalDisk::is_valid_volname(super::super::RUSTFS_META_TMP_BUCKET));
+
+        // Testing platform-specific behavior for special characters
+        #[cfg(windows)]
+        {
+            // On Windows systems, these should be invalid
+            assert!(!LocalDisk::is_valid_volname("invalid\\name"));
+            assert!(!LocalDisk::is_valid_volname("invalid:name"));
+            assert!(!LocalDisk::is_valid_volname("invalid|name"));
+            assert!(!LocalDisk::is_valid_volname("invalid<name"));
+            assert!(!LocalDisk::is_valid_volname("invalid>name"));
+            assert!(!LocalDisk::is_valid_volname("invalid?name"));
+            assert!(!LocalDisk::is_valid_volname("invalid*name"));
+            assert!(!LocalDisk::is_valid_volname("invalid\"name"));
+        }
+
+        #[cfg(not(windows))]
+        {
+            // On non-Windows systems, the current implementation doesn't check special characters
+            // So these would be considered valid
+            assert!(LocalDisk::is_valid_volname("valid/name"));
+            assert!(LocalDisk::is_valid_volname("valid:name"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_format_info_last_check_valid() {
+        let now = OffsetDateTime::now_utc();
+
+        // Valid format info
+        let valid_format_info = FormatInfo {
+            id: Some(Uuid::new_v4()),
+            data: vec![1, 2, 3],
+            file_info: Some(fs::metadata(".").await.unwrap()),
+            last_check: Some(now),
+        };
+        assert!(valid_format_info.last_check_valid());
+
+        // Invalid format info (missing id)
+        let invalid_format_info = FormatInfo {
+            id: None,
+            data: vec![1, 2, 3],
+            file_info: Some(fs::metadata(".").await.unwrap()),
+            last_check: Some(now),
+        };
+        assert!(!invalid_format_info.last_check_valid());
+
+        // Invalid format info (old timestamp)
+        let old_time = OffsetDateTime::now_utc() - time::Duration::seconds(10);
+        let old_format_info = FormatInfo {
+            id: Some(Uuid::new_v4()),
+            data: vec![1, 2, 3],
+            file_info: Some(fs::metadata(".").await.unwrap()),
+            last_check: Some(old_time),
+        };
+        assert!(!old_format_info.last_check_valid());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_exists() {
+        let test_file = "./test_read_exists.txt";
+
+        // Test non-existent file
+        let (data, metadata) = read_file_exists(test_file).await.unwrap();
+        assert!(data.is_empty());
+        assert!(metadata.is_none());
+
+        // Create test file
+        fs::write(test_file, b"test content").await.unwrap();
+
+        // Test existing file
+        let (data, metadata) = read_file_exists(test_file).await.unwrap();
+        assert_eq!(data, b"test content");
+        assert!(metadata.is_some());
+
+        // Clean up
+        let _ = fs::remove_file(test_file).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_file_all() {
+        let test_file = "./test_read_all.txt";
+        let test_content = b"test content for read_all";
+
+        // Create test file
+        fs::write(test_file, test_content).await.unwrap();
+
+        // Test reading file
+        let (data, metadata) = read_file_all(test_file).await.unwrap();
+        assert_eq!(data, test_content);
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), test_content.len() as u64);
+
+        // Clean up
+        let _ = fs::remove_file(test_file).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_file_metadata() {
+        let test_file = "./test_metadata.txt";
+
+        // Create test file
+        fs::write(test_file, b"test").await.unwrap();
+
+        // Test reading metadata
+        let metadata = read_file_metadata(test_file).await.unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 4); // "test" is 4 bytes
+
+        // Clean up
+        let _ = fs::remove_file(test_file).await;
+    }
+
+    #[test]
+    fn test_is_root_path() {
+        // Unix root path
+        assert!(is_root_path("/"));
+
+        // Windows root path (only on Windows)
+        #[cfg(windows)]
+        assert!(is_root_path("\\"));
+
+        // Non-root paths
+        assert!(!is_root_path("/home"));
+        assert!(!is_root_path("/tmp"));
+        assert!(!is_root_path("relative/path"));
+
+        // On non-Windows systems, backslash is not a root path
+        #[cfg(not(windows))]
+        assert!(!is_root_path("\\"));
+    }
 }

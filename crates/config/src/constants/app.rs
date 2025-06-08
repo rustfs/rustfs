@@ -200,7 +200,7 @@ mod tests {
         // Test port related constants
         assert_eq!(DEFAULT_PORT, 9000);
 
-        assert_eq!(DEFAULT_CONSOLE_PORT, 9002);
+        assert_eq!(DEFAULT_CONSOLE_PORT, 9001);
 
         assert_ne!(DEFAULT_PORT, DEFAULT_CONSOLE_PORT, "Main port and console port should be different");
     }
@@ -215,7 +215,7 @@ mod tests {
             "Address should contain the default port"
         );
 
-        assert_eq!(DEFAULT_CONSOLE_ADDRESS, ":9002");
+        assert_eq!(DEFAULT_CONSOLE_ADDRESS, ":9001");
         assert!(DEFAULT_CONSOLE_ADDRESS.starts_with(':'), "Console address should start with colon");
         assert!(
             DEFAULT_CONSOLE_ADDRESS.contains(&DEFAULT_CONSOLE_PORT.to_string()),

@@ -55,7 +55,11 @@ impl RemoteDisk {
     pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
         // let root = fs::canonicalize(ep.url.path()).await?;
         let root = PathBuf::from(ep.get_file_path());
-        let addr = format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), ep.url.port().unwrap());
+        let addr = if let Some(port) = ep.url.port() {
+            format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), port)
+        } else {
+            format!("{}://{}", ep.url.scheme(), ep.url.host_str().unwrap())
+        };
         Ok(Self {
             id: Mutex::new(None),
             addr,
@@ -880,5 +884,245 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(skip(self))]
     async fn healing(&self) -> Option<HealingTracker> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn test_remote_disk_creation() {
+        let url = url::Url::parse("http://example.com:9000/path").unwrap();
+        let endpoint = Endpoint {
+            url: url.clone(),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 1,
+            disk_idx: 2,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+
+        assert!(!remote_disk.is_local());
+        assert_eq!(remote_disk.endpoint.url, url);
+        assert_eq!(remote_disk.endpoint.pool_idx, 0);
+        assert_eq!(remote_disk.endpoint.set_idx, 1);
+        assert_eq!(remote_disk.endpoint.disk_idx, 2);
+        assert_eq!(remote_disk.host_name(), "example.com:9000");
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_basic_properties() {
+        let url = url::Url::parse("http://remote-server:9000").unwrap();
+        let endpoint = Endpoint {
+            url: url.clone(),
+            is_local: false,
+            pool_idx: -1,
+            set_idx: -1,
+            disk_idx: -1,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+
+        // Test basic properties
+        assert!(!remote_disk.is_local());
+        assert_eq!(remote_disk.host_name(), "remote-server:9000");
+        assert!(remote_disk.to_string().contains("remote-server"));
+        assert!(remote_disk.to_string().contains("9000"));
+
+        // Test disk location
+        let location = remote_disk.get_disk_location();
+        assert_eq!(location.pool_idx, None);
+        assert_eq!(location.set_idx, None);
+        assert_eq!(location.disk_idx, None);
+        assert!(!location.valid()); // None values make it invalid
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_path() {
+        let url = url::Url::parse("http://remote-server:9000/storage").unwrap();
+        let endpoint = Endpoint {
+            url: url.clone(),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        let path = remote_disk.path();
+
+        // Remote disk path should be based on the URL path
+        assert!(path.to_string_lossy().contains("storage"));
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_disk_id() {
+        let url = url::Url::parse("http://remote-server:9000").unwrap();
+        let endpoint = Endpoint {
+            url: url.clone(),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+
+        // Initially, disk ID should be None
+        let initial_id = remote_disk.get_disk_id().await.unwrap();
+        assert!(initial_id.is_none());
+
+        // Set a disk ID
+        let test_id = Uuid::new_v4();
+        remote_disk.set_disk_id(Some(test_id)).await.unwrap();
+
+        // Verify the disk ID was set
+        let retrieved_id = remote_disk.get_disk_id().await.unwrap();
+        assert_eq!(retrieved_id, Some(test_id));
+
+        // Clear the disk ID
+        remote_disk.set_disk_id(None).await.unwrap();
+        let cleared_id = remote_disk.get_disk_id().await.unwrap();
+        assert!(cleared_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_endpoints_with_different_schemes() {
+        let test_cases = vec![
+            ("http://server:9000", "server:9000"),
+            ("https://secure-server:443", "secure-server"), // Default HTTPS port is omitted
+            ("http://192.168.1.100:8080", "192.168.1.100:8080"),
+            ("https://secure-server", "secure-server"), // No port specified
+        ];
+
+        for (url_str, expected_hostname) in test_cases {
+            let url = url::Url::parse(url_str).unwrap();
+            let endpoint = Endpoint {
+                url: url.clone(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 0,
+            };
+
+            let disk_option = DiskOption {
+                cleanup: false,
+                health_check: false,
+            };
+
+            let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+
+            assert!(!remote_disk.is_local());
+            assert_eq!(remote_disk.host_name(), expected_hostname);
+            // Note: to_string() might not contain the exact hostname format
+            assert!(!remote_disk.to_string().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_location_validation() {
+        // Test valid location
+        let url = url::Url::parse("http://server:9000").unwrap();
+        let valid_endpoint = Endpoint {
+            url: url.clone(),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 1,
+            disk_idx: 2,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&valid_endpoint, &disk_option).await.unwrap();
+        let location = remote_disk.get_disk_location();
+        assert!(location.valid());
+        assert_eq!(location.pool_idx, Some(0));
+        assert_eq!(location.set_idx, Some(1));
+        assert_eq!(location.disk_idx, Some(2));
+
+        // Test invalid location (negative indices)
+        let invalid_endpoint = Endpoint {
+            url: url.clone(),
+            is_local: false,
+            pool_idx: -1,
+            set_idx: -1,
+            disk_idx: -1,
+        };
+
+        let remote_disk_invalid = RemoteDisk::new(&invalid_endpoint, &disk_option).await.unwrap();
+        let invalid_location = remote_disk_invalid.get_disk_location();
+        assert!(!invalid_location.valid());
+        assert_eq!(invalid_location.pool_idx, None);
+        assert_eq!(invalid_location.set_idx, None);
+        assert_eq!(invalid_location.disk_idx, None);
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_close() {
+        let url = url::Url::parse("http://server:9000").unwrap();
+        let endpoint = Endpoint {
+            url: url.clone(),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+
+        // Test close operation (should succeed)
+        let result = remote_disk.close().await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_remote_disk_sync_properties() {
+        let url = url::Url::parse("https://secure-remote:9000/data").unwrap();
+        let endpoint = Endpoint {
+            url: url.clone(),
+            is_local: false,
+            pool_idx: 1,
+            set_idx: 2,
+            disk_idx: 3,
+        };
+
+        // Test endpoint method - we can't test this without creating RemoteDisk instance
+        // but we can test that the endpoint contains expected values
+        assert_eq!(endpoint.url, url);
+        assert!(!endpoint.is_local);
+        assert_eq!(endpoint.pool_idx, 1);
+        assert_eq!(endpoint.set_idx, 2);
+        assert_eq!(endpoint.disk_idx, 3);
     }
 }

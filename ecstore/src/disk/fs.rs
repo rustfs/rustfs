@@ -179,3 +179,346 @@ pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()
 pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     fs::read(path.as_ref()).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn test_file_mode_constants() {
+        assert_eq!(O_RDONLY, 0x00000);
+        assert_eq!(O_WRONLY, 0x00001);
+        assert_eq!(O_RDWR, 0x00002);
+        assert_eq!(O_CREATE, 0x00040);
+        assert_eq!(O_TRUNC, 0x00200);
+        assert_eq!(O_APPEND, 0x00400);
+    }
+
+    #[tokio::test]
+    async fn test_open_file_read_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_readonly.txt");
+
+        // Create a test file
+        tokio::fs::write(&file_path, b"test content").await.unwrap();
+
+        // Test opening in read-only mode
+        let file = open_file(&file_path, O_RDONLY).await;
+        assert!(file.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_open_file_write_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_writeonly.txt");
+
+        // Test opening in write-only mode with create flag
+        let mut file = open_file(&file_path, O_WRONLY | O_CREATE).await.unwrap();
+
+        // Should be able to write
+        file.write_all(b"write test").await.unwrap();
+        file.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_open_file_read_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_readwrite.txt");
+
+        // Test opening in read-write mode with create flag
+        let mut file = open_file(&file_path, O_RDWR | O_CREATE).await.unwrap();
+
+        // Should be able to write and read
+        file.write_all(b"read-write test").await.unwrap();
+        file.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_open_file_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_append.txt");
+
+        // Create initial content
+        tokio::fs::write(&file_path, b"initial").await.unwrap();
+
+        // Open in append mode
+        let mut file = open_file(&file_path, O_WRONLY | O_APPEND).await.unwrap();
+        file.write_all(b" appended").await.unwrap();
+        file.flush().await.unwrap();
+
+        // Verify content
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "initial appended");
+    }
+
+    #[tokio::test]
+    async fn test_open_file_truncate() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_truncate.txt");
+
+        // Create initial content
+        tokio::fs::write(&file_path, b"initial content").await.unwrap();
+
+        // Open with truncate flag
+        let mut file = open_file(&file_path, O_WRONLY | O_TRUNC).await.unwrap();
+        file.write_all(b"new").await.unwrap();
+        file.flush().await.unwrap();
+
+        // Verify content was truncated
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "new");
+    }
+
+    #[tokio::test]
+    async fn test_access() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_access.txt");
+
+        // Should fail for non-existent file
+        assert!(access(&file_path).await.is_err());
+
+        // Create file and test again
+        tokio::fs::write(&file_path, b"test").await.unwrap();
+        assert!(access(&file_path).await.is_ok());
+    }
+
+    #[test]
+    fn test_access_std() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_access_std.txt");
+
+        // Should fail for non-existent file
+        assert!(access_std(&file_path).is_err());
+
+        // Create file and test again
+        std::fs::write(&file_path, b"test").unwrap();
+        assert!(access_std(&file_path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_lstat() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_lstat.txt");
+
+        // Create test file
+        tokio::fs::write(&file_path, b"test content").await.unwrap();
+
+        // Test lstat
+        let metadata = lstat(&file_path).await.unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 12); // "test content" is 12 bytes
+    }
+
+    #[test]
+    fn test_lstat_std() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_lstat_std.txt");
+
+        // Create test file
+        std::fs::write(&file_path, b"test content").unwrap();
+
+        // Test lstat_std
+        let metadata = lstat_std(&file_path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 12); // "test content" is 12 bytes
+    }
+
+    #[tokio::test]
+    async fn test_make_dir_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let nested_path = temp_dir.path().join("level1").join("level2").join("level3");
+
+        // Should create nested directories
+        assert!(make_dir_all(&nested_path).await.is_ok());
+        assert!(nested_path.exists());
+        assert!(nested_path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_remove_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_remove.txt");
+
+        // Create test file
+        tokio::fs::write(&file_path, b"test").await.unwrap();
+        assert!(file_path.exists());
+
+        // Remove file
+        assert!(remove(&file_path).await.is_ok());
+        assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_remove_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("test_remove_dir");
+
+        // Create test directory
+        tokio::fs::create_dir(&dir_path).await.unwrap();
+        assert!(dir_path.exists());
+
+        // Remove directory
+        assert!(remove(&dir_path).await.is_ok());
+        assert!(!dir_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_remove_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("test_remove_all");
+        let file_path = dir_path.join("nested_file.txt");
+
+        // Create nested structure
+        tokio::fs::create_dir(&dir_path).await.unwrap();
+        tokio::fs::write(&file_path, b"nested content").await.unwrap();
+
+        // Remove all
+        assert!(remove_all(&dir_path).await.is_ok());
+        assert!(!dir_path.exists());
+    }
+
+    #[test]
+    fn test_remove_std() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_remove_std.txt");
+
+        // Create test file
+        std::fs::write(&file_path, b"test").unwrap();
+        assert!(file_path.exists());
+
+        // Remove file
+        assert!(remove_std(&file_path).is_ok());
+        assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn test_remove_all_std() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("test_remove_all_std");
+        let file_path = dir_path.join("nested_file.txt");
+
+        // Create nested structure
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(&file_path, b"nested content").unwrap();
+
+        // Remove all
+        assert!(remove_all_std(&dir_path).is_ok());
+        assert!(!dir_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_mkdir() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("test_mkdir");
+
+        // Create directory
+        assert!(mkdir(&dir_path).await.is_ok());
+        assert!(dir_path.exists());
+        assert!(dir_path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_rename() {
+        let temp_dir = TempDir::new().unwrap();
+        let old_path = temp_dir.path().join("old_name.txt");
+        let new_path = temp_dir.path().join("new_name.txt");
+
+        // Create test file
+        tokio::fs::write(&old_path, b"test content").await.unwrap();
+        assert!(old_path.exists());
+        assert!(!new_path.exists());
+
+        // Rename file
+        assert!(rename(&old_path, &new_path).await.is_ok());
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
+
+        // Verify content preserved
+        let content = tokio::fs::read_to_string(&new_path).await.unwrap();
+        assert_eq!(content, "test content");
+    }
+
+    #[test]
+    fn test_rename_std() {
+        let temp_dir = TempDir::new().unwrap();
+        let old_path = temp_dir.path().join("old_name_std.txt");
+        let new_path = temp_dir.path().join("new_name_std.txt");
+
+        // Create test file
+        std::fs::write(&old_path, b"test content").unwrap();
+        assert!(old_path.exists());
+        assert!(!new_path.exists());
+
+        // Rename file
+        assert!(rename_std(&old_path, &new_path).is_ok());
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
+
+        // Verify content preserved
+        let content = std::fs::read_to_string(&new_path).unwrap();
+        assert_eq!(content, "test content");
+    }
+
+    #[tokio::test]
+    async fn test_read_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_read.txt");
+
+        let test_content = b"This is test content for reading";
+        tokio::fs::write(&file_path, test_content).await.unwrap();
+
+        // Read file
+        let read_content = read_file(&file_path).await.unwrap();
+        assert_eq!(read_content, test_content);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_nonexistent() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("nonexistent.txt");
+
+        // Should fail for non-existent file
+        assert!(read_file(&file_path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_same_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_same.txt");
+
+        // Create test file
+        tokio::fs::write(&file_path, b"test content").await.unwrap();
+
+        // Get metadata twice
+        let metadata1 = tokio::fs::metadata(&file_path).await.unwrap();
+        let metadata2 = tokio::fs::metadata(&file_path).await.unwrap();
+
+        // Should be the same file
+        assert!(same_file(&metadata1, &metadata2));
+    }
+
+    #[tokio::test]
+    async fn test_different_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let file1_path = temp_dir.path().join("file1.txt");
+        let file2_path = temp_dir.path().join("file2.txt");
+
+        // Create two different files
+        tokio::fs::write(&file1_path, b"content1").await.unwrap();
+        tokio::fs::write(&file2_path, b"content2").await.unwrap();
+
+        // Get metadata
+        let metadata1 = tokio::fs::metadata(&file1_path).await.unwrap();
+        let metadata2 = tokio::fs::metadata(&file2_path).await.unwrap();
+
+        // Should be different files
+        assert!(!same_file(&metadata1, &metadata2));
+    }
+
+    #[test]
+    fn test_slash_separator() {
+        assert_eq!(SLASH_SEPARATOR, "/");
+    }
+}

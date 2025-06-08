@@ -94,7 +94,7 @@ impl TryFrom<&str> for Endpoint {
             }
             Err(e) => match e {
                 ParseError::InvalidPort => {
-                    return Err(Error::other("invalid URL endpoint format: port number must be between 1 to 65535"))
+                    return Err(Error::other("invalid URL endpoint format: port number must be between 1 to 65535"));
                 }
                 ParseError::EmptyHost => return Err(Error::other("invalid URL endpoint format: empty host name")),
                 ParseError::RelativeUrlWithoutBase => {
@@ -372,5 +372,138 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_endpoint_display() {
+        // Test file path display
+        let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
+        let display_str = format!("{}", file_endpoint);
+        assert_eq!(display_str, "/tmp/data");
+
+        // Test URL display
+        let url_endpoint = Endpoint::try_from("http://example.com:9000/path").unwrap();
+        let display_str = format!("{}", url_endpoint);
+        assert_eq!(display_str, "http://example.com:9000/path");
+    }
+
+    #[test]
+    fn test_endpoint_type() {
+        let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
+        assert_eq!(file_endpoint.get_type(), EndpointType::Path);
+
+        let url_endpoint = Endpoint::try_from("http://example.com:9000/path").unwrap();
+        assert_eq!(url_endpoint.get_type(), EndpointType::Url);
+    }
+
+    #[test]
+    fn test_endpoint_indexes() {
+        let mut endpoint = Endpoint::try_from("/tmp/data").unwrap();
+
+        // Test initial values
+        assert_eq!(endpoint.pool_idx, -1);
+        assert_eq!(endpoint.set_idx, -1);
+        assert_eq!(endpoint.disk_idx, -1);
+
+        // Test setting indexes
+        endpoint.set_pool_index(2);
+        endpoint.set_set_index(3);
+        endpoint.set_disk_index(4);
+
+        assert_eq!(endpoint.pool_idx, 2);
+        assert_eq!(endpoint.set_idx, 3);
+        assert_eq!(endpoint.disk_idx, 4);
+    }
+
+    #[test]
+    fn test_endpoint_grid_host() {
+        let endpoint = Endpoint::try_from("http://example.com:9000/path").unwrap();
+        assert_eq!(endpoint.grid_host(), "http://example.com:9000");
+
+        let endpoint_no_port = Endpoint::try_from("https://example.com/path").unwrap();
+        assert_eq!(endpoint_no_port.grid_host(), "https://example.com");
+
+        let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
+        assert_eq!(file_endpoint.grid_host(), "");
+    }
+
+    #[test]
+    fn test_endpoint_host_port() {
+        let endpoint = Endpoint::try_from("http://example.com:9000/path").unwrap();
+        assert_eq!(endpoint.host_port(), "example.com:9000");
+
+        let endpoint_no_port = Endpoint::try_from("https://example.com/path").unwrap();
+        assert_eq!(endpoint_no_port.host_port(), "example.com");
+
+        let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
+        assert_eq!(file_endpoint.host_port(), "");
+    }
+
+    #[test]
+    fn test_endpoint_get_file_path() {
+        let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
+        assert_eq!(file_endpoint.get_file_path(), "/tmp/data");
+
+        let url_endpoint = Endpoint::try_from("http://example.com:9000/path/to/data").unwrap();
+        assert_eq!(url_endpoint.get_file_path(), "/path/to/data");
+    }
+
+    #[test]
+    fn test_endpoint_clone_and_equality() {
+        let endpoint1 = Endpoint::try_from("/tmp/data").unwrap();
+        let endpoint2 = endpoint1.clone();
+
+        assert_eq!(endpoint1, endpoint2);
+        assert_eq!(endpoint1.url, endpoint2.url);
+        assert_eq!(endpoint1.is_local, endpoint2.is_local);
+        assert_eq!(endpoint1.pool_idx, endpoint2.pool_idx);
+        assert_eq!(endpoint1.set_idx, endpoint2.set_idx);
+        assert_eq!(endpoint1.disk_idx, endpoint2.disk_idx);
+    }
+
+    #[test]
+    fn test_endpoint_with_special_paths() {
+        // Test with complex paths
+        let complex_path = "/var/lib/rustfs/data/bucket1";
+        let endpoint = Endpoint::try_from(complex_path).unwrap();
+        assert_eq!(endpoint.get_file_path(), complex_path);
+        assert!(endpoint.is_local);
+        assert_eq!(endpoint.get_type(), EndpointType::Path);
+    }
+
+    #[test]
+    fn test_endpoint_update_is_local() {
+        let mut endpoint = Endpoint::try_from("http://localhost:9000/path").unwrap();
+        let result = endpoint.update_is_local(9000);
+        assert!(result.is_ok());
+
+        let mut file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
+        let result = file_endpoint.update_is_local(9000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_url_parse_from_file_path() {
+        let result = url_parse_from_file_path("/tmp/test");
+        assert!(result.is_ok());
+
+        let url = result.unwrap();
+        assert_eq!(url.scheme(), "file");
+    }
+
+    #[test]
+    fn test_endpoint_hash() {
+        use std::collections::HashSet;
+
+        let endpoint1 = Endpoint::try_from("/tmp/data1").unwrap();
+        let endpoint2 = Endpoint::try_from("/tmp/data2").unwrap();
+        let endpoint3 = endpoint1.clone();
+
+        let mut set = HashSet::new();
+        set.insert(endpoint1);
+        set.insert(endpoint2);
+        set.insert(endpoint3); // Should not be added as it's equal to endpoint1
+
+        assert_eq!(set.len(), 2);
     }
 }

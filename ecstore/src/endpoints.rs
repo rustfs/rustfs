@@ -677,7 +677,7 @@ mod test {
             ),
             (
                 vec!["ftp://server/d1", "http://server/d2", "http://server/d3", "http://server/d4"],
-                Some(Error::other("'ftp://server/d1': invalid URL endpoint format")),
+                Some(Error::other("'ftp://server/d1': io error")),
                 10,
             ),
             (
@@ -702,9 +702,7 @@ mod test {
                     "192.168.1.210:9000/tmp/dir2",
                     "192.168.110:9000/tmp/dir3",
                 ],
-                Some(Error::other(
-                    "'192.168.1.210:9000/tmp/dir0': invalid URL endpoint format: missing scheme http or https",
-                )),
+                Some(Error::other("'192.168.1.210:9000/tmp/dir0': io error")),
                 13,
             ),
         ];

@@ -1,5 +1,5 @@
 use super::error::{Error, Result};
-use super::{error::DiskError, DiskInfo};
+use super::{DiskInfo, error::DiskError};
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use uuid::Uuid;
@@ -267,5 +267,266 @@ mod test {
         let p = FormatV3::try_from(data);
 
         println!("{:?}", p);
+    }
+
+    #[test]
+    fn test_format_v3_new_single_disk() {
+        let format = FormatV3::new(1, 1);
+
+        assert_eq!(format.version, FormatMetaVersion::V1);
+        assert_eq!(format.format, FormatBackend::ErasureSingle);
+        assert_eq!(format.erasure.version, FormatErasureVersion::V3);
+        assert_eq!(format.erasure.sets.len(), 1);
+        assert_eq!(format.erasure.sets[0].len(), 1);
+        assert_eq!(format.erasure.distribution_algo, DistributionAlgoVersion::V3);
+        assert_eq!(format.erasure.this, Uuid::nil());
+    }
+
+    #[test]
+    fn test_format_v3_new_multiple_sets() {
+        let format = FormatV3::new(2, 4);
+
+        assert_eq!(format.version, FormatMetaVersion::V1);
+        assert_eq!(format.format, FormatBackend::Erasure);
+        assert_eq!(format.erasure.version, FormatErasureVersion::V3);
+        assert_eq!(format.erasure.sets.len(), 2);
+        assert_eq!(format.erasure.sets[0].len(), 4);
+        assert_eq!(format.erasure.sets[1].len(), 4);
+        assert_eq!(format.erasure.distribution_algo, DistributionAlgoVersion::V3);
+    }
+
+    #[test]
+    fn test_format_v3_drives() {
+        let format = FormatV3::new(2, 4);
+        assert_eq!(format.drives(), 8); // 2 sets * 4 drives each
+
+        let format_single = FormatV3::new(1, 1);
+        assert_eq!(format_single.drives(), 1); // 1 set * 1 drive
+    }
+
+    #[test]
+    fn test_format_v3_to_json() {
+        let format = FormatV3::new(1, 2);
+        let json_result = format.to_json();
+
+        assert!(json_result.is_ok());
+        let json_str = json_result.unwrap();
+        assert!(json_str.contains("\"version\":\"1\""));
+        assert!(json_str.contains("\"format\":\"xl\""));
+    }
+
+    #[test]
+    fn test_format_v3_from_json() {
+        let json_data = r#"{
+            "version": "1",
+            "format": "xl-single",
+            "id": "321b3874-987d-4c15-8fa5-757c956b1243",
+            "xl": {
+                "version": "3",
+                "this": "8ab9a908-f869-4f1f-8e42-eb067ffa7eb5",
+                "sets": [
+                    [
+                        "8ab9a908-f869-4f1f-8e42-eb067ffa7eb5"
+                    ]
+                ],
+                "distributionAlgo": "SIPMOD+PARITY"
+            }
+        }"#;
+
+        let format = FormatV3::try_from(json_data);
+        assert!(format.is_ok());
+
+        let format = format.unwrap();
+        assert_eq!(format.format, FormatBackend::ErasureSingle);
+        assert_eq!(format.erasure.version, FormatErasureVersion::V3);
+        assert_eq!(format.erasure.distribution_algo, DistributionAlgoVersion::V3);
+        assert_eq!(format.erasure.sets.len(), 1);
+        assert_eq!(format.erasure.sets[0].len(), 1);
+    }
+
+    #[test]
+    fn test_format_v3_from_bytes() {
+        let json_data = r#"{
+            "version": "1",
+            "format": "xl",
+            "id": "321b3874-987d-4c15-8fa5-757c956b1243",
+            "xl": {
+                "version": "2",
+                "this": "00000000-0000-0000-0000-000000000000",
+                "sets": [
+                    [
+                        "8ab9a908-f869-4f1f-8e42-eb067ffa7eb5",
+                        "c26315da-05cf-4778-a9ea-b44ea09f58c5"
+                    ]
+                ],
+                "distributionAlgo": "SIPMOD"
+            }
+        }"#;
+
+        let format = FormatV3::try_from(json_data.as_bytes());
+        assert!(format.is_ok());
+
+        let format = format.unwrap();
+        assert_eq!(format.erasure.version, FormatErasureVersion::V2);
+        assert_eq!(format.erasure.distribution_algo, DistributionAlgoVersion::V2);
+        assert_eq!(format.erasure.sets[0].len(), 2);
+    }
+
+    #[test]
+    fn test_format_v3_invalid_json() {
+        let invalid_json = r#"{"invalid": "json"}"#;
+        let format = FormatV3::try_from(invalid_json);
+        assert!(format.is_err());
+    }
+
+    #[test]
+    fn test_find_disk_index_by_disk_id() {
+        let mut format = FormatV3::new(2, 2);
+        let target_disk_id = Uuid::new_v4();
+        format.erasure.sets[1][0] = target_disk_id;
+
+        let result = format.find_disk_index_by_disk_id(target_disk_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), (1, 0));
+    }
+
+    #[test]
+    fn test_find_disk_index_nil_uuid() {
+        let format = FormatV3::new(1, 2);
+        let result = format.find_disk_index_by_disk_id(Uuid::nil());
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::DiskNotFound));
+    }
+
+    #[test]
+    fn test_find_disk_index_max_uuid() {
+        let format = FormatV3::new(1, 2);
+        let result = format.find_disk_index_by_disk_id(Uuid::max());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_disk_index_not_found() {
+        let format = FormatV3::new(1, 2);
+        let non_existent_id = Uuid::new_v4();
+        let result = format.find_disk_index_by_disk_id(non_existent_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_other_identical() {
+        let format1 = FormatV3::new(2, 4);
+        let mut format2 = format1.clone();
+        format2.erasure.this = format1.erasure.sets[0][0];
+
+        let result = format1.check_other(&format2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_other_different_set_count() {
+        let format1 = FormatV3::new(2, 4);
+        let format2 = FormatV3::new(3, 4);
+
+        let result = format1.check_other(&format2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_other_different_set_size() {
+        let format1 = FormatV3::new(2, 4);
+        let format2 = FormatV3::new(2, 6);
+
+        let result = format1.check_other(&format2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_other_different_disk_id() {
+        let format1 = FormatV3::new(1, 2);
+        let mut format2 = format1.clone();
+        format2.erasure.sets[0][0] = Uuid::new_v4();
+
+        let result = format1.check_other(&format2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_other_disk_not_in_sets() {
+        let format1 = FormatV3::new(1, 2);
+        let mut format2 = format1.clone();
+        format2.erasure.this = Uuid::new_v4(); // Set to a UUID not in any set
+
+        let result = format1.check_other(&format2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_meta_version_serialization() {
+        let v1 = FormatMetaVersion::V1;
+        let json = serde_json::to_string(&v1).unwrap();
+        assert_eq!(json, "\"1\"");
+
+        let unknown = FormatMetaVersion::Unknown;
+        let deserialized: FormatMetaVersion = serde_json::from_str("\"unknown\"").unwrap();
+        assert_eq!(deserialized, unknown);
+    }
+
+    #[test]
+    fn test_format_backend_serialization() {
+        let erasure = FormatBackend::Erasure;
+        let json = serde_json::to_string(&erasure).unwrap();
+        assert_eq!(json, "\"xl\"");
+
+        let single = FormatBackend::ErasureSingle;
+        let json = serde_json::to_string(&single).unwrap();
+        assert_eq!(json, "\"xl-single\"");
+
+        let unknown = FormatBackend::Unknown;
+        let deserialized: FormatBackend = serde_json::from_str("\"unknown\"").unwrap();
+        assert_eq!(deserialized, unknown);
+    }
+
+    #[test]
+    fn test_format_erasure_version_serialization() {
+        let v1 = FormatErasureVersion::V1;
+        let json = serde_json::to_string(&v1).unwrap();
+        assert_eq!(json, "\"1\"");
+
+        let v2 = FormatErasureVersion::V2;
+        let json = serde_json::to_string(&v2).unwrap();
+        assert_eq!(json, "\"2\"");
+
+        let v3 = FormatErasureVersion::V3;
+        let json = serde_json::to_string(&v3).unwrap();
+        assert_eq!(json, "\"3\"");
+    }
+
+    #[test]
+    fn test_distribution_algo_version_serialization() {
+        let v1 = DistributionAlgoVersion::V1;
+        let json = serde_json::to_string(&v1).unwrap();
+        assert_eq!(json, "\"CRCMOD\"");
+
+        let v2 = DistributionAlgoVersion::V2;
+        let json = serde_json::to_string(&v2).unwrap();
+        assert_eq!(json, "\"SIPMOD\"");
+
+        let v3 = DistributionAlgoVersion::V3;
+        let json = serde_json::to_string(&v3).unwrap();
+        assert_eq!(json, "\"SIPMOD+PARITY\"");
+    }
+
+    #[test]
+    fn test_format_v3_round_trip_serialization() {
+        let original = FormatV3::new(2, 3);
+        let json = original.to_json().unwrap();
+        let deserialized = FormatV3::try_from(json.as_str()).unwrap();
+
+        assert_eq!(original.version, deserialized.version);
+        assert_eq!(original.format, deserialized.format);
+        assert_eq!(original.erasure.version, deserialized.erasure.version);
+        assert_eq!(original.erasure.sets.len(), deserialized.erasure.sets.len());
+        assert_eq!(original.erasure.distribution_algo, deserialized.erasure.distribution_algo);
     }
 }

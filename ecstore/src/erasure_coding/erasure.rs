@@ -24,7 +24,7 @@ use uuid::Uuid;
 ///
 /// # Example
 /// ```
-/// use erasure_coding::Erasure;
+/// use ecstore::erasure_coding::Erasure;
 /// let erasure = Erasure::new(4, 2, 8);
 /// let data = b"hello world";
 /// let shards = erasure.encode_data(data).unwrap();
