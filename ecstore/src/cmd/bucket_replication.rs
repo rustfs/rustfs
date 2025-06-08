@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 // use error::Error;
+use crate::StorageAPI;
 use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::new_object_layer_fn;
@@ -10,27 +11,26 @@ use crate::store_api::ObjectIO;
 use crate::store_api::ObjectInfo;
 use crate::store_api::ObjectOptions;
 use crate::store_api::ObjectToDelete;
-use crate::StorageAPI;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::Config;
 use aws_sdk_s3::config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::config::Region;
-use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::Config;
 use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
 use common::error::Error;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use http::HeaderMap;
 use http::Method;
 use lazy_static::lazy_static;
 // use std::time::SystemTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use rustfs_rsc::provider::StaticProvider;
 use rustfs_rsc::Minio;
+use rustfs_rsc::provider::StaticProvider;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::ExistingObjectReplicationStatus;
@@ -42,14 +42,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::iter::Iterator;
+use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::vec;
 use time::OffsetDateTime;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -456,7 +456,7 @@ pub async fn get_heal_replicate_object_info(
             },
             None,
         )
-            .await
+        .await
     } else {
         // let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(mt))
         // .await
@@ -1554,7 +1554,7 @@ impl ConfigProcess for s3s::dto::ReplicationConfiguration {
             if obj.existing_object
                 && rule.existing_object_replication.is_some()
                 && rule.existing_object_replication.unwrap().status
-                == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
+                    == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::DISABLED)
             {
                 warn!("need replicate failed");
                 return false;
@@ -1590,7 +1590,7 @@ impl ConfigProcess for s3s::dto::ReplicationConfiguration {
             return obj.replica
                 && rule.source_selection_criteria.is_some()
                 && rule.source_selection_criteria.unwrap().replica_modifications.unwrap().status
-                == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED);
+                    == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED);
         }
         warn!("need replicate failed");
         false
@@ -1971,7 +1971,7 @@ impl ObjectInfoExt for ObjectInfo {
     }
     fn is_multipart(&self) -> bool {
         match &self.etag {
-            Some(etgval) => etgval.len() != 32 && etgval.is_empty(),
+            Some(etgval) => etgval.len() != 32 && !etgval.is_empty(),
             None => false,
         }
     }
