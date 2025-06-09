@@ -171,9 +171,9 @@ pub async fn init_data_scanner() {
 
             // Calculate randomized sleep duration
             // Use random factor (0.0 to 1.0) multiplied by the scanner cycle duration
-            let random_factor: f64 = {
-                let mut rng = rand::thread_rng();
-                rng.gen_range(1.0..10.0)
+            let random_factor = {
+                let mut rng = rand::rng();
+                rng.random_range(1.0..10.0)
             };
             let base_cycle_duration = SCANNER_CYCLE.load(Ordering::SeqCst) as f64;
             let sleep_duration_secs = random_factor * base_cycle_duration;

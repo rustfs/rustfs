@@ -508,8 +508,8 @@ impl ECStore {
             return None;
         }
 
-        let mut rng = rand::thread_rng();
-        let random_u64: u64 = rng.gen();
+        let mut rng = rand::rng();
+        let random_u64: u64 = rng.random_range(0..total);
 
         let choose = random_u64 % total;
         let mut at_total = 0;

@@ -541,14 +541,7 @@ impl FileMeta {
 
     // read_data fill fi.dada
     #[tracing::instrument(level = "debug", skip(self))]
-    pub fn into_fileinfo(
-        &self,
-        volume: &str,
-        path: &str,
-        version_id: &str,
-        read_data: bool,
-        all_parts: bool,
-    ) -> Result<FileInfo> {
+    pub fn to_fileinfo(&self, volume: &str, path: &str, version_id: &str, read_data: bool, all_parts: bool) -> Result<FileInfo> {
         let has_vid = {
             if !version_id.is_empty() {
                 let id = Uuid::parse_str(version_id)?;
@@ -2116,7 +2109,7 @@ pub async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &st
         });
     }
 
-    let fi = meta.into_fileinfo(volume, path, version_id, opts.data, true)?;
+    let fi = meta.to_fileinfo(volume, path, version_id, opts.data, true)?;
     Ok(fi)
 }
 
@@ -2947,7 +2940,7 @@ fn test_file_meta_into_fileinfo() {
     fm.add_version(fi).unwrap();
 
     // Test into_fileinfo with valid version_id
-    let result = fm.into_fileinfo("test-volume", "test-path", &version_id.to_string(), false, false);
+    let result = fm.to_fileinfo("test-volume", "test-path", &version_id.to_string(), false, false);
     assert!(result.is_ok());
     let file_info = result.unwrap();
     assert_eq!(file_info.volume, "test-volume");
@@ -2955,11 +2948,11 @@ fn test_file_meta_into_fileinfo() {
 
     // Test into_fileinfo with invalid version_id
     let invalid_id = Uuid::new_v4();
-    let result = fm.into_fileinfo("test-volume", "test-path", &invalid_id.to_string(), false, false);
+    let result = fm.to_fileinfo("test-volume", "test-path", &invalid_id.to_string(), false, false);
     assert!(result.is_err());
 
     // Test into_fileinfo with empty version_id (should get latest)
-    let result = fm.into_fileinfo("test-volume", "test-path", "", false, false);
+    let result = fm.to_fileinfo("test-volume", "test-path", "", false, false);
     assert!(result.is_ok());
 }
 

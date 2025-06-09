@@ -19,7 +19,6 @@ use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use common::error::{Error, Result};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
@@ -712,7 +711,7 @@ impl ECStore {
 
                     let fallback_disks = {
                         if ask_disks > 0 && disks.len() > ask_disks as usize {
-                            let mut rand = thread_rng();
+                            let mut rand = rand::rng();
                             disks.shuffle(&mut rand);
                             disks.split_off(ask_disks as usize)
                         } else {
@@ -1241,7 +1240,7 @@ impl SetDisks {
         let mut fallback_disks = Vec::new();
 
         if ask_disks > 0 && disks.len() > ask_disks as usize {
-            let mut rand = thread_rng();
+            let mut rand = rand::rng();
             disks.shuffle(&mut rand);
 
             fallback_disks = disks.split_off(ask_disks as usize);
