@@ -24,7 +24,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -535,6 +535,9 @@ impl ECStore {
                 error!("gather_results err {:?}", err);
                 let _ = err_tx2.send(Arc::new(err));
             }
+
+            // cancel call exit spawns
+            let _ = cancel_tx.send(true);
         });
 
         let mut result = {
@@ -559,9 +562,6 @@ impl ECStore {
                }
             }
         };
-
-        // cancel call exit spawns
-        cancel_tx.send(true)?;
 
         // wait spawns exit
         join_all(vec![job1, job2]).await;
@@ -617,7 +617,7 @@ impl ECStore {
 
         tokio::spawn(async move {
             if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
-                println!("merge_entry_channels err {:?}", err)
+                error!("merge_entry_channels err {:?}", err)
             }
         });
 
@@ -1077,7 +1077,10 @@ async fn merge_entry_channels(
                         return Ok(())
                     }
                 },
-                _ = rx.recv()=>return Err(Error::msg("cancel")),
+                _ = rx.recv()=>{
+                    warn!("merge_entry_channels rx.recv() cancel");
+                    return Ok(())
+                },
             }
         }
     }
