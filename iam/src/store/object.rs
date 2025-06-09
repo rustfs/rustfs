@@ -1,5 +1,5 @@
 use super::{GroupInfo, MappedPolicy, Store, UserType};
-use crate::error::{is_err_config_not_found, Error, Result};
+use crate::error::{Error, Result, is_err_config_not_found};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
@@ -8,18 +8,18 @@ use crate::{
 };
 use ecstore::{
     config::{
-        com::{delete_config, read_config, read_config_with_metadata, save_config},
         RUSTFS_CONFIG_PREFIX,
+        com::{delete_config, read_config, read_config_with_metadata, save_config},
     },
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
     store_list_objects::{ObjectInfoOrErr, WalkOptions},
-    utils::path::{path_join_buf, SLASH_SEPARATOR},
+    utils::path::{SLASH_SEPARATOR, path_join_buf},
 };
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use policy::{auth::UserIdentity, policy::PolicyDoc};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Sender};

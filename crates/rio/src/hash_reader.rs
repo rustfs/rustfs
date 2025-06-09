@@ -284,7 +284,7 @@ impl HashReaderDetector for HashReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{encrypt_reader, DecryptReader};
+    use crate::{DecryptReader, encrypt_reader};
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
 

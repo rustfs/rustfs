@@ -1,7 +1,7 @@
 use super::func::InnerFunc;
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{collections::HashMap, fmt};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub type DateFunc = InnerFunc<DateFuncValue>;
 
@@ -82,7 +82,7 @@ mod tests {
         key_name::S3KeyName::*,
     };
     use test_case::test_case;
-    use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
     fn new_func(name: KeyName, variable: Option<String>, value: &str) -> DateFunc {
         DateFunc {

@@ -2,7 +2,7 @@ use super::{
     background_heal_ops::HealTask,
     data_scanner::HEAL_DELETE_DANGLING,
     error::ERR_SKIP_FILE,
-    heal_commands::{HealOpts, HealScanMode, HealStopSuccess, HealingTracker, HEAL_ITEM_BUCKET_METADATA},
+    heal_commands::{HEAL_ITEM_BUCKET_METADATA, HealOpts, HealScanMode, HealStopSuccess, HealingTracker},
 };
 use crate::error::{Error, Result};
 use crate::store_api::StorageAPI;
@@ -16,7 +16,7 @@ use crate::{
     disk::endpoint::Endpoint,
     endpoints::Endpoints,
     global::GLOBAL_IsDistErasure,
-    heal::heal_commands::{HealStartSuccess, HEAL_UNKNOWN_SCAN},
+    heal::heal_commands::{HEAL_UNKNOWN_SCAN, HealStartSuccess},
     new_object_layer_fn,
     utils::path::has_prefix,
 };
@@ -41,10 +41,9 @@ use std::{
 use tokio::{
     select, spawn,
     sync::{
-        broadcast,
+        RwLock, broadcast,
         mpsc::{self, Receiver as M_Receiver, Sender as M_Sender},
         watch::{self, Receiver as W_Receiver, Sender as W_Sender},
-        RwLock,
     },
     time::{interval, sleep},
 };
@@ -784,7 +783,10 @@ impl AllHealState {
             self.stop_heal_sequence(path_s).await?;
         } else if let Some(hs) = self.get_heal_sequence(path_s).await {
             if !hs.has_ended().await {
-                return Err(Error::other(format!("Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {:?}, token is {}", heal_sequence.client_address, heal_sequence.start_time, heal_sequence.client_token)));
+                return Err(Error::other(format!(
+                    "Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {:?}, token is {}",
+                    heal_sequence.client_address, heal_sequence.start_time, heal_sequence.client_token
+                )));
             }
         }
 

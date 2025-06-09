@@ -27,11 +27,7 @@ impl InlineData {
     }
 
     pub fn after_version(&self) -> &[u8] {
-        if self.0.is_empty() {
-            &self.0
-        } else {
-            &self.0[1..]
-        }
+        if self.0.is_empty() { &self.0 } else { &self.0[1..] }
     }
 
     pub fn find(&self, key: &str) -> Result<Option<Vec<u8>>> {

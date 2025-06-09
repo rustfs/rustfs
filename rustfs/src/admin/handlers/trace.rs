@@ -1,9 +1,9 @@
-use ecstore::{peer_rest_client::PeerRestClient, GLOBAL_Endpoints};
+use ecstore::{GLOBAL_Endpoints, peer_rest_client::PeerRestClient};
 use http::StatusCode;
 use hyper::Uri;
 use madmin::service_commands::ServiceTraceOpts;
 use matchit::Params;
-use s3s::{s3_error, Body, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use tracing::warn;
 
 use crate::admin::router::Operation;

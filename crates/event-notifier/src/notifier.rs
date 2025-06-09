@@ -1,4 +1,4 @@
-use crate::{event_bus, ChannelAdapter, Error, Event, EventStore, NotifierConfig};
+use crate::{ChannelAdapter, Error, Event, EventStore, NotifierConfig, event_bus};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

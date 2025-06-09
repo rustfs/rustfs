@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn test_storage_error_to_u32() {
         // Test Io error uses 0x01
-        let io_error = StorageError::Io(IoError::new(ErrorKind::Other, "test"));
+        let io_error = StorageError::Io(IoError::other("test"));
         assert_eq!(io_error.to_u32(), 0x01);
 
         // Test other errors have correct codes
@@ -781,7 +781,7 @@ mod tests {
     #[test]
     fn test_storage_error_from_disk_error() {
         // Test conversion from DiskError
-        let disk_io = DiskError::Io(IoError::new(ErrorKind::Other, "disk io error"));
+        let disk_io = DiskError::Io(IoError::other("disk io error"));
         let storage_error: StorageError = disk_io.into();
         assert!(matches!(storage_error, StorageError::Io(_)));
 
@@ -875,6 +875,197 @@ mod tests {
             } else {
                 panic!("Failed to recover error from code: {:#x}", code);
             }
+        }
+    }
+
+    #[test]
+    fn test_storage_error_io_roundtrip() {
+        // Test StorageError -> std::io::Error -> StorageError roundtrip conversion
+        let original_storage_errors = vec![
+            StorageError::FileNotFound,
+            StorageError::VolumeNotFound,
+            StorageError::DiskFull,
+            StorageError::FileCorrupt,
+            StorageError::MethodNotAllowed,
+            StorageError::BucketExists("test-bucket".to_string()),
+            StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
+        ];
+
+        for original_error in original_storage_errors {
+            // Convert to io::Error and back
+            let io_error: std::io::Error = original_error.clone().into();
+            let recovered_error: StorageError = io_error.into();
+
+            // Check that conversion preserves the essential error information
+            match &original_error {
+                StorageError::Io(_) => {
+                    // Io errors should maintain their inner structure
+                    assert!(matches!(recovered_error, StorageError::Io(_)));
+                }
+                _ => {
+                    // Other errors should be recoverable via downcast or match to equivalent type
+                    assert_eq!(original_error.to_u32(), recovered_error.to_u32());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_io_error_with_storage_error_inside() {
+        // Test that io::Error containing StorageError can be properly converted back
+        let original_storage_error = StorageError::FileNotFound;
+        let io_with_storage_error = std::io::Error::other(original_storage_error.clone());
+
+        // Convert io::Error back to StorageError
+        let recovered_storage_error: StorageError = io_with_storage_error.into();
+        assert_eq!(original_storage_error, recovered_storage_error);
+    }
+
+    #[test]
+    fn test_io_error_with_disk_error_inside() {
+        // Test io::Error containing DiskError -> StorageError conversion
+        let original_disk_error = DiskError::FileNotFound;
+        let io_with_disk_error = std::io::Error::other(original_disk_error.clone());
+
+        // Convert io::Error to StorageError
+        let storage_error: StorageError = io_with_disk_error.into();
+        assert_eq!(storage_error, StorageError::FileNotFound);
+    }
+
+    #[test]
+    fn test_nested_error_conversion_chain() {
+        // Test complex conversion chain: DiskError -> StorageError -> io::Error -> StorageError
+        let original_disk_error = DiskError::DiskFull;
+        let storage_error1: StorageError = original_disk_error.into();
+        let io_error: std::io::Error = storage_error1.into();
+        let storage_error2: StorageError = io_error.into();
+
+        assert_eq!(storage_error2, StorageError::DiskFull);
+    }
+
+    #[test]
+    fn test_storage_error_different_io_kinds() {
+        use std::io::ErrorKind;
+
+        let test_cases = vec![
+            (ErrorKind::NotFound, "not found"),
+            (ErrorKind::PermissionDenied, "permission denied"),
+            (ErrorKind::ConnectionRefused, "connection refused"),
+            (ErrorKind::TimedOut, "timed out"),
+            (ErrorKind::InvalidInput, "invalid input"),
+            (ErrorKind::BrokenPipe, "broken pipe"),
+        ];
+
+        for (kind, message) in test_cases {
+            let io_error = std::io::Error::new(kind, message);
+            let storage_error: StorageError = io_error.into();
+
+            // Should become StorageError::Io with the same kind and message
+            match storage_error {
+                StorageError::Io(inner_io) => {
+                    assert_eq!(inner_io.kind(), kind);
+                    assert!(inner_io.to_string().contains(message));
+                }
+                _ => panic!("Expected StorageError::Io variant for kind: {:?}", kind),
+            }
+        }
+    }
+
+    #[test]
+    fn test_storage_error_to_io_error_preserves_information() {
+        let test_cases = vec![
+            StorageError::FileNotFound,
+            StorageError::VolumeNotFound,
+            StorageError::DiskFull,
+            StorageError::FileCorrupt,
+            StorageError::MethodNotAllowed,
+            StorageError::StorageFull,
+            StorageError::SlowDown,
+            StorageError::BucketExists("test-bucket".to_string()),
+        ];
+
+        for storage_error in test_cases {
+            let io_error: std::io::Error = storage_error.clone().into();
+
+            // Error message should be preserved
+            assert!(io_error.to_string().contains(&storage_error.to_string()));
+
+            // Should be able to downcast back to StorageError
+            let recovered_error = io_error.downcast::<StorageError>();
+            assert!(recovered_error.is_ok());
+            assert_eq!(recovered_error.unwrap(), storage_error);
+        }
+    }
+
+    #[test]
+    fn test_storage_error_io_variant_preservation() {
+        // Test StorageError::Io variant preserves original io::Error
+        let original_io = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "unexpected eof");
+        let storage_error = StorageError::Io(original_io);
+
+        let converted_io: std::io::Error = storage_error.into();
+        assert_eq!(converted_io.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(converted_io.to_string().contains("unexpected eof"));
+    }
+
+    #[test]
+    fn test_from_filemeta_error_conversions() {
+        // Test conversions from rustfs_filemeta::Error
+        use rustfs_filemeta::Error as FilemetaError;
+
+        let filemeta_errors = vec![
+            (FilemetaError::FileNotFound, StorageError::FileNotFound),
+            (FilemetaError::FileVersionNotFound, StorageError::FileVersionNotFound),
+            (FilemetaError::FileCorrupt, StorageError::FileCorrupt),
+            (FilemetaError::MethodNotAllowed, StorageError::MethodNotAllowed),
+            (FilemetaError::VolumeNotFound, StorageError::VolumeNotFound),
+            (FilemetaError::DoneForNow, StorageError::DoneForNow),
+            (FilemetaError::Unexpected, StorageError::Unexpected),
+        ];
+
+        for (filemeta_error, expected_storage_error) in filemeta_errors {
+            let converted_storage_error: StorageError = filemeta_error.into();
+            assert_eq!(converted_storage_error, expected_storage_error);
+
+            // Test reverse conversion
+            let converted_back: rustfs_filemeta::Error = converted_storage_error.into();
+            assert_eq!(converted_back, expected_storage_error.into());
+        }
+    }
+
+    #[test]
+    fn test_error_message_consistency() {
+        let storage_errors = vec![
+            StorageError::BucketNotFound("test-bucket".to_string()),
+            StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
+            StorageError::VersionNotFound("bucket".to_string(), "object".to_string(), "v1".to_string()),
+            StorageError::InvalidUploadID("bucket".to_string(), "object".to_string(), "upload123".to_string()),
+        ];
+
+        for storage_error in storage_errors {
+            let original_message = storage_error.to_string();
+            let io_error: std::io::Error = storage_error.clone().into();
+
+            // The io::Error should contain the original error message or info
+            assert!(io_error.to_string().contains(&original_message));
+        }
+    }
+
+    #[test]
+    fn test_error_equality_after_conversion() {
+        let storage_errors = vec![
+            StorageError::FileNotFound,
+            StorageError::VolumeNotFound,
+            StorageError::DiskFull,
+            StorageError::MethodNotAllowed,
+        ];
+
+        for original_error in storage_errors {
+            // Test that equality is preserved through conversion
+            let io_error: std::io::Error = original_error.clone().into();
+            let recovered_error: StorageError = io_error.into();
+
+            assert_eq!(original_error, recovered_error);
         }
     }
 }

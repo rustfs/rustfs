@@ -20,7 +20,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
                 bavail,
                 bfree,
                 p.as_ref().display()
-            )))
+            )));
         }
     };
 
@@ -32,7 +32,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
                 reserved,
                 blocks,
                 p.as_ref().display()
-            )))
+            )));
         }
     };
 
@@ -45,7 +45,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
                 free,
                 total,
                 p.as_ref().display()
-            )))
+            )));
         }
     };
 

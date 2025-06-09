@@ -1,13 +1,13 @@
 #[cfg(feature = "gpu")]
+use crate::GlobalError;
+#[cfg(feature = "gpu")]
 use crate::system::attributes::ProcessAttributes;
 #[cfg(feature = "gpu")]
 use crate::system::metrics::Metrics;
 #[cfg(feature = "gpu")]
-use crate::GlobalError;
+use nvml_wrapper::Nvml;
 #[cfg(feature = "gpu")]
 use nvml_wrapper::enums::device::UsedGpuMemory;
-#[cfg(feature = "gpu")]
-use nvml_wrapper::Nvml;
 #[cfg(feature = "gpu")]
 use sysinfo::Pid;
 #[cfg(feature = "gpu")]

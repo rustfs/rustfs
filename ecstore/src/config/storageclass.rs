@@ -174,13 +174,7 @@ pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
             parse_storage_class(&ssc_str)?
         } else {
             StorageClass {
-                parity: {
-                    if set_drive_count == 1 {
-                        0
-                    } else {
-                        DEFAULT_RRS_PARITY
-                    }
-                },
+                parity: { if set_drive_count == 1 { 0 } else { DEFAULT_RRS_PARITY } },
             }
         }
     };
@@ -193,7 +187,10 @@ pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
         if let Ok(ev) = env::var(INLINE_BLOCK_ENV) {
             if let Ok(block) = ev.parse::<bytesize::ByteSize>() {
                 if block.as_u64() as usize > DEFAULT_INLINE_BLOCK {
-                    warn!("inline block value bigger than recommended max of 128KiB -> {}, performance may degrade for PUT please benchmark the changes",block);
+                    warn!(
+                        "inline block value bigger than recommended max of 128KiB -> {}, performance may degrade for PUT please benchmark the changes",
+                        block
+                    );
                 }
                 block.as_u64() as usize
             } else {
@@ -295,7 +292,10 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
     }
 
     if ss_parity > 0 && rrs_parity > 0 && ss_parity < rrs_parity {
-        return Err(Error::other(format!("Standard storage class parity drives {} should be greater than or equal to Reduced redundancy storage class parity drives {}", ss_parity, rrs_parity)));
+        return Err(Error::other(format!(
+            "Standard storage class parity drives {} should be greater than or equal to Reduced redundancy storage class parity drives {}",
+            ss_parity, rrs_parity
+        )));
     }
     Ok(())
 }

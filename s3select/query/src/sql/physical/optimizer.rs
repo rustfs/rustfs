@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use api::query::session::SessionCtx;
 use api::QueryResult;
+use api::query::session::SessionCtx;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 

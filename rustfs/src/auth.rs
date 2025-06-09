@@ -7,13 +7,13 @@ use iam::get_global_action_cred;
 use iam::sys::SESSION_POLICY_NAME;
 use policy::auth;
 use policy::auth::get_claims_from_token_with_secret;
+use s3s::S3Error;
+use s3s::S3ErrorCode;
+use s3s::S3Result;
 use s3s::auth::S3Auth;
 use s3s::auth::SecretKey;
 use s3s::auth::SimpleAuth;
 use s3s::s3_error;
-use s3s::S3Error;
-use s3s::S3ErrorCode;
-use s3s::S3Result;
 use serde_json::Value;
 
 pub struct IAMAuth {

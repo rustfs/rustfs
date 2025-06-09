@@ -3,7 +3,6 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 // use rustfs_rio::Reader;
 use smallvec::SmallVec;
 use std::io;
-use std::io::ErrorKind;
 use tracing::error;
 use tracing::warn;
 use uuid::Uuid;
@@ -98,7 +97,7 @@ impl Erasure {
                 if let Some(encoder) = self.encoder.as_ref() {
                     encoder.encode(data_slices).map_err(|e| {
                         error!("encode data error: {:?}", e);
-                        io::Error::new(ErrorKind::Other, format!("encode data error {:?}", e))
+                        io::Error::other(format!("encode data error {:?}", e))
                     })?;
                 } else {
                     warn!("parity_shards > 0, but encoder is None");
@@ -129,7 +128,7 @@ impl Erasure {
             if let Some(encoder) = self.encoder.as_ref() {
                 encoder.reconstruct(shards).map_err(|e| {
                     error!("decode data error: {:?}", e);
-                    io::Error::new(ErrorKind::Other, format!("decode data error {:?}", e))
+                    io::Error::other(format!("decode data error {:?}", e))
                 })?;
             } else {
                 warn!("parity_shards > 0, but encoder is None");

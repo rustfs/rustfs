@@ -7,9 +7,9 @@ use std::{
 };
 
 use super::{
+    Error as IamError, Validator,
     function::key_name::KeyName,
     utils::{path, wildcard},
-    Error as IamError, Validator,
 };
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]

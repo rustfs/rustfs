@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, ops::Deref};
 use strum::{EnumString, IntoStaticStr};
 
-use super::{utils::wildcard, Error as IamError, Validator};
+use super::{Error as IamError, Validator, utils::wildcard};
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ActionSet(pub HashSet<Action>);

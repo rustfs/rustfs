@@ -1,4 +1,4 @@
-use super::{action::Action, statement::BPStatement, Effect, Error as IamError, Statement, ID};
+use super::{Effect, Error as IamError, ID, Statement, action::Action, statement::BPStatement};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -252,9 +252,9 @@ pub mod default {
     use std::{collections::HashSet, sync::LazyLock};
 
     use crate::policy::{
+        ActionSet, DEFAULT_VERSION, Effect, Functions, ResourceSet, Statement,
         action::{Action, AdminAction, KmsAction, S3Action},
         resource::Resource,
-        ActionSet, Effect, Functions, ResourceSet, Statement, DEFAULT_VERSION,
     };
 
     use super::Policy;

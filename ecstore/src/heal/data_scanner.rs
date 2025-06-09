@@ -6,17 +6,17 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
 
 use super::{
-    data_scanner_metric::{globalScannerMetrics, ScannerMetric, ScannerMetrics},
-    data_usage::{store_data_usage_in_backend, DATA_USAGE_BLOOM_NAME_PATH},
+    data_scanner_metric::{ScannerMetric, ScannerMetrics, globalScannerMetrics},
+    data_usage::{DATA_USAGE_BLOOM_NAME_PATH, store_data_usage_in_backend},
     data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
-    heal_commands::{HealScanMode, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
+    heal_commands::{HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN, HealScanMode},
 };
 use crate::{
     bucket::{versioning::VersioningApi, versioning_sys::BucketVersioningSys},
@@ -24,7 +24,7 @@ use crate::{
     heal::data_usage::DATA_USAGE_ROOT,
 };
 use crate::{
-    cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
+    cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
     config::{
         com::{read_config, save_config},
         heal::Config,
@@ -33,22 +33,22 @@ use crate::{
     global::{GLOBAL_BackgroundHealState, GLOBAL_IsErasure, GLOBAL_IsErasureSD},
     heal::{
         data_usage::BACKGROUND_HEAL_INFO_PATH,
-        data_usage_cache::{hash_path, DataUsageHashMap},
+        data_usage_cache::{DataUsageHashMap, hash_path},
         error::ERR_IGNORE_FILE_CONTRIB,
         heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT},
-        heal_ops::{HealSource, BG_HEALING_UUID},
+        heal_ops::{BG_HEALING_UUID, HealSource},
     },
     new_object_layer_fn,
     peer::is_reserved_or_invalid_bucket,
     store::ECStore,
-    utils::path::{path_join, path_to_bucket_object, path_to_bucket_object_with_base_path, SLASH_SEPARATOR},
+    utils::path::{SLASH_SEPARATOR, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path},
 };
+use crate::{disk::DiskAPI, store_api::ObjectInfo};
 use crate::{
     disk::error::DiskError,
     error::{Error, Result},
 };
 use crate::{disk::local::LocalDisk, heal::data_scanner_metric::current_path_updater};
-use crate::{disk::DiskAPI, store_api::ObjectInfo};
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use rand::Rng;
@@ -58,9 +58,8 @@ use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, Re
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{
-        broadcast,
+        RwLock, broadcast,
         mpsc::{self, Sender},
-        RwLock,
     },
     time::sleep,
 };

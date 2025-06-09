@@ -1,11 +1,11 @@
+use crate::GlobalError;
 use crate::system::attributes::ProcessAttributes;
 use crate::system::gpu::GpuCollector;
-use crate::system::metrics::{Metrics, DIRECTION, INTERFACE, STATUS};
-use crate::GlobalError;
+use crate::system::metrics::{DIRECTION, INTERFACE, Metrics, STATUS};
 use opentelemetry::KeyValue;
 use std::time::SystemTime;
 use sysinfo::{Networks, Pid, ProcessStatus, System};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 /// Collector is responsible for collecting system metrics and attributes.
 /// It uses the sysinfo crate to gather information about the system and processes.

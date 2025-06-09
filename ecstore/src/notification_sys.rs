@@ -1,8 +1,8 @@
+use crate::StorageAPI;
 use crate::admin_server_info::get_commit_id;
 use crate::error::{Error, Result};
-use crate::global::{get_global_endpoints, GLOBAL_BOOT_TIME};
+use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
 use crate::peer_rest_client::PeerRestClient;
-use crate::StorageAPI;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use futures::future::join_all;
 use lazy_static::lazy_static;

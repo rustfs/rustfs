@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     config::storageclass::{RRS, STANDARD},
-    disk::{error::DiskError, DeleteOptions, DiskAPI, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    disk::{BUCKET_META_PREFIX, DeleteOptions, DiskAPI, DiskStore, RUSTFS_META_BUCKET, error::DiskError},
     global::GLOBAL_BackgroundHealState,
     heal::heal_ops::HEALING_TRACKER_FILENAME,
     new_object_layer_fn,

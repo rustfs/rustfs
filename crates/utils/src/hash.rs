@@ -114,7 +114,7 @@ mod tests {
         let data = b"test data";
         let hash = HashAlgorithm::BLAKE2b512.hash_encode(data);
         assert_eq!(hash.len(), 32); // blake3 outputs 32 bytes by default
-                                    // BLAKE2b512 should be deterministic
+        // BLAKE2b512 should be deterministic
         let hash2 = HashAlgorithm::BLAKE2b512.hash_encode(data);
         assert_eq!(hash, hash2);
     }

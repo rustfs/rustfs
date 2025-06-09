@@ -721,4 +721,144 @@ mod tests {
             assert!(inner.source().is_none()); // std::io::Error typically doesn't have a source
         }
     }
+
+    #[test]
+    fn test_io_error_roundtrip_conversion() {
+        // Test DiskError -> std::io::Error -> DiskError roundtrip
+        let original_disk_errors = vec![
+            DiskError::FileNotFound,
+            DiskError::VolumeNotFound,
+            DiskError::DiskFull,
+            DiskError::FileCorrupt,
+            DiskError::MethodNotAllowed,
+        ];
+
+        for original_error in original_disk_errors {
+            // Convert to io::Error and back
+            let io_error: std::io::Error = original_error.clone().into();
+            let recovered_error: DiskError = io_error.into();
+
+            // For non-Io variants, they become Io(ErrorKind::Other) and then back to the original
+            match &original_error {
+                DiskError::Io(_) => {
+                    // Io errors should maintain their kind
+                    assert!(matches!(recovered_error, DiskError::Io(_)));
+                }
+                _ => {
+                    // Other errors become Io(Other) and then are recovered via downcast
+                    // The recovered error should be functionally equivalent
+                    assert_eq!(original_error.to_u32(), recovered_error.to_u32());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_io_error_with_disk_error_inside() {
+        // Test that io::Error containing DiskError can be properly converted back
+        let original_disk_error = DiskError::FileNotFound;
+        let io_with_disk_error = std::io::Error::other(original_disk_error.clone());
+
+        // Convert io::Error back to DiskError
+        let recovered_disk_error: DiskError = io_with_disk_error.into();
+        assert_eq!(original_disk_error, recovered_disk_error);
+    }
+
+    #[test]
+    fn test_io_error_different_kinds() {
+        use std::io::ErrorKind;
+
+        let test_cases = vec![
+            (ErrorKind::NotFound, "file not found"),
+            (ErrorKind::PermissionDenied, "permission denied"),
+            (ErrorKind::ConnectionRefused, "connection refused"),
+            (ErrorKind::TimedOut, "timed out"),
+            (ErrorKind::InvalidInput, "invalid input"),
+        ];
+
+        for (kind, message) in test_cases {
+            let io_error = std::io::Error::new(kind, message);
+            let disk_error: DiskError = io_error.into();
+
+            // Should become DiskError::Io with the same kind and message
+            match disk_error {
+                DiskError::Io(inner_io) => {
+                    assert_eq!(inner_io.kind(), kind);
+                    assert!(inner_io.to_string().contains(message));
+                }
+                _ => panic!("Expected DiskError::Io variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_disk_error_to_io_error_preserves_information() {
+        let test_cases = vec![
+            DiskError::FileNotFound,
+            DiskError::VolumeNotFound,
+            DiskError::DiskFull,
+            DiskError::FileCorrupt,
+            DiskError::MethodNotAllowed,
+            DiskError::ErasureReadQuorum,
+            DiskError::ErasureWriteQuorum,
+        ];
+
+        for disk_error in test_cases {
+            let io_error: std::io::Error = disk_error.clone().into();
+
+            // Error message should be preserved
+            assert!(io_error.to_string().contains(&disk_error.to_string()));
+
+            // Should be able to downcast back to DiskError
+            let recovered_error = io_error.downcast::<DiskError>();
+            assert!(recovered_error.is_ok());
+            assert_eq!(recovered_error.unwrap(), disk_error);
+        }
+    }
+
+    #[test]
+    fn test_io_error_downcast_chain() {
+        // Test nested error downcasting chain
+        let original_disk_error = DiskError::FileNotFound;
+
+        // Create a chain: DiskError -> io::Error -> DiskError -> io::Error
+        let io_error1: std::io::Error = original_disk_error.clone().into();
+        let disk_error2: DiskError = io_error1.into();
+        let io_error2: std::io::Error = disk_error2.into();
+
+        // Final io::Error should still contain the original DiskError
+        let final_disk_error = io_error2.downcast::<DiskError>();
+        assert!(final_disk_error.is_ok());
+        assert_eq!(final_disk_error.unwrap(), original_disk_error);
+    }
+
+    #[test]
+    fn test_io_error_with_original_io_content() {
+        // Test DiskError::Io variant preserves original io::Error
+        let original_io = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let disk_error = DiskError::Io(original_io);
+
+        let converted_io: std::io::Error = disk_error.into();
+        assert_eq!(converted_io.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(converted_io.to_string().contains("broken pipe"));
+    }
+
+    #[test]
+    fn test_error_display_preservation() {
+        let disk_errors = vec![
+            DiskError::MaxVersionsExceeded,
+            DiskError::CorruptedFormat,
+            DiskError::UnformattedDisk,
+            DiskError::DiskNotFound,
+            DiskError::FileAccessDenied,
+        ];
+
+        for disk_error in disk_errors {
+            let original_message = disk_error.to_string();
+            let io_error: std::io::Error = disk_error.clone().into();
+
+            // The io::Error should contain the original error message
+            assert!(io_error.to_string().contains(&original_message));
+        }
+    }
 }

@@ -1,18 +1,19 @@
-use crate::config::{storageclass, KVS};
+use crate::config::{KVS, storageclass};
 use crate::disk::error_reduce::{count_errs, reduce_write_quorum_errs};
 use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
 use crate::{
     disk::{
+        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
         error::DiskError,
         format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
-        new_disk, DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
+        new_disk,
     },
     endpoints::Endpoints,
     heal::heal_commands::init_healing_tracker,
 };
 use futures::future::join_all;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{HashMap, hash_map::Entry};
 
 use tracing::{debug, warn};
 use uuid::Uuid;

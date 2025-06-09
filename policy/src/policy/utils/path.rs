@@ -85,11 +85,7 @@ pub fn clean(path: &str) -> String {
         }
     }
 
-    if out.w == 0 {
-        ".".into()
-    } else {
-        out.string()
-    }
+    if out.w == 0 { ".".into() } else { out.string() }
 }
 
 #[cfg(test)]

@@ -3,15 +3,15 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::StorageAPI;
 use crate::bucket::error::BucketMetadataError;
-use crate::bucket::metadata::{load_bucket_metadata_parse, BUCKET_LIFECYCLE_CONFIG};
+use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::is_meta_bucketname;
-use crate::error::{is_err_bucket_not_found, Error, Result};
-use crate::global::{is_dist_erasure, is_erasure, new_object_layer_fn, GLOBAL_Endpoints};
+use crate::error::{Error, Result, is_err_bucket_not_found};
+use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
 use crate::heal::heal_commands::HealOpts;
 use crate::store::ECStore;
 use crate::utils::xml::deserialize;
-use crate::StorageAPI;
 use futures::future::join_all;
 use policy::policy::BucketPolicy;
 use s3s::dto::{
@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, warn};
 
-use super::metadata::{load_bucket_metadata, BucketMetadata};
+use super::metadata::{BucketMetadata, load_bucket_metadata};
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
 
@@ -363,7 +363,7 @@ impl BucketMetadataSys {
                         Err(Error::other("errBucketMetadataNotInitialized"))
                     } else {
                         Err(err)
-                    }
+                    };
                 }
             };
 

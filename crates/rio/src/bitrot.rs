@@ -1,6 +1,6 @@
 use crate::{Reader, Writer};
 use pin_project_lite::pin_project;
-use rustfs_utils::{read_full, write_all, HashAlgorithm};
+use rustfs_utils::{HashAlgorithm, read_full, write_all};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pin_project! {

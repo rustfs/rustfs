@@ -6,7 +6,9 @@ use std::{
 };
 
 use api::{
+    QueryError, QueryResult,
     query::{
+        Query,
         ast::ExtStatement,
         dispatcher::QueryDispatcher,
         execution::{Output, QueryStateMachine},
@@ -14,9 +16,7 @@ use api::{
         logical_planner::{LogicalPlanner, Plan},
         parser::Parser,
         session::{SessionCtx, SessionCtxFactory},
-        Query,
     },
-    QueryError, QueryResult,
 };
 use async_trait::async_trait;
 use datafusion::{
@@ -37,7 +37,7 @@ use s3s::dto::{FileHeaderInfo, SelectObjectContentInput};
 
 use crate::{
     execution::factory::QueryExecutionFactoryRef,
-    metadata::{base_table::BaseTableProvider, ContextProviderExtension, MetadataProvider, TableHandleProviderRef},
+    metadata::{ContextProviderExtension, MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
     sql::logical::planner::DefaultLogicalPlanner,
 };
 

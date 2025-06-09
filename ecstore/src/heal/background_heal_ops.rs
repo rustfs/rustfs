@@ -4,8 +4,8 @@ use std::{cmp::Ordering, env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     spawn,
     sync::{
-        mpsc::{self, Receiver, Sender},
         RwLock,
+        mpsc::{self, Receiver, Sender},
     },
     time::interval,
 };
@@ -14,16 +14,16 @@ use uuid::Uuid;
 
 use super::{
     heal_commands::HealOpts,
-    heal_ops::{new_bg_heal_sequence, HealSequence},
+    heal_ops::{HealSequence, new_bg_heal_sequence},
 };
 use crate::error::{Error, Result};
 use crate::global::GLOBAL_MRFState;
 use crate::heal::error::ERR_RETRY_HEALING;
-use crate::heal::heal_commands::{HealScanMode, HEAL_ITEM_BUCKET};
-use crate::heal::heal_ops::{HealSource, BG_HEALING_UUID};
+use crate::heal::heal_commands::{HEAL_ITEM_BUCKET, HealScanMode};
+use crate::heal::heal_ops::{BG_HEALING_UUID, HealSource};
 use crate::{
     config::RUSTFS_CONFIG_PREFIX,
-    disk::{endpoint::Endpoint, error::DiskError, DiskAPI, DiskInfoOptions, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    disk::{BUCKET_META_PREFIX, DiskAPI, DiskInfoOptions, RUSTFS_META_BUCKET, endpoint::Endpoint, error::DiskError},
     global::{GLOBAL_BackgroundHealRoutine, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP},
     heal::{
         data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT},
@@ -34,7 +34,7 @@ use crate::{
     new_object_layer_fn,
     store::get_disk_via_endpoint,
     store_api::{BucketInfo, BucketOptions, StorageAPI},
-    utils::path::{path_join, SLASH_SEPARATOR},
+    utils::path::{SLASH_SEPARATOR, path_join},
 };
 
 pub static DEFAULT_MONITOR_NEW_DISK_INTERVAL: Duration = Duration::from_secs(10);
@@ -149,7 +149,7 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
             return Err(Error::other(format!(
                 "Unexpected error disk must be initialized by now after formatting: {}",
                 endpoint
-            )))
+            )));
         }
     };
 

@@ -6,7 +6,7 @@ use rustfs_rio::Reader;
 use super::Erasure;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::count_errs;
-use crate::disk::error_reduce::{reduce_write_quorum_errs, OBJECT_OP_IGNORED_ERRS};
+use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
 use std::sync::Arc;
 use std::vec;
 use tokio::sync::mpsc;
@@ -62,15 +62,12 @@ impl<'a> MultiWriter<'a> {
         }
 
         if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Failed to write data: {} (offline-disks={}/{})",
-                    write_err,
-                    count_errs(&self.errs, &Error::DiskNotFound),
-                    self.writers.len()
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to write data: {} (offline-disks={}/{})",
+                write_err,
+                count_errs(&self.errs, &Error::DiskNotFound),
+                self.writers.len()
+            )));
         }
 
         Err(std::io::Error::other(format!(
@@ -103,10 +100,7 @@ impl Erasure {
                         total += n;
                         let res = self.encode_data(&buf[..n])?;
                         if let Err(err) = tx.send(res).await {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Failed to send encoded data : {}", err),
-                            ));
+                            return Err(std::io::Error::other(format!("Failed to send encoded data : {}", err)));
                         }
                     }
                     Ok(_) => break,

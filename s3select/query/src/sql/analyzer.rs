@@ -1,6 +1,6 @@
+use api::QueryResult;
 use api::query::analyzer::Analyzer;
 use api::query::session::SessionCtx;
-use api::QueryResult;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::analyzer::Analyzer as DFAnalyzer;
 

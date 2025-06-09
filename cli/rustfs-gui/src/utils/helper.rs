@@ -11,7 +11,7 @@ use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/embedded-rustfs/"]
@@ -746,10 +746,10 @@ mod tests {
         assert_eq!(ServiceManager::extract_port("host:0"), Some(0));
         assert_eq!(ServiceManager::extract_port("host:65535"), Some(65535));
         assert_eq!(ServiceManager::extract_port("host:65536"), None); // Out of range
-                                                                      // IPv6-like address - extract_port takes the second part after split(':')
-                                                                      // For "::1:8080", split(':') gives ["", "", "1", "8080"], nth(1) gives ""
+        // IPv6-like address - extract_port takes the second part after split(':')
+        // For "::1:8080", split(':') gives ["", "", "1", "8080"], nth(1) gives ""
         assert_eq!(ServiceManager::extract_port("::1:8080"), None); // Second part is empty
-                                                                    // For "[::1]:8080", split(':') gives ["[", "", "1]", "8080"], nth(1) gives ""
+        // For "[::1]:8080", split(':') gives ["[", "", "1]", "8080"], nth(1) gives ""
         assert_eq!(ServiceManager::extract_port("[::1]:8080"), None); // Second part is empty
     }
 

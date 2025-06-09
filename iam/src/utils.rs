@@ -1,6 +1,6 @@
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngCore};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::io::{Error, Result};
 
 pub fn gen_access_key(length: usize) -> Result<String> {

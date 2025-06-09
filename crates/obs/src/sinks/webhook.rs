@@ -1,5 +1,5 @@
-use crate::sinks::Sink;
 use crate::UnifiedLogEntry;
+use crate::sinks::Sink;
 use async_trait::async_trait;
 
 /// Webhook Sink Implementation

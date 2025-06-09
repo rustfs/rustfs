@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
 
-use super::data_scanner::{SizeSummary, DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS};
+use super::data_scanner::{DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS, SizeSummary};
 use super::data_usage::{BucketTargetUsageInfo, BucketUsageInfo, DataUsageInfo};
 
 // DATA_USAGE_BUCKET_LEN must be length of ObjectsHistogramIntervals

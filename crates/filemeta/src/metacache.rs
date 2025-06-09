@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::{merge_file_meta_versions, FileInfo, FileInfoVersions, FileMeta, FileMetaShallowVersion, VersionType};
+use crate::{FileInfo, FileInfoVersions, FileMeta, FileMetaShallowVersion, VersionType, merge_file_meta_versions};
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -10,8 +10,8 @@ use std::{
     pin::Pin,
     ptr,
     sync::{
-        atomic::{AtomicPtr, AtomicU64, Ordering as AtomicOrdering},
         Arc,
+        atomic::{AtomicPtr, AtomicU64, Ordering as AtomicOrdering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };

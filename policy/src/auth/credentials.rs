@@ -1,14 +1,14 @@
 use crate::error::Error as IamError;
 use crate::error::{Error, Result};
-use crate::policy::{iam_policy_claim_name_sa, Policy, Validator, INHERITED_POLICY_TYPE};
+use crate::policy::{INHERITED_POLICY_TYPE, Policy, Validator, iam_policy_claim_name_sa};
 use crate::utils;
 use crate::utils::extract_claims;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use time::macros::offset;
 use time::OffsetDateTime;
+use time::macros::offset;
 
 const ACCESS_KEY_MIN_LEN: usize = 3;
 const ACCESS_KEY_MAX_LEN: usize = 20;

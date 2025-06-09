@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rustfs_filemeta::{test_data::*, FileMeta};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use rustfs_filemeta::{FileMeta, test_data::*};
 
 fn bench_create_real_xlmeta(c: &mut Criterion) {
     c.bench_function("create_real_xlmeta", |b| b.iter(|| black_box(create_real_xlmeta().unwrap())));

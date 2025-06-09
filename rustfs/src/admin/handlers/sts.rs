@@ -10,8 +10,9 @@ use iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use matchit::Params;
 use policy::{auth::get_new_credentials_with_metadata, policy::Policy};
 use s3s::{
+    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
-    s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    s3_error,
 };
 use serde::Deserialize;
 use serde_json::Value;

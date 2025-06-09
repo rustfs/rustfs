@@ -1,4 +1,4 @@
-use super::{storageclass, Config, GLOBAL_StorageClass};
+use super::{Config, GLOBAL_StorageClass, storageclass};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
@@ -123,7 +123,7 @@ pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<C
             } else {
                 error!("read config err {:?}", &err);
                 Err(err)
-            }
+            };
         }
     };
 
@@ -145,7 +145,7 @@ async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<C
                     } else {
                         error!("read config err {:?}", &err);
                         Err(err)
-                    }
+                    };
                 }
             };
             // TODO: decrypt

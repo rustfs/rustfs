@@ -1,4 +1,4 @@
-use crate::compress::{compress_block, decompress_block, CompressionAlgorithm};
+use crate::compress::{CompressionAlgorithm, compress_block, decompress_block};
 use crate::{EtagResolvable, HashReaderDetector};
 use crate::{HashReaderMut, Reader};
 use pin_project_lite::pin_project;

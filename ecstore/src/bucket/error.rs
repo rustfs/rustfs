@@ -95,7 +95,7 @@ impl BucketMetadataError {
             0x06 => Some(BucketMetadataError::BucketQuotaConfigNotFound),
             0x07 => Some(BucketMetadataError::BucketReplicationConfigNotFound),
             0x08 => Some(BucketMetadataError::BucketRemoteTargetNotFound),
-            0x09 => Some(BucketMetadataError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Io error"))),
+            0x09 => Some(BucketMetadataError::Io(std::io::Error::other("Io error"))),
             _ => None,
         }
     }

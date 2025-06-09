@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use api::{
-    query::{logical_planner::QueryPlan, optimizer::Optimizer, physical_planner::PhysicalPlanner, session::SessionCtx},
     QueryResult,
+    query::{logical_planner::QueryPlan, optimizer::Optimizer, physical_planner::PhysicalPlanner, session::SessionCtx},
 };
 use async_trait::async_trait;
-use datafusion::physical_plan::{displayable, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use tracing::debug;
 
 use super::{

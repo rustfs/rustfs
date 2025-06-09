@@ -3824,14 +3824,13 @@ impl ObjectIO for SetDisks {
 
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
-                let a = sc.get_parity_for_sc(
+                sc.get_parity_for_sc(
                     user_defined
                         .get(xhttp::AMZ_STORAGE_CLASS)
                         .cloned()
                         .unwrap_or_default()
                         .as_str(),
-                );
-                a
+                )
             } else {
                 None
             }
@@ -4806,14 +4805,13 @@ impl StorageAPI for SetDisks {
 
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
-                let a = sc.get_parity_for_sc(
+                sc.get_parity_for_sc(
                     user_defined
                         .get(xhttp::AMZ_STORAGE_CLASS)
                         .cloned()
                         .unwrap_or_default()
                         .as_str(),
-                );
-                a
+                )
             } else {
                 None
             }

@@ -5,15 +5,16 @@ use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::{
     disk::{
+        DiskAPI, DiskInfo, DiskOption, DiskStore,
         error::DiskError,
         format::{DistributionAlgoVersion, FormatV3},
-        new_disk, DiskAPI, DiskInfo, DiskOption, DiskStore,
+        new_disk,
     },
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
-    global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
+    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
     heal::heal_commands::{
-        HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_METADATA,
+        DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_METADATA, HealOpts,
     },
     set_disk::SetDisks,
     store_api::{
@@ -27,7 +28,7 @@ use crate::{
 use common::globals::GLOBAL_Local_Node_Name;
 use futures::future::join_all;
 use http::HeaderMap;
-use lock::{namespace_lock::NsLockMap, new_lock_api, LockApi};
+use lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use tokio::sync::RwLock;
 use uuid::Uuid;

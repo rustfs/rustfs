@@ -1,4 +1,4 @@
-use super::{utils::wildcard, Validator};
+use super::{Validator, utils::wildcard};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

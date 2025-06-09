@@ -160,13 +160,7 @@ impl HTTPRangeSpec {
         Some(HTTPRangeSpec {
             is_suffix_length: false,
             start: start as usize,
-            end: {
-                if end < 0 {
-                    None
-                } else {
-                    Some(end as usize)
-                }
-            },
+            end: { if end < 0 { None } else { Some(end as usize) } },
         })
     }
 
@@ -827,7 +821,7 @@ pub trait StorageAPI: ObjectIO {
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)>;
     async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, hs: Arc<HealSequence>, is_meta: bool)
-        -> Result<()>;
+    -> Result<()>;
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
 }

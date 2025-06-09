@@ -10,7 +10,7 @@ use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
 use datafusion::variable::VarType;
 use datafusion::{
     config::ConfigOptions,
-    sql::{planner::ContextProvider, TableReference},
+    sql::{TableReference, planner::ContextProvider},
 };
 
 use crate::data_source::table_source::{TableHandle, TableSourceAdapter};

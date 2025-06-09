@@ -7,10 +7,10 @@ use crate::{
     utils::net::XHost,
 };
 use madmin::{
+    ServerProperties,
     health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysService},
     metrics::RealtimeMetrics,
     net::NetInfo,
-    ServerProperties,
 };
 use protos::{
     node_service_time_out_client,
