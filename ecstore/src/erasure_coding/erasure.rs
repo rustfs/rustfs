@@ -5,23 +5,23 @@
 //!
 //! ## Reed-Solomon Implementations
 //!
-//! ### `reed-solomon-erasure` (Default)
-//! - **Stability**: Mature and well-tested implementation
-//! - **Performance**: Good performance with SIMD acceleration when available
+//! ### Pure Erasure Mode (Default)
+//! - **Stability**: Pure erasure implementation, mature and well-tested
+//! - **Performance**: Good performance with consistent behavior
 //! - **Compatibility**: Works with any shard size
-//! - **Memory**: Efficient memory usage
-//! - **Use case**: Recommended for production use
+//! - **Use case**: Default behavior, recommended for most production use cases
 //!
-//! ### `reed-solomon-simd` (Optional)
-//! - **Performance**: Optimized SIMD implementation for maximum speed
-//! - **Limitations**: Has restrictions on shard sizes (must be >= 64 bytes typically)
-//! - **Memory**: May use more memory for small shards
-//! - **Use case**: Best for large data blocks where performance is critical
+//! ### Hybrid Mode (`reed-solomon-simd` feature)
+//! - **Performance**: Uses SIMD optimization when possible, falls back to erasure implementation for small shards
+//! - **Compatibility**: Works with any shard size through intelligent fallback
+//! - **Reliability**: Best of both worlds - SIMD speed for large data, erasure stability for small data
+//! - **Use case**: Use when maximum performance is needed for large data processing
 //!
 //! ## Feature Flags
 //!
-//! - `reed-solomon-erasure` (default): Use the reed-solomon-erasure implementation
-//! - `reed-solomon-simd`: Use the reed-solomon-simd implementation
+//! - Default: Use pure reed-solomon-erasure implementation (stable and reliable)
+//! - `reed-solomon-simd`: Use hybrid mode (SIMD + erasure fallback for optimal performance)
+//! - `reed-solomon-erasure`: Explicitly enable pure erasure mode (same as default)
 //!
 //! ## Example
 //!
@@ -35,7 +35,6 @@
 //! ```
 
 use bytes::{Bytes, BytesMut};
-#[cfg(feature = "reed-solomon-erasure")]
 use reed_solomon_erasure::galois_8::ReedSolomon as ReedSolomonErasure;
 #[cfg(feature = "reed-solomon-simd")]
 use reed_solomon_simd;
@@ -48,18 +47,18 @@ use uuid::Uuid;
 /// Reed-Solomon encoder variants supporting different implementations.
 #[allow(clippy::large_enum_variant)]
 pub enum ReedSolomonEncoder {
+    /// Hybrid mode: SIMD with erasure fallback (when reed-solomon-simd feature is enabled)
     #[cfg(feature = "reed-solomon-simd")]
-    Simd {
+    Hybrid {
         data_shards: usize,
         parity_shards: usize,
         // 使用RwLock确保线程安全，实现Send + Sync
         encoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
         decoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
-        // 添加erasure后备选项，当SIMD不适用时使用 - 只有两个feature都启用时才存在
-        #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
-        fallback_encoder: Option<Box<ReedSolomonErasure>>,
+        // erasure fallback for small shards or SIMD failures
+        fallback_encoder: Box<ReedSolomonErasure>,
     },
-    #[cfg(feature = "reed-solomon-erasure")]
+    /// Pure erasure mode: default and when reed-solomon-erasure feature is specified
     Erasure(Box<ReedSolomonErasure>),
 }
 
@@ -67,22 +66,19 @@ impl Clone for ReedSolomonEncoder {
     fn clone(&self) -> Self {
         match self {
             #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::Simd {
+            ReedSolomonEncoder::Hybrid {
                 data_shards,
                 parity_shards,
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 fallback_encoder,
                 ..
-            } => ReedSolomonEncoder::Simd {
+            } => ReedSolomonEncoder::Hybrid {
                 data_shards: *data_shards,
                 parity_shards: *parity_shards,
                 // 为新实例创建空的缓存，不共享缓存
                 encoder_cache: std::sync::RwLock::new(None),
                 decoder_cache: std::sync::RwLock::new(None),
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 fallback_encoder: fallback_encoder.clone(),
             },
-            #[cfg(feature = "reed-solomon-erasure")]
             ReedSolomonEncoder::Erasure(encoder) => ReedSolomonEncoder::Erasure(encoder.clone()),
         }
     }
@@ -93,32 +89,27 @@ impl ReedSolomonEncoder {
     pub fn new(data_shards: usize, parity_shards: usize) -> io::Result<Self> {
         #[cfg(feature = "reed-solomon-simd")]
         {
-            #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
-            let fallback_encoder =
-                Some(Box::new(ReedSolomonErasure::new(data_shards, parity_shards).map_err(|e| {
-                    io::Error::other(format!("Failed to create fallback erasure encoder: {:?}", e))
-                })?));
+            // Hybrid mode: SIMD + erasure fallback when reed-solomon-simd feature is enabled
+            let fallback_encoder = Box::new(
+                ReedSolomonErasure::new(data_shards, parity_shards)
+                    .map_err(|e| io::Error::other(format!("Failed to create fallback erasure encoder: {:?}", e)))?,
+            );
 
-            Ok(ReedSolomonEncoder::Simd {
+            Ok(ReedSolomonEncoder::Hybrid {
                 data_shards,
                 parity_shards,
                 encoder_cache: std::sync::RwLock::new(None),
                 decoder_cache: std::sync::RwLock::new(None),
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 fallback_encoder,
             })
         }
 
-        #[cfg(all(feature = "reed-solomon-erasure", not(feature = "reed-solomon-simd")))]
+        #[cfg(not(feature = "reed-solomon-simd"))]
         {
+            // Pure erasure mode when reed-solomon-simd feature is not enabled (default or reed-solomon-erasure)
             let encoder = ReedSolomonErasure::new(data_shards, parity_shards)
                 .map_err(|e| io::Error::other(format!("Failed to create erasure encoder: {:?}", e)))?;
             Ok(ReedSolomonEncoder::Erasure(Box::new(encoder)))
-        }
-
-        #[cfg(not(any(feature = "reed-solomon-simd", feature = "reed-solomon-erasure")))]
-        {
-            Err(io::Error::other("No Reed-Solomon implementation available"))
         }
     }
 
@@ -126,11 +117,10 @@ impl ReedSolomonEncoder {
     pub fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
         match self {
             #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::Simd {
+            ReedSolomonEncoder::Hybrid {
                 data_shards,
                 parity_shards,
                 encoder_cache,
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 fallback_encoder,
                 ..
             } => {
@@ -139,24 +129,17 @@ impl ReedSolomonEncoder {
                     return Ok(());
                 }
 
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 let shard_len = shards_vec[0].len();
-                #[cfg(not(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure")))]
-                let _shard_len = shards_vec[0].len();
 
                 // SIMD 性能最佳的最小 shard 大小 (通常 512-1024 字节)
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 const SIMD_MIN_SHARD_SIZE: usize = 512;
 
-                // 如果 shard 太小，使用 fallback encoder
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
+                // 如果 shard 太小，直接使用 fallback encoder
                 if shard_len < SIMD_MIN_SHARD_SIZE {
-                    if let Some(erasure_encoder) = fallback_encoder {
-                        let fallback_shards: SmallVec<[&mut [u8]; 16]> = SmallVec::from_vec(shards_vec);
-                        return erasure_encoder
-                            .encode(fallback_shards)
-                            .map_err(|e| io::Error::other(format!("Fallback erasure encode error: {:?}", e)));
-                    }
+                    let fallback_shards: SmallVec<[&mut [u8]; 16]> = SmallVec::from_vec(shards_vec);
+                    return fallback_encoder
+                        .encode(fallback_shards)
+                        .map_err(|e| io::Error::other(format!("Fallback erasure encode error: {:?}", e)));
                 }
 
                 // 尝试使用 SIMD，如果失败则回退到 fallback
@@ -165,22 +148,14 @@ impl ReedSolomonEncoder {
                 match simd_result {
                     Ok(()) => Ok(()),
                     Err(simd_error) => {
-                        warn!("SIMD encoding failed: {}, trying fallback", simd_error);
-                        #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
-                        if let Some(erasure_encoder) = fallback_encoder {
-                            let fallback_shards: SmallVec<[&mut [u8]; 16]> = SmallVec::from_vec(shards_vec);
-                            erasure_encoder
-                                .encode(fallback_shards)
-                                .map_err(|e| io::Error::other(format!("Fallback erasure encode error: {:?}", e)))
-                        } else {
-                            Err(simd_error)
-                        }
-                        #[cfg(not(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure")))]
-                        Err(simd_error)
+                        warn!("SIMD encoding failed: {}, using fallback", simd_error);
+                        let fallback_shards: SmallVec<[&mut [u8]; 16]> = SmallVec::from_vec(shards_vec);
+                        fallback_encoder
+                            .encode(fallback_shards)
+                            .map_err(|e| io::Error::other(format!("Fallback erasure encode error: {:?}", e)))
                     }
                 }
             }
-            #[cfg(feature = "reed-solomon-erasure")]
             ReedSolomonEncoder::Erasure(encoder) => encoder
                 .encode(shards)
                 .map_err(|e| io::Error::other(format!("Erasure encode error: {:?}", e))),
@@ -256,38 +231,27 @@ impl ReedSolomonEncoder {
     pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         match self {
             #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::Simd {
+            ReedSolomonEncoder::Hybrid {
                 data_shards,
                 parity_shards,
                 decoder_cache,
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 fallback_encoder,
                 ..
             } => {
                 // Find a valid shard to determine length
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 let shard_len = shards
-                    .iter()
-                    .find_map(|s| s.as_ref().map(|v| v.len()))
-                    .ok_or_else(|| io::Error::other("No valid shards found for reconstruction"))?;
-                #[cfg(not(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure")))]
-                let _shard_len = shards
                     .iter()
                     .find_map(|s| s.as_ref().map(|v| v.len()))
                     .ok_or_else(|| io::Error::other("No valid shards found for reconstruction"))?;
 
                 // SIMD 性能最佳的最小 shard 大小
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
                 const SIMD_MIN_SHARD_SIZE: usize = 512;
 
-                // 如果 shard 太小，使用 fallback encoder
-                #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
+                // 如果 shard 太小，直接使用 fallback encoder
                 if shard_len < SIMD_MIN_SHARD_SIZE {
-                    if let Some(erasure_encoder) = fallback_encoder {
-                        return erasure_encoder
-                            .reconstruct(shards)
-                            .map_err(|e| io::Error::other(format!("Fallback erasure reconstruct error: {:?}", e)));
-                    }
+                    return fallback_encoder
+                        .reconstruct(shards)
+                        .map_err(|e| io::Error::other(format!("Fallback erasure reconstruct error: {:?}", e)));
                 }
 
                 // 尝试使用 SIMD，如果失败则回退到 fallback
@@ -296,21 +260,13 @@ impl ReedSolomonEncoder {
                 match simd_result {
                     Ok(()) => Ok(()),
                     Err(simd_error) => {
-                        warn!("SIMD reconstruction failed: {}, trying fallback", simd_error);
-                        #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
-                        if let Some(erasure_encoder) = fallback_encoder {
-                            erasure_encoder
-                                .reconstruct(shards)
-                                .map_err(|e| io::Error::other(format!("Fallback erasure reconstruct error: {:?}", e)))
-                        } else {
-                            Err(simd_error)
-                        }
-                        #[cfg(not(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure")))]
-                        Err(simd_error)
+                        warn!("SIMD reconstruction failed: {}, using fallback", simd_error);
+                        fallback_encoder
+                            .reconstruct(shards)
+                            .map_err(|e| io::Error::other(format!("Fallback erasure reconstruct error: {:?}", e)))
                     }
                 }
             }
-            #[cfg(feature = "reed-solomon-erasure")]
             ReedSolomonEncoder::Erasure(encoder) => encoder
                 .reconstruct(shards)
                 .map_err(|e| io::Error::other(format!("Erasure reconstruct error: {:?}", e))),
@@ -658,18 +614,18 @@ mod tests {
         let parity_shards = 2;
 
         // Use different block sizes based on feature
-        #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 1024; // SIMD requires larger blocks
         #[cfg(not(feature = "reed-solomon-simd"))]
-        let block_size = 8;
+        let block_size = 8; // Pure erasure mode (default)
+        #[cfg(feature = "reed-solomon-simd")]
+        let block_size = 1024; // Hybrid mode - SIMD with fallback
 
         let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
         // Use different test data based on feature
-        #[cfg(feature = "reed-solomon-simd")]
-        let test_data = b"SIMD test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization.".repeat(20); // ~3KB
         #[cfg(not(feature = "reed-solomon-simd"))]
-        let test_data = b"hello world".to_vec();
+        let test_data = b"hello world".to_vec(); // Small data for erasure (default)
+        #[cfg(feature = "reed-solomon-simd")]
+        let test_data = b"Hybrid mode test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization.".repeat(20); // ~3KB for hybrid
 
         let data = &test_data;
         let encoded_shards = erasure.encode_data(data).unwrap();
@@ -699,9 +655,9 @@ mod tests {
 
         // Use different block sizes based on feature
         #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 32768; // 32KB for large data with SIMD
+        let block_size = 512 * 3; // Hybrid mode - SIMD with fallback
         #[cfg(not(feature = "reed-solomon-simd"))]
-        let block_size = 8192; // 8KB for erasure
+        let block_size = 8192; // Pure erasure mode (default)
 
         let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
@@ -766,21 +722,15 @@ mod tests {
 
         // Use different block sizes based on feature
         #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 1024; // SIMD requires larger blocks
+        let block_size = 1024; // Hybrid mode
         #[cfg(not(feature = "reed-solomon-simd"))]
-        let block_size = 8;
+        let block_size = 8; // Pure erasure mode (default)
 
         let erasure = Arc::new(Erasure::new(data_shards, parity_shards, block_size));
 
-        // Use different test data based on feature, create owned data
-        #[cfg(feature = "reed-solomon-simd")]
+        // Use test data suitable for both modes
         let data =
-            b"SIMD async error test data with sufficient length to meet SIMD requirements for proper testing and validation."
-                .repeat(20); // ~2KB
-        #[cfg(not(feature = "reed-solomon-simd"))]
-        let data =
-            b"SIMD async error test data with sufficient length to meet SIMD requirements for proper testing and validation."
-                .repeat(20); // ~2KB
+            b"Async error test data with sufficient length to meet requirements for proper testing and validation.".repeat(20); // ~2KB
 
         let mut rio_reader = Cursor::new(data);
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(8);
@@ -815,17 +765,16 @@ mod tests {
 
         // Use different block sizes based on feature
         #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 1024; // SIMD requires larger blocks
+        let block_size = 1024; // Hybrid mode
         #[cfg(not(feature = "reed-solomon-simd"))]
-        let block_size = 8;
+        let block_size = 8; // Pure erasure mode (default)
 
         let erasure = Arc::new(Erasure::new(data_shards, parity_shards, block_size));
 
         // Use test data that fits in exactly one block to avoid multi-block complexity
-        #[cfg(feature = "reed-solomon-simd")]
-        let data = b"SIMD channel async callback test data with sufficient length to ensure proper SIMD operation and validation requirements.".repeat(8); // ~1KB, fits in one 1024-byte block
-        #[cfg(not(feature = "reed-solomon-simd"))]
-        let data = b"SIMD channel async callback test data with sufficient length to ensure proper SIMD operation and validation requirements.".repeat(8); // ~1KB, fits in one 1024-byte block
+        let data =
+            b"Channel async callback test data with sufficient length to ensure proper operation and validation requirements."
+                .repeat(8); // ~1KB
 
         // let data = b"callback".to_vec(); // 8 bytes to fit exactly in one 8-byte block
 
@@ -867,20 +816,20 @@ mod tests {
         assert_eq!(&recovered, &data_clone);
     }
 
-    // Tests specifically for reed-solomon-simd implementation
+    // Tests specifically for hybrid mode (SIMD + erasure fallback)
     #[cfg(feature = "reed-solomon-simd")]
-    mod simd_tests {
+    mod hybrid_tests {
         use super::*;
 
         #[test]
-        fn test_simd_encode_decode_roundtrip() {
+        fn test_hybrid_encode_decode_roundtrip() {
             let data_shards = 4;
             let parity_shards = 2;
-            let block_size = 1024; // Use larger block size for SIMD compatibility
+            let block_size = 1024; // Use larger block size for hybrid mode
             let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
-            // Use data that will create shards >= 512 bytes (SIMD minimum)
-            let test_data = b"SIMD test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization and validation.";
+            // Use data that will create shards >= 512 bytes for SIMD optimization
+            let test_data = b"Hybrid test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization and validation.";
             let data = test_data.repeat(25); // Create much larger data: ~5KB total, ~1.25KB per shard
 
             let encoded_shards = erasure.encode_data(&data).unwrap();
@@ -905,13 +854,13 @@ mod tests {
         }
 
         #[test]
-        fn test_simd_all_zero_data() {
+        fn test_hybrid_all_zero_data() {
             let data_shards = 4;
             let parity_shards = 2;
-            let block_size = 1024; // Use larger block size for SIMD compatibility
+            let block_size = 1024; // Use larger block size for hybrid mode
             let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
-            // Create all-zero data that ensures adequate shard size for SIMD
+            // Create all-zero data that ensures adequate shard size for SIMD optimization
             let data = vec![0u8; 1024]; // 1KB of zeros, each shard will be 256 bytes
 
             let encoded_shards = erasure.encode_data(&data).unwrap();
@@ -1243,7 +1192,7 @@ mod tests {
     }
 
     // Comparative tests between different implementations
-    #[cfg(all(feature = "reed-solomon-simd", feature = "reed-solomon-erasure"))]
+    #[cfg(not(feature = "reed-solomon-simd"))]
     mod comparative_tests {
         use super::*;
 
