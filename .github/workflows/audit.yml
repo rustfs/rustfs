@@ -4,13 +4,13 @@ on:
   push:
     branches:
       - main
-    paths: 
+    paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
   pull_request:
     branches:
       - main
-    paths: 
+    paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
   schedule:
@@ -20,6 +20,6 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit -D warnings

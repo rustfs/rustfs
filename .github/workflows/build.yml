@@ -81,7 +81,7 @@ jobs:
         uses: actions/cache@v4.2.3
         with:
           path: /Users/runner/hostedtoolcache/protoc
-          key: protoc-${{ runner.os }}-30.2
+          key: protoc-${{ runner.os }}-31.1
           restore-keys: |
             protoc-${{ runner.os }}-
 
@@ -89,7 +89,7 @@ jobs:
         if: steps.cache-protoc.outputs.cache-hit != 'true'
         uses: arduino/setup-protoc@v3
         with:
-          version: '30.2'
+          version: '31.1'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Flatc
@@ -107,10 +107,10 @@ jobs:
 
       # Set up Zig for cross-compilation
       - uses: mlugg/setup-zig@v2
-        if: matrix.variant.glibc != 'default' || contains(matrix.variant.target, 'linux')
+        if: matrix.variant.glibc != 'default' || contains(matrix.variant.target, 'aarch64-unknown-linux')
 
       - uses: taiki-e/install-action@cargo-zigbuild
-        if: matrix.variant.glibc != 'default' || contains(matrix.variant.target, 'linux')
+        if: matrix.variant.glibc != 'default' || contains(matrix.variant.target, 'aarch64-unknown-linux')
 
       # Download static resources
       - name: Download and Extract Static Assets
@@ -150,7 +150,7 @@ jobs:
 
           # Determine whether to use zigbuild
           USE_ZIGBUILD=false
-          if [[ "$GLIBC" != "default" || "$TARGET" == *"linux"* ]]; then
+          if [[ "$GLIBC" != "default" || "$TARGET" == *"aarch64-unknown-linux"* ]]; then
             USE_ZIGBUILD=true
             echo "Using zigbuild for cross-compilation"
           fi

@@ -19,7 +19,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -34,9 +34,9 @@ jobs:
   pr-checks:
     name: Pull Request Quality Checks
     if: github.event_name == 'pull_request'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - uses: ./.github/actions/setup
 
       - name: Format Check
@@ -54,9 +54,9 @@ jobs:
   develop:
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - uses: ./.github/actions/setup
 
       - name: Format
@@ -92,9 +92,9 @@ jobs:
       - skip-check
       - develop
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

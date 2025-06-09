@@ -9,7 +9,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 lazy_static.workspace = true
-scopeguard = "1.2.0"
+scopeguard = { workspace = true }
 tokio.workspace = true
 tonic = { workspace = true }
 tracing-error.workspace = true

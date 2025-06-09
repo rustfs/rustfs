@@ -1,3 +1,4 @@
+use crate::bucket::metadata_sys;
 use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore};
@@ -425,14 +426,17 @@ impl PeerS3Client for LocalPeerS3Client {
         }
 
         // TODO: reduceWriteQuorumErrs
-
-        // debug!("get_bucket_info errs:{:?}", errs);
+        let mut versioned = false;
+        if let Ok(sys) = metadata_sys::get(bucket).await {
+            versioned = sys.versioning();
+        }
 
         ress.iter()
             .find_map(|op| {
                 op.as_ref().map(|v| BucketInfo {
                     name: v.name.clone(),
                     created: v.created,
+                    versionning: versioned,
                     ..Default::default()
                 })
             })
@@ -491,9 +495,12 @@ pub struct RemotePeerS3Client {
 }
 
 impl RemotePeerS3Client {
-    fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
+    pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default().to_string();
         Self { node, pools, addr }
+    }
+    pub fn get_addr(&self) -> String {
+        self.addr.clone()
     }
 }
 

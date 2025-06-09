@@ -49,6 +49,7 @@ use glob::Pattern;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use madmin::heal_commands::HealResultItem;
+use rand::Rng as _;
 use rustfs_filemeta::MetaCacheEntry;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;
@@ -501,7 +502,8 @@ impl ECStore {
             return None;
         }
 
-        let random_u64: u64 = rand::random();
+        let mut rng = rand::rng();
+        let random_u64: u64 = rng.random_range(0..total);
 
         let choose = random_u64 % total;
         let mut at_total = 0;

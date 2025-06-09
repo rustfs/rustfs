@@ -59,10 +59,7 @@ use http::HeaderMap;
 use lock::{LockApi, namespace_lock::NsLockMap};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use md5::{Digest as Md5Digest, Md5};
-use rand::{
-    thread_rng,
-    {Rng, seq::SliceRandom},
-};
+use rand::{Rng, seq::SliceRandom};
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, file_info_from_raw, merge_file_meta_versions,
@@ -133,7 +130,7 @@ impl SetDisks {
             }
         }
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         disks.shuffle(&mut rng);
 
@@ -142,7 +139,7 @@ impl SetDisks {
     async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_online_disks().await;
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         disks.shuffle(&mut rng);
 
@@ -165,10 +162,10 @@ impl SetDisks {
         let mut futures = Vec::with_capacity(disks.len());
         let mut numbers: Vec<usize> = (0..disks.len()).collect();
         {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             disks.shuffle(&mut rng);
 
-            numbers.shuffle(&mut thread_rng());
+            numbers.shuffle(&mut rng);
         }
 
         for &i in numbers.iter() {
@@ -242,7 +239,7 @@ impl SetDisks {
     async fn _get_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_disks_internal().await;
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         disks.shuffle(&mut rng);
 
@@ -3021,7 +3018,7 @@ impl SetDisks {
         // in different order per erasure set, this wider spread is needed when
         // there are lots of buckets with different order of objects in them.
         let permutes = {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             let mut permutes: Vec<usize> = (0..buckets.len()).collect();
             permutes.shuffle(&mut rng);
             permutes
@@ -3043,8 +3040,8 @@ impl SetDisks {
 
         let (buckets_results_tx, mut buckets_results_rx) = mpsc::channel::<DataUsageEntryInfo>(disks.len());
         let update_time = {
-            let mut rng = thread_rng();
-            Duration::from_secs(30) + Duration::from_secs_f64(10.0 * rng.gen_range(0.0..1.0))
+            let mut rng = rand::rng();
+            Duration::from_secs(30) + Duration::from_secs_f64(10.0 * rng.random_range(0.0..1.0))
         };
         let mut ticker = interval(update_time);
 
@@ -3389,7 +3386,7 @@ impl SetDisks {
             }
 
             {
-                let mut rng = thread_rng();
+                let mut rng = rand::rng();
 
                 // 随机洗牌
                 disks.shuffle(&mut rng);

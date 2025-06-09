@@ -25,6 +25,7 @@ pub fn encode_tags(tags: Vec<Tag>) -> String {
 
     for tag in tags.iter() {
         if let (Some(k), Some(v)) = (tag.key.as_ref(), tag.value.as_ref()) {
+            //encoded.append_pair(k.as_ref().unwrap().as_str(), v.as_ref().unwrap().as_str());
             encoded.append_pair(k.as_str(), v.as_str());
         }
     }

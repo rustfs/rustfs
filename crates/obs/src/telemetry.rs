@@ -332,7 +332,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         let flexi_logger_result = flexi_logger::Logger::try_with_env_or_str(logger_level)
             .unwrap_or_else(|e| {
                 eprintln!(
-                    "Invalid logger level: {}, using default: {},failed error:{}",
+                    "Invalid logger level: {}, using default: {}, failed error: {:?}",
                     logger_level, DEFAULT_LOG_LEVEL, e
                 );
                 flexi_logger::Logger::with(log_spec.clone())

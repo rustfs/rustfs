@@ -7,6 +7,7 @@ use crate::StorageAPI;
 use crate::bucket::error::BucketMetadataError;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::is_meta_bucketname;
+use crate::cmd::bucket_targets;
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
 use crate::heal::heal_commands::HealOpts;
@@ -226,7 +227,9 @@ impl BucketMetadataSys {
             match res {
                 Ok(res) => {
                     if let Some(bucket) = buckets.get(idx) {
-                        mp.insert(bucket.clone(), Arc::new(res));
+                        let x = Arc::new(res);
+                        mp.insert(bucket.clone(), x.clone());
+                        bucket_targets::init_bucket_targets(bucket, x.clone()).await;
                     }
                 }
                 Err(e) => {
@@ -340,6 +343,7 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_config_from_disk(&self, bucket: &str) -> Result<BucketMetadata> {
+        println!("load data from disk");
         if is_meta_bucketname(bucket) {
             return Err(Error::other("errInvalidArgument"));
         }
@@ -549,7 +553,12 @@ impl BucketMetadataSys {
 
     pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
         let (bm, reload) = match self.get_config(bucket).await {
-            Ok(res) => res,
+            Ok(res) => {
+                if res.0.replication_config.is_none() {
+                    return Err(BucketMetadataError::BucketReplicationConfigNotFound.into());
+                }
+                res
+            }
             Err(err) => {
                 warn!("get_replication_config err {:?}", &err);
                 return if err == Error::ConfigNotFound {
@@ -564,7 +573,7 @@ impl BucketMetadataSys {
             if reload {
                 // TODO: globalBucketTargetSys
             }
-
+            //println!("549 {:?}", config.clone());
             Ok((config.clone(), bm.replication_config_updated_at))
         } else {
             Err(BucketMetadataError::BucketReplicationConfigNotFound.into())
@@ -584,9 +593,12 @@ impl BucketMetadataSys {
             }
         };
 
+        println!("573");
+
         if let Some(config) = &bm.bucket_target_config {
             if reload {
                 // TODO: globalBucketTargetSys
+                //config.
             }
 
             Ok(config.clone())

@@ -32,11 +32,11 @@ runs:
 
     - uses: arduino/setup-protoc@v3
       with:
-        version: "30.2"
+        version: "31.1"
 
     - uses: Nugine/setup-flatc@v1
       with:
-        version: "24.3.25"
+        version: "25.2.10"
 
     - uses: dtolnay/rust-toolchain@master
       with:

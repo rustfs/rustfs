@@ -42,8 +42,9 @@ fn encrypt<T: aes_gcm::aead::Aead>(
     data: &[u8],
 ) -> Result<Vec<u8>, crate::Error> {
     use crate::error::Error;
+    use aes_gcm::aead::rand_core::OsRng;
 
-    let nonce = T::generate_nonce(rand::thread_rng());
+    let nonce = T::generate_nonce(&mut OsRng);
 
     let encryptor = stream.encrypt(&nonce, data).map_err(Error::ErrEncryptFailed)?;
 

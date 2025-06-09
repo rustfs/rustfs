@@ -174,7 +174,7 @@ mod tests {
         // Generate a 3MB random byte array for testing
         let size = 3 * 1024 * 1024;
         let mut data = vec![0u8; size];
-        rand::thread_rng().fill(&mut data[..]);
+        rand::rng().fill(&mut data[..]);
         let reader = Cursor::new(data.clone());
         let mut limit_reader = LimitReader::new(reader, size as u64);
 

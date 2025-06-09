@@ -378,7 +378,7 @@ mod tests {
         // Generate 1MB random data
         let size = 1024 * 1024;
         let mut data = vec![0u8; size];
-        rand::thread_rng().fill(&mut data[..]);
+        rand::rng().fill(&mut data[..]);
 
         let mut hasher = Md5::new();
         hasher.update(&data);
@@ -418,8 +418,8 @@ mod tests {
 
         let mut key = [0u8; 32];
         let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut key);
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
 
         let is_encrypt = true;
 

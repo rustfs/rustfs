@@ -165,7 +165,7 @@ mod tests {
         // Generate 3MB random data
         let size = 3 * 1024 * 1024;
         let mut data = vec![0u8; size];
-        rand::thread_rng().fill(&mut data[..]);
+        rand::rng().fill(&mut data[..]);
         let mut hasher = Md5::new();
         hasher.update(&data);
 

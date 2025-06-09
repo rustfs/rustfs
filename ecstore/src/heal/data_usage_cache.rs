@@ -438,8 +438,8 @@ impl DataUsageCache {
             }
             retries += 1;
             let dur = {
-                let mut rng = rand::thread_rng();
-                rng.gen_range(0..1_000)
+                let mut rng = rand::rng();
+                rng.random_range(0..1_000)
             };
             sleep(Duration::from_millis(dur)).await;
         }

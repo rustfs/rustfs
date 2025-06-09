@@ -348,8 +348,8 @@ mod tests {
         let data = b"hello sse encrypt";
         let mut key = [0u8; 32];
         let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut key);
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
 
         let reader = BufReader::new(&data[..]);
         let encrypt_reader = EncryptReader::new(reader, key, nonce);
@@ -375,8 +375,8 @@ mod tests {
         let data = b"test decrypt only";
         let mut key = [0u8; 32];
         let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut key);
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
 
         // Encrypt
         let reader = BufReader::new(&data[..]);
@@ -401,11 +401,11 @@ mod tests {
         use rand::Rng;
         let size = 1024 * 1024;
         let mut data = vec![0u8; size];
-        rand::thread_rng().fill(&mut data[..]);
+        rand::rng().fill(&mut data[..]);
         let mut key = [0u8; 32];
         let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut key);
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
 
         let reader = std::io::Cursor::new(data.clone());
         let encrypt_reader = EncryptReader::new(reader, key, nonce);

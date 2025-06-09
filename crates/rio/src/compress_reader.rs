@@ -434,7 +434,7 @@ mod tests {
         use rand::Rng;
         // Generate 1MB of random bytes
         let mut data = vec![0u8; 1024 * 1024];
-        rand::thread_rng().fill(&mut data[..]);
+        rand::rng().fill(&mut data[..]);
         let reader = Cursor::new(data.clone());
         let mut compress_reader = CompressReader::new(reader, CompressionAlgorithm::Gzip);
 
@@ -453,7 +453,7 @@ mod tests {
         use rand::Rng;
         // Generate 1MB of random bytes
         let mut data = vec![0u8; 1024 * 1024];
-        rand::thread_rng().fill(&mut data[..]);
+        rand::rng().fill(&mut data[..]);
         let reader = Cursor::new(data.clone());
         let mut compress_reader = CompressReader::new(reader, CompressionAlgorithm::Deflate);
 

@@ -18,8 +18,10 @@ use super::{
     data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
     heal_commands::{HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN, HealScanMode},
 };
+use crate::{bucket::metadata_sys, cmd::bucket_replication::queue_replication_heal};
 use crate::{
     bucket::{versioning::VersioningApi, versioning_sys::BucketVersioningSys},
+    cmd::bucket_replication::ReplicationStatusType,
     disk,
     heal::data_usage::DATA_USAGE_ROOT,
 };
@@ -170,9 +172,9 @@ pub async fn init_data_scanner() {
 
             // Calculate randomized sleep duration
             // Use random factor (0.0 to 1.0) multiplied by the scanner cycle duration
-            let random_factor: f64 = {
-                let mut rng = rand::thread_rng();
-                rng.gen_range(1.0..10.0)
+            let random_factor = {
+                let mut rng = rand::rng();
+                rng.random_range(1.0..10.0)
             };
             let base_cycle_duration = SCANNER_CYCLE.load(Ordering::SeqCst) as f64;
             let sleep_duration_secs = random_factor * base_cycle_duration;
@@ -556,12 +558,113 @@ impl ScannerItem {
         Ok(object_infos)
     }
 
-    pub async fn apply_actions(&self, oi: &ObjectInfo, _size_s: &SizeSummary) -> (bool, usize) {
+    pub async fn apply_actions(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) -> (bool, usize) {
         let done = ScannerMetrics::time(ScannerMetric::Ilm);
         //todo: lifecycle
+        info!(
+            "apply_actions {} {} {:?} {:?}",
+            oi.bucket.clone(),
+            oi.name.clone(),
+            oi.version_id.clone(),
+            oi.user_defined.clone()
+        );
+
+        // Create a mutable clone if you need to modify fields
+        let mut oi = oi.clone();
+        oi.replication_status = ReplicationStatusType::from(
+            oi.user_defined
+                .as_ref()
+                .and_then(|map| map.get("x-amz-bucket-replication-status"))
+                .unwrap_or(&"PENDING".to_string()),
+        );
+        info!("apply status is: {:?}", oi.replication_status);
+        self.heal_replication(&oi, _size_s).await;
         done();
 
         (false, oi.size)
+    }
+
+    pub async fn heal_replication(&mut self, oi: &ObjectInfo, size_s: &mut SizeSummary) {
+        if oi.version_id.is_none() {
+            error!(
+                "heal_replication: no version_id or replication config {} {} {}",
+                oi.bucket,
+                oi.name,
+                oi.version_id.is_none()
+            );
+            return;
+        }
+
+        //let config = s3s::dto::ReplicationConfiguration{ role: todo!(), rules: todo!() };
+        // Use the provided variable instead of borrowing self mutably.
+        let replication = match metadata_sys::get_replication_config(&oi.bucket).await {
+            Ok((replication, _)) => replication,
+            Err(_) => {
+                error!("heal_replication: failed to get replication config for bucket {} {}", oi.bucket, oi.name);
+                return;
+            }
+        };
+        if replication.rules.is_empty() {
+            error!("heal_replication: no replication rules for bucket {} {}", oi.bucket, oi.name);
+            return;
+        }
+        if replication.role.is_empty() {
+            // error!("heal_replication: no replication role for bucket {} {}", oi.bucket, oi.name);
+            // return;
+        }
+
+        //if oi.delete_marker || !oi.version_purge_status.is_empty() {
+        if oi.delete_marker {
+            error!(
+                "heal_replication: delete marker or version purge status {} {} {:?} {} {:?}",
+                oi.bucket, oi.name, oi.version_id, oi.delete_marker, oi.version_purge_status
+            );
+            return;
+        }
+
+        if oi.replication_status == ReplicationStatusType::Completed {
+            return;
+        }
+
+        info!("replication status is: {:?} and user define {:?}", oi.replication_status, oi.user_defined);
+
+        let roi = queue_replication_heal(&oi.bucket, oi, &replication, 3).await;
+
+        if roi.is_none() {
+            info!("not need heal {} {} {:?}", oi.bucket, oi.name, oi.version_id);
+            return;
+        }
+
+        for (arn, tgt_status) in &roi.unwrap().target_statuses {
+            let tgt_size_s = size_s.repl_target_stats.entry(arn.clone()).or_default();
+
+            match tgt_status {
+                ReplicationStatusType::Pending => {
+                    tgt_size_s.pending_count += 1;
+                    tgt_size_s.pending_size += oi.size;
+                    size_s.pending_count += 1;
+                    size_s.pending_size += oi.size;
+                }
+                ReplicationStatusType::Failed => {
+                    tgt_size_s.failed_count += 1;
+                    tgt_size_s.failed_size += oi.size;
+                    size_s.failed_count += 1;
+                    size_s.failed_size += oi.size;
+                }
+                ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
+                    tgt_size_s.replicated_count += 1;
+                    tgt_size_s.replicated_size += oi.size;
+                    size_s.replicated_count += 1;
+                    size_s.replicated_size += oi.size;
+                }
+                _ => {}
+            }
+        }
+
+        if matches!(oi.replication_status, ReplicationStatusType::Replica) {
+            size_s.replica_count += 1;
+            size_s.replica_size += oi.size;
+        }
     }
 }
 

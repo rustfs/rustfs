@@ -16,6 +16,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::error;
 
+use crate::bucket::target::BucketTarget;
 use crate::config::com::{read_config, save_config};
 use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
@@ -278,8 +279,11 @@ impl BucketMetadata {
                 self.replication_config_updated_at = updated;
             }
             BUCKET_TARGETS_FILE => {
-                self.tagging_config_xml = data;
-                self.tagging_config_updated_at = updated;
+                // let x = data.clone();
+                // let str = std::str::from_utf8(&x).expect("Invalid UTF-8");
+                // println!("update config:{}", str);
+                self.bucket_targets_config_json = data.clone();
+                self.bucket_targets_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {}", config_file))),
         }
@@ -342,8 +346,10 @@ impl BucketMetadata {
         if !self.replication_config_xml.is_empty() {
             self.replication_config = Some(deserialize::<ReplicationConfiguration>(&self.replication_config_xml)?);
         }
+        //let temp = self.bucket_targets_config_json.clone();
         if !self.bucket_targets_config_json.is_empty() {
-            self.bucket_target_config = Some(BucketTargets::unmarshal(&self.bucket_targets_config_json)?);
+            let arr: Vec<BucketTarget> = serde_json::from_slice(&self.bucket_targets_config_json)?;
+            self.bucket_target_config = Some(BucketTargets { targets: arr });
         } else {
             self.bucket_target_config = Some(BucketTargets::default())
         }

@@ -15,7 +15,6 @@ use crate::utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
 use futures::future::join_all;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 use rustfs_filemeta::{
     FileInfo, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
@@ -24,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -539,6 +538,9 @@ impl ECStore {
                 error!("gather_results err {:?}", err);
                 let _ = err_tx2.send(Arc::new(err));
             }
+
+            // cancel call exit spawns
+            let _ = cancel_tx.send(true);
         });
 
         let mut result = {
@@ -563,9 +565,6 @@ impl ECStore {
                }
             }
         };
-
-        // cancel call exit spawns
-        cancel_tx.send(true).map_err(Error::other)?;
 
         // wait spawns exit
         join_all(vec![job1, job2]).await;
@@ -621,7 +620,7 @@ impl ECStore {
 
         tokio::spawn(async move {
             if let Err(err) = merge_entry_channels(rx, inputs, sender.clone(), 1).await {
-                println!("merge_entry_channels err {:?}", err)
+                error!("merge_entry_channels err {:?}", err)
             }
         });
 
@@ -715,7 +714,7 @@ impl ECStore {
 
                     let fallback_disks = {
                         if ask_disks > 0 && disks.len() > ask_disks as usize {
-                            let mut rand = thread_rng();
+                            let mut rand = rand::rng();
                             disks.shuffle(&mut rand);
                             disks.split_off(ask_disks as usize)
                         } else {
@@ -1067,7 +1066,10 @@ async fn merge_entry_channels(
                         return Ok(())
                     }
                 },
-                _ = rx.recv()=>return Err(Error::other("cancel")),
+                _ = rx.recv()=>{
+                    warn!("merge_entry_channels rx.recv() cancel");
+                    return Ok(())
+                },
             }
         }
     }
@@ -1230,7 +1232,7 @@ impl SetDisks {
         let mut fallback_disks = Vec::new();
 
         if ask_disks > 0 && disks.len() > ask_disks as usize {
-            let mut rand = thread_rng();
+            let mut rand = rand::rng();
             disks.shuffle(&mut rand);
 
             fallback_disks = disks.split_off(ask_disks as usize);
