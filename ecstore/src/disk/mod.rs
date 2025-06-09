@@ -753,7 +753,7 @@ impl MetaCacheEntry {
                 });
             }
 
-            let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
+            let fi = fm.to_fileinfo(bucket, self.name.as_str(), "", false, false)?;
 
             return Ok(fi);
         }
@@ -761,7 +761,7 @@ impl MetaCacheEntry {
         let mut fm = FileMeta::new();
         fm.unmarshal_msg(&self.metadata)?;
 
-        let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
+        let fi = fm.to_fileinfo(bucket, self.name.as_str(), "", false, false)?;
 
         Ok(fi)
     }

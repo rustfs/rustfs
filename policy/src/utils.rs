@@ -14,10 +14,10 @@ pub fn gen_access_key(length: usize) -> Result<String> {
     }
 
     let mut result = String::with_capacity(length);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     for _ in 0..length {
-        result.push(ALPHA_NUMERIC_TABLE[rng.gen_range(0..ALPHA_NUMERIC_TABLE.len())]);
+        result.push(ALPHA_NUMERIC_TABLE[rng.random_range(0..ALPHA_NUMERIC_TABLE.len())]);
     }
 
     Ok(result)
@@ -29,7 +29,7 @@ pub fn gen_secret_key(length: usize) -> Result<String> {
     if length < 8 {
         return Err(Error::msg("secret key length is too short"));
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let mut key = vec![0u8; URL_SAFE_NO_PAD.estimated_decoded_length(length)];
     rng.fill_bytes(&mut key);

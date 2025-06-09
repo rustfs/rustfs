@@ -61,10 +61,7 @@ use http::HeaderMap;
 use lock::{namespace_lock::NsLockMap, LockApi};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use md5::{Digest as Md5Digest, Md5};
-use rand::{
-    thread_rng,
-    {seq::SliceRandom, Rng},
-};
+use rand::{seq::SliceRandom, Rng};
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::time::SystemTime;
@@ -136,7 +133,7 @@ impl SetDisks {
             }
         }
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         disks.shuffle(&mut rng);
 
@@ -145,7 +142,7 @@ impl SetDisks {
     async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_online_disks().await;
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         disks.shuffle(&mut rng);
 
@@ -170,10 +167,10 @@ impl SetDisks {
         let mut futures = Vec::with_capacity(disks.len());
         let mut numbers: Vec<usize> = (0..disks.len()).collect();
         {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             disks.shuffle(&mut rng);
 
-            numbers.shuffle(&mut thread_rng());
+            numbers.shuffle(&mut rng);
         }
 
         for &i in numbers.iter() {
@@ -247,7 +244,7 @@ impl SetDisks {
     async fn _get_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_disks_internal().await;
 
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
 
         disks.shuffle(&mut rng);
 
@@ -1275,7 +1272,7 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let finfo = match meta.into_fileinfo(bucket, object, "", true, true) {
+        let finfo = match meta.to_fileinfo(bucket, object, "", true, true) {
             Ok(res) => res,
             Err(err) => {
                 for item in errs.iter_mut() {
@@ -1302,7 +1299,7 @@ impl SetDisks {
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
-                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, true) {
+                match meta.to_fileinfo(bucket, object, vid.to_string().as_str(), read_data, true) {
                     Ok(res) => meta_file_infos[idx] = res,
                     Err(err) => errs[idx] = Some(err),
                 }
@@ -2929,7 +2926,7 @@ impl SetDisks {
         // in different order per erasure set, this wider spread is needed when
         // there are lots of buckets with different order of objects in them.
         let permutes = {
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
             let mut permutes: Vec<usize> = (0..buckets.len()).collect();
             permutes.shuffle(&mut rng);
             permutes
@@ -2951,8 +2948,8 @@ impl SetDisks {
 
         let (buckets_results_tx, mut buckets_results_rx) = mpsc::channel::<DataUsageEntryInfo>(disks.len());
         let update_time = {
-            let mut rng = thread_rng();
-            Duration::from_secs(30) + Duration::from_secs_f64(10.0 * rng.gen_range(0.0..1.0))
+            let mut rng = rand::rng();
+            Duration::from_secs(30) + Duration::from_secs_f64(10.0 * rng.random_range(0.0..1.0))
         };
         let mut ticker = interval(update_time);
 
@@ -3297,7 +3294,7 @@ impl SetDisks {
             }
 
             {
-                let mut rng = thread_rng();
+                let mut rng = rand::rng();
 
                 // 随机洗牌
                 disks.shuffle(&mut rng);

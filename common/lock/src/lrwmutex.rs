@@ -77,8 +77,8 @@ impl LRWMutex {
                 }
                 let sleep_time: u64;
                 {
-                    let mut rng = rand::thread_rng();
-                    sleep_time = rng.gen_range(10..=50);
+                    let mut rng = rand::rng();
+                    sleep_time = rng.random_range(10..=50);
                 }
                 sleep(Duration::from_millis(sleep_time)).await;
             }

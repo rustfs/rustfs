@@ -148,7 +148,7 @@ pin-project-lite = "0.2.16"
 prost = "0.13.5"
 prost-build = "0.13.5"
 protobuf = "3.7"
-rand = "0.8.5"
+rand = "0.9.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 regex = { version = "1.11.1" }
