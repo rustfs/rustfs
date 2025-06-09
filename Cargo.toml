@@ -80,7 +80,6 @@ const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
 datafusion = "46.0.1"
 derive_builder = "0.20.2"
-dotenvy = "0.15.7"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
 dotenvy = "0.15.7"

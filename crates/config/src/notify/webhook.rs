@@ -7,7 +7,6 @@ pub struct WebhookArgs {
     pub endpoint: String,
     pub auth_token: String,
     #[serde(skip)]
-    pub transport: Option<()>, // Placeholder for *http.Transport
     pub queue_dir: String,
     pub queue_limit: u64,
     pub client_cert: String,
@@ -21,7 +20,6 @@ impl WebhookArgs {
             enable: false,
             endpoint: "".to_string(),
             auth_token: "".to_string(),
-            transport: None,
             queue_dir: "".to_string(),
             queue_limit: 0,
             client_cert: "".to_string(),
@@ -62,7 +60,6 @@ mod tests {
         let args = WebhookArgs::new();
         assert_eq!(args.endpoint, "");
         assert_eq!(args.auth_token, "");
-        assert!(args.transport.is_none());
         assert_eq!(args.queue_dir, "");
         assert_eq!(args.queue_limit, 0);
         assert_eq!(args.client_cert, "");
