@@ -17,7 +17,7 @@ webhook = ["dep:reqwest"]
 kafka = ["dep:rdkafka"]
 
 [dependencies]
-rustfs-config = { workspace = true }
+rustfs-config = { workspace = true, features = ["constants"] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 flexi_logger = { workspace = true, features = ["trc", "kv"] }

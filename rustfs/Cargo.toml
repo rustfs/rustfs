@@ -57,7 +57,7 @@ protos.workspace = true
 query = { workspace = true }
 regex = { workspace = true }
 rmp-serde.workspace = true
-rustfs-config = { workspace = true }
+rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }

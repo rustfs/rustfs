@@ -1,4 +1,3 @@
-use config::ConfigError;
 use thiserror::Error;
 use tokio::sync::mpsc::error;
 use tokio::task::JoinError;
@@ -35,8 +34,6 @@ pub enum Error {
     Custom(String),
     #[error("Configuration error: {0}")]
     ConfigError(String),
-    #[error("Configuration loading error: {0}")]
-    Config(#[from] ConfigError),
     #[error("create adapter failed error: {0}")]
     AdapterCreationFailed(String),
 }
@@ -147,20 +144,6 @@ mod tests {
                 assert!(converted_error.to_string().contains("Serialization error"));
             }
             _ => panic!("Expected Serde error variant"),
-        }
-    }
-
-    #[test]
-    fn test_config_error_conversion() {
-        // Test configuration error conversion
-        let config_error = ConfigError::Message("invalid configuration".to_string());
-        let converted_error: Error = config_error.into();
-
-        match converted_error {
-            Error::Config(_) => {
-                assert!(converted_error.to_string().contains("Configuration loading error"));
-            }
-            _ => panic!("Expected Config error variant"),
         }
     }
 

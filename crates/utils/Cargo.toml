@@ -8,7 +8,7 @@ version.workspace = true
 
 [dependencies]
 local-ip-address = { workspace = true, optional = true }
-rustfs-config = { workspace = true }
+rustfs-config = { workspace = true, features = ["constants"] }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
