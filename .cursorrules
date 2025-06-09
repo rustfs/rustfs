@@ -32,10 +32,24 @@ RustFS is a high-performance distributed object storage system written in Rust, 
 - Avoid blocking operations, use `spawn_blocking` when necessary
 
 ### 3. Error Handling Strategy
-- Use unified error type `common::error::Error`
-- Support error chains and context information
-- Use `thiserror` to define specific error types
-- Error conversion uses `downcast_ref` for type checking
+- **Use modular, type-safe error handling with `thiserror`**
+- Each module should define its own error type using `thiserror::Error` derive macro
+- Support error chains and context information through `#[from]` and `#[source]` attributes
+- Use `Result<T>` type aliases for consistency within each module
+- Error conversion between modules should use explicit `From` implementations
+- Follow the pattern: `pub type Result<T> = core::result::Result<T, Error>`
+- Use `#[error("description")]` attributes for clear error messages
+- Support error downcasting when needed through `other()` helper methods
+- Implement `Clone` for errors when required by the domain logic
+- **Current module error types:**
+  - `ecstore::error::StorageError` - Storage layer errors
+  - `ecstore::disk::error::DiskError` - Disk operation errors
+  - `iam::error::Error` - Identity and access management errors
+  - `policy::error::Error` - Policy-related errors
+  - `crypto::error::Error` - Cryptographic operation errors
+  - `filemeta::error::Error` - File metadata errors
+  - `rustfs::error::ApiError` - API layer errors
+  - Module-specific error types for specialized functionality
 
 ## Code Style Guidelines
 
@@ -263,34 +277,192 @@ info!(
 
 ### 1. Error Type Definition
 ```rust
-#[derive(Debug, thiserror::Error)]
+// Use thiserror for module-specific error types
+#[derive(thiserror::Error, Debug)]
 pub enum MyError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    
+    #[error("Storage error: {0}")]
+    Storage(#[from] ecstore::error::StorageError),
+    
     #[error("Custom error: {message}")]
     Custom { message: String },
+    
+    #[error("File not found: {path}")]
+    FileNotFound { path: String },
+    
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+}
+
+// Provide Result type alias for the module
+pub type Result<T> = core::result::Result<T, MyError>;
+```
+
+### 2. Error Helper Methods
+```rust
+impl MyError {
+    /// Create error from any compatible error type
+    pub fn other<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        MyError::Io(std::io::Error::other(error))
+    }
 }
 ```
 
-### 2. Error Conversion
+### 3. Error Conversion Between Modules
 ```rust
-pub fn to_s3_error(err: Error) -> S3Error {
-    if let Some(storage_err) = err.downcast_ref::<StorageError>() {
-        match storage_err {
-            StorageError::ObjectNotFound(bucket, object) => {
-                s3_error!(NoSuchKey, "{}/{}", bucket, object)
+// Convert between different module error types
+impl From<ecstore::error::StorageError> for MyError {
+    fn from(e: ecstore::error::StorageError) -> Self {
+        match e {
+            ecstore::error::StorageError::FileNotFound => {
+                MyError::FileNotFound { path: "unknown".to_string() }
             }
-            // Other error types...
+            _ => MyError::Storage(e),
         }
     }
-    // Default error handling
+}
+
+// Provide reverse conversion when needed
+impl From<MyError> for ecstore::error::StorageError {
+    fn from(e: MyError) -> Self {
+        match e {
+            MyError::FileNotFound { .. } => ecstore::error::StorageError::FileNotFound,
+            MyError::Storage(e) => e,
+            _ => ecstore::error::StorageError::other(e),
+        }
+    }
 }
 ```
 
-### 3. Error Context
+### 4. Error Context and Propagation
 ```rust
-// Add error context
-.map_err(|e| Error::from_string(format!("Failed to process {}: {}", path, e)))?
+// Use ? operator for clean error propagation
+async fn example_function() -> Result<()> {
+    let data = read_file("path").await?;
+    process_data(data).await?;
+    Ok(())
+}
+
+// Add context to errors
+fn process_with_context(path: &str) -> Result<()> {
+    std::fs::read(path)
+        .map_err(|e| MyError::Custom { 
+            message: format!("Failed to read {}: {}", path, e) 
+        })?;
+    Ok(())
+}
+```
+
+### 5. API Error Conversion (S3 Example)
+```rust
+// Convert storage errors to API-specific errors
+use s3s::{S3Error, S3ErrorCode};
+
+#[derive(Debug)]
+pub struct ApiError {
+    pub code: S3ErrorCode,
+    pub message: String,
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl From<ecstore::error::StorageError> for ApiError {
+    fn from(err: ecstore::error::StorageError) -> Self {
+        let code = match &err {
+            ecstore::error::StorageError::BucketNotFound(_) => S3ErrorCode::NoSuchBucket,
+            ecstore::error::StorageError::ObjectNotFound(_, _) => S3ErrorCode::NoSuchKey,
+            ecstore::error::StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyExists,
+            ecstore::error::StorageError::InvalidArgument(_, _, _) => S3ErrorCode::InvalidArgument,
+            ecstore::error::StorageError::MethodNotAllowed => S3ErrorCode::MethodNotAllowed,
+            ecstore::error::StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
+            _ => S3ErrorCode::InternalError,
+        };
+
+        ApiError {
+            code,
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
+impl From<ApiError> for S3Error {
+    fn from(err: ApiError) -> Self {
+        let mut s3e = S3Error::with_message(err.code, err.message);
+        if let Some(source) = err.source {
+            s3e.set_source(source);
+        }
+        s3e
+    }
+}
+```
+
+### 6. Error Handling Best Practices
+
+#### Pattern Matching and Error Classification
+```rust
+// Use pattern matching for specific error handling
+async fn handle_storage_operation() -> Result<()> {
+    match storage.get_object("bucket", "key").await {
+        Ok(object) => process_object(object),
+        Err(ecstore::error::StorageError::ObjectNotFound(bucket, key)) => {
+            warn!("Object not found: {}/{}", bucket, key);
+            create_default_object(bucket, key).await
+        }
+        Err(ecstore::error::StorageError::BucketNotFound(bucket)) => {
+            error!("Bucket not found: {}", bucket);
+            Err(MyError::Custom { 
+                message: format!("Bucket {} does not exist", bucket) 
+            })
+        }
+        Err(e) => {
+            error!("Storage operation failed: {}", e);
+            Err(MyError::Storage(e))
+        }
+    }
+}
+```
+
+#### Error Aggregation and Reporting
+```rust
+// Collect and report multiple errors
+pub fn validate_configuration(config: &Config) -> Result<()> {
+    let mut errors = Vec::new();
+    
+    if config.bucket_name.is_empty() {
+        errors.push("Bucket name cannot be empty");
+    }
+    
+    if config.region.is_empty() {
+        errors.push("Region must be specified");
+    }
+    
+    if !errors.is_empty() {
+        return Err(MyError::Custom {
+            message: format!("Configuration validation failed: {}", errors.join(", "))
+        });
+    }
+    
+    Ok(())
+}
+```
+
+#### Contextual Error Information
+```rust
+// Add operation context to errors
+#[tracing::instrument(skip(self))]
+async fn upload_file(&self, bucket: &str, key: &str, data: Vec<u8>) -> Result<()> {
+    self.storage
+        .put_object(bucket, key, data)
+        .await
+        .map_err(|e| MyError::Custom {
+            message: format!("Failed to upload {}/{}: {}", bucket, key, e)
+        })
+}
 ```
 
 ## Performance Optimization Guidelines
@@ -330,6 +502,45 @@ mod tests {
     #[test_case("input2", "expected2")]
     fn test_with_cases(input: &str, expected: &str) {
         assert_eq!(function(input), expected);
+    }
+
+    #[test]
+    fn test_error_conversion() {
+        use ecstore::error::StorageError;
+        
+        let storage_err = StorageError::BucketNotFound("test-bucket".to_string());
+        let api_err: ApiError = storage_err.into();
+        
+        assert_eq!(api_err.code, S3ErrorCode::NoSuchBucket);
+        assert!(api_err.message.contains("test-bucket"));
+        assert!(api_err.source.is_some());
+    }
+
+    #[test]
+    fn test_error_types() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let my_err = MyError::Io(io_err);
+        
+        // Test error matching
+        match my_err {
+            MyError::Io(_) => {}, // Expected
+            _ => panic!("Unexpected error type"),
+        }
+    }
+
+    #[test]
+    fn test_error_context() {
+        let result = process_with_context("nonexistent_file.txt");
+        assert!(result.is_err());
+        
+        let err = result.unwrap_err();
+        match err {
+            MyError::Custom { message } => {
+                assert!(message.contains("Failed to read"));
+                assert!(message.contains("nonexistent_file.txt"));
+            }
+            _ => panic!("Expected Custom error"),
+        }
     }
 }
 ```
