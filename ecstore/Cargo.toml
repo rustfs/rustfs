@@ -10,6 +10,11 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["reed-solomon-simd"]
+reed-solomon-simd = ["dep:reed-solomon-simd"]
+reed-solomon-erasure = ["dep:reed-solomon-erasure"]
+
 [dependencies]
 rustfs-config = { workspace = true }
 async-trait.workspace = true
@@ -35,7 +40,8 @@ http.workspace = true
 highway = { workspace = true }
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
-reed-solomon-erasure = { workspace = true }
+reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"], optional = true }
+reed-solomon-simd = { version = "3.0.0", optional = true }
 transform-stream = "0.3.1"
 lazy_static.workspace = true
 lock.workspace = true
