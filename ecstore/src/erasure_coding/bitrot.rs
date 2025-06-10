@@ -367,6 +367,7 @@ mod tests {
 
         // 读
         let reader = bitrot_writer.into_inner();
+        let reader = Cursor::new(reader.into_inner());
         let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256);
         let mut out = Vec::new();
         let mut n = 0;
@@ -442,6 +443,7 @@ mod tests {
         assert_eq!(n, data.len());
 
         let reader = bitrot_writer.into_inner();
+        let reader = Cursor::new(reader.into_inner());
         let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::None);
         let mut out = Vec::new();
         let mut n = 0;

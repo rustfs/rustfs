@@ -2,7 +2,7 @@ use super::error::{Error, Result};
 use super::os::{is_root_disk, rename_all};
 use super::{
     BUCKET_META_PREFIX, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, Info, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+    FileInfoVersions, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
     STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, os,
 };
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
@@ -32,7 +32,7 @@ use crate::heal::heal_commands::{HealScanMode, HealingTracker};
 use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
 use crate::new_object_layer_fn;
 use crate::store_api::{ObjectInfo, StorageAPI};
-use crate::utils::os::get_info;
+// use crate::utils::os::get_info;
 use crate::utils::path::{
     GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
     path_join, path_join_buf,
@@ -46,6 +46,7 @@ use rustfs_filemeta::{
     read_xl_meta_no_data,
 };
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::os::get_info;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::io::SeekFrom;
@@ -2284,7 +2285,7 @@ impl DiskAPI for LocalDisk {
     }
 }
 
-async fn get_disk_info(drive_path: PathBuf) -> Result<(Info, bool)> {
+async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
 

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Addr};
 use madmin::metrics::{DiskIOStats, DiskMetric, RealtimeMetrics};
+use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -14,7 +15,7 @@ use crate::{
     },
     new_object_layer_fn,
     store_api::StorageAPI,
-    utils::os::get_drive_stats,
+    // utils::os::get_drive_stats,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
