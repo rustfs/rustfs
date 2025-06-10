@@ -32,7 +32,7 @@
 //! - Small vs large shard scenarios for SIMD optimization
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use ecstore::erasure_coding::Erasure;
+use ecstore::erasure_coding::{Erasure, calc_shard_size};
 use std::time::Duration;
 
 /// 基准测试配置结构体
@@ -122,7 +122,7 @@ fn bench_encode_performance(c: &mut Criterion) {
                     let encoder = ReedSolomonEncoder::new(config.data_shards, config.parity_shards).unwrap();
                     b.iter(|| {
                         // 创建编码所需的数据结构
-                        let per_shard_size = data.len().div_ceil(config.data_shards);
+                        let per_shard_size = calc_shard_size(data.len(), config.data_shards);
                         let total_size = per_shard_size * (config.data_shards + config.parity_shards);
                         let mut buffer = vec![0u8; total_size];
                         buffer[..data.len()].copy_from_slice(data);
@@ -141,7 +141,7 @@ fn bench_encode_performance(c: &mut Criterion) {
         #[cfg(feature = "reed-solomon-simd")]
         {
             // 只对大shard测试SIMD（小于512字节的shard SIMD性能不佳）
-            let shard_size = config.data_size.div_ceil(config.data_shards);
+            let shard_size = calc_shard_size(config.data_size, config.data_shards);
             if shard_size >= 512 {
                 let mut simd_group = c.benchmark_group("encode_simd_direct");
                 simd_group.throughput(Throughput::Bytes(config.data_size as u64));
@@ -154,15 +154,20 @@ fn bench_encode_performance(c: &mut Criterion) {
                     |b, (data, config)| {
                         b.iter(|| {
                             // 直接使用SIMD实现
-                            let per_shard_size = data.len().div_ceil(config.data_shards);
+                            let per_shard_size = calc_shard_size(data.len(), config.data_shards);
                             match reed_solomon_simd::ReedSolomonEncoder::new(
                                 config.data_shards,
                                 config.parity_shards,
                                 per_shard_size,
                             ) {
                                 Ok(mut encoder) => {
-                                    // 添加数据分片
-                                    for chunk in data.chunks(per_shard_size) {
+                                    // 创建正确大小的缓冲区，并填充数据
+                                    let mut buffer = vec![0u8; per_shard_size * config.data_shards];
+                                    let copy_len = data.len().min(buffer.len());
+                                    buffer[..copy_len].copy_from_slice(&data[..copy_len]);
+
+                                    // 按正确的分片大小添加数据分片
+                                    for chunk in buffer.chunks_exact(per_shard_size) {
                                         encoder.add_original_shard(black_box(chunk)).unwrap();
                                     }
 
@@ -232,7 +237,7 @@ fn bench_decode_performance(c: &mut Criterion) {
         // 如果使用混合模式（默认），测试SIMD解码性能
         #[cfg(not(feature = "reed-solomon-erasure"))]
         {
-            let shard_size = config.data_size.div_ceil(config.data_shards);
+            let shard_size = calc_shard_size(config.data_size, config.data_shards);
             if shard_size >= 512 {
                 let mut simd_group = c.benchmark_group("decode_simd_direct");
                 simd_group.throughput(Throughput::Bytes(config.data_size as u64));
@@ -244,7 +249,7 @@ fn bench_decode_performance(c: &mut Criterion) {
                     &(&encoded_shards, &config),
                     |b, (shards, config)| {
                         b.iter(|| {
-                            let per_shard_size = config.data_size.div_ceil(config.data_shards);
+                            let per_shard_size = calc_shard_size(config.data_size, config.data_shards);
                             match reed_solomon_simd::ReedSolomonDecoder::new(
                                 config.data_shards,
                                 config.parity_shards,
