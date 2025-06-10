@@ -114,13 +114,13 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
         }
     };
 
-    let mut pattens = Vec::new();
+    let mut patterns = Vec::new();
     while let Some(prefix) = parts.get(1) {
         let seq = parse_ellipses_range(parts[2].into())?;
 
         match ELLIPSES_RE.captures(prefix.into()) {
             Some(cs) => {
-                pattens.push(Pattern {
+                patterns.push(Pattern {
                     seq,
                     prefix: String::new(),
                     suffix: parts[3].into(),
@@ -128,7 +128,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
                 parts = cs;
             }
             None => {
-                pattens.push(Pattern {
+                patterns.push(Pattern {
                     seq,
                     prefix: prefix.as_str().to_owned(),
                     suffix: parts[3].into(),
@@ -141,7 +141,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
     // Check if any of the prefix or suffixes now have flower braces
     // left over, in such a case we generally think that there is
     // perhaps a typo in users input and error out accordingly.
-    for p in pattens.iter() {
+    for p in patterns.iter() {
         if p.prefix.contains(OPEN_BRACES)
             || p.prefix.contains(CLOSE_BRACES)
             || p.suffix.contains(OPEN_BRACES)
@@ -154,7 +154,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
         }
     }
 
-    Ok(ArgPattern::new(pattens))
+    Ok(ArgPattern::new(patterns))
 }
 
 /// returns true if input arg has ellipses type pattern.
@@ -173,7 +173,7 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
     if !pattern.contains(OPEN_BRACES) {
         return Err(Error::other("Invalid argument"));
     }
-    if !pattern.contains(OPEN_BRACES) {
+    if !pattern.contains(CLOSE_BRACES) {
         return Err(Error::other("Invalid argument"));
     }
 
