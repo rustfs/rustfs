@@ -1,5 +1,5 @@
 use crate::config::EventNotifierConfig;
-use crate::Event;
+use crate::event::Event;
 use common::error::{Error, Result};
 use ecstore::store::ECStore;
 use std::sync::Arc;

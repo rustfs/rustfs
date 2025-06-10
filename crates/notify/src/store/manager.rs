@@ -115,11 +115,6 @@ impl EventManager {
             merged.webhook.insert(id, config);
         }
 
-        // Merge Kafka configurations
-        for (id, config) in new.kafka {
-            merged.kafka.insert(id, config);
-        }
-
         // Merge MQTT configurations
         for (id, config) in new.mqtt {
             merged.mqtt.insert(id, config);

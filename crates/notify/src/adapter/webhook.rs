@@ -1,8 +1,5 @@
-use crate::config::webhook::WebhookConfig;
 use crate::config::STORE_PREFIX;
-use crate::store::queue::Store;
 use crate::{ChannelAdapter, ChannelAdapterType};
-use crate::{Error, QueueStore};
 use crate::{Event, DEFAULT_RETRY_INTERVAL};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};

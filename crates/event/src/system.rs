@@ -1,4 +1,3 @@
-use crate::config::EventNotifierConfig;
 use crate::notifier::EventNotifier;
 use common::error::Result;
 use ecstore::store::ECStore;

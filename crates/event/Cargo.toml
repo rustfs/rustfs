@@ -1,24 +1,17 @@
 [package]
-name = "rustfs-notify"
+name = "rustfs-event"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[features]
-default = ["webhook"]
-webhook = ["dep:reqwest"]
-mqtt = ["rumqttc"]
-
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
-async-trait = { workspace = true }
 common = { workspace = true }
 ecstore = { workspace = true }
 once_cell = { workspace = true }
 reqwest = { workspace = true, optional = true }
-rumqttc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
@@ -29,13 +22,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "macros", "signal", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
-snap = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber = { workspace = true }
-axum = { workspace = true }
-dotenvy = { workspace = true }
 
 [lints]
 workspace = true

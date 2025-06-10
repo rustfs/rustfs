@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// WebhookArgs - Webhook target arguments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7,6 +8,7 @@ pub struct WebhookArgs {
     pub endpoint: String,
     pub auth_token: String,
     #[serde(skip)]
+    pub custom_headers: Option<HashMap<String, String>>,
     pub queue_dir: String,
     pub queue_limit: u64,
     pub client_cert: String,
@@ -20,6 +22,7 @@ impl WebhookArgs {
             enable: false,
             endpoint: "".to_string(),
             auth_token: "".to_string(),
+            custom_headers: None,
             queue_dir: "".to_string(),
             queue_limit: 0,
             client_cert: "".to_string(),
@@ -53,13 +56,14 @@ impl Default for WebhookArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::notify::webhook::WebhookArgs;
 
     #[test]
     fn test_webhook_args_new() {
         let args = WebhookArgs::new();
         assert_eq!(args.endpoint, "");
         assert_eq!(args.auth_token, "");
+        assert!(args.custom_headers.is_none());
         assert_eq!(args.queue_dir, "");
         assert_eq!(args.queue_limit, 0);
         assert_eq!(args.client_cert, "");

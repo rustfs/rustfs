@@ -7,9 +7,11 @@ members = [
     "common/protos", # Protocol buffer definitions
     "common/workers", # Worker thread pools and task scheduling
     "crates/config", # Configuration management
-    "crates/notify", # Event notification system
+    "crates/event", # Event handling and processing
+    "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
     "crates/utils", # Utility functions and helpers
+    "crates/zip", # ZIP file handling and compression
     "crypto", # Cryptography and security features
     "ecstore", # Erasure coding storage implementation
     "e2e_test", # End-to-end test suite
@@ -18,7 +20,6 @@ members = [
     "rustfs", # Core file system implementation
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
-    "crates/zip",
 ]
 resolver = "2"
 
@@ -74,7 +75,7 @@ byteorder = "1.5.0"
 cfg-if = "1.0.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.39", features = ["derive", "env"] }
+clap = { version = "4.5.40", features = ["derive", "env"] }
 const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
 datafusion = "46.0.1"
@@ -184,7 +185,7 @@ serde_urlencoded = "0.7.1"
 serde_with = "3.12.0"
 sha2 = "0.10.9"
 siphasher = "1.0.1"
-smallvec = { version = "1.15.0", features = ["serde"] }
+smallvec = { version = "1.15.1", features = ["serde"] }
 
 snafu = "0.8.6"
 snap = "1.1.1"

@@ -8127,6 +8127,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-event"
+version = "0.0.1"
+dependencies = [
+ "common",
+ "ecstore",
+ "once_cell",
+ "reqwest",
+ "rustfs-config",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "smallvec",
+ "strum",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rustfs-gui"
 version = "0.0.1"
 dependencies = [
@@ -8156,11 +8177,10 @@ dependencies = [
  "common",
  "dotenvy",
  "ecstore",
- "lazy_static",
  "once_cell",
- "rdkafka",
  "reqwest",
  "rumqttc",
+ "rustfs-config",
  "serde",
  "serde_json",
  "serde_with",
@@ -9047,9 +9067,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.15.0"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8917285742e9f3e1683f0a9c4e6b57960b7314d0b08d30d1ecd426713ee2eee9"
+checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 dependencies = [
  "serde",
 ]
