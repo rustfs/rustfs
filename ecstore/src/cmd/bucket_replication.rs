@@ -1,7 +1,6 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 // use error::Error;
-use crate::StorageAPI;
 use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::error::Error;
@@ -12,25 +11,26 @@ use crate::store_api::ObjectIO;
 use crate::store_api::ObjectInfo;
 use crate::store_api::ObjectOptions;
 use crate::store_api::ObjectToDelete;
-use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::Config;
+use crate::StorageAPI;
 use aws_sdk_s3::config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::config::Region;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::Config;
 use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
-use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use http::HeaderMap;
 use http::Method;
 use lazy_static::lazy_static;
 // use std::time::SystemTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use rustfs_rsc::Minio;
 use rustfs_rsc::provider::StaticProvider;
+use rustfs_rsc::Minio;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::ExistingObjectReplicationStatus;
@@ -42,14 +42,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::iter::Iterator;
-use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::vec;
 use time::OffsetDateTime;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -831,7 +831,8 @@ impl ReplicationPool {
 
     fn get_worker_ch(&self, bucket: &str, object: &str, _sz: i64) -> Option<&Sender<Box<dyn ReplicationWorkerOperation>>> {
         let h = xxh3_64(format!("{}{}", bucket, object).as_bytes()); // 计算哈希值
-        //need lock;
+
+        // need lock;
         let workers = &self.workers_sender; // 读锁
 
         if workers.is_empty() {

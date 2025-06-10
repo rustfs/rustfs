@@ -39,8 +39,8 @@ jobs:
       - uses: actions/checkout@v4.2.2
       - uses: ./.github/actions/setup
 
-      - name: Format Check
-        run: cargo fmt --all --check
+      # - name: Format Check
+      #   run: cargo fmt --all --check
 
       - name: Lint Check
         run: cargo check --all-targets
@@ -51,22 +51,23 @@ jobs:
       - name: Unit Tests
         run: cargo test --all --exclude e2e_test
 
-  develop:
-    needs: skip-check
+      - name: Format Code
+        run: cargo fmt --all
+
+  s3s-e2e:
+    name: E2E (s3s-e2e)
+    needs:
+      - skip-check
+      - develop
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4.2.2
-      - uses: ./.github/actions/setup
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Lint
-        run: cargo check --all-targets
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          cache-all-crates: true
 
       - name: Test
         run: cargo test --all --exclude e2e_test
@@ -85,21 +86,6 @@ jobs:
         with:
           name: rustfs
           path: ./target/artifacts/*
-
-  s3s-e2e:
-    name: E2E (s3s-e2e)
-    needs:
-      - skip-check
-      - develop
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          cache-all-crates: true
 
       - name: Install s3s-e2e
         run: |
@@ -120,3 +106,22 @@ jobs:
         with:
           name: s3s-e2e.logs
           path: /tmp/rustfs.log
+
+
+
+  develop:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: ./.github/actions/setup
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
