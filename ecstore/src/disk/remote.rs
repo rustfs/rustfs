@@ -7,7 +7,7 @@ use protos::{
     proto_gen::node_service::{
         CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
         DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, NsScannerRequest,
-        ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequst,
+        ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
         StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
@@ -40,7 +40,7 @@ use crate::{
     },
 };
 
-use protos::proto_gen::node_service::RenamePartRequst;
+use protos::proto_gen::node_service::RenamePartRequest;
 
 #[derive(Debug)]
 pub struct RemoteDisk {
@@ -631,7 +631,7 @@ impl DiskAPI for RemoteDisk {
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(RenameFileRequst {
+        let request = Request::new(RenameFileRequest {
             disk: self.endpoint.to_string(),
             src_volume: src_volume.to_string(),
             src_path: src_path.to_string(),
@@ -654,7 +654,7 @@ impl DiskAPI for RemoteDisk {
         let mut client = node_service_time_out_client(&self.addr)
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(RenamePartRequst {
+        let request = Request::new(RenamePartRequest {
             disk: self.endpoint.to_string(),
             src_volume: src_volume.to_string(),
             src_path: src_path.to_string(),
