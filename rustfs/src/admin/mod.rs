@@ -3,7 +3,6 @@ pub mod router;
 mod rpc;
 pub mod utils;
 
-use common::error::Result;
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
     group, policys, pools, rebalance,
@@ -20,7 +19,7 @@ use s3s::route::S3Route;
 const ADMIN_PREFIX: &str = "/rustfs/admin";
 const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin";
 
-pub fn make_admin_route() -> Result<impl S3Route> {
+pub fn make_admin_route() -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new();
 
     // 1
@@ -126,7 +125,7 @@ pub fn make_admin_route() -> Result<impl S3Route> {
     Ok(r)
 }
 
-fn register_user_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
+fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     // 1
     r.insert(
         Method::GET,

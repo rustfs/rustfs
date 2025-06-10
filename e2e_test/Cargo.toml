@@ -28,3 +28,4 @@ tower.workspace = true
 url.workspace = true
 madmin.workspace =true
 common.workspace = true
+rustfs-filemeta.workspace = true

@@ -1,6 +1,6 @@
 use crate::logger::InitLogStatus;
-use crate::telemetry::{init_telemetry, OtelGuard};
-use crate::{get_global_logger, init_global_logger, AppConfig, Logger};
+use crate::telemetry::{OtelGuard, init_telemetry};
+use crate::{AppConfig, Logger, get_global_logger, init_global_logger};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, SetError};
 use tracing::{error, info};

@@ -1,5 +1,5 @@
 use super::{error::BucketMetadataError, metadata_sys::get_bucket_metadata_sys};
-use common::error::Result;
+use crate::error::Result;
 use policy::policy::{BucketPolicy, BucketPolicyArgs};
 use tracing::warn;
 
@@ -10,8 +10,9 @@ impl PolicySys {
         match Self::get(args.bucket).await {
             Ok(cfg) => return cfg.is_allowed(args),
             Err(err) => {
-                if !BucketMetadataError::BucketPolicyNotFound.is(&err) {
-                    warn!("config get err {:?}", err);
+                let berr: BucketMetadataError = err.into();
+                if berr != BucketMetadataError::BucketPolicyNotFound {
+                    warn!("config get err {:?}", berr);
                 }
             }
         }

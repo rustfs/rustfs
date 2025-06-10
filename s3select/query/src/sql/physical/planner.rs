@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
+use api::QueryResult;
 use api::query::physical_planner::PhysicalPlanner;
 use api::query::session::SessionCtx;
-use api::QueryResult;
 use async_trait::async_trait;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
 use datafusion::physical_optimizer::coalesce_batches::CoalesceBatches;
 use datafusion::physical_optimizer::join_selection::JoinSelection;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{
     DefaultPhysicalPlanner as DFDefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner as DFPhysicalPlanner,

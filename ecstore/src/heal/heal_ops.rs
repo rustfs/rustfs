@@ -2,8 +2,9 @@ use super::{
     background_heal_ops::HealTask,
     data_scanner::HEAL_DELETE_DANGLING,
     error::ERR_SKIP_FILE,
-    heal_commands::{HealOpts, HealScanMode, HealStopSuccess, HealingTracker, HEAL_ITEM_BUCKET_METADATA},
+    heal_commands::{HEAL_ITEM_BUCKET_METADATA, HealOpts, HealScanMode, HealStopSuccess, HealingTracker},
 };
+use crate::error::{Error, Result};
 use crate::store_api::StorageAPI;
 use crate::{
     config::com::CONFIG_PREFIX,
@@ -12,10 +13,10 @@ use crate::{
     heal::{error::ERR_HEAL_STOP_SIGNALLED, heal_commands::DRIVE_STATE_OK},
 };
 use crate::{
-    disk::{endpoint::Endpoint, MetaCacheEntry},
+    disk::endpoint::Endpoint,
     endpoints::Endpoints,
     global::GLOBAL_IsDistErasure,
-    heal::heal_commands::{HealStartSuccess, HEAL_UNKNOWN_SCAN},
+    heal::heal_commands::{HEAL_UNKNOWN_SCAN, HealStartSuccess},
     new_object_layer_fn,
     utils::path::has_prefix,
 };
@@ -24,10 +25,10 @@ use crate::{
     utils::path::path_join,
 };
 use chrono::Utc;
-use common::error::{Error, Result};
 use futures::join;
 use lazy_static::lazy_static;
 use madmin::heal_commands::{HealDriveInfo, HealItemType, HealResultItem};
+use rustfs_filemeta::MetaCacheEntry;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -40,10 +41,9 @@ use std::{
 use tokio::{
     select, spawn,
     sync::{
-        broadcast,
+        RwLock, broadcast,
         mpsc::{self, Receiver as M_Receiver, Sender as M_Sender},
         watch::{self, Receiver as W_Receiver, Sender as W_Sender},
-        RwLock,
     },
     time::{interval, sleep},
 };
@@ -285,10 +285,10 @@ impl HealSequence {
 
                     }
                     _ = self.is_done() => {
-                        return Err(Error::from_string("stopped"));
+                        return Err(Error::other("stopped"));
                     }
                     _ = interval_timer.tick() => {
-                        return Err(Error::from_string("timeout"));
+                        return Err(Error::other("timeout"));
                     }
                 }
             } else {
@@ -412,7 +412,9 @@ impl HealSequence {
 
     async fn heal_rustfs_sys_meta(h: Arc<HealSequence>, meta_prefix: &str) -> Result<()> {
         info!("heal_rustfs_sys_meta, h: {:?}", h);
-        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+        let Some(store) = new_object_layer_fn() else {
+            return Err(Error::other("errServerNotInitialized"));
+        };
         let setting = h.setting;
         store
             .heal_objects(RUSTFS_META_BUCKET, meta_prefix, &setting, h.clone(), true)
@@ -450,7 +452,9 @@ impl HealSequence {
             }
             (hs.object.clone(), hs.setting)
         };
-        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+        let Some(store) = new_object_layer_fn() else {
+            return Err(Error::other("errServerNotInitialized"));
+        };
         store.heal_objects(bucket, &object, &setting, hs.clone(), false).await
     }
 
@@ -464,7 +468,7 @@ impl HealSequence {
         info!("heal_object");
         if hs.is_quitting().await {
             info!("heal_object hs is quitting");
-            return Err(Error::from_string(ERR_HEAL_STOP_SIGNALLED));
+            return Err(Error::other(ERR_HEAL_STOP_SIGNALLED));
         }
 
         info!("will queue task");
@@ -491,7 +495,7 @@ impl HealSequence {
         _scan_mode: HealScanMode,
     ) -> Result<()> {
         if hs.is_quitting().await {
-            return Err(Error::from_string(ERR_HEAL_STOP_SIGNALLED));
+            return Err(Error::other(ERR_HEAL_STOP_SIGNALLED));
         }
 
         hs.queue_heal_task(
@@ -615,7 +619,7 @@ impl AllHealState {
             Some(h) => {
                 if client_token != h.client_token {
                     info!("err heal invalid client token");
-                    return Err(Error::from_string("err heal invalid client token"));
+                    return Err(Error::other("err heal invalid client token"));
                 }
                 let num_items = h.current_status.read().await.items.len();
                 let mut last_result_index = *h.last_sent_result_index.read().await;
@@ -634,7 +638,7 @@ impl AllHealState {
                     Err(e) => {
                         h.current_status.write().await.items.clear();
                         info!("json encode err, e: {}", e);
-                        Err(Error::msg(e.to_string()))
+                        Err(Error::other(e.to_string()))
                     }
                 }
             }
@@ -644,7 +648,7 @@ impl AllHealState {
             })
             .map_err(|e| {
                 info!("json encode err, e: {}", e);
-                Error::msg(e.to_string())
+                Error::other(e.to_string())
             }),
         }
     }
@@ -779,7 +783,10 @@ impl AllHealState {
             self.stop_heal_sequence(path_s).await?;
         } else if let Some(hs) = self.get_heal_sequence(path_s).await {
             if !hs.has_ended().await {
-                return Err(Error::from_string(format!("Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {:?}, token is {}", heal_sequence.client_address, heal_sequence.start_time, heal_sequence.client_token)));
+                return Err(Error::other(format!(
+                    "Heal is already running on the given path (use force-start option to stop and start afresh). The heal was started by IP {} at {:?}, token is {}",
+                    heal_sequence.client_address, heal_sequence.start_time, heal_sequence.client_token
+                )));
             }
         }
 
@@ -787,7 +794,7 @@ impl AllHealState {
 
         for (k, v) in self.heal_seq_map.read().await.iter() {
             if (has_prefix(k, path_s) || has_prefix(path_s, k)) && !v.has_ended().await {
-                return Err(Error::from_string(format!(
+                return Err(Error::other(format!(
                     "The provided heal sequence path overlaps with an existing heal path: {}",
                     k
                 )));

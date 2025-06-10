@@ -1,22 +1,21 @@
-use common::error::Result;
-use hyper::http::Extensions;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
 use hyper::Uri;
+use hyper::http::Extensions;
 use matchit::Params;
 use matchit::Router;
-use s3s::header;
-use s3s::route::S3Route;
-use s3s::s3_error;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
+use s3s::header;
+use s3s::route::S3Route;
+use s3s::s3_error;
 
-use super::rpc::RPC_PREFIX;
 use super::ADMIN_PREFIX;
 use super::RUSTFS_ADMIN_PREFIX;
+use super::rpc::RPC_PREFIX;
 
 pub struct S3Router<T> {
     router: Router<T>,
@@ -29,12 +28,12 @@ impl<T: Operation> S3Router<T> {
         Self { router }
     }
 
-    pub fn insert(&mut self, method: Method, path: &str, operation: T) -> Result<()> {
+    pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
         let path = Self::make_route_str(method, path);
 
         // warn!("set uri {}", &path);
 
-        self.router.insert(path, operation)?;
+        self.router.insert(path, operation).map_err(std::io::Error::other)?;
 
         Ok(())
     }

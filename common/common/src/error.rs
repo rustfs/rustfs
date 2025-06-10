@@ -11,6 +11,13 @@ pub struct Error {
 }
 
 impl Error {
+    pub fn other<E>(error: E) -> Self
+    where
+        E: std::fmt::Display + Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self::from_std_error(error.into())
+    }
+
     /// Create a new error from a `std::error::Error`.
     #[must_use]
     #[track_caller]

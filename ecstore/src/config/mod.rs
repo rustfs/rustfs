@@ -1,12 +1,11 @@
 pub mod com;
-pub mod error;
 #[allow(dead_code)]
 pub mod heal;
 pub mod storageclass;
 
+use crate::error::Result;
 use crate::store::ECStore;
-use com::{lookup_configs, read_config_without_migrate, STORAGE_CLASS_SUB_SYS};
-use common::error::Result;
+use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -70,11 +69,7 @@ impl KVS {
         KVS(Vec::new())
     }
     pub fn get(&self, key: &str) -> String {
-        if let Some(v) = self.lookup(key) {
-            v
-        } else {
-            "".to_owned()
-        }
+        if let Some(v) = self.lookup(key) { v } else { "".to_owned() }
     }
     pub fn lookup(&self, key: &str) -> Option<String> {
         for kv in self.0.iter() {

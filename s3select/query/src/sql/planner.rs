@@ -1,10 +1,10 @@
 use api::{
+    QueryError, QueryResult,
     query::{
         ast::ExtStatement,
         logical_planner::{LogicalPlanner, Plan, QueryPlan},
         session::SessionCtx,
     },
-    QueryError, QueryResult,
 };
 use async_recursion::async_recursion;
 use async_trait::async_trait;

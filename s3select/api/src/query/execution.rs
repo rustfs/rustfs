@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -13,9 +13,9 @@ use futures::{Stream, StreamExt, TryStreamExt};
 
 use crate::{QueryError, QueryResult};
 
+use super::Query;
 use super::logical_planner::Plan;
 use super::session::SessionCtx;
-use super::Query;
 
 pub type QueryExecutionRef = Arc<dyn QueryExecution>;
 

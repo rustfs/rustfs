@@ -3,18 +3,20 @@ use super::options::del_opts;
 use super::options::extract_metadata;
 use super::options::put_opts;
 use crate::auth::get_condition_values;
+use crate::error::ApiError;
 use crate::storage::access::ReqInfo;
+use crate::storage::options::copy_dst_opts;
+use crate::storage::options::copy_src_opts;
+use crate::storage::options::{extract_metadata_from_mime, get_opts};
 use api::query::Context;
 use api::query::Query;
 use api::server::dbms::DatabaseManagerSystem;
 use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Utc;
-use common::error::Result;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
-use datafusion::arrow::json::writer::JsonArray;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
-use ecstore::bucket::error::BucketMetadataError;
+use datafusion::arrow::json::writer::JsonArray;
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
 use ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
@@ -31,8 +33,9 @@ use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::cmd::bucket_replication::get_must_replicate_options;
 use ecstore::cmd::bucket_replication::must_replicate;
 use ecstore::cmd::bucket_replication::schedule_replication;
-use ecstore::io::READ_BUFFER_SIZE;
+use ecstore::error::StorageError;
 use ecstore::new_object_layer_fn;
+use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::CompletePart;
 use ecstore::store_api::DeleteBucketOptions;
@@ -45,6 +48,8 @@ use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 // use ecstore::store_api::RESERVED_METADATA_PREFIX;
+use ecstore::cmd::bucket_replication::ReplicationStatusType;
+use ecstore::cmd::bucket_replication::ReplicationType;
 use ecstore::store_api::RESERVED_METADATA_PREFIX_LOWER;
 use ecstore::utils::path::path_join_buf;
 use ecstore::utils::xml;
@@ -54,27 +59,28 @@ use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use policy::auth;
-use policy::policy::action::Action;
-use policy::policy::action::S3Action;
 use policy::policy::BucketPolicy;
 use policy::policy::BucketPolicyArgs;
 use policy::policy::Validator;
+use policy::policy::action::Action;
+use policy::policy::action::S3Action;
 use query::instance::make_rustfsms;
+use rustfs_rio::HashReader;
 use rustfs_zip::CompressionFormat;
-use s3s::dto::*;
-use s3s::s3_error;
+use s3s::S3;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
-use s3s::S3;
+use s3s::dto::*;
+use s3s::s3_error;
 use s3s::{S3Request, S3Response};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
@@ -86,13 +92,6 @@ use tracing::info;
 use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
-
-use crate::storage::error::to_s3_error;
-use crate::storage::options::copy_dst_opts;
-use crate::storage::options::copy_src_opts;
-use crate::storage::options::{extract_metadata_from_mime, get_opts};
-use ecstore::cmd::bucket_replication::ReplicationStatusType;
-use ecstore::cmd::bucket_replication::ReplicationType;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -184,12 +183,15 @@ impl FS {
 
                 println!("Extracted: {}, size {}", fpath, size);
 
-                let mut reader = PutObjReader::new(Box::new(f), size);
+                // Wrap the tar entry with BufReader to make it compatible with Reader trait
+                let reader = Box::new(tokio::io::BufReader::new(f));
+                let hrd = HashReader::new(reader, size as i64, size as i64, None, false).map_err(ApiError::from)?;
+                let mut reader = PutObjReader::new(hrd, size);
 
                 let _obj_info = store
                     .put_object(&bucket, &fpath, &mut reader, &ObjectOptions::default())
                     .await
-                    .map_err(to_s3_error)?;
+                    .map_err(ApiError::from)?;
 
                 // let e_tag = obj_info.etag;
 
@@ -253,7 +255,7 @@ impl S3 for FS {
                 },
             )
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let output = CreateBucketOutput::default();
         Ok(S3Response::new(output))
@@ -279,7 +281,7 @@ impl S3 for FS {
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
-        let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(to_s3_error)?;
+        let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
 
         src_opts.version_id = version_id.clone();
 
@@ -292,7 +294,7 @@ impl S3 for FS {
 
         let dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, None)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
 
@@ -309,7 +311,7 @@ impl S3 for FS {
         let gr = store
             .get_object_reader(&src_bucket, &src_key, None, h, &get_opts)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let mut src_info = gr.object_info.clone();
 
@@ -317,8 +319,11 @@ impl S3 for FS {
             src_info.metadata_only = true;
         }
 
+        let hrd = HashReader::new(gr.stream, gr.object_info.size as i64, gr.object_info.size as i64, None, false)
+            .map_err(ApiError::from)?;
+
         src_info.put_object_reader = Some(PutObjReader {
-            stream: gr.stream,
+            stream: hrd,
             content_length: gr.object_info.size as usize,
         });
 
@@ -329,7 +334,7 @@ impl S3 for FS {
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // warn!("copy_object oi {:?}", &oi);
 
@@ -364,7 +369,7 @@ impl S3 for FS {
                 },
             )
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
@@ -380,7 +385,7 @@ impl S3 for FS {
 
         let opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let version_id = opts.version_id.as_ref().map(|v| Uuid::parse_str(v).ok()).unwrap_or_default();
         let dobj = ObjectToDelete {
@@ -393,7 +398,7 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-        let (dobjs, _errs) = store.delete_objects(&bucket, objects, opts).await.map_err(to_s3_error)?;
+        let (dobjs, _errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
 
         // TODO: let errors;
 
@@ -401,13 +406,7 @@ impl S3 for FS {
             if let Some((a, b)) = dobjs
                 .iter()
                 .map(|v| {
-                    let delete_marker = {
-                        if v.delete_marker {
-                            Some(true)
-                        } else {
-                            None
-                        }
-                    };
+                    let delete_marker = { if v.delete_marker { Some(true) } else { None } };
 
                     let version_id = v.version_id.clone();
 
@@ -456,20 +455,14 @@ impl S3 for FS {
 
         let opts: ObjectOptions = del_opts(&bucket, "", None, &req.headers, Some(metadata))
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
-        let (dobjs, errs) = store.delete_objects(&bucket, objects, opts).await.map_err(to_s3_error)?;
+        let (dobjs, errs) = store.delete_objects(&bucket, objects, opts).await.map_err(ApiError::from)?;
 
         let deleted = dobjs
             .iter()
             .map(|v| DeletedObject {
-                delete_marker: {
-                    if v.delete_marker {
-                        Some(true)
-                    } else {
-                        None
-                    }
-                },
+                delete_marker: { if v.delete_marker { Some(true) } else { None } },
                 delete_marker_version_id: v.delete_marker_version_id.clone(),
                 key: Some(v.object_name.clone()),
                 version_id: v.version_id.clone(),
@@ -502,7 +495,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&input.bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let output = GetBucketLocationOutput::default();
         Ok(S3Response::new(output))
@@ -559,7 +552,7 @@ impl S3 for FS {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -568,7 +561,7 @@ impl S3 for FS {
         let reader = store
             .get_object_reader(bucket.as_str(), key.as_str(), rs, h, &opts)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let info = reader.object_info;
 
@@ -589,7 +582,7 @@ impl S3 for FS {
         let last_modified = info.mod_time.map(Timestamp::from);
 
         let body = Some(StreamingBlob::wrap(bytes_stream(
-            ReaderStream::with_capacity(reader.stream, READ_BUFFER_SIZE),
+            ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
             info.size,
         )));
 
@@ -615,7 +608,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&input.bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
         // mc cp step 2 GetBucketInfo
 
         Ok(S3Response::new(HeadBucketOutput::default()))
@@ -660,13 +653,13 @@ impl S3 for FS {
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(to_s3_error)?;
+        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
         // warn!("head_object info {:?}", &info);
 
@@ -709,7 +702,7 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(to_s3_error)?;
+        let mut bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
 
         let mut req = req;
 
@@ -801,7 +794,7 @@ impl S3 for FS {
                 start_after,
             )
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // warn!("object_infos objects {:?}", object_infos.objects);
 
@@ -882,7 +875,7 @@ impl S3 for FS {
         let object_infos = store
             .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let objects: Vec<ObjectVersion> = object_infos
             .objects
@@ -970,9 +963,14 @@ impl S3 for FS {
             }
         };
 
-        let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
+        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        let body = Box::new(tokio::io::BufReader::new(body));
+        let hrd = HashReader::new(body, content_length as i64, content_length as i64, None, false).map_err(ApiError::from)?;
+        let mut reader = PutObjReader::new(hrd, content_length as usize);
 
-        let mut reader = PutObjReader::new(body, content_length as usize);
+        // let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
+
+        // let mut reader = PutObjReader::new(body, content_length as usize);
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -991,7 +989,7 @@ impl S3 for FS {
 
         let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(mt))
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let repoptions =
             get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
@@ -1012,7 +1010,7 @@ impl S3 for FS {
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let e_tag = obj_info.etag.clone();
 
@@ -1062,10 +1060,12 @@ impl S3 for FS {
 
         let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
-        let MultipartUploadResult { upload_id, .. } =
-            store.new_multipart_upload(&bucket, &key, &opts).await.map_err(to_s3_error)?;
+        let MultipartUploadResult { upload_id, .. } = store
+            .new_multipart_upload(&bucket, &key, &opts)
+            .await
+            .map_err(ApiError::from)?;
 
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
@@ -1109,10 +1109,12 @@ impl S3 for FS {
             }
         };
 
-        let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
+        let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
+        let body = Box::new(tokio::io::BufReader::new(body));
+        let hrd = HashReader::new(body, content_length as i64, content_length as i64, None, false).map_err(ApiError::from)?;
 
         // mc cp step 4
-        let mut data = PutObjReader::new(body, content_length as usize);
+        let mut data = PutObjReader::new(hrd, content_length as usize);
         let opts = ObjectOptions::default();
 
         let Some(store) = new_object_layer_fn() else {
@@ -1124,7 +1126,7 @@ impl S3 for FS {
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut data, &opts)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let output = UploadPartOutput {
             e_tag: info.etag,
@@ -1190,7 +1192,7 @@ impl S3 for FS {
         let obj_info = store
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
@@ -1232,7 +1234,7 @@ impl S3 for FS {
         store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
     }
 
@@ -1270,13 +1272,13 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let data = try_!(xml::serialize(&tagging));
 
         metadata_sys::update(&bucket, BUCKET_TAGGING_CONFIG, data)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(Default::default()))
     }
@@ -1290,7 +1292,7 @@ impl S3 for FS {
 
         metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
@@ -1316,7 +1318,7 @@ impl S3 for FS {
         store
             .put_object_tags(&bucket, &object, &tags, &ObjectOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(PutObjectTaggingOutput { version_id: None }))
     }
@@ -1333,7 +1335,7 @@ impl S3 for FS {
         let tags = store
             .get_object_tags(&bucket, &object, &ObjectOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let tag_set = decode_tags(tags.as_str());
 
@@ -1359,7 +1361,7 @@ impl S3 for FS {
         store
             .delete_object_tags(&bucket, &object, &ObjectOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: None }))
     }
@@ -1377,9 +1379,9 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
-        let VersioningConfiguration { status, .. } = BucketVersioningSys::get(&bucket).await.map_err(to_s3_error)?;
+        let VersioningConfiguration { status, .. } = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
 
         Ok(S3Response::new(GetBucketVersioningOutput {
             status,
@@ -1407,7 +1409,7 @@ impl S3 for FS {
 
         metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // TODO: globalSiteReplicationSys.BucketMetaHook
 
@@ -1427,7 +1429,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let conditions = get_condition_values(&req.headers, &auth::Credentials::default());
 
@@ -1474,15 +1476,15 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let cfg = match PolicySys::get(&bucket).await {
             Ok(res) => res,
             Err(err) => {
-                if BucketMetadataError::BucketPolicyNotFound.is(&err) {
+                if StorageError::BucketPolicyNotFound == err {
                     return Err(s3_error!(NoSuchBucketPolicy));
                 }
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", err)));
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, err.to_string()));
             }
         };
 
@@ -1501,7 +1503,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // warn!("input policy {}", &policy);
 
@@ -1517,7 +1519,7 @@ impl S3 for FS {
 
         metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(PutBucketPolicyOutput {}))
     }
@@ -1535,11 +1537,11 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         metadata_sys::delete(&bucket, BUCKET_POLICY_CONFIG)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(DeleteBucketPolicyOutput {}))
     }
@@ -1558,7 +1560,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
             Ok((cfg, _)) => Some(cfg.rules),
@@ -1597,7 +1599,7 @@ impl S3 for FS {
         let data = try_!(xml::serialize(&input_cfg));
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
@@ -1616,11 +1618,11 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
@@ -1638,7 +1640,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let server_side_encryption_configuration = match metadata_sys::get_sse_config(&bucket).await {
             Ok((cfg, _)) => Some(cfg),
@@ -1675,14 +1677,14 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // TODO: check kms
 
         let data = try_!(xml::serialize(&server_side_encryption_configuration));
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
         Ok(S3Response::new(PutBucketEncryptionOutput::default()))
     }
 
@@ -1699,8 +1701,10 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
-        metadata_sys::delete(&bucket, BUCKET_SSECONFIG).await.map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
+        metadata_sys::delete(&bucket, BUCKET_SSECONFIG)
+            .await
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(DeleteBucketEncryptionOutput::default()))
     }
@@ -1747,13 +1751,13 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let data = try_!(xml::serialize(&input_cfg));
 
         metadata_sys::update(&bucket, OBJECT_LOCK_CONFIG, data)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
@@ -1771,13 +1775,13 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let rcfg = match metadata_sys::get_replication_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
                 error!("get_replication_config err {:?}", err);
-                return Err(to_s3_error(err));
+                return Err(ApiError::from(err).into());
             }
         };
 
@@ -1822,14 +1826,14 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // TODO: check enable, versioning enable
         let data = try_!(xml::serialize(&replication_configuration));
 
         metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
@@ -1847,10 +1851,10 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
         metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // TODO: remove targets
         error!("delete bucket");
@@ -1871,7 +1875,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let has_notification_config = match metadata_sys::get_notification_config(&bucket).await {
             Ok(cfg) => cfg,
@@ -1918,13 +1922,13 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let data = try_!(xml::serialize(&notification_configuration));
 
         metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // TODO: event notice add rule
 
@@ -1941,7 +1945,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let grants = vec![Grant {
             grantee: Some(Grantee {
@@ -1977,7 +1981,7 @@ impl S3 for FS {
         store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         if let Some(canned_acl) = acl {
             if canned_acl.as_str() != BucketCannedACL::PRIVATE {
@@ -2153,14 +2157,14 @@ impl S3 for FS {
         let _ = store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
             error!("get_object_info failed, {}", e.to_string());
@@ -2205,14 +2209,14 @@ impl S3 for FS {
         let _ = store
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let mut eval_metadata = HashMap::new();
         let legal_hold = legal_hold
@@ -2257,11 +2261,11 @@ impl S3 for FS {
         };
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
 
         let object_info = store.get_object_info(&bucket, &key, &opts).await.map_err(|e| {
             error!("get_object_info failed, {}", e.to_string());
@@ -2305,7 +2309,7 @@ impl S3 for FS {
         };
 
         // check object lock
-        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(to_s3_error)?;
+        let _ = metadata_sys::get_object_lock_config(&bucket).await.map_err(ApiError::from)?;
 
         // TODO: check allow
 
@@ -2328,7 +2332,7 @@ impl S3 for FS {
 
         let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
-            .map_err(to_s3_error)?;
+            .map_err(ApiError::from)?;
         opts.eval_metadata = Some(eval_metadata);
 
         store.put_object_metadata(&bucket, &key, &opts).await.map_err(|e| {
@@ -2343,9 +2347,9 @@ impl S3 for FS {
 }
 
 #[allow(dead_code)]
-pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
+pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static
 where
-    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
     AsyncTryStream::<Bytes, E, _>::new(|mut y| async move {

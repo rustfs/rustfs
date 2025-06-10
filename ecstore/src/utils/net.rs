@@ -1,5 +1,5 @@
-use common::error::{Error, Result};
 use lazy_static::lazy_static;
+use std::io::{Error, Result};
 use std::{
     collections::HashSet,
     fmt::Display,
@@ -23,7 +23,7 @@ pub fn is_socket_addr(addr: &str) -> bool {
 pub fn check_local_server_addr(server_addr: &str) -> Result<SocketAddr> {
     let addr: Vec<SocketAddr> = match server_addr.to_socket_addrs() {
         Ok(addr) => addr.collect(),
-        Err(err) => return Err(Error::new(Box::new(err))),
+        Err(err) => return Err(err),
     };
 
     // 0.0.0.0 is a wildcard address and refers to local network
@@ -44,7 +44,7 @@ pub fn check_local_server_addr(server_addr: &str) -> Result<SocketAddr> {
         }
     }
 
-    Err(Error::from_string("host in server address should be this server"))
+    Err(Error::other("host in server address should be this server"))
 }
 
 /// checks if the given parameter correspond to one of
@@ -53,10 +53,7 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> Result<boo
     let local_set: HashSet<IpAddr> = LOCAL_IPS.iter().copied().collect();
     let is_local_host = match host {
         Host::Domain(domain) => {
-            let ips = match (domain, 0).to_socket_addrs().map(|v| v.map(|v| v.ip()).collect::<Vec<_>>()) {
-                Ok(ips) => ips,
-                Err(err) => return Err(Error::new(Box::new(err))),
-            };
+            let ips = (domain, 0).to_socket_addrs().map(|v| v.map(|v| v.ip()).collect::<Vec<_>>())?;
 
             ips.iter().any(|ip| local_set.contains(ip))
         }
@@ -79,7 +76,7 @@ pub fn get_host_ip(host: Host<&str>) -> Result<HashSet<IpAddr>> {
             .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
         {
             Ok(ips) => Ok(ips),
-            Err(err) => Err(Error::new(Box::new(err))),
+            Err(err) => Err(err),
         },
         Host::Ipv4(ip) => {
             let mut set = HashSet::with_capacity(1);
@@ -102,7 +99,7 @@ pub fn get_available_port() -> u16 {
 pub(crate) fn must_get_local_ips() -> Result<Vec<IpAddr>> {
     match netif::up() {
         Ok(up) => Ok(up.map(|x| x.address().to_owned()).collect()),
-        Err(err) => Err(Error::from_string(format!("Unable to get IP addresses of this host: {}", err))),
+        Err(err) => Err(Error::other(format!("Unable to get IP addresses of this host: {}", err))),
     }
 }
 
@@ -149,7 +146,7 @@ pub fn parse_and_resolve_address(addr_str: &str) -> Result<SocketAddr> {
         let port_str = port;
         let port: u16 = port_str
             .parse()
-            .map_err(|e| Error::from_string(format!("Invalid port format: {}, err:{:?}", addr_str, e)))?;
+            .map_err(|e| Error::other(format!("Invalid port format: {}, err:{:?}", addr_str, e)))?;
         let final_port = if port == 0 {
             get_available_port() // assume get_available_port is available here
         } else {
@@ -199,13 +196,10 @@ mod test {
             ("localhost:54321", Ok(())),
             ("0.0.0.0:9000", Ok(())),
             // (":0", Ok(())),
-            ("localhost", Err(Error::from_string("invalid socket address"))),
-            ("", Err(Error::from_string("invalid socket address"))),
-            (
-                "example.org:54321",
-                Err(Error::from_string("host in server address should be this server")),
-            ),
-            (":-10", Err(Error::from_string("invalid port value"))),
+            ("localhost", Err(Error::other("invalid socket address"))),
+            ("", Err(Error::other("invalid socket address"))),
+            ("example.org:54321", Err(Error::other("host in server address should be this server"))),
+            (":-10", Err(Error::other("invalid port value"))),
         ];
 
         for test_case in test_cases {

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result as DFResult;
 use datafusion::datasource::listing::ListingTable;
-use datafusion::datasource::{provider_as_source, TableProvider};
+use datafusion::datasource::{TableProvider, provider_as_source};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableSource};
 use datafusion::prelude::Expr;

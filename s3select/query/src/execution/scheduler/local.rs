@@ -4,7 +4,7 @@ use api::query::scheduler::{ExecutionResults, Scheduler};
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::{execute_stream, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 
 pub struct LocalScheduler {}
 

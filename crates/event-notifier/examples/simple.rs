@@ -1,5 +1,5 @@
-use rustfs_event_notifier::create_adapters;
 use rustfs_event_notifier::NotifierSystem;
+use rustfs_event_notifier::create_adapters;
 use rustfs_event_notifier::{AdapterConfig, NotifierConfig, WebhookConfig};
 use rustfs_event_notifier::{Bucket, Event, Identity, Metadata, Name, Object, Source};
 use std::collections::HashMap;

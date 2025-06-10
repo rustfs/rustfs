@@ -1,5 +1,5 @@
-use super::{utils::wildcard, Validator};
-use common::error::{Error, Result};
+use super::{Validator, utils::wildcard};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -25,7 +25,7 @@ impl Validator for Principal {
     type Error = Error;
     fn is_valid(&self) -> Result<()> {
         if self.aws.is_empty() {
-            return Err(Error::msg("Principal is empty"));
+            return Err(Error::other("Principal is empty"));
         }
         Ok(())
     }

@@ -1,9 +1,9 @@
 pub mod object;
 
 use crate::cache::Cache;
-use common::error::Result;
+use crate::error::Result;
 use policy::{auth::UserIdentity, policy::PolicyDoc};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 
@@ -49,7 +49,7 @@ pub trait Store: Clone + Send + Sync + 'static {
         m: &mut HashMap<String, MappedPolicy>,
     ) -> Result<()>;
     async fn load_mapped_policys(&self, user_type: UserType, is_group: bool, m: &mut HashMap<String, MappedPolicy>)
-        -> Result<()>;
+    -> Result<()>;
 
     async fn load_all(&self, cache: &Cache) -> Result<()>;
 }

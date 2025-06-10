@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use crate::QueryResult;
 
 use super::{
+    Query,
     execution::{Output, QueryStateMachine},
     logical_planner::Plan,
-    Query,
 };
 
 #[async_trait]

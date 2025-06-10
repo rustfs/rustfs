@@ -1,7 +1,7 @@
-use common::error::{Error, Result};
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
+use ecstore::error::Result;
+use ecstore::error::StorageError;
 use ecstore::store_api::ObjectOptions;
-use ecstore::store_err::StorageError;
 use ecstore::utils::path::is_dir_object;
 use http::{HeaderMap, HeaderValue};
 use lazy_static::lazy_static;
@@ -25,24 +25,16 @@ pub async fn del_opts(
 
     if let Some(ref id) = vid {
         if let Err(_err) = Uuid::parse_str(id.as_str()) {
-            return Err(Error::new(StorageError::InvalidVersionID(
-                bucket.to_owned(),
-                object.to_owned(),
-                id.clone(),
-            )));
+            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
         }
 
         if !versioned {
-            return Err(Error::new(StorageError::InvalidArgument(
-                bucket.to_owned(),
-                object.to_owned(),
-                id.clone(),
-            )));
+            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
         }
     }
 
     let mut opts = put_opts_from_headers(headers, metadata)
-        .map_err(|err| Error::new(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())))?;
+        .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
@@ -72,24 +64,16 @@ pub async fn get_opts(
 
     if let Some(ref id) = vid {
         if let Err(_err) = Uuid::parse_str(id.as_str()) {
-            return Err(Error::new(StorageError::InvalidVersionID(
-                bucket.to_owned(),
-                object.to_owned(),
-                id.clone(),
-            )));
+            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
         }
 
         if !versioned {
-            return Err(Error::new(StorageError::InvalidArgument(
-                bucket.to_owned(),
-                object.to_owned(),
-                id.clone(),
-            )));
+            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
         }
     }
 
     let mut opts = get_default_opts(headers, None, false)
-        .map_err(|err| Error::new(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())))?;
+        .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
@@ -122,24 +106,16 @@ pub async fn put_opts(
 
     if let Some(ref id) = vid {
         if let Err(_err) = Uuid::parse_str(id.as_str()) {
-            return Err(Error::new(StorageError::InvalidVersionID(
-                bucket.to_owned(),
-                object.to_owned(),
-                id.clone(),
-            )));
+            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
         }
 
         if !versioned {
-            return Err(Error::new(StorageError::InvalidArgument(
-                bucket.to_owned(),
-                object.to_owned(),
-                id.clone(),
-            )));
+            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
         }
     }
 
     let mut opts = put_opts_from_headers(headers, metadata)
-        .map_err(|err| Error::new(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())))?;
+        .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
@@ -317,15 +293,13 @@ mod tests {
 
         assert!(result.is_err());
         if let Err(err) = result {
-            if let Some(storage_err) = err.downcast_ref::<StorageError>() {
-                match storage_err {
-                    StorageError::InvalidVersionID(bucket, object, version) => {
-                        assert_eq!(bucket, "test-bucket");
-                        assert_eq!(object, "test-object");
-                        assert_eq!(version, "invalid-uuid");
-                    }
-                    _ => panic!("Expected InvalidVersionID error"),
+            match err {
+                StorageError::InvalidVersionID(bucket, object, version) => {
+                    assert_eq!(bucket, "test-bucket");
+                    assert_eq!(object, "test-object");
+                    assert_eq!(version, "invalid-uuid");
                 }
+                _ => panic!("Expected InvalidVersionID error"),
             }
         }
     }
@@ -373,15 +347,13 @@ mod tests {
 
         assert!(result.is_err());
         if let Err(err) = result {
-            if let Some(storage_err) = err.downcast_ref::<StorageError>() {
-                match storage_err {
-                    StorageError::InvalidVersionID(bucket, object, version) => {
-                        assert_eq!(bucket, "test-bucket");
-                        assert_eq!(object, "test-object");
-                        assert_eq!(version, "invalid-uuid");
-                    }
-                    _ => panic!("Expected InvalidVersionID error"),
+            match err {
+                StorageError::InvalidVersionID(bucket, object, version) => {
+                    assert_eq!(bucket, "test-bucket");
+                    assert_eq!(object, "test-object");
+                    assert_eq!(version, "invalid-uuid");
                 }
+                _ => panic!("Expected InvalidVersionID error"),
             }
         }
     }
@@ -419,15 +391,13 @@ mod tests {
 
         assert!(result.is_err());
         if let Err(err) = result {
-            if let Some(storage_err) = err.downcast_ref::<StorageError>() {
-                match storage_err {
-                    StorageError::InvalidVersionID(bucket, object, version) => {
-                        assert_eq!(bucket, "test-bucket");
-                        assert_eq!(object, "test-object");
-                        assert_eq!(version, "invalid-uuid");
-                    }
-                    _ => panic!("Expected InvalidVersionID error"),
+            match err {
+                StorageError::InvalidVersionID(bucket, object, version) => {
+                    assert_eq!(bucket, "test-bucket");
+                    assert_eq!(object, "test-object");
+                    assert_eq!(version, "invalid-uuid");
                 }
+                _ => panic!("Expected InvalidVersionID error"),
             }
         }
     }

@@ -5,10 +5,10 @@ use iam::get_global_action_cred;
 use madmin::{AccountStatus, AddOrUpdateUserReq};
 use matchit::Params;
 use policy::policy::{
-    action::{Action, AdminAction},
     Args,
+    action::{Action, AdminAction},
 };
-use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;

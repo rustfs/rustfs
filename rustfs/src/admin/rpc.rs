@@ -2,27 +2,26 @@ use super::router::AdminOperation;
 use super::router::Operation;
 use super::router::S3Router;
 use crate::storage::ecfs::bytes_stream;
-use common::error::Result;
 use ecstore::disk::DiskAPI;
-use ecstore::io::READ_BUFFER_SIZE;
+use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use ecstore::store::find_local_disk;
 use futures::TryStreamExt;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
-use s3s::dto::StreamingBlob;
-use s3s::s3_error;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
+use s3s::dto::StreamingBlob;
+use s3s::s3_error;
 use serde_urlencoded::from_bytes;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
 
 pub const RPC_PREFIX: &str = "/rustfs/rpc";
 
-pub fn regist_rpc_route(r: &mut S3Router<AdminOperation>) -> Result<()> {
+pub fn regist_rpc_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
         format!("{}{}", RPC_PREFIX, "/read_file_stream").as_str(),
@@ -73,7 +72,7 @@ impl Operation for ReadFile {
         Ok(S3Response::new((
             StatusCode::OK,
             Body::from(StreamingBlob::wrap(bytes_stream(
-                ReaderStream::with_capacity(file, READ_BUFFER_SIZE),
+                ReaderStream::with_capacity(file, DEFAULT_READ_BUFFER_SIZE),
                 query.length,
             ))),
         )))

@@ -7,6 +7,7 @@ mod global;
 mod notifier;
 mod store;
 
+pub use adapter::ChannelAdapter;
 pub use adapter::create_adapters;
 #[cfg(all(feature = "kafka", target_os = "linux"))]
 pub use adapter::kafka::KafkaAdapter;
@@ -14,7 +15,6 @@ pub use adapter::kafka::KafkaAdapter;
 pub use adapter::mqtt::MqttAdapter;
 #[cfg(feature = "webhook")]
 pub use adapter::webhook::WebhookAdapter;
-pub use adapter::ChannelAdapter;
 pub use bus::event_bus;
 #[cfg(all(feature = "kafka", target_os = "linux"))]
 pub use config::KafkaConfig;

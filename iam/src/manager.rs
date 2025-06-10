@@ -1,23 +1,22 @@
+use crate::error::{Error, Result, is_err_config_not_found};
 use crate::{
     cache::{Cache, CacheEntity},
-    error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
+    error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
     get_global_action_cred,
-    store::{object::IAM_CONFIG_PREFIX, GroupInfo, MappedPolicy, Store, UserType},
+    store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
     sys::{
-        UpdateServiceAccountOpts, MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED,
-        STATUS_DISABLED, STATUS_ENABLED,
+        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
+        UpdateServiceAccountOpts,
     },
 };
-use common::error::{Error, Result};
-use ecstore::config::error::is_err_config_not_found;
 use ecstore::utils::{crypto::base64_encode, path::path_join_buf};
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use policy::{
     arn::ARN,
-    auth::{self, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign, Credentials, UserIdentity},
+    auth::{self, Credentials, UserIdentity, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign},
     format::Format,
     policy::{
-        default::DEFAULT_POLICIES, iam_policy_claim_name_sa, Policy, PolicyDoc, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE,
+        EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -25,8 +24,8 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::Duration,
 };
@@ -183,7 +182,7 @@ where
 
     pub async fn get_policy(&self, name: &str) -> Result<Policy> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let policies = MappedPolicy::new(name).to_slice();
@@ -200,13 +199,13 @@ where
                 .load()
                 .get(&policy)
                 .cloned()
-                .ok_or(Error::new(IamError::NoSuchPolicy))?;
+                .ok_or(Error::NoSuchPolicy)?;
 
             to_merge.push(v.policy);
         }
 
         if to_merge.is_empty() {
-            return Err(Error::new(IamError::NoSuchPolicy));
+            return Err(Error::NoSuchPolicy);
         }
 
         Ok(Policy::merge_policies(to_merge))
@@ -214,20 +213,15 @@ where
 
     pub async fn get_policy_doc(&self, name: &str) -> Result<PolicyDoc> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
-        self.cache
-            .policy_docs
-            .load()
-            .get(name)
-            .cloned()
-            .ok_or(Error::new(IamError::NoSuchPolicy))
+        self.cache.policy_docs.load().get(name).cloned().ok_or(Error::NoSuchPolicy)
     }
 
     pub async fn delete_policy(&self, name: &str, is_from_notify: bool) -> Result<()> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if is_from_notify {
@@ -255,7 +249,7 @@ where
             });
 
             if !users.is_empty() || !groups.is_empty() {
-                return Err(IamError::PolicyInUse.into());
+                return Err(Error::PolicyInUse);
             }
 
             if let Err(err) = self.api.delete_policy_doc(name).await {
@@ -275,7 +269,7 @@ where
 
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
         if name.is_empty() || policy.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let policy_doc = self
@@ -407,7 +401,7 @@ where
         }
 
         if !user_exists {
-            return Err(Error::new(IamError::NoSuchUser(access_key.to_string())));
+            return Err(Error::NoSuchUser(access_key.to_string()));
         }
 
         Ok(ret)
@@ -453,13 +447,13 @@ where
     /// create a service account and update cache
     pub async fn add_service_account(&self, cred: Credentials) -> Result<OffsetDateTime> {
         if cred.access_key.is_empty() || cred.parent_user.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users = self.cache.users.load();
         if let Some(x) = users.get(&cred.access_key) {
             if x.credentials.is_service_account() {
-                return Err(Error::new(IamError::IAMActionNotAllowed));
+                return Err(Error::IAMActionNotAllowed);
             }
         }
 
@@ -476,11 +470,11 @@ where
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
         let Some(ui) = self.cache.users.load().get(name).cloned() else {
-            return Err(IamError::NoSuchServiceAccount(name.to_string()).into());
+            return Err(Error::NoSuchServiceAccount(name.to_string()));
         };
 
         if !ui.credentials.is_service_account() {
-            return Err(IamError::NoSuchServiceAccount(name.to_string()).into());
+            return Err(Error::NoSuchServiceAccount(name.to_string()));
         }
 
         let mut cr = ui.credentials.clone();
@@ -488,7 +482,7 @@ where
 
         if let Some(secret) = opts.secret_key {
             if !is_secret_key_valid(&secret) {
-                return Err(IamError::InvalidSecretKeyLength.into());
+                return Err(Error::InvalidSecretKeyLength);
             }
             cr.secret_key = secret;
         }
@@ -535,7 +529,7 @@ where
             if !session_policy.version.is_empty() && !session_policy.statements.is_empty() {
                 let policy_buf = serde_json::to_vec(&session_policy)?;
                 if policy_buf.len() > MAX_SVCSESSION_POLICY_SIZE {
-                    return Err(IamError::PolicyTooLarge.into());
+                    return Err(Error::PolicyTooLarge);
                 }
 
                 m.insert(SESSION_POLICY_NAME.to_owned(), serde_json::Value::String(base64_encode(&policy_buf)));
@@ -558,7 +552,7 @@ where
 
     pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let (mut policies, _) = self.policy_db_get_internal(name, false, false).await?;
@@ -594,7 +588,7 @@ where
                         Cache::add_or_update(&self.cache.groups, name, p, OffsetDateTime::now_utc());
                     }
 
-                    m.get(name).cloned().ok_or(IamError::NoSuchGroup(name.to_string()))?
+                    m.get(name).cloned().ok_or(Error::NoSuchGroup(name.to_string()))?
                 }
             };
 
@@ -639,7 +633,7 @@ where
                     Cache::add_or_update(&self.cache.user_policies, name, p, OffsetDateTime::now_utc());
                     p.clone()
                 } else {
-                    let mp = match self.cache.sts_policies.load().get(name) {
+                    match self.cache.sts_policies.load().get(name) {
                         Some(p) => p.clone(),
                         None => {
                             let mut m = HashMap::new();
@@ -651,8 +645,7 @@ where
                                 MappedPolicy::default()
                             }
                         }
-                    };
-                    mp
+                    }
                 }
             }
         };
@@ -737,7 +730,7 @@ where
     }
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if policy.is_empty() {
@@ -763,7 +756,7 @@ where
         let policy_docs_cache = self.cache.policy_docs.load();
         for p in mp.to_slice() {
             if !policy_docs_cache.contains_key(&p) {
-                return Err(Error::new(IamError::NoSuchPolicy));
+                return Err(Error::NoSuchPolicy);
             }
         }
 
@@ -791,14 +784,14 @@ where
                 cred.is_expired(),
                 cred.parent_user.is_empty()
             );
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if let Some(policy) = policy_name {
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
             if combined_policy_stmt.is_empty() {
-                return Err(Error::msg(format!("need poliy not found {}", IamError::NoSuchPolicy)));
+                return Err(Error::other(format!("need poliy not found {}", IamError::NoSuchPolicy)));
             }
 
             self.api
@@ -825,11 +818,11 @@ where
 
         let u = match users.get(name) {
             Some(u) => u,
-            None => return Err(Error::new(IamError::NoSuchUser(name.to_string()))),
+            None => return Err(Error::NoSuchUser(name.to_string())),
         };
 
         if u.credentials.is_temp() || u.credentials.is_service_account() {
-            return Err(Error::new(IamError::IAMActionNotAllowed));
+            return Err(Error::IAMActionNotAllowed);
         }
 
         let mut uinfo = madmin::UserInfo {
@@ -961,7 +954,7 @@ where
         if let Some(x) = users.get(access_key) {
             warn!("user already exists: {:?}", x);
             if x.credentials.is_temp() {
-                return Err(IamError::IAMActionNotAllowed.into());
+                return Err(Error::IAMActionNotAllowed);
             }
         }
 
@@ -989,7 +982,7 @@ where
 
     pub async fn delete_user(&self, access_key: &str, utype: UserType) -> Result<()> {
         if access_key.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if utype == UserType::Reg {
@@ -1041,13 +1034,13 @@ where
 
     pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
         if access_key.is_empty() || secret_key.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users = self.cache.users.load();
         let u = match users.get(access_key) {
             Some(u) => u,
-            None => return Err(Error::new(IamError::NoSuchUser(access_key.to_string()))),
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
 
         let mut cred = u.credentials.clone();
@@ -1064,21 +1057,21 @@ where
 
     pub async fn set_user_status(&self, access_key: &str, status: AccountStatus) -> Result<OffsetDateTime> {
         if access_key.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if !access_key.is_empty() && status != AccountStatus::Enabled && status != AccountStatus::Disabled {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users = self.cache.users.load();
         let u = match users.get(access_key) {
             Some(u) => u,
-            None => return Err(Error::new(IamError::NoSuchUser(access_key.to_string()))),
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
 
         if u.credentials.is_temp() || u.credentials.is_service_account() {
-            return Err(Error::new(IamError::IAMActionNotAllowed));
+            return Err(Error::IAMActionNotAllowed);
         }
 
         let status = {
@@ -1123,7 +1116,7 @@ where
         let users = self.cache.users.load();
         let u = match users.get(access_key) {
             Some(u) => u,
-            None => return Err(Error::new(IamError::NoSuchUser(access_key.to_string()))),
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
 
         if u.credentials.is_temp() {
@@ -1135,7 +1128,7 @@ where
 
     pub async fn add_users_to_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
         if group.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users_cache = self.cache.users.load();
@@ -1143,10 +1136,10 @@ where
         for member in members.iter() {
             if let Some(u) = users_cache.get(member) {
                 if u.credentials.is_temp() || u.credentials.is_service_account() {
-                    return Err(Error::new(IamError::IAMActionNotAllowed));
+                    return Err(Error::IAMActionNotAllowed);
                 }
             } else {
-                return Err(Error::new(IamError::NoSuchUser(member.to_string())));
+                return Err(Error::NoSuchUser(member.to_string()));
             }
         }
 
@@ -1181,13 +1174,13 @@ where
 
     pub async fn set_group_status(&self, name: &str, enable: bool) -> Result<OffsetDateTime> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let groups = self.cache.groups.load();
         let mut gi = match groups.get(name) {
             Some(gi) => gi.clone(),
-            None => return Err(Error::new(IamError::NoSuchGroup(name.to_string()))),
+            None => return Err(Error::NoSuchGroup(name.to_string())),
         };
 
         if enable {
@@ -1213,7 +1206,7 @@ where
             .load()
             .get(name)
             .cloned()
-            .ok_or(Error::new(IamError::NoSuchGroup(name.to_string())))?;
+            .ok_or(Error::NoSuchGroup(name.to_string()))?;
 
         Ok(GroupDesc {
             name: name.to_string(),
@@ -1240,7 +1233,7 @@ where
             .load()
             .get(name)
             .cloned()
-            .ok_or(Error::new(IamError::NoSuchGroup(name.to_string())))?;
+            .ok_or(Error::NoSuchGroup(name.to_string()))?;
 
         let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
@@ -1266,7 +1259,7 @@ where
 
     pub async fn remove_users_from_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
         if group.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users_cache = self.cache.users.load();
@@ -1274,10 +1267,10 @@ where
         for member in members.iter() {
             if let Some(u) = users_cache.get(member) {
                 if u.credentials.is_temp() || u.credentials.is_service_account() {
-                    return Err(Error::new(IamError::IAMActionNotAllowed));
+                    return Err(Error::IAMActionNotAllowed);
                 }
             } else {
-                return Err(Error::new(IamError::NoSuchUser(member.to_string())));
+                return Err(Error::NoSuchUser(member.to_string()));
             }
         }
 
@@ -1287,10 +1280,10 @@ where
             .load()
             .get(group)
             .cloned()
-            .ok_or(Error::new(IamError::NoSuchGroup(group.to_string())))?;
+            .ok_or(Error::NoSuchGroup(group.to_string()))?;
 
         if members.is_empty() && !gi.members.is_empty() {
-            return Err(IamError::GroupNotEmpty.into());
+            return Err(Error::GroupNotEmpty);
         }
 
         if members.is_empty() {
@@ -1589,7 +1582,7 @@ pub fn get_token_signing_key() -> Option<String> {
 
 pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
     let Some(sys_key) = get_token_signing_key() else {
-        return Err(Error::msg("global active sk not init"));
+        return Err(Error::other("global active sk not init"));
     };
 
     let keys = vec![&sys_key, &u.credentials.secret_key];
@@ -1599,7 +1592,7 @@ pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
             return Ok(claims);
         }
     }
-    Err(Error::msg("unable to extract claims"))
+    Err(Error::other("unable to extract claims"))
 }
 
 fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (String, Policy) {

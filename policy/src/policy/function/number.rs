@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use super::func::InnerFunc;
 use serde::{
-    de::{Error, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{Error, Visitor},
 };
 
 pub type NumberFunc = InnerFunc<NumberFuncValue>;

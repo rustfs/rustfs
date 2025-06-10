@@ -1,6 +1,6 @@
 use super::func::InnerFunc;
 use ipnetwork::IpNetwork;
-use serde::{de::Visitor, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Visitor};
 use std::{borrow::Cow, collections::HashMap, net::IpAddr};
 
 pub type AddrFunc = InnerFunc<AddrFuncValue>;

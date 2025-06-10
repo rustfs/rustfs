@@ -1,5 +1,5 @@
-use crate::{create_adapters, Error, Event, NotifierConfig, NotifierSystem};
-use std::sync::{atomic, Arc};
+use crate::{Error, Event, NotifierConfig, NotifierSystem, create_adapters};
+use std::sync::{Arc, atomic};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::instrument;
 

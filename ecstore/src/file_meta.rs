@@ -1,10 +1,10 @@
 use crate::disk::FileInfoVersions;
+use crate::error::StorageError;
 use crate::file_meta_inline::InlineData;
 use crate::store_api::RawFileInfo;
-use crate::store_err::StorageError;
 use crate::{
     disk::error::DiskError,
-    store_api::{ErasureInfo, FileInfo, ObjectPartInfo, ERASURE_ALGORITHM},
+    store_api::{ERASURE_ALGORITHM, ErasureInfo, FileInfo, ObjectPartInfo},
 };
 use byteorder::ByteOrder;
 use common::error::{Error, Result};
@@ -541,15 +541,18 @@ impl FileMeta {
 
     // read_data fill fi.dada
     #[tracing::instrument(level = "debug", skip(self))]
-    pub fn to_fileinfo(&self, volume: &str, path: &str, version_id: &str, read_data: bool, all_parts: bool) -> Result<FileInfo> {
+    pub fn into_fileinfo(
+        &self,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        read_data: bool,
+        all_parts: bool,
+    ) -> Result<FileInfo> {
         let has_vid = {
             if !version_id.is_empty() {
                 let id = Uuid::parse_str(version_id)?;
-                if !id.is_nil() {
-                    Some(id)
-                } else {
-                    None
-                }
+                if !id.is_nil() { Some(id) } else { None }
             } else {
                 None
             }
@@ -597,28 +600,6 @@ impl FileMeta {
             file_version.unmarshal_msg(&version.meta)?;
             let fi = file_version.to_fileinfo(volume, path, None, all_parts);
             versions.push(fi);
-        }
-
-        let num = versions.len();
-        let mut prev_mod_time = None;
-        for (i, fi) in versions.iter_mut().enumerate() {
-            if i == 0 {
-                fi.is_latest = true;
-            } else {
-                fi.successor_mod_time = prev_mod_time;
-            }
-            fi.num_versions = num;
-            prev_mod_time = fi.mod_time;
-        }
-
-        if versions.is_empty() {
-            versions.push(FileInfo {
-                name: path.to_string(),
-                volume: volume.to_string(),
-                deleted: true,
-                is_latest: true,
-                ..Default::default()
-            });
         }
 
         Ok(FileInfoVersions {
@@ -1056,11 +1037,7 @@ impl FileMetaVersionHeader {
         cur.read_exact(&mut buf)?;
         self.version_id = {
             let id = Uuid::from_bytes(buf);
-            if id.is_nil() {
-                None
-            } else {
-                Some(id)
-            }
+            if id.is_nil() { None } else { Some(id) }
         };
 
         // mod_time
@@ -1220,11 +1197,7 @@ impl MetaObject {
                     cur.read_exact(&mut buf)?;
                     self.version_id = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
                 "DDir" => {
@@ -1233,11 +1206,7 @@ impl MetaObject {
                     cur.read_exact(&mut buf)?;
                     self.data_dir = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
                 "EcAlgo" => {
@@ -1718,11 +1687,7 @@ impl MetaDeleteMarker {
                     cur.read_exact(&mut buf)?;
                     self.version_id = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
 
@@ -2109,7 +2074,7 @@ pub async fn get_file_info(buf: &[u8], volume: &str, path: &str, version_id: &st
         });
     }
 
-    let fi = meta.to_fileinfo(volume, path, version_id, opts.data, true)?;
+    let fi = meta.into_fileinfo(volume, path, version_id, opts.data, true)?;
     Ok(fi)
 }
 
@@ -2940,7 +2905,7 @@ fn test_file_meta_into_fileinfo() {
     fm.add_version(fi).unwrap();
 
     // Test into_fileinfo with valid version_id
-    let result = fm.to_fileinfo("test-volume", "test-path", &version_id.to_string(), false, false);
+    let result = fm.into_fileinfo("test-volume", "test-path", &version_id.to_string(), false, false);
     assert!(result.is_ok());
     let file_info = result.unwrap();
     assert_eq!(file_info.volume, "test-volume");
@@ -2948,11 +2913,11 @@ fn test_file_meta_into_fileinfo() {
 
     // Test into_fileinfo with invalid version_id
     let invalid_id = Uuid::new_v4();
-    let result = fm.to_fileinfo("test-volume", "test-path", &invalid_id.to_string(), false, false);
+    let result = fm.into_fileinfo("test-volume", "test-path", &invalid_id.to_string(), false, false);
     assert!(result.is_err());
 
     // Test into_fileinfo with empty version_id (should get latest)
-    let result = fm.to_fileinfo("test-volume", "test-path", "", false, false);
+    let result = fm.into_fileinfo("test-volume", "test-path", "", false, false);
     assert!(result.is_ok());
 }
 

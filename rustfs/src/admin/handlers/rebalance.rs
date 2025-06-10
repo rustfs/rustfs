@@ -1,14 +1,14 @@
 use ecstore::{
-    config::error::is_err_config_not_found,
+    StorageAPI,
+    error::StorageError,
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt},
     store_api::BucketOptions,
-    StorageAPI,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use tracing::warn;
@@ -133,7 +133,7 @@ impl Operation for RebalanceStatus {
 
         let mut meta = RebalanceMeta::new();
         if let Err(err) = meta.load(store.pools[0].clone()).await {
-            if is_err_config_not_found(&err) {
+            if err == StorageError::ConfigNotFound {
                 return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
             }
 

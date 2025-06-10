@@ -93,6 +93,8 @@ tower-http = { workspace = true, features = [
 ] }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
+rustfs-filemeta.workspace = true
+rustfs-rio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true

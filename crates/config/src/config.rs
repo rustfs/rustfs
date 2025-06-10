@@ -1,5 +1,5 @@
-use crate::event::config::NotifierConfig;
 use crate::ObservabilityConfig;
+use crate::event::config::NotifierConfig;
 
 /// RustFs configuration
 pub struct RustFsConfig {

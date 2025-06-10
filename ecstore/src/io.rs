@@ -6,9 +6,9 @@ use md5::Md5;
 use pin_project_lite::pin_project;
 use std::io;
 use std::pin::Pin;
-use std::task::ready;
 use std::task::Context;
 use std::task::Poll;
+use std::task::ready;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
@@ -19,7 +19,7 @@ use tokio_util::io::StreamReader;
 use tracing::error;
 use tracing::warn;
 
-pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
+// pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
 pub const READ_BUFFER_SIZE: usize = 1024 * 1024;
@@ -93,37 +93,37 @@ impl AsyncWrite for HttpFileWriter {
     }
 }
 
-pub struct HttpFileReader {
-    inner: FileReader,
-}
+// pub struct HttpFileReader {
+//     inner: FileReader,
+// }
 
-impl HttpFileReader {
-    pub async fn new(url: &str, disk: &str, volume: &str, path: &str, offset: usize, length: usize) -> io::Result<Self> {
-        let resp = reqwest::Client::new()
-            .get(format!(
-                "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-                url,
-                urlencoding::encode(disk),
-                urlencoding::encode(volume),
-                urlencoding::encode(path),
-                offset,
-                length
-            ))
-            .send()
-            .await
-            .map_err(io::Error::other)?;
+// impl HttpFileReader {
+//     pub async fn new(url: &str, disk: &str, volume: &str, path: &str, offset: usize, length: usize) -> io::Result<Self> {
+//         let resp = reqwest::Client::new()
+//             .get(format!(
+//                 "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
+//                 url,
+//                 urlencoding::encode(disk),
+//                 urlencoding::encode(volume),
+//                 urlencoding::encode(path),
+//                 offset,
+//                 length
+//             ))
+//             .send()
+//             .await
+//             .map_err(io::Error::other)?;
 
-        let inner = Box::new(StreamReader::new(resp.bytes_stream().map_err(io::Error::other)));
+//         let inner = Box::new(StreamReader::new(resp.bytes_stream().map_err(io::Error::other)));
 
-        Ok(Self { inner })
-    }
-}
+//         Ok(Self { inner })
+//     }
+// }
 
-impl AsyncRead for HttpFileReader {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
+// impl AsyncRead for HttpFileReader {
+//     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+//         Pin::new(&mut self.inner).poll_read(cx, buf)
+//     }
+// }
 
 #[async_trait]
 pub trait Etag {
@@ -277,65 +277,65 @@ mod tests {
         assert!(writer.is_ok(), "HttpFileWriter creation should succeed even with invalid URL");
     }
 
-    #[tokio::test]
-    async fn test_http_file_reader_creation() {
-        // Test creation without actually making HTTP requests
-        // We'll test the URL construction logic by checking the error messages
-        let result =
-            HttpFileReader::new("http://invalid-server:9999", "test-disk", "test-volume", "test-file.txt", 0, 1024).await;
+    // #[tokio::test]
+    // async fn test_http_file_reader_creation() {
+    //     // Test creation without actually making HTTP requests
+    //     // We'll test the URL construction logic by checking the error messages
+    //     let result =
+    //         HttpFileReader::new("http://invalid-server:9999", "test-disk", "test-volume", "test-file.txt", 0, 1024).await;
 
-        // May succeed or fail depending on network conditions, but should not panic
-        // The important thing is that the URL construction logic works
-        assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
-    }
+    //     // May succeed or fail depending on network conditions, but should not panic
+    //     // The important thing is that the URL construction logic works
+    //     assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
+    // }
 
-    #[tokio::test]
-    async fn test_http_file_reader_with_offset_and_length() {
-        let result = HttpFileReader::new(
-            "http://invalid-server:9999",
-            "test-disk",
-            "test-volume",
-            "test-file.txt",
-            100, // offset
-            500, // length
-        )
-        .await;
+    // #[tokio::test]
+    // async fn test_http_file_reader_with_offset_and_length() {
+    //     let result = HttpFileReader::new(
+    //         "http://invalid-server:9999",
+    //         "test-disk",
+    //         "test-volume",
+    //         "test-file.txt",
+    //         100, // offset
+    //         500, // length
+    //     )
+    //     .await;
 
-        // May succeed or fail, but this tests parameter handling
-        assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
-    }
+    //     // May succeed or fail, but this tests parameter handling
+    //     assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
+    // }
 
-    #[tokio::test]
-    async fn test_http_file_reader_zero_length() {
-        let result = HttpFileReader::new(
-            "http://invalid-server:9999",
-            "test-disk",
-            "test-volume",
-            "test-file.txt",
-            0,
-            0, // zero length
-        )
-        .await;
+    // #[tokio::test]
+    // async fn test_http_file_reader_zero_length() {
+    //     let result = HttpFileReader::new(
+    //         "http://invalid-server:9999",
+    //         "test-disk",
+    //         "test-volume",
+    //         "test-file.txt",
+    //         0,
+    //         0, // zero length
+    //     )
+    //     .await;
 
-        // May succeed or fail, but this tests zero length handling
-        assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
-    }
+    //     // May succeed or fail, but this tests zero length handling
+    //     assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
+    // }
 
-    #[tokio::test]
-    async fn test_http_file_reader_with_special_characters() {
-        let result = HttpFileReader::new(
-            "http://invalid-server:9999",
-            "test disk with spaces",
-            "test/volume",
-            "test file with spaces & symbols.txt",
-            0,
-            1024,
-        )
-        .await;
+    // #[tokio::test]
+    // async fn test_http_file_reader_with_special_characters() {
+    //     let result = HttpFileReader::new(
+    //         "http://invalid-server:9999",
+    //         "test disk with spaces",
+    //         "test/volume",
+    //         "test file with spaces & symbols.txt",
+    //         0,
+    //         1024,
+    //     )
+    //     .await;
 
-        // May succeed or fail, but this tests URL encoding
-        assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
-    }
+    //     // May succeed or fail, but this tests URL encoding
+    //     assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
+    // }
 
     #[tokio::test]
     async fn test_etag_reader_creation() {
@@ -439,17 +439,17 @@ mod tests {
         assert_eq!(etag.len(), 32, "MD5 hash should be 32 characters");
     }
 
-    #[tokio::test]
-    async fn test_file_reader_and_writer_types() {
-        // Test that the type aliases are correctly defined
-        let _reader: FileReader = Box::new(Cursor::new(b"test"));
-        let (_writer_tx, writer_rx) = tokio::io::duplex(1024);
-        let _writer: FileWriter = Box::new(writer_rx);
+    // #[tokio::test]
+    // async fn test_file_reader_and_writer_types() {
+    //     // Test that the type aliases are correctly defined
+    //     let _reader: FileReader = Box::new(Cursor::new(b"test"));
+    //     let (_writer_tx, writer_rx) = tokio::io::duplex(1024);
+    //     let _writer: FileWriter = Box::new(writer_rx);
 
-        // If this compiles, the types are correctly defined
-        // This is a placeholder test - remove meaningless assertion
-        // assert!(true);
-    }
+    //     // If this compiles, the types are correctly defined
+    //     // This is a placeholder test - remove meaningless assertion
+    //     // assert!(true);
+    // }
 
     #[tokio::test]
     async fn test_etag_trait_implementation() {
@@ -503,45 +503,45 @@ mod tests {
         assert_eq!(result1, "d41d8cd98f00b204e9800998ecf8427e");
     }
 
-    #[tokio::test]
-    async fn test_edge_case_parameters() {
-        // Test HttpFileWriter with edge case parameters
-        let writer = HttpFileWriter::new(
-            "http://localhost:8080",
-            "", // empty disk
-            "", // empty volume
-            "", // empty path
-            0,  // zero size
-            false,
-        );
-        assert!(writer.is_ok(), "HttpFileWriter should handle empty parameters");
+    // #[tokio::test]
+    // async fn test_edge_case_parameters() {
+    //     // Test HttpFileWriter with edge case parameters
+    //     let writer = HttpFileWriter::new(
+    //         "http://localhost:8080",
+    //         "", // empty disk
+    //         "", // empty volume
+    //         "", // empty path
+    //         0,  // zero size
+    //         false,
+    //     );
+    //     assert!(writer.is_ok(), "HttpFileWriter should handle empty parameters");
 
-        // Test HttpFileReader with edge case parameters
-        let result = HttpFileReader::new(
-            "http://invalid:9999",
-            "", // empty disk
-            "", // empty volume
-            "", // empty path
-            0,  // zero offset
-            0,  // zero length
-        )
-        .await;
-        // May succeed or fail, but parameters should be handled
-        assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
-    }
+    //     // Test HttpFileReader with edge case parameters
+    //     let result = HttpFileReader::new(
+    //         "http://invalid:9999",
+    //         "", // empty disk
+    //         "", // empty volume
+    //         "", // empty path
+    //         0,  // zero offset
+    //         0,  // zero length
+    //     )
+    //     .await;
+    //     // May succeed or fail, but parameters should be handled
+    //     assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
+    // }
 
-    #[tokio::test]
-    async fn test_url_encoding_edge_cases() {
-        // Test with characters that need URL encoding
-        let special_chars = "test file with spaces & symbols + % # ? = @ ! $ ( ) [ ] { } | \\ / : ; , . < > \" '";
+    // #[tokio::test]
+    // async fn test_url_encoding_edge_cases() {
+    //     // Test with characters that need URL encoding
+    //     let special_chars = "test file with spaces & symbols + % # ? = @ ! $ ( ) [ ] { } | \\ / : ; , . < > \" '";
 
-        let writer = HttpFileWriter::new("http://localhost:8080", special_chars, special_chars, special_chars, 1024, false);
-        assert!(writer.is_ok(), "HttpFileWriter should handle special characters");
+    //     let writer = HttpFileWriter::new("http://localhost:8080", special_chars, special_chars, special_chars, 1024, false);
+    //     assert!(writer.is_ok(), "HttpFileWriter should handle special characters");
 
-        let result = HttpFileReader::new("http://invalid:9999", special_chars, special_chars, special_chars, 0, 1024).await;
-        // May succeed or fail, but URL encoding should work
-        assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
-    }
+    //     let result = HttpFileReader::new("http://invalid:9999", special_chars, special_chars, special_chars, 0, 1024).await;
+    //     // May succeed or fail, but URL encoding should work
+    //     assert!(result.is_ok() || result.is_err(), "HttpFileReader creation should not panic");
+    // }
 
     #[tokio::test]
     async fn test_etag_reader_with_binary_data() {

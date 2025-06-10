@@ -1,9 +1,8 @@
 use crate::bitrot::{BitrotReader, BitrotWriter};
-use crate::error::clone_err;
+use crate::disk::error::{Error, Result};
+use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
 use crate::io::Etag;
-use crate::quorum::{object_op_ignored_errs, reduce_write_quorum_errs};
 use bytes::{Bytes, BytesMut};
-use common::error::{Error, Result};
 use futures::future::join_all;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use smallvec::SmallVec;
@@ -73,11 +72,7 @@ impl Erasure {
                 if total_size > 0 {
                     let new_len = {
                         let remain = total_size - total;
-                        if remain > self.block_size {
-                            self.block_size
-                        } else {
-                            remain
-                        }
+                        if remain > self.block_size { self.block_size } else { remain }
                     };
 
                     if new_len == 0 && total > 0 {
@@ -91,7 +86,7 @@ impl Erasure {
                             if let ErrorKind::UnexpectedEof = e.kind() {
                                 break;
                             } else {
-                                return Err(Error::new(e));
+                                return Err(e.into());
                             }
                         }
                     };
@@ -115,7 +110,7 @@ impl Erasure {
                     if let Some(w) = w_op {
                         w.write(blocks_inner[i_inner].clone()).await.err()
                     } else {
-                        Some(Error::new(DiskError::DiskNotFound))
+                        Some(DiskError::DiskNotFound)
                     }
                 }
             });
@@ -128,7 +123,7 @@ impl Erasure {
                 continue;
             }
 
-            if let Some(err) = reduce_write_quorum_errs(&errs, object_op_ignored_errs().as_ref(), write_quorum) {
+            if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
                 warn!("Erasure encode errs {:?}", &errs);
                 return Err(err);
             }
@@ -210,7 +205,7 @@ impl Erasure {
 
         if bytes_writed != length {
             // debug!("bytes_writed != length: {} != {} ", bytes_writed, length);
-            return (bytes_writed, Some(Error::msg("erasure decode less data")));
+            return (bytes_writed, Some(Error::other("erasure decode less data")));
         }
 
         (bytes_writed, None)
@@ -228,7 +223,7 @@ impl Erasure {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         if bufs.len() < data_blocks {
-            return Err(Error::msg("read bufs not match data_blocks"));
+            return Err(Error::other("read bufs not match data_blocks"));
         }
 
         let data_len: usize = bufs
@@ -238,7 +233,7 @@ impl Erasure {
             .map(|v| v.as_ref().unwrap().len())
             .sum();
         if data_len < length {
-            return Err(Error::msg(format!("write_data_blocks data_len < length {} < {}", data_len, length)));
+            return Err(Error::other(format!("write_data_blocks data_len < length {} < {}", data_len, length)));
         }
 
         let mut offset = offset;
@@ -304,7 +299,7 @@ impl Erasure {
 
             // partiy 数量大于 0 才 ec
             if self.parity_shards > 0 {
-                self.encoder.as_ref().unwrap().encode(data_slices)?;
+                self.encoder.as_ref().unwrap().encode(data_slices).map_err(Error::other)?;
             }
         }
 
@@ -321,7 +316,7 @@ impl Erasure {
 
     pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> Result<()> {
         if self.parity_shards > 0 {
-            self.encoder.as_ref().unwrap().reconstruct(shards)?;
+            self.encoder.as_ref().unwrap().reconstruct(shards).map_err(Error::other)?;
         }
 
         Ok(())
@@ -382,7 +377,7 @@ impl Erasure {
             total_length
         );
         if writers.len() != self.parity_shards + self.data_shards {
-            return Err(Error::from_string("invalid argument"));
+            return Err(Error::other("invalid argument"));
         }
         let mut reader = ShardReader::new(readers, self, 0, total_length);
 
@@ -397,12 +392,12 @@ impl Erasure {
             let mut bufs = reader.read().await?;
 
             if self.parity_shards > 0 {
-                self.encoder.as_ref().unwrap().reconstruct(&mut bufs)?;
+                self.encoder.as_ref().unwrap().reconstruct(&mut bufs).map_err(Error::other)?;
             }
 
             let shards = bufs.into_iter().flatten().map(Bytes::from).collect::<Vec<_>>();
             if shards.len() != self.parity_shards + self.data_shards {
-                return Err(Error::from_string("can not reconstruct data"));
+                return Err(Error::other("can not reconstruct data"));
             }
 
             for (i, w) in writers.iter_mut().enumerate() {
@@ -419,7 +414,7 @@ impl Erasure {
             }
         }
         if !errs.is_empty() {
-            return Err(clone_err(&errs[0]));
+            return Err(errs[0].clone().into());
         }
 
         Ok(())
@@ -494,7 +489,7 @@ impl ShardReader {
                 if let Some(disk) = disk {
                     disk.read_at(offset, read_length).await
                 } else {
-                    Err(Error::new(DiskError::DiskNotFound))
+                    Err(DiskError::DiskNotFound)
                 }
             });
         }
@@ -517,7 +512,7 @@ impl ShardReader {
             warn!("ec decode read ress {:?}", &ress);
             warn!("ec decode read errors {:?}", &errors);
 
-            return Err(Error::msg("shard reader read faild"));
+            return Err(Error::other("shard reader read faild"));
         }
 
         self.offset += self.shard_size;

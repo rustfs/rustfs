@@ -2,7 +2,7 @@ use crate::Error;
 use crate::Log;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::fs::{create_dir_all, File, OpenOptions};
+use tokio::fs::{File, OpenOptions, create_dir_all};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::RwLock;
 use tracing::instrument;

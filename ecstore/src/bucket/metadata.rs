@@ -18,8 +18,8 @@ use tracing::error;
 
 use crate::bucket::target::BucketTarget;
 use crate::config::com::{read_config, save_config};
-use crate::{config, new_object_layer_fn};
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
+use crate::new_object_layer_fn;
 
 use crate::disk::BUCKET_META_PREFIX;
 use crate::store::ECStore;
@@ -178,7 +178,7 @@ impl BucketMetadata {
 
     pub fn check_header(buf: &[u8]) -> Result<()> {
         if buf.len() <= 4 {
-            return Err(Error::msg("read_bucket_metadata: data invalid"));
+            return Err(Error::other("read_bucket_metadata: data invalid"));
         }
 
         let format = LittleEndian::read_u16(&buf[0..2]);
@@ -186,12 +186,12 @@ impl BucketMetadata {
 
         match format {
             BUCKET_METADATA_FORMAT => {}
-            _ => return Err(Error::msg("read_bucket_metadata: format invalid")),
+            _ => return Err(Error::other("read_bucket_metadata: format invalid")),
         }
 
         match version {
             BUCKET_METADATA_VERSION => {}
-            _ => return Err(Error::msg("read_bucket_metadata: version invalid")),
+            _ => return Err(Error::other("read_bucket_metadata: version invalid")),
         }
 
         Ok(())
@@ -285,7 +285,7 @@ impl BucketMetadata {
                 self.bucket_targets_config_json = data.clone();
                 self.bucket_targets_config_updated_at = updated;
             }
-            _ => return Err(Error::msg(format!("config file not found : {}", config_file))),
+            _ => return Err(Error::other(format!("config file not found : {}", config_file))),
         }
 
         Ok(updated)
@@ -296,7 +296,9 @@ impl BucketMetadata {
     }
 
     pub async fn save(&mut self) -> Result<()> {
-        let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+        let Some(store) = new_object_layer_fn() else {
+            return Err(Error::other("errServerNotInitialized"));
+        };
 
         self.parse_all_configs(store.clone())?;
 
@@ -364,7 +366,7 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
     let mut bm = match read_bucket_metadata(api.clone(), bucket).await {
         Ok(res) => res,
         Err(err) => {
-            if !config::error::is_err_config_not_found(&err) {
+            if err != Error::ConfigNotFound {
                 return Err(err);
             }
 
@@ -388,7 +390,7 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
 async fn read_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
     if bucket.is_empty() {
         error!("bucket name empty");
-        return Err(Error::msg("invalid argument"));
+        return Err(Error::other("invalid argument"));
     }
 
     let bm = BucketMetadata::new(bucket);
@@ -403,7 +405,7 @@ async fn read_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketM
     Ok(bm)
 }
 
-fn _write_time<S>(t: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error>
+fn _write_time<S>(t: &OffsetDateTime, s: S) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
 {

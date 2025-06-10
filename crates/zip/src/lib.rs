@@ -608,8 +608,8 @@ mod tests {
     #[tokio::test]
     async fn test_decompress_with_invalid_format() {
         // Test decompression with invalid format
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let sample_content = b"Hello, compression world!";
         let cursor = Cursor::new(sample_content);
@@ -634,8 +634,8 @@ mod tests {
     #[tokio::test]
     async fn test_decompress_with_zip_format() {
         // Test decompression with Zip format (currently not supported)
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let sample_content = b"Hello, compression world!";
         let cursor = Cursor::new(sample_content);
@@ -660,8 +660,8 @@ mod tests {
     #[tokio::test]
     async fn test_decompress_error_propagation() {
         // Test error propagation during decompression process
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let sample_content = b"Hello, compression world!";
         let cursor = Cursor::new(sample_content);
@@ -690,8 +690,8 @@ mod tests {
     #[tokio::test]
     async fn test_decompress_callback_execution() {
         // Test callback function execution during decompression
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let sample_content = b"Hello, compression world!";
         let cursor = Cursor::new(sample_content);

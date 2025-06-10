@@ -1,9 +1,9 @@
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, ops::Deref};
 use strum::{EnumString, IntoStaticStr};
 
-use super::{utils::wildcard, Error as IamError, Validator};
+use super::{Error as IamError, Validator, utils::wildcard};
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct ActionSet(pub HashSet<Action>);
@@ -84,7 +84,7 @@ impl Action {
 
 impl TryFrom<&str> for Action {
     type Error = Error;
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
         if value.starts_with(Self::S3_PREFIX) {
             Ok(Self::S3Action(
                 S3Action::try_from(value).map_err(|_| IamError::InvalidAction(value.into()))?,

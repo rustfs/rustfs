@@ -1,11 +1,11 @@
 use nix::sys::stat::{self, stat};
-use nix::sys::statfs::{self, statfs, FsType};
+use nix::sys::statfs::{self, FsType, statfs};
 use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind};
 use std::path::Path;
 
 use crate::disk::Info;
-use common::error::{Error as e_Error, Result};
+use std::io::{Error, Result};
 
 use super::IOStats;
 
@@ -29,7 +29,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
                     bfree,
                     p.as_ref().display()
                 ),
-            ))
+            ));
         }
     };
 
@@ -44,7 +44,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
                     blocks,
                     p.as_ref().display()
                 ),
-            ))
+            ));
         }
     };
 
@@ -60,7 +60,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<Info> {
                     total,
                     p.as_ref().display()
                 ),
-            ))
+            ));
         }
     };
 
@@ -122,7 +122,7 @@ pub fn get_drive_stats(major: u32, minor: u32) -> Result<IOStats> {
 fn read_drive_stats(stats_file: &str) -> Result<IOStats> {
     let stats = read_stat(stats_file)?;
     if stats.len() < 11 {
-        return Err(e_Error::from_string(format!("found invalid format while reading {}", stats_file)));
+        return Err(Error::new(ErrorKind::Other, format!("found invalid format while reading {}", stats_file)));
     }
     let mut io_stats = IOStats {
         read_ios: stats[0],

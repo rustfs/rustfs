@@ -19,14 +19,17 @@ members = [
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
     "crates/zip",
+    "crates/filemeta",
+    "crates/rio",
+
 ]
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.75"
+rust-version = "1.85"
 version = "0.0.1"
 
 [workspace.lints.rust]
@@ -53,6 +56,10 @@ rustfs-config = { path = "./crates/config", version = "0.0.1" }
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
 rustfs-utils = { path = "crates/utils", version = "0.0.1" }
+rustfs-rio = { path = "crates/rio", version = "0.0.1" }
+rustfs-filemeta = { path = "crates/filemeta", version = "0.0.1" }
+rustfs-disk = { path = "crates/disk", version = "0.0.1" }
+rustfs-error = { path = "crates/error", version = "0.0.1" }
 workers = { path = "./common/workers", version = "0.0.1" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 arc-swap = "1.7.1"
@@ -151,6 +158,7 @@ protobuf = "3.7"
 rand = "0.9.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
+reed-solomon-simd = { version = "3.0.0" }
 regex = { version = "1.11.1" }
 reqwest = { version = "0.12.19", default-features = false, features = [
     "rustls-tls",

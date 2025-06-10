@@ -1,14 +1,14 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 use crate::{
-    bucket::{self, target::BucketTargets},
-    new_object_layer_fn, peer, store_api,
-};
-use crate::{
+    StorageAPI,
     bucket::{metadata_sys, target::BucketTarget},
     endpoints::Node,
     peer::{PeerS3Client, RemotePeerS3Client},
-    StorageAPI,
+};
+use crate::{
+    bucket::{self, target::BucketTargets},
+    new_object_layer_fn, peer, store_api,
 };
 //use tokio::sync::RwLock;
 use aws_sdk_s3::Client as S3Client;
@@ -535,6 +535,7 @@ pub struct TargetClient {
 }
 
 impl TargetClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: reqwest::Client,
         health_check_duration: Duration,
@@ -623,11 +624,6 @@ impl ARN {
         false
     }
 
-    /// 将 ARN 转为字符串格式
-    pub fn to_string(&self) -> String {
-        format!("arn:rustfs:{}:{}:{}:{}", self.arn_type, self.region, self.id, self.bucket)
-    }
-
     /// 从字符串解析 ARN
     pub fn parse(s: &str) -> Result<Self, String> {
         // ARN 必须是格式 arn:rustfs:<Type>:<REGION>:<ID>:<remote-bucket>
@@ -652,7 +648,7 @@ impl ARN {
 // 实现 `Display` trait，使得可以直接使用 `format!` 或 `{}` 输出 ARN
 impl std::fmt::Display for ARN {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "arn:rustfs:{}:{}:{}:{}", self.arn_type, self.region, self.id, self.bucket)
     }
 }
 

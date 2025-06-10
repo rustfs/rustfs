@@ -125,7 +125,7 @@ impl LRWMutex {
 mod test {
     use std::{sync::Arc, time::Duration};
 
-    use common::error::Result;
+    use std::io::Result;
     use tokio::time::sleep;
 
     use crate::lrwmutex::LRWMutex;

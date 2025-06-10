@@ -5,7 +5,7 @@ use iam::{
 };
 use madmin::GroupAddRemove;
 use matchit::Params;
-use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;

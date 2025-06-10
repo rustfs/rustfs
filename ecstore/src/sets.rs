@@ -1,16 +1,20 @@
 #![allow(clippy::map_entry)]
 use std::{collections::HashMap, sync::Arc};
 
+use crate::disk::error_reduce::count_errs;
+use crate::error::{Error, Result};
 use crate::{
     disk::{
-        error::{is_unformatted_disk, DiskError},
+        DiskAPI, DiskInfo, DiskOption, DiskStore,
+        error::DiskError,
         format::{DistributionAlgoVersion, FormatV3},
-        new_disk, DiskAPI, DiskInfo, DiskOption, DiskStore,
+        new_disk,
     },
     endpoints::{Endpoints, PoolEndpoints},
-    global::{is_dist_erasure, GLOBAL_LOCAL_DISK_SET_DRIVES},
+    error::StorageError,
+    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
     heal::heal_commands::{
-        HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_METADATA,
+        DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_METADATA, HealOpts,
     },
     set_disk::SetDisks,
     store_api::{
@@ -18,15 +22,13 @@ use crate::{
         ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult,
         ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
-    store_err::StorageError,
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
     utils::{hash, path::path_join_buf},
 };
-use common::error::{Error, Result};
 use common::globals::GLOBAL_Local_Node_Name;
 use futures::future::join_all;
 use http::HeaderMap;
-use lock::{namespace_lock::NsLockMap, new_lock_api, LockApi};
+use lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -122,7 +124,7 @@ impl Sets {
                 }
 
                 let has_disk_id = disk.as_ref().unwrap().get_disk_id().await.unwrap_or_else(|err| {
-                    if is_unformatted_disk(&err) {
+                    if err == DiskError::UnformattedDisk {
                         error!("get_disk_id err {:?}", err);
                     } else {
                         warn!("get_disk_id err {:?}", err);
@@ -452,11 +454,11 @@ impl StorageAPI for Sets {
             return dst_set.put_object(dst_bucket, dst_object, put_object_reader, &put_opts).await;
         }
 
-        Err(Error::new(StorageError::InvalidArgument(
+        Err(StorageError::InvalidArgument(
             src_bucket.to_owned(),
             src_object.to_owned(),
             "put_object_reader2 is none".to_owned(),
-        )))
+        ))
     }
 
     #[tracing::instrument(skip(self))]
@@ -705,9 +707,9 @@ impl StorageAPI for Sets {
             res.before.drives.push(v.clone());
             res.after.drives.push(v.clone());
         }
-        if DiskError::UnformattedDisk.count_errs(&errs) == 0 {
+        if count_errs(&errs, &DiskError::UnformattedDisk) == 0 {
             info!("disk formats success, NoHealRequired, errs: {:?}", errs);
-            return Ok((res, Some(Error::new(DiskError::NoHealRequired))));
+            return Ok((res, Some(StorageError::NoHealRequired)));
         }
 
         // if !self.format.eq(&ref_format) {
@@ -807,7 +809,7 @@ async fn _close_storage_disks(disks: &[Option<DiskStore>]) {
 async fn init_storage_disks_with_errors(
     endpoints: &Endpoints,
     opts: &DiskOption,
-) -> (Vec<Option<DiskStore>>, Vec<Option<Error>>) {
+) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
     // Bootstrap disks.
     // let disks = Arc::new(RwLock::new(vec![None; endpoints.as_ref().len()]));
     // let errs = Arc::new(RwLock::new(vec![None; endpoints.as_ref().len()]));
@@ -856,20 +858,21 @@ async fn init_storage_disks_with_errors(
     (disks, errs)
 }
 
-fn formats_to_drives_info(endpoints: &Endpoints, formats: &[Option<FormatV3>], errs: &[Option<Error>]) -> Vec<HealDriveInfo> {
+fn formats_to_drives_info(endpoints: &Endpoints, formats: &[Option<FormatV3>], errs: &[Option<DiskError>]) -> Vec<HealDriveInfo> {
     let mut before_drives = Vec::with_capacity(endpoints.as_ref().len());
     for (index, format) in formats.iter().enumerate() {
         let drive = endpoints.get_string(index);
         let state = if format.is_some() {
             DRIVE_STATE_OK
-        } else {
-            if let Some(Some(err)) = errs.get(index) {
-                match err.downcast_ref::<DiskError>() {
-                    Some(DiskError::UnformattedDisk) => DRIVE_STATE_MISSING,
-                    Some(DiskError::DiskNotFound) => DRIVE_STATE_OFFLINE,
-                    _ => DRIVE_STATE_CORRUPT,
-                };
+        } else if let Some(Some(err)) = errs.get(index) {
+            if *err == DiskError::UnformattedDisk {
+                DRIVE_STATE_MISSING
+            } else if *err == DiskError::DiskNotFound {
+                DRIVE_STATE_OFFLINE
+            } else {
+                DRIVE_STATE_CORRUPT
             }
+        } else {
             DRIVE_STATE_CORRUPT
         };
 
@@ -892,14 +895,14 @@ fn new_heal_format_sets(
     set_count: usize,
     set_drive_count: usize,
     formats: &[Option<FormatV3>],
-    errs: &[Option<Error>],
+    errs: &[Option<DiskError>],
 ) -> (Vec<Vec<Option<FormatV3>>>, Vec<Vec<DiskInfo>>) {
     let mut new_formats = vec![vec![None; set_drive_count]; set_count];
     let mut current_disks_info = vec![vec![DiskInfo::default(); set_drive_count]; set_count];
     for (i, set) in ref_format.erasure.sets.iter().enumerate() {
         for j in 0..set.len() {
             if let Some(Some(err)) = errs.get(i * set_drive_count + j) {
-                if let Some(DiskError::UnformattedDisk) = err.downcast_ref::<DiskError>() {
+                if *err == DiskError::UnformattedDisk {
                     let mut fm = FormatV3::new(set_count, set_drive_count);
                     fm.id = ref_format.id;
                     fm.format = ref_format.format.clone();

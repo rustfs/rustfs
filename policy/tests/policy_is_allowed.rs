@@ -1,7 +1,7 @@
-use policy::policy::action::Action;
-use policy::policy::action::S3Action::*;
 use policy::policy::ActionSet;
 use policy::policy::Effect::*;
+use policy::policy::action::Action;
+use policy::policy::action::S3Action::*;
 use policy::policy::*;
 use serde_json::Value;
 use std::collections::HashMap;

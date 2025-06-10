@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common::error::Result;
 use lazy_static::lazy_static;
 use local_locker::LocalLocker;
 use lock_args::LockArgs;
 use remote_client::RemoteClient;
+use std::io::Result;
 use tokio::sync::RwLock;
 
 pub mod drwmutex;
