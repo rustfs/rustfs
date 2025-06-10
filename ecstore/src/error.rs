@@ -161,7 +161,7 @@ pub enum StorageError {
     #[error("not first disk")]
     NotFirstDisk,
 
-    #[error("first disk wiat")]
+    #[error("first disk wait")]
     FirstDiskWait,
 
     #[error("Bucket policy not found")]

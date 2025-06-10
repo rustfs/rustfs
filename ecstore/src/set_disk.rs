@@ -1939,7 +1939,7 @@ impl SetDisks {
                 }
             }
 
-            // debug!("ec decode {} writed size {}", part_number, n);
+            // debug!("ec decode {} written size {}", part_number, n);
 
             total_readed += part_length;
             part_offset = 0;

@@ -155,7 +155,7 @@ impl Erasure {
 
         // debug!("decode block from {} to {}", start_block, end_block);
 
-        let mut bytes_writed = 0;
+        let mut bytes_written = 0;
 
         for block_idx in start_block..=end_block {
             let (block_offset, block_length) = if start_block == end_block {
@@ -178,37 +178,37 @@ impl Erasure {
 
             let mut bufs = match reader.read().await {
                 Ok(bufs) => bufs,
-                Err(err) => return (bytes_writed, Some(err)),
+                Err(err) => return (bytes_written, Some(err)),
             };
 
             if self.parity_shards > 0 {
                 if let Err(err) = self.decode_data(&mut bufs) {
-                    return (bytes_writed, Some(err));
+                    return (bytes_written, Some(err));
                 }
             }
 
-            let writed_n = match self
+            let written_n = match self
                 .write_data_blocks(writer, bufs, self.data_shards, block_offset, block_length)
                 .await
             {
                 Ok(n) => n,
                 Err(err) => {
                     error!("write_data_blocks err {:?}", &err);
-                    return (bytes_writed, Some(err));
+                    return (bytes_written, Some(err));
                 }
             };
 
-            bytes_writed += writed_n;
+            bytes_written += written_n;
 
-            // debug!("decode {} writed_n {}, total_writed: {} ", block_idx, writed_n, bytes_writed);
+            // debug!("decode {} written_n {}, total_written: {} ", block_idx, written_n, bytes_written);
         }
 
-        if bytes_writed != length {
-            // debug!("bytes_writed != length: {} != {} ", bytes_writed, length);
-            return (bytes_writed, Some(Error::other("erasure decode less data")));
+        if bytes_written != length {
+            // debug!("bytes_written != length: {} != {} ", bytes_written, length);
+            return (bytes_written, Some(Error::other("erasure decode less data")));
         }
 
-        (bytes_writed, None)
+        (bytes_written, None)
     }
 
     async fn write_data_blocks<W>(
@@ -241,7 +241,7 @@ impl Erasure {
         // debug!("write_data_blocks offset {}, length {}", offset, length);
 
         let mut write = length;
-        let mut total_writed = 0;
+        let mut total_written = 0;
 
         for opt_buf in bufs.iter().take(data_blocks) {
             let buf = opt_buf.as_ref().unwrap();
@@ -263,7 +263,7 @@ impl Erasure {
                 // debug!("write_data_blocks write buf less len {}", buf.len());
                 writer.write_all(buf).await?;
                 // debug!("write_data_blocks write done len {}", buf.len());
-                total_writed += buf.len();
+                total_written += buf.len();
                 break;
             }
 
@@ -272,10 +272,10 @@ impl Erasure {
 
             // debug!("write_data_blocks write done len {}", n);
             write -= n;
-            total_writed += n;
+            total_written += n;
         }
 
-        Ok(total_writed)
+        Ok(total_written)
     }
 
     pub fn total_shard_count(&self) -> usize {

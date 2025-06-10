@@ -342,7 +342,7 @@ pub fn ec_drives_no_config(set_drive_count: usize) -> Result<usize> {
 //     #[error("not first disk")]
 //     NotFirstDisk,
 
-//     #[error("first disk wiat")]
+//     #[error("first disk wait")]
 //     FirstDiskWait,
 
 //     #[error("invalid part id {0}")]
