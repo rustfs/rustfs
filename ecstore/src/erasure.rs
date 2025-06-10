@@ -512,7 +512,7 @@ impl ShardReader {
             warn!("ec decode read ress {:?}", &ress);
             warn!("ec decode read errors {:?}", &errors);
 
-                            return Err(Error::other("shard reader read failed"));
+            return Err(Error::other("shard reader read failed"));
         }
 
         self.offset += self.shard_size;
