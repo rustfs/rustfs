@@ -129,7 +129,7 @@ message CheckPartsResponse {
   optional Error error = 3;
 }
 
-message RenamePartRequst {
+message RenamePartRequest {
   string disk = 1;
   string src_volume = 2;
   string src_path = 3;
@@ -143,7 +143,7 @@ message RenamePartResponse {
   optional Error error = 2;
 }
 
-message RenameFileRequst {
+message RenameFileRequest {
   string disk = 1;
   string src_volume = 2;
   string src_path = 3;
@@ -175,7 +175,7 @@ message WriteResponse {
 //   string path = 3;
 //   bytes data = 4;
 // }
-// 
+//
 // message AppendResponse {
 //   bool success = 1;
 //   optional Error error = 2;
@@ -755,8 +755,8 @@ service NodeService {
   rpc Delete(DeleteRequest) returns (DeleteResponse) {};
   rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {};
   rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {};
-  rpc RenamePart(RenamePartRequst) returns (RenamePartResponse) {};
-  rpc RenameFile(RenameFileRequst) returns (RenameFileResponse) {};
+  rpc RenamePart(RenamePartRequest) returns (RenamePartResponse) {};
+  rpc RenameFile(RenameFileRequest) returns (RenameFileResponse) {};
   rpc Write(WriteRequest) returns (WriteResponse) {};
   rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {};
 //  rpc Append(AppendRequest) returns (AppendResponse) {};

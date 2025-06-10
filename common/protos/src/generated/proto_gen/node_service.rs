@@ -191,7 +191,7 @@ pub struct CheckPartsResponse {
     pub error: ::core::option::Option<Error>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RenamePartRequst {
+pub struct RenamePartRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
@@ -213,7 +213,7 @@ pub struct RenamePartResponse {
     pub error: ::core::option::Option<Error>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RenameFileRequst {
+pub struct RenameFileRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
@@ -1298,7 +1298,7 @@ pub mod node_service_client {
         }
         pub async fn rename_part(
             &mut self,
-            request: impl tonic::IntoRequest<super::RenamePartRequst>,
+            request: impl tonic::IntoRequest<super::RenamePartRequest>,
         ) -> std::result::Result<tonic::Response<super::RenamePartResponse>, tonic::Status> {
             self.inner
                 .ready()
@@ -1313,7 +1313,7 @@ pub mod node_service_client {
         }
         pub async fn rename_file(
             &mut self,
-            request: impl tonic::IntoRequest<super::RenameFileRequst>,
+            request: impl tonic::IntoRequest<super::RenameFileRequest>,
         ) -> std::result::Result<tonic::Response<super::RenameFileResponse>, tonic::Status> {
             self.inner
                 .ready()
@@ -2330,11 +2330,11 @@ pub mod node_service_server {
         ) -> std::result::Result<tonic::Response<super::CheckPartsResponse>, tonic::Status>;
         async fn rename_part(
             &self,
-            request: tonic::Request<super::RenamePartRequst>,
+            request: tonic::Request<super::RenamePartRequest>,
         ) -> std::result::Result<tonic::Response<super::RenamePartResponse>, tonic::Status>;
         async fn rename_file(
             &self,
-            request: tonic::Request<super::RenameFileRequst>,
+            request: tonic::Request<super::RenameFileRequest>,
         ) -> std::result::Result<tonic::Response<super::RenameFileResponse>, tonic::Status>;
         async fn write(
             &self,
@@ -2989,10 +2989,10 @@ pub mod node_service_server {
                 "/node_service.NodeService/RenamePart" => {
                     #[allow(non_camel_case_types)]
                     struct RenamePartSvc<T: NodeService>(pub Arc<T>);
-                    impl<T: NodeService> tonic::server::UnaryService<super::RenamePartRequst> for RenamePartSvc<T> {
+                    impl<T: NodeService> tonic::server::UnaryService<super::RenamePartRequest> for RenamePartSvc<T> {
                         type Response = super::RenamePartResponse;
                         type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
-                        fn call(&mut self, request: tonic::Request<super::RenamePartRequst>) -> Self::Future {
+                        fn call(&mut self, request: tonic::Request<super::RenamePartRequest>) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move { <T as NodeService>::rename_part(&inner, request).await };
                             Box::pin(fut)
@@ -3017,10 +3017,10 @@ pub mod node_service_server {
                 "/node_service.NodeService/RenameFile" => {
                     #[allow(non_camel_case_types)]
                     struct RenameFileSvc<T: NodeService>(pub Arc<T>);
-                    impl<T: NodeService> tonic::server::UnaryService<super::RenameFileRequst> for RenameFileSvc<T> {
+                    impl<T: NodeService> tonic::server::UnaryService<super::RenameFileRequest> for RenameFileSvc<T> {
                         type Response = super::RenameFileResponse;
                         type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
-                        fn call(&mut self, request: tonic::Request<super::RenameFileRequst>) -> Self::Future {
+                        fn call(&mut self, request: tonic::Request<super::RenameFileRequest>) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move { <T as NodeService>::rename_file(&inner, request).await };
                             Box::pin(fut)

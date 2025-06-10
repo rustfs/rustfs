@@ -437,7 +437,7 @@ impl Node for NodeService {
         }
     }
 
-    async fn rename_part(&self, request: Request<RenamePartRequst>) -> Result<Response<RenamePartResponse>, Status> {
+    async fn rename_part(&self, request: Request<RenamePartRequest>) -> Result<Response<RenamePartResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk
@@ -467,7 +467,7 @@ impl Node for NodeService {
         }
     }
 
-    async fn rename_file(&self, request: Request<RenameFileRequst>) -> Result<Response<RenameFileResponse>, Status> {
+    async fn rename_file(&self, request: Request<RenameFileRequest>) -> Result<Response<RenameFileResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk
@@ -2224,7 +2224,7 @@ mod tests {
         Mss, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadMultipleRequest, ReadMultipleResponse,
         ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, ReloadPoolMetaRequest, ReloadPoolMetaResponse,
         ReloadSiteReplicationConfigRequest, ReloadSiteReplicationConfigResponse, RenameDataRequest, RenameDataResponse,
-        RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse, ServerInfoRequest, ServerInfoResponse,
+        RenameFileRequest, RenameFileResponse, RenamePartRequest, RenamePartResponse, ServerInfoRequest, ServerInfoResponse,
         SignalServiceRequest, SignalServiceResponse, StatVolumeRequest, StatVolumeResponse, StopRebalanceRequest,
         StopRebalanceResponse, UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest, VerifyFileResponse,
         WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse,
@@ -2508,7 +2508,7 @@ mod tests {
     async fn test_rename_part_invalid_disk() {
         let service = create_test_node_service();
 
-        let request = Request::new(RenamePartRequst {
+        let request = Request::new(RenamePartRequest {
             disk: "invalid-disk-path".to_string(),
             src_volume: "src-volume".to_string(),
             src_path: "src-path".to_string(),
@@ -2529,7 +2529,7 @@ mod tests {
     async fn test_rename_file_invalid_disk() {
         let service = create_test_node_service();
 
-        let request = Request::new(RenameFileRequst {
+        let request = Request::new(RenameFileRequest {
             disk: "invalid-disk-path".to_string(),
             src_volume: "src-volume".to_string(),
             src_path: "src-path".to_string(),
