@@ -241,7 +241,7 @@ impl ECStore {
                 sleep(Duration::from_secs(wait_sec)).await;
 
                 if exit_count > 10 {
-                    return Err(Error::other("ec init faild"));
+                    return Err(Error::other("ec init failed"));
                 }
 
                 exit_count += 1;

@@ -1508,14 +1508,14 @@ impl S3 for FS {
         // warn!("input policy {}", &policy);
 
         let cfg: BucketPolicy =
-            serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy faild {:?}", e))?;
+            serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?;
 
         if let Err(err) = cfg.is_valid() {
             warn!("put_bucket_policy err input {:?}, {:?}", &policy, err);
             return Err(s3_error!(InvalidPolicyDocument));
         }
 
-        let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy faild {:?}", e))?;
+        let data = serde_json::to_vec(&cfg).map_err(|e| s3_error!(InternalError, "parse policy failed {:?}", e))?;
 
         metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
             .await
