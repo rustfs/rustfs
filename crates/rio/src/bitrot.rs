@@ -237,6 +237,9 @@ mod tests {
         while n < data_size {
             let mut buf = vec![0u8; shard_size];
             let m = bitrot_reader.read(&mut buf).await.unwrap();
+            if m == 0 {
+                break;
+            }
             assert_eq!(&buf[..m], &data[n..n + m]);
 
             out.extend_from_slice(&buf[..m]);
@@ -281,6 +284,9 @@ mod tests {
             }
 
             let m = res.unwrap();
+            if m == 0 {
+                break;
+            }
 
             assert_eq!(&buf[..m], &data[n..n + m]);
 
@@ -312,6 +318,9 @@ mod tests {
         while n < data_size {
             let mut buf = vec![0u8; shard_size];
             let m = bitrot_reader.read(&mut buf).await.unwrap();
+            if m == 0 {
+                break;
+            }
             assert_eq!(&buf[..m], &data[n..n + m]);
             out.extend_from_slice(&buf[..m]);
             n += m;
