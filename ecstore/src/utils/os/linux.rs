@@ -1,11 +1,10 @@
 use nix::sys::stat::{self, stat};
 use nix::sys::statfs::{self, FsType, statfs};
 use std::fs::File;
-use std::io::{self, BufRead, Error, ErrorKind};
+use std::io::{self, BufRead, Error, ErrorKind, Result};
 use std::path::Path;
 
 use crate::disk::Info;
-use std::io::{Error, Result};
 
 use super::IOStats;
 
@@ -163,7 +162,9 @@ fn read_stat(file_name: &str) -> Result<Vec<u64>> {
         // 分割行并解析为 u64
         // https://rust-lang.github.io/rust-clippy/master/index.html#trim_split_whitespace
         for token in line.split_whitespace() {
-            let ui64: u64 = token.parse()?;
+            let ui64: u64 = token
+                .parse()
+                .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Failed to parse token '{}': {}", token, e)))?;
             stats.push(ui64);
         }
     }
