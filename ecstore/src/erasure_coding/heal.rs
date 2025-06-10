@@ -1,19 +1,23 @@
+use super::BitrotReader;
+use super::BitrotWriterWrapper;
 use super::decode::ParallelReader;
 use crate::disk::error::{Error, Result};
 use crate::erasure_coding::encode::MultiWriter;
 use bytes::Bytes;
-use rustfs_rio::BitrotReader;
-use rustfs_rio::BitrotWriter;
+use tokio::io::AsyncRead;
 use tracing::info;
 
 impl super::Erasure {
-    pub async fn heal(
+    pub async fn heal<R>(
         &self,
-        writers: &mut [Option<BitrotWriter>],
-        readers: Vec<Option<BitrotReader>>,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        readers: Vec<Option<BitrotReader<R>>>,
         total_length: usize,
         _prefer: &[bool],
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send + Sync,
+    {
         info!(
             "Erasure heal, writers len: {}, readers len: {}, total_length: {}",
             writers.len(),

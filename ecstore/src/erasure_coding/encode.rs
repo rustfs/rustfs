@@ -1,24 +1,22 @@
-use bytes::Bytes;
-use rustfs_rio::BitrotWriter;
-use rustfs_rio::Reader;
-// use std::io::Cursor;
-// use std::mem;
+use super::BitrotWriterWrapper;
 use super::Erasure;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::count_errs;
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
+use bytes::Bytes;
 use std::sync::Arc;
 use std::vec;
+use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 
 pub(crate) struct MultiWriter<'a> {
-    writers: &'a mut [Option<BitrotWriter>],
+    writers: &'a mut [Option<BitrotWriterWrapper>],
     write_quorum: usize,
     errs: Vec<Option<Error>>,
 }
 
 impl<'a> MultiWriter<'a> {
-    pub fn new(writers: &'a mut [Option<BitrotWriter>], write_quorum: usize) -> Self {
+    pub fn new(writers: &'a mut [Option<BitrotWriterWrapper>], write_quorum: usize) -> Self {
         let length = writers.len();
         MultiWriter {
             writers,
@@ -82,11 +80,11 @@ impl Erasure {
     pub async fn encode<R>(
         self: Arc<Self>,
         mut reader: R,
-        writers: &mut [Option<BitrotWriter>],
+        writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
     ) -> std::io::Result<(R, usize)>
     where
-        R: Reader + Send + Sync + Unpin + 'static,
+        R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(8);
 

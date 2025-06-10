@@ -1,9 +1,11 @@
+use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
 use crate::disk::{
     self, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS,
     conv_part_err_to_int, has_part_err,
 };
 use crate::erasure_coding;
+use crate::erasure_coding::bitrot_verify;
 use crate::error::{Error, Result};
 use crate::global::GLOBAL_MRFState;
 use crate::heal::data_usage_cache::DataUsageCache;
@@ -64,7 +66,7 @@ use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, file_info_from_raw, merge_file_meta_versions,
 };
-use rustfs_rio::{BitrotReader, BitrotWriter, EtagResolvable, HashReader, Writer, bitrot_verify};
+use rustfs_rio::{EtagResolvable, HashReader};
 use rustfs_utils::HashAlgorithm;
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
@@ -1865,51 +1867,31 @@ impl SetDisks {
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
-                if let Some(inline_data) = files[idx].data.clone() {
-                    let rd = Cursor::new(inline_data);
-                    let reader = BitrotReader::new(Box::new(rd), erasure.shard_size(), HashAlgorithm::HighwayHash256);
-                    readers.push(Some(reader));
-                    errors.push(None);
-                } else if let Some(disk) = disk_op {
-                    // Calculate ceiling division of till_offset by shard_size
-                    let till_offset =
-                        till_offset.div_ceil(erasure.shard_size()) * HashAlgorithm::HighwayHash256.size() + till_offset;
-
-                    let rd = disk
-                        .read_file_stream(
-                            bucket,
-                            &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or(Uuid::nil()), part_number),
-                            part_offset,
-                            till_offset,
-                        )
-                        .await?;
-                    let reader = BitrotReader::new(
-                        Box::new(rustfs_rio::WarpReader::new(rd)),
-                        erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256,
-                    );
-                    readers.push(Some(reader));
-                    errors.push(None);
-                } else {
-                    errors.push(Some(DiskError::DiskNotFound));
-                    readers.push(None);
+                match create_bitrot_reader(
+                    files[idx].data.as_deref(),
+                    disk_op.as_ref(),
+                    bucket,
+                    &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
+                    part_offset,
+                    till_offset,
+                    erasure.shard_size(),
+                    HashAlgorithm::HighwayHash256,
+                )
+                .await
+                {
+                    Ok(Some(reader)) => {
+                        readers.push(Some(reader));
+                        errors.push(None);
+                    }
+                    Ok(None) => {
+                        readers.push(None);
+                        errors.push(Some(DiskError::DiskNotFound));
+                    }
+                    Err(e) => {
+                        readers.push(None);
+                        errors.push(Some(e));
+                    }
                 }
-
-                // if let Some(disk) = disk_op {
-                //     let checksum_info = files[idx].erasure.get_checksum_info(part_number);
-                //     let reader = new_bitrot_filereader(
-                //         disk.clone(),
-                //         files[idx].data.clone(),
-                //         bucket.to_owned(),
-                //         format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or(Uuid::nil()), part_number),
-                //         till_offset,
-                //         checksum_info.algorithm,
-                //         erasure.shard_size(erasure.block_size),
-                //     );
-                //     readers.push(Some(reader));
-                // } else {
-                //     readers.push(None)
-                // }
             }
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
@@ -2478,59 +2460,31 @@ impl SetDisks {
                                 let mut prefer = vec![false; latest_disks.len()];
                                 for (index, disk) in latest_disks.iter().enumerate() {
                                     if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
-                                        // let filereader = {
-                                        //     if let Some(ref data) = metadata.data {
-                                        //         Box::new(BufferReader::new(data.clone()))
-                                        //     } else {
-                                        //         let disk = disk.clone();
-                                        //         let part_path = format!("{}/{}/part.{}", object, src_data_dir, part.number);
-
-                                        //         disk.read_file(bucket, &part_path).await?
-                                        //     }
-                                        // };
-                                        // let reader = new_bitrot_filereader(
-                                        //     disk.clone(),
-                                        //     metadata.data.clone(),
-                                        //     bucket.to_owned(),
-                                        //     format!("{}/{}/part.{}", object, src_data_dir, part.number),
-                                        //     till_offset,
-                                        //     checksum_algo.clone(),
-                                        //     erasure.shard_size(erasure.block_size),
-                                        // );
-
-                                        if let Some(ref data) = metadata.data {
-                                            let rd = Cursor::new(data.clone());
-                                            let reader =
-                                                BitrotReader::new(Box::new(rd), erasure.shard_size(), checksum_algo.clone());
-                                            readers.push(Some(reader));
-                                            // errors.push(None);
-                                        } else {
-                                            let length =
-                                                till_offset.div_ceil(erasure.shard_size()) * checksum_algo.size() + till_offset;
-                                            let rd = match disk
-                                                .read_file_stream(
-                                                    bucket,
-                                                    &format!("{}/{}/part.{}", object, src_data_dir, part.number),
-                                                    0,
-                                                    length,
-                                                )
-                                                .await
-                                            {
-                                                Ok(rd) => rd,
-                                                Err(e) => {
-                                                    // errors.push(Some(e.into()));
-                                                    error!("heal_object read_file err: {:?}", e);
-                                                    writers.push(None);
-                                                    continue;
-                                                }
-                                            };
-                                            let reader = BitrotReader::new(
-                                                Box::new(rustfs_rio::WarpReader::new(rd)),
-                                                erasure.shard_size(),
-                                                HashAlgorithm::HighwayHash256,
-                                            );
-                                            readers.push(Some(reader));
-                                            // errors.push(None);
+                                        match create_bitrot_reader(
+                                            metadata.data.as_deref(),
+                                            Some(disk),
+                                            bucket,
+                                            &format!("{}/{}/part.{}", object, src_data_dir, part.number),
+                                            0,
+                                            till_offset,
+                                            erasure.shard_size(),
+                                            checksum_algo.clone(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(reader)) => {
+                                                readers.push(Some(reader));
+                                            }
+                                            Ok(None) => {
+                                                error!("heal_object disk not available");
+                                                readers.push(None);
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                error!("heal_object read_file err: {:?}", e);
+                                                readers.push(None);
+                                                continue;
+                                            }
                                         }
 
                                         prefer[index] = disk.host_name().is_empty();
@@ -2549,55 +2503,67 @@ impl SetDisks {
                                 };
 
                                 for disk in out_dated_disks.iter() {
-                                    if let Some(disk) = disk {
-                                        // let filewriter = {
-                                        //     if is_inline_buffer {
-                                        //         Box::new(Cursor::new(Vec::new()))
-                                        //     } else {
-                                        //         let disk = disk.clone();
-                                        //         let part_path = format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number);
-                                        //         disk.create_file("", RUSTFS_META_TMP_BUCKET, &part_path, 0).await?
-                                        //     }
-                                        // };
+                                    let writer = create_bitrot_writer(
+                                        is_inline_buffer,
+                                        disk.as_ref(),
+                                        RUSTFS_META_TMP_BUCKET,
+                                        &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
+                                        erasure.shard_file_size(part.size),
+                                        erasure.shard_size(),
+                                        HashAlgorithm::HighwayHash256,
+                                    )
+                                    .await?;
+                                    writers.push(Some(writer));
 
-                                        if is_inline_buffer {
-                                            let writer = BitrotWriter::new(
-                                                Writer::from_cursor(Cursor::new(Vec::new())),
-                                                erasure.shard_size(),
-                                                HashAlgorithm::HighwayHash256,
-                                            );
-                                            writers.push(Some(writer));
-                                        } else {
-                                            let f = disk
-                                                .create_file(
-                                                    "",
-                                                    RUSTFS_META_TMP_BUCKET,
-                                                    &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
-                                                    0,
-                                                )
-                                                .await?;
-                                            let writer = BitrotWriter::new(
-                                                Writer::from_tokio_writer(f),
-                                                erasure.shard_size(),
-                                                HashAlgorithm::HighwayHash256,
-                                            );
-                                            writers.push(Some(writer));
-                                        }
+                                    // if let Some(disk) = disk {
+                                    //     // let filewriter = {
+                                    //     //     if is_inline_buffer {
+                                    //     //         Box::new(Cursor::new(Vec::new()))
+                                    //     //     } else {
+                                    //     //         let disk = disk.clone();
+                                    //     //         let part_path = format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number);
+                                    //     //         disk.create_file("", RUSTFS_META_TMP_BUCKET, &part_path, 0).await?
+                                    //     //     }
+                                    //     // };
 
-                                        // let writer = new_bitrot_filewriter(
-                                        //     disk.clone(),
-                                        //     RUSTFS_META_TMP_BUCKET,
-                                        //     format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number).as_str(),
-                                        //     is_inline_buffer,
-                                        //     DEFAULT_BITROT_ALGO,
-                                        //     erasure.shard_size(erasure.block_size),
-                                        // )
-                                        // .await?;
+                                    //     if is_inline_buffer {
+                                    //         let writer = BitrotWriter::new(
+                                    //             Writer::from_cursor(Cursor::new(Vec::new())),
+                                    //             erasure.shard_size(),
+                                    //             HashAlgorithm::HighwayHash256,
+                                    //         );
+                                    //         writers.push(Some(writer));
+                                    //     } else {
+                                    //         let f = disk
+                                    //             .create_file(
+                                    //                 "",
+                                    //                 RUSTFS_META_TMP_BUCKET,
+                                    //                 &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
+                                    //                 0,
+                                    //             )
+                                    //             .await?;
+                                    //         let writer = BitrotWriter::new(
+                                    //             Writer::from_tokio_writer(f),
+                                    //             erasure.shard_size(),
+                                    //             HashAlgorithm::HighwayHash256,
+                                    //         );
+                                    //         writers.push(Some(writer));
+                                    //     }
 
-                                        // writers.push(Some(writer));
-                                    } else {
-                                        writers.push(None);
-                                    }
+                                    //     // let writer = new_bitrot_filewriter(
+                                    //     //     disk.clone(),
+                                    //     //     RUSTFS_META_TMP_BUCKET,
+                                    //     //     format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number).as_str(),
+                                    //     //     is_inline_buffer,
+                                    //     //     DEFAULT_BITROT_ALGO,
+                                    //     //     erasure.shard_size(erasure.block_size),
+                                    //     // )
+                                    //     // .await?;
+
+                                    //     // writers.push(Some(writer));
+                                    // } else {
+                                    //     writers.push(None);
+                                    // }
                                 }
 
                                 // Heal each part. erasure.Heal() will write the healed
@@ -2630,8 +2596,7 @@ impl SetDisks {
                                             // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
                                             //     parts_metadata[index].data = Some(w.inline_data().to_vec());
                                             // }
-                                            parts_metadata[index].data =
-                                                Some(writer.into_inner().into_cursor_inner().unwrap_or_default());
+                                            parts_metadata[index].data = Some(writer.into_inline_data().unwrap_or_default());
                                         }
                                         parts_metadata[index].set_inline_data();
                                     } else {
@@ -3882,27 +3847,38 @@ impl ObjectIO for SetDisks {
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
             if let Some(disk) = disk_op {
-                let writer = if is_inline_buffer {
-                    BitrotWriter::new(
-                        Writer::from_cursor(Cursor::new(Vec::new())),
-                        erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256,
-                    )
-                } else {
-                    let f = match disk
-                        .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_object, erasure.shard_file_size(data.content_length))
-                        .await
-                    {
-                        Ok(f) => f,
-                        Err(e) => {
-                            errors.push(Some(e));
-                            writers.push(None);
-                            continue;
-                        }
-                    };
+                let writer = create_bitrot_writer(
+                    is_inline_buffer,
+                    Some(disk),
+                    RUSTFS_META_TMP_BUCKET,
+                    &tmp_object,
+                    erasure.shard_file_size(data.content_length),
+                    erasure.shard_size(),
+                    HashAlgorithm::HighwayHash256,
+                )
+                .await?;
 
-                    BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
-                };
+                // let writer = if is_inline_buffer {
+                //     BitrotWriter::new(
+                //         Writer::from_cursor(Cursor::new(Vec::new())),
+                //         erasure.shard_size(),
+                //         HashAlgorithm::HighwayHash256,
+                //     )
+                // } else {
+                //     let f = match disk
+                //         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_object, erasure.shard_file_size(data.content_length))
+                //         .await
+                //     {
+                //         Ok(f) => f,
+                //         Err(e) => {
+                //             errors.push(Some(e));
+                //             writers.push(None);
+                //             continue;
+                //         }
+                //     };
+
+                //     BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
+                // };
 
                 writers.push(Some(writer));
                 errors.push(None);
@@ -3952,7 +3928,7 @@ impl ObjectIO for SetDisks {
         for (i, fi) in parts_metadatas.iter_mut().enumerate() {
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
-                    fi.data = Some(writer.into_inner().into_cursor_inner().unwrap_or_default());
+                    fi.data = Some(writer.into_inline_data().unwrap_or_default());
                 }
             }
 
@@ -4553,21 +4529,32 @@ impl StorageAPI for SetDisks {
         let mut errors = Vec::with_capacity(shuffle_disks.len());
         for disk_op in shuffle_disks.iter() {
             if let Some(disk) = disk_op {
-                let writer = {
-                    let f = match disk
-                        .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, erasure.shard_file_size(data.content_length))
-                        .await
-                    {
-                        Ok(f) => f,
-                        Err(e) => {
-                            errors.push(Some(e));
-                            writers.push(None);
-                            continue;
-                        }
-                    };
+                let writer = create_bitrot_writer(
+                    false,
+                    Some(disk),
+                    RUSTFS_META_TMP_BUCKET,
+                    &tmp_part_path,
+                    erasure.shard_file_size(data.content_length),
+                    erasure.shard_size(),
+                    HashAlgorithm::HighwayHash256,
+                )
+                .await?;
 
-                    BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
-                };
+                // let writer = {
+                //     let f = match disk
+                //         .create_file("", RUSTFS_META_TMP_BUCKET, &tmp_part_path, erasure.shard_file_size(data.content_length))
+                //         .await
+                //     {
+                //         Ok(f) => f,
+                //         Err(e) => {
+                //             errors.push(Some(e));
+                //             writers.push(None);
+                //             continue;
+                //         }
+                //     };
+
+                //     BitrotWriter::new(Writer::from_tokio_writer(f), erasure.shard_size(), HashAlgorithm::HighwayHash256)
+                // };
 
                 writers.push(Some(writer));
                 errors.push(None);
@@ -6079,7 +6066,6 @@ mod tests {
         // Test object directory dangling detection
         let errs = vec![Some(DiskError::FileNotFound), Some(DiskError::FileNotFound), None];
         assert!(is_object_dir_dang_ling(&errs));
-
         let errs2 = vec![None, None, None];
         assert!(!is_object_dir_dang_ling(&errs2));
 

@@ -1,308 +1,270 @@
-# Reed-Solomon 纠删码性能基准测试
+# Reed-Solomon Erasure Coding Performance Benchmark
 
-本目录包含了比较不同 Reed-Solomon 实现性能的综合基准测试套件。
+This directory contains a comprehensive benchmark suite for comparing the performance of different Reed-Solomon implementations.
 
-## 📊 测试概述
+## 📊 Test Overview
 
-### 支持的实现模式
+### Supported Implementation Modes
 
-#### 🏛️ 纯 Erasure 模式（默认，推荐）
-- **稳定可靠**: 使用成熟的 reed-solomon-erasure 实现
-- **广泛兼容**: 支持任意分片大小
-- **内存高效**: 优化的内存使用模式
-- **可预测性**: 性能对分片大小不敏感
-- **使用场景**: 生产环境默认选择，适合大多数应用场景
+#### 🏛️ Pure Erasure Mode (Default, Recommended)
+- **Stable and Reliable**: Uses mature reed-solomon-erasure implementation
+- **Wide Compatibility**: Supports arbitrary shard sizes
+- **Memory Efficient**: Optimized memory usage patterns
+- **Predictable**: Performance insensitive to shard size
+- **Use Case**: Default choice for production environments, suitable for most application scenarios
 
-#### 🎯 混合模式（`reed-solomon-simd` feature）
-- **自动优化**: 根据分片大小智能选择最优实现
-- **SIMD + Erasure Fallback**: 大分片使用 SIMD 优化，小分片或 SIMD 失败时自动回退到 Erasure 实现
-- **兼容性**: 支持所有分片大小和配置
-- **性能**: 在各种场景下都能提供最佳性能
-- **使用场景**: 需要最大化性能的场景，适合处理大量数据
+#### 🎯 SIMD Mode (`reed-solomon-simd` feature)
+- **High Performance Optimization**: Uses SIMD instruction sets for high-performance encoding/decoding
+- **Performance Oriented**: Focuses on maximizing processing performance
+- **Target Scenarios**: High-performance scenarios for large data processing
+- **Use Case**: Scenarios requiring maximum performance, suitable for handling large amounts of data
 
-**回退机制**:
-- ✅ 分片 ≥ 512 字节：优先使用 SIMD 优化
-- 🔄 分片 < 512 字节或 SIMD 失败：自动回退到 Erasure 实现
-- 📊 无缝切换，透明给用户
+### Test Dimensions
 
-### 测试维度
+- **Encoding Performance** - Speed of encoding data into erasure code shards
+- **Decoding Performance** - Speed of recovering original data from erasure code shards
+- **Shard Size Sensitivity** - Impact of different shard sizes on performance
+- **Erasure Code Configuration** - Performance impact of different data/parity shard ratios
+- **SIMD Mode Performance** - Performance characteristics of SIMD optimization
+- **Concurrency Performance** - Performance in multi-threaded environments
+- **Memory Efficiency** - Memory usage patterns and efficiency
+- **Error Recovery Capability** - Recovery performance under different numbers of lost shards
 
-- **编码性能** - 数据编码成纠删码分片的速度
-- **解码性能** - 从纠删码分片恢复原始数据的速度
-- **分片大小敏感性** - 不同分片大小对性能的影响
-- **纠删码配置** - 不同数据/奇偶分片比例的性能影响
-- **混合模式回退** - SIMD 与 Erasure 回退机制的性能
-- **并发性能** - 多线程环境下的性能表现
-- **内存效率** - 内存使用模式和效率
-- **错误恢复能力** - 不同丢失分片数量下的恢复性能
+## 🚀 Quick Start
 
-## 🚀 快速开始
-
-### 运行快速测试
+### Run Quick Tests
 
 ```bash
-# 运行快速性能对比测试（默认混合模式）
+# Run quick performance comparison tests (default pure Erasure mode)
 ./run_benchmarks.sh quick
 ```
 
-### 运行完整对比测试
+### Run Complete Comparison Tests
 
 ```bash
-# 运行详细的实现对比测试
+# Run detailed implementation comparison tests
 ./run_benchmarks.sh comparison
 ```
 
-### 运行特定模式的测试
+### Run Specific Mode Tests
 
 ```bash
-# 测试默认纯 erasure 模式（推荐）
+# Test default pure erasure mode (recommended)
 ./run_benchmarks.sh erasure
 
-# 测试混合模式（SIMD + Erasure fallback）
-./run_benchmarks.sh hybrid
+# Test SIMD mode
+./run_benchmarks.sh simd
 ```
 
-## 📈 手动运行基准测试
+## 📈 Manual Benchmark Execution
 
-### 基本使用
+### Basic Usage
 
 ```bash
-# 运行所有基准测试（默认纯 erasure 模式）
+# Run all benchmarks (default pure erasure mode)
 cargo bench
 
-# 运行特定的基准测试文件
+# Run specific benchmark files
 cargo bench --bench erasure_benchmark
 cargo bench --bench comparison_benchmark
 ```
 
-### 对比不同实现模式
+### Compare Different Implementation Modes
 
 ```bash
-# 测试默认纯 erasure 模式
+# Test default pure erasure mode
 cargo bench --bench comparison_benchmark
 
-# 测试混合模式（SIMD + Erasure fallback）
+# Test SIMD mode
 cargo bench --bench comparison_benchmark \
     --features reed-solomon-simd
 
-# 保存基线进行对比
+# Save baseline for comparison
 cargo bench --bench comparison_benchmark \
     -- --save-baseline erasure_baseline
 
-# 与基线比较混合模式性能
+# Compare SIMD mode performance with baseline
 cargo bench --bench comparison_benchmark \
     --features reed-solomon-simd \
     -- --baseline erasure_baseline
 ```
 
-### 过滤特定测试
+### Filter Specific Tests
 
 ```bash
-# 只运行编码测试
+# Run only encoding tests
 cargo bench encode
 
-# 只运行解码测试  
+# Run only decoding tests  
 cargo bench decode
 
-# 只运行特定数据大小的测试
+# Run tests for specific data sizes
 cargo bench 1MB
 
-# 只运行特定配置的测试
+# Run tests for specific configurations
 cargo bench "4+2"
 ```
 
-## 📊 查看结果
+## 📊 View Results
 
-### HTML 报告
+### HTML Reports
 
-基准测试结果会自动生成 HTML 报告：
+Benchmark results automatically generate HTML reports:
 
 ```bash
-# 启动本地服务器查看报告
+# Start local server to view reports
 cd target/criterion
 python3 -m http.server 8080
 
-# 在浏览器中访问
+# Access in browser
 open http://localhost:8080/report/index.html
 ```
 
-### 命令行输出
+### Command Line Output
 
-基准测试会在终端显示：
-- 每秒操作数 (ops/sec)
-- 吞吐量 (MB/s)
-- 延迟统计 (平均值、标准差、百分位数)
-- 性能变化趋势
-- 回退机制触发情况
+Benchmarks display in terminal:
+- Operations per second (ops/sec)
+- Throughput (MB/s)
+- Latency statistics (mean, standard deviation, percentiles)
+- Performance trend changes
 
-## 🔧 测试配置
+## 🔧 Test Configuration
 
-### 数据大小
+### Data Sizes
 
-- **小数据**: 1KB, 8KB - 测试小文件场景和回退机制
-- **中等数据**: 64KB, 256KB - 测试常见文件大小
-- **大数据**: 1MB, 4MB - 测试大文件处理和 SIMD 优化
-- **超大数据**: 16MB+ - 测试高吞吐量场景
+- **Small Data**: 1KB, 8KB - Test small file scenarios
+- **Medium Data**: 64KB, 256KB - Test common file sizes
+- **Large Data**: 1MB, 4MB - Test large file processing and SIMD optimization
+- **Very Large Data**: 16MB+ - Test high throughput scenarios
 
-### 纠删码配置
+### Erasure Code Configurations
 
-- **(4,2)** - 常用配置，33% 冗余
-- **(6,3)** - 50% 冗余，平衡性能和可靠性
-- **(8,4)** - 50% 冗余，更多并行度
-- **(10,5)**, **(12,6)** - 高并行度配置
+- **(4,2)** - Common configuration, 33% redundancy
+- **(6,3)** - 50% redundancy, balanced performance and reliability
+- **(8,4)** - 50% redundancy, more parallelism
+- **(10,5)**, **(12,6)** - High parallelism configurations
 
-### 分片大小
+### Shard Sizes
 
-测试从 32 字节到 8KB 的不同分片大小，特别关注：
-- **回退临界点**: 512 字节 - 混合模式的 SIMD/Erasure 切换点
-- **内存对齐**: 64, 128, 256 字节 - 内存对齐对性能的影响
-- **Cache 友好**: 1KB, 2KB, 4KB - CPU 缓存友好的大小
+Test different shard sizes from 32 bytes to 8KB, with special focus on:
+- **Memory Alignment**: 64, 128, 256 bytes - Impact of memory alignment on performance
+- **Cache Friendly**: 1KB, 2KB, 4KB - CPU cache-friendly sizes
 
-## 📝 解读测试结果
+## 📝 Interpreting Test Results
 
-### 性能指标
+### Performance Metrics
 
-1. **吞吐量 (Throughput)**
-   - 单位: MB/s 或 GB/s
-   - 衡量数据处理速度
-   - 越高越好
+1. **Throughput**
+   - Unit: MB/s or GB/s
+   - Measures data processing speed
+   - Higher is better
 
-2. **延迟 (Latency)**
-   - 单位: 微秒 (μs) 或毫秒 (ms)
-   - 衡量单次操作时间
-   - 越低越好
+2. **Latency**
+   - Unit: microseconds (μs) or milliseconds (ms)
+   - Measures single operation time
+   - Lower is better
 
-3. **CPU 效率**
-   - 每 CPU 周期处理的字节数
-   - 反映算法效率
+3. **CPU Efficiency**
+   - Bytes processed per CPU cycle
+   - Reflects algorithm efficiency
 
-4. **回退频率**
-   - 混合模式下 SIMD 到 Erasure 的回退次数
-   - 反映智能选择的效果
+### Expected Results
 
-### 预期结果
+**Pure Erasure Mode (Default)**:
+- Stable performance, insensitive to shard size
+- Best compatibility, supports all configurations
+- Stable and predictable memory usage
 
-**纯 Erasure 模式（默认）**:
-- 性能稳定，对分片大小不敏感
-- 兼容性最佳，支持所有配置
-- 内存使用稳定可预测
+**SIMD Mode (`reed-solomon-simd` feature)**:
+- High-performance SIMD optimized implementation
+- Suitable for large data processing scenarios
+- Focuses on maximizing performance
 
-**混合模式（`reed-solomon-simd` feature）**:
-- 大分片 (≥512B)：接近纯 SIMD 性能
-- 小分片 (<512B)：自动回退到 Erasure，保证兼容性
-- 整体：在各种场景下都有良好表现
+**Shard Size Sensitivity**:
+- SIMD mode may be more sensitive to shard sizes
+- Pure Erasure mode relatively insensitive to shard size
 
-**分片大小敏感性**:
-- 混合模式在 512B 附近可能有性能切换
-- 纯 Erasure 模式对分片大小相对不敏感
+**Memory Usage**:
+- SIMD mode may have specific memory alignment requirements
+- Pure Erasure mode has more stable memory usage
 
-**内存使用**:
-- 混合模式根据场景优化内存使用
-- 纯 Erasure 模式内存使用更稳定
+## 🛠️ Custom Testing
 
-## 🛠️ 自定义测试
+### Adding New Test Scenarios
 
-### 添加新的测试场景
-
-编辑 `benches/erasure_benchmark.rs` 或 `benches/comparison_benchmark.rs`：
+Edit `benches/erasure_benchmark.rs` or `benches/comparison_benchmark.rs`:
 
 ```rust
-// 添加新的测试配置
+// Add new test configuration
 let configs = vec![
-    // 你的自定义配置
+    // Your custom configuration
     BenchConfig::new(10, 4, 2048 * 1024, 2048 * 1024), // 10+4, 2MB
 ];
 ```
 
-### 调整测试参数
+### Adjust Test Parameters
 
 ```rust
-// 修改采样和测试时间
-group.sample_size(20);  // 样本数量
-group.measurement_time(Duration::from_secs(10));  // 测试时间
+// Modify sampling and test time
+group.sample_size(20);  // Sample count
+group.measurement_time(Duration::from_secs(10));  // Test duration
 ```
 
-### 测试回退机制
+## 🐛 Troubleshooting
 
-```rust
-// 测试混合模式的回退行为
-#[cfg(not(feature = "reed-solomon-erasure"))]
-{
-    // 测试小分片是否正确回退
-    let small_data = vec![0u8; 256]; // 小于 512B，应该使用 Erasure
-    let erasure = Erasure::new(4, 2, 256);
-    let result = erasure.encode_data(&small_data);
-    assert!(result.is_ok()); // 应该成功回退
-}
-```
+### Common Issues
 
-## 🐛 故障排除
-
-### 常见问题
-
-1. **编译错误**: 确保安装了正确的依赖
+1. **Compilation Errors**: Ensure correct dependencies are installed
 ```bash
 cargo update
 cargo build --all-features
 ```
 
-2. **性能异常**: 检查是否在正确的模式下运行
+2. **Performance Anomalies**: Check if running in correct mode
 ```bash
-# 检查当前配置
+# Check current configuration
 cargo bench --bench comparison_benchmark -- --help
 ```
 
-3. **回退过于频繁**: 调整 SIMD 临界点
-```rust
-// 在代码中可以调整这个值
-const SIMD_MIN_SHARD_SIZE: usize = 512;
-```
-
-4. **测试时间过长**: 调整测试参数
+3. **Tests Taking Too Long**: Adjust test parameters
 ```bash
-# 使用更短的测试时间
+# Use shorter test duration
 cargo bench -- --quick
 ```
 
-### 性能分析
+### Performance Analysis
 
-使用 `perf` 等工具进行更详细的性能分析：
+Use tools like `perf` for detailed performance analysis:
 
 ```bash
-# 分析 CPU 使用情况
+# Analyze CPU usage
 cargo bench --bench comparison_benchmark & 
 perf record -p $(pgrep -f comparison_benchmark)
 perf report
 ```
 
-### 调试回退机制
+## 🤝 Contributing
 
-```bash
-# 启用详细日志查看回退情况
-RUST_LOG=warn cargo bench --bench comparison_benchmark
-```
+Welcome to submit new benchmark scenarios or optimization suggestions:
 
-## 🤝 贡献
+1. Fork the project
+2. Create feature branch: `git checkout -b feature/new-benchmark`
+3. Add test cases
+4. Commit changes: `git commit -m 'Add new benchmark for XYZ'`
+5. Push to branch: `git push origin feature/new-benchmark`
+6. Create Pull Request
 
-欢迎提交新的基准测试场景或优化建议：
-
-1. Fork 项目
-2. 创建特性分支: `git checkout -b feature/new-benchmark`
-3. 添加测试用例
-4. 提交更改: `git commit -m 'Add new benchmark for XYZ'`
-5. 推送到分支: `git push origin feature/new-benchmark`
-6. 创建 Pull Request
-
-## 📚 参考资料
+## 📚 References
 
 - [reed-solomon-erasure crate](https://crates.io/crates/reed-solomon-erasure)
 - [reed-solomon-simd crate](https://crates.io/crates/reed-solomon-simd)
-- [Criterion.rs 基准测试框架](https://bheisler.github.io/criterion.rs/book/)
-- [Reed-Solomon 纠删码原理](https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction)
+- [Criterion.rs benchmark framework](https://bheisler.github.io/criterion.rs/book/)
+- [Reed-Solomon error correction principles](https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction)
 
 ---
 
-💡 **提示**: 
-- 推荐使用默认的混合模式，它能在各种场景下自动选择最优实现
-- 基准测试结果可能因硬件、操作系统和编译器版本而异
-- 建议在目标部署环境中运行测试以获得最准确的性能数据 
+💡 **Tips**: 
+- Recommend using the default pure Erasure mode, which provides stable performance across various scenarios
+- Consider SIMD mode for high-performance requirements
+- Benchmark results may vary based on hardware, operating system, and compiler versions
+- Suggest running tests in target deployment environment for most accurate performance data 

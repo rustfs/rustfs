@@ -2,7 +2,7 @@
 
 # Reed-Solomon 实现性能比较脚本
 # 
-# 这个脚本将运行不同的基准测试来比较混合模式和纯Erasure模式的性能
+# 这个脚本将运行不同的基准测试来比较SIMD模式和纯Erasure模式的性能
 # 
 # 使用方法:
 #   ./run_benchmarks.sh [quick|full|comparison]
@@ -74,15 +74,16 @@ run_erasure_benchmark() {
     print_success "纯 Erasure 模式基准测试完成"
 }
 
-# 运行混合模式基准测试（默认）
-run_hybrid_benchmark() {
-    print_info "🎯 开始运行混合模式基准测试（默认）..."
+# 运行SIMD模式基准测试
+run_simd_benchmark() {
+    print_info "🎯 开始运行SIMD模式基准测试..."
     echo "================================================"
     
     cargo bench --bench comparison_benchmark \
-        -- --save-baseline hybrid_baseline
+        --features reed-solomon-simd \
+        -- --save-baseline simd_baseline
     
-    print_success "混合模式基准测试完成"
+    print_success "SIMD模式基准测试完成"
 }
 
 # 运行完整的基准测试套件
@@ -90,7 +91,7 @@ run_full_benchmark() {
     print_info "🚀 开始运行完整基准测试套件..."
     echo "================================================"
     
-    # 运行详细的基准测试（使用默认混合模式）
+    # 运行详细的基准测试（使用默认纯Erasure模式）
     cargo bench --bench erasure_benchmark
     
     print_success "完整基准测试套件完成"
@@ -106,8 +107,9 @@ run_comparison_benchmark() {
         --features reed-solomon-erasure \
         -- --save-baseline erasure_baseline
     
-    print_info "步骤 2: 测试混合模式并与 Erasure 模式对比..."
+    print_info "步骤 2: 测试SIMD模式并与 Erasure 模式对比..."
     cargo bench --bench comparison_benchmark \
+        --features reed-solomon-simd \
         -- --baseline erasure_baseline
     
     print_success "性能对比测试完成"
@@ -141,8 +143,9 @@ run_quick_test() {
         --features reed-solomon-erasure \
         -- encode_comparison --quick
     
-    print_info "测试混合模式（默认）..."
+    print_info "测试SIMD模式..."
     cargo bench --bench comparison_benchmark \
+        --features reed-solomon-simd \
         -- encode_comparison --quick
     
     print_success "快速测试完成"
@@ -153,31 +156,31 @@ show_help() {
     echo "Reed-Solomon 性能基准测试脚本"
     echo ""
     echo "实现模式："
-    echo "  🎯 混合模式（默认）    - SIMD + Erasure 智能回退，推荐使用"
-    echo "  🏛️ 纯 Erasure 模式    - 稳定兼容的 reed-solomon-erasure 实现"
+    echo "  🏛️ 纯 Erasure 模式（默认）- 稳定兼容的 reed-solomon-erasure 实现"
+    echo "  🎯 SIMD模式              - 高性能SIMD优化实现"
     echo ""
     echo "使用方法:"
     echo "  $0 [command]"
     echo ""
     echo "命令:"
     echo "  quick        运行快速性能测试"
-    echo "  full         运行完整基准测试套件（混合模式）"
+    echo "  full         运行完整基准测试套件（默认Erasure模式）"
     echo "  comparison   运行详细的实现模式对比测试"
     echo "  erasure      只测试纯 Erasure 模式"
-    echo "  hybrid       只测试混合模式（默认行为）"
+    echo "  simd         只测试SIMD模式"
     echo "  clean        清理测试结果"
     echo "  help         显示此帮助信息"
     echo ""
     echo "示例:"
     echo "  $0 quick              # 快速测试两种模式"
     echo "  $0 comparison         # 详细对比测试"
-    echo "  $0 full              # 完整测试套件（混合模式）"
-    echo "  $0 hybrid            # 只测试混合模式"
+    echo "  $0 full              # 完整测试套件（默认Erasure模式）"
+    echo "  $0 simd              # 只测试SIMD模式"
     echo "  $0 erasure           # 只测试纯 Erasure 模式"
     echo ""
     echo "模式说明:"
-    echo "  混合模式: 大分片(≥512B)使用SIMD优化，小分片自动回退到Erasure"
-    echo "  Erasure模式: 所有情况都使用reed-solomon-erasure实现"
+    echo "  Erasure模式: 使用reed-solomon-erasure实现，稳定可靠"
+    echo "  SIMD模式: 使用reed-solomon-simd实现，高性能优化"
 }
 
 # 显示测试配置信息
@@ -193,16 +196,16 @@ show_test_info() {
     if [ -f "/proc/cpuinfo" ]; then
         echo "  - CPU 型号: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
         if grep -q "avx2" /proc/cpuinfo; then
-            echo "  - SIMD 支持: AVX2 ✅ (混合模式将利用SIMD优化)"
+            echo "  - SIMD 支持: AVX2 ✅ (SIMD模式将利用SIMD优化)"
         elif grep -q "sse4" /proc/cpuinfo; then
-            echo "  - SIMD 支持: SSE4 ✅ (混合模式将利用SIMD优化)"
+            echo "  - SIMD 支持: SSE4 ✅ (SIMD模式将利用SIMD优化)"
         else
-            echo "  - SIMD 支持: 未检测到高级 SIMD 特性 (混合模式将主要使用Erasure)"
+            echo "  - SIMD 支持: 未检测到高级 SIMD 特性"
         fi
     fi
     
-    echo "  - 默认模式: 混合模式 (SIMD + Erasure 智能回退)"
-    echo "  - 回退阈值: 512字节分片大小"
+    echo "  - 默认模式: 纯Erasure模式 (稳定可靠)"
+    echo "  - 高性能模式: SIMD模式 (性能优化)"
     echo ""
 }
 
@@ -234,9 +237,9 @@ main() {
             run_erasure_benchmark
             generate_comparison_report
             ;;
-        "hybrid")
+        "simd")
             cleanup
-            run_hybrid_benchmark
+            run_simd_benchmark
             generate_comparison_report
             ;;
         "clean")
@@ -254,7 +257,7 @@ main() {
     esac
     
     print_success "✨ 基准测试执行完成!"
-    print_info "💡 提示: 推荐使用混合模式（默认），它能自动在SIMD和Erasure之间智能选择"
+    print_info "💡 提示: 推荐使用默认的纯Erasure模式，对于高性能需求可考虑SIMD模式"
 }
 
 # 如果直接运行此脚本，调用主函数

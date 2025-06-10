@@ -1,18 +1,20 @@
+use super::BitrotReader;
 use super::Erasure;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
 use futures::future::join_all;
 use pin_project_lite::pin_project;
-use rustfs_rio::BitrotReader;
 use std::io;
 use std::io::ErrorKind;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::error;
 
 pin_project! {
-pub(crate) struct ParallelReader {
+pub(crate) struct ParallelReader<R> {
     #[pin]
-    readers: Vec<Option<BitrotReader>>,
+    readers: Vec<Option<BitrotReader<R>>>,
     offset: usize,
     shard_size: usize,
     shard_file_size: usize,
@@ -21,9 +23,12 @@ pub(crate) struct ParallelReader {
 }
 }
 
-impl ParallelReader {
+impl<R> ParallelReader<R>
+where
+    R: AsyncRead + Unpin + Send + Sync,
+{
     // readers传入前应处理disk错误，确保每个reader达到可用数量的BitrotReader
-    pub fn new(readers: Vec<Option<BitrotReader>>, e: Erasure, offset: usize, total_length: usize) -> Self {
+    pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
         let shard_size = e.shard_size();
         let shard_file_size = e.shard_file_size(total_length);
 
@@ -42,7 +47,10 @@ impl ParallelReader {
     }
 }
 
-impl ParallelReader {
+impl<R> ParallelReader<R>
+where
+    R: AsyncRead + Unpin + Send + Sync,
+{
     pub async fn read(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
         // if self.readers.len() != self.total_shards {
         //     return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers"));
@@ -175,16 +183,17 @@ where
 }
 
 impl Erasure {
-    pub async fn decode<W>(
+    pub async fn decode<W, R>(
         &self,
         writer: &mut W,
-        readers: Vec<Option<BitrotReader>>,
+        readers: Vec<Option<BitrotReader<R>>>,
         offset: usize,
         length: usize,
         total_length: usize,
     ) -> (usize, Option<std::io::Error>)
     where
-        W: tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+        W: AsyncWrite + Send + Sync + Unpin,
+        R: AsyncRead + Unpin + Send + Sync,
     {
         if readers.len() != self.data_shards + self.parity_shards {
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")));

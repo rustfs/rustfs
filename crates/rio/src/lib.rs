@@ -30,9 +30,6 @@ pub use writer::*;
 mod http_reader;
 pub use http_reader::*;
 
-mod bitrot;
-pub use bitrot::*;
-
 mod etag;
 
 pub trait Reader: tokio::io::AsyncRead + Unpin + Send + Sync + EtagResolvable + HashReaderDetector {}

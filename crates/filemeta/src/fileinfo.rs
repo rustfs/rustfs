@@ -93,6 +93,10 @@ pub struct ErasureInfo {
     pub checksums: Vec<ChecksumInfo>,
 }
 
+pub fn calc_shard_size(block_size: usize, data_shards: usize) -> usize {
+    (block_size.div_ceil(data_shards) + 1) & !1
+}
+
 impl ErasureInfo {
     pub fn get_checksum_info(&self, part_number: usize) -> ChecksumInfo {
         for sum in &self.checksums {
@@ -109,7 +113,7 @@ impl ErasureInfo {
 
     /// Calculate the size of each shard.
     pub fn shard_size(&self) -> usize {
-        self.block_size.div_ceil(self.data_blocks)
+        calc_shard_size(self.block_size, self.data_blocks)
     }
     /// Calculate the total erasure file size for a given original size.
     // Returns the final erasure size from the original size
@@ -120,7 +124,7 @@ impl ErasureInfo {
 
         let num_shards = total_length / self.block_size;
         let last_block_size = total_length % self.block_size;
-        let last_shard_size = last_block_size.div_ceil(self.data_blocks);
+        let last_shard_size = calc_shard_size(last_block_size, self.data_blocks);
         num_shards * self.shard_size() + last_shard_size
     }
 

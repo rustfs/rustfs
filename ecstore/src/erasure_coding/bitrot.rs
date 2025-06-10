@@ -206,10 +206,146 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     Ok(())
 }
 
+/// Custom writer enum that supports inline buffer storage
+pub enum CustomWriter {
+    /// Inline buffer writer - stores data in memory
+    InlineBuffer(Vec<u8>),
+    /// Disk-based writer using tokio file
+    Other(Box<dyn AsyncWrite + Unpin + Send + Sync>),
+}
+
+impl CustomWriter {
+    /// Create a new inline buffer writer
+    pub fn new_inline_buffer() -> Self {
+        Self::InlineBuffer(Vec::new())
+    }
+
+    /// Create a new disk writer from any AsyncWrite implementation
+    pub fn new_tokio_writer<W>(writer: W) -> Self
+    where
+        W: AsyncWrite + Unpin + Send + Sync + 'static,
+    {
+        Self::Other(Box::new(writer))
+    }
+
+    /// Get the inline buffer data if this is an inline buffer writer
+    pub fn get_inline_data(&self) -> Option<&[u8]> {
+        match self {
+            Self::InlineBuffer(data) => Some(data),
+            Self::Other(_) => None,
+        }
+    }
+
+    /// Extract the inline buffer data, consuming the writer
+    pub fn into_inline_data(self) -> Option<Vec<u8>> {
+        match self {
+            Self::InlineBuffer(data) => Some(data),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+impl AsyncWrite for CustomWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::InlineBuffer(data) => {
+                data.extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            Self::Other(writer) => {
+                let pinned_writer = std::pin::Pin::new(writer.as_mut());
+                pinned_writer.poll_write(cx, buf)
+            }
+        }
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::InlineBuffer(_) => std::task::Poll::Ready(Ok(())),
+            Self::Other(writer) => {
+                let pinned_writer = std::pin::Pin::new(writer.as_mut());
+                pinned_writer.poll_flush(cx)
+            }
+        }
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::InlineBuffer(_) => std::task::Poll::Ready(Ok(())),
+            Self::Other(writer) => {
+                let pinned_writer = std::pin::Pin::new(writer.as_mut());
+                pinned_writer.poll_shutdown(cx)
+            }
+        }
+    }
+}
+
+/// Wrapper around BitrotWriter that uses our custom writer
+pub struct BitrotWriterWrapper {
+    bitrot_writer: BitrotWriter<CustomWriter>,
+    writer_type: WriterType,
+}
+
+/// Enum to track the type of writer we're using
+enum WriterType {
+    InlineBuffer,
+    Other,
+}
+
+impl std::fmt::Debug for BitrotWriterWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BitrotWriterWrapper")
+            .field(
+                "writer_type",
+                &match self.writer_type {
+                    WriterType::InlineBuffer => "InlineBuffer",
+                    WriterType::Other => "Other",
+                },
+            )
+            .finish()
+    }
+}
+
+impl BitrotWriterWrapper {
+    /// Create a new BitrotWriterWrapper with custom writer
+    pub fn new(writer: CustomWriter, shard_size: usize, checksum_algo: HashAlgorithm) -> Self {
+        let writer_type = match &writer {
+            CustomWriter::InlineBuffer(_) => WriterType::InlineBuffer,
+            CustomWriter::Other(_) => WriterType::Other,
+        };
+
+        Self {
+            bitrot_writer: BitrotWriter::new(writer, shard_size, checksum_algo),
+            writer_type,
+        }
+    }
+
+    /// Write data to the bitrot writer
+    pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bitrot_writer.write(buf).await
+    }
+
+    /// Extract the inline buffer data, consuming the wrapper
+    pub fn into_inline_data(self) -> Option<Vec<u8>> {
+        match self.writer_type {
+            WriterType::InlineBuffer => {
+                let writer = self.bitrot_writer.into_inner();
+                writer.into_inline_data()
+            }
+            WriterType::Other => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
-    use crate::{BitrotReader, BitrotWriter};
+    use super::BitrotReader;
+    use super::BitrotWriter;
     use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;
 

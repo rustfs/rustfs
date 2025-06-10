@@ -11,16 +11,16 @@
 //! - **Compatibility**: Works with any shard size
 //! - **Use case**: Default behavior, recommended for most production use cases
 //!
-//! ### Hybrid Mode (`reed-solomon-simd` feature)
-//! - **Performance**: Uses SIMD optimization when possible, falls back to erasure implementation for small shards
-//! - **Compatibility**: Works with any shard size through intelligent fallback
-//! - **Reliability**: Best of both worlds - SIMD speed for large data, erasure stability for small data
+//! ### SIMD Mode (`reed-solomon-simd` feature)
+//! - **Performance**: Uses SIMD optimization for high-performance encoding/decoding
+//! - **Compatibility**: Works with any shard size through SIMD implementation
+//! - **Reliability**: High-performance SIMD implementation for large data processing
 //! - **Use case**: Use when maximum performance is needed for large data processing
 //!
 //! ## Feature Flags
 //!
 //! - Default: Use pure reed-solomon-erasure implementation (stable and reliable)
-//! - `reed-solomon-simd`: Use hybrid mode (SIMD + erasure fallback for optimal performance)
+//! - `reed-solomon-simd`: Use SIMD mode for optimal performance
 //! - `reed-solomon-erasure`: Explicitly enable pure erasure mode (same as default)
 //!
 //! ## Example
@@ -38,25 +38,23 @@ use bytes::{Bytes, BytesMut};
 use reed_solomon_erasure::galois_8::ReedSolomon as ReedSolomonErasure;
 #[cfg(feature = "reed-solomon-simd")]
 use reed_solomon_simd;
-// use rustfs_rio::Reader;
 use smallvec::SmallVec;
 use std::io;
+use tokio::io::AsyncRead;
 use tracing::warn;
 use uuid::Uuid;
 
 /// Reed-Solomon encoder variants supporting different implementations.
 #[allow(clippy::large_enum_variant)]
 pub enum ReedSolomonEncoder {
-    /// Hybrid mode: SIMD with erasure fallback (when reed-solomon-simd feature is enabled)
+    /// SIMD mode: High-performance SIMD implementation (when reed-solomon-simd feature is enabled)
     #[cfg(feature = "reed-solomon-simd")]
-    Hybrid {
+    SIMD {
         data_shards: usize,
         parity_shards: usize,
         // 使用RwLock确保线程安全，实现Send + Sync
         encoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
         decoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
-        // erasure fallback for small shards or SIMD failures
-        fallback_encoder: Box<ReedSolomonErasure>,
     },
     /// Pure erasure mode: default and when reed-solomon-erasure feature is specified
     Erasure(Box<ReedSolomonErasure>),
@@ -66,18 +64,16 @@ impl Clone for ReedSolomonEncoder {
     fn clone(&self) -> Self {
         match self {
             #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::Hybrid {
+            ReedSolomonEncoder::SIMD {
                 data_shards,
                 parity_shards,
-                fallback_encoder,
                 ..
-            } => ReedSolomonEncoder::Hybrid {
+            } => ReedSolomonEncoder::SIMD {
                 data_shards: *data_shards,
                 parity_shards: *parity_shards,
                 // 为新实例创建空的缓存，不共享缓存
                 encoder_cache: std::sync::RwLock::new(None),
                 decoder_cache: std::sync::RwLock::new(None),
-                fallback_encoder: fallback_encoder.clone(),
             },
             ReedSolomonEncoder::Erasure(encoder) => ReedSolomonEncoder::Erasure(encoder.clone()),
         }
@@ -89,18 +85,12 @@ impl ReedSolomonEncoder {
     pub fn new(data_shards: usize, parity_shards: usize) -> io::Result<Self> {
         #[cfg(feature = "reed-solomon-simd")]
         {
-            // Hybrid mode: SIMD + erasure fallback when reed-solomon-simd feature is enabled
-            let fallback_encoder = Box::new(
-                ReedSolomonErasure::new(data_shards, parity_shards)
-                    .map_err(|e| io::Error::other(format!("Failed to create fallback erasure encoder: {:?}", e)))?,
-            );
-
-            Ok(ReedSolomonEncoder::Hybrid {
+            // SIMD mode when reed-solomon-simd feature is enabled
+            Ok(ReedSolomonEncoder::SIMD {
                 data_shards,
                 parity_shards,
                 encoder_cache: std::sync::RwLock::new(None),
                 decoder_cache: std::sync::RwLock::new(None),
-                fallback_encoder,
             })
         }
 
@@ -117,11 +107,10 @@ impl ReedSolomonEncoder {
     pub fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
         match self {
             #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::Hybrid {
+            ReedSolomonEncoder::SIMD {
                 data_shards,
                 parity_shards,
                 encoder_cache,
-                fallback_encoder,
                 ..
             } => {
                 let mut shards_vec: Vec<&mut [u8]> = shards.into_vec();
@@ -129,30 +118,14 @@ impl ReedSolomonEncoder {
                     return Ok(());
                 }
 
-                let shard_len = shards_vec[0].len();
-
-                // SIMD 性能最佳的最小 shard 大小 (通常 512-1024 字节)
-                const SIMD_MIN_SHARD_SIZE: usize = 512;
-
-                // 如果 shard 太小，直接使用 fallback encoder
-                if shard_len < SIMD_MIN_SHARD_SIZE {
-                    let fallback_shards: SmallVec<[&mut [u8]; 16]> = SmallVec::from_vec(shards_vec);
-                    return fallback_encoder
-                        .encode(fallback_shards)
-                        .map_err(|e| io::Error::other(format!("Fallback erasure encode error: {:?}", e)));
-                }
-
-                // 尝试使用 SIMD，如果失败则回退到 fallback
+                // 使用 SIMD 进行编码
                 let simd_result = self.encode_with_simd(*data_shards, *parity_shards, encoder_cache, &mut shards_vec);
 
                 match simd_result {
                     Ok(()) => Ok(()),
                     Err(simd_error) => {
-                        warn!("SIMD encoding failed: {}, using fallback", simd_error);
-                        let fallback_shards: SmallVec<[&mut [u8]; 16]> = SmallVec::from_vec(shards_vec);
-                        fallback_encoder
-                            .encode(fallback_shards)
-                            .map_err(|e| io::Error::other(format!("Fallback erasure encode error: {:?}", e)))
+                        warn!("SIMD encoding failed: {}", simd_error);
+                        Err(simd_error)
                     }
                 }
             }
@@ -231,39 +204,20 @@ impl ReedSolomonEncoder {
     pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         match self {
             #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::Hybrid {
+            ReedSolomonEncoder::SIMD {
                 data_shards,
                 parity_shards,
                 decoder_cache,
-                fallback_encoder,
                 ..
             } => {
-                // Find a valid shard to determine length
-                let shard_len = shards
-                    .iter()
-                    .find_map(|s| s.as_ref().map(|v| v.len()))
-                    .ok_or_else(|| io::Error::other("No valid shards found for reconstruction"))?;
-
-                // SIMD 性能最佳的最小 shard 大小
-                const SIMD_MIN_SHARD_SIZE: usize = 512;
-
-                // 如果 shard 太小，直接使用 fallback encoder
-                if shard_len < SIMD_MIN_SHARD_SIZE {
-                    return fallback_encoder
-                        .reconstruct(shards)
-                        .map_err(|e| io::Error::other(format!("Fallback erasure reconstruct error: {:?}", e)));
-                }
-
-                // 尝试使用 SIMD，如果失败则回退到 fallback
+                // 使用 SIMD 进行重构
                 let simd_result = self.reconstruct_with_simd(*data_shards, *parity_shards, decoder_cache, shards);
 
                 match simd_result {
                     Ok(()) => Ok(()),
                     Err(simd_error) => {
-                        warn!("SIMD reconstruction failed: {}, using fallback", simd_error);
-                        fallback_encoder
-                            .reconstruct(shards)
-                            .map_err(|e| io::Error::other(format!("Fallback erasure reconstruct error: {:?}", e)))
+                        warn!("SIMD reconstruction failed: {}", simd_error);
+                        Err(simd_error)
                     }
                 }
             }
@@ -402,6 +356,10 @@ impl Clone for Erasure {
     }
 }
 
+pub fn calc_shard_size(block_size: usize, data_shards: usize) -> usize {
+    (block_size.div_ceil(data_shards) + 1) & !1
+}
+
 impl Erasure {
     /// Create a new Erasure instance.
     ///
@@ -439,7 +397,7 @@ impl Erasure {
         // let total_size = shard_size * self.total_shard_count();
 
         // 数据切片数量
-        let per_shard_size = data.len().div_ceil(self.data_shards);
+        let per_shard_size = calc_shard_size(data.len(), self.data_shards);
         // 总需求大小
         let need_total_size = per_shard_size * self.total_shard_count();
 
@@ -507,7 +465,7 @@ impl Erasure {
 
     /// Calculate the size of each shard.
     pub fn shard_size(&self) -> usize {
-        self.block_size.div_ceil(self.data_shards)
+        calc_shard_size(self.block_size, self.data_shards)
     }
     /// Calculate the total erasure file size for a given original size.
     // Returns the final erasure size from the original size
@@ -518,7 +476,7 @@ impl Erasure {
 
         let num_shards = total_length / self.block_size;
         let last_block_size = total_length % self.block_size;
-        let last_shard_size = last_block_size.div_ceil(self.data_shards);
+        let last_shard_size = calc_shard_size(last_block_size, self.data_shards);
         num_shards * self.shard_size() + last_shard_size
     }
 
@@ -536,22 +494,29 @@ impl Erasure {
         till_offset
     }
 
-    /// Encode all data from a rustfs_rio::Reader in blocks, calling an async callback for each encoded block.
-    /// This method is async and returns the reader and total bytes read after all blocks are processed.
+    /// Encode all data from a reader in blocks, calling an async callback for each encoded block.
+    /// This method is async and returns the total bytes read after all blocks are processed.
     ///
     /// # Arguments
-    /// * `reader` - A rustfs_rio::Reader to read data from.
-    /// * `mut on_block` - Async callback: FnMut(Result<Vec<Bytes>, std::io::Error>) -> Future<Output=Result<(), E>> + Send
+    /// * `reader` - An async reader implementing AsyncRead + Send + Sync + Unpin
+    /// * `mut on_block` - Async callback that receives encoded blocks and returns a Result
+    /// * `F` - Callback type: FnMut(Result<Vec<Bytes>, std::io::Error>) -> Future<Output=Result<(), E>> + Send
+    /// * `Fut` - Future type returned by the callback
+    /// * `E` - Error type returned by the callback
+    /// * `R` - Reader type implementing AsyncRead + Send + Sync + Unpin
     ///
     /// # Returns
-    /// Result<(reader, total_bytes_read), E> after all data has been processed or on callback error.
+    /// Result<usize, E> containing total bytes read, or error from callback
+    ///
+    /// # Errors
+    /// Returns error if reading from reader fails or if callback returns error
     pub async fn encode_stream_callback_async<F, Fut, E, R>(
         self: std::sync::Arc<Self>,
         reader: &mut R,
         mut on_block: F,
     ) -> Result<usize, E>
     where
-        R: rustfs_rio::Reader + Send + Sync + Unpin,
+        R: AsyncRead + Send + Sync + Unpin,
         F: FnMut(std::io::Result<Vec<Bytes>>) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), E>> + Send,
     {
@@ -582,6 +547,7 @@ impl Erasure {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -603,9 +569,9 @@ mod tests {
         // Case 5: total_length > block_size, aligned
         assert_eq!(erasure.shard_file_size(16), 4); // 16/8=2, last=0, 2*2+0=4
 
-        assert_eq!(erasure.shard_file_size(1248739), 312185); // 1248739/8=156092, last=3, 3 div_ceil 4=1, 156092*2+1=312185
+        assert_eq!(erasure.shard_file_size(1248739), 312186); // 1248739/8=156092, last=3, 3 div_ceil 4=1, 156092*2+1=312185
 
-        assert_eq!(erasure.shard_file_size(43), 11); // 43/8=5, last=3, 3 div_ceil 4=1, 5*2+1=11
+        assert_eq!(erasure.shard_file_size(43), 12); // 43/8=5, last=3, 3 div_ceil 4=1, 5*2+1=11
     }
 
     #[test]
@@ -617,7 +583,7 @@ mod tests {
         #[cfg(not(feature = "reed-solomon-simd"))]
         let block_size = 8; // Pure erasure mode (default)
         #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 1024; // Hybrid mode - SIMD with fallback
+        let block_size = 1024; // SIMD mode - SIMD with fallback
 
         let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
@@ -625,7 +591,7 @@ mod tests {
         #[cfg(not(feature = "reed-solomon-simd"))]
         let test_data = b"hello world".to_vec(); // Small data for erasure (default)
         #[cfg(feature = "reed-solomon-simd")]
-        let test_data = b"Hybrid mode test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization.".repeat(20); // ~3KB for hybrid
+        let test_data = b"SIMD mode test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization.".repeat(20); // ~3KB for SIMD
 
         let data = &test_data;
         let encoded_shards = erasure.encode_data(data).unwrap();
@@ -655,7 +621,7 @@ mod tests {
 
         // Use different block sizes based on feature
         #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 512 * 3; // Hybrid mode - SIMD with fallback
+        let block_size = 512 * 3; // SIMD mode
         #[cfg(not(feature = "reed-solomon-simd"))]
         let block_size = 8192; // Pure erasure mode (default)
 
@@ -700,7 +666,7 @@ mod tests {
     #[test]
     fn test_shard_size_and_file_size() {
         let erasure = Erasure::new(4, 2, 8);
-        assert_eq!(erasure.shard_file_size(33), 9);
+        assert_eq!(erasure.shard_file_size(33), 10);
         assert_eq!(erasure.shard_file_size(0), 0);
     }
 
@@ -722,7 +688,7 @@ mod tests {
 
         // Use different block sizes based on feature
         #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 1024; // Hybrid mode
+        let block_size = 1024; // SIMD mode
         #[cfg(not(feature = "reed-solomon-simd"))]
         let block_size = 8; // Pure erasure mode (default)
 
@@ -732,12 +698,12 @@ mod tests {
         let data =
             b"Async error test data with sufficient length to meet requirements for proper testing and validation.".repeat(20); // ~2KB
 
-        let mut rio_reader = Cursor::new(data);
+        let mut reader = Cursor::new(data);
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(8);
         let erasure_clone = erasure.clone();
         let handle = tokio::spawn(async move {
             erasure_clone
-                .encode_stream_callback_async::<_, _, (), _>(&mut rio_reader, move |res| {
+                .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
                     let tx = tx.clone();
                     async move {
                         let shards = res.unwrap();
@@ -765,7 +731,7 @@ mod tests {
 
         // Use different block sizes based on feature
         #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 1024; // Hybrid mode
+        let block_size = 1024; // SIMD mode
         #[cfg(not(feature = "reed-solomon-simd"))]
         let block_size = 8; // Pure erasure mode (default)
 
@@ -779,12 +745,12 @@ mod tests {
         // let data = b"callback".to_vec(); // 8 bytes to fit exactly in one 8-byte block
 
         let data_clone = data.clone(); // Clone for later comparison
-        let mut rio_reader = Cursor::new(data);
+        let mut reader = Cursor::new(data);
         let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(8);
         let erasure_clone = erasure.clone();
         let handle = tokio::spawn(async move {
             erasure_clone
-                .encode_stream_callback_async::<_, _, (), _>(&mut rio_reader, move |res| {
+                .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
                     let tx = tx.clone();
                     async move {
                         let shards = res.unwrap();
@@ -816,20 +782,20 @@ mod tests {
         assert_eq!(&recovered, &data_clone);
     }
 
-    // Tests specifically for hybrid mode (SIMD + erasure fallback)
+    // Tests specifically for SIMD mode
     #[cfg(feature = "reed-solomon-simd")]
-    mod hybrid_tests {
+    mod simd_tests {
         use super::*;
 
         #[test]
-        fn test_hybrid_encode_decode_roundtrip() {
+        fn test_simd_encode_decode_roundtrip() {
             let data_shards = 4;
             let parity_shards = 2;
-            let block_size = 1024; // Use larger block size for hybrid mode
+            let block_size = 1024; // Use larger block size for SIMD mode
             let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
             // Use data that will create shards >= 512 bytes for SIMD optimization
-            let test_data = b"Hybrid test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization and validation.";
+            let test_data = b"SIMD mode test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization and validation.";
             let data = test_data.repeat(25); // Create much larger data: ~5KB total, ~1.25KB per shard
 
             let encoded_shards = erasure.encode_data(&data).unwrap();
@@ -854,10 +820,10 @@ mod tests {
         }
 
         #[test]
-        fn test_hybrid_all_zero_data() {
+        fn test_simd_all_zero_data() {
             let data_shards = 4;
             let parity_shards = 2;
-            let block_size = 1024; // Use larger block size for hybrid mode
+            let block_size = 1024; // Use larger block size for SIMD mode
             let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
             // Create all-zero data that ensures adequate shard size for SIMD optimization
@@ -997,39 +963,35 @@ mod tests {
         }
 
         #[test]
-        fn test_simd_smart_fallback() {
+        fn test_simd_small_data_handling() {
             let data_shards = 4;
             let parity_shards = 2;
-            let block_size = 32; // 很小的block_size，会导致小shard
+            let block_size = 32; // Small block size for testing edge cases
             let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
-            // 使用小数据，每个shard只有8字节，远小于512字节SIMD最小要求
-            let small_data = b"tiny!123".to_vec(); // 8字节数据
+            // Use small data to test SIMD handling of small shards
+            let small_data = b"tiny!123".to_vec(); // 8 bytes data
 
-            // 应该能够成功编码（通过fallback）
+            // Test encoding with small data
             let result = erasure.encode_data(&small_data);
             match result {
                 Ok(shards) => {
-                    println!(
-                        "✅ Smart fallback worked: encoded {} bytes into {} shards",
-                        small_data.len(),
-                        shards.len()
-                    );
+                    println!("✅ SIMD encoding succeeded: {} bytes into {} shards", small_data.len(), shards.len());
                     assert_eq!(shards.len(), data_shards + parity_shards);
 
-                    // 测试解码
+                    // Test decoding
                     let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|shard| Some(shard.to_vec())).collect();
 
-                    // 丢失一些shard来测试恢复
-                    shards_opt[1] = None; // 丢失一个数据shard
-                    shards_opt[4] = None; // 丢失一个奇偶shard
+                    // Lose some shards to test recovery
+                    shards_opt[1] = None; // Lose one data shard
+                    shards_opt[4] = None; // Lose one parity shard
 
                     let decode_result = erasure.decode_data(&mut shards_opt);
                     match decode_result {
                         Ok(()) => {
-                            println!("✅ Smart fallback decode worked");
+                            println!("✅ SIMD decode worked");
 
-                            // 验证恢复的数据
+                            // Verify recovered data
                             let mut recovered = Vec::new();
                             for shard in shards_opt.iter().take(data_shards) {
                                 recovered.extend_from_slice(shard.as_ref().unwrap());
@@ -1038,17 +1000,17 @@ mod tests {
                             println!("recovered: {:?}", recovered);
                             println!("small_data: {:?}", small_data);
                             assert_eq!(&recovered, &small_data);
-                            println!("✅ Data recovery successful with smart fallback");
+                            println!("✅ Data recovery successful with SIMD");
                         }
                         Err(e) => {
-                            println!("❌ Smart fallback decode failed: {}", e);
-                            // 对于很小的数据，如果decode失败也是可以接受的
+                            println!("❌ SIMD decode failed: {}", e);
+                            // For very small data, decode failure might be acceptable
                         }
                     }
                 }
                 Err(e) => {
-                    println!("❌ Smart fallback encode failed: {}", e);
-                    // 如果连fallback都失败了，说明数据太小或配置有问题
+                    println!("❌ SIMD encode failed: {}", e);
+                    // For very small data or configuration issues, encoding might fail
                 }
             }
         }
@@ -1143,14 +1105,14 @@ mod tests {
             let test_data = b"SIMD stream processing test with sufficient data length for multiple blocks and proper SIMD optimization verification!";
             let data = test_data.repeat(5); // Create owned Vec<u8>
             let data_clone = data.clone(); // Clone for later comparison
-            let mut rio_reader = Cursor::new(data);
+            let mut reader = Cursor::new(data);
 
             let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(16);
             let erasure_clone = erasure.clone();
 
             let handle = tokio::spawn(async move {
                 erasure_clone
-                    .encode_stream_callback_async::<_, _, (), _>(&mut rio_reader, move |res| {
+                    .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
                         let tx = tx.clone();
                         async move {
                             let shards = res.unwrap();

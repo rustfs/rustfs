@@ -2,7 +2,7 @@
 //!
 //! This benchmark compares the performance of different Reed-Solomon implementations:
 //! - Default (Pure erasure): Stable reed-solomon-erasure implementation
-//! - `reed-solomon-simd` feature: Hybrid mode with SIMD optimization and erasure fallback
+//! - `reed-solomon-simd` feature: SIMD mode with optimized performance
 //!
 //! ## Running Benchmarks
 //!

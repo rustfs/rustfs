@@ -38,13 +38,13 @@ use crate::utils::path::{
     path_join, path_join_buf,
 };
 
+use crate::erasure_coding::bitrot_verify;
 use common::defer;
 use path_absolutize::Absolutize;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, Opts, RawFileInfo, UpdateFn, get_file_info,
     read_xl_meta_no_data,
 };
-use rustfs_rio::bitrot_verify;
 use rustfs_utils::HashAlgorithm;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;

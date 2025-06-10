@@ -11,7 +11,7 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-default = ["reed-solomon-erasure"]
+default = ["reed-solomon-simd"]
 reed-solomon-simd = []
 reed-solomon-erasure = []
 
