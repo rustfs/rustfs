@@ -74,7 +74,7 @@ byteorder = "1.5.0"
 cfg-if = "1.0.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.39", features = ["derive", "env"] }
+clap = { version = "4.5.40", features = ["derive", "env"] }
 config = "0.15.11"
 const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
@@ -184,7 +184,7 @@ serde_urlencoded = "0.7.1"
 serde_with = "3.12.0"
 sha2 = "0.10.9"
 siphasher = "1.0.1"
-smallvec = { version = "1.15.0", features = ["serde"] }
+smallvec = { version = "1.15.1", features = ["serde"] }
 snafu = "0.8.6"
 socket2 = "0.5.10"
 strum = { version = "0.27.1", features = ["derive"] }
