@@ -69,6 +69,11 @@ jobs:
           cache-on-failure: true
           cache-all-crates: true
 
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y musl-tools build-essential lld libdbus-1-dev libwayland-dev libwebkit2gtk-4.1-dev libxdo-dev
+
       - name: Test
         run: cargo test --all --exclude e2e_test
 
@@ -86,11 +91,6 @@ jobs:
         with:
           name: rustfs
           path: ./target/artifacts/*
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libglib2.0-dev pkg-config libzstd-dev
 
       - name: Install s3s-e2e
         run: |
