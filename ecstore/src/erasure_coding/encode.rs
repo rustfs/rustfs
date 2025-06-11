@@ -69,9 +69,14 @@ impl<'a> MultiWriter<'a> {
         }
 
         Err(std::io::Error::other(format!(
-            "Failed to write data:  (offline-disks={}/{})",
+            "Failed to write data:  (offline-disks={}/{}): {}",
             count_errs(&self.errs, &Error::DiskNotFound),
-            self.writers.len()
+            self.writers.len(),
+            self.errs
+                .iter()
+                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
         )))
     }
 }
