@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use serde::Deserialize;
@@ -9,7 +10,6 @@ use uuid::Uuid;
 
 use crate::headers::RESERVED_METADATA_PREFIX;
 use crate::headers::RUSTFS_HEALING;
-use crate::headers::X_RUSTFS_INLINE_DATA;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
@@ -302,10 +302,13 @@ impl FileInfo {
     }
 
     pub fn set_inline_data(&mut self) {
-        self.metadata.insert(X_RUSTFS_INLINE_DATA.to_owned(), "true".to_owned());
+        self.metadata
+            .insert(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).to_owned(), "true".to_owned());
     }
     pub fn inline_data(&self) -> bool {
-        self.metadata.get(X_RUSTFS_INLINE_DATA).is_some_and(|v| v == "true")
+        self.metadata
+            .contains_key(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).as_str())
+            && !self.is_remote()
     }
 
     /// Check if the object is compressed

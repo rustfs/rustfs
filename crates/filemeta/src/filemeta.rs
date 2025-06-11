@@ -1855,12 +1855,12 @@ impl MetaObject {
 
     pub fn inlinedata(&self) -> bool {
         self.meta_sys
-            .contains_key(format!("{}inline", RESERVED_METADATA_PREFIX_LOWER).as_str())
+            .contains_key(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).as_str())
     }
 
     pub fn reset_inline_data(&mut self) {
         self.meta_sys
-            .remove(format!("{}inline", RESERVED_METADATA_PREFIX_LOWER).as_str());
+            .remove(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).as_str());
     }
 
     /// Remove restore headers

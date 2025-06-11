@@ -97,6 +97,11 @@ jobs:
           name: rustfs
           path: ./target/artifacts
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev pkg-config
+
       - name: Run s3s-e2e
         timeout-minutes: 10
         run: |

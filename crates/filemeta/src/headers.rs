@@ -9,7 +9,7 @@ pub const RESERVED_METADATA_PREFIX_LOWER: &str = "x-rustfs-internal-";
 pub const RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
 // pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
-pub const X_RUSTFS_INLINE_DATA: &str = "x-rustfs-inline-data";
+// pub const X_RUSTFS_INLINE_DATA: &str = "x-rustfs-inline-data";
 
 pub const VERSION_PURGE_STATUS_KEY: &str = "X-Rustfs-Internal-purgestatus";
 
