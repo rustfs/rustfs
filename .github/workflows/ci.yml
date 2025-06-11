@@ -87,6 +87,11 @@ jobs:
           name: rustfs
           path: ./target/artifacts/*
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev pkg-config libzstd-dev
+
       - name: Install s3s-e2e
         run: |
           cargo install s3s-e2e --git https://github.com/Nugine/s3s.git
@@ -96,11 +101,6 @@ jobs:
         with:
           name: rustfs
           path: ./target/artifacts
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libglib2.0-dev pkg-config
 
       - name: Run s3s-e2e
         timeout-minutes: 10
