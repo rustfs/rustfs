@@ -7,19 +7,24 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-blake3 = { version = "1.8.2", optional = true }
+base64-simd= { workspace = true , optional = true}
+blake3 = { workspace = true, optional = true }
+crc32fast.workspace = true
+hex-simd= { workspace = true , optional = true}
 highway = { workspace = true, optional = true }
 lazy_static= { workspace = true , optional = true}
 local-ip-address = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 netif= { workspace = true , optional = true}
 nix = { workspace = true, optional = true }
+regex= { workspace = true, optional = true }
 rustfs-config = { workspace = true }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+siphasher = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
 tracing = { workspace = true }
@@ -42,7 +47,9 @@ tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls charac
 net = ["ip","dep:url", "dep:netif", "dep:lazy_static"]  # empty network features
 io = ["dep:tokio"]
 path = []
-hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde"]
+string = ["dep:regex","dep:lazy_static"]
+crypto = ["dep:base64-simd","dep:hex-simd"]
+hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher"]
 os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
 integration = []  # integration test features
-full = ["ip", "tls", "net", "io","hash", "os", "integration","path"]  # all features
+full = ["ip", "tls", "net", "io","hash", "os", "integration","path","crypto", "string"]  # all features

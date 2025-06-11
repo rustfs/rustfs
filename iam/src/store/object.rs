@@ -14,11 +14,11 @@ use ecstore::{
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
     store_list_objects::{ObjectInfoOrErr, WalkOptions},
-    utils::path::{SLASH_SEPARATOR, path_join_buf},
 };
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use policy::{auth::UserIdentity, policy::PolicyDoc};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
@@ -206,7 +206,7 @@ impl ObjectStore {
         let mut futures = Vec::with_capacity(names.len());
 
         for name in names {
-            let policy_name = ecstore::utils::path::dir(name);
+            let policy_name = rustfs_utils::path::dir(name);
             futures.push(async move {
                 match self.load_policy(&policy_name).await {
                     Ok(p) => Ok(p),
@@ -238,7 +238,7 @@ impl ObjectStore {
         let mut futures = Vec::with_capacity(names.len());
 
         for name in names {
-            let user_name = ecstore::utils::path::dir(name);
+            let user_name = rustfs_utils::path::dir(name);
             futures.push(async move {
                 match self.load_user_identity(&user_name, user_type).await {
                     Ok(res) => Ok(res),
@@ -464,7 +464,7 @@ impl Store for ObjectStore {
             }
 
             if let Some(item) = v.item {
-                let name = ecstore::utils::path::dir(&item);
+                let name = rustfs_utils::path::dir(&item);
                 self.load_user(&name, user_type, m).await?;
             }
         }
@@ -526,7 +526,7 @@ impl Store for ObjectStore {
             }
 
             if let Some(item) = v.item {
-                let name = ecstore::utils::path::dir(&item);
+                let name = rustfs_utils::path::dir(&item);
                 self.load_group(&name, m).await?;
             }
         }
@@ -590,7 +590,7 @@ impl Store for ObjectStore {
             }
 
             if let Some(item) = v.item {
-                let name = ecstore::utils::path::dir(&item);
+                let name = rustfs_utils::path::dir(&item);
                 self.load_policy_doc(&name, m).await?;
             }
         }
@@ -690,7 +690,7 @@ impl Store for ObjectStore {
                             continue;
                         }
 
-                        let policy_name = ecstore::utils::path::dir(&policies_list[idx]);
+                        let policy_name = rustfs_utils::path::dir(&policies_list[idx]);
 
                         info!("load policy: {}", policy_name);
 
@@ -706,7 +706,7 @@ impl Store for ObjectStore {
                         continue;
                     }
 
-                    let policy_name = ecstore::utils::path::dir(&policies_list[idx]);
+                    let policy_name = rustfs_utils::path::dir(&policies_list[idx]);
                     info!("load policy: {}", policy_name);
                     policy_docs_cache.insert(policy_name, p);
                 }
@@ -734,7 +734,7 @@ impl Store for ObjectStore {
                             continue;
                         }
 
-                        let name = ecstore::utils::path::dir(&item_name_list[idx]);
+                        let name = rustfs_utils::path::dir(&item_name_list[idx]);
                         info!("load reg user: {}", name);
                         user_items_cache.insert(name, p);
                     }
@@ -748,7 +748,7 @@ impl Store for ObjectStore {
                         continue;
                     }
 
-                    let name = ecstore::utils::path::dir(&item_name_list[idx]);
+                    let name = rustfs_utils::path::dir(&item_name_list[idx]);
                     info!("load reg user: {}", name);
                     user_items_cache.insert(name, p);
                 }
@@ -764,7 +764,7 @@ impl Store for ObjectStore {
             let mut items_cache = CacheEntity::default();
 
             for item in item_name_list.iter() {
-                let name = ecstore::utils::path::dir(item);
+                let name = rustfs_utils::path::dir(item);
                 info!("load group: {}", name);
                 if let Err(err) = self.load_group(&name, &mut items_cache).await {
                     return Err(Error::other(format!("load group failed: {}", err)));
@@ -843,7 +843,7 @@ impl Store for ObjectStore {
             let mut items_cache = HashMap::default();
 
             for item in item_name_list.iter() {
-                let name = ecstore::utils::path::dir(item);
+                let name = rustfs_utils::path::dir(item);
                 info!("load svc user: {}", name);
                 if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await {
                     if !is_err_no_such_user(&err) {
@@ -880,7 +880,7 @@ impl Store for ObjectStore {
             for item in item_name_list.iter() {
                 info!("load sts user path: {}", item);
 
-                let name = ecstore::utils::path::dir(item);
+                let name = rustfs_utils::path::dir(item);
                 info!("load sts user: {}", name);
                 if let Err(err) = self.load_user(&name, UserType::Sts, &mut sts_items_cache).await {
                     info!("load sts user failed: {}", err);

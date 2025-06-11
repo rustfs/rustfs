@@ -9,7 +9,7 @@ use crate::{
         UpdateServiceAccountOpts,
     },
 };
-use ecstore::utils::{crypto::base64_encode, path::path_join_buf};
+// use ecstore::utils::crypto::base64_encode;
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use policy::{
     arn::ARN,
@@ -19,6 +19,8 @@ use policy::{
         EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
     },
 };
+use rustfs_utils::crypto::base64_encode;
+use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{

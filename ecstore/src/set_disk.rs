@@ -9,6 +9,7 @@ use crate::erasure_coding::bitrot_verify;
 use crate::error::{Error, Result};
 use crate::global::GLOBAL_MRFState;
 use crate::heal::data_usage_cache::DataUsageCache;
+use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::store_api::ObjectToDelete;
 use crate::{
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
@@ -38,20 +39,13 @@ use crate::{
         ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::load_format_erasure,
-    utils::{
-        crypto::{base64_decode, base64_encode, hex},
-        path::{SLASH_SEPARATOR, encode_dir_object, has_suffix},
-    },
+    // utils::crypto::{base64_decode, base64_encode, hex},
     xhttp,
 };
 use crate::{disk::STORAGE_FORMAT_FILE, heal::mrf::PartialOperation};
 use crate::{
     heal::data_scanner::{HEAL_DELETE_DANGLING, globalHealConfig},
     store_api::ListObjectVersionsInfo,
-};
-use crate::{
-    heal::heal_ops::{HealEntryFn, HealSequence},
-    utils::path::path_join_buf,
 };
 use bytesize::ByteSize;
 use chrono::Utc;
@@ -67,7 +61,11 @@ use rustfs_filemeta::{
     RawFileInfo, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_rio::{EtagResolvable, HashReader};
-use rustfs_utils::HashAlgorithm;
+use rustfs_utils::{
+    HashAlgorithm,
+    crypto::{base64_decode, base64_encode, hex},
+    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
+};
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem;

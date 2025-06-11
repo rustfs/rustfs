@@ -48,11 +48,10 @@ use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 // use ecstore::store_api::RESERVED_METADATA_PREFIX;
+use ecstore::bucket::utils::serialize;
 use ecstore::cmd::bucket_replication::ReplicationStatusType;
 use ecstore::cmd::bucket_replication::ReplicationType;
 use ecstore::store_api::RESERVED_METADATA_PREFIX_LOWER;
-use ecstore::utils::path::path_join_buf;
-use ecstore::utils::xml;
 use ecstore::xhttp;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
@@ -66,6 +65,7 @@ use policy::policy::action::Action;
 use policy::policy::action::S3Action;
 use query::instance::make_rustfsms;
 use rustfs_rio::HashReader;
+use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
 use s3s::S3;
 use s3s::S3Error;
@@ -1274,7 +1274,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let data = try_!(xml::serialize(&tagging));
+        let data = try_!(serialize(&tagging));
 
         metadata_sys::update(&bucket, BUCKET_TAGGING_CONFIG, data)
             .await
@@ -1405,7 +1405,7 @@ impl S3 for FS {
         // check bucket object lock enable
         // check replication suspended
 
-        let data = try_!(xml::serialize(&versioning_configuration));
+        let data = try_!(serialize(&versioning_configuration));
 
         metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
             .await
@@ -1596,7 +1596,7 @@ impl S3 for FS {
 
         let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
 
-        let data = try_!(xml::serialize(&input_cfg));
+        let data = try_!(serialize(&input_cfg));
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
@@ -1681,7 +1681,7 @@ impl S3 for FS {
 
         // TODO: check kms
 
-        let data = try_!(xml::serialize(&server_side_encryption_configuration));
+        let data = try_!(serialize(&server_side_encryption_configuration));
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
@@ -1753,7 +1753,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let data = try_!(xml::serialize(&input_cfg));
+        let data = try_!(serialize(&input_cfg));
 
         metadata_sys::update(&bucket, OBJECT_LOCK_CONFIG, data)
             .await
@@ -1829,7 +1829,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         // TODO: check enable, versioning enable
-        let data = try_!(xml::serialize(&replication_configuration));
+        let data = try_!(serialize(&replication_configuration));
 
         metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
             .await
@@ -1924,7 +1924,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let data = try_!(xml::serialize(&notification_configuration));
+        let data = try_!(serialize(&notification_configuration));
 
         metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
             .await

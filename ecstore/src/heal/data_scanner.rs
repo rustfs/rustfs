@@ -43,7 +43,6 @@ use crate::{
     new_object_layer_fn,
     peer::is_reserved_or_invalid_bucket,
     store::ECStore,
-    utils::path::{SLASH_SEPARATOR, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path},
 };
 use crate::{disk::DiskAPI, store_api::ObjectInfo};
 use crate::{
@@ -56,6 +55,7 @@ use lazy_static::lazy_static;
 use rand::Rng;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, ReplicationConfiguration, ReplicationRuleStatus};
 use serde::{Deserialize, Serialize};
 use tokio::{

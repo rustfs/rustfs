@@ -16,8 +16,17 @@ The `EtagResolvable` trait provides a clean way to handle recursive unwrapping:
 ## Usage Examples
 
 ```rust
+use rustfs_rio::{CompressReader, EtagReader, resolve_etag_generic};
+use rustfs_rio::compress::CompressionAlgorithm;
+use tokio::io::BufReader;
+use std::io::Cursor;
+
 // Direct usage with trait-based approach
-let mut reader = CompressReader::new(EtagReader::new(some_async_read, Some("test_etag".to_string())));
+let data = b"test data";
+let reader = BufReader::new(Cursor::new(&data[..]));
+let reader = Box::new(reader);
+let etag_reader = EtagReader::new(reader, Some("test_etag".to_string()));
+let mut reader = CompressReader::new(etag_reader, CompressionAlgorithm::Gzip);
 let etag = resolve_etag_generic(&mut reader);
 ```
 */

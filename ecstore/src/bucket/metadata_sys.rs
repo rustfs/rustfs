@@ -6,13 +6,12 @@ use std::{collections::HashMap, sync::Arc};
 use crate::StorageAPI;
 use crate::bucket::error::BucketMetadataError;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
-use crate::bucket::utils::is_meta_bucketname;
+use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::cmd::bucket_targets;
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, new_object_layer_fn};
 use crate::heal::heal_commands::HealOpts;
 use crate::store::ECStore;
-use crate::utils::xml::deserialize;
 use futures::future::join_all;
 use policy::policy::BucketPolicy;
 use s3s::dto::{

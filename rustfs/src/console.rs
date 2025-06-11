@@ -8,6 +8,7 @@ use axum::{
 };
 use axum_extra::extract::Host;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_utils::net::parse_and_resolve_address;
 use std::io;
 
 use axum::response::Redirect;
@@ -239,8 +240,7 @@ pub async fn start_static_file_server(
         .layer(tower_http::compression::CompressionLayer::new().gzip(true).deflate(true))
         .layer(TraceLayer::new_for_http());
 
-    use ecstore::utils::net;
-    let server_addr = net::parse_and_resolve_address(addrs).expect("Failed to parse socket address");
+    let server_addr = parse_and_resolve_address(addrs).expect("Failed to parse socket address");
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 

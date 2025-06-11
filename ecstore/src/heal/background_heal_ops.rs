@@ -1,5 +1,6 @@
 use futures::future::join_all;
 use madmin::heal_commands::HealResultItem;
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
 use std::{cmp::Ordering, env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     spawn,
@@ -34,7 +35,6 @@ use crate::{
     new_object_layer_fn,
     store::get_disk_via_endpoint,
     store_api::{BucketInfo, BucketOptions, StorageAPI},
-    utils::path::{SLASH_SEPARATOR, path_join},
 };
 
 pub static DEFAULT_MONITOR_NEW_DISK_INTERVAL: Duration = Duration::from_secs(10);

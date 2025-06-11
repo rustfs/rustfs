@@ -25,9 +25,6 @@ use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
-use crate::utils::crypto::base64_decode;
-use crate::utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
-use crate::utils::xml;
 use crate::{
     bucket::metadata::BucketMetadata,
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
@@ -41,6 +38,8 @@ use crate::{
     },
     store_init,
 };
+use rustfs_utils::crypto::base64_decode;
+use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
 
 use crate::error::{Error, Result};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
@@ -1347,12 +1346,12 @@ impl StorageAPI for ECStore {
         meta.set_created(opts.created_at);
 
         if opts.lock_enabled {
-            meta.object_lock_config_xml = xml::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
-            meta.versioning_config_xml = xml::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.object_lock_config_xml = crate::bucket::utils::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
         if opts.versioning_enabled {
-            meta.versioning_config_xml = xml::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
         meta.save().await?;

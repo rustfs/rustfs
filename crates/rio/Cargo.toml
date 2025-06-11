@@ -34,3 +34,4 @@ rustfs-utils = {workspace = true, features= ["io","hash"]}
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["async", "async_tokio", "tokio"] }
+tokio-test = "0.4"

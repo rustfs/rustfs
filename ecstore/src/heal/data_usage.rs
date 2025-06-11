@@ -6,9 +6,9 @@ use crate::{
     error::to_object_err,
     new_object_layer_fn,
     store::ECStore,
-    utils::path::SLASH_SEPARATOR,
 };
 use lazy_static::lazy_static;
+use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::mpsc::Receiver;

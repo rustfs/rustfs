@@ -1,7 +1,6 @@
 use super::error::{Error, Result};
-use crate::utils::net;
 use path_absolutize::Absolutize;
-use rustfs_utils::is_local_host;
+use rustfs_utils::{is_local_host, is_socket_addr};
 use std::{fmt::Display, path::Path};
 use url::{ParseError, Url};
 
@@ -186,7 +185,7 @@ fn url_parse_from_file_path(value: &str) -> Result<Url> {
     // localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
     // /mnt/export1. So we go ahead and start the rustfs server in FS modes in these cases.
     let addr: Vec<&str> = value.splitn(2, '/').collect();
-    if net::is_socket_addr(addr[0]) {
+    if is_socket_addr(addr[0]) {
         return Err(Error::other("invalid URL endpoint format: missing scheme http or https"));
     }
 

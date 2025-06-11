@@ -17,13 +17,13 @@ use time::OffsetDateTime;
 use tracing::error;
 
 use crate::bucket::target::BucketTarget;
+use crate::bucket::utils::deserialize;
 use crate::config::com::{read_config, save_config};
 use crate::error::{Error, Result};
 use crate::new_object_layer_fn;
 
 use crate::disk::BUCKET_META_PREFIX;
 use crate::store::ECStore;
-use crate::utils::xml::deserialize;
 
 pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
 pub const BUCKET_METADATA_FORMAT: u16 = 1;

@@ -102,8 +102,8 @@ pub fn get_logger() -> &'static Arc<tokio::sync::Mutex<Logger>> {
 /// ```rust
 /// use rustfs_obs::{ init_obs, set_global_guard};
 ///
-/// fn init() -> Result<(), Box<dyn std::error::Error>> {
-///     let guard = init_obs(None);
+/// async fn init() -> Result<(), Box<dyn std::error::Error>> {
+///     let (_, guard) = init_obs(None).await;
 ///     set_global_guard(guard)?;
 ///     Ok(())
 /// }

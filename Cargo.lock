@@ -4918,6 +4918,7 @@ dependencies = [
  "policy",
  "rand 0.9.1",
  "regex",
+ "rustfs-utils",
  "serde",
  "serde_json",
  "strum",
@@ -8445,6 +8446,7 @@ dependencies = [
  "rustfs-utils",
  "snap",
  "tokio",
+ "tokio-test",
  "tokio-util",
  "zstd",
 ]
@@ -8480,19 +8482,24 @@ dependencies = [
 name = "rustfs-utils"
 version = "0.0.1"
 dependencies = [
+ "base64-simd",
  "blake3",
+ "crc32fast",
+ "hex-simd",
  "highway",
  "lazy_static",
  "local-ip-address",
  "md-5",
  "netif",
  "nix 0.30.1",
+ "regex",
  "rustfs-config",
  "rustls 0.23.27",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
  "serde",
  "sha2 0.10.9",
+ "siphasher 1.0.1",
  "tempfile",
  "tokio",
  "tracing",
@@ -10033,6 +10040,19 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "xattr",
+]
+
+[[package]]
+name = "tokio-test"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2468baabc3311435b55dd935f702f42cd1b8abb7e754fb7dfb16bd36aa88f9f7"
+dependencies = [
+ "async-stream",
+ "bytes",
+ "futures-core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

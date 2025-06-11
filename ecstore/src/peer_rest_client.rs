@@ -4,7 +4,6 @@ use crate::{
     global::is_dist_erasure,
     heal::heal_commands::BgHealState,
     metrics_realtime::{CollectMetricsOpts, MetricType},
-    utils::net::XHost,
 };
 use madmin::{
     ServerProperties,
@@ -25,6 +24,7 @@ use protos::{
     },
 };
 use rmp_serde::{Deserializer, Serializer};
+use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};
 use std::{collections::HashMap, io::Cursor, time::SystemTime};
 use tonic::Request;

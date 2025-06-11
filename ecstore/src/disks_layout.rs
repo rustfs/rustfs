@@ -1,4 +1,4 @@
-use crate::utils::ellipses::*;
+use rustfs_utils::string::{ArgPattern, find_ellipses_patterns, has_ellipses};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::env;
@@ -443,6 +443,8 @@ fn get_total_sizes(arg_patterns: &[ArgPattern]) -> Vec<usize> {
 
 #[cfg(test)]
 mod test {
+    use rustfs_utils::string::Pattern;
+
     use super::*;
 
     impl PartialEq for EndpointSet {

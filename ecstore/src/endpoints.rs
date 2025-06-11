@@ -1,10 +1,11 @@
+use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
 use tracing::{instrument, warn};
 
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
     disks_layout::DisksLayout,
     global::global_rustfs_port,
-    utils::net::{self, XHost},
+    // utils::net::{self, XHost},
 };
 use std::io::{Error, Result};
 use std::{
@@ -159,7 +160,7 @@ impl PoolEndpointList {
             return Err(Error::other("invalid number of endpoints"));
         }
 
-        let server_addr = net::check_local_server_addr(server_addr)?;
+        let server_addr = check_local_server_addr(server_addr)?;
 
         // For single arg, return single drive EC setup.
         if disks_layout.is_single_drive_layout() {
@@ -227,7 +228,7 @@ impl PoolEndpointList {
 
                 let host = ep.url.host().unwrap();
                 let host_ip_set = host_ip_cache.entry(host.clone()).or_insert({
-                    net::get_host_ip(host.clone()).map_err(|e| Error::other(format!("host '{}' cannot resolve: {}", host, e)))?
+                    get_host_ip(host.clone()).map_err(|e| Error::other(format!("host '{}' cannot resolve: {}", host, e)))?
                 });
 
                 let path = ep.get_file_path();
@@ -331,7 +332,7 @@ impl PoolEndpointList {
                         ep.is_local = true;
                     }
                     Some(host) => {
-                        ep.is_local = net::is_local_host(host, ep.url.port().unwrap_or_default(), local_port)?;
+                        ep.is_local = is_local_host(host, ep.url.port().unwrap_or_default(), local_port)?;
                     }
                 }
             }
@@ -370,7 +371,7 @@ impl PoolEndpointList {
                             resolved_set.insert((i, j));
                             continue;
                         }
-                        Some(host) => match net::is_local_host(host, ep.url.port().unwrap_or_default(), local_port) {
+                        Some(host) => match is_local_host(host, ep.url.port().unwrap_or_default(), local_port) {
                             Ok(is_local) => {
                                 if !found_local {
                                     found_local = is_local;
@@ -605,6 +606,8 @@ impl EndpointServerPools {
 
 #[cfg(test)]
 mod test {
+    use rustfs_utils::must_get_local_ips;
+
     use super::*;
     use std::path::Path;
 
@@ -736,7 +739,7 @@ mod test {
 
         // Filter ipList by IPs those do not start with '127.'.
         let non_loop_back_i_ps =
-            net::must_get_local_ips().map_or(vec![], |v| v.into_iter().filter(|ip| ip.is_ipv4() && ip.is_loopback()).collect());
+            must_get_local_ips().map_or(vec![], |v| v.into_iter().filter(|ip| ip.is_ipv4() && ip.is_loopback()).collect());
         if non_loop_back_i_ps.is_empty() {
             panic!("No non-loop back IP address found for this host");
         }

@@ -16,7 +16,6 @@ use crate::set_disk::SetDisks;
 use crate::store_api::{
     BucketOptions, CompletePart, GetObjectReader, MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI,
 };
-use crate::utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use crate::{sets::Sets, store::ECStore};
 use ::workers::workers::Workers;
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
@@ -26,6 +25,7 @@ use http::HeaderMap;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_rio::HashReader;
+use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;

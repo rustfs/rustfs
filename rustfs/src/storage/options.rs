@@ -2,9 +2,9 @@ use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::error::Result;
 use ecstore::error::StorageError;
 use ecstore::store_api::ObjectOptions;
-use ecstore::utils::path::is_dir_object;
 use http::{HeaderMap, HeaderValue};
 use lazy_static::lazy_static;
+use rustfs_utils::path::is_dir_object;
 use std::collections::HashMap;
 use uuid::Uuid;
 

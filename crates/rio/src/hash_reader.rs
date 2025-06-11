@@ -28,33 +28,35 @@
 //! # tokio_test::block_on(async {
 //! let data = b"hello world";
 //! let reader = BufReader::new(Cursor::new(&data[..]));
+//! let reader = Box::new(reader);
 //! let size = data.len() as i64;
 //! let actual_size = size;
 //! let etag = None;
 //! let diskable_md5 = false;
 //!
 //! // Method 1: Simple creation (recommended for most cases)
-//! let hash_reader = HashReader::new(reader, size, actual_size, etag, diskable_md5);
+//! let hash_reader = HashReader::new(reader, size, actual_size, etag.clone(), diskable_md5).unwrap();
 //!
 //! // Method 2: With manual wrapping to recreate original logic
 //! let reader2 = BufReader::new(Cursor::new(&data[..]));
-//! let wrapped_reader = if size > 0 {
+//! let reader2 = Box::new(reader2);
+//! let wrapped_reader: Box<dyn rustfs_rio::Reader> = if size > 0 {
 //!     if !diskable_md5 {
 //!         // Wrap with both HardLimitReader and EtagReader
 //!         let hard_limit = HardLimitReader::new(reader2, size);
-//!         EtagReader::new(hard_limit, etag.clone())
+//!         Box::new(EtagReader::new(Box::new(hard_limit), etag.clone()))
 //!     } else {
 //!         // Only wrap with HardLimitReader
-//!         HardLimitReader::new(reader2, size)
+//!         Box::new(HardLimitReader::new(reader2, size))
 //!     }
 //! } else if !diskable_md5 {
 //!     // Only wrap with EtagReader
-//!     EtagReader::new(reader2, etag.clone())
+//!     Box::new(EtagReader::new(reader2, etag.clone()))
 //! } else {
 //!     // No wrapping needed
 //!     reader2
 //! };
-//! let hash_reader2 = HashReader::new(wrapped_reader, size, actual_size, etag, diskable_md5);
+//! let hash_reader2 = HashReader::new(wrapped_reader, size, actual_size, etag, diskable_md5).unwrap();
 //! # });
 //! ```
 //!
@@ -70,14 +72,14 @@
 //! # tokio_test::block_on(async {
 //! let data = b"test";
 //! let reader = BufReader::new(Cursor::new(&data[..]));
-//! let hash_reader = HashReader::new(reader, 4, 4, None, false);
+//! let hash_reader = HashReader::new(Box::new(reader), 4, 4, None, false).unwrap();
 //!
 //! // Check if a type is a HashReader
 //! assert!(hash_reader.is_hash_reader());
 //!
 //! // Use new for compatibility (though it's simpler to use new() directly)
 //! let reader2 = BufReader::new(Cursor::new(&data[..]));
-//! let result = HashReader::new(reader2, 4, 4, None, false);
+//! let result = HashReader::new(Box::new(reader2), 4, 4, None, false);
 //! assert!(result.is_ok());
 //! # });
 //! ```

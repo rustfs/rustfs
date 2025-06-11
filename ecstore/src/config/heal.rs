@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::utils::bool_flag::parse_bool;
+use rustfs_utils::string::parse_bool;
 use std::time::Duration;
 
 #[derive(Debug, Default)]

@@ -32,8 +32,7 @@ use crate::heal::heal_commands::{HealScanMode, HealingTracker};
 use crate::heal::heal_ops::HEALING_TRACKER_FILENAME;
 use crate::new_object_layer_fn;
 use crate::store_api::{ObjectInfo, StorageAPI};
-// use crate::utils::os::get_info;
-use crate::utils::path::{
+use rustfs_utils::path::{
     GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
     path_join, path_join_buf,
 };

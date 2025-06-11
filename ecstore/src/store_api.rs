@@ -4,11 +4,12 @@ use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusTy
 use crate::error::{Error, Result};
 use crate::heal::heal_ops::HealSequence;
 use crate::store_utils::clean_metadata;
-use crate::{disk::DiskStore, heal::heal_commands::HealOpts, utils::path::decode_dir_object, xhttp};
+use crate::{disk::DiskStore, heal::heal_commands::HealOpts, xhttp};
 use http::{HeaderMap, HeaderValue};
 use madmin::heal_commands::HealResultItem;
 use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo};
 use rustfs_rio::{HashReader, Reader};
+use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;

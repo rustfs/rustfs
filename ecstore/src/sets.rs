@@ -23,13 +23,13 @@ use crate::{
         ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
-    utils::{hash, path::path_join_buf},
 };
 use common::globals::GLOBAL_Local_Node_Name;
 use futures::future::join_all;
 use http::HeaderMap;
 use lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -232,11 +232,9 @@ impl Sets {
 
     fn get_hashed_set_index(&self, input: &str) -> usize {
         match self.distribution_algo {
-            DistributionAlgoVersion::V1 => hash::crc_hash(input, self.disk_set.len()),
+            DistributionAlgoVersion::V1 => crc_hash(input, self.disk_set.len()),
 
-            DistributionAlgoVersion::V2 | DistributionAlgoVersion::V3 => {
-                hash::sip_hash(input, self.disk_set.len(), self.id.as_bytes())
-            }
+            DistributionAlgoVersion::V2 | DistributionAlgoVersion::V3 => sip_hash(input, self.disk_set.len(), self.id.as_bytes()),
         }
     }
 

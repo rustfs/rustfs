@@ -6,12 +6,11 @@ use std::{
 
 use crate::{
     config::storageclass::{RRS, STANDARD},
-    disk::{BUCKET_META_PREFIX, DeleteOptions, DiskAPI, DiskStore, RUSTFS_META_BUCKET, error::DiskError},
+    disk::{BUCKET_META_PREFIX, DeleteOptions, DiskAPI, DiskStore, RUSTFS_META_BUCKET, error::DiskError, fs::read_file},
     global::GLOBAL_BackgroundHealState,
     heal::heal_ops::HEALING_TRACKER_FILENAME,
     new_object_layer_fn,
     store_api::{BucketInfo, StorageAPI},
-    utils::fs::read_file,
 };
 use crate::{disk, error::Result};
 use chrono::{DateTime, Utc};

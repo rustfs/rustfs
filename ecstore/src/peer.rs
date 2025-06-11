@@ -8,7 +8,6 @@ use crate::heal::heal_commands::{
 };
 use crate::heal::heal_ops::RUSTFS_RESERVED_BUCKET;
 use crate::store::all_local_disk;
-use crate::utils::wildcard::is_rustfs_meta_bucket_name;
 use crate::{
     disk::{self, VolumeInfo},
     endpoints::{EndpointServerPools, Node},
@@ -750,7 +749,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
         });
     }
 
-    if opts.remove && !is_rustfs_meta_bucket_name(bucket) && !is_all_buckets_not_found(&errs) {
+    if opts.remove && !bucket.starts_with(disk::RUSTFS_META_BUCKET) && !is_all_buckets_not_found(&errs) {
         let mut futures = Vec::new();
         for disk in disks.iter() {
             let disk = disk.clone();

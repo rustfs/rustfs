@@ -98,7 +98,7 @@ pub fn get_available_port() -> u16 {
 }
 
 /// returns IPs of local interface
-pub(crate) fn must_get_local_ips() -> std::io::Result<Vec<IpAddr>> {
+pub fn must_get_local_ips() -> std::io::Result<Vec<IpAddr>> {
     match netif::up() {
         Ok(up) => Ok(up.map(|x| x.address().to_owned()).collect()),
         Err(err) => Err(std::io::Error::other(format!("Unable to get IP addresses of this host: {}", err))),
