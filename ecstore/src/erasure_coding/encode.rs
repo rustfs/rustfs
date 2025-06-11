@@ -55,7 +55,7 @@ impl<'a> MultiWriter<'a> {
         }
 
         let nil_count = self.errs.iter().filter(|&e| e.is_none()).count();
-        if nil_count > self.write_quorum {
+        if nil_count >= self.write_quorum {
             return Ok(());
         }
 
