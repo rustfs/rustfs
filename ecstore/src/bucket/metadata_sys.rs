@@ -443,7 +443,6 @@ impl BucketMetadataSys {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
-                warn!("get_object_lock_config err {:?}", &err);
                 return if err == Error::ConfigNotFound {
                     Err(BucketMetadataError::BucketObjectLockConfigNotFound.into())
                 } else {

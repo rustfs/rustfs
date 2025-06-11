@@ -24,11 +24,12 @@
 //! use rustfs_rio::{HashReader, HardLimitReader, EtagReader};
 //! use tokio::io::BufReader;
 //! use std::io::Cursor;
+//! use rustfs_rio::WarpReader;
 //!
 //! # tokio_test::block_on(async {
 //! let data = b"hello world";
 //! let reader = BufReader::new(Cursor::new(&data[..]));
-//! let reader = Box::new(reader);
+//! let reader = Box::new(WarpReader::new(reader));
 //! let size = data.len() as i64;
 //! let actual_size = size;
 //! let etag = None;
@@ -39,7 +40,7 @@
 //!
 //! // Method 2: With manual wrapping to recreate original logic
 //! let reader2 = BufReader::new(Cursor::new(&data[..]));
-//! let reader2 = Box::new(reader2);
+//! let reader2 = Box::new(WarpReader::new(reader2));
 //! let wrapped_reader: Box<dyn rustfs_rio::Reader> = if size > 0 {
 //!     if !diskable_md5 {
 //!         // Wrap with both HardLimitReader and EtagReader
@@ -68,18 +69,19 @@
 //! use rustfs_rio::{HashReader, HashReaderDetector};
 //! use tokio::io::BufReader;
 //! use std::io::Cursor;
+//! use rustfs_rio::WarpReader;
 //!
 //! # tokio_test::block_on(async {
 //! let data = b"test";
 //! let reader = BufReader::new(Cursor::new(&data[..]));
-//! let hash_reader = HashReader::new(Box::new(reader), 4, 4, None, false).unwrap();
+//! let hash_reader = HashReader::new(Box::new(WarpReader::new(reader)), 4, 4, None, false).unwrap();
 //!
 //! // Check if a type is a HashReader
 //! assert!(hash_reader.is_hash_reader());
 //!
 //! // Use new for compatibility (though it's simpler to use new() directly)
 //! let reader2 = BufReader::new(Cursor::new(&data[..]));
-//! let result = HashReader::new(Box::new(reader2), 4, 4, None, false);
+//! let result = HashReader::new(Box::new(WarpReader::new(reader2)), 4, 4, None, false);
 //! assert!(result.is_ok());
 //! # });
 //! ```
@@ -89,6 +91,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
+use crate::compress_index::{Index, TryGetIndex};
 use crate::{EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, Reader};
 
 /// Trait for mutable operations on HashReader
@@ -283,10 +286,16 @@ impl HashReaderDetector for HashReader {
     }
 }
 
+impl TryGetIndex for HashReader {
+    fn try_get_index(&self) -> Option<&Index> {
+        self.inner.try_get_index()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DecryptReader, encrypt_reader};
+    use crate::{DecryptReader, WarpReader, encrypt_reader};
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -299,14 +308,14 @@ mod tests {
 
         // Test 1: Simple creation
         let reader1 = BufReader::new(Cursor::new(&data[..]));
-        let reader1 = Box::new(reader1);
+        let reader1 = Box::new(WarpReader::new(reader1));
         let hash_reader1 = HashReader::new(reader1, size, actual_size, etag.clone(), false).unwrap();
         assert_eq!(hash_reader1.size(), size);
         assert_eq!(hash_reader1.actual_size(), actual_size);
 
         // Test 2: With HardLimitReader wrapping
         let reader2 = BufReader::new(Cursor::new(&data[..]));
-        let reader2 = Box::new(reader2);
+        let reader2 = Box::new(WarpReader::new(reader2));
         let hard_limit = HardLimitReader::new(reader2, size);
         let hard_limit = Box::new(hard_limit);
         let hash_reader2 = HashReader::new(hard_limit, size, actual_size, etag.clone(), false).unwrap();
@@ -315,7 +324,7 @@ mod tests {
 
         // Test 3: With EtagReader wrapping
         let reader3 = BufReader::new(Cursor::new(&data[..]));
-        let reader3 = Box::new(reader3);
+        let reader3 = Box::new(WarpReader::new(reader3));
         let etag_reader = EtagReader::new(reader3, etag.clone());
         let etag_reader = Box::new(etag_reader);
         let hash_reader3 = HashReader::new(etag_reader, size, actual_size, etag.clone(), false).unwrap();
@@ -327,7 +336,7 @@ mod tests {
     async fn test_hashreader_etag_basic() {
         let data = b"hello hashreader";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, false).unwrap();
         let mut buf = Vec::new();
         let _ = hash_reader.read_to_end(&mut buf).await.unwrap();
@@ -341,7 +350,7 @@ mod tests {
     async fn test_hashreader_diskable_md5() {
         let data = b"no etag";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, true).unwrap();
         let mut buf = Vec::new();
         let _ = hash_reader.read_to_end(&mut buf).await.unwrap();
@@ -355,11 +364,11 @@ mod tests {
     async fn test_hashreader_new_logic() {
         let data = b"test data";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         // Create a HashReader first
         let hash_reader =
             HashReader::new(reader, data.len() as i64, data.len() as i64, Some("test_etag".to_string()), false).unwrap();
-        let hash_reader = Box::new(hash_reader);
+        let hash_reader = Box::new(WarpReader::new(hash_reader));
         // Now try to create another HashReader from the existing one using new
         let result = HashReader::new(hash_reader, data.len() as i64, data.len() as i64, Some("test_etag".to_string()), false);
 
@@ -371,11 +380,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_for_wrapping_readers() {
-        use crate::compress::CompressionAlgorithm;
         use crate::{CompressReader, DecompressReader};
         use md5::{Digest, Md5};
         use rand::Rng;
         use rand::RngCore;
+        use rustfs_utils::compress::CompressionAlgorithm;
 
         // Generate 1MB random data
         let size = 1024 * 1024;
@@ -397,7 +406,7 @@ mod tests {
         let size = data.len() as i64;
         let actual_size = data.len() as i64;
 
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         // 创建 HashReader
         let mut hr = HashReader::new(reader, size, actual_size, Some(expected.clone()), false).unwrap();
 
@@ -427,7 +436,7 @@ mod tests {
 
         if is_encrypt {
             // 加密压缩后的数据
-            let encrypt_reader = encrypt_reader::EncryptReader::new(Cursor::new(compressed_data), key, nonce);
+            let encrypt_reader = encrypt_reader::EncryptReader::new(WarpReader::new(Cursor::new(compressed_data)), key, nonce);
             let mut encrypted_data = Vec::new();
             let mut encrypt_reader = encrypt_reader;
             encrypt_reader.read_to_end(&mut encrypted_data).await.unwrap();
@@ -435,14 +444,15 @@ mod tests {
             println!("Encrypted size: {}", encrypted_data.len());
 
             // 解密数据
-            let decrypt_reader = DecryptReader::new(Cursor::new(encrypted_data), key, nonce);
+            let decrypt_reader = DecryptReader::new(WarpReader::new(Cursor::new(encrypted_data)), key, nonce);
             let mut decrypt_reader = decrypt_reader;
             let mut decrypted_data = Vec::new();
             decrypt_reader.read_to_end(&mut decrypted_data).await.unwrap();
 
             if is_compress {
                 // 如果使用了压缩，需要解压缩
-                let decompress_reader = DecompressReader::new(Cursor::new(decrypted_data), CompressionAlgorithm::Gzip);
+                let decompress_reader =
+                    DecompressReader::new(WarpReader::new(Cursor::new(decrypted_data)), CompressionAlgorithm::Gzip);
                 let mut decompress_reader = decompress_reader;
                 let mut final_data = Vec::new();
                 decompress_reader.read_to_end(&mut final_data).await.unwrap();
@@ -460,7 +470,8 @@ mod tests {
 
         // 如果不加密，直接处理压缩/解压缩
         if is_compress {
-            let decompress_reader = DecompressReader::new(Cursor::new(compressed_data), CompressionAlgorithm::Gzip);
+            let decompress_reader =
+                DecompressReader::new(WarpReader::new(Cursor::new(compressed_data)), CompressionAlgorithm::Gzip);
             let mut decompress_reader = decompress_reader;
             let mut decompressed = Vec::new();
             decompress_reader.read_to_end(&mut decompressed).await.unwrap();
@@ -481,8 +492,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_compression_with_compressible_data() {
-        use crate::compress::CompressionAlgorithm;
         use crate::{CompressReader, DecompressReader};
+        use rustfs_utils::compress::CompressionAlgorithm;
 
         // Create highly compressible data (repeated pattern)
         let pattern = b"Hello, World! This is a test pattern that should compress well. ";
@@ -495,7 +506,7 @@ mod tests {
         println!("Original data size: {} bytes", data.len());
 
         let reader = BufReader::new(Cursor::new(data.clone()));
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, false).unwrap();
 
         // Test compression
@@ -525,8 +536,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_compression_algorithms() {
-        use crate::compress::CompressionAlgorithm;
         use crate::{CompressReader, DecompressReader};
+        use rustfs_utils::compress::CompressionAlgorithm;
 
         let data = b"This is test data for compression algorithm testing. ".repeat(1000);
         println!("Testing with {} bytes of data", data.len());
@@ -541,7 +552,7 @@ mod tests {
             println!("\nTesting algorithm: {:?}", algorithm);
 
             let reader = BufReader::new(Cursor::new(data.clone()));
-            let reader = Box::new(reader);
+            let reader = Box::new(WarpReader::new(reader));
             let hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, false).unwrap();
 
             // Compress

@@ -164,7 +164,7 @@ pub struct PutFileQuery {
     volume: String,
     path: String,
     append: bool,
-    size: usize,
+    size: i64,
 }
 pub struct PutFile {}
 #[async_trait::async_trait]

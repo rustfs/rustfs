@@ -469,22 +469,27 @@ impl Erasure {
     }
     /// Calculate the total erasure file size for a given original size.
     // Returns the final erasure size from the original size
-    pub fn shard_file_size(&self, total_length: usize) -> usize {
+    pub fn shard_file_size(&self, total_length: i64) -> i64 {
         if total_length == 0 {
             return 0;
         }
+        if total_length < 0 {
+            return total_length;
+        }
+
+        let total_length = total_length as usize;
 
         let num_shards = total_length / self.block_size;
         let last_block_size = total_length % self.block_size;
         let last_shard_size = calc_shard_size(last_block_size, self.data_shards);
-        num_shards * self.shard_size() + last_shard_size
+        (num_shards * self.shard_size() + last_shard_size) as i64
     }
 
     /// Calculate the offset in the erasure file where reading begins.
     // Returns the offset in the erasure file where reading begins
     pub fn shard_file_offset(&self, start_offset: usize, length: usize, total_length: usize) -> usize {
         let shard_size = self.shard_size();
-        let shard_file_size = self.shard_file_size(total_length);
+        let shard_file_size = self.shard_file_size(total_length as i64) as usize;
         let end_shard = (start_offset + length) / self.block_size;
         let mut till_offset = end_shard * shard_size + shard_size;
         if till_offset > shard_file_size {

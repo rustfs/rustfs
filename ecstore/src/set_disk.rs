@@ -55,13 +55,14 @@ use lock::{LockApi, namespace_lock::NsLockMap};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
+use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, file_info_from_raw,
     headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     merge_file_meta_versions,
 };
-use rustfs_rio::{EtagResolvable, HashReader};
+use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
 use rustfs_utils::{
     HashAlgorithm,
     crypto::{base64_decode, base64_encode, hex},
@@ -860,7 +861,8 @@ impl SetDisks {
         };
 
         if let Some(err) = reduce_read_quorum_errs(errs, OBJECT_OP_IGNORED_ERRS, expected_rquorum) {
-            error!("object_quorum_from_meta: {:?}, errs={:?}", err, errs);
+            // let object = parts_metadata.first().map(|v| v.name.clone()).unwrap_or_default();
+            // error!("object_quorum_from_meta: {:?}, errs={:?}, object={:?}", err, errs, object);
             return Err(err);
         }
 
@@ -1773,7 +1775,7 @@ impl SetDisks {
         {
             Ok(v) => v,
             Err(e) => {
-                error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
+                // error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
                 return Err(e);
             }
         };
@@ -1817,7 +1819,7 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         offset: usize,
-        length: usize,
+        length: i64,
         writer: &mut W,
         fi: FileInfo,
         files: Vec<FileInfo>,
@@ -1830,11 +1832,16 @@ impl SetDisks {
     {
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
-        let total_size = fi.size;
+        let total_size = fi.size as usize;
 
-        let length = { if length == 0 { total_size - offset } else { length } };
+        let length = if length < 0 {
+            fi.size as usize - offset
+        } else {
+            length as usize
+        };
 
         if offset > total_size || offset + length > total_size {
+            error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
             return Err(Error::other("offset out of range"));
         }
 
@@ -1852,11 +1859,6 @@ impl SetDisks {
 
         let (last_part_index, _) = fi.to_part_offset(end_offset)?;
 
-        // debug!(
-        //     "get_object_with_fileinfo end offset:{}, last_part_index:{},part_offset:{}",
-        //     end_offset, last_part_index, 0
-        // );
-
         // let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
@@ -1870,7 +1872,7 @@ impl SetDisks {
             let part_number = fi.parts[i].number;
             let part_size = fi.parts[i].size;
             let mut part_length = part_size - part_offset;
-            if part_length > length - total_readed {
+            if part_length > (length - total_readed) {
                 part_length = length - total_readed
             }
 
@@ -1912,7 +1914,7 @@ impl SetDisks {
                     error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
                     return Err(to_object_err(read_err.into(), vec![bucket, object]));
                 }
-
+                error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
                 return Err(Error::other(format!("not enough disks to read: {:?}", errors)));
             }
 
@@ -2259,7 +2261,8 @@ impl SetDisks {
                             erasure_coding::Erasure::default()
                         };
 
-                        result.object_size = ObjectInfo::from_file_info(&lastest_meta, bucket, object, true).get_actual_size()?;
+                        result.object_size =
+                            ObjectInfo::from_file_info(&lastest_meta, bucket, object, true).get_actual_size()? as usize;
                         // Loop to find number of disks with valid data, per-drive
                         // data state and a list of outdated disks on which data needs
                         // to be healed.
@@ -2521,7 +2524,7 @@ impl SetDisks {
                                         disk.as_ref(),
                                         RUSTFS_META_TMP_BUCKET,
                                         &format!("{}/{}/part.{}", tmp_id, dst_data_dir, part.number),
-                                        erasure.shard_file_size(part.size),
+                                        erasure.shard_file_size(part.size as i64),
                                         erasure.shard_size(),
                                         HashAlgorithm::HighwayHash256,
                                     )
@@ -2603,6 +2606,7 @@ impl SetDisks {
                                         part.size,
                                         part.mod_time,
                                         part.actual_size,
+                                        part.index.clone(),
                                     );
                                     if is_inline_buffer {
                                         if let Some(writer) = writers[index].take() {
@@ -2834,7 +2838,7 @@ impl SetDisks {
             heal_item_type: HEAL_ITEM_OBJECT.to_string(),
             bucket: bucket.to_string(),
             object: object.to_string(),
-            object_size: lfi.size,
+            object_size: lfi.size as usize,
             version_id: version_id.to_string(),
             disk_count: disk_len,
             ..Default::default()
@@ -3500,7 +3504,7 @@ impl SetDisks {
                         if let (Some(started), Some(mod_time)) = (started, version.mod_time) {
                             if mod_time > started {
                                 version_not_found += 1;
-                                if send(heal_entry_skipped(version.size)).await {
+                                if send(heal_entry_skipped(version.size as usize)).await {
                                     defer.await;
                                     return;
                                 }
@@ -3544,10 +3548,10 @@ impl SetDisks {
 
                         if version_healed {
                             bg_seq.count_healed(HEAL_ITEM_OBJECT.to_string()).await;
-                            result = heal_entry_success(version.size);
+                            result = heal_entry_success(version.size as usize);
                         } else {
                             bg_seq.count_failed(HEAL_ITEM_OBJECT.to_string()).await;
-                            result = heal_entry_failure(version.size);
+                            result = heal_entry_failure(version.size as usize);
                             match version.version_id {
                                 Some(version_id) => {
                                     info!("unable to heal object {}/{}-v({})", bucket, version.name, version_id);
@@ -3863,7 +3867,7 @@ impl ObjectIO for SetDisks {
 
         let is_inline_buffer = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
-                sc.should_inline(erasure.shard_file_size(data.content_length), opts.versioned)
+                sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
             } else {
                 false
             }
@@ -3878,7 +3882,7 @@ impl ObjectIO for SetDisks {
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
                     &tmp_object,
-                    erasure.shard_file_size(data.content_length),
+                    erasure.shard_file_size(data.size()),
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
@@ -3924,7 +3928,10 @@ impl ObjectIO for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {:?}", errors)));
         }
 
-        let stream = mem::replace(&mut data.stream, HashReader::new(Box::new(Cursor::new(Vec::new())), 0, 0, None, false)?);
+        let stream = mem::replace(
+            &mut data.stream,
+            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)?,
+        );
 
         let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
             Ok((r, w)) => (r, w),
@@ -3939,6 +3946,16 @@ impl ObjectIO for SetDisks {
         //     error!("close_bitrot_writers err {:?}", err);
         // }
 
+        if (w_size as i64) < data.size() {
+            return Err(Error::other("put_object write size < data.size()"));
+        }
+
+        if user_defined.contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER)) {
+            user_defined.insert(format!("{}compression-size", RESERVED_METADATA_PREFIX_LOWER), w_size.to_string());
+        }
+
+        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+
         //TODO: userDefined
 
         let etag = data.stream.try_resolve_etag().unwrap_or_default();
@@ -3947,6 +3964,14 @@ impl ObjectIO for SetDisks {
 
         if !user_defined.contains_key("content-type") {
             //  get content-type
+        }
+
+        let mut actual_size = data.actual_size();
+        if actual_size < 0 {
+            let is_compressed = fi.is_compressed();
+            if !is_compressed {
+                actual_size = w_size as i64;
+            }
         }
 
         if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
@@ -3962,17 +3987,19 @@ impl ObjectIO for SetDisks {
                 if let Some(writer) = writers[i].take() {
                     fi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
                 }
+
+                fi.set_inline_data();
             }
 
             fi.metadata = user_defined.clone();
             fi.mod_time = Some(now);
-            fi.size = w_size;
+            fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
-            fi.add_object_part(1, etag.clone(), w_size, fi.mod_time, w_size);
+            fi.add_object_part(1, etag.clone(), w_size, fi.mod_time, actual_size, index_op.clone());
 
-            fi.set_inline_data();
-
-            // debug!("put_object fi {:?}", &fi)
+            if opts.data_movement {
+                fi.set_data_moved();
+            }
         }
 
         let (online_disks, _, op_old_dir) = Self::rename_data(
@@ -4566,7 +4593,7 @@ impl StorageAPI for SetDisks {
                     Some(disk),
                     RUSTFS_META_TMP_BUCKET,
                     &tmp_part_path,
-                    erasure.shard_file_size(data.content_length),
+                    erasure.shard_file_size(data.size()),
                     erasure.shard_size(),
                     HashAlgorithm::HighwayHash256,
                 )
@@ -4605,16 +4632,33 @@ impl StorageAPI for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {:?}", errors)));
         }
 
-        let stream = mem::replace(&mut data.stream, HashReader::new(Box::new(Cursor::new(Vec::new())), 0, 0, None, false)?);
+        let stream = mem::replace(
+            &mut data.stream,
+            HashReader::new(Box::new(WarpReader::new(Cursor::new(Vec::new()))), 0, 0, None, false)?,
+        );
 
         let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录
 
         let _ = mem::replace(&mut data.stream, reader);
 
+        if (w_size as i64) < data.size() {
+            return Err(Error::other("put_object_part write size < data.size()"));
+        }
+
+        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+
         let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 
         if let Some(ref tag) = opts.preserve_etag {
-            etag = tag.clone(); // TODO: 需要验证 etag 是否一致
+            etag = tag.clone();
+        }
+
+        let mut actual_size = data.actual_size();
+        if actual_size < 0 {
+            let is_compressed = fi.is_compressed();
+            if !is_compressed {
+                actual_size = w_size as i64;
+            }
         }
 
         let part_info = ObjectPartInfo {
@@ -4622,7 +4666,8 @@ impl StorageAPI for SetDisks {
             number: part_id,
             size: w_size,
             mod_time: Some(OffsetDateTime::now_utc()),
-            actual_size: data.content_length,
+            actual_size,
+            index: index_op,
             ..Default::default()
         };
 
@@ -4649,6 +4694,7 @@ impl StorageAPI for SetDisks {
             part_num: part_id,
             last_mod: Some(OffsetDateTime::now_utc()),
             size: w_size,
+            actual_size,
         };
 
         // error!("put_object_part ret {:?}", &ret);
@@ -4932,7 +4978,7 @@ impl StorageAPI for SetDisks {
     // complete_multipart_upload 完成
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         object: &str,
         upload_id: &str,
@@ -4974,12 +5020,15 @@ impl StorageAPI for SetDisks {
         for (i, res) in part_files_resp.iter().enumerate() {
             let part_id = uploaded_parts[i].part_num;
             if !res.error.is_empty() || !res.exists {
-                // error!("complete_multipart_upload part_id err {:?}", res);
+                error!("complete_multipart_upload part_id err {:?}, exists={}", res, res.exists);
                 return Err(Error::InvalidPart(part_id, bucket.to_owned(), object.to_owned()));
             }
 
-            let part_fi = FileInfo::unmarshal(&res.data).map_err(|_e| {
-                // error!("complete_multipart_upload FileInfo::unmarshal err {:?}", e);
+            let part_fi = FileInfo::unmarshal(&res.data).map_err(|e| {
+                error!(
+                    "complete_multipart_upload FileInfo::unmarshal err {:?}, part_id={}, bucket={}, object={}",
+                    e, part_id, bucket, object
+                );
                 Error::InvalidPart(part_id, bucket.to_owned(), object.to_owned())
             })?;
             let part = &part_fi.parts[0];
@@ -4989,11 +5038,18 @@ impl StorageAPI for SetDisks {
             // debug!("complete part {} object info {:?}", part_num, &part);
 
             if part_id != part_num {
-                // error!("complete_multipart_upload part_id err part_id != part_num {} != {}", part_id, part_num);
+                error!("complete_multipart_upload part_id err part_id != part_num {} != {}", part_id, part_num);
                 return Err(Error::InvalidPart(part_id, bucket.to_owned(), object.to_owned()));
             }
 
-            fi.add_object_part(part.number, part.etag.clone(), part.size, part.mod_time, part.actual_size);
+            fi.add_object_part(
+                part.number,
+                part.etag.clone(),
+                part.size,
+                part.mod_time,
+                part.actual_size,
+                part.index.clone(),
+            );
         }
 
         let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files_metas, &fi);
@@ -5003,24 +5059,35 @@ impl StorageAPI for SetDisks {
         fi.parts = Vec::with_capacity(uploaded_parts.len());
 
         let mut object_size: usize = 0;
-        let mut object_actual_size: usize = 0;
+        let mut object_actual_size: i64 = 0;
 
         for (i, p) in uploaded_parts.iter().enumerate() {
             let has_part = curr_fi.parts.iter().find(|v| v.number == p.part_num);
             if has_part.is_none() {
-                // error!("complete_multipart_upload has_part.is_none() {:?}", has_part);
+                error!(
+                    "complete_multipart_upload has_part.is_none() {:?}, part_id={}, bucket={}, object={}",
+                    has_part, p.part_num, bucket, object
+                );
                 return Err(Error::InvalidPart(p.part_num, "".to_owned(), p.etag.clone().unwrap_or_default()));
             }
 
             let ext_part = &curr_fi.parts[i];
 
             if p.etag != Some(ext_part.etag.clone()) {
+                error!(
+                    "complete_multipart_upload etag err {:?}, part_id={}, bucket={}, object={}",
+                    p.etag, p.part_num, bucket, object
+                );
                 return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
             }
 
             // TODO: crypto
 
-            if (i < uploaded_parts.len() - 1) && !is_min_allowed_part_size(ext_part.size) {
+            if (i < uploaded_parts.len() - 1) && !is_min_allowed_part_size(ext_part.actual_size) {
+                error!(
+                    "complete_multipart_upload is_min_allowed_part_size err {:?}, part_id={}, bucket={}, object={}",
+                    ext_part.actual_size, p.part_num, bucket, object
+                );
                 return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
             }
 
@@ -5033,11 +5100,12 @@ impl StorageAPI for SetDisks {
                 size: ext_part.size,
                 mod_time: ext_part.mod_time,
                 actual_size: ext_part.actual_size,
+                index: ext_part.index.clone(),
                 ..Default::default()
             });
         }
 
-        fi.size = object_size;
+        fi.size = object_size as i64;
         fi.mod_time = opts.mod_time;
         if fi.mod_time.is_none() {
             fi.mod_time = Some(OffsetDateTime::now_utc());
@@ -5053,6 +5121,18 @@ impl StorageAPI for SetDisks {
         };
 
         fi.metadata.insert("etag".to_owned(), etag);
+
+        fi.metadata
+            .insert(format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER), object_actual_size.to_string());
+
+        if fi.is_compressed() {
+            fi.metadata
+                .insert(format!("{}compression-size", RESERVED_METADATA_PREFIX_LOWER), object_size.to_string());
+        }
+
+        if opts.data_movement {
+            fi.set_data_moved();
+        }
 
         // TODO: object_actual_size
         let _ = object_actual_size;
@@ -5125,17 +5205,6 @@ impl StorageAPI for SetDisks {
         )
         .await?;
 
-        for (i, op_disk) in online_disks.iter().enumerate() {
-            if let Some(disk) = op_disk {
-                if disk.is_online().await {
-                    fi = parts_metadatas[i].clone();
-                    break;
-                }
-            }
-        }
-
-        fi.is_latest = true;
-
         // debug!("complete fileinfo {:?}", &fi);
 
         // TODO: reduce_common_data_dir
@@ -5157,7 +5226,22 @@ impl StorageAPI for SetDisks {
                 .await;
         }
 
-        let _ = self.delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path).await;
+        let upload_id_path = upload_id_path.clone();
+        let store = self.clone();
+        let _cleanup_handle = tokio::spawn(async move {
+            let _ = store.delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path).await;
+        });
+
+        for (i, op_disk) in online_disks.iter().enumerate() {
+            if let Some(disk) = op_disk {
+                if disk.is_online().await {
+                    fi = parts_metadatas[i].clone();
+                    break;
+                }
+            }
+        }
+
+        fi.is_latest = true;
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
@@ -5517,7 +5601,7 @@ async fn disks_with_all_parts(
                 let verify_err = bitrot_verify(
                     Box::new(Cursor::new(data.clone())),
                     data_len,
-                    meta.erasure.shard_file_size(meta.size),
+                    meta.erasure.shard_file_size(meta.size) as usize,
                     checksum_info.algorithm,
                     checksum_info.hash,
                     meta.erasure.shard_size(),
@@ -5729,8 +5813,8 @@ pub async fn stat_all_dirs(disks: &[Option<DiskStore>], bucket: &str, prefix: &s
 }
 
 const GLOBAL_MIN_PART_SIZE: ByteSize = ByteSize::mib(5);
-fn is_min_allowed_part_size(size: usize) -> bool {
-    size as u64 >= GLOBAL_MIN_PART_SIZE.as_u64()
+fn is_min_allowed_part_size(size: i64) -> bool {
+    size >= GLOBAL_MIN_PART_SIZE.as_u64() as i64
 }
 
 fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {

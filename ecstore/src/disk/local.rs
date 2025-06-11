@@ -773,7 +773,7 @@ impl LocalDisk {
             Ok(res) => res,
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
-                    warn!("scan list_dir {}, err {:?}", &current, &e);
+                    debug!("scan list_dir {}, err {:?}", &current, &e);
                 }
 
                 if opts.report_notfound && e == Error::FileNotFound && current == &opts.base_dir {
@@ -785,7 +785,6 @@ impl LocalDisk {
         };
 
         if entries.is_empty() {
-            warn!("scan list_dir {}, entries is empty", &current);
             return Ok(());
         }
 
@@ -801,7 +800,6 @@ impl LocalDisk {
             let entry = item.clone();
             // check limit
             if opts.limit > 0 && *objs_returned >= opts.limit {
-                warn!("scan list_dir {}, limit reached", &current);
                 return Ok(());
             }
             // check prefix
@@ -1207,7 +1205,7 @@ impl DiskAPI for LocalDisk {
             let err = self
                 .bitrot_verify(
                     &part_path,
-                    erasure.shard_file_size(part.size),
+                    erasure.shard_file_size(part.size as i64) as usize,
                     checksum_info.algorithm,
                     &checksum_info.hash,
                     erasure.shard_size(),
@@ -1248,7 +1246,7 @@ impl DiskAPI for LocalDisk {
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                         continue;
                     }
-                    if (st.len() as usize) < fi.erasure.shard_file_size(part.size) {
+                    if (st.len() as i64) < fi.erasure.shard_file_size(part.size as i64) {
                         resp.results[i] = CHECK_PART_FILE_CORRUPT;
                         continue;
                     }
@@ -1400,7 +1398,7 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
         // warn!("disk create_file: origvolume: {}, volume: {}, path: {}", origvolume, volume, path);
 
         if !origvolume.is_empty() {
@@ -1574,11 +1572,6 @@ impl DiskAPI for LocalDisk {
         let mut current = opts.base_dir.clone();
         self.scan_dir(&mut current, &opts, &mut out, &mut objs_returned).await?;
 
-        warn!(
-            "walk_dir: done, volume_dir: {:?}, base_dir: {}",
-            volume_dir.to_string_lossy(),
-            opts.base_dir
-        );
         Ok(())
     }
 
@@ -2239,7 +2232,7 @@ impl DiskAPI for LocalDisk {
                     let mut obj_deleted = false;
                     for info in obj_infos.iter() {
                         let done = ScannerMetrics::time(ScannerMetric::ApplyVersion);
-                        let sz: usize;
+                        let sz: i64;
                         (obj_deleted, sz) = item.apply_actions(info, &mut size_s).await;
                         done();
 
@@ -2260,7 +2253,7 @@ impl DiskAPI for LocalDisk {
                             size_s.versions += 1;
                         }
 
-                        size_s.total_size += sz;
+                        size_s.total_size += sz as usize;
 
                         if info.delete_marker {
                             continue;

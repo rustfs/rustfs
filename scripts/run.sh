@@ -19,7 +19,7 @@ mkdir -p ./target/volume/test{0..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-   export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
+    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -71,6 +71,11 @@ export OTEL_INSTRUMENTATION_NAME="rustfs"
 export OTEL_INSTRUMENTATION_VERSION="0.1.1"
 export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
+
+export RUSTFS_NS_SCANNER_INTERVAL=60  # 对象扫描间隔时间，单位为秒
+# exportRUSTFS_SKIP_BACKGROUND_TASK=true
+
+export RUSTFS_COMPRESSION_ENABLED=true # 是否启用压缩
 
 # 事件消息配置
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"

@@ -6,6 +6,7 @@ use crate::headers::{
     RESERVED_METADATA_PREFIX_LOWER, VERSION_PURGE_STATUS_KEY,
 };
 use byteorder::ByteOrder;
+use bytes::Bytes;
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -1379,9 +1380,9 @@ pub struct MetaObject {
     pub part_numbers: Vec<usize>,           // Part Numbers
     pub part_etags: Vec<String>,            // Part ETags
     pub part_sizes: Vec<usize>,             // Part Sizes
-    pub part_actual_sizes: Vec<usize>,      // Part ActualSizes (compression)
-    pub part_indices: Vec<Vec<u8>>,         // Part Indexes (compression)
-    pub size: usize,                        // Object version size
+    pub part_actual_sizes: Vec<i64>,        // Part ActualSizes (compression)
+    pub part_indices: Vec<Bytes>,           // Part Indexes (compression)
+    pub size: i64,                          // Object version size
     pub mod_time: Option<OffsetDateTime>,   // Object version modified time
     pub meta_sys: HashMap<String, Vec<u8>>, // Object version internal metadata
     pub meta_user: HashMap<String, String>, // Object version metadata set by user
@@ -1538,7 +1539,7 @@ impl MetaObject {
                         let mut buf = vec![0u8; blen as usize];
                         cur.read_exact(&mut buf)?;
 
-                        indices.push(buf);
+                        indices.push(Bytes::from(buf));
                     }
 
                     self.part_indices = indices;
@@ -1810,13 +1811,16 @@ impl MetaObject {
         }
 
         for (k, v) in &self.meta_sys {
+            if k == AMZ_STORAGE_CLASS && v == b"STANDARD" {
+                continue;
+            }
+
             if k.starts_with(RESERVED_METADATA_PREFIX)
                 || k.starts_with(RESERVED_METADATA_PREFIX_LOWER)
                 || k == VERSION_PURGE_STATUS_KEY
             {
-                continue;
+                metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
             }
-            metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
         }
 
         // todo: ReplicationState,Delete
@@ -2799,13 +2803,13 @@ mod test {
 
         // 2. 测试极大的文件大小
         let large_object = MetaObject {
-            size: usize::MAX,
+            size: i64::MAX,
             part_sizes: vec![usize::MAX],
             ..Default::default()
         };
 
         // 应该能够处理大数值
-        assert_eq!(large_object.size, usize::MAX);
+        assert_eq!(large_object.size, i64::MAX);
     }
 
     #[tokio::test]
@@ -3367,7 +3371,7 @@ pub struct DetailedVersionStats {
     pub free_versions: usize,
     pub versions_with_data_dir: usize,
     pub versions_with_inline_data: usize,
-    pub total_size: usize,
+    pub total_size: i64,
     pub latest_mod_time: Option<OffsetDateTime>,
 }
 

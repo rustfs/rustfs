@@ -29,10 +29,15 @@ use ecstore::bucket::metadata_sys;
 use ecstore::bucket::policy_sys::PolicySys;
 use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
+use ecstore::bucket::utils::serialize;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
+use ecstore::cmd::bucket_replication::ReplicationStatusType;
+use ecstore::cmd::bucket_replication::ReplicationType;
 use ecstore::cmd::bucket_replication::get_must_replicate_options;
 use ecstore::cmd::bucket_replication::must_replicate;
 use ecstore::cmd::bucket_replication::schedule_replication;
+use ecstore::compress::MIN_COMPRESSIBLE_SIZE;
+use ecstore::compress::is_compressible;
 use ecstore::error::StorageError;
 use ecstore::new_object_layer_fn;
 use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -46,12 +51,7 @@ use ecstore::store_api::ObjectIO;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
-use ecstore::store_api::StorageAPI;
-// use ecstore::store_api::RESERVED_METADATA_PREFIX;
-use ecstore::bucket::utils::serialize;
-use ecstore::cmd::bucket_replication::ReplicationStatusType;
-use ecstore::cmd::bucket_replication::ReplicationType;
-use ecstore::store_api::RESERVED_METADATA_PREFIX_LOWER;
+use ecstore::store_api::StorageAPI; // use ecstore::store_api::RESERVED_METADATA_PREFIX;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
@@ -63,8 +63,13 @@ use policy::policy::Validator;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
 use query::instance::make_rustfsms;
+use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_rio::CompressReader;
 use rustfs_rio::HashReader;
+use rustfs_rio::Reader;
+use rustfs_rio::WarpReader;
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
 use s3s::S3;
@@ -86,7 +91,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
-use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -179,14 +183,31 @@ impl FS {
                     fpath = format!("{}/{}", prefix, fpath);
                 }
 
-                let size = f.header().size().unwrap_or_default() as usize;
+                let mut size = f.header().size().unwrap_or_default() as i64;
 
                 println!("Extracted: {}, size {}", fpath, size);
 
-                // Wrap the tar entry with BufReader to make it compatible with Reader trait
-                let reader = Box::new(tokio::io::BufReader::new(f));
-                let hrd = HashReader::new(reader, size as i64, size as i64, None, false).map_err(ApiError::from)?;
-                let mut reader = PutObjReader::new(hrd, size);
+                let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(f));
+
+                let mut metadata = HashMap::new();
+
+                let actual_size = size;
+
+                if is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+                    metadata.insert(
+                        format!("{}compression", RESERVED_METADATA_PREFIX_LOWER),
+                        CompressionAlgorithm::default().to_string(),
+                    );
+                    metadata.insert(format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER,), size.to_string());
+
+                    let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+
+                    reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+                    size = -1;
+                }
+
+                let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+                let mut reader = PutObjReader::new(hrd);
 
                 let _obj_info = store
                     .put_object(&bucket, &fpath, &mut reader, &ObjectOptions::default())
@@ -319,13 +340,10 @@ impl S3 for FS {
             src_info.metadata_only = true;
         }
 
-        let hrd = HashReader::new(gr.stream, gr.object_info.size as i64, gr.object_info.size as i64, None, false)
-            .map_err(ApiError::from)?;
+        let reader = Box::new(WarpReader::new(gr.stream));
+        let hrd = HashReader::new(reader, gr.object_info.size, gr.object_info.size, None, false).map_err(ApiError::from)?;
 
-        src_info.put_object_reader = Some(PutObjReader {
-            stream: hrd,
-            content_length: gr.object_info.size as usize,
-        });
+        src_info.put_object_reader = Some(PutObjReader::new(hrd));
 
         // check quota
         // TODO: src metadada
@@ -536,13 +554,13 @@ impl S3 for FS {
         let rs = range.map(|v| match v {
             Range::Int { first, last } => HTTPRangeSpec {
                 is_suffix_length: false,
-                start: first as usize,
-                end: last.map(|v| v as usize),
+                start: first as i64,
+                end: if let Some(last) = last { last as i64 } else { -1 },
             },
             Range::Suffix { length } => HTTPRangeSpec {
                 is_suffix_length: true,
-                start: length as usize,
-                end: None,
+                start: length as i64,
+                end: -1,
             },
         });
 
@@ -583,7 +601,7 @@ impl S3 for FS {
 
         let body = Some(StreamingBlob::wrap(bytes_stream(
             ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
-            info.size,
+            info.size as usize,
         )));
 
         let output = GetObjectOutput {
@@ -637,13 +655,13 @@ impl S3 for FS {
         let rs = range.map(|v| match v {
             Range::Int { first, last } => HTTPRangeSpec {
                 is_suffix_length: false,
-                start: first as usize,
-                end: last.map(|v| v as usize),
+                start: first as i64,
+                end: if let Some(last) = last { last as i64 } else { -1 },
             },
             Range::Suffix { length } => HTTPRangeSpec {
                 is_suffix_length: true,
-                start: length as usize,
-                end: None,
+                start: length as i64,
+                end: -1,
             },
         });
 
@@ -664,8 +682,8 @@ impl S3 for FS {
         // warn!("head_object info {:?}", &info);
 
         let content_type = {
-            if let Some(content_type) = info.content_type {
-                match ContentType::from_str(&content_type) {
+            if let Some(content_type) = &info.content_type {
+                match ContentType::from_str(content_type) {
                     Ok(res) => Some(res),
                     Err(err) => {
                         error!("parse content-type err {} {:?}", &content_type, err);
@@ -679,10 +697,14 @@ impl S3 for FS {
         };
         let last_modified = info.mod_time.map(Timestamp::from);
 
+        // TODO: range download
+
+        let content_length = info.get_actual_size().map_err(ApiError::from)?;
+
         let metadata = info.user_defined;
 
         let output = HeadObjectOutput {
-            content_length: Some(try_!(i64::try_from(info.size))),
+            content_length: Some(content_length),
             content_type,
             last_modified,
             e_tag: info.etag,
@@ -806,7 +828,7 @@ impl S3 for FS {
                 let mut obj = Object {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.size as i64),
+                    size: Some(v.size),
                     e_tag: v.etag.clone(),
                     ..Default::default()
                 };
@@ -885,7 +907,7 @@ impl S3 for FS {
                 ObjectVersion {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.size as i64),
+                    size: Some(v.size),
                     version_id: v.version_id.map(|v| v.to_string()),
                     is_latest: Some(v.is_latest),
                     e_tag: v.etag.clone(),
@@ -926,7 +948,6 @@ impl S3 for FS {
             return self.put_object_extract(req).await;
         }
 
-        info!("put object");
         let input = req.input;
 
         if let Some(ref storage_class) = input.storage_class {
@@ -949,7 +970,7 @@ impl S3 for FS {
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        let content_length = match content_length {
+        let mut size = match content_length {
             Some(c) => c,
             None => {
                 if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
@@ -964,9 +985,6 @@ impl S3 for FS {
         };
 
         let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
-        let body = Box::new(tokio::io::BufReader::new(body));
-        let hrd = HashReader::new(body, content_length as i64, content_length as i64, None, false).map_err(ApiError::from)?;
-        let mut reader = PutObjReader::new(hrd, content_length as usize);
 
         // let body = Box::new(StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))));
 
@@ -984,10 +1002,32 @@ impl S3 for FS {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
+        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
+
+        let actual_size = size;
+
+        if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+            metadata.insert(
+                format!("{}compression", RESERVED_METADATA_PREFIX_LOWER),
+                CompressionAlgorithm::default().to_string(),
+            );
+            metadata.insert(format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER,), size.to_string());
+
+            let hrd = HashReader::new(reader, size as i64, size as i64, None, false).map_err(ApiError::from)?;
+
+            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+            size = -1;
+        }
+
+        // TODO: md5 check
+        let reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+
+        let mut reader = PutObjReader::new(reader);
+
         let mt = metadata.clone();
         let mt2 = metadata.clone();
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(mt))
+        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(mt))
             .await
             .map_err(ApiError::from)?;
 
@@ -995,17 +1035,17 @@ impl S3 for FS {
             get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
 
         let dsc = must_replicate(&bucket, &key, &repoptions).await;
-        warn!("dsc {}", &dsc.replicate_any().clone());
+        // warn!("dsc {}", &dsc.replicate_any().clone());
         if dsc.replicate_any() {
-            let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
-            let now: DateTime<Utc> = Utc::now();
-            let formatted_time = now.to_rfc3339();
-            metadata.insert(k, formatted_time);
-            let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
-            metadata.insert(k, dsc.pending_status());
+            if let Some(metadata) = opts.user_defined.as_mut() {
+                let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
+                let now: DateTime<Utc> = Utc::now();
+                let formatted_time = now.to_rfc3339();
+                metadata.insert(k, formatted_time);
+                let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
+                metadata.insert(k, dsc.pending_status());
+            }
         }
-
-        debug!("put_object opts {:?}", &opts);
 
         let obj_info = store
             .put_object(&bucket, &key, &mut reader, &opts)
@@ -1058,6 +1098,13 @@ impl S3 for FS {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
+        if is_compressible(&req.headers, &key) {
+            metadata.insert(
+                format!("{}compression", RESERVED_METADATA_PREFIX_LOWER),
+                CompressionAlgorithm::default().to_string(),
+            );
+        }
+
         let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
             .await
             .map_err(ApiError::from)?;
@@ -1095,7 +1142,7 @@ impl S3 for FS {
         // let upload_id =
 
         let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
-        let content_length = match content_length {
+        let mut size = match content_length {
             Some(c) => c,
             None => {
                 if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
@@ -1110,21 +1157,42 @@ impl S3 for FS {
         };
 
         let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
-        let body = Box::new(tokio::io::BufReader::new(body));
-        let hrd = HashReader::new(body, content_length as i64, content_length as i64, None, false).map_err(ApiError::from)?;
 
         // mc cp step 4
-        let mut data = PutObjReader::new(hrd, content_length as usize);
+
         let opts = ObjectOptions::default();
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // TODO: hash_reader
+        let fi = store
+            .get_multipart_info(&bucket, &key, &upload_id, &opts)
+            .await
+            .map_err(ApiError::from)?;
+
+        let is_compressible = fi
+            .user_defined
+            .contains_key(format!("{}compression", RESERVED_METADATA_PREFIX_LOWER).as_str());
+
+        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
+
+        let actual_size = size;
+
+        if is_compressible {
+            let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+
+            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+            size = -1;
+        }
+
+        // TODO: md5 check
+        let reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+
+        let mut reader = PutObjReader::new(reader);
 
         let info = store
-            .put_object_part(&bucket, &key, &upload_id, part_id, &mut data, &opts)
+            .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
 

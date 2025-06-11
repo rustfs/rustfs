@@ -1,3 +1,4 @@
+use crate::compress_index::{Index, TryGetIndex};
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut, Reader};
 use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
@@ -82,8 +83,16 @@ impl HashReaderDetector for EtagReader {
     }
 }
 
+impl TryGetIndex for EtagReader {
+    fn try_get_index(&self) -> Option<&Index> {
+        self.inner.try_get_index()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::WarpReader;
+
     use super::*;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -95,7 +104,7 @@ mod tests {
         hasher.update(data);
         let expected = format!("{:x}", hasher.finalize());
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
 
         let mut buf = Vec::new();
@@ -114,7 +123,7 @@ mod tests {
         hasher.update(data);
         let expected = format!("{:x}", hasher.finalize());
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
 
         let mut buf = Vec::new();
@@ -133,7 +142,7 @@ mod tests {
         hasher.update(data);
         let expected = format!("{:x}", hasher.finalize());
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
 
         let mut buf = Vec::new();
@@ -150,7 +159,7 @@ mod tests {
     async fn test_etag_reader_not_finished() {
         let data = b"abc123";
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
 
         // Do not read to end, etag should be None
@@ -174,7 +183,7 @@ mod tests {
         let expected = format!("{:x}", hasher.finalize());
 
         let reader = Cursor::new(data.clone());
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, None);
 
         let mut buf = Vec::new();
@@ -193,7 +202,7 @@ mod tests {
         hasher.update(data);
         let expected = format!("{:x}", hasher.finalize());
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, Some(expected.clone()));
 
         let mut buf = Vec::new();
@@ -209,7 +218,7 @@ mod tests {
         let data = b"checksum test data";
         let wrong_checksum = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
         let reader = BufReader::new(&data[..]);
-        let reader = Box::new(reader);
+        let reader = Box::new(WarpReader::new(reader));
         let mut etag_reader = EtagReader::new(reader, Some(wrong_checksum));
 
         let mut buf = Vec::new();

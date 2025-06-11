@@ -3666,6 +3666,7 @@ dependencies = [
  "shadow-rs",
  "siphasher 1.0.1",
  "smallvec",
+ "temp-env",
  "tempfile",
  "thiserror 2.0.12",
  "time",
@@ -8435,25 +8436,23 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "base64-simd",
- "brotli 8.0.1",
+ "byteorder",
  "bytes",
  "crc32fast",
  "criterion",
- "flate2",
  "futures",
  "hex-simd",
  "http 1.3.1",
- "lz4",
  "md-5",
  "pin-project-lite",
  "rand 0.9.1",
  "reqwest",
  "rustfs-utils",
- "snap",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-test",
  "tokio-util",
- "zstd",
 ]
 
 [[package]]
@@ -8489,14 +8488,18 @@ version = "0.0.1"
 dependencies = [
  "base64-simd",
  "blake3",
+ "brotli 8.0.1",
  "crc32fast",
+ "flate2",
  "hex-simd",
  "highway",
  "lazy_static",
  "local-ip-address",
+ "lz4",
  "md-5",
  "netif",
  "nix 0.30.1",
+ "rand 0.9.1",
  "regex",
  "rustfs-config",
  "rustls 0.23.27",
@@ -8505,11 +8508,13 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "siphasher 1.0.1",
+ "snap",
  "tempfile",
  "tokio",
  "tracing",
  "url",
  "winapi",
+ "zstd",
 ]
 
 [[package]]
@@ -9738,6 +9743,15 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
+
+[[package]]
+name = "temp-env"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45107136c2ddf8c4b87453c02294fd0adf41751796e81e8ba3f7fd951977ab57"
+dependencies = [
+ "once_cell",
+]
 
 [[package]]
 name = "tempfile"

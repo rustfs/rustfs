@@ -32,6 +32,29 @@ pub fn match_pattern(pattern: &str, name: &str) -> bool {
     deep_match_rune(name.as_bytes(), pattern.as_bytes(), false)
 }
 
+pub fn has_pattern(patterns: &[&str], match_str: &str) -> bool {
+    for pattern in patterns {
+        if match_simple(pattern, match_str) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn has_string_suffix_in_slice(str: &str, list: &[&str]) -> bool {
+    let str = str.to_lowercase();
+    for v in list {
+        if *v == "*" {
+            return true;
+        }
+
+        if str.ends_with(&v.to_lowercase()) {
+            return true;
+        }
+    }
+    false
+}
+
 fn deep_match_rune(str_: &[u8], pattern: &[u8], simple: bool) -> bool {
     let (mut str_, mut pattern) = (str_, pattern);
     while !pattern.is_empty() {

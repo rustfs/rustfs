@@ -108,7 +108,7 @@ impl ObjectStore for EcObjectStore {
         let meta = ObjectMeta {
             location: location.clone(),
             last_modified: Utc::now(),
-            size: reader.object_info.size,
+            size: reader.object_info.size as usize,
             e_tag: reader.object_info.etag,
             version: None,
         };
@@ -121,7 +121,7 @@ impl ObjectStore for EcObjectStore {
                         ConvertStream::new(reader.stream, self.delimiter.clone()),
                         DEFAULT_READ_BUFFER_SIZE,
                     ),
-                    reader.object_info.size,
+                    reader.object_info.size as usize,
                 )
                 .boxed(),
             )
@@ -129,7 +129,7 @@ impl ObjectStore for EcObjectStore {
             object_store::GetResultPayload::Stream(
                 bytes_stream(
                     ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
-                    reader.object_info.size,
+                    reader.object_info.size as usize,
                 )
                 .boxed(),
             )
@@ -137,7 +137,7 @@ impl ObjectStore for EcObjectStore {
         Ok(GetResult {
             payload,
             meta,
-            range: 0..reader.object_info.size,
+            range: 0..reader.object_info.size as usize,
             attributes,
         })
     }
@@ -161,7 +161,7 @@ impl ObjectStore for EcObjectStore {
         Ok(ObjectMeta {
             location: location.clone(),
             last_modified: Utc::now(),
-            size: info.size,
+            size: info.size as usize,
             e_tag: info.etag,
             version: None,
         })

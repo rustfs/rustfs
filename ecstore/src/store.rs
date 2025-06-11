@@ -1233,7 +1233,7 @@ impl ObjectIO for ECStore {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
-        let idx = self.get_pool_idx(bucket, &object, data.content_length as i64).await?;
+        let idx = self.get_pool_idx(bucket, &object, data.size()).await?;
 
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(StorageError::DataMovementOverwriteErr(
@@ -1508,9 +1508,7 @@ impl StorageAPI for ECStore {
 
         // TODO: nslock
 
-        let pool_idx = self
-            .get_pool_idx_no_lock(src_bucket, &src_object, src_info.size as i64)
-            .await?;
+        let pool_idx = self.get_pool_idx_no_lock(src_bucket, &src_object, src_info.size).await?;
 
         if cp_src_dst_same {
             if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
@@ -1995,7 +1993,7 @@ impl StorageAPI for ECStore {
 
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         object: &str,
         upload_id: &str,
@@ -2006,6 +2004,7 @@ impl StorageAPI for ECStore {
 
         if self.single_pool() {
             return self.pools[0]
+                .clone()
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await;
         }
@@ -2015,6 +2014,7 @@ impl StorageAPI for ECStore {
                 continue;
             }
 
+            let pool = pool.clone();
             let err = match pool
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
                 .await

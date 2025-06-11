@@ -9,7 +9,7 @@
 //! async fn main() {
 //!  let data = b"hello world";
 //!       let reader = BufReader::new(&data[..]);
-//!      let mut limit_reader = LimitReader::new(reader, data.len() as u64);
+//!      let mut limit_reader = LimitReader::new(reader, data.len());
 //!
 //!      let mut buf = Vec::new();
 //!      let n = limit_reader.read_to_end(&mut buf).await.unwrap();
@@ -23,25 +23,25 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::{EtagResolvable, HashReaderDetector, HashReaderMut, Reader};
+use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
 
 pin_project! {
     #[derive(Debug)]
     pub struct LimitReader<R> {
         #[pin]
         pub inner: R,
-        limit: u64,
-        read: u64,
+        limit: usize,
+        read: usize,
     }
 }
 
 /// A wrapper for AsyncRead that limits the total number of bytes read.
 impl<R> LimitReader<R>
 where
-    R: Reader,
+    R: AsyncRead + Unpin + Send + Sync,
 {
     /// Create a new LimitReader wrapping `inner`, with a total read limit of `limit` bytes.
-    pub fn new(inner: R, limit: u64) -> Self {
+    pub fn new(inner: R, limit: usize) -> Self {
         Self { inner, limit, read: 0 }
     }
 }
@@ -57,7 +57,7 @@ where
             return Poll::Ready(Ok(()));
         }
         let orig_remaining = buf.remaining();
-        let allowed = remaining.min(orig_remaining as u64) as usize;
+        let allowed = remaining.min(orig_remaining);
         if allowed == 0 {
             return Poll::Ready(Ok(()));
         }
@@ -66,7 +66,7 @@ where
             let poll = this.inner.as_mut().poll_read(cx, buf);
             if let Poll::Ready(Ok(())) = &poll {
                 let n = buf.filled().len() - before_size;
-                *this.read += n as u64;
+                *this.read += n;
             }
             poll
         } else {
@@ -76,7 +76,7 @@ where
             if let Poll::Ready(Ok(())) = &poll {
                 let n = temp_buf.filled().len();
                 buf.put_slice(temp_buf.filled());
-                *this.read += n as u64;
+                *this.read += n;
             }
             poll
         }
@@ -115,7 +115,7 @@ mod tests {
     async fn test_limit_reader_exact() {
         let data = b"hello world";
         let reader = BufReader::new(&data[..]);
-        let mut limit_reader = LimitReader::new(reader, data.len() as u64);
+        let mut limit_reader = LimitReader::new(reader, data.len());
 
         let mut buf = Vec::new();
         let n = limit_reader.read_to_end(&mut buf).await.unwrap();
@@ -176,7 +176,7 @@ mod tests {
         let mut data = vec![0u8; size];
         rand::rng().fill(&mut data[..]);
         let reader = Cursor::new(data.clone());
-        let mut limit_reader = LimitReader::new(reader, size as u64);
+        let mut limit_reader = LimitReader::new(reader, size);
 
         // Read data into buffer
         let mut buf = Vec::new();

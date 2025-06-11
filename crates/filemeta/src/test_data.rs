@@ -91,7 +91,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
     let mut fm = FileMeta::new();
 
     // 创建10个版本的对象
-    for i in 0..10 {
+    for i in 0i64..10i64 {
         let version_id = Uuid::new_v4();
         let data_dir = if i % 3 == 0 { Some(Uuid::new_v4()) } else { None };
 
@@ -113,9 +113,9 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
             part_numbers: vec![1],
             part_etags: vec![format!("etag-{:08x}", i)],
             part_sizes: vec![1024 * (i + 1) as usize],
-            part_actual_sizes: vec![1024 * (i + 1) as usize],
+            part_actual_sizes: vec![1024 * (i + 1)],
             part_indices: Vec::new(),
-            size: 1024 * (i + 1) as usize,
+            size: 1024 * (i + 1),
             mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312200 + i * 60)?),
             meta_sys: HashMap::new(),
             meta_user: metadata,
@@ -221,7 +221,7 @@ pub fn create_xlmeta_with_inline_data() -> Result<Vec<u8>> {
         part_sizes: vec![inline_data.len()],
         part_actual_sizes: Vec::new(),
         part_indices: Vec::new(),
-        size: inline_data.len(),
+        size: inline_data.len() as i64,
         mod_time: Some(OffsetDateTime::now_utc()),
         meta_sys: HashMap::new(),
         meta_user: HashMap::new(),
