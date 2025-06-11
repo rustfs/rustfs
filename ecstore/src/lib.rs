@@ -25,7 +25,6 @@ pub mod store_api;
 mod store_init;
 pub mod store_list_objects;
 mod store_utils;
-pub mod xhttp;
 
 pub use global::new_object_layer_fn;
 pub use global::set_global_endpoints;

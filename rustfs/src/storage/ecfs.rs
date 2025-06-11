@@ -52,7 +52,6 @@ use ecstore::bucket::utils::serialize;
 use ecstore::cmd::bucket_replication::ReplicationStatusType;
 use ecstore::cmd::bucket_replication::ReplicationType;
 use ecstore::store_api::RESERVED_METADATA_PREFIX_LOWER;
-use ecstore::xhttp;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
@@ -64,6 +63,7 @@ use policy::policy::Validator;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
 use query::instance::make_rustfsms;
+use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
 use rustfs_rio::HashReader;
 use rustfs_utils::path::path_join_buf;
 use rustfs_zip::CompressionFormat;
@@ -952,7 +952,7 @@ impl S3 for FS {
         let content_length = match content_length {
             Some(c) => c,
             None => {
-                if let Some(val) = req.headers.get(xhttp::AMZ_DECODED_CONTENT_LENGTH) {
+                if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
                     match atoi::atoi::<i64>(val.as_bytes()) {
                         Some(x) => x,
                         None => return Err(s3_error!(UnexpectedContent)),
@@ -981,7 +981,7 @@ impl S3 for FS {
         extract_metadata_from_mime(&req.headers, &mut metadata);
 
         if let Some(tags) = tagging {
-            metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
+            metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
         let mt = metadata.clone();
@@ -1055,7 +1055,7 @@ impl S3 for FS {
         let mut metadata = extract_metadata(&req.headers);
 
         if let Some(tags) = tagging {
-            metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags);
+            metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
         let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
@@ -1098,7 +1098,7 @@ impl S3 for FS {
         let content_length = match content_length {
             Some(c) => c,
             None => {
-                if let Some(val) = req.headers.get(xhttp::AMZ_DECODED_CONTENT_LENGTH) {
+                if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
                     match atoi::atoi::<i64>(val.as_bytes()) {
                         Some(x) => x,
                         None => return Err(s3_error!(UnexpectedContent)),

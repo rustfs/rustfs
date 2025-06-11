@@ -15,3 +15,7 @@ pub const VERSION_PURGE_STATUS_KEY: &str = "X-Rustfs-Internal-purgestatus";
 
 pub const X_RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
 pub const X_RUSTFS_DATA_MOV: &str = "X-Rustfs-Internal-data-mov";
+
+pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
+pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
+pub const AMZ_DECODED_CONTENT_LENGTH: &str = "X-Amz-Decoded-Content-Length";

@@ -39,8 +39,6 @@ use crate::{
         ObjectOptions, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::load_format_erasure,
-    // utils::crypto::{base64_decode, base64_encode, hex},
-    xhttp,
 };
 use crate::{disk::STORAGE_FORMAT_FILE, heal::mrf::PartialOperation};
 use crate::{
@@ -58,7 +56,9 @@ use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, file_info_from_raw, merge_file_meta_versions,
+    RawFileInfo, file_info_from_raw,
+    headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
+    merge_file_meta_versions,
 };
 use rustfs_rio::{EtagResolvable, HashReader};
 use rustfs_utils::{
@@ -3784,13 +3784,7 @@ impl ObjectIO for SetDisks {
 
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
-                sc.get_parity_for_sc(
-                    user_defined
-                        .get(xhttp::AMZ_STORAGE_CLASS)
-                        .cloned()
-                        .unwrap_or_default()
-                        .as_str(),
-                )
+                sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None
             }
@@ -3915,9 +3909,9 @@ impl ObjectIO for SetDisks {
             //  get content-type
         }
 
-        if let Some(sc) = user_defined.get(xhttp::AMZ_STORAGE_CLASS) {
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
             if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(xhttp::AMZ_STORAGE_CLASS);
+                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
             }
         }
 
@@ -4414,7 +4408,7 @@ impl StorageAPI for SetDisks {
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         let (mut fi, _, disks) = self.get_object_fileinfo(bucket, object, opts, false).await?;
 
-        fi.metadata.insert(xhttp::AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
+        fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
 
         // TODO: userdeefined
 
@@ -4779,21 +4773,15 @@ impl StorageAPI for SetDisks {
             user_defined.insert("etag".to_owned(), etag.clone());
         }
 
-        if let Some(sc) = user_defined.get(xhttp::AMZ_STORAGE_CLASS) {
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
             if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(xhttp::AMZ_STORAGE_CLASS);
+                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
             }
         }
 
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
-                sc.get_parity_for_sc(
-                    user_defined
-                        .get(xhttp::AMZ_STORAGE_CLASS)
-                        .cloned()
-                        .unwrap_or_default()
-                        .as_str(),
-                )
+                sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None
             }
@@ -4831,9 +4819,9 @@ impl StorageAPI for SetDisks {
             // TODO: get content-type
         }
 
-        if let Some(sc) = user_defined.get(xhttp::AMZ_STORAGE_CLASS) {
+        if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS) {
             if sc == storageclass::STANDARD {
-                let _ = user_defined.remove(xhttp::AMZ_STORAGE_CLASS);
+                let _ = user_defined.remove(AMZ_STORAGE_CLASS);
             }
         }
 

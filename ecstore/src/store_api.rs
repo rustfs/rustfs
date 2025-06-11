@@ -4,10 +4,10 @@ use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusTy
 use crate::error::{Error, Result};
 use crate::heal::heal_ops::HealSequence;
 use crate::store_utils::clean_metadata;
-use crate::{disk::DiskStore, heal::heal_commands::HealOpts, xhttp};
+use crate::{disk::DiskStore, heal::heal_commands::HealOpts};
 use http::{HeaderMap, HeaderValue};
 use madmin::heal_commands::HealResultItem;
-use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo};
+use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
 use rustfs_rio::{HashReader, Reader};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
@@ -424,7 +424,7 @@ impl ObjectInfo {
         };
 
         // tags
-        let user_tags = fi.metadata.get(xhttp::AMZ_OBJECT_TAGGING).cloned().unwrap_or_default();
+        let user_tags = fi.metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default();
 
         let inlined = fi.inline_data();
 
