@@ -534,6 +534,7 @@ pub struct TargetClient {
     pub sk: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl TargetClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -624,7 +625,7 @@ impl ARN {
         false
     }
 
-    /// 从字符串解析 ARN
+    // 从字符串解析 ARN
     pub fn parse(s: &str) -> Result<Self, String> {
         // ARN 必须是格式 arn:rustfs:<Type>:<REGION>:<ID>:<remote-bucket>
         if !s.starts_with("arn:rustfs:") {

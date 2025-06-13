@@ -26,6 +26,8 @@ use futures::stream::FuturesUnordered;
 use http::HeaderMap;
 use http::Method;
 use lazy_static::lazy_static;
+use std::str::FromStr;
+use std::sync::Arc;
 // use std::time::SystemTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -42,7 +44,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::iter::Iterator;
-use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 use std::vec;
@@ -1113,27 +1114,15 @@ pub enum ReplicationAction {
     ReplicateAll,
 }
 
-impl ReplicationAction {
-    /// Get the replication action based on the operation type and object info comparison.
-    pub fn from_operation_type(op_type: &str) -> Self {
-        match op_type.to_lowercase().as_str() {
-            "metadata" => ReplicationAction::ReplicateMetadata,
-            "none" => ReplicationAction::ReplicateNone,
-            "all" => ReplicationAction::ReplicateAll,
-            _ => ReplicationAction::ReplicateAll,
-        }
-    }
-}
-
-impl std::str::FromStr for ReplicationAction {
+impl FromStr for ReplicationAction {
+    // 工厂方法，根据字符串生成对应的枚举
     type Err = ();
-
     fn from_str(action: &str) -> Result<Self, Self::Err> {
         match action.to_lowercase().as_str() {
             "metadata" => Ok(ReplicationAction::ReplicateMetadata),
             "none" => Ok(ReplicationAction::ReplicateNone),
             "all" => Ok(ReplicationAction::ReplicateAll),
-            _ => Ok(ReplicationAction::ReplicateAll),
+            _ => Err(()),
         }
     }
 }
@@ -2103,13 +2092,10 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
 
 impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
     fn to_mrf_entry(&self) -> MRFReplicateEntry {
-        // Since both branches are identical, we can simplify this
-        let version_id = self.deleted_object.delete_marker_version_id.clone();
-
         MRFReplicateEntry {
             bucket: self.bucket.clone(),
-            object: self.deleted_object.object_name.clone().unwrap(),
-            version_id: "0".to_string(), // 直接使用计算后的 version_id
+            object: self.deleted_object.object_name.clone().unwrap().clone(),
+            version_id: self.deleted_object.delete_marker_version_id.clone().unwrap_or_default(),
             retry_count: 0,
             sz: 0,
         }
@@ -2170,11 +2156,10 @@ async fn replicate_object_with_multipart(
                 let task = Arc::clone(&task);
                 let bucket = local_obj_info.bucket.clone();
                 let name = local_obj_info.name.clone();
-                let version_id_clone = version_id;
 
                 upload_futures.push(tokio::spawn(async move {
                     let get_opts = ObjectOptions {
-                        version_id: Some(version_id_clone.to_string()),
+                        version_id: Some(version_id.to_string()),
                         versioned: true,
                         part_number: Some(index + 1),
                         version_suspended: false,
@@ -2185,11 +2170,11 @@ async fn replicate_object_with_multipart(
                     match store.get_object_reader(&bucket, &name, None, h, &get_opts).await {
                         Ok(mut reader) => match reader.read_all().await {
                             Ok(ret) => {
-                                debug!("2025 readall suc:");
+                                debug!("readall suc:");
                                 let body = Bytes::from(ret);
                                 match minio_cli.upload_part(&task, index + 1, body).await {
                                     Ok(part) => {
-                                        debug!("2025 multipar upload suc:");
+                                        debug!("multipar upload suc:");
                                         Ok((index, part))
                                     }
                                     Err(err) => {
@@ -2362,7 +2347,7 @@ impl ReplicateObjectInfo {
                 version_suspended: false,
                 ..Default::default()
             };
-            warn!("version id is:{:?}", get_opts.version_id.clone());
+            warn!("version id is:{:?}", get_opts.version_id);
             let h = HeaderMap::new();
             let gr = store
                 .get_object_reader(&object_info.bucket, &object_info.name, None, h, &get_opts)
@@ -2427,7 +2412,6 @@ impl ReplicateObjectInfo {
     async fn get_object_info(&self, opts: ObjectOptions) -> Result<ObjectInfo, Error> {
         let objectlayer = new_object_layer_fn();
         //let opts = ecstore::store_api::ObjectOptions { max_parity: (), mod_time: (), part_number: (), delete_prefix: (), version_id: (), no_lock: (), versioned: (), version_suspended: (), skip_decommissioned: (), skip_rebalancing: (), data_movement: (), src_pool_idx: (), user_defined: (), preserve_etag: (), metadata_chg: (), replication_request: (), delete_marker: () }
-
         objectlayer.unwrap().get_object_info(&self.bucket, &self.name, &opts).await
     }
 
