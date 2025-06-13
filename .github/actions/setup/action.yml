@@ -13,9 +13,9 @@ inputs:
     description: "Cache key for shared cache"
   cache-save-if:
     required: true
-    default: true
+    default: ${{ github.ref == 'refs/heads/main' }}
     description: "Cache save condition"
-  run-os:
+  runs-on:
     required: true
     default: "ubuntu-latest"
     description: "Running system"
@@ -24,7 +24,7 @@ runs:
   using: "composite"
   steps:
     - name: Install system dependencies
-      if: inputs.run-os == 'ubuntu-latest'
+      if: inputs.runs-on == 'ubuntu-latest'
       shell: bash
       run: |
         sudo apt update
@@ -45,7 +45,6 @@ runs:
 
     - uses: Swatinem/rust-cache@v2
       with:
-        cache-on-failure: true
         cache-all-crates: true
         shared-key: ${{ inputs.cache-shared-key }}
         save-if: ${{ inputs.cache-save-if }}
