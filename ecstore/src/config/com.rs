@@ -41,6 +41,7 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
             if err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _)) {
                 Error::ConfigNotFound
             } else {
+                warn!("read_config_with_metadata: err: {:?}, file: {}", err, file);
                 err
             }
         })?;
@@ -92,9 +93,19 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
 }
 
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
-    let _ = api
+    warn!(
+        "save_config_with_opts, bucket: {}, file: {}, data len: {}",
+        RUSTFS_META_BUCKET,
+        file,
+        data.len()
+    );
+    if let Err(err) = api
         .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data), opts)
-        .await?;
+        .await
+    {
+        warn!("save_config_with_opts: err: {:?}, file: {}", err, file);
+        return Err(err);
+    }
     Ok(())
 }
 

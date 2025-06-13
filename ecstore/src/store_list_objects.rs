@@ -364,6 +364,7 @@ impl ECStore {
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
         if marker.is_none() && version_marker.is_some() {
+            warn!("inner_list_object_versions: marker is none and version_marker is some");
             return Err(StorageError::NotImplemented);
         }
 

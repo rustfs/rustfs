@@ -95,38 +95,45 @@ where
         self.clone().save_iam_formatter().await?;
         self.clone().load().await?;
 
-        // Background thread starts periodic updates or receives signal updates
-        tokio::spawn({
-            let s = Arc::clone(&self);
-            async move {
-                let ticker = tokio::time::interval(Duration::from_secs(120));
-                tokio::pin!(ticker, reciver);
-                loop {
-                    select! {
-                        _ = ticker.tick() => {
-                            if let Err(err) =s.clone().load().await{
-                                error!("iam load err {:?}", err);
-                            }
-                        },
-                        i = reciver.recv() => {
-                            match i {
-                                Some(t) => {
-                                    let last = s.last_timestamp.load(Ordering::Relaxed);
-                                    if last <= t {
+        // 检查环境变量是否设置
+        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
 
-                                        if let Err(err) =s.clone().load().await{
-                                            error!("iam load err {:?}", err);
+        if !skip_background_task {
+            // Background thread starts periodic updates or receives signal updates
+            tokio::spawn({
+                let s = Arc::clone(&self);
+                async move {
+                    let ticker = tokio::time::interval(Duration::from_secs(120));
+                    tokio::pin!(ticker, reciver);
+                    loop {
+                        select! {
+                            _ = ticker.tick() => {
+                                warn!("iam load ticker");
+                                if let Err(err) =s.clone().load().await{
+                                    error!("iam load err {:?}", err);
+                                }
+                            },
+                            i = reciver.recv() => {
+                                warn!("iam load reciver");
+                                match i {
+                                    Some(t) => {
+                                        let last = s.last_timestamp.load(Ordering::Relaxed);
+                                        if last <= t {
+                                            warn!("iam load reciver load");
+                                            if let Err(err) =s.clone().load().await{
+                                                error!("iam load err {:?}", err);
+                                            }
+                                            ticker.reset();
                                         }
-                                        ticker.reset();
-                                    }
-                                },
-                                None => return,
+                                    },
+                                    None => return,
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
+            });
+        }
 
         Ok(())
     }

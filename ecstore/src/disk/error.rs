@@ -124,7 +124,7 @@ pub enum DiskError {
     #[error("erasure read quorum")]
     ErasureReadQuorum,
 
-    #[error("io error")]
+    #[error("io error {0}")]
     Io(io::Error),
 }
 

@@ -807,11 +807,38 @@ impl Node for NodeService {
                                 }
                             }
                             Err(err) => {
+                                if err == rustfs_filemeta::Error::Unexpected {
+                                    let _ = tx
+                                        .send(Ok(WalkDirResponse {
+                                            success: false,
+                                            meta_cache_entry: "".to_string(),
+                                            error_info: Some(err.to_string()),
+                                        }))
+                                        .await;
+
+                                    break;
+                                }
+
                                 if rustfs_filemeta::is_io_eof(&err) {
+                                    let _ = tx
+                                        .send(Ok(WalkDirResponse {
+                                            success: false,
+                                            meta_cache_entry: "".to_string(),
+                                            error_info: Some(err.to_string()),
+                                        }))
+                                        .await;
                                     break;
                                 }
 
                                 println!("get err {:?}", err);
+
+                                let _ = tx
+                                    .send(Ok(WalkDirResponse {
+                                        success: false,
+                                        meta_cache_entry: "".to_string(),
+                                        error_info: Some(err.to_string()),
+                                    }))
+                                    .await;
                                 break;
                             }
                         }

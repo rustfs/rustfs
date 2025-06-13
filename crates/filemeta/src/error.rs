@@ -111,7 +111,20 @@ impl Clone for Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
+        match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => Error::Unexpected,
+            _ => Error::Io(e),
+        }
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Unexpected => std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Unexpected EOF"),
+            Error::Io(e) => e,
+            _ => std::io::Error::other(e.to_string()),
+        }
     }
 }
 

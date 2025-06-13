@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::vec;
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
+use tracing::error;
 
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
@@ -60,6 +61,13 @@ impl<'a> MultiWriter<'a> {
         }
 
         if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
+            error!(
+                "reduce_write_quorum_errs: {:?}, offline-disks={}/{}, errs={:?}",
+                write_err,
+                count_errs(&self.errs, &Error::DiskNotFound),
+                self.writers.len(),
+                self.errs
+            );
             return Err(std::io::Error::other(format!(
                 "Failed to write data: {} (offline-disks={}/{})",
                 write_err,

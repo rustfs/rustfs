@@ -773,7 +773,7 @@ impl LocalDisk {
             Ok(res) => res,
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
-                    info!("scan list_dir {}, err {:?}", &current, &e);
+                    warn!("scan list_dir {}, err {:?}", &current, &e);
                 }
 
                 if opts.report_notfound && e == Error::FileNotFound && current == &opts.base_dir {
@@ -785,6 +785,7 @@ impl LocalDisk {
         };
 
         if entries.is_empty() {
+            warn!("scan list_dir {}, entries is empty", &current);
             return Ok(());
         }
 
@@ -800,6 +801,7 @@ impl LocalDisk {
             let entry = item.clone();
             // check limit
             if opts.limit > 0 && *objs_returned >= opts.limit {
+                warn!("scan list_dir {}, limit reached", &current);
                 return Ok(());
             }
             // check prefix
@@ -843,13 +845,14 @@ impl LocalDisk {
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
                 out.write_obj(&MetaCacheEntry {
-                    name,
+                    name: name.clone(),
                     metadata,
                     ..Default::default()
                 })
                 .await?;
                 *objs_returned += 1;
 
+                // warn!("scan list_dir {}, write_obj done, name: {:?}", &current, &name);
                 return Ok(());
             }
         }
@@ -870,6 +873,7 @@ impl LocalDisk {
 
         for entry in entries.iter() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
+                // warn!("scan list_dir {}, limit reached 2", &current);
                 return Ok(());
             }
 
@@ -945,6 +949,7 @@ impl LocalDisk {
 
         while let Some(dir) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
+                // warn!("scan list_dir {}, limit reached 3", &current);
                 return Ok(());
             }
 
@@ -965,6 +970,7 @@ impl LocalDisk {
             }
         }
 
+        // warn!("scan list_dir {}, done", &current);
         Ok(())
     }
 }
@@ -1568,6 +1574,11 @@ impl DiskAPI for LocalDisk {
         let mut current = opts.base_dir.clone();
         self.scan_dir(&mut current, &opts, &mut out, &mut objs_returned).await?;
 
+        warn!(
+            "walk_dir: done, volume_dir: {:?}, base_dir: {}",
+            volume_dir.to_string_lossy(),
+            opts.base_dir
+        );
         Ok(())
     }
 

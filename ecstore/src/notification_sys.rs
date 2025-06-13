@@ -143,7 +143,11 @@ impl NotificationSys {
     #[tracing::instrument(skip(self))]
     pub async fn load_rebalance_meta(&self, start: bool) {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for client in self.peer_clients.iter().flatten() {
+        for (i, client) in self.peer_clients.iter().flatten().enumerate() {
+            warn!(
+                "notification load_rebalance_meta start: {}, index: {}, client: {:?}",
+                start, i, client.host
+            );
             futures.push(client.load_rebalance_meta(start));
         }
 
@@ -158,10 +162,15 @@ impl NotificationSys {
     }
 
     pub async fn stop_rebalance(&self) {
+        warn!("notification stop_rebalance start");
         let Some(store) = new_object_layer_fn() else {
             error!("stop_rebalance: not init");
             return;
         };
+
+        // warn!("notification stop_rebalance load_rebalance_meta");
+        // self.load_rebalance_meta(false).await;
+        // warn!("notification stop_rebalance load_rebalance_meta done");
 
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().flatten() {
@@ -175,7 +184,9 @@ impl NotificationSys {
             }
         }
 
+        warn!("notification stop_rebalance stop_rebalance start");
         let _ = store.stop_rebalance().await;
+        warn!("notification stop_rebalance stop_rebalance done");
     }
 }
 

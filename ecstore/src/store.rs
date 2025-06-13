@@ -847,9 +847,26 @@ impl ECStore {
         let (update_closer_tx, mut update_close_rx) = mpsc::channel(10);
         let mut ctx_clone = cancel.subscribe();
         let all_buckets_clone = all_buckets.clone();
+        // 新增：从环境变量读取interval，默认30秒
+        let ns_scanner_interval_secs = std::env::var("RUSTFS_NS_SCANNER_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        // 检查是否跳过后台任务
+        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        if skip_background_task {
+            info!("跳过后台任务执行: RUSTFS_SKIP_BACKGROUND_TASK=true");
+            return Ok(());
+        }
+
         let task = tokio::spawn(async move {
             let mut last_update: Option<SystemTime> = None;
-            let mut interval = interval(Duration::from_secs(30));
+            let mut interval = interval(Duration::from_secs(ns_scanner_interval_secs));
             let all_merged = Arc::new(RwLock::new(DataUsageCache::default()));
             loop {
                 select! {

@@ -79,3 +79,13 @@ build: BUILD_CMD = /root/.cargo/bin/cargo build --release --bin rustfs --target-
 build:
 	$(DOCKER_CLI) build -t $(ROCKYLINUX_BUILD_IMAGE_NAME) -f $(DOCKERFILE_PATH)/Dockerfile.$(BUILD_OS) .
 	$(DOCKER_CLI) run --rm --name $(ROCKYLINUX_BUILD_CONTAINER_NAME) -v $(shell pwd):/root/s3-rustfs -it $(ROCKYLINUX_BUILD_IMAGE_NAME) $(BUILD_CMD)
+
+.PHONY: build-musl
+build-musl:
+	@echo "🔨 Building rustfs for x86_64-unknown-linux-musl..."
+	cargo build --target x86_64-unknown-linux-musl --bin rustfs -r
+
+.PHONY: deploy-dev
+deploy-dev: build-musl
+	@echo "🚀 Deploying to dev server: $${IP}"
+	./scripts/dev_deploy.sh $${IP}
