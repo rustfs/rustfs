@@ -73,7 +73,7 @@ where
 
         if hash_size > 0 {
             let actual_hash = self.hash_algo.hash_encode(&out[..data_len]);
-            if actual_hash != hash_buf {
+            if actual_hash.as_ref() != hash_buf.as_slice() {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
             }
         }
@@ -139,7 +139,7 @@ where
 
         if hash_algo.size() > 0 {
             let hash = hash_algo.hash_encode(buf);
-            self.buf.extend_from_slice(&hash);
+            self.buf.extend_from_slice(hash.as_ref());
         }
 
         self.buf.extend_from_slice(buf);
@@ -196,7 +196,7 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
         let read = r.read_exact(&mut buf).await?;
 
         let actual_hash = algo.hash_encode(&buf);
-        if actual_hash != hash_buf[0..n] {
+        if actual_hash.as_ref() != &hash_buf[0..n] {
             return Err(std::io::Error::other("bitrot hash mismatch"));
         }
 
