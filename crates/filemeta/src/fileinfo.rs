@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::headers::RESERVED_METADATA_PREFIX_LOWER;
+use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use serde::Deserialize;
@@ -36,7 +37,7 @@ pub struct ObjectPartInfo {
 pub struct ChecksumInfo {
     pub part_number: usize,
     pub algorithm: HashAlgorithm,
-    pub hash: Vec<u8>,
+    pub hash: Bytes,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Default, Clone)]
@@ -167,13 +168,13 @@ pub struct FileInfo {
     pub mark_deleted: bool,
     // ReplicationState - Internal replication state to be passed back in ObjectInfo
     // pub replication_state: Option<ReplicationState>, // TODO: implement ReplicationState
-    pub data: Option<Vec<u8>>,
+    pub data: Option<Bytes>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
     pub fresh: bool,
     pub idx: usize,
     // Combined checksum when object was uploaded
-    pub checksum: Option<Vec<u8>>,
+    pub checksum: Option<Bytes>,
     pub versioned: bool,
 }
 

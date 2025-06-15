@@ -22,6 +22,7 @@ use crate::heal::{
     data_usage_cache::{DataUsageCache, DataUsageEntry},
     heal_commands::{HealScanMode, HealingTracker},
 };
+use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
 use error::{Error, Result};
@@ -319,7 +320,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.rename_part(src_volume, src_path, dst_volume, dst_path, meta).await,
             Disk::Remote(remote_disk) => {
@@ -493,7 +494,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
-    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()>;
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     // VerifyFile
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;

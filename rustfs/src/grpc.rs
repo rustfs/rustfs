@@ -446,7 +446,7 @@ impl Node for NodeService {
                     &request.src_path,
                     &request.dst_volume,
                     &request.dst_path,
-                    request.meta,
+                    request.meta.into(),
                 )
                 .await
             {

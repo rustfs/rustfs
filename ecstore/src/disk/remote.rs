@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use bytes::Bytes;
 use futures::lock::Mutex;
 use http::{HeaderMap, Method};
 use protos::{
@@ -649,7 +650,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         info!("rename_part {}/{}", src_volume, src_path);
         let mut client = node_service_time_out_client(&self.addr)
             .await
@@ -660,7 +661,7 @@ impl DiskAPI for RemoteDisk {
             src_path: src_path.to_string(),
             dst_volume: dst_volume.to_string(),
             dst_path: dst_path.to_string(),
-            meta,
+            meta: meta.to_vec(),
         });
 
         let response = client.rename_part(request).await?.into_inner();

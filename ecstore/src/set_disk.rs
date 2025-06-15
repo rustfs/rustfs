@@ -45,6 +45,7 @@ use crate::{
     heal::data_scanner::{HEAL_DELETE_DANGLING, globalHealConfig},
     store_api::ListObjectVersionsInfo,
 };
+use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::Utc;
 use futures::future::join_all;
@@ -489,7 +490,7 @@ impl SetDisks {
         src_object: &str,
         dst_bucket: &str,
         dst_object: &str,
-        meta: Vec<u8>,
+        meta: Bytes,
         write_quorum: usize,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
         let src_bucket = Arc::new(src_bucket.to_string());
@@ -2594,7 +2595,8 @@ impl SetDisks {
                                             // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
                                             //     parts_metadata[index].data = Some(w.inline_data().to_vec());
                                             // }
-                                            parts_metadata[index].data = Some(writer.into_inline_data().unwrap_or_default());
+                                            parts_metadata[index].data =
+                                                Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
                                         }
                                         parts_metadata[index].set_inline_data();
                                     } else {
@@ -3920,7 +3922,7 @@ impl ObjectIO for SetDisks {
         for (i, fi) in parts_metadatas.iter_mut().enumerate() {
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
-                    fi.data = Some(writer.into_inline_data().unwrap_or_default());
+                    fi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
                 }
             }
 
@@ -4599,7 +4601,7 @@ impl StorageAPI for SetDisks {
             &tmp_part_path,
             RUSTFS_META_MULTIPART_BUCKET,
             &part_path,
-            fi_buff,
+            fi_buff.into(),
             write_quorum,
         )
         .await?;
