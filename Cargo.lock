@@ -1406,6 +1406,9 @@ name = "bytes"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bytes-utils"
@@ -8357,6 +8360,7 @@ name = "rustfs-filemeta"
 version = "0.0.1"
 dependencies = [
  "byteorder",
+ "bytes",
  "crc32fast",
  "criterion",
  "rmp",
