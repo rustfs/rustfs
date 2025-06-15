@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustfs_utils::{HashAlgorithm, read_full, write_all};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -174,7 +175,7 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     want_size: usize,
     part_size: usize,
     algo: HashAlgorithm,
-    _want: Vec<u8>,
+    _want: Bytes, // FIXME: useless parameter?
     mut shard_size: usize,
 ) -> std::io::Result<()> {
     let mut hash_buf = vec![0; algo.size()];

@@ -703,7 +703,7 @@ impl LocalDisk {
         let meta = file.metadata().await.map_err(to_file_error)?;
         let file_size = meta.len() as usize;
 
-        bitrot_verify(Box::new(file), file_size, part_size, algo, sum.to_vec(), shard_size)
+        bitrot_verify(Box::new(file), file_size, part_size, algo, bytes::Bytes::copy_from_slice(sum), shard_size)
             .await
             .map_err(to_file_error)?;
 
