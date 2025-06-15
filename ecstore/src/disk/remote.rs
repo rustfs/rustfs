@@ -270,7 +270,7 @@ impl DiskAPI for RemoteDisk {
             .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
         let request = Request::new(WalkDirRequest {
             disk: self.endpoint.to_string(),
-            walk_dir_options: buf,
+            walk_dir_options: buf.into(),
         });
         let mut response = client.walk_dir(request).await?.into_inner();
 
@@ -661,7 +661,7 @@ impl DiskAPI for RemoteDisk {
             src_path: src_path.to_string(),
             dst_volume: dst_volume.to_string(),
             dst_path: dst_path.to_string(),
-            meta: meta.to_vec(),
+            meta,
         });
 
         let response = client.rename_part(request).await?.into_inner();
@@ -783,7 +783,7 @@ impl DiskAPI for RemoteDisk {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
-            data,
+            data: data.into(),
         });
 
         let response = client.write_all(request).await?.into_inner();
@@ -813,7 +813,7 @@ impl DiskAPI for RemoteDisk {
             return Err(response.error.unwrap_or_default().into());
         }
 
-        Ok(response.data)
+        Ok(response.data.into())
     }
 
     #[tracing::instrument(skip(self))]

@@ -3581,6 +3581,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "e2e_test"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "common",
  "ecstore",
  "flatbuffers 25.2.10",

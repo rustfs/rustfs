@@ -24,6 +24,7 @@ use lock::{GLOBAL_LOCAL_SERVER, Locker, lock_args::LockArgs};
 
 use common::globals::GLOBAL_Local_Node_Name;
 
+use bytes::Bytes;
 use madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
 };
@@ -108,7 +109,7 @@ impl Node for NodeService {
 
         Ok(tonic::Response::new(PingResponse {
             version: 1,
-            body: finished_data.to_vec(),
+            body: Bytes::copy_from_slice(finished_data),
         }))
     }
 
@@ -276,19 +277,19 @@ impl Node for NodeService {
             match disk.read_all(&request.volume, &request.path).await {
                 Ok(data) => Ok(tonic::Response::new(ReadAllResponse {
                     success: true,
-                    data: data.to_vec(),
+                    data: data.into(),
                     error: None,
                 })),
                 Err(err) => Ok(tonic::Response::new(ReadAllResponse {
                     success: false,
-                    data: Vec::new(),
+                    data: Bytes::new(),
                     error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(ReadAllResponse {
                 success: false,
-                data: Vec::new(),
+                data: Bytes::new(),
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
@@ -297,7 +298,7 @@ impl Node for NodeService {
     async fn write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk.write_all(&request.volume, &request.path, request.data).await {
+            match disk.write_all(&request.volume, &request.path, request.data.into()).await {
                 Ok(_) => Ok(tonic::Response::new(WriteAllResponse {
                     success: true,
                     error: None,
@@ -446,7 +447,7 @@ impl Node for NodeService {
                     &request.src_path,
                     &request.dst_volume,
                     &request.dst_path,
-                    request.meta.into(),
+                    request.meta,
                 )
                 .await
             {
@@ -1577,7 +1578,7 @@ impl Node for NodeService {
         let Some(store) = new_object_layer_fn() else {
             return Ok(tonic::Response::new(LocalStorageInfoResponse {
                 success: false,
-                storage_info: vec![],
+                storage_info: Bytes::new(),
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
@@ -1587,14 +1588,14 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(LocalStorageInfoResponse {
                 success: false,
-                storage_info: vec![],
+                storage_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
 
         Ok(tonic::Response::new(LocalStorageInfoResponse {
             success: true,
-            storage_info: buf,
+            storage_info: buf.into(),
             error_info: None,
         }))
     }
@@ -1605,13 +1606,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(ServerInfoResponse {
                 success: false,
-                server_properties: vec![],
+                server_properties: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(ServerInfoResponse {
             success: true,
-            server_properties: buf,
+            server_properties: buf.into(),
             error_info: None,
         }))
     }
@@ -1622,13 +1623,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetCpusResponse {
                 success: false,
-                cpus: vec![],
+                cpus: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetCpusResponse {
             success: true,
-            cpus: buf,
+            cpus: buf.into(),
             error_info: None,
         }))
     }
@@ -1640,13 +1641,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetNetInfoResponse {
                 success: false,
-                net_info: vec![],
+                net_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetNetInfoResponse {
             success: true,
-            net_info: buf,
+            net_info: buf.into(),
             error_info: None,
         }))
     }
@@ -1657,13 +1658,13 @@ impl Node for NodeService {
         if let Err(err) = partitions.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetPartitionsResponse {
                 success: false,
-                partitions: vec![],
+                partitions: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetPartitionsResponse {
             success: true,
-            partitions: buf,
+            partitions: buf.into(),
             error_info: None,
         }))
     }
@@ -1674,13 +1675,13 @@ impl Node for NodeService {
         if let Err(err) = os_info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetOsInfoResponse {
                 success: false,
-                os_info: vec![],
+                os_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetOsInfoResponse {
             success: true,
-            os_info: buf,
+            os_info: buf.into(),
             error_info: None,
         }))
     }
@@ -1695,13 +1696,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetSeLinuxInfoResponse {
                 success: false,
-                sys_services: vec![],
+                sys_services: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetSeLinuxInfoResponse {
             success: true,
-            sys_services: buf,
+            sys_services: buf.into(),
             error_info: None,
         }))
     }
@@ -1713,13 +1714,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetSysConfigResponse {
                 success: false,
-                sys_config: vec![],
+                sys_config: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetSysConfigResponse {
             success: true,
-            sys_config: buf,
+            sys_config: buf.into(),
             error_info: None,
         }))
     }
@@ -1731,13 +1732,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetSysErrorsResponse {
                 success: false,
-                sys_errors: vec![],
+                sys_errors: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetSysErrorsResponse {
             success: true,
-            sys_errors: buf,
+            sys_errors: buf.into(),
             error_info: None,
         }))
     }
@@ -1749,13 +1750,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetMemInfoResponse {
                 success: false,
-                mem_info: vec![],
+                mem_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetMemInfoResponse {
             success: true,
-            mem_info: buf,
+            mem_info: buf.into(),
             error_info: None,
         }))
     }
@@ -1774,13 +1775,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetMetricsResponse {
                 success: false,
-                realtime_metrics: vec![],
+                realtime_metrics: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetMetricsResponse {
             success: true,
-            realtime_metrics: buf,
+            realtime_metrics: buf.into(),
             error_info: None,
         }))
     }
@@ -1792,13 +1793,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetProcInfoResponse {
                 success: false,
-                proc_info: vec![],
+                proc_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetProcInfoResponse {
             success: true,
-            proc_info: buf,
+            proc_info: buf.into(),
             error_info: None,
         }))
     }
@@ -2085,7 +2086,7 @@ impl Node for NodeService {
         if !ok {
             return Ok(tonic::Response::new(BackgroundHealStatusResponse {
                 success: false,
-                bg_heal_state: vec![],
+                bg_heal_state: Bytes::new(),
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         }
@@ -2094,13 +2095,13 @@ impl Node for NodeService {
         if let Err(err) = state.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(BackgroundHealStatusResponse {
                 success: false,
-                bg_heal_state: vec![],
+                bg_heal_state: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(BackgroundHealStatusResponse {
             success: true,
-            bg_heal_state: buf,
+            bg_heal_state: buf.into(),
             error_info: None,
         }))
     }
@@ -2257,7 +2258,7 @@ mod tests {
 
         let request = Request::new(PingRequest {
             version: 1,
-            body: fbb.finished_data().to_vec(),
+            body: Bytes::copy_from_slice(fbb.finished_data()),
         });
 
         let response = service.ping(request).await;
@@ -2274,7 +2275,7 @@ mod tests {
 
         let request = Request::new(PingRequest {
             version: 1,
-            body: vec![0x00, 0x01, 0x02], // Invalid flatbuffer data
+            body: vec![0x00, 0x01, 0x02].into(), // Invalid flatbuffer data
         });
 
         let response = service.ping(request).await;
@@ -2397,7 +2398,7 @@ mod tests {
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
-            data: vec![1, 2, 3, 4],
+            data: vec![1, 2, 3, 4].into(),
         });
 
         let response = service.write_all(request).await;
@@ -2514,7 +2515,7 @@ mod tests {
             src_path: "src-path".to_string(),
             dst_volume: "dst-volume".to_string(),
             dst_path: "dst-path".to_string(),
-            meta: vec![],
+            meta: Bytes::new(),
         });
 
         let response = service.rename_part(request).await;

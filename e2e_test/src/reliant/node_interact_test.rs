@@ -43,7 +43,7 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     // Construct PingRequest
     let request = Request::new(PingRequest {
         version: 1,
-        body: finished_data.to_vec(),
+        body: bytes::Bytes::copy_from_slice(finished_data),
     });
 
     // Send request and get response
@@ -114,7 +114,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
     let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string()).await?;
     let request = Request::new(WalkDirRequest {
         disk: "/home/dandan/code/rust/s3-rustfs/target/debug/data".to_string(),
-        walk_dir_options: buf,
+        walk_dir_options: buf.into(),
     });
     let mut response = client.walk_dir(request).await?.into_inner();
 
