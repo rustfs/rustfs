@@ -5,11 +5,19 @@ use pin_project_lite::pin_project;
 use reqwest::{Client, Method, RequestBuilder};
 use std::io::{self, Error};
 use std::pin::Pin;
+use std::sync::LazyLock;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
+
+fn get_http_client() -> Client {
+    // Reuse the HTTP connection pool in the global `reqwest::Client` instance
+    // TODO: interact with load balancing?
+    static CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+    CLIENT.clone()
+}
 
 static HTTP_DEBUG_LOG: bool = false;
 #[inline(always)]
@@ -46,7 +54,7 @@ impl HttpReader {
             read_buf_size
         );
         // First, check if the connection is available (HEAD)
-        let client = Client::new();
+        let client = get_http_client();
         let head_resp = client.head(&url).headers(headers.clone()).send().await;
         match head_resp {
             Ok(resp) => {
@@ -71,7 +79,7 @@ impl HttpReader {
         let (rd, mut wd) = tokio::io::duplex(read_buf_size);
         let (err_tx, err_rx) = oneshot::channel::<io::Error>();
         tokio::spawn(async move {
-            let client = Client::new();
+            let client = get_http_client();
             let request: RequestBuilder = client.request(method_clone, url_clone).headers(headers_clone);
 
             let response = request.send().await;
@@ -220,7 +228,7 @@ impl HttpWriter {
         let headers_clone = headers.clone();
 
         // First, try to write empty data to check if writable
-        let client = Client::new();
+        let client = get_http_client();
         let resp = client.put(&url).headers(headers.clone()).body(Vec::new()).send().await;
         match resp {
             Ok(resp) => {
@@ -245,7 +253,7 @@ impl HttpWriter {
                 "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
             );
 
-            let client = Client::new();
+            let client = get_http_client();
             let request = client
                 .request(method_clone, url_clone.clone())
                 .headers(headers_clone.clone())
