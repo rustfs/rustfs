@@ -45,6 +45,7 @@ use crate::{
     heal::data_scanner::{HEAL_DELETE_DANGLING, globalHealConfig},
     store_api::ListObjectVersionsInfo,
 };
+use bytes::Bytes;
 use bytesize::ByteSize;
 use chrono::Utc;
 use futures::future::join_all;
@@ -489,7 +490,7 @@ impl SetDisks {
         src_object: &str,
         dst_bucket: &str,
         dst_object: &str,
-        meta: Vec<u8>,
+        meta: Bytes,
         write_quorum: usize,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
         let src_bucket = Arc::new(src_bucket.to_string());
@@ -4600,7 +4601,7 @@ impl StorageAPI for SetDisks {
             &tmp_part_path,
             RUSTFS_META_MULTIPART_BUCKET,
             &part_path,
-            fi_buff,
+            fi_buff.into(),
             write_quorum,
         )
         .await?;

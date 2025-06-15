@@ -38,6 +38,7 @@ use rustfs_utils::path::{
 };
 
 use crate::erasure_coding::bitrot_verify;
+use bytes::Bytes;
 use common::defer;
 use path_absolutize::Absolutize;
 use rustfs_filemeta::{
@@ -1250,7 +1251,7 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
@@ -1303,7 +1304,7 @@ impl DiskAPI for LocalDisk {
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
 
-        self.write_all(dst_volume, format!("{}.meta", dst_path).as_str(), meta)
+        self.write_all(dst_volume, format!("{}.meta", dst_path).as_str(), meta.to_vec())
             .await?;
 
         if let Some(parent) = src_file_path.parent() {
