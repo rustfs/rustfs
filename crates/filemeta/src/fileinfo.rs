@@ -168,13 +168,13 @@ pub struct FileInfo {
     pub mark_deleted: bool,
     // ReplicationState - Internal replication state to be passed back in ObjectInfo
     // pub replication_state: Option<ReplicationState>, // TODO: implement ReplicationState
-    pub data: Option<Vec<u8>>,
+    pub data: Option<Bytes>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
     pub fresh: bool,
     pub idx: usize,
     // Combined checksum when object was uploaded
-    pub checksum: Option<Vec<u8>>,
+    pub checksum: Option<Bytes>,
     pub versioned: bool,
 }
 

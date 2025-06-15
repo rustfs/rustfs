@@ -2594,7 +2594,8 @@ impl SetDisks {
                                             // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
                                             //     parts_metadata[index].data = Some(w.inline_data().to_vec());
                                             // }
-                                            parts_metadata[index].data = Some(writer.into_inline_data().unwrap_or_default());
+                                            parts_metadata[index].data =
+                                                Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
                                         }
                                         parts_metadata[index].set_inline_data();
                                     } else {
@@ -3920,7 +3921,7 @@ impl ObjectIO for SetDisks {
         for (i, fi) in parts_metadatas.iter_mut().enumerate() {
             if is_inline_buffer {
                 if let Some(writer) = writers[i].take() {
-                    fi.data = Some(writer.into_inline_data().unwrap_or_default());
+                    fi.data = Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
                 }
             }
 

@@ -419,7 +419,7 @@ impl FileMeta {
 
         if let Some(ref data) = fi.data {
             let key = vid.unwrap_or_default().to_string();
-            self.data.replace(&key, data.clone())?;
+            self.data.replace(&key, data.to_vec())?;
         }
 
         let version = FileMetaVersion::from(fi);
@@ -543,7 +543,10 @@ impl FileMeta {
             }
 
             if read_data {
-                fi.data = self.data.find(fi.version_id.unwrap_or_default().to_string().as_str())?;
+                fi.data = self
+                    .data
+                    .find(fi.version_id.unwrap_or_default().to_string().as_str())?
+                    .map(bytes::Bytes::from);
             }
 
             fi.num_versions = self.versions.len();
