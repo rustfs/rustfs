@@ -49,7 +49,7 @@ Our GitHub Actions workflow builds multiple image variants:
 
 | Variant | Tag Suffix | Description | Use Case |
 |---------|------------|-------------|----------|
-| Production | *(none)* | Minimal Alpine-based runtime | Production deployment |
+| Production | *(none)* | Minimal Ubuntu-based runtime | Production deployment |
 | Ubuntu | `-ubuntu22.04` | Ubuntu 22.04 based build environment | Development/Testing |
 | Rocky Linux | `-rockylinux9.3` | Rocky Linux 9.3 based build environment | Enterprise environments |
 | Development | `-devenv` | Full development environment | Development/Debugging |
@@ -57,8 +57,8 @@ Our GitHub Actions workflow builds multiple image variants:
 ### Supported Architectures
 
 All images support multi-architecture:
-- `linux/amd64` (x86_64)
-- `linux/arm64` (aarch64)
+- `linux/amd64` (x86_64-unknown-linux-musl)
+- `linux/arm64` (aarch64-unknown-linux-gnu)
 
 ### Tag Examples
 
@@ -86,6 +86,15 @@ The Docker build workflow (`.github/workflows/docker.yml`) automatically:
 4. **Creates multi-arch manifests** for seamless platform selection
 5. **Performs security scanning** using Trivy
 
+### Cross-Compilation Strategy
+
+To handle complex native dependencies, we use different compilation strategies:
+
+- **x86_64**: Native compilation with `x86_64-unknown-linux-musl` for static linking
+- **aarch64**: Cross-compilation with `aarch64-unknown-linux-gnu` using the `cross` tool
+
+This approach ensures compatibility with various C libraries while maintaining performance.
+
 ### Workflow Triggers
 
 - **Push to main branch**: Builds and pushes `main` and `latest` tags
@@ -111,11 +120,37 @@ GITHUB_TOKEN=automatically-provided
 ### Prerequisites
 
 - Docker with BuildKit enabled
-- Docker Compose (optional)
+- Rust toolchain (1.85+)
+- Protocol Buffers compiler (protoc 31.1+)
+- FlatBuffers compiler (flatc 25.2.10+)
+- `cross` tool for ARM64 compilation
+
+### Installation Commands
+
+```bash
+# Install Rust targets
+rustup target add x86_64-unknown-linux-musl
+rustup target add aarch64-unknown-linux-gnu
+
+# Install cross for ARM64 compilation
+cargo install cross --git https://github.com/cross-rs/cross
+
+# Install protoc (macOS)
+brew install protobuf
+
+# Install protoc (Ubuntu)
+sudo apt-get install protobuf-compiler
+
+# Install flatc
+# Download from: https://github.com/google/flatbuffers/releases
+```
 
 ### Build Commands
 
 ```bash
+# Test cross-compilation setup
+./scripts/test-cross-build.sh
+
 # Build production image for local platform
 docker build -t rustfs:local .
 
@@ -131,6 +166,19 @@ docker build --platform linux/arm64 -t rustfs:arm64 .
 
 # Build multi-platform image
 docker buildx build --platform linux/amd64,linux/arm64 -t rustfs:multi .
+```
+
+### Cross-Compilation
+
+```bash
+# Generate protobuf code first
+cargo run --bin gproto
+
+# Native x86_64 build
+cargo build --release --target x86_64-unknown-linux-musl --bin rustfs
+
+# Cross-compile for ARM64
+cross build --release --target aarch64-unknown-linux-gnu --bin rustfs
 ```
 
 ### Build with Docker Compose
@@ -316,6 +364,18 @@ docker run --rm \
   cargo build --release --bin rustfs
 ```
 
+### Testing Cross-Compilation
+
+```bash
+# Run the test script to verify cross-compilation setup
+./scripts/test-cross-build.sh
+
+# This will test:
+# - x86_64-unknown-linux-musl compilation
+# - aarch64-unknown-linux-gnu cross-compilation
+# - Docker builds for both architectures
+```
+
 ## 🔐 Security
 
 ### Security Scanning
@@ -332,7 +392,7 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
 ### Security Best Practices
 
 1. **Use non-root user**: Images run as `rustfs` user (UID 1000)
-2. **Minimal base images**: Alpine Linux for production
+2. **Minimal base images**: Ubuntu minimal for production
 3. **Security updates**: Regular base image updates
 4. **Secret management**: Use Docker secrets or environment files
 5. **Network security**: Use Docker networks and proper firewall rules
@@ -341,10 +401,50 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
 
 ### Common Issues
 
-1. **Build failures**: Check build logs and ensure all dependencies are installed
-2. **Permission issues**: Ensure proper volume permissions for UID 1000
-3. **Network connectivity**: Verify port mappings and network configuration
-4. **Resource limits**: Ensure sufficient memory and CPU for compilation
+#### 1. Cross-Compilation Failures
+
+**Problem**: ARM64 build fails with linking errors
+```bash
+error: linking with `aarch64-linux-gnu-gcc` failed
+```
+
+**Solution**: Use the `cross` tool instead of native cross-compilation:
+```bash
+# Install cross tool
+cargo install cross --git https://github.com/cross-rs/cross
+
+# Use cross for ARM64 builds
+cross build --release --target aarch64-unknown-linux-gnu --bin rustfs
+```
+
+#### 2. Protobuf Generation Issues
+
+**Problem**: Missing protobuf definitions
+```bash
+error: failed to run custom build command for `protos`
+```
+
+**Solution**: Generate protobuf code first:
+```bash
+cargo run --bin gproto
+```
+
+#### 3. Docker Build Failures
+
+**Problem**: Binary not found in Docker build
+```bash
+COPY failed: file not found in build context
+```
+
+**Solution**: Ensure binaries are built before Docker build:
+```bash
+# Build binaries first
+cargo build --release --target x86_64-unknown-linux-musl --bin rustfs
+cross build --release --target aarch64-unknown-linux-gnu --bin rustfs
+
+# Then build Docker image
+docker build .
+```
 
 ### Debug Commands
 
@@ -356,13 +456,16 @@ docker ps -a
 docker logs rustfs --tail 100
 
 # Access container shell
-docker exec -it rustfs sh
+docker exec -it rustfs bash
 
 # Check resource usage
 docker stats rustfs
 
 # Inspect container configuration
 docker inspect rustfs
+
+# Test cross-compilation setup
+./scripts/test-cross-build.sh
 ```
 
 ## 🔄 CI/CD Integration
@@ -422,5 +525,6 @@ pipeline {
 - [Docker Official Documentation](https://docs.docker.com/)
 - [Docker Compose Reference](https://docs.docker.com/compose/)
 - [GitHub Actions Documentation](https://docs.github.com/en/actions)
+- [Cross-compilation with Rust](https://rust-lang.github.io/rustup/cross-compilation.html)
+- [Cross tool documentation](https://github.com/cross-rs/cross)
 - [RustFS Configuration Guide](../README.md)
-- [Kubernetes Deployment Guide](./kubernetes.md)

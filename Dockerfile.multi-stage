@@ -16,7 +16,6 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     lld \
-    musl-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cross-compilation tools for ARM64
@@ -39,13 +38,15 @@ RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.
 
 # Set up Rust targets based on platform
 RUN case "$TARGETPLATFORM" in \
-        "linux/amd64") rustup target add x86_64-unknown-linux-musl ;; \
-        "linux/arm64") rustup target add aarch64-unknown-linux-musl ;; \
+        "linux/amd64") rustup target add x86_64-unknown-linux-gnu ;; \
+        "linux/arm64") rustup target add aarch64-unknown-linux-gnu ;; \
         *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
     esac
 
 # Set up environment for cross-compilation
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 
 WORKDIR /usr/src/rustfs
 
@@ -60,8 +61,8 @@ RUN find . -name "Cargo.toml" -not -path "./Cargo.toml" | \
 
 # Build dependencies only (cache layer)
 RUN case "$TARGETPLATFORM" in \
-        "linux/amd64") cargo build --release --target x86_64-unknown-linux-musl ;; \
-        "linux/arm64") cargo build --release --target aarch64-unknown-linux-musl ;; \
+        "linux/amd64") cargo build --release --target x86_64-unknown-linux-gnu ;; \
+        "linux/arm64") cargo build --release --target aarch64-unknown-linux-gnu ;; \
     esac
 
 # Copy source code
@@ -73,27 +74,28 @@ RUN cargo run --bin gproto
 # Build the actual application
 RUN case "$TARGETPLATFORM" in \
         "linux/amd64") \
-            cargo build --release --target x86_64-unknown-linux-musl --bin rustfs && \
-            cp target/x86_64-unknown-linux-musl/release/rustfs /usr/local/bin/rustfs \
+            cargo build --release --target x86_64-unknown-linux-gnu --bin rustfs && \
+            cp target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
             ;; \
         "linux/arm64") \
-            cargo build --release --target aarch64-unknown-linux-musl --bin rustfs && \
-            cp target/aarch64-unknown-linux-musl/release/rustfs /usr/local/bin/rustfs \
+            cargo build --release --target aarch64-unknown-linux-gnu --bin rustfs && \
+            cp target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
             ;; \
     esac
 
-# Runtime stage - minimal Alpine image
-FROM alpine:latest
+# Runtime stage - Ubuntu minimal for better compatibility
+FROM ubuntu:22.04
 
 # Install runtime dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y \
     ca-certificates \
     tzdata \
-    && rm -rf /var/cache/apk/*
+    wget \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create rustfs user and group
-RUN addgroup -g 1000 rustfs && \
-    adduser -D -s /bin/sh -u 1000 -G rustfs rustfs
+RUN groupadd -g 1000 rustfs && \
+    useradd -d /app -g rustfs -u 1000 -s /bin/bash rustfs
 
 WORKDIR /app
 
@@ -103,7 +105,7 @@ RUN mkdir -p /data/rustfs{0,1,2,3} && \
 
 # Copy binary from builder stage
 COPY --from=builder /usr/local/bin/rustfs /app/rustfs
-RUN chmod +x /app/rustfs
+RUN chmod +x /app/rustfs && chown rustfs:rustfs /app/rustfs
 
 # Switch to non-root user
 USER rustfs

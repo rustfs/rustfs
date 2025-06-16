@@ -48,11 +48,13 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             arch: amd64
-          - target: aarch64-unknown-linux-musl
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             arch: arm64
+            use_cross: true
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -63,13 +65,17 @@ jobs:
           target: ${{ matrix.target }}
           components: rustfmt, clippy
 
-      - name: Install cross-compilation dependencies
+      - name: Install cross-compilation dependencies (native build)
+        if: matrix.use_cross == false
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
+
+      - name: Install cross tool (cross compilation)
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -94,10 +100,18 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.target }}-
             ${{ runner.os }}-cargo-
 
-      - name: Build RustFS binary
+      - name: Generate protobuf code
+        run: cargo run --bin gproto
+
+      - name: Build RustFS binary (native)
+        if: matrix.use_cross == false
         run: |
-          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           cargo build --release --target ${{ matrix.target }} --bin rustfs
+
+      - name: Build RustFS binary (cross)
+        if: matrix.use_cross == true
+        run: |
+          cross build --release --target ${{ matrix.target }} --bin rustfs
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -128,9 +142,9 @@ jobs:
       - name: Setup binary files
         run: |
           mkdir -p target/x86_64-unknown-linux-musl/release
-          mkdir -p target/aarch64-unknown-linux-musl/release
+          mkdir -p target/aarch64-unknown-linux-gnu/release
           cp artifacts/rustfs-amd64/rustfs target/x86_64-unknown-linux-musl/release/
-          cp artifacts/rustfs-arm64/rustfs target/aarch64-unknown-linux-musl/release/
+          cp artifacts/rustfs-arm64/rustfs target/aarch64-unknown-linux-gnu/release/
           chmod +x target/*/release/rustfs
 
       - name: Set up Docker Buildx
