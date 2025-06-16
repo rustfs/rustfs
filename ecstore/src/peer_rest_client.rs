@@ -664,7 +664,7 @@ impl PeerRestClient {
 
         let response = client.load_rebalance_meta(request).await?.into_inner();
 
-        warn!("load_rebalance_meta response {:?}", response);
+        warn!("load_rebalance_meta response {:?}, grid_host: {:?}", response, &self.grid_host);
         if !response.success {
             if let Some(msg) = response.error_info {
                 return Err(Error::other(msg));

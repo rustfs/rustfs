@@ -3,6 +3,7 @@ use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Client, Method, RequestBuilder};
+use std::error::Error as _;
 use std::io::{self, Error};
 use std::pin::Pin;
 use std::sync::LazyLock;
@@ -43,12 +44,18 @@ pin_project! {
 }
 
 impl HttpReader {
-    pub async fn new(url: String, method: Method, headers: HeaderMap) -> io::Result<Self> {
+    pub async fn new(url: String, method: Method, headers: HeaderMap, body: Option<Vec<u8>>) -> io::Result<Self> {
         http_log!("[HttpReader::new] url: {url}, method: {method:?}, headers: {headers:?}");
-        Self::with_capacity(url, method, headers, 0).await
+        Self::with_capacity(url, method, headers, body, 0).await
     }
     /// Create a new HttpReader from a URL. The request is performed immediately.
-    pub async fn with_capacity(url: String, method: Method, headers: HeaderMap, mut read_buf_size: usize) -> io::Result<Self> {
+    pub async fn with_capacity(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        mut read_buf_size: usize,
+    ) -> io::Result<Self> {
         http_log!(
             "[HttpReader::with_capacity] url: {url}, method: {method:?}, headers: {headers:?}, buf_size: {}",
             read_buf_size
@@ -60,12 +67,12 @@ impl HttpReader {
             Ok(resp) => {
                 http_log!("[HttpReader::new] HEAD status: {}", resp.status());
                 if !resp.status().is_success() {
-                    return Err(Error::other(format!("HEAD failed: status {}", resp.status())));
+                    return Err(Error::other(format!("HEAD failed: url: {}, status {}", url, resp.status())));
                 }
             }
             Err(e) => {
                 http_log!("[HttpReader::new] HEAD error: {e}");
-                return Err(Error::other(format!("HEAD request failed: {e}")));
+                return Err(Error::other(e.source().map(|s| s.to_string()).unwrap_or_else(|| e.to_string())));
             }
         }
 
@@ -80,7 +87,10 @@ impl HttpReader {
         let (err_tx, err_rx) = oneshot::channel::<io::Error>();
         tokio::spawn(async move {
             let client = get_http_client();
-            let request: RequestBuilder = client.request(method_clone, url_clone).headers(headers_clone);
+            let mut request: RequestBuilder = client.request(method_clone, url_clone).headers(headers_clone);
+            if let Some(body) = body {
+                request = request.body(body);
+            }
 
             let response = request.send().await;
             match response {

@@ -2,20 +2,20 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use futures::lock::Mutex;
-use http::{HeaderMap, Method};
+use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use protos::{
     node_service_time_out_client,
     proto_gen::node_service::{
         CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
         DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, NsScannerRequest,
         ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
-        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WalkDirRequest, WriteAllRequest, WriteMetadataRequest,
+        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
     },
 };
-use rmp_serde::Serializer;
-use rustfs_filemeta::{FileInfo, MetaCacheEntry, MetacacheWriter, RawFileInfo};
+
+use rustfs_filemeta::{FileInfo, RawFileInfo};
 use rustfs_rio::{HttpReader, HttpWriter};
-use serde::Serialize;
+
 use tokio::{
     io::AsyncWrite,
     sync::mpsc::{self, Sender},
@@ -256,47 +256,55 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
-    // FIXME: TODO: use writer
-    #[tracing::instrument(skip(self, wr))]
-    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
-        let now = std::time::SystemTime::now();
-        info!("walk_dir {}/{}/{:?}", self.endpoint.to_string(), opts.bucket, opts.filter_prefix);
-        let mut wr = wr;
-        let mut out = MetacacheWriter::new(&mut wr);
-        let mut buf = Vec::new();
-        opts.serialize(&mut Serializer::new(&mut buf))?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
-        let request = Request::new(WalkDirRequest {
-            disk: self.endpoint.to_string(),
-            walk_dir_options: buf.into(),
-        });
-        let mut response = client.walk_dir(request).await?.into_inner();
+    // // FIXME: TODO: use writer
+    // #[tracing::instrument(skip(self, wr))]
+    // async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+    //     let now = std::time::SystemTime::now();
+    //     info!("walk_dir {}/{}/{:?}", self.endpoint.to_string(), opts.bucket, opts.filter_prefix);
+    //     let mut wr = wr;
+    //     let mut out = MetacacheWriter::new(&mut wr);
+    //     let mut buf = Vec::new();
+    //     opts.serialize(&mut Serializer::new(&mut buf))?;
+    //     let mut client = node_service_time_out_client(&self.addr)
+    //         .await
+    //         .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
+    //     let request = Request::new(WalkDirRequest {
+    //         disk: self.endpoint.to_string(),
+    //         walk_dir_options: buf.into(),
+    //     });
+    //     let mut response = client.walk_dir(request).await?.into_inner();
 
-        loop {
-            match response.next().await {
-                Some(Ok(resp)) => {
-                    if !resp.success {
-                        return Err(Error::other(resp.error_info.unwrap_or_default()));
-                    }
-                    let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-                        .map_err(|_| Error::other(format!("Unexpected response: {:?}", response)))?;
-                    out.write_obj(&entry).await?;
-                }
-                None => break,
-                _ => return Err(Error::other(format!("Unexpected response: {:?}", response))),
-            }
-        }
+    //     loop {
+    //         match response.next().await {
+    //             Some(Ok(resp)) => {
+    //                 if !resp.success {
+    //                     if let Some(err) = resp.error_info {
+    //                         if err == "Unexpected EOF" {
+    //                             return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, err)));
+    //                         } else {
+    //                             return Err(Error::other(err));
+    //                         }
+    //                     }
 
-        info!(
-            "walk_dir {}/{:?} done {:?}",
-            opts.bucket,
-            opts.filter_prefix,
-            now.elapsed().unwrap_or_default()
-        );
-        Ok(())
-    }
+    //                     return Err(Error::other("unknown error"));
+    //                 }
+    //                 let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
+    //                     .map_err(|_| Error::other(format!("Unexpected response: {:?}", response)))?;
+    //                 out.write_obj(&entry).await?;
+    //             }
+    //             None => break,
+    //             _ => return Err(Error::other(format!("Unexpected response: {:?}", response))),
+    //         }
+    //     }
+
+    //     info!(
+    //         "walk_dir {}/{:?} done {:?}",
+    //         opts.bucket,
+    //         opts.filter_prefix,
+    //         now.elapsed().unwrap_or_default()
+    //     );
+    //     Ok(())
+    // }
 
     #[tracing::instrument(skip(self))]
     async fn delete_version(
@@ -559,6 +567,28 @@ impl DiskAPI for RemoteDisk {
         Ok(response.volumes)
     }
 
+    #[tracing::instrument(skip(self, wr))]
+    async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        info!("walk_dir {}", self.endpoint.to_string());
+
+        let url = format!(
+            "{}/rustfs/rpc/walk_dir?disk={}",
+            self.endpoint.grid_host(),
+            urlencoding::encode(self.endpoint.to_string().as_str()),
+        );
+
+        let opts = serde_json::to_vec(&opts)?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let mut reader = HttpReader::new(url, Method::GET, headers, Some(opts)).await?;
+
+        tokio::io::copy(&mut reader, wr).await?;
+
+        Ok(())
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         info!("read_file {}/{}", volume, path);
@@ -573,7 +603,7 @@ impl DiskAPI for RemoteDisk {
             0
         );
 
-        Ok(Box::new(HttpReader::new(url, Method::GET, HeaderMap::new()).await?))
+        Ok(Box::new(HttpReader::new(url, Method::GET, HeaderMap::new(), None).await?))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -589,7 +619,7 @@ impl DiskAPI for RemoteDisk {
             length
         );
 
-        Ok(Box::new(HttpReader::new(url, Method::GET, HeaderMap::new()).await?))
+        Ok(Box::new(HttpReader::new(url, Method::GET, HeaderMap::new(), None).await?))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]

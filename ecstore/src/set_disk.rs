@@ -860,6 +860,7 @@ impl SetDisks {
         };
 
         if let Some(err) = reduce_read_quorum_errs(errs, OBJECT_OP_IGNORED_ERRS, expected_rquorum) {
+            error!("object_quorum_from_meta: {:?}, errs={:?}", err, errs);
             return Err(err);
         }
 
@@ -872,6 +873,7 @@ impl SetDisks {
         let parity_blocks = Self::common_parity(&parities, default_parity_count as i32);
 
         if parity_blocks < 0 {
+            error!("object_quorum_from_meta: parity_blocks < 0, errs={:?}", errs);
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -936,6 +938,7 @@ impl SetDisks {
             Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count).map_err(map_err_notfound)?;
 
         if read_quorum < 0 {
+            error!("check_upload_id_exists: read_quorum < 0, errs={:?}", errs);
             return Err(Error::ErasureReadQuorum);
         }
 
@@ -977,6 +980,7 @@ impl SetDisks {
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
         if quorum < 1 {
+            error!("find_file_info_in_quorum: quorum < 1");
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -1035,6 +1039,7 @@ impl SetDisks {
         }
 
         if max_count < quorum {
+            error!("find_file_info_in_quorum: max_count < quorum, max_val={:?}", max_val);
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -1079,7 +1084,7 @@ impl SetDisks {
             return Ok(fi);
         }
 
-        warn!("QuorumError::Read, find_file_info_in_quorum fileinfo not found");
+        error!("find_file_info_in_quorum: fileinfo not found");
 
         Err(DiskError::ErasureReadQuorum)
     }
@@ -1763,10 +1768,18 @@ impl SetDisks {
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
-        let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
-            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
+        let (read_quorum, _) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
+                return Err(e);
+            }
+        };
 
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum as usize) {
+            error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
@@ -1896,6 +1909,7 @@ impl SetDisks {
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < erasure.data_shards {
                 if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
+                    error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
                     return Err(to_object_err(read_err.into(), vec![bucket, object]));
                 }
 
@@ -2942,6 +2956,7 @@ impl SetDisks {
             }
             Ok(m)
         } else {
+            error!("delete_if_dang_ling: is_object_dang_ling errs={:?}", errs);
             Err(DiskError::ErasureReadQuorum)
         }
     }
@@ -3004,41 +3019,56 @@ impl SetDisks {
         }
 
         let (buckets_results_tx, mut buckets_results_rx) = mpsc::channel::<DataUsageEntryInfo>(disks.len());
+        // 新增：从环境变量读取基础间隔，默认30秒
+        let set_disk_update_interval_secs = std::env::var("RUSTFS_NS_SCANNER_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
         let update_time = {
             let mut rng = rand::rng();
-            Duration::from_secs(30) + Duration::from_secs_f64(10.0 * rng.random_range(0.0..1.0))
+            Duration::from_secs(set_disk_update_interval_secs) + Duration::from_secs_f64(10.0 * rng.random_range(0.0..1.0))
         };
         let mut ticker = interval(update_time);
 
-        let task = tokio::spawn(async move {
-            let last_save = Some(SystemTime::now());
-            let mut need_loop = true;
-            while need_loop {
-                select! {
-                    _ = ticker.tick() => {
-                        if !cache.info.last_update.eq(&last_save) {
-                            let _ = cache.save(DATA_USAGE_CACHE_NAME).await;
-                            let _ = updates.send(cache.clone()).await;
-                        }
-                    }
-                    result = buckets_results_rx.recv() => {
-                        match result {
-                            Some(result) => {
-                                cache.replace(&result.name, &result.parent, result.entry);
-                                cache.info.last_update = Some(SystemTime::now());
-                            },
-                            None => {
-                                need_loop = false;
-                                cache.info.next_cycle = want_cycle;
-                                cache.info.last_update = Some(SystemTime::now());
+        // 检查是否需要运行后台任务
+        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        let task = if !skip_background_task {
+            Some(tokio::spawn(async move {
+                let last_save = Some(SystemTime::now());
+                let mut need_loop = true;
+                while need_loop {
+                    select! {
+                        _ = ticker.tick() => {
+                            if !cache.info.last_update.eq(&last_save) {
                                 let _ = cache.save(DATA_USAGE_CACHE_NAME).await;
                                 let _ = updates.send(cache.clone()).await;
                             }
                         }
+                        result = buckets_results_rx.recv() => {
+                            match result {
+                                Some(result) => {
+                                    cache.replace(&result.name, &result.parent, result.entry);
+                                    cache.info.last_update = Some(SystemTime::now());
+                                },
+                                None => {
+                                    need_loop = false;
+                                    cache.info.next_cycle = want_cycle;
+                                    cache.info.last_update = Some(SystemTime::now());
+                                    let _ = cache.save(DATA_USAGE_CACHE_NAME).await;
+                                    let _ = updates.send(cache.clone()).await;
+                                }
+                            }
+                        }
                     }
                 }
-            }
-        });
+            }))
+        } else {
+            None
+        };
 
         // Restrict parallelism for disk usage scanner
         let max_procs = num_cpus::get();
@@ -3142,7 +3172,9 @@ impl SetDisks {
 
         info!("ns_scanner start");
         let _ = join_all(futures).await;
-        let _ = task.await;
+        if let Some(task) = task {
+            let _ = task.await;
+        }
         info!("ns_scanner completed");
         Ok(())
     }
@@ -3894,7 +3926,13 @@ impl ObjectIO for SetDisks {
 
         let stream = mem::replace(&mut data.stream, HashReader::new(Box::new(Cursor::new(Vec::new())), 0, 0, None, false)?);
 
-        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: 出错，删除临时目录
+        let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+            Ok((r, w)) => (r, w),
+            Err(e) => {
+                error!("encode err {:?}", e);
+                return Err(e.into());
+            }
+        }; // TODO: 出错，删除临时目录
 
         let _ = mem::replace(&mut data.stream, reader);
         // if let Err(err) = close_bitrot_writers(&mut writers).await {

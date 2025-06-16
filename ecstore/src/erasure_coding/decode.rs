@@ -242,12 +242,14 @@ impl Erasure {
             }
 
             if !reader.can_decode(&shards) {
+                error!("erasure decode can_decode errs: {:?}", &errs);
                 ret_err = Some(Error::ErasureReadQuorum.into());
                 break;
             }
 
             // Decode the shards
             if let Err(e) = self.decode_data(&mut shards) {
+                error!("erasure decode decode_data err: {:?}", e);
                 ret_err = Some(e);
                 break;
             }
@@ -255,6 +257,7 @@ impl Erasure {
             let n = match write_data_blocks(writer, &shards, self.data_shards, block_offset, block_length).await {
                 Ok(n) => n,
                 Err(e) => {
+                    error!("erasure decode write_data_blocks err: {:?}", e);
                     ret_err = Some(e);
                     break;
                 }
