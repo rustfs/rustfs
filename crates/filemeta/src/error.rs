@@ -427,6 +427,9 @@ mod tests {
             let filemeta_error: Error = io_error.into();
 
             match filemeta_error {
+                Error::Unexpected => {
+                    assert_eq!(kind, ErrorKind::UnexpectedEof);
+                }
                 Error::Io(extracted_io_error) => {
                     assert_eq!(extracted_io_error.kind(), kind);
                     assert!(extracted_io_error.to_string().contains("test error"));
