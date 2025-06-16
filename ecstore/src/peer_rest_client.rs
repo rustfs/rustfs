@@ -292,8 +292,8 @@ impl PeerRestClient {
         let mut buf_o = Vec::new();
         opts.serialize(&mut Serializer::new(&mut buf_o))?;
         let request = Request::new(GetMetricsRequest {
-            metric_type: buf_t,
-            opts: buf_o,
+            metric_type: buf_t.into(),
+            opts: buf_o.into(),
         });
 
         let response = client.get_metrics(request).await?.into_inner();
