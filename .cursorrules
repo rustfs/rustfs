@@ -3,6 +3,7 @@
 ## ⚠️ CRITICAL DEVELOPMENT RULES ⚠️
 
 ### 🚨 NEVER COMMIT DIRECTLY TO MASTER/MAIN BRANCH 🚨
+
 - **This is the most important rule - NEVER modify code directly on main or master branch**
 - **Always work on feature branches and use pull requests for all changes**
 - **Any direct commits to master/main branch are strictly forbidden**
@@ -15,23 +16,27 @@
   6. Create a pull request for review
 
 ## Project Overview
+
 RustFS is a high-performance distributed object storage system written in Rust, compatible with S3 API. The project adopts a modular architecture, supporting erasure coding storage, multi-tenant management, observability, and other enterprise-level features.
 
 ## Core Architecture Principles
 
 ### 1. Modular Design
+
 - Project uses Cargo workspace structure, containing multiple independent crates
 - Core modules: `rustfs` (main service), `ecstore` (erasure coding storage), `common` (shared components)
 - Functional modules: `iam` (identity management), `madmin` (management interface), `crypto` (encryption), etc.
 - Tool modules: `cli` (command line tool), `crates/*` (utility libraries)
 
 ### 2. Asynchronous Programming Pattern
+
 - Comprehensive use of `tokio` async runtime
 - Prioritize `async/await` syntax
 - Use `async-trait` for async methods in traits
 - Avoid blocking operations, use `spawn_blocking` when necessary
 
 ### 3. Error Handling Strategy
+
 - **Use modular, type-safe error handling with `thiserror`**
 - Each module should define its own error type using `thiserror::Error` derive macro
 - Support error chains and context information through `#[from]` and `#[source]` attributes
@@ -54,6 +59,7 @@ RustFS is a high-performance distributed object storage system written in Rust, 
 ## Code Style Guidelines
 
 ### 1. Formatting Configuration
+
 ```toml
 max_width = 130
 fn_call_width = 90
@@ -69,21 +75,25 @@ single_line_let_else_max_width = 100
 Before every commit, you **MUST**:
 
 1. **Format your code**:
+
    ```bash
    cargo fmt --all
    ```
 
 2. **Verify formatting**:
+
    ```bash
    cargo fmt --all --check
    ```
 
 3. **Pass clippy checks**:
+
    ```bash
    cargo clippy --all-targets --all-features -- -D warnings
    ```
 
 4. **Ensure compilation**:
+
    ```bash
    cargo check --all-targets
    ```
@@ -158,6 +168,7 @@ Example output when formatting fails:
 ```
 
 ### 3. Naming Conventions
+
 - Use `snake_case` for functions, variables, modules
 - Use `PascalCase` for types, traits, enums
 - Constants use `SCREAMING_SNAKE_CASE`
@@ -167,6 +178,7 @@ Example output when formatting fails:
 - Choose names that clearly express the purpose and intent
 
 ### 4. Type Declaration Guidelines
+
 - **Prefer type inference over explicit type declarations** when the type is obvious from context
 - Let the Rust compiler infer types whenever possible to reduce verbosity and improve maintainability
 - Only specify types explicitly when:
@@ -176,6 +188,7 @@ Example output when formatting fails:
   - Needed to resolve ambiguity between multiple possible types
 
 **Good examples (prefer these):**
+
 ```rust
 // Compiler can infer the type
 let items = vec![1, 2, 3, 4];
@@ -187,6 +200,7 @@ let filtered: Vec<_> = items.iter().filter(|&&x| x > 2).collect();
 ```
 
 **Avoid unnecessary explicit types:**
+
 ```rust
 // Unnecessary - type is obvious
 let items: Vec<i32> = vec![1, 2, 3, 4];
@@ -195,6 +209,7 @@ let result: ProcessResult = process_data(&input);
 ```
 
 **When explicit types are beneficial:**
+
 ```rust
 // API boundaries - always specify types
 pub fn process_data(input: &[u8]) -> Result<ProcessResult, Error> { ... }
@@ -207,6 +222,7 @@ let cache: HashMap<String, Arc<Mutex<CacheEntry>>> = HashMap::new();
 ```
 
 ### 5. Documentation Comments
+
 - Public APIs must have documentation comments
 - Use `///` for documentation comments
 - Complex functions add `# Examples` and `# Parameters` descriptions
@@ -215,6 +231,7 @@ let cache: HashMap<String, Arc<Mutex<CacheEntry>>> = HashMap::new();
 - Avoid meaningless comments like "debug 111" or placeholder text
 
 ### 6. Import Guidelines
+
 - Standard library imports first
 - Third-party crate imports in the middle
 - Project internal imports last
@@ -223,6 +240,7 @@ let cache: HashMap<String, Arc<Mutex<CacheEntry>>> = HashMap::new();
 ## Asynchronous Programming Guidelines
 
 ### 1. Trait Definition
+
 ```rust
 #[async_trait::async_trait]
 pub trait StorageAPI: Send + Sync {
@@ -231,6 +249,7 @@ pub trait StorageAPI: Send + Sync {
 ```
 
 ### 2. Error Handling
+
 ```rust
 // Use ? operator to propagate errors
 async fn example_function() -> Result<()> {
@@ -241,6 +260,7 @@ async fn example_function() -> Result<()> {
 ```
 
 ### 3. Concurrency Control
+
 - Use `Arc` and `Mutex`/`RwLock` for shared state management
 - Prioritize async locks from `tokio::sync`
 - Avoid holding locks for long periods
@@ -248,6 +268,7 @@ async fn example_function() -> Result<()> {
 ## Logging and Tracing Guidelines
 
 ### 1. Tracing Usage
+
 ```rust
 #[tracing::instrument(skip(self, data))]
 async fn process_data(&self, data: &[u8]) -> Result<()> {
@@ -257,6 +278,7 @@ async fn process_data(&self, data: &[u8]) -> Result<()> {
 ```
 
 ### 2. Log Levels
+
 - `error!`: System errors requiring immediate attention
 - `warn!`: Warning information that may affect functionality
 - `info!`: Important business information
@@ -264,6 +286,7 @@ async fn process_data(&self, data: &[u8]) -> Result<()> {
 - `trace!`: Detailed execution paths
 
 ### 3. Structured Logging
+
 ```rust
 info!(
     counter.rustfs_api_requests_total = 1_u64,
@@ -276,22 +299,23 @@ info!(
 ## Error Handling Guidelines
 
 ### 1. Error Type Definition
+
 ```rust
 // Use thiserror for module-specific error types
 #[derive(thiserror::Error, Debug)]
 pub enum MyError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Storage error: {0}")]
     Storage(#[from] ecstore::error::StorageError),
-    
+
     #[error("Custom error: {message}")]
     Custom { message: String },
-    
+
     #[error("File not found: {path}")]
     FileNotFound { path: String },
-    
+
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 }
@@ -301,6 +325,7 @@ pub type Result<T> = core::result::Result<T, MyError>;
 ```
 
 ### 2. Error Helper Methods
+
 ```rust
 impl MyError {
     /// Create error from any compatible error type
@@ -314,6 +339,7 @@ impl MyError {
 ```
 
 ### 3. Error Conversion Between Modules
+
 ```rust
 // Convert between different module error types
 impl From<ecstore::error::StorageError> for MyError {
@@ -340,6 +366,7 @@ impl From<MyError> for ecstore::error::StorageError {
 ```
 
 ### 4. Error Context and Propagation
+
 ```rust
 // Use ? operator for clean error propagation
 async fn example_function() -> Result<()> {
@@ -351,14 +378,15 @@ async fn example_function() -> Result<()> {
 // Add context to errors
 fn process_with_context(path: &str) -> Result<()> {
     std::fs::read(path)
-        .map_err(|e| MyError::Custom { 
-            message: format!("Failed to read {}: {}", path, e) 
+        .map_err(|e| MyError::Custom {
+            message: format!("Failed to read {}: {}", path, e)
         })?;
     Ok(())
 }
 ```
 
 ### 5. API Error Conversion (S3 Example)
+
 ```rust
 // Convert storage errors to API-specific errors
 use s3s::{S3Error, S3ErrorCode};
@@ -404,6 +432,7 @@ impl From<ApiError> for S3Error {
 ### 6. Error Handling Best Practices
 
 #### Pattern Matching and Error Classification
+
 ```rust
 // Use pattern matching for specific error handling
 async fn handle_storage_operation() -> Result<()> {
@@ -415,8 +444,8 @@ async fn handle_storage_operation() -> Result<()> {
         }
         Err(ecstore::error::StorageError::BucketNotFound(bucket)) => {
             error!("Bucket not found: {}", bucket);
-            Err(MyError::Custom { 
-                message: format!("Bucket {} does not exist", bucket) 
+            Err(MyError::Custom {
+                message: format!("Bucket {} does not exist", bucket)
             })
         }
         Err(e) => {
@@ -428,30 +457,32 @@ async fn handle_storage_operation() -> Result<()> {
 ```
 
 #### Error Aggregation and Reporting
+
 ```rust
 // Collect and report multiple errors
 pub fn validate_configuration(config: &Config) -> Result<()> {
     let mut errors = Vec::new();
-    
+
     if config.bucket_name.is_empty() {
         errors.push("Bucket name cannot be empty");
     }
-    
+
     if config.region.is_empty() {
         errors.push("Region must be specified");
     }
-    
+
     if !errors.is_empty() {
         return Err(MyError::Custom {
             message: format!("Configuration validation failed: {}", errors.join(", "))
         });
     }
-    
+
     Ok(())
 }
 ```
 
 #### Contextual Error Information
+
 ```rust
 // Add operation context to errors
 #[tracing::instrument(skip(self))]
@@ -468,11 +499,13 @@ async fn upload_file(&self, bucket: &str, key: &str, data: Vec<u8>) -> Result<()
 ## Performance Optimization Guidelines
 
 ### 1. Memory Management
+
 - Use `Bytes` instead of `Vec<u8>` for zero-copy operations
 - Avoid unnecessary cloning, use reference passing
 - Use `Arc` for sharing large objects
 
 ### 2. Concurrency Optimization
+
 ```rust
 // Use join_all for concurrent operations
 let futures = disks.iter().map(|disk| disk.operation());
@@ -480,12 +513,14 @@ let results = join_all(futures).await;
 ```
 
 ### 3. Caching Strategy
+
 - Use `lazy_static` or `OnceCell` for global caching
 - Implement LRU cache to avoid memory leaks
 
 ## Testing Guidelines
 
 ### 1. Unit Tests
+
 ```rust
 #[cfg(test)]
 mod tests {
@@ -507,10 +542,10 @@ mod tests {
     #[test]
     fn test_error_conversion() {
         use ecstore::error::StorageError;
-        
+
         let storage_err = StorageError::BucketNotFound("test-bucket".to_string());
         let api_err: ApiError = storage_err.into();
-        
+
         assert_eq!(api_err.code, S3ErrorCode::NoSuchBucket);
         assert!(api_err.message.contains("test-bucket"));
         assert!(api_err.source.is_some());
@@ -520,7 +555,7 @@ mod tests {
     fn test_error_types() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let my_err = MyError::Io(io_err);
-        
+
         // Test error matching
         match my_err {
             MyError::Io(_) => {}, // Expected
@@ -532,7 +567,7 @@ mod tests {
     fn test_error_context() {
         let result = process_with_context("nonexistent_file.txt");
         assert!(result.is_err());
-        
+
         let err = result.unwrap_err();
         match err {
             MyError::Custom { message } => {
@@ -546,10 +581,12 @@ mod tests {
 ```
 
 ### 2. Integration Tests
+
 - Use `e2e_test` module for end-to-end testing
 - Simulate real storage environments
 
 ### 3. Test Quality Standards
+
 - Write meaningful test cases that verify actual functionality
 - Avoid placeholder or debug content like "debug 111", "test test", etc.
 - Use descriptive test names that clearly indicate what is being tested
@@ -559,9 +596,11 @@ mod tests {
 ## Cross-Platform Compatibility Guidelines
 
 ### 1. CPU Architecture Compatibility
+
 - **Always consider multi-platform and different CPU architecture compatibility** when writing code
 - Support major architectures: x86_64, aarch64 (ARM64), and other target platforms
 - Use conditional compilation for architecture-specific code:
+
 ```rust
 #[cfg(target_arch = "x86_64")]
 fn optimized_x86_64_function() { /* x86_64 specific implementation */ }
@@ -574,16 +613,19 @@ fn generic_function() { /* Generic fallback implementation */ }
 ```
 
 ### 2. Platform-Specific Dependencies
+
 - Use feature flags for platform-specific dependencies
 - Provide fallback implementations for unsupported platforms
 - Test on multiple architectures in CI/CD pipeline
 
 ### 3. Endianness Considerations
+
 - Use explicit byte order conversion when dealing with binary data
 - Prefer `to_le_bytes()`, `from_le_bytes()` for consistent little-endian format
 - Use `byteorder` crate for complex binary format handling
 
 ### 4. SIMD and Performance Optimizations
+
 - Use portable SIMD libraries like `wide` or `packed_simd`
 - Provide fallback implementations for non-SIMD architectures
 - Use runtime feature detection when appropriate
@@ -591,10 +633,12 @@ fn generic_function() { /* Generic fallback implementation */ }
 ## Security Guidelines
 
 ### 1. Memory Safety
+
 - Disable `unsafe` code (workspace.lints.rust.unsafe_code = "deny")
 - Use `rustls` instead of `openssl`
 
 ### 2. Authentication and Authorization
+
 ```rust
 // Use IAM system for permission checks
 let identity = iam.authenticate(&access_key, &secret_key).await?;
@@ -604,11 +648,13 @@ iam.authorize(&identity, &action, &resource).await?;
 ## Configuration Management Guidelines
 
 ### 1. Environment Variables
+
 - Use `RUSTFS_` prefix
 - Support both configuration files and environment variables
 - Provide reasonable default values
 
 ### 2. Configuration Structure
+
 ```rust
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -622,10 +668,12 @@ pub struct Config {
 ## Dependency Management Guidelines
 
 ### 1. Workspace Dependencies
+
 - Manage versions uniformly at workspace level
 - Use `workspace = true` to inherit configuration
 
 ### 2. Feature Flags
+
 ```rust
 [features]
 default = ["file"]
@@ -636,15 +684,18 @@ kafka = ["dep:rdkafka"]
 ## Deployment and Operations Guidelines
 
 ### 1. Containerization
+
 - Provide Dockerfile and docker-compose configuration
 - Support multi-stage builds to optimize image size
 
 ### 2. Observability
+
 - Integrate OpenTelemetry for distributed tracing
 - Support Prometheus metrics collection
 - Provide Grafana dashboards
 
 ### 3. Health Checks
+
 ```rust
 // Implement health check endpoint
 async fn health_check() -> Result<HealthStatus> {
@@ -655,6 +706,7 @@ async fn health_check() -> Result<HealthStatus> {
 ## Code Review Checklist
 
 ### 1. **Code Formatting and Quality (MANDATORY)**
+
 - [ ] **Code is properly formatted** (`cargo fmt --all --check` passes)
 - [ ] **All clippy warnings are resolved** (`cargo clippy --all-targets --all-features -- -D warnings` passes)
 - [ ] **Code compiles successfully** (`cargo check --all-targets` passes)
@@ -662,27 +714,32 @@ async fn health_check() -> Result<HealthStatus> {
 - [ ] **No formatting-related changes** mixed with functional changes (separate commits)
 
 ### 2. Functionality
+
 - [ ] Are all error cases properly handled?
 - [ ] Is there appropriate logging?
 - [ ] Is there necessary test coverage?
 
 ### 3. Performance
+
 - [ ] Are unnecessary memory allocations avoided?
 - [ ] Are async operations used correctly?
 - [ ] Are there potential deadlock risks?
 
 ### 4. Security
+
 - [ ] Are input parameters properly validated?
 - [ ] Are there appropriate permission checks?
 - [ ] Is information leakage avoided?
 
 ### 5. Cross-Platform Compatibility
+
 - [ ] Does the code work on different CPU architectures (x86_64, aarch64)?
 - [ ] Are platform-specific features properly gated with conditional compilation?
 - [ ] Is byte order handling correct for binary data?
 - [ ] Are there appropriate fallback implementations for unsupported platforms?
 
 ### 6. Code Commits and Documentation
+
 - [ ] Does it comply with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)?
 - [ ] Are commit messages concise and under 72 characters for the title line?
 - [ ] Commit titles should be concise and in English, avoid Chinese
@@ -691,6 +748,7 @@ async fn health_check() -> Result<HealthStatus> {
 ## Common Patterns and Best Practices
 
 ### 1. Resource Management
+
 ```rust
 // Use RAII pattern for resource management
 pub struct ResourceGuard {
@@ -705,6 +763,7 @@ impl Drop for ResourceGuard {
 ```
 
 ### 2. Dependency Injection
+
 ```rust
 // Use dependency injection pattern
 pub struct Service {
@@ -714,6 +773,7 @@ pub struct Service {
 ```
 
 ### 3. Graceful Shutdown
+
 ```rust
 // Implement graceful shutdown
 async fn shutdown_gracefully(shutdown_rx: &mut Receiver<()>) {
@@ -732,16 +792,19 @@ async fn shutdown_gracefully(shutdown_rx: &mut Receiver<()>) {
 ## Domain-Specific Guidelines
 
 ### 1. Storage Operations
+
 - All storage operations must support erasure coding
 - Implement read/write quorum mechanisms
 - Support data integrity verification
 
 ### 2. Network Communication
+
 - Use gRPC for internal service communication
 - HTTP/HTTPS support for S3-compatible API
 - Implement connection pooling and retry mechanisms
 
 ### 3. Metadata Management
+
 - Use FlatBuffers for serialization
 - Support version control and migration
 - Implement metadata caching
@@ -751,11 +814,12 @@ These rules should serve as guiding principles when developing the RustFS projec
 ### 4. Code Operations
 
 #### Branch Management
- - **🚨 CRITICAL: NEVER modify code directly on main or master branch - THIS IS ABSOLUTELY FORBIDDEN 🚨**
- - **⚠️ ANY DIRECT COMMITS TO MASTER/MAIN WILL BE REJECTED AND MUST BE REVERTED IMMEDIATELY ⚠️**
- - **Always work on feature branches - NO EXCEPTIONS**
- - Always check the .cursorrules file before starting to ensure you understand the project guidelines
- - **MANDATORY workflow for ALL changes:**
+
+- **🚨 CRITICAL: NEVER modify code directly on main or master branch - THIS IS ABSOLUTELY FORBIDDEN 🚨**
+- **⚠️ ANY DIRECT COMMITS TO MASTER/MAIN WILL BE REJECTED AND MUST BE REVERTED IMMEDIATELY ⚠️**
+- **Always work on feature branches - NO EXCEPTIONS**
+- Always check the .cursorrules file before starting to ensure you understand the project guidelines
+- **MANDATORY workflow for ALL changes:**
    1. `git checkout main` (switch to main branch)
    2. `git pull` (get latest changes)
    3. `git checkout -b feat/your-feature-name` (create and switch to feature branch)
@@ -763,28 +827,54 @@ These rules should serve as guiding principles when developing the RustFS projec
    5. Test thoroughly before committing
    6. Commit and push to the feature branch
    7. Create a pull request for code review
- - Use descriptive branch names following the pattern: `feat/feature-name`, `fix/issue-name`, `refactor/component-name`, etc.
- - **Double-check current branch before ANY commit: `git branch` to ensure you're NOT on main/master**
- - Ensure all changes are made on feature branches and merged through pull requests
+- Use descriptive branch names following the pattern: `feat/feature-name`, `fix/issue-name`, `refactor/component-name`, etc.
+- **Double-check current branch before ANY commit: `git branch` to ensure you're NOT on main/master**
+- Ensure all changes are made on feature branches and merged through pull requests
 
 #### Development Workflow
- - Use English for all code comments, documentation, and variable names
- - Write meaningful and descriptive names for variables, functions, and methods
- - Avoid meaningless test content like "debug 111" or placeholder values
- - Before each change, carefully read the existing code to ensure you understand the code structure and implementation, do not break existing logic implementation, do not introduce new issues
- - Ensure each change provides sufficient test cases to guarantee code correctness
- - Do not arbitrarily modify numbers and constants in test cases, carefully analyze their meaning to ensure test case correctness
- - When writing or modifying tests, check existing test cases to ensure they have scientific naming and rigorous logic testing, if not compliant, modify test cases to ensure scientific and rigorous testing
- - **Before committing any changes, run `cargo clippy --all-targets --all-features -- -D warnings` to ensure all code passes Clippy checks**
- - After each development completion, first git add . then git commit -m "feat: feature description" or "fix: issue description", ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
- - **Keep commit messages concise and under 72 characters** for the title line, use body for detailed explanations if needed
- - After each development completion, first git push to remote repository
- - After each change completion, summarize the changes, do not create summary files, provide a brief change description, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
- - Provide change descriptions needed for PR in the conversation, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
- - **Always provide PR descriptions in English** after completing any changes, including:
-   - Clear and concise title following Conventional Commits format
-   - Detailed description of what was changed and why
-   - List of key changes and improvements
-   - Any breaking changes or migration notes if applicable
-   - Testing information and verification steps
- - **Provide PR descriptions in copyable markdown format** enclosed in code blocks for easy one-click copying
+
+- Use English for all code comments, documentation, and variable names
+- Write meaningful and descriptive names for variables, functions, and methods
+- Avoid meaningless test content like "debug 111" or placeholder values
+- Before each change, carefully read the existing code to ensure you understand the code structure and implementation, do not break existing logic implementation, do not introduce new issues
+- Ensure each change provides sufficient test cases to guarantee code correctness
+- Do not arbitrarily modify numbers and constants in test cases, carefully analyze their meaning to ensure test case correctness
+- When writing or modifying tests, check existing test cases to ensure they have scientific naming and rigorous logic testing, if not compliant, modify test cases to ensure scientific and rigorous testing
+- **Before committing any changes, run `cargo clippy --all-targets --all-features -- -D warnings` to ensure all code passes Clippy checks**
+- After each development completion, first git add . then git commit -m "feat: feature description" or "fix: issue description", ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+- **Keep commit messages concise and under 72 characters** for the title line, use body for detailed explanations if needed
+- After each development completion, first git push to remote repository
+- After each change completion, summarize the changes, do not create summary files, provide a brief change description, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+- Provide change descriptions needed for PR in the conversation, ensure compliance with [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)
+- **Always provide PR descriptions in English** after completing any changes, including:
+  - Clear and concise title following Conventional Commits format
+  - Detailed description of what was changed and why
+  - List of key changes and improvements
+  - Any breaking changes or migration notes if applicable
+  - Testing information and verification steps
+- **Provide PR descriptions in copyable markdown format** enclosed in code blocks for easy one-click copying
+
+## 🚫 AI 文档生成限制
+
+### 禁止生成总结文档
+
+- **严格禁止创建任何形式的AI生成总结文档**
+- **不得创建包含大量表情符号、详细格式化表格和典型AI风格的文档**
+- **不得在项目中生成以下类型的文档：**
+  - 基准测试总结文档（BENCHMARK*.md）
+  - 实现对比分析文档（IMPLEMENTATION_COMPARISON*.md）
+  - 性能分析报告文档
+  - 架构总结文档
+  - 功能对比文档
+  - 任何带有大量表情符号和格式化内容的文档
+- **如果需要文档，请只在用户明确要求时创建，并保持简洁实用的风格**
+- **文档应当专注于实际需要的信息，避免过度格式化和装饰性内容**
+- **任何发现的AI生成总结文档都应该立即删除**
+
+### 允许的文档类型
+
+- README.md（项目介绍，保持简洁）
+- 技术文档（仅在明确需要时创建）
+- 用户手册（仅在明确需要时创建）
+- API文档（从代码生成）
+- 变更日志（CHANGELOG.md）
