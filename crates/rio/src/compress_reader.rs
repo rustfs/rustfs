@@ -3,15 +3,20 @@ use crate::{EtagResolvable, HashReaderDetector};
 use crate::{HashReaderMut, Reader};
 use pin_project_lite::pin_project;
 use rustfs_utils::compress::{CompressionAlgorithm, compress_block, decompress_block};
-use rustfs_utils::{put_uvarint, put_uvarint_len, uvarint};
+use rustfs_utils::{put_uvarint, uvarint};
+use std::cmp::min;
 use std::io::{self};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
+// use tracing::error;
 
 const COMPRESS_TYPE_COMPRESSED: u8 = 0x00;
 const COMPRESS_TYPE_UNCOMPRESSED: u8 = 0x01;
 const COMPRESS_TYPE_END: u8 = 0xFF;
+
+const DEFAULT_BLOCK_SIZE: usize = 1 << 20; // 1MB
+const HEADER_LEN: usize = 8;
 
 pin_project! {
     #[derive(Debug)]
@@ -43,11 +48,11 @@ where
             pos: 0,
             done: false,
             compression_algorithm,
-            block_size: 1 << 20, // Default 1MB
+            block_size: DEFAULT_BLOCK_SIZE,
             index: Index::new(),
             written: 0,
             uncomp_written: 0,
-            temp_buffer: Vec::with_capacity(1 << 20), // 预分配1MB容量
+            temp_buffer: Vec::with_capacity(DEFAULT_BLOCK_SIZE), // Pre-allocate capacity
             temp_pos: 0,
         }
     }
@@ -85,9 +90,9 @@ where
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
-        // If buffer has data, serve from buffer first
+        // Copy from buffer first if available
         if *this.pos < this.buffer.len() {
-            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len() - *this.pos);
+            let to_copy = min(buf.remaining(), this.buffer.len() - *this.pos);
             buf.put_slice(&this.buffer[*this.pos..*this.pos + to_copy]);
             *this.pos += to_copy;
             if *this.pos == this.buffer.len() {
@@ -96,101 +101,57 @@ where
             }
             return Poll::Ready(Ok(()));
         }
-
         if *this.done {
             return Poll::Ready(Ok(()));
         }
-
-        // 如果临时缓冲区未满，继续读取数据
+        // Fill temporary buffer
         while this.temp_buffer.len() < *this.block_size {
             let remaining = *this.block_size - this.temp_buffer.len();
             let mut temp = vec![0u8; remaining];
             let mut temp_buf = ReadBuf::new(&mut temp);
-
             match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
                 Poll::Pending => {
-                    // 如果临时缓冲区为空，返回 Pending
                     if this.temp_buffer.is_empty() {
                         return Poll::Pending;
                     }
-                    // 否则继续处理已读取的数据
                     break;
                 }
                 Poll::Ready(Ok(())) => {
                     let n = temp_buf.filled().len();
                     if n == 0 {
-                        // EOF
                         if this.temp_buffer.is_empty() {
-                            // // 如果没有累积的数据，写入结束标记
-                            // let mut header = [0u8; 8];
-                            // header[0] = 0xFF;
-                            // *this.buffer = header.to_vec();
-                            // *this.pos = 0;
-                            // *this.done = true;
-                            // let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
-                            // buf.put_slice(&this.buffer[..to_copy]);
-                            // *this.pos += to_copy;
                             return Poll::Ready(Ok(()));
                         }
-                        // 有累积的数据，处理它
                         break;
                     }
                     this.temp_buffer.extend_from_slice(&temp[..n]);
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => {
+                    // error!("CompressReader poll_read: read inner error: {e}");
+                    return Poll::Ready(Err(e));
+                }
             }
         }
-
-        // 处理累积的数据
+        // Process accumulated data
         if !this.temp_buffer.is_empty() {
             let uncompressed_data = &this.temp_buffer;
-            let crc = crc32fast::hash(uncompressed_data);
-            let compressed_data = compress_block(uncompressed_data, *this.compression_algorithm);
-
-            let uncompressed_len = uncompressed_data.len();
-            let compressed_len = compressed_data.len();
-            let int_len = put_uvarint_len(uncompressed_len as u64);
-
-            let len = compressed_len + int_len;
-            let header_len = 8;
-
-            let mut header = [0u8; 8];
-            header[0] = COMPRESS_TYPE_COMPRESSED;
-            header[1] = (len & 0xFF) as u8;
-            header[2] = ((len >> 8) & 0xFF) as u8;
-            header[3] = ((len >> 16) & 0xFF) as u8;
-            header[4] = (crc & 0xFF) as u8;
-            header[5] = ((crc >> 8) & 0xFF) as u8;
-            header[6] = ((crc >> 16) & 0xFF) as u8;
-            header[7] = ((crc >> 24) & 0xFF) as u8;
-
-            let mut out = Vec::with_capacity(len + header_len);
-            out.extend_from_slice(&header);
-
-            let mut uncompressed_len_buf = vec![0u8; int_len];
-            put_uvarint(&mut uncompressed_len_buf, uncompressed_len as u64);
-            out.extend_from_slice(&uncompressed_len_buf);
-
-            out.extend_from_slice(&compressed_data);
-
+            let out = build_compressed_block(uncompressed_data, *this.compression_algorithm);
             *this.written += out.len();
-            *this.uncomp_written += uncompressed_len;
-
-            this.index.add(*this.written as i64, *this.uncomp_written as i64)?;
-
+            *this.uncomp_written += uncompressed_data.len();
+            if let Err(e) = this.index.add(*this.written as i64, *this.uncomp_written as i64) {
+                // error!("CompressReader index add error: {e}");
+                return Poll::Ready(Err(e));
+            }
             *this.buffer = out;
             *this.pos = 0;
-            this.temp_buffer.clear();
-
-            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+            this.temp_buffer.truncate(0); // More efficient way to clear
+            let to_copy = min(buf.remaining(), this.buffer.len());
             buf.put_slice(&this.buffer[..to_copy]);
             *this.pos += to_copy;
             if *this.pos == this.buffer.len() {
                 this.buffer.clear();
                 *this.pos = 0;
             }
-
-            // println!("write block, to_copy: {}, pos: {}, buffer_len: {}", to_copy, this.pos, this.buffer.len());
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -222,9 +183,10 @@ where
 
 pin_project! {
     /// A reader wrapper that decompresses data on the fly using DEFLATE algorithm.
-    // 1~3 bytes store the length of the compressed data
-    // The first byte stores the type of the compressed data: 00 = compressed, 01 = uncompressed
-    // The first 4 bytes store the CRC32 checksum of the compressed data
+    /// Header format:
+    /// - First byte: compression type (00 = compressed, 01 = uncompressed, FF = end)
+    /// - Bytes 1-3: length of compressed data (little-endian)
+    /// - Bytes 4-7: CRC32 checksum of uncompressed data (little-endian)
     #[derive(Debug)]
     pub struct DecompressReader<R> {
         #[pin]
@@ -232,11 +194,11 @@ pin_project! {
         buffer: Vec<u8>,
         buffer_pos: usize,
         finished: bool,
-        // New fields for saving header read progress across polls
+        // Fields for saving header read progress across polls
         header_buf: [u8; 8],
         header_read: usize,
         header_done: bool,
-        // New fields for saving compressed block read progress across polls
+        // Fields for saving compressed block read progress across polls
         compressed_buf: Option<Vec<u8>>,
         compressed_read: usize,
         compressed_len: usize,
@@ -271,28 +233,24 @@ where
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
-
-        // Serve from buffer if any
+        // Copy from buffer first if available
         if *this.buffer_pos < this.buffer.len() {
-            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len() - *this.buffer_pos);
+            let to_copy = min(buf.remaining(), this.buffer.len() - *this.buffer_pos);
             buf.put_slice(&this.buffer[*this.buffer_pos..*this.buffer_pos + to_copy]);
             *this.buffer_pos += to_copy;
             if *this.buffer_pos == this.buffer.len() {
                 this.buffer.clear();
                 *this.buffer_pos = 0;
             }
-
             return Poll::Ready(Ok(()));
         }
-
         if *this.finished {
             return Poll::Ready(Ok(()));
         }
-
-        // Read header, support saving progress across polls
-        while !*this.header_done && *this.header_read < 8 {
-            let mut temp = [0u8; 8];
-            let mut temp_buf = ReadBuf::new(&mut temp[0..8 - *this.header_read]);
+        // Read header
+        while !*this.header_done && *this.header_read < HEADER_LEN {
+            let mut temp = [0u8; HEADER_LEN];
+            let mut temp_buf = ReadBuf::new(&mut temp[0..HEADER_LEN - *this.header_read]);
             match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {
@@ -304,31 +262,25 @@ where
                     *this.header_read += n;
                 }
                 Poll::Ready(Err(e)) => {
+                    // error!("DecompressReader poll_read: read header error: {e}");
                     return Poll::Ready(Err(e));
                 }
             }
-            if *this.header_read < 8 {
-                // Header not fully read, return Pending or Ok, wait for next poll
+            if *this.header_read < HEADER_LEN {
                 return Poll::Pending;
             }
         }
-
         if !*this.header_done && *this.header_read == 0 {
             return Poll::Ready(Ok(()));
         }
-
         let typ = this.header_buf[0];
         let len = (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
         let crc = (this.header_buf[4] as u32)
             | ((this.header_buf[5] as u32) << 8)
             | ((this.header_buf[6] as u32) << 16)
             | ((this.header_buf[7] as u32) << 24);
-
-        // Header is used up, reset header_read
         *this.header_read = 0;
         *this.header_done = true;
-
-        // Save compressed block read progress across polls
         if this.compressed_buf.is_none() {
             *this.compressed_len = len;
             *this.compressed_buf = Some(vec![0u8; *this.compressed_len]);
@@ -347,6 +299,7 @@ where
                     *this.compressed_read += n;
                 }
                 Poll::Ready(Err(e)) => {
+                    // error!("DecompressReader poll_read: read compressed block error: {e}");
                     this.compressed_buf.take();
                     *this.compressed_read = 0;
                     *this.compressed_len = 0;
@@ -354,14 +307,13 @@ where
                 }
             }
         }
-
-        // After reading all, unpack
         let (uncompress_len, uvarint) = uvarint(&compressed_buf[0..16]);
         let compressed_data = &compressed_buf[uvarint as usize..];
         let decompressed = if typ == COMPRESS_TYPE_COMPRESSED {
             match decompress_block(compressed_data, *this.compression_algorithm) {
                 Ok(out) => out,
                 Err(e) => {
+                    // error!("DecompressReader decompress_block error: {e}");
                     this.compressed_buf.take();
                     *this.compressed_read = 0;
                     *this.compressed_len = 0;
@@ -371,27 +323,28 @@ where
         } else if typ == COMPRESS_TYPE_UNCOMPRESSED {
             compressed_data.to_vec()
         } else if typ == COMPRESS_TYPE_END {
-            // Handle end marker
             this.compressed_buf.take();
             *this.compressed_read = 0;
             *this.compressed_len = 0;
             *this.finished = true;
             return Poll::Ready(Ok(()));
         } else {
+            // error!("DecompressReader unknown compression type: {typ}");
             this.compressed_buf.take();
             *this.compressed_read = 0;
             *this.compressed_len = 0;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown compression type")));
         };
         if decompressed.len() != uncompress_len as usize {
+            // error!("DecompressReader decompressed length mismatch: {} != {}", decompressed.len(), uncompress_len);
             this.compressed_buf.take();
             *this.compressed_read = 0;
             *this.compressed_len = 0;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Decompressed length mismatch")));
         }
-
         let actual_crc = crc32fast::hash(&decompressed);
         if actual_crc != crc {
+            // error!("DecompressReader CRC32 mismatch: actual {actual_crc} != expected {crc}");
             this.compressed_buf.take();
             *this.compressed_read = 0;
             *this.compressed_len = 0;
@@ -399,20 +352,17 @@ where
         }
         *this.buffer = decompressed;
         *this.buffer_pos = 0;
-        // Clear compressed block state for next block
         this.compressed_buf.take();
         *this.compressed_read = 0;
         *this.compressed_len = 0;
         *this.header_done = false;
-        let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+        let to_copy = min(buf.remaining(), this.buffer.len());
         buf.put_slice(&this.buffer[..to_copy]);
         *this.buffer_pos += to_copy;
-
         if *this.buffer_pos == this.buffer.len() {
             this.buffer.clear();
             *this.buffer_pos = 0;
         }
-
         Poll::Ready(Ok(()))
     }
 }
@@ -436,6 +386,30 @@ where
     fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
         self.inner.as_hash_reader_mut()
     }
+}
+
+/// Build compressed block with header + uvarint + compressed data
+fn build_compressed_block(uncompressed_data: &[u8], compression_algorithm: CompressionAlgorithm) -> Vec<u8> {
+    let crc = crc32fast::hash(uncompressed_data);
+    let compressed_data = compress_block(uncompressed_data, compression_algorithm);
+    let uncompressed_len = uncompressed_data.len();
+    let mut uncompressed_len_buf = [0u8; 10];
+    let int_len = put_uvarint(&mut uncompressed_len_buf[..], uncompressed_len as u64);
+    let len = compressed_data.len() + int_len;
+    let mut header = [0u8; HEADER_LEN];
+    header[0] = COMPRESS_TYPE_COMPRESSED;
+    header[1] = (len & 0xFF) as u8;
+    header[2] = ((len >> 8) & 0xFF) as u8;
+    header[3] = ((len >> 16) & 0xFF) as u8;
+    header[4] = (crc & 0xFF) as u8;
+    header[5] = ((crc >> 8) & 0xFF) as u8;
+    header[6] = ((crc >> 16) & 0xFF) as u8;
+    header[7] = ((crc >> 24) & 0xFF) as u8;
+    let mut out = Vec::with_capacity(len + HEADER_LEN);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&uncompressed_len_buf[..int_len]);
+    out.extend_from_slice(&compressed_data);
+    out
 }
 
 #[cfg(test)]

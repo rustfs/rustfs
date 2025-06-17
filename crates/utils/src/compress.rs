@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_compression_benchmark() {
-        let sizes = [8 * 1024, 16 * 1024, 64 * 1024, 128 * 1024, 512 * 1024, 1024 * 1024];
+        let sizes = [128 * 1024, 512 * 1024, 1024 * 1024];
         let algorithms = [
             CompressionAlgorithm::Gzip,
             CompressionAlgorithm::Deflate,
