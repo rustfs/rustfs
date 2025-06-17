@@ -6,7 +6,7 @@ use ecstore::disk::DiskAPI;
 use ecstore::disk::WalkDirOptions;
 use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use ecstore::store::find_local_disk;
-use futures::TryStreamExt;
+use futures::StreamExt;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -17,8 +17,8 @@ use s3s::S3Result;
 use s3s::dto::StreamingBlob;
 use s3s::s3_error;
 use serde_urlencoded::from_bytes;
+use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
-use tokio_util::io::StreamReader;
 use tracing::warn;
 
 pub const RPC_PREFIX: &str = "/rustfs/rpc";
@@ -194,11 +194,12 @@ impl Operation for PutFile {
                 .map_err(|e| s3_error!(InternalError, "read file err {}", e))?
         };
 
-        let mut body = StreamReader::new(req.input.into_stream().map_err(std::io::Error::other));
-
-        tokio::io::copy(&mut body, &mut file)
-            .await
-            .map_err(|e| s3_error!(InternalError, "copy err {}", e))?;
+        let mut body = req.input;
+        while let Some(item) = body.next().await {
+            let bytes = item.map_err(|e| s3_error!(InternalError, "body stream err {}", e))?;
+            let result = file.write_all(&bytes).await;
+            result.map_err(|e| s3_error!(InternalError, "write file err {}", e))?;
+        }
 
         Ok(S3Response::new((StatusCode::OK, Body::empty())))
     }
