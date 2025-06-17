@@ -311,7 +311,7 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
     let tmpfile = Uuid::new_v4().to_string();
 
     let disk = disk.as_ref().unwrap();
-    disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data.into_bytes())
+    disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data.into_bytes().into())
         .await?;
 
     disk.rename_file(RUSTFS_META_BUCKET, tmpfile.as_str(), RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)

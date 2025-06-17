@@ -298,7 +298,7 @@ impl Node for NodeService {
     async fn write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk.write_all(&request.volume, &request.path, request.data.into()).await {
+            match disk.write_all(&request.volume, &request.path, request.data).await {
                 Ok(_) => Ok(tonic::Response::new(WriteAllResponse {
                     success: true,
                     error: None,
