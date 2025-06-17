@@ -104,8 +104,8 @@ impl Erasure {
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
             let mut total = 0;
+            let mut buf = vec![0u8; block_size];
             loop {
-                let mut buf = vec![0u8; block_size];
                 match rustfs_utils::read_full(&mut reader, &mut buf).await {
                     Ok(n) if n > 0 => {
                         total += n;
@@ -122,7 +122,6 @@ impl Erasure {
                         return Err(e);
                     }
                 }
-                buf.clear();
             }
 
             Ok((reader, total))
