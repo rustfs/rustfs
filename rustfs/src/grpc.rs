@@ -277,7 +277,7 @@ impl Node for NodeService {
             match disk.read_all(&request.volume, &request.path).await {
                 Ok(data) => Ok(tonic::Response::new(ReadAllResponse {
                     success: true,
-                    data: data.into(),
+                    data,
                     error: None,
                 })),
                 Err(err) => Ok(tonic::Response::new(ReadAllResponse {

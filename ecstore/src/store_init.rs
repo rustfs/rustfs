@@ -256,7 +256,7 @@ pub async fn load_format_erasure(disk: &DiskStore, heal: bool) -> disk::error::R
             _ => e,
         })?;
 
-    let mut fm = FormatV3::try_from(data.as_slice())?;
+    let mut fm = FormatV3::try_from(data.as_ref())?;
 
     if heal {
         let info = disk
