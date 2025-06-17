@@ -18,7 +18,7 @@ RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.
     && mv flatc /usr/local/bin/ && chmod +x /usr/local/bin/flatc && rm -rf Linux.flatc.binary.g++-13.zip
 
 # install rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 COPY .docker/cargo.config.toml /root/.cargo/config.toml
 
