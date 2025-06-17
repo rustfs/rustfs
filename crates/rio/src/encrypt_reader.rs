@@ -1,5 +1,6 @@
 use crate::HashReaderDetector;
 use crate::HashReaderMut;
+use crate::compress_index::{Index, TryGetIndex};
 use crate::{EtagResolvable, Reader};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -142,6 +143,15 @@ where
 
     fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
         self.inner.as_hash_reader_mut()
+    }
+}
+
+impl<R> TryGetIndex for EncryptReader<R>
+where
+    R: TryGetIndex,
+{
+    fn try_get_index(&self) -> Option<&Index> {
+        self.inner.try_get_index()
     }
 }
 
@@ -339,6 +349,8 @@ where
 mod tests {
     use std::io::Cursor;
 
+    use crate::WarpReader;
+
     use super::*;
     use rand::RngCore;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -352,7 +364,7 @@ mod tests {
         rand::rng().fill_bytes(&mut nonce);
 
         let reader = BufReader::new(&data[..]);
-        let encrypt_reader = EncryptReader::new(reader, key, nonce);
+        let encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
 
         // Encrypt
         let mut encrypt_reader = encrypt_reader;
@@ -361,7 +373,7 @@ mod tests {
 
         // Decrypt using DecryptReader
         let reader = Cursor::new(encrypted.clone());
-        let decrypt_reader = DecryptReader::new(reader, key, nonce);
+        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
@@ -380,7 +392,7 @@ mod tests {
 
         // Encrypt
         let reader = BufReader::new(&data[..]);
-        let encrypt_reader = EncryptReader::new(reader, key, nonce);
+        let encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
@@ -388,7 +400,7 @@ mod tests {
         // Now test DecryptReader
 
         let reader = Cursor::new(encrypted.clone());
-        let decrypt_reader = DecryptReader::new(reader, key, nonce);
+        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
@@ -408,13 +420,13 @@ mod tests {
         rand::rng().fill_bytes(&mut nonce);
 
         let reader = std::io::Cursor::new(data.clone());
-        let encrypt_reader = EncryptReader::new(reader, key, nonce);
+        let encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
         encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
 
         let reader = std::io::Cursor::new(encrypted.clone());
-        let decrypt_reader = DecryptReader::new(reader, key, nonce);
+        let decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();

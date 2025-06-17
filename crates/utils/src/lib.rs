@@ -25,6 +25,9 @@ pub mod string;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 
+#[cfg(feature = "compress")]
+pub mod compress;
+
 #[cfg(feature = "tls")]
 pub use certs::*;
 #[cfg(feature = "hash")]
@@ -36,3 +39,6 @@ pub use ip::*;
 
 #[cfg(feature = "crypto")]
 pub use crypto::*;
+
+#[cfg(feature = "compress")]
+pub use compress::*;

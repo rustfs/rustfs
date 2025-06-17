@@ -112,7 +112,13 @@ impl Config {
         }
     }
 
-    pub fn should_inline(&self, shard_size: usize, versioned: bool) -> bool {
+    pub fn should_inline(&self, shard_size: i64, versioned: bool) -> bool {
+        if shard_size < 0 {
+            return false;
+        }
+
+        let shard_size = shard_size as usize;
+
         let mut inline_block = DEFAULT_INLINE_BLOCK;
         if self.initialized {
             inline_block = self.inline_block;

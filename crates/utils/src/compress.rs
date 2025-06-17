@@ -1,13 +1,13 @@
-use http::HeaderMap;
 use std::io::Write;
 use tokio::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CompressionAlgorithm {
+    None,
     Gzip,
-    #[default]
     Deflate,
     Zstd,
+    #[default]
     Lz4,
     Brotli,
     Snappy,
@@ -16,6 +16,7 @@ pub enum CompressionAlgorithm {
 impl CompressionAlgorithm {
     pub fn as_str(&self) -> &str {
         match self {
+            CompressionAlgorithm::None => "none",
             CompressionAlgorithm::Gzip => "gzip",
             CompressionAlgorithm::Deflate => "deflate",
             CompressionAlgorithm::Zstd => "zstd",
@@ -42,10 +43,8 @@ impl std::str::FromStr for CompressionAlgorithm {
             "lz4" => Ok(CompressionAlgorithm::Lz4),
             "brotli" => Ok(CompressionAlgorithm::Brotli),
             "snappy" => Ok(CompressionAlgorithm::Snappy),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Unsupported compression algorithm: {}", s),
-            )),
+            "none" => Ok(CompressionAlgorithm::None),
+            _ => Err(std::io::Error::other(format!("Unsupported compression algorithm: {}", s))),
         }
     }
 }
@@ -88,6 +87,7 @@ pub fn compress_block(input: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> 
             let _ = encoder.write_all(input);
             encoder.into_inner().unwrap_or_default()
         }
+        CompressionAlgorithm::None => input.to_vec(),
     }
 }
 
@@ -129,20 +129,15 @@ pub fn decompress_block(compressed: &[u8], algorithm: CompressionAlgorithm) -> i
             std::io::Read::read_to_end(&mut decoder, &mut out)?;
             Ok(out)
         }
+        CompressionAlgorithm::None => Ok(Vec::new()),
     }
-}
-
-pub const MIN_COMPRESSIBLE_SIZE: i64 = 4096;
-
-pub fn is_compressible(_headers: &HeaderMap) -> bool {
-    // TODO: Implement this function
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::time::Instant;
 
     #[test]
     fn test_compress_decompress_gzip() {
@@ -266,5 +261,58 @@ mod tests {
                 && !brotli.is_empty()
                 && !snappy.is_empty()
         );
+    }
+
+    #[test]
+    fn test_compression_benchmark() {
+        let sizes = [128 * 1024, 512 * 1024, 1024 * 1024];
+        let algorithms = [
+            CompressionAlgorithm::Gzip,
+            CompressionAlgorithm::Deflate,
+            CompressionAlgorithm::Zstd,
+            CompressionAlgorithm::Lz4,
+            CompressionAlgorithm::Brotli,
+            CompressionAlgorithm::Snappy,
+        ];
+
+        println!("\n压缩算法基准测试结果:");
+        println!(
+            "{:<10} {:<10} {:<15} {:<15} {:<15}",
+            "数据大小", "算法", "压缩时间(ms)", "压缩后大小", "压缩率"
+        );
+
+        for size in sizes {
+            // 生成可压缩的数据（重复的文本模式）
+            let pattern = b"Hello, this is a test pattern that will be repeated multiple times to create compressible data. ";
+            let data: Vec<u8> = pattern.iter().cycle().take(size).copied().collect();
+
+            for algo in algorithms {
+                // 压缩测试
+                let start = Instant::now();
+                let compressed = compress_block(&data, algo);
+                let compress_time = start.elapsed();
+
+                // 解压测试
+                let start = Instant::now();
+                let _decompressed = decompress_block(&compressed, algo).unwrap();
+                let _decompress_time = start.elapsed();
+
+                // 计算压缩率
+                let compression_ratio = (size as f64 / compressed.len() as f64) as f32;
+
+                println!(
+                    "{:<10} {:<10} {:<15.2} {:<15} {:<15.2}x",
+                    format!("{}KB", size / 1024),
+                    algo.as_str(),
+                    compress_time.as_secs_f64() * 1000.0,
+                    compressed.len(),
+                    compression_ratio
+                );
+
+                // 验证解压结果
+                assert_eq!(_decompressed, data);
+            }
+            println!(); // 添加空行分隔不同大小的结果
+        }
     }
 }

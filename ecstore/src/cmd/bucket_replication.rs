@@ -511,8 +511,8 @@ pub async fn get_heal_replicate_object_info(
 
     let mut result = ReplicateObjectInfo {
         name: oi.name.clone(),
-        size: oi.size as i64,
-        actual_size: asz as i64,
+        size: oi.size,
+        actual_size: asz,
         bucket: oi.bucket.clone(),
         //version_id: oi.version_id.clone(),
         version_id: oi
@@ -814,8 +814,8 @@ impl ReplicationPool {
             vsender.pop(); // Dropping the sender will close the channel
         }
         self.workers_sender = vsender;
-        warn!("self sender size is {:?}", self.workers_sender.len());
-        warn!("self sender size is {:?}", self.workers_sender.len());
+        // warn!("self sender size is {:?}", self.workers_sender.len());
+        // warn!("self sender size is {:?}", self.workers_sender.len());
     }
 
     async fn resize_failed_workers(&self, _count: usize) {
@@ -1758,13 +1758,13 @@ pub async fn schedule_replication(oi: ObjectInfo, o: Arc<store::ECStore>, dsc: R
     let replication_timestamp = Utc::now(); // Placeholder for timestamp parsing
     let replication_state = oi.replication_state();
 
-    let actual_size = oi.actual_size.unwrap_or(0);
+    let actual_size = oi.actual_size;
     //let ssec = oi.user_defined.contains_key("ssec");
     let ssec = false;
 
     let ri = ReplicateObjectInfo {
         name: oi.name,
-        size: oi.size as i64,
+        size: oi.size,
         bucket: oi.bucket,
         version_id: oi
             .version_id
@@ -2018,8 +2018,8 @@ impl ReplicateObjectInfo {
             mod_time: Some(
                 OffsetDateTime::from_unix_timestamp(self.mod_time.timestamp()).unwrap_or_else(|_| OffsetDateTime::now_utc()),
             ),
-            size: self.size as usize,
-            actual_size: Some(self.actual_size as usize),
+            size: self.size,
+            actual_size: self.actual_size,
             is_dir: false,
             user_defined: None, // 可以按需从别处导入
             parity_blocks: 0,
@@ -2317,7 +2317,7 @@ impl ReplicateObjectInfo {
 
         // 设置对象大小
         //rinfo.size = object_info.actual_size.unwrap_or(0);
-        rinfo.size = object_info.actual_size.map_or(0, |v| v as i64);
+        rinfo.size = object_info.actual_size;
         //rinfo.replication_action = object_info.
 
         rinfo.replication_status = ReplicationStatusType::Completed;

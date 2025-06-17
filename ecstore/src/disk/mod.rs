@@ -304,7 +304,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
+    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
         match self {
             Disk::Local(local_disk) => local_disk.create_file(_origvolume, volume, path, _file_size).await,
             Disk::Remote(remote_disk) => remote_disk.create_file(_origvolume, volume, path, _file_size).await,
@@ -491,7 +491,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;

@@ -12,13 +12,13 @@ use crate::store_api::{CompletePart, GetObjectReader, ObjectIO, ObjectOptions, P
 use common::defer;
 use http::HeaderMap;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::HashReader;
+use rustfs_rio::{HashReader, WarpReader};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -62,7 +62,7 @@ impl RebalanceStats {
 
         self.num_versions += 1;
         let on_disk_size = if !fi.deleted {
-            fi.size as i64 * (fi.erasure.data_blocks + fi.erasure.parity_blocks) as i64 / fi.erasure.data_blocks as i64
+            fi.size * (fi.erasure.data_blocks + fi.erasure.parity_blocks) as i64 / fi.erasure.data_blocks as i64
         } else {
             0
         };
@@ -703,7 +703,7 @@ impl ECStore {
     #[allow(unused_assignments)]
     #[tracing::instrument(skip(self, set))]
     async fn rebalance_entry(
-        &self,
+        self: Arc<Self>,
         bucket: String,
         pool_index: usize,
         entry: MetaCacheEntry,
@@ -834,7 +834,7 @@ impl ECStore {
                     }
                 };
 
-                if let Err(err) = self.rebalance_object(pool_index, bucket.clone(), rd).await {
+                if let Err(err) = self.clone().rebalance_object(pool_index, bucket.clone(), rd).await {
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
                         ignore = true;
                         warn!("rebalance_entry {} Entry {} is already deleted, skipping", &bucket, version.name);
@@ -890,7 +890,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rd))]
-    async fn rebalance_object(&self, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
+    async fn rebalance_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
         let object_info = rd.object_info.clone();
 
         // TODO: check : use size or actual_size ?
@@ -969,6 +969,7 @@ impl ECStore {
             }
 
             if let Err(err) = self
+                .clone()
                 .complete_multipart_upload(
                     &bucket,
                     &object_info.name,
@@ -989,8 +990,9 @@ impl ECStore {
             return Ok(());
         }
 
-        let hrd = HashReader::new(rd.stream, object_info.size as i64, object_info.size as i64, None, false)?;
-        let mut data = PutObjReader::new(hrd, object_info.size);
+        let reader = BufReader::new(rd.stream);
+        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, false)?;
+        let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self
             .put_object(

@@ -14,23 +14,20 @@ tokio = { workspace = true, features = ["full"] }
 rand = { workspace = true }
 md-5 = { workspace = true }
 http.workspace = true
-flate2 = "1.1.1"
 aes-gcm = "0.10.3"
 crc32fast = "1.4.2"
 pin-project-lite.workspace = true
 async-trait.workspace = true
 base64-simd = "0.8.0"
 hex-simd = "0.8.0"
-zstd = "0.13.3"
-lz4 = "1.28.1"
-brotli = "8.0.1"
-snap = "1.1.1"
-
+serde = { workspace = true }
 bytes.workspace = true
 reqwest.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
-rustfs-utils = {workspace = true, features= ["io","hash"]}
+rustfs-utils = {workspace = true, features= ["io","hash","compress"]}
+byteorder.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["async", "async_tokio", "tokio"] }

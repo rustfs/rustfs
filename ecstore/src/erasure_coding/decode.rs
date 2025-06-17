@@ -30,7 +30,7 @@ where
     // readers传入前应处理disk错误，确保每个reader达到可用数量的BitrotReader
     pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
         let shard_size = e.shard_size();
-        let shard_file_size = e.shard_file_size(total_length);
+        let shard_file_size = e.shard_file_size(total_length as i64) as usize;
 
         let offset = (offset / e.block_size) * shard_size;
 
@@ -142,6 +142,7 @@ where
     W: tokio::io::AsyncWrite + Send + Sync + Unpin,
 {
     if get_data_block_len(en_blocks, data_blocks) < length {
+        error!("write_data_blocks get_data_block_len < length");
         return Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough data blocks to write"));
     }
 
@@ -150,6 +151,7 @@ where
 
     for block_op in &en_blocks[..data_blocks] {
         if block_op.is_none() {
+            error!("write_data_blocks block_op.is_none()");
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "Missing data block"));
         }
 
@@ -164,7 +166,10 @@ where
         offset = 0;
 
         if write_left < block.len() {
-            writer.write_all(&block_slice[..write_left]).await?;
+            writer.write_all(&block_slice[..write_left]).await.map_err(|e| {
+                error!("write_data_blocks write_all err: {}", e);
+                e
+            })?;
 
             total_written += write_left;
             break;
@@ -172,7 +177,10 @@ where
 
         let n = block_slice.len();
 
-        writer.write_all(block_slice).await?;
+        writer.write_all(block_slice).await.map_err(|e| {
+            error!("write_data_blocks write_all2 err: {}", e);
+            e
+        })?;
 
         write_left -= n;
 
@@ -228,6 +236,7 @@ impl Erasure {
             };
 
             if block_length == 0 {
+                // error!("erasure decode decode block_length == 0");
                 break;
             }
 

@@ -640,7 +640,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter> {
+    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter> {
         info!("create_file {}/{}/{}", self.endpoint.to_string(), volume, path);
 
         let url = format!(

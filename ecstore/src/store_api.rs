@@ -7,24 +7,24 @@ use crate::store_utils::clean_metadata;
 use crate::{disk::DiskStore, heal::heal_commands::HealOpts};
 use http::{HeaderMap, HeaderValue};
 use madmin::heal_commands::HealResultItem;
+use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
-use rustfs_rio::{HashReader, Reader};
+use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::str::FromStr as _;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tracing::warn;
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
-pub const RESERVED_METADATA_PREFIX: &str = "X-Rustfs-Internal-";
-pub const RESERVED_METADATA_PREFIX_LOWER: &str = "x-rustfs-internal-";
-pub const RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
-pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MakeBucketOptions {
@@ -53,52 +53,97 @@ pub struct DeleteBucketOptions {
 
 pub struct PutObjReader {
     pub stream: HashReader,
-    pub content_length: usize,
 }
 
 impl Debug for PutObjReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PutObjReader")
-            .field("content_length", &self.content_length)
-            .finish()
+        f.debug_struct("PutObjReader").finish()
     }
 }
 
 impl PutObjReader {
-    pub fn new(stream: HashReader, content_length: usize) -> Self {
-        PutObjReader { stream, content_length }
+    pub fn new(stream: HashReader) -> Self {
+        PutObjReader { stream }
     }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
-        let content_length = data.len();
+        let content_length = data.len() as i64;
         PutObjReader {
-            stream: HashReader::new(Box::new(Cursor::new(data)), content_length as i64, content_length as i64, None, false)
+            stream: HashReader::new(Box::new(WarpReader::new(Cursor::new(data))), content_length, content_length, None, false)
                 .unwrap(),
-            content_length,
         }
+    }
+
+    pub fn size(&self) -> i64 {
+        self.stream.size()
+    }
+
+    pub fn actual_size(&self) -> i64 {
+        self.stream.actual_size()
     }
 }
 
 pub struct GetObjectReader {
-    pub stream: Box<dyn Reader>,
+    pub stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     pub object_info: ObjectInfo,
 }
 
 impl GetObjectReader {
     #[tracing::instrument(level = "debug", skip(reader))]
     pub fn new(
-        reader: Box<dyn Reader>,
+        reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
         rs: Option<HTTPRangeSpec>,
         oi: &ObjectInfo,
         opts: &ObjectOptions,
         _h: &HeaderMap<HeaderValue>,
-    ) -> Result<(Self, usize, usize)> {
+    ) -> Result<(Self, usize, i64)> {
         let mut rs = rs;
 
         if let Some(part_number) = opts.part_number {
             if rs.is_none() {
                 rs = HTTPRangeSpec::from_object_info(oi, part_number);
             }
+        }
+
+        // TODO:Encrypted
+
+        let (algo, is_compressed) = oi.is_compressed_ok()?;
+
+        // TODO: check TRANSITION
+
+        if is_compressed {
+            let actual_size = oi.get_actual_size()?;
+            let (off, length) = (0, oi.size);
+            let (_dec_off, dec_length) = (0, actual_size);
+            if let Some(_rs) = rs {
+                // TODO: range spec is not supported for compressed object
+                return Err(Error::other("The requested range is not satisfiable"));
+                // let (off, length) = rs.get_offset_length(actual_size)?;
+            }
+
+            let dec_reader = DecompressReader::new(reader, algo);
+
+            let actual_size = if actual_size > 0 {
+                actual_size as usize
+            } else {
+                return Err(Error::other(format!("invalid decompressed size {}", actual_size)));
+            };
+
+            warn!("actual_size: {}", actual_size);
+            let dec_reader = LimitReader::new(dec_reader, actual_size);
+
+            let mut oi = oi.clone();
+            oi.size = dec_length;
+
+            warn!("oi.size: {}, off: {}, length: {}", oi.size, off, length);
+            return Ok((
+                GetObjectReader {
+                    stream: Box::new(dec_reader),
+                    object_info: oi,
+                },
+                off,
+                length,
+            ));
         }
 
         if let Some(rs) = rs {
@@ -142,8 +187,8 @@ impl GetObjectReader {
 #[derive(Debug)]
 pub struct HTTPRangeSpec {
     pub is_suffix_length: bool,
-    pub start: usize,
-    pub end: Option<usize>,
+    pub start: i64,
+    pub end: i64,
 }
 
 impl HTTPRangeSpec {
@@ -152,29 +197,38 @@ impl HTTPRangeSpec {
             return None;
         }
 
-        let mut start = 0;
-        let mut end = -1;
+        let mut start = 0i64;
+        let mut end = -1i64;
         for i in 0..oi.parts.len().min(part_number) {
             start = end + 1;
-            end = start + oi.parts[i].size as i64 - 1
+            end = start + (oi.parts[i].size as i64) - 1
         }
 
         Some(HTTPRangeSpec {
             is_suffix_length: false,
-            start: start as usize,
-            end: { if end < 0 { None } else { Some(end as usize) } },
+            start,
+            end,
         })
     }
 
-    pub fn get_offset_length(&self, res_size: usize) -> Result<(usize, usize)> {
+    pub fn get_offset_length(&self, res_size: i64) -> Result<(usize, i64)> {
         let len = self.get_length(res_size)?;
+
         let mut start = self.start;
         if self.is_suffix_length {
-            start = res_size - self.start
+            start = res_size + self.start;
+
+            if start < 0 {
+                start = 0;
+            }
         }
-        Ok((start, len))
+        Ok((start as usize, len))
     }
-    pub fn get_length(&self, res_size: usize) -> Result<usize> {
+    pub fn get_length(&self, res_size: i64) -> Result<i64> {
+        if res_size < 0 {
+            return Err(Error::other("The requested range is not satisfiable"));
+        }
+
         if self.is_suffix_length {
             let specified_len = self.start; // 假设 h.start 是一个 i64 类型
             let mut range_length = specified_len;
@@ -190,8 +244,8 @@ impl HTTPRangeSpec {
             return Err(Error::other("The requested range is not satisfiable"));
         }
 
-        if let Some(end) = self.end {
-            let mut end = end;
+        if self.end > -1 {
+            let mut end = self.end;
             if res_size <= end {
                 end = res_size - 1;
             }
@@ -200,7 +254,7 @@ impl HTTPRangeSpec {
             return Ok(range_length);
         }
 
-        if self.end.is_none() {
+        if self.end == -1 {
             let range_length = res_size - self.start;
             return Ok(range_length);
         }
@@ -276,6 +330,7 @@ pub struct PartInfo {
     pub last_mod: Option<OffsetDateTime>,
     pub size: usize,
     pub etag: Option<String>,
+    pub actual_size: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -298,9 +353,9 @@ pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
     pub mod_time: Option<OffsetDateTime>,
-    pub size: usize,
+    pub size: i64,
     // Actual size is the real size of the object uploaded by client.
-    pub actual_size: Option<usize>,
+    pub actual_size: i64,
     pub is_dir: bool,
     pub user_defined: Option<HashMap<String, String>>,
     pub parity_blocks: usize,
@@ -364,9 +419,23 @@ impl Clone for ObjectInfo {
 impl ObjectInfo {
     pub fn is_compressed(&self) -> bool {
         if let Some(meta) = &self.user_defined {
-            meta.contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX))
+            meta.contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER))
         } else {
             false
+        }
+    }
+
+    pub fn is_compressed_ok(&self) -> Result<(CompressionAlgorithm, bool)> {
+        let scheme = self
+            .user_defined
+            .as_ref()
+            .and_then(|meta| meta.get(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER)).cloned());
+
+        if let Some(scheme) = scheme {
+            let algorithm = CompressionAlgorithm::from_str(&scheme)?;
+            Ok((algorithm, true))
+        } else {
+            Ok((CompressionAlgorithm::None, false))
         }
     }
 
@@ -374,17 +443,17 @@ impl ObjectInfo {
         self.etag.as_ref().is_some_and(|v| v.len() != 32)
     }
 
-    pub fn get_actual_size(&self) -> std::io::Result<usize> {
-        if let Some(actual_size) = self.actual_size {
-            return Ok(actual_size);
+    pub fn get_actual_size(&self) -> std::io::Result<i64> {
+        if self.actual_size > 0 {
+            return Ok(self.actual_size);
         }
 
         if self.is_compressed() {
             if let Some(meta) = &self.user_defined {
-                if let Some(size_str) = meta.get(&format!("{}actual-size", RESERVED_METADATA_PREFIX)) {
+                if let Some(size_str) = meta.get(&format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER)) {
                     if !size_str.is_empty() {
                         // Todo: deal with error
-                        let size = size_str.parse::<usize>().map_err(|e| std::io::Error::other(e.to_string()))?;
+                        let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
                         return Ok(size);
                     }
                 }
@@ -395,8 +464,9 @@ impl ObjectInfo {
                 actual_size += part.actual_size;
             });
             if actual_size == 0 && actual_size != self.size {
-                return Err(std::io::Error::other("invalid decompressed size"));
+                return Err(std::io::Error::other(format!("invalid decompressed size {} {}", actual_size, self.size)));
             }
+
             return Ok(actual_size);
         }
 
@@ -803,7 +873,7 @@ pub trait StorageAPI: ObjectIO {
     // ListObjectParts
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()>;
     async fn complete_multipart_upload(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         object: &str,
         upload_id: &str,

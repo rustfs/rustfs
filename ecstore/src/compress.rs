@@ -1,0 +1,115 @@
+use rustfs_utils::string::has_pattern;
+use rustfs_utils::string::has_string_suffix_in_slice;
+use std::env;
+use tracing::error;
+
+pub const MIN_COMPRESSIBLE_SIZE: usize = 4096;
+
+// 环境变量名称，用于控制是否启用压缩
+pub const ENV_COMPRESSION_ENABLED: &str = "RUSTFS_COMPRESSION_ENABLED";
+
+// Some standard object extensions which we strictly dis-allow for compression.
+pub const STANDARD_EXCLUDE_COMPRESS_EXTENSIONS: &[&str] = &[
+    ".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".mp4", ".mkv", ".mov", ".jpg", ".png", ".gif",
+];
+
+// Some standard content-types which we strictly dis-allow for compression.
+pub const STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES: &[&str] = &[
+    "video/*",
+    "audio/*",
+    "application/zip",
+    "application/x-gzip",
+    "application/x-zip-compressed",
+    "application/x-compress",
+    "application/x-spoon",
+];
+
+pub fn is_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
+    // 检查环境变量是否启用压缩，默认关闭
+    if let Ok(compression_enabled) = env::var(ENV_COMPRESSION_ENABLED) {
+        if compression_enabled.to_lowercase() != "true" {
+            error!("Compression is disabled by environment variable");
+            return false;
+        }
+    } else {
+        // 环境变量未设置时默认关闭
+        return false;
+    }
+
+    let content_type = headers.get("content-type").and_then(|s| s.to_str().ok()).unwrap_or("");
+
+    // TODO: crypto request return false
+
+    if has_string_suffix_in_slice(object_name, STANDARD_EXCLUDE_COMPRESS_EXTENSIONS) {
+        error!("object_name: {} is not compressible", object_name);
+        return false;
+    }
+
+    if !content_type.is_empty() && has_pattern(STANDARD_EXCLUDE_COMPRESS_CONTENT_TYPES, content_type) {
+        error!("content_type: {} is not compressible", content_type);
+        return false;
+    }
+    true
+
+    // TODO: check from config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temp_env;
+
+    #[test]
+    fn test_is_compressible() {
+        use http::HeaderMap;
+
+        let headers = HeaderMap::new();
+
+        // 测试环境变量控制
+        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("false"), || {
+            assert!(!is_compressible(&headers, "file.txt"));
+        });
+
+        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
+            assert!(is_compressible(&headers, "file.txt"));
+        });
+
+        temp_env::with_var_unset(ENV_COMPRESSION_ENABLED, || {
+            assert!(!is_compressible(&headers, "file.txt"));
+        });
+
+        temp_env::with_var(ENV_COMPRESSION_ENABLED, Some("true"), || {
+            let mut headers = HeaderMap::new();
+            // 测试不可压缩的扩展名
+            headers.insert("content-type", "text/plain".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.gz"));
+            assert!(!is_compressible(&headers, "file.zip"));
+            assert!(!is_compressible(&headers, "file.mp4"));
+            assert!(!is_compressible(&headers, "file.jpg"));
+
+            // 测试不可压缩的内容类型
+            headers.insert("content-type", "video/mp4".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
+            headers.insert("content-type", "audio/mpeg".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
+            headers.insert("content-type", "application/zip".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
+            headers.insert("content-type", "application/x-gzip".parse().unwrap());
+            assert!(!is_compressible(&headers, "file.txt"));
+
+            // 测试可压缩的情况
+            headers.insert("content-type", "text/plain".parse().unwrap());
+            assert!(is_compressible(&headers, "file.txt"));
+            assert!(is_compressible(&headers, "file.log"));
+
+            headers.insert("content-type", "text/html".parse().unwrap());
+            assert!(is_compressible(&headers, "file.html"));
+
+            headers.insert("content-type", "application/json".parse().unwrap());
+            assert!(is_compressible(&headers, "file.json"));
+        });
+    }
+}

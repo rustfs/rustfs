@@ -157,6 +157,11 @@ prost = "0.13.5"
 prost-build = "0.13.5"
 protobuf = "3.7"
 rand = "0.9.1"
+brotli = "8.0.1"
+flate2 = "1.1.1"
+zstd = "0.13.3"
+lz4 = "1.28.1"
+snap = "1.1.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 reed-solomon-simd = { version = "3.0.0" }

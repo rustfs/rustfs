@@ -85,6 +85,11 @@ build-musl:
 	@echo "🔨 Building rustfs for x86_64-unknown-linux-musl..."
 	cargo build --target x86_64-unknown-linux-musl --bin rustfs -r
 
+.PHONY: build-gnu
+build-gnu:
+	@echo "🔨 Building rustfs for x86_64-unknown-linux-gnu..."
+	cargo build --target x86_64-unknown-linux-gnu --bin rustfs -r
+
 .PHONY: deploy-dev
 deploy-dev: build-musl
 	@echo "🚀 Deploying to dev server: $${IP}"

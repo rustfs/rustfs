@@ -93,17 +93,11 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
 }
 
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
-    warn!(
-        "save_config_with_opts, bucket: {}, file: {}, data len: {}",
-        RUSTFS_META_BUCKET,
-        file,
-        data.len()
-    );
     if let Err(err) = api
         .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data), opts)
         .await
     {
-        warn!("save_config_with_opts: err: {:?}, file: {}", err, file);
+        error!("save_config_with_opts: err: {:?}, file: {}", err, file);
         return Err(err);
     }
     Ok(())
