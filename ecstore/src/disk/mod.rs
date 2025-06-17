@@ -364,7 +364,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
+    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.write_all(volume, path, data).await,
             Disk::Remote(remote_disk) => remote_disk.write_all(volume, path, data).await,
@@ -372,7 +372,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         match self {
             Disk::Local(local_disk) => local_disk.read_all(volume, path).await,
             Disk::Remote(remote_disk) => remote_disk.read_all(volume, path).await,
@@ -504,8 +504,8 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // ReadParts
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
-    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
+    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     async fn ns_scanner(
         &self,

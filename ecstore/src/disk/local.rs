@@ -68,7 +68,7 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct FormatInfo {
     pub id: Option<Uuid>,
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub file_info: Option<Metadata>,
     pub last_check: Option<OffsetDateTime>,
 }
@@ -138,7 +138,7 @@ impl LocalDisk {
         let mut format_last_check = None;
 
         if !format_data.is_empty() {
-            let s = format_data.as_slice();
+            let s = format_data.as_ref();
             let fm = FormatV3::try_from(s).map_err(Error::other)?;
             let (set_idx, disk_idx) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
 
@@ -629,7 +629,7 @@ impl LocalDisk {
     }
 
     // write_all_public for trail
-    async fn write_all_public(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
+    async fn write_all_public(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let mut format_info = self.format_info.write().await;
             format_info.data.clone_from(&data);
@@ -637,7 +637,7 @@ impl LocalDisk {
 
         let volume_dir = self.get_bucket_path(volume)?;
 
-        self.write_all_private(volume, path, data.into(), true, &volume_dir).await?;
+        self.write_all_private(volume, path, data, true, &volume_dir).await?;
 
         Ok(())
     }
@@ -980,13 +980,13 @@ fn is_root_path(path: impl AsRef<Path>) -> bool {
 }
 
 // 过滤 std::io::ErrorKind::NotFound
-pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<Metadata>)> {
+pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Bytes, Option<Metadata>)> {
     let p = path.as_ref();
     let (data, meta) = match read_file_all(&p).await {
         Ok((data, meta)) => (data, Some(meta)),
         Err(e) => {
             if e == Error::FileNotFound {
-                (Vec::new(), None)
+                (Bytes::new(), None)
             } else {
                 return Err(e);
             }
@@ -1001,13 +1001,13 @@ pub async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Vec<u8>, Option
     Ok((data, meta))
 }
 
-pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Vec<u8>, Metadata)> {
+pub async fn read_file_all(path: impl AsRef<Path>) -> Result<(Bytes, Metadata)> {
     let p = path.as_ref();
     let meta = read_file_metadata(&path).await?;
 
     let data = fs::read(&p).await.map_err(to_file_error)?;
 
-    Ok((data, meta))
+    Ok((data.into(), meta))
 }
 
 pub async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
@@ -1131,7 +1131,7 @@ impl DiskAPI for LocalDisk {
 
         format_info.id = Some(disk_id);
         format_info.file_info = Some(file_meta);
-        format_info.data = b;
+        format_info.data = b.into();
         format_info.last_check = Some(OffsetDateTime::now_utc());
 
         Ok(Some(disk_id))
@@ -1147,7 +1147,7 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let format_info = self.format_info.read().await;
             if !format_info.data.is_empty() {
@@ -1162,7 +1162,7 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
+    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         self.write_all_public(volume, path, data).await
     }
 
@@ -1331,7 +1331,7 @@ impl DiskAPI for LocalDisk {
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
 
-        self.write_all(dst_volume, format!("{}.meta", dst_path).as_str(), meta.to_vec())
+        self.write_all(dst_volume, format!("{}.meta", dst_path).as_str(), meta)
             .await?;
 
         if let Some(parent) = src_file_path.parent() {
@@ -1700,7 +1700,7 @@ impl DiskAPI for LocalDisk {
 
         let new_dst_buf = xlmeta.marshal_msg()?;
 
-        self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf)
+        self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
             .await?;
         if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
             let no_inline = fi.data.is_none() && fi.size > 0;
@@ -1866,11 +1866,11 @@ impl DiskAPI for LocalDisk {
                     }
                 })?;
 
-            if !FileMeta::is_xl2_v1_format(buf.as_slice()) {
+            if !FileMeta::is_xl2_v1_format(buf.as_ref()) {
                 return Err(DiskError::FileVersionNotFound);
             }
 
-            let mut xl_meta = FileMeta::load(buf.as_slice())?;
+            let mut xl_meta = FileMeta::load(buf.as_ref())?;
 
             xl_meta.update_object_version(fi)?;
 
@@ -1902,7 +1902,7 @@ impl DiskAPI for LocalDisk {
 
         let fm_data = meta.marshal_msg()?;
 
-        self.write_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str(), fm_data)
+        self.write_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str(), fm_data.into())
             .await?;
 
         Ok(())
@@ -2076,7 +2076,7 @@ impl DiskAPI for LocalDisk {
                     }
 
                     res.exists = true;
-                    res.data = data;
+                    res.data = data.into();
                     res.mod_time = match meta.modified() {
                         Ok(md) => Some(OffsetDateTime::from(md)),
                         Err(_) => {
@@ -2461,8 +2461,8 @@ mod test {
         disk.make_volume("test-volume").await.unwrap();
 
         // Test write and read operations
-        let test_data = vec![1, 2, 3, 4, 5];
-        disk.write_all("test-volume", "test-file.txt", test_data.clone())
+        let test_data: Vec<u8> = vec![1, 2, 3, 4, 5];
+        disk.write_all("test-volume", "test-file.txt", test_data.clone().into())
             .await
             .unwrap();
 
@@ -2587,7 +2587,7 @@ mod test {
         // Valid format info
         let valid_format_info = FormatInfo {
             id: Some(Uuid::new_v4()),
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             file_info: Some(fs::metadata(".").await.unwrap()),
             last_check: Some(now),
         };
@@ -2596,7 +2596,7 @@ mod test {
         // Invalid format info (missing id)
         let invalid_format_info = FormatInfo {
             id: None,
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             file_info: Some(fs::metadata(".").await.unwrap()),
             last_check: Some(now),
         };
@@ -2606,7 +2606,7 @@ mod test {
         let old_time = OffsetDateTime::now_utc() - time::Duration::seconds(10);
         let old_format_info = FormatInfo {
             id: Some(Uuid::new_v4()),
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             file_info: Some(fs::metadata(".").await.unwrap()),
             last_check: Some(old_time),
         };
@@ -2627,7 +2627,7 @@ mod test {
 
         // Test existing file
         let (data, metadata) = read_file_exists(test_file).await.unwrap();
-        assert_eq!(data, b"test content");
+        assert_eq!(data.as_ref(), b"test content");
         assert!(metadata.is_some());
 
         // Clean up
@@ -2644,7 +2644,7 @@ mod test {
 
         // Test reading file
         let (data, metadata) = read_file_all(test_file).await.unwrap();
-        assert_eq!(data, test_content);
+        assert_eq!(data.as_ref(), test_content);
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), test_content.len() as u64);
 

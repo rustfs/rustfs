@@ -804,7 +804,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
+    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         info!("write_all");
         let mut client = node_service_time_out_client(&self.addr)
             .await
@@ -813,7 +813,7 @@ impl DiskAPI for RemoteDisk {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             path: path.to_string(),
-            data: data.into(),
+            data,
         });
 
         let response = client.write_all(request).await?.into_inner();
@@ -826,7 +826,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         info!("read_all {}/{}", volume, path);
         let mut client = node_service_time_out_client(&self.addr)
             .await
@@ -843,7 +843,7 @@ impl DiskAPI for RemoteDisk {
             return Err(response.error.unwrap_or_default().into());
         }
 
-        Ok(response.data.into())
+        Ok(response.data)
     }
 
     #[tracing::instrument(skip(self))]

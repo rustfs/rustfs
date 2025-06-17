@@ -1,15 +1,17 @@
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Client, Method, RequestBuilder};
 use std::error::Error as _;
 use std::io::{self, Error};
+use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc;
+use tokio_util::io::StreamReader;
 
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
 
@@ -38,8 +40,7 @@ pin_project! {
         url:String,
         method: Method,
         headers: HeaderMap,
-        inner: DuplexStream,
-        err_rx: oneshot::Receiver<std::io::Error>,
+        inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
     }
 }
 
@@ -54,11 +55,11 @@ impl HttpReader {
         method: Method,
         headers: HeaderMap,
         body: Option<Vec<u8>>,
-        mut read_buf_size: usize,
+        _read_buf_size: usize,
     ) -> io::Result<Self> {
         http_log!(
             "[HttpReader::with_capacity] url: {url}, method: {method:?}, headers: {headers:?}, buf_size: {}",
-            read_buf_size
+            _read_buf_size
         );
         // First, check if the connection is available (HEAD)
         let client = get_http_client();
@@ -76,59 +77,30 @@ impl HttpReader {
             }
         }
 
-        let url_clone = url.clone();
-        let method_clone = method.clone();
-        let headers_clone = headers.clone();
-
-        if read_buf_size == 0 {
-            read_buf_size = 8192; // Default buffer size
+        let client = get_http_client();
+        let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
+        if let Some(body) = body {
+            request = request.body(body);
         }
-        let (rd, mut wd) = tokio::io::duplex(read_buf_size);
-        let (err_tx, err_rx) = oneshot::channel::<io::Error>();
-        tokio::spawn(async move {
-            let client = get_http_client();
-            let mut request: RequestBuilder = client.request(method_clone, url_clone).headers(headers_clone);
-            if let Some(body) = body {
-                request = request.body(body);
-            }
 
-            let response = request.send().await;
-            match response {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        let mut stream = resp.bytes_stream();
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(data) => {
-                                    if let Err(e) = wd.write_all(&data).await {
-                                        let _ = err_tx.send(Error::other(format!("HttpReader write error: {}", e)));
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = err_tx.send(Error::other(format!("HttpReader stream error: {}", e)));
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        http_log!("[HttpReader::spawn] HTTP request failed with status: {}", resp.status());
-                        let _ = err_tx.send(Error::other(format!(
-                            "HttpReader HTTP request failed with non-200 status {}",
-                            resp.status()
-                        )));
-                    }
-                }
-                Err(e) => {
-                    let _ = err_tx.send(Error::other(format!("HttpReader HTTP request error: {}", e)));
-                }
-            }
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| Error::other(format!("HttpReader HTTP request error: {}", e)))?;
 
-            http_log!("[HttpReader::spawn] HTTP request completed, exiting");
-        });
+        if resp.status().is_success().not() {
+            return Err(Error::other(format!(
+                "HttpReader HTTP request failed with non-200 status {}",
+                resp.status()
+            )));
+        }
+
+        let stream = resp
+            .bytes_stream()
+            .map_err(|e| Error::other(format!("HttpReader stream error: {}", e)));
+
         Ok(Self {
-            inner: rd,
-            err_rx,
+            inner: StreamReader::new(Box::pin(stream)),
             url,
             method,
             headers,
@@ -153,14 +125,6 @@ impl AsyncRead for HttpReader {
             self.method,
             buf.remaining()
         );
-        // Check for errors from the request
-        match Pin::new(&mut self.err_rx).try_recv() {
-            Ok(e) => return Poll::Ready(Err(e)),
-            Err(oneshot::error::TryRecvError::Empty) => {}
-            Err(oneshot::error::TryRecvError::Closed) => {
-                // return Poll::Ready(Err(Error::new(ErrorKind::Other, "HTTP request closed")));
-            }
-        }
         // Read from the inner stream
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
