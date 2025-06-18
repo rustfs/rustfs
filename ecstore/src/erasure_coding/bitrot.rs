@@ -152,9 +152,9 @@ where
 
         self.inner.write_all(&self.buf).await?;
 
-        self.inner.flush().await?;
+        // self.inner.flush().await?;
 
-        let n = self.buf.len();
+        let n = buf.len();
 
         self.buf.clear();
 
