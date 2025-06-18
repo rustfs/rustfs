@@ -2,6 +2,8 @@ use crate::notifier::EventNotifier;
 use common::error::Result;
 use ecstore::store::ECStore;
 use once_cell::sync::OnceCell;
+use rustfs_notify::Event;
+use rustfs_notify::EventNotifierConfig;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info};
 
@@ -37,7 +39,7 @@ impl EventSystem {
     }
 
     /// Send events
-    pub async fn send_event(&self, event: crate::Event) -> Result<()> {
+    pub async fn send_event(&self, event: Event) -> Result<()> {
         let guard = self
             .notifier
             .lock()

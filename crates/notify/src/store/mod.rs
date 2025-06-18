@@ -8,8 +8,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 
-pub(crate) mod manager;
-pub(crate) mod queue;
+pub mod manager;
+pub mod queue;
 
 // 常量定义
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(3);
@@ -231,11 +231,16 @@ where
 }
 
 // 发送项目辅助函数
-pub async fn send_items(target: &dyn Target, mut key_ch: mpsc::Receiver<Key>, mut done_ch: mpsc::Receiver<()>, logger: Logger) {
+pub async fn send_items(
+    target: Arc<dyn Target>,
+    mut key_ch: mpsc::Receiver<Key>,
+    mut done_ch: mpsc::Receiver<()>,
+    logger: Logger,
+) {
     let mut retry_interval = time::interval(RETRY_INTERVAL);
-
+    let target_clone = target.clone();
     async fn try_send(
-        target: &dyn Target,
+        target: Arc<dyn Target>,
         key: Key,
         retry_interval: &mut time::Interval,
         done_ch: &mut mpsc::Receiver<()>,
@@ -265,7 +270,7 @@ pub async fn send_items(target: &dyn Target, mut key_ch: mpsc::Receiver<Key>, mu
             maybe_key = key_ch.recv() => {
                 match maybe_key {
                     Some(key) => {
-                        if !try_send(target, key, &mut retry_interval, &mut done_ch, logger).await {
+                        if !try_send(target_clone.clone(), key, &mut retry_interval, &mut done_ch, logger).await {
                             return;
                         }
                     }
@@ -280,7 +285,7 @@ pub async fn send_items(target: &dyn Target, mut key_ch: mpsc::Receiver<Key>, mu
 }
 
 // 流式传输项目
-pub async fn stream_items<T>(store: Arc<dyn Store<T>>, target: &dyn Target, done_ch: mpsc::Receiver<()>, logger: Logger)
+pub async fn stream_items<T>(store: Arc<dyn Store<T>>, target: Arc<dyn Target>, done_ch: mpsc::Receiver<()>, logger: Logger)
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static,
 {

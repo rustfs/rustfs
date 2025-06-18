@@ -1,5 +1,4 @@
-use crate::Error;
-use reqwest::dns::Name;
+use crate::error::Error;
 use serde::{Deserialize, Serialize};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use smallvec::{smallvec, SmallVec};

@@ -8,10 +8,12 @@ version.workspace = true
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-notify = { workspace = true }
+async-trait = { workspace = true }
 common = { workspace = true }
 ecstore = { workspace = true }
 once_cell = { workspace = true }
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
@@ -22,6 +24,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "macros", "signal", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
+url = { workspace = true }
+urlencoding = { workspace = true }
+rumqttc = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,9 +1,12 @@
 use crate::config::STORE_PREFIX;
-use crate::{ChannelAdapter, ChannelAdapterType};
+use crate::error::Error;
+use crate::store::Store;
+use crate::{ChannelAdapter, ChannelAdapterType, QueueStore};
 use crate::{Event, DEFAULT_RETRY_INTERVAL};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{self, Client, Identity, RequestBuilder};
+use rustfs_config::notify::webhook::WebhookArgs;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,7 +33,7 @@ pub const ENV_WEBHOOK_CLIENT_KEY: &str = "RUSTFS_NOTIFY_WEBHOOK_CLIENT_KEY";
 /// Webhook adapter for sending events to a webhook endpoint.
 pub struct WebhookAdapter {
     /// Configuration information
-    config: WebhookConfig,
+    config: WebhookArgs,
     /// Event storage queues
     store: Option<Arc<QueueStore<Event>>>,
     /// HTTP client
@@ -39,16 +42,9 @@ pub struct WebhookAdapter {
 
 impl WebhookAdapter {
     /// Creates a new Webhook adapter.
-    pub fn new(config: WebhookConfig) -> Self {
+    pub async fn new(config: WebhookArgs) -> Self {
         let mut builder = Client::builder();
-        if config.timeout.is_some() {
-            // Set the timeout for the client
-            match config.timeout {
-                Some(t) => builder = builder.timeout(Duration::from_secs(t)),
-                None => tracing::warn!("Timeout is not set, using default timeout"),
-            }
-        }
-        let client = if let (Some(cert_path), Some(key_path)) = (&config.client_cert, &config.client_key) {
+        let client = if let (cert_path, key_path) = (&config.client_cert, &config.client_key) {
             let cert_path = PathBuf::from(cert_path);
             let key_path = PathBuf::from(key_path);
 
@@ -90,21 +86,20 @@ impl WebhookAdapter {
         });
 
         // create a queue store if enabled
-        let store = if !config.common.queue_dir.len() > 0 {
-            let store_path = PathBuf::from(&config.common.queue_dir).join(format!(
+        let store = if !config.queue_dir.len() > 0 {
+            let store_path = PathBuf::from(&config.queue_dir).join(format!(
                 "{}-{}-{}",
                 STORE_PREFIX,
                 Webhook.as_str(),
-                config.common.identifier
+                "identifier".to_string()
             ));
-            let queue_limit = if config.common.queue_limit > 0 {
-                config.common.queue_limit
+            let queue_limit = if config.queue_limit > 0 {
+                config.queue_limit
             } else {
                 crate::config::default_queue_limit()
             };
-            let name = config.common.identifier.clone();
-            let store = QueueStore::new(store_path, name, queue_limit, Some(".event".to_string()));
-            if let Err(e) = store.open() {
+            let store = QueueStore::new(store_path, queue_limit, Some(".event"));
+            if let Err(e) = store.open().await {
                 tracing::error!("Unable to open queue storage: {}", e);
                 None
             } else {
@@ -120,9 +115,10 @@ impl WebhookAdapter {
     /// Handle backlog events in storage
     pub async fn process_backlog(&self) -> Result<(), Error> {
         if let Some(store) = &self.store {
-            let keys = store.list();
+            let keys = store.list().await;
             for key in keys {
-                match store.get_multiple(&key) {
+                let key_clone = key.clone();
+                match store.get_multiple(key).await {
                     Ok(events) => {
                         for event in events {
                             if let Err(e) = self.send_with_retry(&event).await {
@@ -132,7 +128,7 @@ impl WebhookAdapter {
                             }
                         }
                         // Deleted after successful processing
-                        if let Err(e) = store.del(&key) {
+                        if let Err(e) = store.del(key_clone).await {
                             tracing::error!("Failed to delete a handled event: {}", e);
                         }
                     }
@@ -140,7 +136,7 @@ impl WebhookAdapter {
                         tracing::error!("Failed to read events from storage: {}", e);
                         // delete the broken entries
                         // If the event cannot be read, it may be corrupted, delete it
-                        if let Err(del_err) = store.del(&key) {
+                        if let Err(del_err) = store.del(key_clone).await {
                             tracing::error!("Failed to delete a corrupted event: {}", del_err);
                         }
                     }
@@ -153,10 +149,7 @@ impl WebhookAdapter {
 
     ///Send events to the webhook endpoint with retry logic
     async fn send_with_retry(&self, event: &Event) -> Result<(), Error> {
-        let retry_interval = match self.config.retry_interval {
-            Some(t) => Duration::from_secs(t),
-            None => Duration::from_secs(DEFAULT_RETRY_INTERVAL), // Default to 3 seconds if not set
-        };
+        let retry_interval = Duration::from_secs(DEFAULT_RETRY_INTERVAL);
         let mut attempts = 0;
 
         loop {
@@ -164,17 +157,14 @@ impl WebhookAdapter {
             match self.send_request(event).await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    if attempts <= self.config.max_retries {
-                        tracing::warn!("Send to webhook fails and will be retried after 3 seconds:{}", e);
-                        sleep(retry_interval).await;
-                    } else if let Some(store) = &self.store {
+                    tracing::warn!("Send to webhook fails and will be retried after 3 seconds:{}", e);
+                    sleep(retry_interval).await;
+                    if let Some(store) = &self.store {
                         // store in a queue for later processing
                         tracing::warn!("The maximum number of retries is reached, and the event is stored in a queue:{}", e);
-                        if let Err(store_err) = store.put(event.clone()) {
+                        if let Err(store_err) = store.put(event.clone()).await {
                             tracing::error!("Events cannot be stored to a queue:{}", store_err);
                         }
-                        return Err(e);
-                    } else {
                         return Err(e);
                     }
                 }
@@ -211,7 +201,7 @@ impl WebhookAdapter {
             .post(&self.config.endpoint)
             .json(event)
             .header("Content-Type", "application/json");
-        if let Some(token) = &self.config.auth_token {
+        if let token = &self.config.auth_token {
             let tokens: Vec<&str> = token.split_whitespace().collect();
             match tokens.len() {
                 2 => request = request.header("Authorization", token),
@@ -234,9 +224,10 @@ impl WebhookAdapter {
     /// Save the event to the queue
     async fn save_to_queue(&self, event: &Event) -> Result<(), Error> {
         if let Some(store) = &self.store {
-            store
-                .put(event.clone())
-                .map_err(|e| Error::Custom(format!("Saving events to queue failed: {}", e)))?;
+            store.put(event.clone()).await.map_err(|e| {
+                tracing::error!("Failed to save event to queue: {}", e);
+                Error::Custom(format!("Failed to save event to queue: {}", e))
+            })?;
         }
         Ok(())
     }

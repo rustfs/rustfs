@@ -85,7 +85,7 @@ pub trait ChannelAdapter: Send + Sync + 'static {
 }
 
 /// Creates channel adapters based on the provided configuration.
-pub fn create_adapters(configs: Vec<AdapterConfig>) -> Result<Vec<Arc<dyn ChannelAdapter>>, Error> {
+pub async fn create_adapters(configs: Vec<AdapterConfig>) -> Result<Vec<Arc<dyn ChannelAdapter>>, Error> {
     let mut adapters: Vec<Arc<dyn ChannelAdapter>> = Vec::new();
 
     for config in configs {
@@ -93,7 +93,7 @@ pub fn create_adapters(configs: Vec<AdapterConfig>) -> Result<Vec<Arc<dyn Channe
             #[cfg(feature = "webhook")]
             AdapterConfig::Webhook(webhook_config) => {
                 webhook_config.validate().map_err(Error::ConfigError)?;
-                adapters.push(Arc::new(webhook::WebhookAdapter::new(webhook_config.clone())));
+                adapters.push(Arc::new(webhook::WebhookAdapter::new(webhook_config.clone()).await));
             }
             #[cfg(feature = "mqtt")]
             AdapterConfig::Mqtt(mqtt_config) => {

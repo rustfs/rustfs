@@ -1,7 +1,7 @@
-use crate::config::EventNotifierConfig;
-use crate::event::Event;
 use common::error::{Error, Result};
 use ecstore::store::ECStore;
+use rustfs_notify::Event;
+use rustfs_notify::EventNotifierConfig;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -25,7 +25,7 @@ impl EventNotifier {
     /// Create a new event notifier
     #[instrument(skip_all)]
     pub async fn new(store: Arc<ECStore>) -> Result<Self> {
-        let manager = crate::store::manager::EventManager::new(store);
+        let manager = rustfs_notify::manager::EventManager::new(store);
 
         let manager = Arc::new(manager.await);
 

@@ -157,7 +157,7 @@ impl EventManager {
         };
 
         let adapter_configs = config.to_adapter_configs();
-        match adapter::create_adapters(adapter_configs) {
+        match adapter::create_adapters(adapter_configs).await {
             Ok(adapters) => Ok(adapters),
             Err(err) => {
                 tracing::error!("Failed to create adapters: {:?}", err);
