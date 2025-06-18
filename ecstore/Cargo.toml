@@ -56,7 +56,9 @@ tokio-util = { workspace = true, features = ["io", "compat"] }
 crc32fast = { workspace = true }
 siphasher = { workspace = true }
 base64-simd = { workspace = true }
-sha2 = { version = "0.11.0-pre.4" }
+base64 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 hex-simd = { workspace = true }
 path-clean = { workspace = true }
 tempfile.workspace = true

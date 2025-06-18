@@ -68,7 +68,7 @@ use rustfs_utils::{
     crypto::{base64_decode, base64_encode, hex},
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::hash::Hash;
 use std::mem;
 use std::time::SystemTime;
