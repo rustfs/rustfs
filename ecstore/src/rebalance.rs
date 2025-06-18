@@ -243,7 +243,7 @@ impl ECStore {
                     return Err(err);
                 }
 
-                error!("rebalanceMeta: not found, rebalance not started");
+                warn!("rebalanceMeta: not found, rebalance not started");
             }
         }
 
@@ -501,7 +501,7 @@ impl ECStore {
             if let Some(meta) = rebalance_meta.as_mut() {
                 meta.cancel = Some(tx)
             } else {
-                error!("start_rebalance: rebalance_meta is None exit");
+                warn!("start_rebalance: rebalance_meta is None exit");
                 return;
             }
 

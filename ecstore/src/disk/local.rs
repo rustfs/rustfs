@@ -1399,8 +1399,6 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
-        // warn!("disk create_file: origvolume: {}, volume: {}, path: {}", origvolume, volume, path);
-
         if !origvolume.is_empty() {
             let origvolume_dir = self.get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume) {
@@ -1431,8 +1429,6 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "debug", skip(self))]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        warn!("disk append_file:  volume: {}, path: {}", volume, path);
-
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
@@ -1497,7 +1493,9 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileCorrupt);
         }
 
-        f.seek(SeekFrom::Start(offset as u64)).await?;
+        if offset > 0 {
+            f.seek(SeekFrom::Start(offset as u64)).await?;
+        }
 
         Ok(Box::new(f))
     }

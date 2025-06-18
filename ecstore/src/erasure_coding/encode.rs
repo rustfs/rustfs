@@ -97,6 +97,13 @@ impl<'a> MultiWriter<'a> {
                 .join(", ")
         )))
     }
+
+    pub async fn _shutdown(&mut self) -> std::io::Result<()> {
+        for writer in self.writers.iter_mut().flatten() {
+            writer.shutdown().await?;
+        }
+        Ok(())
+    }
 }
 
 impl Erasure {
@@ -147,7 +154,7 @@ impl Erasure {
         }
 
         let (reader, total) = task.await??;
-
+        // writers.shutdown().await?;
         Ok((reader, total))
     }
 }

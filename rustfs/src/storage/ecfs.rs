@@ -91,6 +91,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -1787,7 +1788,7 @@ impl S3 for FS {
         let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
-                warn!("get_object_lock_config err {:?}", err);
+                debug!("get_object_lock_config err {:?}", err);
                 None
             }
         };

@@ -28,7 +28,7 @@ pub async fn create_bitrot_reader(
     checksum_algo: HashAlgorithm,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
     // Calculate the total length to read, including the checksum overhead
-    let length = offset.div_ceil(shard_size) * checksum_algo.size() + length;
+    let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
 
     if let Some(data) = inline_data {
         // Use inline data

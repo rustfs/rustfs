@@ -9,14 +9,14 @@ UNZIP_TARGET="./"
 
 
 SERVER_LIST=(
-    "root@172.23.215.2" # node1
-    "root@172.23.215.4" # node2
-    "root@172.23.215.7" # node3
-    "root@172.23.215.3" # node4
-    "root@172.23.215.8" # node5
-    "root@172.23.215.5" # node6
-    "root@172.23.215.9" # node7
-    "root@172.23.215.6" # node8
+    "root@node1" # node1
+    "root@node2" # node2
+    "root@node3" # node3
+    "root@node4" # node4
+    # "root@node5" # node5
+    # "root@node6" # node6
+    # "root@node7" # node7
+    # "root@node8" # node8
 )
 
 REMOTE_TMP="~/rustfs"

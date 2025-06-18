@@ -1859,8 +1859,6 @@ impl SetDisks {
 
         let (last_part_index, _) = fi.to_part_offset(end_offset)?;
 
-        // let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
-
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
         let mut total_readed = 0;

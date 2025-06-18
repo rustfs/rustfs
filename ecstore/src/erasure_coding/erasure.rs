@@ -556,6 +556,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_shard_file_size_cases2() {
+        let erasure = Erasure::new(12, 4, 1024 * 1024);
+
+        assert_eq!(erasure.shard_file_size(1572864), 131074);
+    }
+
+    #[test]
     fn test_shard_file_size_cases() {
         let erasure = Erasure::new(4, 2, 8);
 
@@ -577,6 +584,8 @@ mod tests {
         assert_eq!(erasure.shard_file_size(1248739), 312186); // 1248739/8=156092, last=3, 3 div_ceil 4=1, 156092*2+1=312185
 
         assert_eq!(erasure.shard_file_size(43), 12); // 43/8=5, last=3, 3 div_ceil 4=1, 5*2+1=11
+
+        assert_eq!(erasure.shard_file_size(1572864), 393216); // 43/8=5, last=3, 3 div_ceil 4=1, 5*2+1=11
     }
 
     #[test]
@@ -677,9 +686,14 @@ mod tests {
 
     #[test]
     fn test_shard_file_offset() {
-        let erasure = Erasure::new(4, 2, 8);
-        let offset = erasure.shard_file_offset(0, 16, 32);
+        let erasure = Erasure::new(8, 8, 1024 * 1024);
+        let offset = erasure.shard_file_offset(0, 86, 86);
+        println!("offset={}", offset);
         assert!(offset > 0);
+
+        let total_length = erasure.shard_file_size(86);
+        println!("total_length={}", total_length);
+        assert!(total_length > 0);
     }
 
     #[tokio::test]

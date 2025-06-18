@@ -67,36 +67,34 @@ where
         }
 
         // 使用并发读取所有分片
+        let mut read_futs = Vec::with_capacity(self.readers.len());
 
-        let read_futs: Vec<_> = self
-            .readers
-            .iter_mut()
-            .enumerate()
-            .map(|(i, opt_reader)| {
-                if let Some(reader) = opt_reader.as_mut() {
+        for (i, opt_reader) in self.readers.iter_mut().enumerate() {
+            let future = if let Some(reader) = opt_reader.as_mut() {
+                Box::pin(async move {
                     let mut buf = vec![0u8; shard_size];
-                    // 需要move i, buf
-                    Some(async move {
-                        match reader.read(&mut buf).await {
-                            Ok(n) => {
-                                buf.truncate(n);
-                                (i, Ok(buf))
-                            }
-                            Err(e) => (i, Err(Error::from(e))),
+                    match reader.read(&mut buf).await {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            (i, Ok(buf))
                         }
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+                        Err(e) => (i, Err(Error::from(e))),
+                    }
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
+            } else {
+                // reader是None时返回FileNotFound错误
+                Box::pin(async move { (i, Err(Error::FileNotFound)) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
+            };
+            read_futs.push(future);
+        }
 
-        // 过滤掉None，join_all
-        let mut results = join_all(read_futs.into_iter().flatten()).await;
+        let results = join_all(read_futs).await;
 
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; self.readers.len()];
         let mut errs = vec![None; self.readers.len()];
-        for (i, shard) in results.drain(..) {
+
+        for (i, shard) in results.into_iter() {
             match shard {
                 Ok(data) => {
                     if !data.is_empty() {

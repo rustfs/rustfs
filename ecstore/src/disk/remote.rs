@@ -608,7 +608,14 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        info!("read_file_stream {}/{}/{}", self.endpoint.to_string(), volume, path);
+        // warn!(
+        //     "disk remote read_file_stream {}/{}/{} offset={} length={}",
+        //     self.endpoint.to_string(),
+        //     volume,
+        //     path,
+        //     offset,
+        //     length
+        // );
         let url = format!(
             "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
             self.endpoint.grid_host(),
@@ -641,7 +648,13 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter> {
-        info!("create_file {}/{}/{}", self.endpoint.to_string(), volume, path);
+        // warn!(
+        //     "disk remote create_file {}/{}/{} file_size={}",
+        //     self.endpoint.to_string(),
+        //     volume,
+        //     path,
+        //     file_size
+        // );
 
         let url = format!(
             "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
