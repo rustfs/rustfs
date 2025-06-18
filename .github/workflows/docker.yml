@@ -120,16 +120,15 @@ jobs:
           path: target/${{ matrix.target }}/release/rustfs
           retention-days: 1
 
-  # Build and push Docker images
+  # Build and push multi-arch Docker images
   build-images:
     needs: [skip-check, build-binary]
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       matrix:
         image-type: [production, ubuntu, rockylinux, devenv]
-        platform: [linux/amd64, linux/arm64]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -211,85 +210,21 @@ jobs:
           flavor: |
             latest=false
 
-      - name: Build and push Docker image
+      - name: Build and push multi-arch Docker image
         uses: docker/build-push-action@v5
         with:
           context: ${{ steps.dockerfile.outputs.context }}
           file: ${{ steps.dockerfile.outputs.dockerfile }}
-          platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))) || github.event.inputs.push_to_registry == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.image-type }}-${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image-type }}-${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ matrix.image-type }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image-type }}
           build-args: |
             BUILDTIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
             REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
-
-  # Create multi-arch manifests
-  create-manifest:
-    needs: [skip-check, build-images]
-    if: needs.skip-check.outputs.should_skip != 'true' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        image-type: [production, ubuntu, rockylinux, devenv]
-    steps:
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set image suffix
-        id: suffix
-        run: |
-          case "${{ matrix.image-type }}" in
-            production) echo "suffix=" >> $GITHUB_OUTPUT ;;
-            ubuntu) echo "suffix=-ubuntu22.04" >> $GITHUB_OUTPUT ;;
-            rockylinux) echo "suffix=-rockylinux9.3" >> $GITHUB_OUTPUT ;;
-            devenv) echo "suffix=-devenv" >> $GITHUB_OUTPUT ;;
-          esac
-
-      - name: Create and push manifest
-        run: |
-          # Set tag based on ref
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            TAG=${GITHUB_REF#refs/tags/}
-          else
-            TAG="main"
-          fi
-
-          SUFFIX="${{ steps.suffix.outputs.suffix }}"
-
-          # Docker Hub manifest
-          docker buildx imagetools create -t ${REGISTRY_IMAGE_DOCKERHUB}:${TAG}${SUFFIX} \
-            ${REGISTRY_IMAGE_DOCKERHUB}:${TAG}${SUFFIX}-linux-amd64 \
-            ${REGISTRY_IMAGE_DOCKERHUB}:${TAG}${SUFFIX}-linux-arm64
-
-          # GitHub Container Registry manifest
-          docker buildx imagetools create -t ${REGISTRY_IMAGE_GHCR}:${TAG}${SUFFIX} \
-            ${REGISTRY_IMAGE_GHCR}:${TAG}${SUFFIX}-linux-amd64 \
-            ${REGISTRY_IMAGE_GHCR}:${TAG}${SUFFIX}-linux-arm64
-
-          # Create latest tag for main branch
-          if [[ $GITHUB_REF == refs/heads/main ]]; then
-            docker buildx imagetools create -t ${REGISTRY_IMAGE_DOCKERHUB}:latest${SUFFIX} \
-              ${REGISTRY_IMAGE_DOCKERHUB}:${TAG}${SUFFIX}-linux-amd64 \
-              ${REGISTRY_IMAGE_DOCKERHUB}:${TAG}${SUFFIX}-linux-arm64
-
-            docker buildx imagetools create -t ${REGISTRY_IMAGE_GHCR}:latest${SUFFIX} \
-              ${REGISTRY_IMAGE_GHCR}:${TAG}${SUFFIX}-linux-amd64 \
-              ${REGISTRY_IMAGE_GHCR}:${TAG}${SUFFIX}-linux-arm64
-          fi
 
   # Security scanning
   security-scan:
