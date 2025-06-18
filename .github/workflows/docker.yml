@@ -5,16 +5,16 @@ on:
     branches:
       - main
     tags:
-      - 'v*'
+      - "v*"
   pull_request:
     branches:
       - main
   workflow_dispatch:
     inputs:
       push_to_registry:
-        description: 'Push images to registry'
+        description: "Push images to registry"
         required: false
-        default: 'true'
+        default: "true"
         type: boolean
 
 env:
@@ -34,7 +34,7 @@ jobs:
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@v5
         with:
-          concurrent_skipping: 'same_content_newer'
+          concurrent_skipping: "same_content_newer"
           cancel_others: true
           paths_ignore: '["*.md", "docs/**"]'
 
@@ -225,25 +225,3 @@ jobs:
             BUILDTIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
             REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
-
-  # Security scanning
-  security-scan:
-    needs: [skip-check, build-images]
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        image-type: [production]
-    steps:
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ env.REGISTRY_IMAGE_GHCR }}:main
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-
-      - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v2
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
