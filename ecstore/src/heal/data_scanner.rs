@@ -41,8 +41,8 @@ use crate::{
         heal_ops::{BG_HEALING_UUID, HealSource},
     },
     new_object_layer_fn,
-    peer::is_reserved_or_invalid_bucket,
     store::ECStore,
+    store_utils::is_reserved_or_invalid_bucket,
 };
 use crate::{disk::DiskAPI, store_api::ObjectInfo};
 use crate::{

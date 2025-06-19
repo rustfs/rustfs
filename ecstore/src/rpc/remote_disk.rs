@@ -13,13 +13,25 @@ use protos::{
     },
 };
 
+use crate::disk::{
+    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    endpoint::Endpoint,
+};
+use crate::{
+    disk::error::{Error, Result},
+    rpc::build_auth_headers,
+};
+use crate::{
+    disk::{FileReader, FileWriter},
+    heal::{
+        data_scanner::ShouldSleepFn,
+        data_usage_cache::{DataUsageCache, DataUsageEntry},
+        heal_commands::{HealScanMode, HealingTracker},
+    },
+};
 use rustfs_filemeta::{FileInfo, RawFileInfo};
 use rustfs_rio::{HttpReader, HttpWriter};
-
-use base64::{Engine as _, engine::general_purpose};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     io::AsyncWrite,
     sync::mpsc::{self, Sender},
@@ -29,25 +41,7 @@ use tonic::Request;
 use tracing::info;
 use uuid::Uuid;
 
-use super::error::{Error, Result};
-use super::{
-    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    endpoint::Endpoint,
-};
-
-use crate::{
-    disk::{FileReader, FileWriter},
-    heal::{
-        data_scanner::ShouldSleepFn,
-        data_usage_cache::{DataUsageCache, DataUsageEntry},
-        heal_commands::{HealScanMode, HealingTracker},
-    },
-};
-
 use protos::proto_gen::node_service::RenamePartRequest;
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug)]
 pub struct RemoteDisk {
@@ -74,35 +68,6 @@ impl RemoteDisk {
             root,
             endpoint: ep.clone(),
         })
-    }
-
-    /// Get the shared secret for HMAC signing
-    fn get_shared_secret() -> String {
-        std::env::var("RUSTFS_RPC_SECRET").unwrap_or_else(|_| "rustfs-default-secret".to_string())
-    }
-
-    /// Generate HMAC-SHA256 signature for the given data
-    fn generate_signature(secret: &str, url: &str, method: &str, timestamp: u64) -> String {
-        let data = format!("{}|{}|{}", url, method, timestamp);
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
-        mac.update(data.as_bytes());
-        let result = mac.finalize();
-        general_purpose::STANDARD.encode(result.into_bytes())
-    }
-
-    /// Build headers with authentication signature
-    fn build_auth_headers(&self, url: &str, method: &Method, base_headers: Option<HeaderMap>) -> HeaderMap {
-        let mut headers = base_headers.unwrap_or_default();
-
-        let secret = Self::get_shared_secret();
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-        let signature = Self::generate_signature(&secret, url, method.as_str(), timestamp);
-
-        headers.insert("x-rustfs-signature", HeaderValue::from_str(&signature).unwrap());
-        headers.insert("x-rustfs-timestamp", HeaderValue::from_str(&timestamp.to_string()).unwrap());
-
-        headers
     }
 }
 
@@ -614,9 +579,9 @@ impl DiskAPI for RemoteDisk {
 
         let opts = serde_json::to_vec(&opts)?;
 
-        let mut base_headers = HeaderMap::new();
-        base_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let headers = self.build_auth_headers(&url, &Method::GET, Some(base_headers));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        build_auth_headers(&url, &Method::GET, &mut headers);
 
         let mut reader = HttpReader::new(url, Method::GET, headers, Some(opts)).await?;
 
@@ -639,7 +604,9 @@ impl DiskAPI for RemoteDisk {
             0
         );
 
-        let headers = self.build_auth_headers(&url, &Method::GET, None);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        build_auth_headers(&url, &Method::GET, &mut headers);
         Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
     }
 
@@ -663,7 +630,9 @@ impl DiskAPI for RemoteDisk {
             length
         );
 
-        let headers = self.build_auth_headers(&url, &Method::GET, None);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        build_auth_headers(&url, &Method::GET, &mut headers);
         Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
     }
 
@@ -681,7 +650,9 @@ impl DiskAPI for RemoteDisk {
             0
         );
 
-        let headers = self.build_auth_headers(&url, &Method::PUT, None);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        build_auth_headers(&url, &Method::PUT, &mut headers);
         Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
     }
 
@@ -705,7 +676,9 @@ impl DiskAPI for RemoteDisk {
             file_size
         );
 
-        let headers = self.build_auth_headers(&url, &Method::PUT, None);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        build_auth_headers(&url, &Method::PUT, &mut headers);
         Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
     }
 

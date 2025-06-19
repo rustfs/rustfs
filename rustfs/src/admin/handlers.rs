@@ -11,20 +11,20 @@ use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
 use ecstore::error::StorageError;
 use ecstore::global::GLOBAL_ALlHealState;
+use ecstore::global::get_global_action_cred;
 use ecstore::heal::data_usage::load_data_usage_from_backend;
 use ecstore::heal::heal_commands::HealOpts;
 use ecstore::heal::heal_ops::new_heal_sequence;
 use ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use ecstore::new_object_layer_fn;
-use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::StorageAPI;
+use ecstore::store_utils::is_reserved_or_invalid_bucket;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
 use hyper::StatusCode;
-use iam::get_global_action_cred;
 use iam::store::MappedPolicy;
 use rustfs_utils::path::path_join;
 // use lazy_static::lazy_static;
@@ -810,7 +810,7 @@ impl Operation for SetRemoteTargetHandler {
         //println!("bucket is:{}", bucket.clone());
         if let Some(bucket) = querys.get("bucket") {
             if bucket.is_empty() {
-                println!("have bucket: {}", bucket);
+                info!("have bucket: {}", bucket);
                 return Ok(S3Response::new((StatusCode::OK, Body::from("fuck".to_string()))));
             }
             let Some(store) = new_object_layer_fn() else {
@@ -824,13 +824,13 @@ impl Operation for SetRemoteTargetHandler {
                 .await
             {
                 Ok(info) => {
-                    println!("Bucket Info: {:?}", info);
+                    info!("Bucket Info: {:?}", info);
                     if !info.versionning {
                         return Ok(S3Response::new((StatusCode::FORBIDDEN, Body::from("bucket need versioned".to_string()))));
                     }
                 }
                 Err(err) => {
-                    eprintln!("Error: {:?}", err);
+                    error!("Error: {:?}", err);
                     return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("empty bucket".to_string()))));
                 }
             }
@@ -934,7 +934,7 @@ impl Operation for ListRemoteTargetHandler {
                 .await
             {
                 Ok(info) => {
-                    println!("Bucket Info: {:?}", info);
+                    info!("Bucket Info: {:?}", info);
                     if !info.versionning {
                         return Ok(S3Response::new((
                             StatusCode::FORBIDDEN,
@@ -943,7 +943,7 @@ impl Operation for ListRemoteTargetHandler {
                     }
                 }
                 Err(err) => {
-                    eprintln!("Error fetching bucket info: {:?}", err);
+                    error!("Error fetching bucket info: {:?}", err);
                     return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
                 }
             }

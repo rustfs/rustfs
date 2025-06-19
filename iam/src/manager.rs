@@ -2,14 +2,13 @@ use crate::error::{Error, Result, is_err_config_not_found};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
-    get_global_action_cred,
     store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
     sys::{
         MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
         UpdateServiceAccountOpts,
     },
 };
-// use ecstore::utils::crypto::base64_encode;
+use ecstore::global::get_global_action_cred;
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use policy::{
     arn::ARN,
@@ -39,8 +38,8 @@ use tokio::{
         mpsc::{Receiver, Sender},
     },
 };
-use tracing::error;
 use tracing::warn;
+use tracing::{error, info};
 
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
@@ -108,18 +107,18 @@ where
                     loop {
                         select! {
                             _ = ticker.tick() => {
-                                warn!("iam load ticker");
+                                info!("iam load ticker");
                                 if let Err(err) =s.clone().load().await{
                                     error!("iam load err {:?}", err);
                                 }
                             },
                             i = reciver.recv() => {
-                                warn!("iam load reciver");
+                                info!("iam load reciver");
                                 match i {
                                     Some(t) => {
                                         let last = s.last_timestamp.load(Ordering::Relaxed);
                                         if last <= t {
-                                            warn!("iam load reciver load");
+                                            info!("iam load reciver load");
                                             if let Err(err) =s.clone().load().await{
                                                 error!("iam load err {:?}", err);
                                             }

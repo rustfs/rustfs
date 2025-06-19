@@ -1,12 +1,3 @@
-use lazy_static::lazy_static;
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-    time::SystemTime,
-};
-use tokio::sync::{OnceCell, RwLock};
-use uuid::Uuid;
-
 use crate::heal::mrf::MRFState;
 use crate::{
     disk::DiskStore,
@@ -14,6 +5,15 @@ use crate::{
     heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState},
     store::ECStore,
 };
+use lazy_static::lazy_static;
+use policy::auth::Credentials;
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::SystemTime,
+};
+use tokio::sync::{OnceCell, RwLock};
+use uuid::Uuid;
 
 pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
 pub const DISK_MIN_INODES: u64 = 1000;
@@ -37,6 +37,38 @@ lazy_static! {
     pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
     static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
+}
+
+static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
+
+pub fn init_global_action_cred(ak: Option<String>, sk: Option<String>) {
+    let ak = {
+        if let Some(k) = ak {
+            k
+        } else {
+            rustfs_utils::string::gen_access_key(20).unwrap_or_default()
+        }
+    };
+
+    let sk = {
+        if let Some(k) = sk {
+            k
+        } else {
+            rustfs_utils::string::gen_secret_key(32).unwrap_or_default()
+        }
+    };
+
+    GLOBAL_ACTIVE_CRED
+        .set(Credentials {
+            access_key: ak,
+            secret_key: sk,
+            ..Default::default()
+        })
+        .unwrap();
+}
+
+pub fn get_global_action_cred() -> Option<Credentials> {
+    GLOBAL_ACTIVE_CRED.get().cloned()
 }
 
 /// Get the global rustfs port

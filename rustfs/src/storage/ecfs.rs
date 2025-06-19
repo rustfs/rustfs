@@ -8,6 +8,7 @@ use crate::storage::access::ReqInfo;
 use crate::storage::options::copy_dst_opts;
 use crate::storage::options::copy_src_opts;
 use crate::storage::options::{extract_metadata_from_mime, get_opts};
+use api::object_store::bytes_stream;
 use api::query::Context;
 use api::query::Query;
 use api::server::dbms::DatabaseManagerSystem;
@@ -52,8 +53,7 @@ use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI; // use ecstore::store_api::RESERVED_METADATA_PREFIX;
-use futures::pin_mut;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use policy::auth;
@@ -95,7 +95,6 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
-use transform_stream::AsyncTryStream;
 use uuid::Uuid;
 
 macro_rules! try_ {
@@ -2413,25 +2412,4 @@ impl S3 for FS {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         }))
     }
-}
-
-#[allow(dead_code)]
-pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static
-where
-    S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
-    E: Send + 'static,
-{
-    AsyncTryStream::<Bytes, E, _>::new(|mut y| async move {
-        pin_mut!(stream);
-        let mut remaining: usize = content_length;
-        while let Some(result) = stream.next().await {
-            let mut bytes = result?;
-            if bytes.len() > remaining {
-                bytes.truncate(remaining);
-            }
-            remaining -= bytes.len();
-            y.yield_ok(bytes).await;
-        }
-        Ok(())
-    })
 }

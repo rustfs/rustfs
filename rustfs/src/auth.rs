@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-
+use ecstore::global::get_global_action_cred;
 use http::HeaderMap;
 use http::Uri;
 use iam::error::Error as IamError;
-use iam::get_global_action_cred;
 use iam::sys::SESSION_POLICY_NAME;
 use policy::auth;
 use policy::auth::get_claims_from_token_with_secret;
@@ -15,6 +13,7 @@ use s3s::auth::SecretKey;
 use s3s::auth::SimpleAuth;
 use s3s::s3_error;
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub struct IAMAuth {
     simple_auth: SimpleAuth,
