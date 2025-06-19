@@ -6,36 +6,34 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[features]
-default = ["webhook"]
-webhook = ["dep:reqwest"]
-mqtt = ["rumqttc"]
-
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
 async-trait = { workspace = true }
-common = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+const-str = { workspace = true }
 ecstore = { workspace = true }
+libc = { workspace = true }
 once_cell = { workspace = true }
-reqwest = { workspace = true, optional = true }
-rumqttc = { workspace = true, optional = true }
+quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
+reqwest = { workspace = true }
+rumqttc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
-smallvec = { workspace = true, features = ["serde"] }
-strum = { workspace = true, features = ["derive"] }
-tracing = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "net", "macros", "signal", "rt-multi-thread"] }
-tokio-util = { workspace = true }
-uuid = { workspace = true, features = ["v4", "serde"] }
 snap = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+url = { workspace = true }
+urlencoding = { workspace = true }
+wildmatch = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber = { workspace = true }
+mockito = "1.7"
+reqwest = { workspace = true, default-features = false, features = ["rustls-tls", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
 axum = { workspace = true }
-dotenvy = { workspace = true }
 
 [lints]
 workspace = true

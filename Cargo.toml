@@ -3,13 +3,14 @@ members = [
     "appauth", # Application authentication and authorization
     "cli/rustfs-gui", # Graphical user interface client
     "common/common", # Shared utilities and data structures
+    "crates/filemeta", # File metadata management
     "common/lock", # Distributed locking implementation
     "common/protos", # Protocol buffer definitions
     "common/workers", # Worker thread pools and task scheduling
     "crates/config", # Configuration management
-    "crates/event", # Event handling and processing
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
+    "crates/rio", # Rust I/O utilities and abstractions
     "crates/utils", # Utility functions and helpers
     "crates/zip", # ZIP file handling and compression
     "crypto", # Cryptography and security features
@@ -20,9 +21,8 @@ members = [
     "rustfs", # Core file system implementation
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
-    "crates/zip",
-    "crates/filemeta",
-    "crates/rio",
+
+
 ]
 resolver = "2"
 
@@ -121,12 +121,14 @@ keyring = { version = "3.6.2", features = [
     "sync-secret-service",
 ] }
 lazy_static = "1.5.0"
+libc = "0.2.174"
 libsystemd = { version = "0.7.2" }
 local-ip-address = "0.6.5"
 matchit = "0.8.4"
 md-5 = "0.10.6"
 mime = "0.3.17"
 mime_guess = "2.0.5"
+mockito = "1.7.0"
 netif = "0.1.6"
 nix = { version = "0.30.1", features = ["fs"] }
 nu-ansi-term = "0.50.1"
@@ -159,6 +161,7 @@ pin-project-lite = "0.2.16"
 prost = "0.13.5"
 prost-build = "0.13.5"
 protobuf = "3.7"
+quick-xml = "0.37.5"
 rand = "0.9.1"
 brotli = "8.0.1"
 flate2 = "1.1.1"
@@ -241,6 +244,7 @@ uuid = { version = "1.17.0", features = [
     "fast-rng",
     "macro-diagnostics",
 ] }
+wildmatch = { version = "2.4.0", features = ["serde"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 

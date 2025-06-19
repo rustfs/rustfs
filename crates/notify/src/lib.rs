@@ -1,22 +1,74 @@
-mod adapter;
-mod config;
-mod error;
-mod event;
-mod notifier;
+//! RustFs Notify - A flexible and extensible event notification system for object storage.
+//!
+//! This library provides a Rust implementation of a storage bucket notification system,
+//! similar to RustFS's notification system. It supports sending events to various targets
+//! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
+
+pub mod args;
+pub mod arn;
+pub mod config;
+pub mod error;
+pub mod event;
+pub mod factory;
+pub mod global;
+pub mod integration;
+pub mod notifier;
+pub mod registry;
+pub mod rules;
 pub mod store;
-mod system;
+pub mod stream;
+pub mod target;
+pub mod utils;
 
-pub use adapter::create_adapters;
-#[cfg(feature = "mqtt")]
-pub use adapter::mqtt::MqttAdapter;
-#[cfg(feature = "webhook")]
-pub use adapter::webhook::WebhookAdapter;
+// Re-exports
+pub use config::{parse_config, Config, KV, KVS};
+pub use error::{NotificationError, StoreError, TargetError};
+pub use event::{Event, EventLog, EventName};
+pub use integration::NotificationSystem;
+pub use rules::BucketNotificationConfig;
+use std::io::IsTerminal;
+pub use target::Target;
 
-pub use adapter::ChannelAdapter;
-pub use adapter::ChannelAdapterType;
-pub use config::{AdapterConfig, EventNotifierConfig, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_INTERVAL};
-pub use error::Error;
-pub use event::{Bucket, Event, EventBuilder, Identity, Log, Metadata, Name, Object, Source};
-pub use store::manager;
-pub use store::queue;
-pub use store::queue::QueueStore;
+use tracing_subscriber::{fmt, prelude::*, util::SubscriberInitExt, EnvFilter};
+
+/// Initialize the tracing log system
+///
+/// # Example
+/// ```
+/// notify::init_logger(notify::LogLevel::Info);
+/// ```
+pub fn init_logger(level: LogLevel) {
+    let filter = EnvFilter::default().add_directive(level.into());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_target(true)
+                .with_ansi(std::io::stdout().is_terminal())
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true),
+        )
+        .init();
+}
+
+/// Log level definition
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevel> for tracing_subscriber::filter::Directive {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Debug => "debug".parse().unwrap(),
+            LogLevel::Info => "info".parse().unwrap(),
+            LogLevel::Warn => "warn".parse().unwrap(),
+            LogLevel::Error => "error".parse().unwrap(),
+        }
+    }
+}

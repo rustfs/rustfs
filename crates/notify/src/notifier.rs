@@ -1,143 +1,263 @@
-use crate::config::EventNotifierConfig;
-use crate::Event;
-use common::error::{Error, Result};
-use ecstore::store::ECStore;
-use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
-use tokio_util::sync::CancellationToken;
+use crate::arn::TargetID;
+use crate::{error::NotificationError, event::Event, rules::RulesMap, target::Target, EventName};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
 
-/// Event Notifier
+/// Manages event notification to targets based on rules
 pub struct EventNotifier {
-    /// The event sending channel
-    sender: mpsc::Sender<Event>,
-    /// Receiver task handle
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Configuration information
-    config: EventNotifierConfig,
-    /// Turn off tagging
-    shutdown: CancellationToken,
-    /// Close the notification channel
-    shutdown_complete_tx: Option<broadcast::Sender<()>>,
+    target_list: Arc<RwLock<TargetList>>,
+    bucket_rules_map: Arc<RwLock<HashMap<String, RulesMap>>>,
+}
+
+impl Default for EventNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EventNotifier {
-    /// Create a new event notifier
-    #[instrument(skip_all)]
-    pub async fn new(store: Arc<ECStore>) -> Result<Self> {
-        let manager = crate::store::manager::EventManager::new(store);
-
-        let manager = Arc::new(manager.await);
-
-        // Initialize the configuration
-        let config = manager.clone().init().await?;
-
-        // Create adapters
-        let adapters = manager.clone().create_adapters().await?;
-        info!("Created {} adapters", adapters.len());
-
-        // Create a close marker
-        let shutdown = CancellationToken::new();
-        let (shutdown_complete_tx, _) = broadcast::channel(1);
-
-        // 创建事件通道 - 使用默认容量，因为每个适配器都有自己的队列
-        // 这里使用较小的通道容量，因为事件会被快速分发到适配器
-        let (sender, mut receiver) = mpsc::channel::<Event>(100);
-
-        let shutdown_clone = shutdown.clone();
-        let shutdown_complete_tx_clone = shutdown_complete_tx.clone();
-        let adapters_clone = adapters.clone();
-
-        // Start the event processing task
-        let task_handle = tokio::spawn(async move {
-            debug!("The event processing task starts");
-
-            loop {
-                tokio::select! {
-                    Some(event) = receiver.recv() => {
-                        debug!("The event is received:{}", event.id);
-
-                        // Distribute to all adapters
-                        for adapter in &adapters_clone {
-                            let adapter_name = adapter.name();
-                            match adapter.send(&event).await {
-                                Ok(_) => {
-                                    debug!("Event {} Successfully sent to the adapter {}", event.id, adapter_name);
-                                }
-                                Err(e) => {
-                                    error!("Event {} send to adapter {} failed:{}", event.id, adapter_name, e);
-                                }
-                            }
-                        }
-                    }
-
-                    _ = shutdown_clone.cancelled() => {
-                        info!("A shutdown signal is received, and the event processing task is stopped");
-                        let _ = shutdown_complete_tx_clone.send(());
-                        break;
-                    }
-                }
-            }
-
-            debug!("The event processing task has been stopped");
-        });
-
-        Ok(Self {
-            sender,
-            task_handle: Some(task_handle),
-            config,
-            shutdown,
-            shutdown_complete_tx: Some(shutdown_complete_tx),
-        })
+    /// Creates a new EventNotifier
+    pub fn new() -> Self {
+        EventNotifier {
+            target_list: Arc::new(RwLock::new(TargetList::new())),
+            bucket_rules_map: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
-    /// Turn off the event notifier
-    pub async fn shutdown(&mut self) -> Result<()> {
-        info!("Turn off the event notifier");
-        self.shutdown.cancel();
+    /// Returns a reference to the target list
+    /// This method provides access to the target list for external use.
+    ///
+    pub fn target_list(&self) -> Arc<RwLock<TargetList>> {
+        Arc::clone(&self.target_list)
+    }
 
-        if let Some(shutdown_tx) = self.shutdown_complete_tx.take() {
-            let mut rx = shutdown_tx.subscribe();
-
-            // Wait for the shutdown to complete the signal or time out
-            tokio::select! {
-                _ = rx.recv() => {
-                    debug!("A shutdown completion signal is received");
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    warn!("Shutdown timeout and forced termination");
-                }
-            }
+    /// Removes all notification rules for a bucket
+    ///
+    /// # Arguments
+    /// * `bucket_name` - The name of the bucket for which to remove rules
+    ///
+    /// This method removes all rules associated with the specified bucket name.
+    /// It will log a message indicating the removal of rules.
+    pub async fn remove_rules_map(&self, bucket_name: &str) {
+        let mut rules_map = self.bucket_rules_map.write().await;
+        if rules_map.remove(bucket_name).is_some() {
+            info!("Removed all notification rules for bucket: {}", bucket_name);
         }
+    }
 
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
-            match handle.await {
-                Ok(_) => debug!("The event processing task has been terminated gracefully"),
-                Err(e) => {
-                    if e.is_cancelled() {
-                        debug!("The event processing task has been canceled");
+    /// Returns a list of ARNs for the registered targets
+    pub async fn get_arn_list(&self, region: &str) -> Vec<String> {
+        let target_list_guard = self.target_list.read().await;
+        target_list_guard
+            .keys()
+            .iter()
+            .map(|target_id| target_id.to_arn(region).to_arn_string())
+            .collect()
+    }
+
+    /// Adds a rules map for a bucket
+    pub async fn add_rules_map(&self, bucket_name: &str, rules_map: RulesMap) {
+        let mut bucket_rules_guard = self.bucket_rules_map.write().await;
+        if rules_map.is_empty() {
+            bucket_rules_guard.remove(bucket_name);
+        } else {
+            bucket_rules_guard.insert(bucket_name.to_string(), rules_map);
+        }
+        info!("Added rules for bucket: {}", bucket_name);
+    }
+
+    /// Removes notification rules for a bucket
+    pub async fn remove_notification(&self, bucket_name: &str) {
+        let mut bucket_rules_guard = self.bucket_rules_map.write().await;
+        bucket_rules_guard.remove(bucket_name);
+        info!("Removed notification rules for bucket: {}", bucket_name);
+    }
+
+    /// Removes all targets
+    pub async fn remove_all_bucket_targets(&self) {
+        let mut target_list_guard = self.target_list.write().await;
+        // The logic for sending cancel signals via stream_cancel_senders would be removed.
+        // TargetList::clear_targets_only already handles calling target.close().
+        target_list_guard.clear_targets_only().await; // Modified clear to not re-cancel
+        info!("Removed all targets and their streams");
+    }
+
+    /// Sends an event to the appropriate targets based on the bucket rules
+    #[instrument(skip(self, event))]
+    pub async fn send(&self, bucket_name: &str, event_name: &str, object_key: &str, event: Event) {
+        let bucket_rules_guard = self.bucket_rules_map.read().await;
+        if let Some(rules) = bucket_rules_guard.get(bucket_name) {
+            let target_ids = rules.match_rules(EventName::from(event_name), object_key);
+            if target_ids.is_empty() {
+                debug!("No matching targets for event in bucket: {}", bucket_name);
+                return;
+            }
+            let target_ids_len = target_ids.len();
+            let mut handles = vec![];
+
+            // 使用作用域来限制 target_list 的借用范围
+            {
+                let target_list_guard = self.target_list.read().await;
+                info!("Sending event to targets: {:?}", target_ids);
+                for target_id in target_ids {
+                    // `get` now returns Option<Arc<dyn Target + Send + Sync>>
+                    if let Some(target_arc) = target_list_guard.get(&target_id) {
+                        // 克隆 Arc<Box<dyn Target>> (target_list 存储的就是这个类型) 以便移入异步任务
+                        // target_arc is already Arc, clone it for the async task
+                        let cloned_target_for_task = target_arc.clone();
+                        let event_clone = event.clone();
+                        let target_name_for_task = cloned_target_for_task.name(); // 在生成任务前获取名称
+                        debug!(
+                            "Preparing to send event to target: {}",
+                            target_name_for_task
+                        );
+                        // 在闭包中使用克隆的数据，避免借用冲突
+                        let handle = tokio::spawn(async move {
+                            if let Err(e) = cloned_target_for_task.save(event_clone).await {
+                                error!(
+                                    "Failed to send event to target {}: {}",
+                                    target_name_for_task, e
+                                );
+                            } else {
+                                debug!(
+                                    "Successfully saved event to target {}",
+                                    target_name_for_task
+                                );
+                            }
+                        });
+                        handles.push(handle);
                     } else {
-                        error!("An error occurred while waiting for the event processing task to terminate:{}", e);
+                        warn!(
+                            "Target ID {:?} found in rules but not in target list.",
+                            target_id
+                        );
                     }
                 }
+                // target_list 在这里自动释放
             }
-        }
 
-        info!("The event notifier is completely turned off");
+            // 等待所有任务完成
+            for handle in handles {
+                if let Err(e) = handle.await {
+                    error!("Task for sending/saving event failed: {}", e);
+                }
+            }
+            info!(
+                "Event processing initiated for {} targets for bucket: {}",
+                target_ids_len, bucket_name
+            );
+        } else {
+            debug!("No rules found for bucket: {}", bucket_name);
+        }
+    }
+
+    /// Initializes the targets for buckets
+    #[instrument(skip(self, targets_to_init))]
+    pub async fn init_bucket_targets(
+        &self,
+        targets_to_init: Vec<Box<dyn Target + Send + Sync>>,
+    ) -> Result<(), NotificationError> {
+        // 当前激活的、更简单的逻辑：
+        let mut target_list_guard = self.target_list.write().await; // 获取 TargetList 的写锁
+        for target_boxed in targets_to_init {
+            // 遍历传入的 Box<dyn Target>
+            debug!("init bucket target: {}", target_boxed.name());
+            // TargetList::add 方法期望 Arc<dyn Target + Send + Sync>
+            // 因此，需要将 Box<dyn Target + Send + Sync> 转换为 Arc<dyn Target + Send + Sync>
+            let target_arc: Arc<dyn Target + Send + Sync> = Arc::from(target_boxed);
+            target_list_guard.add(target_arc)?; // 将 Arc<dyn Target> 添加到列表中
+        }
+        info!(
+            "Initialized {} targets, list size: {}", // 更清晰的日志
+            target_list_guard.len(),
+            target_list_guard.len()
+        );
+        Ok(()) // 确保返回 Result
+    }
+}
+
+/// A thread-safe list of targets
+pub struct TargetList {
+    targets: HashMap<TargetID, Arc<dyn Target + Send + Sync>>,
+}
+
+impl Default for TargetList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TargetList {
+    /// Creates a new TargetList
+    pub fn new() -> Self {
+        TargetList {
+            targets: HashMap::new(),
+        }
+    }
+
+    /// Adds a target to the list
+    pub fn add(&mut self, target: Arc<dyn Target + Send + Sync>) -> Result<(), NotificationError> {
+        let id = target.id();
+        if self.targets.contains_key(&id) {
+            // Potentially update or log a warning/error if replacing an existing target.
+            warn!(
+                "Target with ID {} already exists in TargetList. It will be overwritten.",
+                id
+            );
+        }
+        self.targets.insert(id, target);
         Ok(())
     }
 
-    /// Send events
-    pub async fn send(&self, event: Event) -> Result<()> {
-        self.sender
-            .send(event)
-            .await
-            .map_err(|e| Error::msg(format!("Failed to send events to channel:{}", e)))
+    /// Removes a target by ID. Note: This does not stop its associated event stream.
+    /// Stream cancellation should be handled by EventNotifier.
+    pub async fn remove_target_only(
+        &mut self,
+        id: &TargetID,
+    ) -> Option<Arc<dyn Target + Send + Sync>> {
+        if let Some(target_arc) = self.targets.remove(id) {
+            if let Err(e) = target_arc.close().await {
+                // Target's own close logic
+                error!("Failed to close target {} during removal: {}", id, e);
+            }
+            Some(target_arc)
+        } else {
+            None
+        }
     }
 
-    /// Get the current configuration
-    pub fn config(&self) -> &EventNotifierConfig {
-        &self.config
+    /// Clears all targets from the list. Note: This does not stop their associated event streams.
+    /// Stream cancellation should be handled by EventNotifier.
+    pub async fn clear_targets_only(&mut self) {
+        let target_ids_to_clear: Vec<TargetID> = self.targets.keys().cloned().collect();
+        for id in target_ids_to_clear {
+            if let Some(target_arc) = self.targets.remove(&id) {
+                if let Err(e) = target_arc.close().await {
+                    error!("Failed to close target {} during clear: {}", id, e);
+                }
+            }
+        }
+        self.targets.clear();
+    }
+
+    /// Returns a target by ID
+    pub fn get(&self, id: &TargetID) -> Option<Arc<dyn Target + Send + Sync>> {
+        self.targets.get(id).cloned()
+    }
+
+    /// Returns all target IDs
+    pub fn keys(&self) -> Vec<TargetID> {
+        self.targets.keys().cloned().collect()
+    }
+
+    /// Returns the number of targets
+    pub fn len(&self) -> usize {
+        self.targets.len()
+    }
+
+    // is_empty can be derived from len()
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
     }
 }

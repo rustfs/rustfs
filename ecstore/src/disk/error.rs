@@ -486,13 +486,7 @@ pub struct FileAccessDeniedWithContext {
 
 impl std::fmt::Display for FileAccessDeniedWithContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-<<<<<<< HEAD
-        write!(f, "Access files '{}' denied: {}", self.path.display(), self.source)
-||||||| 5ab2ce3c
-        write!(f, "访问文件 '{}' 被拒绝：{}", self.path.display(), self.source)
-=======
         write!(f, "file access denied for path: {}", self.path.display())
->>>>>>> 46870384b75a45ad0dd683099061f9e50a58c1e7
     }
 }
 
