@@ -1,6 +1,6 @@
+use serde::Deserialize;
 use serde::de::{Error, MapAccess};
 use serde::ser::SerializeMap;
-use serde::Deserialize;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
@@ -122,11 +122,7 @@ impl Condition {
             DateGreaterThanEquals(s) => s.evaluate(OffsetDateTime::ge, values),
         };
 
-        if self.is_negate() {
-            !r
-        } else {
-            r
-        }
+        if self.is_negate() { !r } else { r }
     }
 
     #[inline]

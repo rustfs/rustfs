@@ -1,7 +1,7 @@
-use common::error::{Error, Result};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use rand::{Rng, RngCore};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
+use std::io::{Error, Result};
 
 /// Generates a random access key of the specified length.
 ///
@@ -24,7 +24,7 @@ pub fn gen_access_key(length: usize) -> Result<String> {
     ];
 
     if length < 3 {
-        return Err(Error::msg("access key length is too short"));
+        return Err(Error::other("access key length is too short"));
     }
 
     let mut result = String::with_capacity(length);
@@ -55,7 +55,7 @@ pub fn gen_secret_key(length: usize) -> Result<String> {
     use base64_simd::URL_SAFE_NO_PAD;
 
     if length < 8 {
-        return Err(Error::msg("secret key length is too short"));
+        return Err(Error::other("secret key length is too short"));
     }
     let mut rng = rand::rng();
 
@@ -68,7 +68,7 @@ pub fn gen_secret_key(length: usize) -> Result<String> {
     Ok(key_str)
 }
 
-pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> std::result::Result<String, jsonwebtoken::errors::Error> {
     let header = Header::new(Algorithm::HS512);
     jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
 }
@@ -76,7 +76,7 @@ pub fn generate_jwt<T: Serialize>(claims: &T, secret: &str) -> Result<String, js
 pub fn extract_claims<T: DeserializeOwned>(
     token: &str,
     secret: &str,
-) -> Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
+) -> std::result::Result<jsonwebtoken::TokenData<T>, jsonwebtoken::errors::Error> {
     jsonwebtoken::decode::<T>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),

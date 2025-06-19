@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use api::{
+    QueryError,
     query::{
         execution::{QueryExecutionFactory, QueryExecutionRef, QueryStateMachineRef},
         logical_planner::Plan,
         optimizer::Optimizer,
         scheduler::SchedulerRef,
     },
-    QueryError,
 };
 use async_trait::async_trait;
 

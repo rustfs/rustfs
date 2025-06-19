@@ -1,8 +1,8 @@
 use super::{
-    action::Action, ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, Principal, ResourceSet, Validator,
-    ID,
+    ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
+    action::Action,
 };
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]

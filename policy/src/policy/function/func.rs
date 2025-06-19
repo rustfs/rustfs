@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use serde::{
-    de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
+    de::{self, Visitor},
 };
 
 use super::key::Key;

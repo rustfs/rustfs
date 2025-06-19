@@ -1,6 +1,6 @@
 use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
-use crate::utils::wildcard;
+use rustfs_utils::string::match_simple;
 
 pub trait VersioningApi {
     fn enabled(&self) -> bool;
@@ -33,7 +33,7 @@ impl VersioningApi for VersioningConfiguration {
             for p in excluded_prefixes.iter() {
                 if let Some(ref sprefix) = p.prefix {
                     let pattern = format!("{}*", sprefix);
-                    if wildcard::match_simple(&pattern, prefix) {
+                    if match_simple(&pattern, prefix) {
                         return false;
                     }
                 }
@@ -63,7 +63,7 @@ impl VersioningApi for VersioningConfiguration {
                 for p in excluded_prefixes.iter() {
                     if let Some(ref sprefix) = p.prefix {
                         let pattern = format!("{}*", sprefix);
-                        if wildcard::match_simple(&pattern, prefix) {
+                        if match_simple(&pattern, prefix) {
                             return true;
                         }
                     }

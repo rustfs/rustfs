@@ -1,5 +1,5 @@
 use opentelemetry::global;
-use rustfs_obs::{get_logger, init_obs, log_info, BaseLogEntry, ServerLogEntry, SystemObserver};
+use rustfs_obs::{BaseLogEntry, ServerLogEntry, SystemObserver, get_logger, init_obs, log_info};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use tracing::{error, info, instrument};

@@ -1,6 +1,6 @@
 use crate::sinks::Sink;
 use crate::{
-    sinks, AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry,
+    AppConfig, AuditLogEntry, BaseLogEntry, ConsoleLogEntry, GlobalError, OtelConfig, ServerLogEntry, UnifiedLogEntry, sinks,
 };
 use rustfs_config::{APP_NAME, ENVIRONMENT, SERVICE_VERSION};
 use std::sync::Arc;

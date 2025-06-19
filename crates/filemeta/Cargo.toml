@@ -1,0 +1,32 @@
+[package]
+name = "rustfs-filemeta"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+crc32fast = "1.4.2"
+rmp.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+time.workspace = true
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
+tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
+bytes.workspace = true
+rustfs-utils = {workspace = true, features= ["hash"]}
+byteorder = "1.5.0"
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "xl_meta_bench"
+harness = false
+
+[lints]
+workspace = true

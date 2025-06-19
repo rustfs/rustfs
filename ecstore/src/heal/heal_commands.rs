@@ -6,15 +6,14 @@ use std::{
 
 use crate::{
     config::storageclass::{RRS, STANDARD},
-    disk::{DeleteOptions, DiskAPI, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    disk::{BUCKET_META_PREFIX, DeleteOptions, DiskAPI, DiskStore, RUSTFS_META_BUCKET, error::DiskError, fs::read_file},
     global::GLOBAL_BackgroundHealState,
     heal::heal_ops::HEALING_TRACKER_FILENAME,
     new_object_layer_fn,
     store_api::{BucketInfo, StorageAPI},
-    utils::fs::read_file,
 };
+use crate::{disk, error::Result};
 use chrono::{DateTime, Utc};
-use common::error::{Error, Result};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -124,12 +123,12 @@ pub struct HealingTracker {
 }
 
 impl HealingTracker {
-    pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(self).map_err(|err| Error::from_string(err.to_string()))
+    pub fn marshal_msg(&self) -> disk::error::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
     }
 
-    pub fn unmarshal_msg(data: &[u8]) -> Result<Self> {
-        serde_json::from_slice::<HealingTracker>(data).map_err(|err| Error::from_string(err.to_string()))
+    pub fn unmarshal_msg(data: &[u8]) -> disk::error::Result<Self> {
+        Ok(serde_json::from_slice::<HealingTracker>(data)?)
     }
 
     pub async fn reset_healing(&mut self) {
@@ -195,10 +194,10 @@ impl HealingTracker {
         }
     }
 
-    pub async fn update(&mut self) -> Result<()> {
+    pub async fn update(&mut self) -> disk::error::Result<()> {
         if let Some(disk) = &self.disk {
             if healing(disk.path().to_string_lossy().as_ref()).await?.is_none() {
-                return Err(Error::from_string(format!("healingTracker: drive {} is not marked as healing", self.id)));
+                return Err(DiskError::other(format!("healingTracker: drive {} is not marked as healing", self.id)));
             }
             let _ = self.mu.write().await;
             if self.id.is_empty() || self.pool_index.is_none() || self.set_index.is_none() || self.disk_index.is_none() {
@@ -213,12 +212,16 @@ impl HealingTracker {
         self.save().await
     }
 
-    pub async fn save(&mut self) -> Result<()> {
+    pub async fn save(&mut self) -> disk::error::Result<()> {
         let _ = self.mu.write().await;
         if self.pool_index.is_none() || self.set_index.is_none() || self.disk_index.is_none() {
-            let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+            let Some(store) = new_object_layer_fn() else {
+                return Err(DiskError::other("errServerNotInitialized"));
+            };
 
-            (self.pool_index, self.set_index, self.disk_index) = store.get_pool_and_set(&self.id).await?;
+            // TODO: check error type
+            (self.pool_index, self.set_index, self.disk_index) =
+                store.get_pool_and_set(&self.id).await.map_err(|_| DiskError::DiskNotFound)?;
         }
 
         self.last_update = Some(SystemTime::now());
@@ -229,9 +232,8 @@ impl HealingTracker {
 
         if let Some(disk) = &self.disk {
             let file_path = Path::new(BUCKET_META_PREFIX).join(HEALING_TRACKER_FILENAME);
-            return disk
-                .write_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap(), htracker_bytes)
-                .await;
+            disk.write_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap(), htracker_bytes.into())
+                .await?;
         }
         Ok(())
     }
@@ -239,17 +241,16 @@ impl HealingTracker {
     pub async fn delete(&self) -> Result<()> {
         if let Some(disk) = &self.disk {
             let file_path = Path::new(BUCKET_META_PREFIX).join(HEALING_TRACKER_FILENAME);
-            return disk
-                .delete(
-                    RUSTFS_META_BUCKET,
-                    file_path.to_str().unwrap(),
-                    DeleteOptions {
-                        recursive: false,
-                        immediate: false,
-                        ..Default::default()
-                    },
-                )
-                .await;
+            disk.delete(
+                RUSTFS_META_BUCKET,
+                file_path.to_str().unwrap(),
+                DeleteOptions {
+                    recursive: false,
+                    immediate: false,
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
 
         Ok(())
@@ -372,7 +373,7 @@ impl Clone for HealingTracker {
     }
 }
 
-pub async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTracker> {
+pub async fn load_healing_tracker(disk: &Option<DiskStore>) -> disk::error::Result<HealingTracker> {
     if let Some(disk) = disk {
         let disk_id = disk.get_disk_id().await?;
         if let Some(disk_id) = disk_id {
@@ -381,7 +382,7 @@ pub async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTra
             let data = disk.read_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap()).await?;
             let mut healing_tracker = HealingTracker::unmarshal_msg(&data)?;
             if healing_tracker.id != disk_id && !healing_tracker.id.is_empty() {
-                return Err(Error::from_string(format!(
+                return Err(DiskError::other(format!(
                     "loadHealingTracker: drive id mismatch expected {}, got {}",
                     healing_tracker.id, disk_id
                 )));
@@ -390,14 +391,14 @@ pub async fn load_healing_tracker(disk: &Option<DiskStore>) -> Result<HealingTra
             healing_tracker.disk = Some(disk.clone());
             Ok(healing_tracker)
         } else {
-            Err(Error::from_string("loadHealingTracker: disk not have id"))
+            Err(DiskError::other("loadHealingTracker: disk not have id"))
         }
     } else {
-        Err(Error::from_string("loadHealingTracker: nil drive given"))
+        Err(DiskError::other("loadHealingTracker: nil drive given"))
     }
 }
 
-pub async fn init_healing_tracker(disk: DiskStore, heal_id: &str) -> Result<HealingTracker> {
+pub async fn init_healing_tracker(disk: DiskStore, heal_id: &str) -> disk::error::Result<HealingTracker> {
     let disk_location = disk.get_disk_location();
     Ok(HealingTracker {
         id: disk
@@ -416,7 +417,7 @@ pub async fn init_healing_tracker(disk: DiskStore, heal_id: &str) -> Result<Heal
     })
 }
 
-pub async fn healing(derive_path: &str) -> Result<Option<HealingTracker>> {
+pub async fn healing(derive_path: &str) -> disk::error::Result<Option<HealingTracker>> {
     let healing_file = Path::new(derive_path)
         .join(RUSTFS_META_BUCKET)
         .join(BUCKET_META_PREFIX)

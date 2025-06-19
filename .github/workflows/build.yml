@@ -17,42 +17,114 @@ jobs:
       matrix:
         os: [ ubuntu-latest, macos-latest, windows-latest ]
         variant:
-          - { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
-          - { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
+          - {
+            profile: release,
+            target: x86_64-unknown-linux-musl,
+            glibc: "default",
+          }
+          - {
+            profile: release,
+            target: x86_64-unknown-linux-gnu,
+            glibc: "default",
+          }
           - { profile: release, target: aarch64-apple-darwin, glibc: "default" }
           #- { profile: release, target: aarch64-unknown-linux-gnu, glibc: "default" }
-          - { profile: release, target: aarch64-unknown-linux-musl, glibc: "default" }
+          - {
+            profile: release,
+            target: aarch64-unknown-linux-musl,
+            glibc: "default",
+          }
           #- { profile: release, target: x86_64-pc-windows-msvc, glibc: "default" }
         exclude:
           # Linux targets on non-Linux systems
           - os: macos-latest
-            variant: { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: x86_64-unknown-linux-gnu,
+                glibc: "default",
+              }
           - os: macos-latest
-            variant: { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: x86_64-unknown-linux-musl,
+                glibc: "default",
+              }
           - os: macos-latest
-            variant: { profile: release, target: aarch64-unknown-linux-gnu, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: aarch64-unknown-linux-gnu,
+                glibc: "default",
+              }
           - os: macos-latest
-            variant: { profile: release, target: aarch64-unknown-linux-musl, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: aarch64-unknown-linux-musl,
+                glibc: "default",
+              }
           - os: windows-latest
-            variant: { profile: release, target: x86_64-unknown-linux-gnu, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: x86_64-unknown-linux-gnu,
+                glibc: "default",
+              }
           - os: windows-latest
-            variant: { profile: release, target: x86_64-unknown-linux-musl, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: x86_64-unknown-linux-musl,
+                glibc: "default",
+              }
           - os: windows-latest
-            variant: { profile: release, target: aarch64-unknown-linux-gnu, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: aarch64-unknown-linux-gnu,
+                glibc: "default",
+              }
           - os: windows-latest
-            variant: { profile: release, target: aarch64-unknown-linux-musl, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: aarch64-unknown-linux-musl,
+                glibc: "default",
+              }
 
           # Apple targets on non-macOS systems
           - os: ubuntu-latest
-            variant: { profile: release, target: aarch64-apple-darwin, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: aarch64-apple-darwin,
+                glibc: "default",
+              }
           - os: windows-latest
-            variant: { profile: release, target: aarch64-apple-darwin, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: aarch64-apple-darwin,
+                glibc: "default",
+              }
 
           # Windows targets on non-Windows systems
           - os: ubuntu-latest
-            variant: { profile: release, target: x86_64-pc-windows-msvc, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: x86_64-pc-windows-msvc,
+                glibc: "default",
+              }
           - os: macos-latest
-            variant: { profile: release, target: x86_64-pc-windows-msvc, glibc: "default" }
+            variant:
+              {
+                profile: release,
+                target: x86_64-pc-windows-msvc,
+                glibc: "default",
+              }
 
     steps:
       - name: Checkout repository
@@ -89,7 +161,7 @@ jobs:
         if: steps.cache-protoc.outputs.cache-hit != 'true'
         uses: arduino/setup-protoc@v3
         with:
-          version: '31.1'
+          version: "31.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Flatc
@@ -107,10 +179,10 @@ jobs:
 
       # Set up Zig for cross-compilation
       - uses: mlugg/setup-zig@v2
-        if: matrix.variant.glibc != 'default' || contains(matrix.variant.target, 'linux')
+        if: matrix.variant.glibc != 'default' || contains(matrix.variant.target, 'aarch64-unknown-linux')
 
       - uses: taiki-e/install-action@cargo-zigbuild
-        if: matrix.variant.glibc != 'default' || contains(matrix.variant.target, 'linux')
+        if: matrix.variant.glibc != 'default' || contains(matrix.variant.target, 'aarch64-unknown-linux')
 
       # Download static resources
       - name: Download and Extract Static Assets
@@ -150,7 +222,7 @@ jobs:
 
           # Determine whether to use zigbuild
           USE_ZIGBUILD=false
-          if [[ "$GLIBC" != "default" || "$TARGET" == *"linux"* ]]; then
+          if [[ "$GLIBC" != "default" || "$TARGET" == *"aarch64-unknown-linux"* ]]; then
             USE_ZIGBUILD=true
             echo "Using zigbuild for cross-compilation"
           fi
@@ -180,14 +252,14 @@ jobs:
           if [[ "$GLIBC" != "default" ]]; then
             BIN_NAME="${BIN_NAME}.glibc${GLIBC}"
           fi
-          
+
           # Windows systems use exe suffix, and other systems do not have suffix
           if [[ "${{ matrix.variant.target }}" == *"windows"* ]]; then
             BIN_NAME="${BIN_NAME}.exe"
           else
             BIN_NAME="${BIN_NAME}.bin"
           fi
-          
+
           echo "Binary name will be: $BIN_NAME"
 
           echo "::group::Building rustfs"
@@ -265,17 +337,56 @@ jobs:
           path: ${{ steps.package.outputs.artifact_name }}.zip
           retention-days: 7
 
+      # Install ossutil2 tool for OSS upload
+      - name: Install ossutil2
+        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "::group::Installing ossutil2"
+          # Download and install ossutil based on platform
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            curl -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
+            unzip -o ossutil.zip
+            chmod 755 ossutil-2.1.1-linux-amd64/ossutil
+            sudo mv ossutil-2.1.1-linux-amd64/ossutil /usr/local/bin/
+            rm -rf ossutil.zip ossutil-2.1.1-linux-amd64
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            if [ "$(uname -m)" = "arm64" ]; then
+              curl -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-mac-arm64.zip
+            else
+              curl -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-mac-amd64.zip
+            fi
+            unzip -o ossutil.zip
+            chmod 755 ossutil-*/ossutil
+            sudo mv ossutil-*/ossutil /usr/local/bin/
+            rm -rf ossutil.zip ossutil-*
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            curl -o ossutil.zip https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-windows-amd64.zip
+            unzip -o ossutil.zip
+            mv ossutil-*/ossutil.exe /usr/bin/ossutil.exe
+            rm -rf ossutil.zip ossutil-*
+          fi
+          echo "ossutil2 installation completed"
+
+          # Set the OSS configuration
+          ossutil config set Region oss-cn-beijing
+          ossutil config set endpoint oss-cn-beijing.aliyuncs.com
+          ossutil config set accessKeyID ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          ossutil config set accessKeySecret ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+
       - name: Upload to Aliyun OSS
         if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
-        uses: JohnGuan/oss-upload-action@main
-        with:
-          key-id: ${{ secrets.ALICLOUDOSS_KEY_ID }}
-          key-secret: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-          region: oss-cn-beijing
-          bucket: rustfs-artifacts
-          assets: |
-            ${{ steps.package.outputs.artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.zip
-            ${{ steps.package.outputs.artifact_name }}.zip:/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.latest.zip  
+        shell: bash
+        env:
+          OSSUTIL_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSSUTIL_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSSUTIL_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        run: |
+          echo "::group::Uploading files to OSS"
+          # Upload the artifact file to two different paths
+          ossutil cp "${{ steps.package.outputs.artifact_name }}.zip" "oss://rustfs-artifacts/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.zip" --force
+          ossutil cp "${{ steps.package.outputs.artifact_name }}.zip" "oss://rustfs-artifacts/artifacts/rustfs/${{ steps.package.outputs.artifact_name }}.latest.zip" --force
+          echo "Successfully uploaded artifacts to OSS"
 
       # Determine whether to perform GUI construction based on conditions
       - name: Prepare for GUI build
@@ -393,16 +504,17 @@ jobs:
       # Upload GUI to Alibaba Cloud OSS
       - name: Upload GUI to Aliyun OSS
         if: startsWith(github.ref, 'refs/tags/')
-        uses: JohnGuan/oss-upload-action@main
-        with:
-          key-id: ${{ secrets.ALICLOUDOSS_KEY_ID }}
-          key-secret: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-          region: oss-cn-beijing
-          bucket: rustfs-artifacts
-          assets: |
-            ${{ steps.build_gui.outputs.gui_artifact_name }}.zip:/artifacts/rustfs/${{ steps.build_gui.outputs.gui_artifact_name }}.zip
-            ${{ steps.build_gui.outputs.gui_artifact_name }}.zip:/artifacts/rustfs/${{ steps.build_gui.outputs.gui_artifact_name }}.latest.zip
-
+        shell: bash
+        env:
+          OSSUTIL_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSSUTIL_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSSUTIL_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        run: |
+          echo "::group::Uploading GUI files to OSS"
+          # Upload the GUI artifact file to two different paths
+          ossutil cp "${{ steps.build_gui.outputs.gui_artifact_name }}.zip" "oss://rustfs-artifacts/artifacts/rustfs/${{ steps.build_gui.outputs.gui_artifact_name }}.zip" --force
+          ossutil cp "${{ steps.build_gui.outputs.gui_artifact_name }}.zip" "oss://rustfs-artifacts/artifacts/rustfs/${{ steps.build_gui.outputs.gui_artifact_name }}.latest.zip" --force
+          echo "Successfully uploaded GUI artifacts to OSS"
 
   merge:
     runs-on: ubuntu-latest

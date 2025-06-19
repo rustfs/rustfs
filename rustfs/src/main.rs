@@ -2,6 +2,7 @@ mod admin;
 mod auth;
 mod config;
 mod console;
+mod error;
 mod event;
 mod grpc;
 pub mod license;
@@ -18,7 +19,7 @@ use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
 use common::{
-    error::{Error, Result},
+    // error::{Error, Result},
     globals::set_global_addr,
 };
 use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
@@ -27,7 +28,6 @@ use ecstore::config as ecconfig;
 use ecstore::config::GLOBAL_ConfigSys;
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::store_api::BucketOptions;
-use ecstore::utils::net;
 use ecstore::StorageAPI;
 use ecstore::{
     endpoints::EndpointServerPools,
@@ -50,10 +50,12 @@ use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_obs::{init_obs, set_global_guard, SystemObserver};
+use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
 use service::hybrid;
 use socket2::SockRef;
+use std::io::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,7 +75,7 @@ const MI_B: usize = 1024 * 1024;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[allow(clippy::result_large_err)]
-fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
+fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
 
     match req.metadata().get("authorization") {
@@ -107,7 +109,7 @@ async fn main() -> Result<()> {
     let (_logger, guard) = init_obs(Some(opt.clone().obs_endpoint)).await;
 
     // Store in global storage
-    set_global_guard(guard)?;
+    set_global_guard(guard).map_err(Error::other)?;
 
     // Run parameters
     run(opt).await
@@ -120,7 +122,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize event notifier
     // event::init_event_notifier(opt.event_config).await;
 
-    let server_addr = net::parse_and_resolve_address(opt.address.as_str())?;
+    let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
@@ -139,8 +141,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     let local_ip = rustfs_utils::get_local_ip().ok_or(local_addr.ip()).unwrap();
 
     // For RPC
-    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
-        .map_err(|err| Error::from_string(err.to_string()))?;
+    let (endpoint_pools, setup_type) =
+        EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone()).map_err(Error::other)?;
 
     // Print RustFS-style logging for pool formatting
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
@@ -164,7 +166,10 @@ async fn run(opt: config::Opt) -> Result<()> {
     info!("   RootUser: {}", opt.access_key.clone());
     info!("   RootPass: {}", opt.secret_key.clone());
     if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
-        warn!("Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables", DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY);
+        warn!(
+            "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
+            DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+        );
     }
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
@@ -184,9 +189,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     update_erasure_type(setup_type).await;
 
     // Initialize the local disk
-    init_local_disks(endpoint_pools.clone())
-        .await
-        .map_err(|err| Error::from_string(err.to_string()))?;
+    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
 
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
@@ -208,7 +211,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         if !opt.server_domains.is_empty() {
             info!("virtual-hosted-style requests are enabled use domain_name {:?}", &opt.server_domains);
-            b.set_host(MultiDomain::new(&opt.server_domains)?);
+            b.set_host(MultiDomain::new(&opt.server_domains).map_err(Error::other)?);
         }
 
         // // Enable parsing virtual-hosted-style requests
@@ -501,9 +504,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     // init store
     let store = ECStore::new(server_addr.clone(), endpoint_pools.clone())
         .await
-        .map_err(|err| {
-            error!("ECStore::new {:?}", &err);
-            Error::from_string(err.to_string())
+        .inspect_err(|err| {
+            error!("ECStore::new {:?}", err);
         })?;
 
     ecconfig::init();
@@ -522,7 +524,7 @@ async fn run(opt: config::Opt) -> Result<()> {
             ..Default::default()
         })
         .await
-        .map_err(|err| Error::from_string(err.to_string()))?;
+        .map_err(Error::other)?;
 
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
 
@@ -532,7 +534,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     new_global_notification_sys(endpoint_pools.clone()).await.map_err(|err| {
         error!("new_global_notification_sys failed {:?}", &err);
-        Error::from_string(err.to_string())
+        Error::other(err)
     })?;
 
     // init scanner
@@ -558,7 +560,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 
         if console_address.is_empty() {
             error!("console_address is empty");
-            return Err(Error::from_string("console_address is empty".to_string()));
+            return Err(Error::other("console_address is empty".to_string()));
         }
 
         tokio::spawn(async move {

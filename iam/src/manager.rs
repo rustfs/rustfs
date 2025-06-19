@@ -1,3 +1,4 @@
+use crate::error::{is_err_config_not_found, Error, Result};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
@@ -8,9 +9,7 @@ use crate::{
         STATUS_DISABLED, STATUS_ENABLED,
     },
 };
-use common::error::{Error, Result};
-use ecstore::config::error::is_err_config_not_found;
-use ecstore::utils::{crypto::base64_encode, path::path_join_buf};
+// use ecstore::utils::crypto::base64_encode;
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use policy::{
     arn::ARN,
@@ -20,6 +19,8 @@ use policy::{
         default::DEFAULT_POLICIES, iam_policy_claim_name_sa, Policy, PolicyDoc, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE,
     },
 };
+use rustfs_utils::crypto::base64_encode;
+use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -75,7 +76,7 @@ where
     T: Store,
 {
     pub(crate) async fn new(api: T) -> Arc<Self> {
-        let (sender, receiver) = mpsc::channel::<i64>(100);
+        let (sender, reciver) = mpsc::channel::<i64>(100);
 
         let sys = Arc::new(Self {
             api,
@@ -86,46 +87,53 @@ where
             last_timestamp: AtomicI64::new(0),
         });
 
-        sys.clone().init(receiver).await.unwrap();
+        sys.clone().init(reciver).await.unwrap();
         sys
     }
 
-    async fn init(self: Arc<Self>, receiver: Receiver<i64>) -> Result<()> {
+    async fn init(self: Arc<Self>, reciver: Receiver<i64>) -> Result<()> {
         self.clone().save_iam_formatter().await?;
         self.clone().load().await?;
 
-        // Background thread starts periodic updates or receives signal updates
-        tokio::spawn({
-            let s = Arc::clone(&self);
-            async move {
-                let ticker = tokio::time::interval(Duration::from_secs(120));
-                tokio::pin!(ticker, receiver);
-                loop {
-                    select! {
-                        _ = ticker.tick() => {
-                            if let Err(err) =s.clone().load().await{
-                                error!("iam load err {:?}", err);
-                            }
-                        },
-                        i = receiver.recv() => {
-                            match i {
-                                Some(t) => {
-                                    let last = s.last_timestamp.load(Ordering::Relaxed);
-                                    if last <= t {
+        // 检查环境变量是否设置
+        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
 
-                                        if let Err(err) =s.clone().load().await{
-                                            error!("iam load err {:?}", err);
+        if !skip_background_task {
+            // Background thread starts periodic updates or receives signal updates
+            tokio::spawn({
+                let s = Arc::clone(&self);
+                async move {
+                    let ticker = tokio::time::interval(Duration::from_secs(120));
+                    tokio::pin!(ticker, reciver);
+                    loop {
+                        select! {
+                            _ = ticker.tick() => {
+                                warn!("iam load ticker");
+                                if let Err(err) =s.clone().load().await{
+                                    error!("iam load err {:?}", err);
+                                }
+                            },
+                            i = reciver.recv() => {
+                                warn!("iam load reciver");
+                                match i {
+                                    Some(t) => {
+                                        let last = s.last_timestamp.load(Ordering::Relaxed);
+                                        if last <= t {
+                                            warn!("iam load reciver load");
+                                            if let Err(err) =s.clone().load().await{
+                                                error!("iam load err {:?}", err);
+                                            }
+                                            ticker.reset();
                                         }
-                                        ticker.reset();
-                                    }
-                                },
-                                None => return,
+                                    },
+                                    None => return,
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
+            });
+        }
 
         Ok(())
     }
@@ -183,7 +191,7 @@ where
 
     pub async fn get_policy(&self, name: &str) -> Result<Policy> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let policies = MappedPolicy::new(name).to_slice();
@@ -200,13 +208,13 @@ where
                 .load()
                 .get(&policy)
                 .cloned()
-                .ok_or(Error::new(IamError::NoSuchPolicy))?;
+                .ok_or(Error::NoSuchPolicy)?;
 
             to_merge.push(v.policy);
         }
 
         if to_merge.is_empty() {
-            return Err(Error::new(IamError::NoSuchPolicy));
+            return Err(Error::NoSuchPolicy);
         }
 
         Ok(Policy::merge_policies(to_merge))
@@ -214,20 +222,15 @@ where
 
     pub async fn get_policy_doc(&self, name: &str) -> Result<PolicyDoc> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
-        self.cache
-            .policy_docs
-            .load()
-            .get(name)
-            .cloned()
-            .ok_or(Error::new(IamError::NoSuchPolicy))
+        self.cache.policy_docs.load().get(name).cloned().ok_or(Error::NoSuchPolicy)
     }
 
     pub async fn delete_policy(&self, name: &str, is_from_notify: bool) -> Result<()> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if is_from_notify {
@@ -255,7 +258,7 @@ where
             });
 
             if !users.is_empty() || !groups.is_empty() {
-                return Err(IamError::PolicyInUse.into());
+                return Err(Error::PolicyInUse);
             }
 
             if let Err(err) = self.api.delete_policy_doc(name).await {
@@ -275,7 +278,7 @@ where
 
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
         if name.is_empty() || policy.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let policy_doc = self
@@ -407,7 +410,7 @@ where
         }
 
         if !user_exists {
-            return Err(Error::new(IamError::NoSuchUser(access_key.to_string())));
+            return Err(Error::NoSuchUser(access_key.to_string()));
         }
 
         Ok(ret)
@@ -453,13 +456,13 @@ where
     /// create a service account and update cache
     pub async fn add_service_account(&self, cred: Credentials) -> Result<OffsetDateTime> {
         if cred.access_key.is_empty() || cred.parent_user.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users = self.cache.users.load();
         if let Some(x) = users.get(&cred.access_key) {
             if x.credentials.is_service_account() {
-                return Err(Error::new(IamError::IAMActionNotAllowed));
+                return Err(Error::IAMActionNotAllowed);
             }
         }
 
@@ -476,11 +479,11 @@ where
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
         let Some(ui) = self.cache.users.load().get(name).cloned() else {
-            return Err(IamError::NoSuchServiceAccount(name.to_string()).into());
+            return Err(Error::NoSuchServiceAccount(name.to_string()));
         };
 
         if !ui.credentials.is_service_account() {
-            return Err(IamError::NoSuchServiceAccount(name.to_string()).into());
+            return Err(Error::NoSuchServiceAccount(name.to_string()));
         }
 
         let mut cr = ui.credentials.clone();
@@ -488,7 +491,7 @@ where
 
         if let Some(secret) = opts.secret_key {
             if !is_secret_key_valid(&secret) {
-                return Err(IamError::InvalidSecretKeyLength.into());
+                return Err(Error::InvalidSecretKeyLength);
             }
             cr.secret_key = secret;
         }
@@ -535,7 +538,7 @@ where
             if !session_policy.version.is_empty() && !session_policy.statements.is_empty() {
                 let policy_buf = serde_json::to_vec(&session_policy)?;
                 if policy_buf.len() > MAX_SVCSESSION_POLICY_SIZE {
-                    return Err(IamError::PolicyTooLarge.into());
+                    return Err(Error::PolicyTooLarge);
                 }
 
                 m.insert(SESSION_POLICY_NAME.to_owned(), serde_json::Value::String(base64_encode(&policy_buf)));
@@ -558,7 +561,7 @@ where
 
     pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let (mut policies, _) = self.policy_db_get_internal(name, false, false).await?;
@@ -594,7 +597,7 @@ where
                         Cache::add_or_update(&self.cache.groups, name, p, OffsetDateTime::now_utc());
                     }
 
-                    m.get(name).cloned().ok_or(IamError::NoSuchGroup(name.to_string()))?
+                    m.get(name).cloned().ok_or(Error::NoSuchGroup(name.to_string()))?
                 }
             };
 
@@ -639,7 +642,7 @@ where
                     Cache::add_or_update(&self.cache.user_policies, name, p, OffsetDateTime::now_utc());
                     p.clone()
                 } else {
-                    let mp = match self.cache.sts_policies.load().get(name) {
+                    match self.cache.sts_policies.load().get(name) {
                         Some(p) => p.clone(),
                         None => {
                             let mut m = HashMap::new();
@@ -651,8 +654,7 @@ where
                                 MappedPolicy::default()
                             }
                         }
-                    };
-                    mp
+                    }
                 }
             }
         };
@@ -696,7 +698,7 @@ where
 
         for group in self
             .cache
-            .user_group_memberships
+            .user_group_memeberships
             .load()
             .get(name)
             .cloned()
@@ -737,7 +739,7 @@ where
     }
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if policy.is_empty() {
@@ -763,7 +765,7 @@ where
         let policy_docs_cache = self.cache.policy_docs.load();
         for p in mp.to_slice() {
             if !policy_docs_cache.contains_key(&p) {
-                return Err(Error::new(IamError::NoSuchPolicy));
+                return Err(Error::NoSuchPolicy);
             }
         }
 
@@ -791,14 +793,14 @@ where
                 cred.is_expired(),
                 cred.parent_user.is_empty()
             );
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if let Some(policy) = policy_name {
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
             if combined_policy_stmt.is_empty() {
-                return Err(Error::msg(format!("need policy not found {}", IamError::NoSuchPolicy)));
+                return Err(Error::other(format!("need poliy not found {}", IamError::NoSuchPolicy)));
             }
 
             self.api
@@ -821,15 +823,15 @@ where
     pub async fn get_user_info(&self, name: &str) -> Result<madmin::UserInfo> {
         let users = self.cache.users.load();
         let policies = self.cache.user_policies.load();
-        let group_members = self.cache.user_group_memberships.load();
+        let group_members = self.cache.user_group_memeberships.load();
 
         let u = match users.get(name) {
             Some(u) => u,
-            None => return Err(Error::new(IamError::NoSuchUser(name.to_string()))),
+            None => return Err(Error::NoSuchUser(name.to_string())),
         };
 
         if u.credentials.is_temp() || u.credentials.is_service_account() {
-            return Err(Error::new(IamError::IAMActionNotAllowed));
+            return Err(Error::IAMActionNotAllowed);
         }
 
         let mut uinfo = madmin::UserInfo {
@@ -860,7 +862,7 @@ where
 
         let users = self.cache.users.load();
         let policies = self.cache.user_policies.load();
-        let group_members = self.cache.user_group_memberships.load();
+        let group_members = self.cache.user_group_memeberships.load();
 
         for (k, v) in users.iter() {
             if v.credentials.is_temp() || v.credentials.is_service_account() {
@@ -894,7 +896,7 @@ where
     pub async fn get_bucket_users(&self, bucket_name: &str) -> Result<HashMap<String, madmin::UserInfo>> {
         let users = self.cache.users.load();
         let policies_cache = self.cache.user_policies.load();
-        let group_members = self.cache.user_group_memberships.load();
+        let group_members = self.cache.user_group_memeberships.load();
         let group_policy_cache = self.cache.group_policies.load();
 
         let mut ret = HashMap::new();
@@ -961,7 +963,7 @@ where
         if let Some(x) = users.get(access_key) {
             warn!("user already exists: {:?}", x);
             if x.credentials.is_temp() {
-                return Err(IamError::IAMActionNotAllowed.into());
+                return Err(Error::IAMActionNotAllowed);
             }
         }
 
@@ -971,7 +973,7 @@ where
                 _ => auth::ACCOUNT_OFF,
             }
         };
-        let user_entity = UserIdentity::from(Credentials {
+        let user_entiry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: args.secret_key.to_string(),
             status: status.to_owned(),
@@ -979,21 +981,21 @@ where
         });
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entity.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, user_entiry.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, user_entity)?;
+        self.update_user_with_claims(access_key, user_entiry)?;
 
         Ok(OffsetDateTime::now_utc())
     }
 
     pub async fn delete_user(&self, access_key: &str, utype: UserType) -> Result<()> {
         if access_key.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if utype == UserType::Reg {
-            if let Some(member_of) = self.cache.user_group_memberships.load().get(access_key) {
+            if let Some(member_of) = self.cache.user_group_memeberships.load().get(access_key) {
                 for member in member_of.iter() {
                     let _ = self
                         .remove_members_from_group(member, vec![access_key.to_string()], false)
@@ -1041,13 +1043,13 @@ where
 
     pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
         if access_key.is_empty() || secret_key.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users = self.cache.users.load();
         let u = match users.get(access_key) {
             Some(u) => u,
-            None => return Err(Error::new(IamError::NoSuchUser(access_key.to_string()))),
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
 
         let mut cred = u.credentials.clone();
@@ -1064,21 +1066,21 @@ where
 
     pub async fn set_user_status(&self, access_key: &str, status: AccountStatus) -> Result<OffsetDateTime> {
         if access_key.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         if !access_key.is_empty() && status != AccountStatus::Enabled && status != AccountStatus::Disabled {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users = self.cache.users.load();
         let u = match users.get(access_key) {
             Some(u) => u,
-            None => return Err(Error::new(IamError::NoSuchUser(access_key.to_string()))),
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
 
         if u.credentials.is_temp() || u.credentials.is_service_account() {
-            return Err(Error::new(IamError::IAMActionNotAllowed));
+            return Err(Error::IAMActionNotAllowed);
         }
 
         let status = {
@@ -1088,7 +1090,7 @@ where
             }
         };
 
-        let user_entity = UserIdentity::from(Credentials {
+        let user_entiry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: u.credentials.secret_key.clone(),
             status: status.to_owned(),
@@ -1096,10 +1098,10 @@ where
         });
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entity.clone(), None)
+            .save_user_identity(access_key, UserType::Reg, user_entiry.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, user_entity)?;
+        self.update_user_with_claims(access_key, user_entiry)?;
 
         Ok(OffsetDateTime::now_utc())
     }
@@ -1123,7 +1125,7 @@ where
         let users = self.cache.users.load();
         let u = match users.get(access_key) {
             Some(u) => u,
-            None => return Err(Error::new(IamError::NoSuchUser(access_key.to_string()))),
+            None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
 
         if u.credentials.is_temp() {
@@ -1135,7 +1137,7 @@ where
 
     pub async fn add_users_to_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
         if group.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users_cache = self.cache.users.load();
@@ -1143,10 +1145,10 @@ where
         for member in members.iter() {
             if let Some(u) = users_cache.get(member) {
                 if u.credentials.is_temp() || u.credentials.is_service_account() {
-                    return Err(Error::new(IamError::IAMActionNotAllowed));
+                    return Err(Error::IAMActionNotAllowed);
                 }
             } else {
-                return Err(Error::new(IamError::NoSuchUser(member.to_string())));
+                return Err(Error::NoSuchUser(member.to_string()));
             }
         }
 
@@ -1167,12 +1169,12 @@ where
 
         Cache::add_or_update(&self.cache.groups, group, &gi, OffsetDateTime::now_utc());
 
-        let user_group_memberships = self.cache.user_group_memberships.load();
+        let user_group_memeberships = self.cache.user_group_memeberships.load();
         members.iter().for_each(|member| {
-            if let Some(m) = user_group_memberships.get(member) {
+            if let Some(m) = user_group_memeberships.get(member) {
                 let mut m = m.clone();
                 m.insert(group.to_string());
-                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_group_memeberships, member, &m, OffsetDateTime::now_utc());
             }
         });
 
@@ -1181,13 +1183,13 @@ where
 
     pub async fn set_group_status(&self, name: &str, enable: bool) -> Result<OffsetDateTime> {
         if name.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let groups = self.cache.groups.load();
         let mut gi = match groups.get(name) {
             Some(gi) => gi.clone(),
-            None => return Err(Error::new(IamError::NoSuchGroup(name.to_string()))),
+            None => return Err(Error::NoSuchGroup(name.to_string())),
         };
 
         if enable {
@@ -1213,7 +1215,7 @@ where
             .load()
             .get(name)
             .cloned()
-            .ok_or(Error::new(IamError::NoSuchGroup(name.to_string())))?;
+            .ok_or(Error::NoSuchGroup(name.to_string()))?;
 
         Ok(GroupDesc {
             name: name.to_string(),
@@ -1240,7 +1242,7 @@ where
             .load()
             .get(name)
             .cloned()
-            .ok_or(Error::new(IamError::NoSuchGroup(name.to_string())))?;
+            .ok_or(Error::NoSuchGroup(name.to_string()))?;
 
         let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
@@ -1252,12 +1254,12 @@ where
 
         Cache::add_or_update(&self.cache.groups, name, &gi, OffsetDateTime::now_utc());
 
-        let user_group_memberships = self.cache.user_group_memberships.load();
+        let user_group_memeberships = self.cache.user_group_memeberships.load();
         members.iter().for_each(|member| {
-            if let Some(m) = user_group_memberships.get(member) {
+            if let Some(m) = user_group_memeberships.get(member) {
                 let mut m = m.clone();
                 m.remove(name);
-                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_group_memeberships, member, &m, OffsetDateTime::now_utc());
             }
         });
 
@@ -1266,7 +1268,7 @@ where
 
     pub async fn remove_users_from_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
         if group.is_empty() {
-            return Err(Error::new(IamError::InvalidArgument));
+            return Err(Error::InvalidArgument);
         }
 
         let users_cache = self.cache.users.load();
@@ -1274,10 +1276,10 @@ where
         for member in members.iter() {
             if let Some(u) = users_cache.get(member) {
                 if u.credentials.is_temp() || u.credentials.is_service_account() {
-                    return Err(Error::new(IamError::IAMActionNotAllowed));
+                    return Err(Error::IAMActionNotAllowed);
                 }
             } else {
-                return Err(Error::new(IamError::NoSuchUser(member.to_string())));
+                return Err(Error::NoSuchUser(member.to_string()));
             }
         }
 
@@ -1287,10 +1289,10 @@ where
             .load()
             .get(group)
             .cloned()
-            .ok_or(Error::new(IamError::NoSuchGroup(group.to_string())))?;
+            .ok_or(Error::NoSuchGroup(group.to_string()))?;
 
         if members.is_empty() && !gi.members.is_empty() {
-            return Err(IamError::GroupNotEmpty.into());
+            return Err(Error::GroupNotEmpty);
         }
 
         if members.is_empty() {
@@ -1308,23 +1310,23 @@ where
     }
 
     fn remove_group_from_memberships_map(&self, group: &str) {
-        let user_group_memberships = self.cache.user_group_memberships.load();
-        for (k, v) in user_group_memberships.iter() {
+        let user_group_memeberships = self.cache.user_group_memeberships.load();
+        for (k, v) in user_group_memeberships.iter() {
             if v.contains(group) {
                 let mut m = v.clone();
                 m.remove(group);
-                Cache::add_or_update(&self.cache.user_group_memberships, k, &m, OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_group_memeberships, k, &m, OffsetDateTime::now_utc());
             }
         }
     }
 
     fn update_group_memberships_map(&self, group: &str, gi: &GroupInfo) {
-        let user_group_memberships = self.cache.user_group_memberships.load();
+        let user_group_memeberships = self.cache.user_group_memeberships.load();
         for member in gi.members.iter() {
-            if let Some(m) = user_group_memberships.get(member) {
+            if let Some(m) = user_group_memeberships.get(member) {
                 let mut m = m.clone();
                 m.insert(group.to_string());
-                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_group_memeberships, member, &m, OffsetDateTime::now_utc());
             }
         }
     }
@@ -1442,7 +1444,7 @@ where
                 Cache::delete(&self.cache.users, name, OffsetDateTime::now_utc());
             }
 
-            let member_of = self.cache.user_group_memberships.load();
+            let member_of = self.cache.user_group_memeberships.load();
             if let Some(m) = member_of.get(name) {
                 for group in m.iter() {
                     if let Err(err) = self.remove_members_from_group(group, vec![name.to_string()], true).await {
@@ -1589,7 +1591,7 @@ pub fn get_token_signing_key() -> Option<String> {
 
 pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
     let Some(sys_key) = get_token_signing_key() else {
-        return Err(Error::msg("global active sk not init"));
+        return Err(Error::other("global active sk not init"));
     };
 
     let keys = vec![&sys_key, &u.credentials.secret_key];
@@ -1599,7 +1601,7 @@ pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
             return Ok(claims);
         }
     }
-    Err(Error::msg("unable to extract claims"))
+    Err(Error::other("unable to extract claims"))
 }
 
 fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (String, Policy) {

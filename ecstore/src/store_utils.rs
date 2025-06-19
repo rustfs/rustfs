@@ -1,6 +1,6 @@
 use crate::config::storageclass::STANDARD;
-use crate::xhttp::AMZ_OBJECT_TAGGING;
-use crate::xhttp::AMZ_STORAGE_CLASS;
+use rustfs_filemeta::headers::AMZ_OBJECT_TAGGING;
+use rustfs_filemeta::headers::AMZ_STORAGE_CLASS;
 use std::collections::HashMap;
 
 pub fn clean_metadata(metadata: &mut HashMap<String, String>) {

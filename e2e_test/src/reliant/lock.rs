@@ -5,7 +5,7 @@ use std::{error::Error, sync::Arc, time::Duration};
 use lock::{
     drwmutex::Options,
     lock_args::LockArgs,
-    namespace_lock::{new_nslock, NsLockMap},
+    namespace_lock::{NsLockMap, new_nslock},
     new_lock_api,
 };
 use protos::{node_service_time_out_client, proto_gen::node_service::GenerallyLockRequest};
@@ -60,16 +60,16 @@ async fn test_lock_unlock_ns_lock() -> Result<(), Box<dyn Error>> {
         vec![locker],
     )
     .await;
-    assert!(ns
-        .0
-        .write()
-        .await
-        .get_lock(&Options {
-            timeout: Duration::from_secs(5),
-            retry_interval: Duration::from_secs(1),
-        })
-        .await
-        .unwrap());
+    assert!(
+        ns.0.write()
+            .await
+            .get_lock(&Options {
+                timeout: Duration::from_secs(5),
+                retry_interval: Duration::from_secs(1),
+            })
+            .await
+            .unwrap()
+    );
 
     ns.0.write().await.un_lock().await.unwrap();
     Ok(())

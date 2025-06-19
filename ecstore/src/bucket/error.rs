@@ -1,6 +1,6 @@
-use common::error::Error;
+use crate::error::Error;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum BucketMetadataError {
     #[error("tagging not found")]
     TaggingNotFound,
@@ -18,17 +18,57 @@ pub enum BucketMetadataError {
     BucketReplicationConfigNotFound,
     #[error("bucket remote target not found")]
     BucketRemoteTargetNotFound,
+
+    #[error("Io error: {0}")]
+    Io(std::io::Error),
 }
 
 impl BucketMetadataError {
-    pub fn is(&self, err: &Error) -> bool {
-        if let Some(e) = err.downcast_ref::<BucketMetadataError>() {
-            e == self
-        } else {
-            false
+    pub fn other<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        BucketMetadataError::Io(std::io::Error::other(error))
+    }
+}
+
+impl From<BucketMetadataError> for Error {
+    fn from(e: BucketMetadataError) -> Self {
+        match e {
+            BucketMetadataError::BucketPolicyNotFound => Error::BucketPolicyNotFound,
+            _ => Error::other(e),
         }
     }
 }
+
+impl From<Error> for BucketMetadataError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::BucketPolicyNotFound => BucketMetadataError::BucketPolicyNotFound,
+            Error::Io(e) => e.into(),
+            _ => BucketMetadataError::other(e),
+        }
+    }
+}
+
+impl From<std::io::Error> for BucketMetadataError {
+    fn from(e: std::io::Error) -> Self {
+        e.downcast::<BucketMetadataError>().unwrap_or_else(BucketMetadataError::other)
+    }
+}
+
+impl PartialEq for BucketMetadataError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (BucketMetadataError::Io(e1), BucketMetadataError::Io(e2)) => {
+                e1.kind() == e2.kind() && e1.to_string() == e2.to_string()
+            }
+            (e1, e2) => e1.to_u32() == e2.to_u32(),
+        }
+    }
+}
+
+impl Eq for BucketMetadataError {}
 
 impl BucketMetadataError {
     pub fn to_u32(&self) -> u32 {
@@ -41,6 +81,7 @@ impl BucketMetadataError {
             BucketMetadataError::BucketQuotaConfigNotFound => 0x06,
             BucketMetadataError::BucketReplicationConfigNotFound => 0x07,
             BucketMetadataError::BucketRemoteTargetNotFound => 0x08,
+            BucketMetadataError::Io(_) => 0x09,
         }
     }
 
@@ -54,6 +95,7 @@ impl BucketMetadataError {
             0x06 => Some(BucketMetadataError::BucketQuotaConfigNotFound),
             0x07 => Some(BucketMetadataError::BucketReplicationConfigNotFound),
             0x08 => Some(BucketMetadataError::BucketRemoteTargetNotFound),
+            0x09 => Some(BucketMetadataError::Io(std::io::Error::other("Io error"))),
             _ => None,
         }
     }

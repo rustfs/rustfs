@@ -1,15 +1,15 @@
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::heal::background_heal_ops::{heal_bucket, heal_object};
 use crate::heal::heal_commands::{HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN};
-use crate::utils::path::SLASH_SEPARATOR;
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
+use rustfs_utils::path::SLASH_SEPARATOR;
 use std::ops::Sub;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
 use tracing::error;
 use uuid::Uuid;

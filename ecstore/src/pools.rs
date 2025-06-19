@@ -1,9 +1,13 @@
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::cache_value::metacache_set::{list_path_raw, ListPathRawOptions};
-use crate::config::com::{read_config, save_config, CONFIG_PREFIX};
-use crate::config::error::ConfigError;
-use crate::disk::error::is_err_volume_not_found;
-use crate::disk::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
+use crate::config::com::{CONFIG_PREFIX, read_config, save_config};
+use crate::disk::error::DiskError;
+use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+use crate::error::{Error, Result};
+use crate::error::{
+    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
+    is_err_version_not_found,
+};
 use crate::heal::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::heal::heal_commands::HealOpts;
 use crate::new_object_layer_fn;
@@ -12,18 +16,16 @@ use crate::set_disk::SetDisks;
 use crate::store_api::{
     BucketOptions, CompletePart, GetObjectReader, MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI,
 };
-use crate::store_err::{
-    is_err_bucket_exists, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found, StorageError,
-};
-use crate::utils::path::{encode_dir_object, path_join, SLASH_SEPARATOR};
 use crate::{sets::Sets, store::ECStore};
 use ::workers::workers::Workers;
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use common::defer;
-use common::error::{Error, Result};
 use futures::future::BoxFuture;
 use http::HeaderMap;
 use rmp_serde::{Deserializer, Serializer};
+use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_rio::{HashReader, WarpReader};
+use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -31,7 +33,7 @@ use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::broadcast::Receiver as B_Receiver;
 use tracing::{error, info, warn};
 
@@ -106,12 +108,12 @@ impl PoolMeta {
                 if data.is_empty() {
                     return Ok(());
                 } else if data.len() <= 4 {
-                    return Err(Error::from_string("poolMeta: no data"));
+                    return Err(Error::other("poolMeta: no data"));
                 }
                 data
             }
             Err(err) => {
-                if let Some(ConfigError::NotFound) = err.downcast_ref::<ConfigError>() {
+                if err == Error::ConfigNotFound {
                     return Ok(());
                 }
                 return Err(err);
@@ -119,11 +121,11 @@ impl PoolMeta {
         };
         let format = LittleEndian::read_u16(&data[0..2]);
         if format != POOL_META_FORMAT {
-            return Err(Error::msg(format!("PoolMeta: unknown format: {}", format)));
+            return Err(Error::other(format!("PoolMeta: unknown format: {}", format)));
         }
         let version = LittleEndian::read_u16(&data[2..4]);
         if version != POOL_META_VERSION {
-            return Err(Error::msg(format!("PoolMeta: unknown version: {}", version)));
+            return Err(Error::other(format!("PoolMeta: unknown version: {}", version)));
         }
 
         let mut buf = Deserializer::new(Cursor::new(&data[4..]));
@@ -131,7 +133,7 @@ impl PoolMeta {
         *self = meta;
 
         if self.version != POOL_META_VERSION {
-            return Err(Error::msg(format!("unexpected PoolMeta version: {}", self.version)));
+            return Err(Error::other(format!("unexpected PoolMeta version: {}", self.version)));
         }
         Ok(())
     }
@@ -230,7 +232,7 @@ impl PoolMeta {
         if let Some(pool) = self.pools.get_mut(idx) {
             if let Some(ref info) = pool.decommission {
                 if !info.complete && !info.failed && !info.canceled {
-                    return Err(Error::new(StorageError::DecommissionAlreadyRunning));
+                    return Err(StorageError::DecommissionAlreadyRunning);
                 }
             }
 
@@ -304,7 +306,7 @@ impl PoolMeta {
     }
 
     pub fn track_current_bucket_object(&mut self, idx: usize, bucket: String, object: String) {
-        if !self.pools.get(idx).is_some_and(|v| v.decommission.is_some()) {
+        if self.pools.get(idx).is_none_or(|v| v.decommission.is_none()) {
             return;
         }
 
@@ -317,8 +319,8 @@ impl PoolMeta {
     }
 
     pub async fn update_after(&mut self, idx: usize, pools: Vec<Arc<Sets>>, duration: Duration) -> Result<bool> {
-        if !self.pools.get(idx).is_some_and(|v| v.decommission.is_some()) {
-            return Err(Error::msg("InvalidArgument"));
+        if self.pools.get(idx).is_none_or(|v| v.decommission.is_none()) {
+            return Err(Error::other("InvalidArgument"));
         }
 
         let now = OffsetDateTime::now_utc();
@@ -377,7 +379,7 @@ impl PoolMeta {
                         pi.position + 1,
                         k
                     );
-                    // return Err(Error::msg(format!(
+                    // return Err(Error::other(format!(
                     //     "pool({}) = {} is decommissioned, please remove from server command line",
                     //     pi.position + 1,
                     //     k
@@ -590,22 +592,22 @@ impl ECStore {
                 used: total - free,
             })
         } else {
-            Err(Error::msg("InvalidArgument"))
+            Err(Error::other("InvalidArgument"))
         }
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
         if self.single_pool() {
-            return Err(Error::msg("InvalidArgument"));
+            return Err(Error::other("InvalidArgument"));
         }
 
         let Some(has_canceler) = self.decommission_cancelers.get(idx) else {
-            return Err(Error::msg("InvalidArgument"));
+            return Err(Error::other("InvalidArgument"));
         };
 
         if has_canceler.is_none() {
-            return Err(Error::new(StorageError::DecommissionNotStarted));
+            return Err(StorageError::DecommissionNotStarted);
         }
 
         let mut lock = self.pool_meta.write().await;
@@ -638,11 +640,11 @@ impl ECStore {
     pub async fn decommission(&self, rx: B_Receiver<bool>, indices: Vec<usize>) -> Result<()> {
         warn!("decommission: {:?}", indices);
         if indices.is_empty() {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("InvalidArgument"));
         }
 
         if self.single_pool() {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("InvalidArgument"));
         }
 
         self.start_decommission(indices.clone()).await?;
@@ -880,7 +882,7 @@ impl ECStore {
         pool: Arc<Sets>,
         bi: DecomBucketInfo,
     ) -> Result<()> {
-        let wk = Workers::new(pool.disk_set.len() * 2).map_err(|v| Error::from_string(v))?;
+        let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
 
         // let mut vc = None;
         // replication
@@ -942,7 +944,7 @@ impl ECStore {
                         }
                         Err(err) => {
                             error!("decommission_pool: list_objects_to_decommission {} err {:?}", set_id, &err);
-                            if is_err_volume_not_found(&err) {
+                            if is_err_bucket_not_found(&err) {
                                 warn!("decommission_pool: list_objects_to_decommission {} volume not found", set_id);
                                 break;
                             }
@@ -1008,7 +1010,7 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn decommission_failed(&self, idx: usize) -> Result<()> {
         if self.single_pool() {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("errInvalidArgument"));
         }
 
         let mut pool_meta = self.pool_meta.write().await;
@@ -1028,7 +1030,7 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn complete_decommission(&self, idx: usize) -> Result<()> {
         if self.single_pool() {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("errInvalidArgument"));
         }
 
         let mut pool_meta = self.pool_meta.write().await;
@@ -1102,11 +1104,11 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn start_decommission(&self, indices: Vec<usize>) -> Result<()> {
         if indices.is_empty() {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("errInvalidArgument"));
         }
 
         if self.single_pool() {
-            return Err(Error::msg("errInvalidArgument"));
+            return Err(Error::other("errInvalidArgument"));
         }
 
         let decom_buckets = self.get_buckets_to_decommission().await?;
@@ -1220,9 +1222,7 @@ impl ECStore {
 
                 reader.read_exact(&mut chunk).await?;
 
-                // 每次从 reader 中读取一个 part 上传
-                let rd = Box::new(Cursor::new(chunk));
-                let mut data = PutObjReader::new(rd, part.size);
+                let mut data = PutObjReader::from_vec(chunk);
 
                 let pi = match self
                     .put_object_part(
@@ -1232,7 +1232,7 @@ impl ECStore {
                         part.number,
                         &mut data,
                         &ObjectOptions {
-                            preserve_etag: part.e_tag.clone(),
+                            preserve_etag: Some(part.etag.clone()),
                             ..Default::default()
                         },
                     )
@@ -1249,11 +1249,12 @@ impl ECStore {
 
                 parts[i] = CompletePart {
                     part_num: pi.part_num,
-                    e_tag: pi.etag,
+                    etag: pi.etag,
                 };
             }
 
             if let Err(err) = self
+                .clone()
                 .complete_multipart_upload(
                     &bucket,
                     &object_info.name,
@@ -1275,7 +1276,9 @@ impl ECStore {
             return Ok(());
         }
 
-        let mut data = PutObjReader::new(rd.stream, object_info.size);
+        let reader = BufReader::new(rd.stream);
+        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, false)?;
+        let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self
             .put_object(
@@ -1318,7 +1321,7 @@ impl SetDisks {
     ) -> Result<()> {
         let (disks, _) = self.get_online_disks_with_healing(false).await;
         if disks.is_empty() {
-            return Err(Error::msg("errNoDiskAvailable"));
+            return Err(Error::other("errNoDiskAvailable"));
         }
 
         let listing_quorum = self.set_drive_count.div_ceil(2);
@@ -1341,7 +1344,7 @@ impl SetDisks {
                 recursice: true,
                 min_disks: listing_quorum,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                     let resolver = resolver.clone();
                     let cb_func = cb_func.clone();
                     match entries.resolve(resolver) {

@@ -11,15 +11,15 @@ pub struct Error {
 pub struct PingRequest {
     #[prost(uint64, tag = "1")]
     pub version: u64,
-    #[prost(bytes = "vec", tag = "2")]
-    pub body: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub body: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PingResponse {
     #[prost(uint64, tag = "1")]
     pub version: u64,
-    #[prost(bytes = "vec", tag = "2")]
-    pub body: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub body: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HealBucketRequest {
@@ -105,8 +105,8 @@ pub struct ReadAllRequest {
 pub struct ReadAllResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub data: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
 }
@@ -119,8 +119,8 @@ pub struct WriteAllRequest {
     pub volume: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub path: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "4")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub data: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WriteAllResponse {
@@ -191,7 +191,7 @@ pub struct CheckPartsResponse {
     pub error: ::core::option::Option<Error>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RenamePartRequst {
+pub struct RenamePartRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
@@ -202,8 +202,8 @@ pub struct RenamePartRequst {
     pub dst_volume: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub dst_path: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "6")]
-    pub meta: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub meta: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RenamePartResponse {
@@ -213,7 +213,7 @@ pub struct RenamePartResponse {
     pub error: ::core::option::Option<Error>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RenameFileRequst {
+pub struct RenameFileRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
@@ -243,8 +243,8 @@ pub struct WriteRequest {
     pub path: ::prost::alloc::string::String,
     #[prost(bool, tag = "4")]
     pub is_append: bool,
-    #[prost(bytes = "vec", tag = "5")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub data: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WriteResponse {
@@ -271,8 +271,8 @@ pub struct ReadAtRequest {
 pub struct ReadAtResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub data: ::prost::bytes::Bytes,
     #[prost(int64, tag = "3")]
     pub read_size: i64,
     #[prost(message, optional, tag = "4")]
@@ -300,8 +300,8 @@ pub struct WalkDirRequest {
     /// indicate which one in the disks
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "2")]
-    pub walk_dir_options: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub walk_dir_options: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WalkDirResponse {
@@ -633,8 +633,8 @@ pub struct LocalStorageInfoRequest {
 pub struct LocalStorageInfoResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub storage_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub storage_info: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -647,8 +647,8 @@ pub struct ServerInfoRequest {
 pub struct ServerInfoResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub server_properties: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub server_properties: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -658,8 +658,8 @@ pub struct GetCpusRequest {}
 pub struct GetCpusResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub cpus: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub cpus: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -669,8 +669,8 @@ pub struct GetNetInfoRequest {}
 pub struct GetNetInfoResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub net_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub net_info: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -680,8 +680,8 @@ pub struct GetPartitionsRequest {}
 pub struct GetPartitionsResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub partitions: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub partitions: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -691,8 +691,8 @@ pub struct GetOsInfoRequest {}
 pub struct GetOsInfoResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub os_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub os_info: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -702,8 +702,8 @@ pub struct GetSeLinuxInfoRequest {}
 pub struct GetSeLinuxInfoResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub sys_services: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub sys_services: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -713,8 +713,8 @@ pub struct GetSysConfigRequest {}
 pub struct GetSysConfigResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub sys_config: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub sys_config: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -724,8 +724,8 @@ pub struct GetSysErrorsRequest {}
 pub struct GetSysErrorsResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub sys_errors: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub sys_errors: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -735,24 +735,24 @@ pub struct GetMemInfoRequest {}
 pub struct GetMemInfoResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub mem_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub mem_info: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetMetricsRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub metric_type: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub opts: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub metric_type: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub opts: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetMetricsResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub realtime_metrics: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub realtime_metrics: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -762,8 +762,8 @@ pub struct GetProcInfoRequest {}
 pub struct GetProcInfoResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub proc_info: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub proc_info: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -786,7 +786,7 @@ pub struct DownloadProfileDataResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
     #[prost(map = "string, bytes", tag = "2")]
-    pub data: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::vec::Vec<u8>>,
+    pub data: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::bytes::Bytes>,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -799,8 +799,8 @@ pub struct GetBucketStatsDataRequest {
 pub struct GetBucketStatsDataResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub bucket_stats: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub bucket_stats: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -810,8 +810,8 @@ pub struct GetSrMetricsDataRequest {}
 pub struct GetSrMetricsDataResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub sr_metrics_summary: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub sr_metrics_summary: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -821,8 +821,8 @@ pub struct GetAllBucketStatsRequest {}
 pub struct GetAllBucketStatsResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub bucket_stats_map: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub bucket_stats_map: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -979,36 +979,36 @@ pub struct BackgroundHealStatusRequest {}
 pub struct BackgroundHealStatusResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub bg_heal_state: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub bg_heal_state: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetMetacacheListingRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub opts: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub opts: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetMetacacheListingResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub metacache: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub metacache: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateMetacacheListingRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub metacache: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub metacache: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateMetacacheListingResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub metacache: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub metacache: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -1091,9 +1091,9 @@ pub mod node_service_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<<T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody>,
-            >,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<<T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody>,
+                >,
             <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
                 Into<StdError> + std::marker::Send + std::marker::Sync,
         {
@@ -1298,7 +1298,7 @@ pub mod node_service_client {
         }
         pub async fn rename_part(
             &mut self,
-            request: impl tonic::IntoRequest<super::RenamePartRequst>,
+            request: impl tonic::IntoRequest<super::RenamePartRequest>,
         ) -> std::result::Result<tonic::Response<super::RenamePartResponse>, tonic::Status> {
             self.inner
                 .ready()
@@ -1313,7 +1313,7 @@ pub mod node_service_client {
         }
         pub async fn rename_file(
             &mut self,
-            request: impl tonic::IntoRequest<super::RenameFileRequst>,
+            request: impl tonic::IntoRequest<super::RenameFileRequest>,
         ) -> std::result::Result<tonic::Response<super::RenameFileResponse>, tonic::Status> {
             self.inner
                 .ready()
@@ -2330,11 +2330,11 @@ pub mod node_service_server {
         ) -> std::result::Result<tonic::Response<super::CheckPartsResponse>, tonic::Status>;
         async fn rename_part(
             &self,
-            request: tonic::Request<super::RenamePartRequst>,
+            request: tonic::Request<super::RenamePartRequest>,
         ) -> std::result::Result<tonic::Response<super::RenamePartResponse>, tonic::Status>;
         async fn rename_file(
             &self,
-            request: tonic::Request<super::RenameFileRequst>,
+            request: tonic::Request<super::RenameFileRequest>,
         ) -> std::result::Result<tonic::Response<super::RenameFileResponse>, tonic::Status>;
         async fn write(
             &self,
@@ -2989,10 +2989,10 @@ pub mod node_service_server {
                 "/node_service.NodeService/RenamePart" => {
                     #[allow(non_camel_case_types)]
                     struct RenamePartSvc<T: NodeService>(pub Arc<T>);
-                    impl<T: NodeService> tonic::server::UnaryService<super::RenamePartRequst> for RenamePartSvc<T> {
+                    impl<T: NodeService> tonic::server::UnaryService<super::RenamePartRequest> for RenamePartSvc<T> {
                         type Response = super::RenamePartResponse;
                         type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
-                        fn call(&mut self, request: tonic::Request<super::RenamePartRequst>) -> Self::Future {
+                        fn call(&mut self, request: tonic::Request<super::RenamePartRequest>) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move { <T as NodeService>::rename_part(&inner, request).await };
                             Box::pin(fut)
@@ -3017,10 +3017,10 @@ pub mod node_service_server {
                 "/node_service.NodeService/RenameFile" => {
                     #[allow(non_camel_case_types)]
                     struct RenameFileSvc<T: NodeService>(pub Arc<T>);
-                    impl<T: NodeService> tonic::server::UnaryService<super::RenameFileRequst> for RenameFileSvc<T> {
+                    impl<T: NodeService> tonic::server::UnaryService<super::RenameFileRequest> for RenameFileSvc<T> {
                         type Response = super::RenameFileResponse;
                         type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
-                        fn call(&mut self, request: tonic::Request<super::RenameFileRequst>) -> Self::Future {
+                        fn call(&mut self, request: tonic::Request<super::RenameFileRequest>) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move { <T as NodeService>::rename_file(&inner, request).await };
                             Box::pin(fut)

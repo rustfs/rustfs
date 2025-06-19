@@ -7,7 +7,7 @@ use policy::auth;
 use policy::policy::action::{Action, S3Action};
 use policy::policy::{Args, BucketPolicyArgs};
 use s3s::access::{S3Access, S3AccessContext};
-use s3s::{dto::*, s3_error, S3Error, S3ErrorCode, S3Request, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 
 #[allow(dead_code)]
@@ -218,11 +218,9 @@ impl S3Access for FS {
             let req_info = req.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
             let (src_bucket, src_key, version_id) = match &req.input.copy_source {
                 CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-                CopySource::Bucket {
-                    ref bucket,
-                    ref key,
-                    version_id,
-                } => (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string())),
+                CopySource::Bucket { bucket, key, version_id } => {
+                    (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
+                }
             };
 
             req_info.bucket = Some(src_bucket);

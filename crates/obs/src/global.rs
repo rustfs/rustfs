@@ -1,6 +1,6 @@
 use crate::logger::InitLogStatus;
-use crate::telemetry::{init_telemetry, OtelGuard};
-use crate::{get_global_logger, init_global_logger, AppConfig, Logger};
+use crate::telemetry::{OtelGuard, init_telemetry};
+use crate::{AppConfig, Logger, get_global_logger, init_global_logger};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, SetError};
 use tracing::{error, info};
@@ -102,8 +102,8 @@ pub fn get_logger() -> &'static Arc<tokio::sync::Mutex<Logger>> {
 /// ```rust
 /// use rustfs_obs::{ init_obs, set_global_guard};
 ///
-/// fn init() -> Result<(), Box<dyn std::error::Error>> {
-///     let guard = init_obs(None);
+/// async fn init() -> Result<(), Box<dyn std::error::Error>> {
+///     let (_, guard) = init_obs(None).await;
 ///     set_global_guard(guard)?;
 ///     Ok(())
 /// }

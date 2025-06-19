@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use datafusion::{
-    execution::{context::SessionState, runtime_env::RuntimeEnvBuilder, SessionStateBuilder},
+    execution::{SessionStateBuilder, context::SessionState, runtime_env::RuntimeEnvBuilder},
     parquet::data_type::AsBytes,
     prelude::SessionContext,
 };
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::{ObjectStore, memory::InMemory, path::Path};
 use tracing::error;
 
-use crate::{object_store::EcObjectStore, QueryError, QueryResult};
+use crate::{QueryError, QueryResult, object_store::EcObjectStore};
 
 use super::Context;
 

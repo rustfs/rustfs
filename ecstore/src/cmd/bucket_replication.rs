@@ -1,9 +1,9 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 // use error::Error;
-use crate::StorageAPI;
 use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::error::Error;
 use crate::new_object_layer_fn;
 use crate::peer::RemotePeerS3Client;
 use crate::store;
@@ -11,26 +11,26 @@ use crate::store_api::ObjectIO;
 use crate::store_api::ObjectInfo;
 use crate::store_api::ObjectOptions;
 use crate::store_api::ObjectToDelete;
-use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::Config;
+use crate::StorageAPI;
 use aws_sdk_s3::config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::config::Region;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::Config;
 use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
-use common::error::Error;
-use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use http::HeaderMap;
 use http::Method;
 use lazy_static::lazy_static;
 // use std::time::SystemTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use rustfs_rsc::Minio;
 use rustfs_rsc::provider::StaticProvider;
+use rustfs_rsc::Minio;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::ExistingObjectReplicationStatus;
@@ -42,14 +42,15 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::iter::Iterator;
-use std::sync::Arc;
+use std::str::FromStr;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::vec;
 use time::OffsetDateTime;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -186,10 +187,7 @@ const CAPACITY_XML_OBJECT: &str = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/
 const VEEAM_AGENT_SUBSTR: &str = "APN/1.0 Veeam/1.0";
 
 fn is_veeam_sos_api_object(object: &str) -> bool {
-    match object {
-        SYSTEM_XML_OBJECT | CAPACITY_XML_OBJECT => true,
-        _ => false,
-    }
+    matches!(object, SYSTEM_XML_OBJECT | CAPACITY_XML_OBJECT)
 }
 
 pub async fn queue_replication_heal(
@@ -410,7 +408,7 @@ pub async fn get_heal_replicate_object_info(
         }
 
         if !oi.version_purge_status.is_empty() {
-            oi.version_purge_status_internal = format!("{}={};", rcfg.role, oi.version_purge_status.to_string());
+            oi.version_purge_status_internal = format!("{}={};", rcfg.role, oi.version_purge_status);
         }
 
         // let to_replace: Vec<(String, String)> = user_defined
@@ -513,8 +511,8 @@ pub async fn get_heal_replicate_object_info(
 
     let mut result = ReplicateObjectInfo {
         name: oi.name.clone(),
-        size: oi.size as i64,
-        actual_size: asz as i64,
+        size: oi.size,
+        actual_size: asz,
         bucket: oi.bucket.clone(),
         //version_id: oi.version_id.clone(),
         version_id: oi
@@ -534,7 +532,7 @@ pub async fn get_heal_replicate_object_info(
         existing_obj_resync: Default::default(),
         target_statuses: tgt_statuses,
         target_purge_statuses: purge_statuses,
-        replication_timestamp: tm.unwrap_or_else(|| Utc::now()),
+        replication_timestamp: tm.unwrap_or_else(Utc::now),
         //ssec: crypto::is_encrypted(&oi.user_defined),
         ssec: false,
         user_tags: oi.user_tags.clone(),
@@ -816,8 +814,8 @@ impl ReplicationPool {
             vsender.pop(); // Dropping the sender will close the channel
         }
         self.workers_sender = vsender;
-        warn!("self sender size is {:?}", self.workers_sender.len());
-        warn!("self sender size is {:?}", self.workers_sender.len());
+        // warn!("self sender size is {:?}", self.workers_sender.len());
+        // warn!("self sender size is {:?}", self.workers_sender.len());
     }
 
     async fn resize_failed_workers(&self, _count: usize) {
@@ -834,7 +832,8 @@ impl ReplicationPool {
 
     fn get_worker_ch(&self, bucket: &str, object: &str, _sz: i64) -> Option<&Sender<Box<dyn ReplicationWorkerOperation>>> {
         let h = xxh3_64(format!("{}{}", bucket, object).as_bytes()); // 计算哈希值
-        //need lock;
+
+        // need lock;
         let workers = &self.workers_sender; // 读锁
 
         if workers.is_empty() {
@@ -969,7 +968,7 @@ impl ReplicationResyncer {
 pub async fn init_bucket_replication_pool() {
     if let Some(store) = new_object_layer_fn() {
         let opts = ReplicationPoolOpts::default();
-        let stats = ReplicationStats::default();
+        let stats = ReplicationStats;
         let stat = Arc::new(stats);
         warn!("init bucket replication pool");
         ReplicationPool::init_bucket_replication_pool(store, opts, stat).await;
@@ -1071,16 +1070,16 @@ impl From<&str> for VersionPurgeStatusType {
     }
 }
 
-// 将枚举转换为字符串
-impl ToString for VersionPurgeStatusType {
-    fn to_string(&self) -> String {
-        match self {
-            VersionPurgeStatusType::Pending => "PENDING".to_string(),
-            VersionPurgeStatusType::Complete => "COMPLETE".to_string(),
-            VersionPurgeStatusType::Failed => "FAILED".to_string(),
-            VersionPurgeStatusType::Empty => "".to_string(),
-            VersionPurgeStatusType::Unknown => "".to_string(),
-        }
+impl fmt::Display for VersionPurgeStatusType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            VersionPurgeStatusType::Pending => "PENDING",
+            VersionPurgeStatusType::Complete => "COMPLETE",
+            VersionPurgeStatusType::Failed => "FAILED",
+            VersionPurgeStatusType::Empty => "",
+            VersionPurgeStatusType::Unknown => "UNKNOWN",
+        };
+        write!(f, "{}", s)
     }
 }
 
@@ -1115,14 +1114,15 @@ pub enum ReplicationAction {
     ReplicateAll,
 }
 
-impl ReplicationAction {
+impl FromStr for ReplicationAction {
     // 工厂方法，根据字符串生成对应的枚举
-    pub fn from_str(action: &str) -> Self {
+    type Err = ();
+    fn from_str(action: &str) -> Result<Self, Self::Err> {
         match action.to_lowercase().as_str() {
-            "metadata" => ReplicationAction::ReplicateMetadata,
-            "none" => ReplicationAction::ReplicateNone,
-            "all" => ReplicationAction::ReplicateAll,
-            _ => ReplicationAction::ReplicateNone,
+            "metadata" => Ok(ReplicationAction::ReplicateMetadata),
+            "none" => Ok(ReplicationAction::ReplicateNone),
+            "all" => Ok(ReplicationAction::ReplicateAll),
+            _ => Err(()),
         }
     }
 }
@@ -1256,19 +1256,20 @@ pub struct ReplicateTargetDecision {
 }
 
 impl ReplicateTargetDecision {
-    /// 将结构体转换为字符串
-    pub fn to_string(&self) -> String {
-        format!("{};{};{};{}", self.replicate, self.synchronous, self.arn, self.id)
-    }
-
     /// 创建一个新的 ReplicateTargetDecision 实例
     pub fn new(arn: &str, replicate: bool, synchronous: bool) -> Self {
         Self {
+            id: String::new(),
             replicate,
             synchronous,
             arn: arn.to_string(),
-            id: String::new(),
         }
+    }
+}
+
+impl fmt::Display for ReplicateTargetDecision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{};{};{};{}", self.replicate, self.synchronous, self.arn, self.id)
     }
 }
 
@@ -1318,7 +1319,7 @@ impl fmt::Display for ReplicateDecision {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut entries = Vec::new();
         for (key, value) in &self.targets_map {
-            entries.push(format!("{}={}", key, value.to_string()));
+            entries.push(format!("{}={}", key, value));
         }
         write!(f, "{}", entries.join(","))
     }
@@ -1757,13 +1758,13 @@ pub async fn schedule_replication(oi: ObjectInfo, o: Arc<store::ECStore>, dsc: R
     let replication_timestamp = Utc::now(); // Placeholder for timestamp parsing
     let replication_state = oi.replication_state();
 
-    let actual_size = oi.actual_size.unwrap_or(0);
+    let actual_size = oi.actual_size;
     //let ssec = oi.user_defined.contains_key("ssec");
     let ssec = false;
 
     let ri = ReplicateObjectInfo {
         name: oi.name,
-        size: oi.size as i64,
+        size: oi.size,
         bucket: oi.bucket,
         version_id: oi
             .version_id
@@ -2017,8 +2018,8 @@ impl ReplicateObjectInfo {
             mod_time: Some(
                 OffsetDateTime::from_unix_timestamp(self.mod_time.timestamp()).unwrap_or_else(|_| OffsetDateTime::now_utc()),
             ),
-            size: self.size as usize,
-            actual_size: Some(self.actual_size as usize),
+            size: self.size,
+            actual_size: self.actual_size,
             is_dir: false,
             user_defined: None, // 可以按需从别处导入
             parity_blocks: 0,
@@ -2091,16 +2092,10 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
 
 impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
     fn to_mrf_entry(&self) -> MRFReplicateEntry {
-        let version_id = if !self.deleted_object.delete_marker_version_id.is_none() {
-            self.deleted_object.delete_marker_version_id.clone()
-        } else {
-            self.deleted_object.delete_marker_version_id.clone()
-        };
-
         MRFReplicateEntry {
             bucket: self.bucket.clone(),
             object: self.deleted_object.object_name.clone().unwrap().clone(),
-            version_id: "0".to_string(), // 直接使用计算后的 version_id
+            version_id: self.deleted_object.delete_marker_version_id.clone().unwrap_or_default(),
             retry_count: 0,
             sz: 0,
         }
@@ -2138,7 +2133,8 @@ async fn replicate_object_with_multipart(
         .endpoint(target_info.endpoint.clone())
         .provider(provider)
         .secure(false)
-        .build()?;
+        .build()
+        .map_err(|e| Error::other(format!("build minio client failed: {}", e)))?;
 
     let ret = minio_cli
         .create_multipart_upload_with_versionid(tgt_cli.bucket.clone(), local_obj_info.name.clone(), rep_obj.version_id.clone())
@@ -2147,7 +2143,7 @@ async fn replicate_object_with_multipart(
         Ok(task) => {
             let parts_len = local_obj_info.parts.len();
             let mut part_results = vec![None; parts_len];
-            let version_id = local_obj_info.version_id.clone().expect("missing version_id");
+            let version_id = local_obj_info.version_id.expect("missing version_id");
             let task = Arc::new(task); // clone safe
             let store = Arc::new(store);
             let minio_cli = Arc::new(minio_cli);
@@ -2160,7 +2156,6 @@ async fn replicate_object_with_multipart(
                 let task = Arc::clone(&task);
                 let bucket = local_obj_info.bucket.clone();
                 let name = local_obj_info.name.clone();
-                let version_id = version_id.clone();
 
                 upload_futures.push(tokio::spawn(async move {
                     let get_opts = ObjectOptions {
@@ -2175,16 +2170,16 @@ async fn replicate_object_with_multipart(
                     match store.get_object_reader(&bucket, &name, None, h, &get_opts).await {
                         Ok(mut reader) => match reader.read_all().await {
                             Ok(ret) => {
-                                debug!("2025 readall suc:");
+                                debug!("readall suc:");
                                 let body = Bytes::from(ret);
                                 match minio_cli.upload_part(&task, index + 1, body).await {
                                     Ok(part) => {
-                                        debug!("2025 multipar upload suc:");
+                                        debug!("multipar upload suc:");
                                         Ok((index, part))
                                     }
                                     Err(err) => {
                                         error!("upload part {} failed: {}", index + 1, err);
-                                        Err(Error::from_string(format!("upload error: {}", err)))
+                                        Err(Error::other(format!("upload error: {}", err)))
                                     }
                                 }
                             }
@@ -2195,7 +2190,7 @@ async fn replicate_object_with_multipart(
                         },
                         Err(err) => {
                             error!("reader error for part {}: {}", index + 1, err);
-                            Err(Error::from_string(format!("reader error: {}", err)))
+                            Err(Error::other(format!("reader error: {}", err)))
                         }
                     }
                 }));
@@ -2212,7 +2207,7 @@ async fn replicate_object_with_multipart(
                     }
                     Err(join_err) => {
                         error!("tokio join error: {}", join_err);
-                        return Err(Error::from_string(format!("join error: {}", join_err)));
+                        return Err(Error::other(format!("join error: {}", join_err)));
                     }
                 }
             }
@@ -2226,12 +2221,12 @@ async fn replicate_object_with_multipart(
                 }
                 Err(err) => {
                     error!("finish upload failed:{}", err);
-                    return Err(err.into());
+                    return Err(Error::other(format!("finish upload failed:{}", err)));
                 }
             }
         }
         Err(err) => {
-            return Err(err.into());
+            return Err(Error::other(format!("finish upload failed:{}", err)));
         }
     }
     Ok(())
@@ -2266,7 +2261,7 @@ impl ReplicateObjectInfo {
             arn: _arn.clone(),
             prev_replication_status: self.target_replication_status(&_arn.clone()),
             replication_status: ReplicationStatusType::Failed,
-            op_type: self.op_type.clone(),
+            op_type: self.op_type,
             replication_action: ReplicationAction::ReplicateAll,
             endpoint: target.endpoint.clone(),
             secure: target.endpoint.clone().contains("https://"),
@@ -2302,10 +2297,12 @@ impl ReplicateObjectInfo {
         // versionSuspended := globalBucketVersioningSys.PrefixSuspended(bucket, object)
 
         // 模拟对象获取和元数据检查
-        let mut opt = ObjectOptions::default();
-        opt.version_id = Some(self.version_id.clone());
-        opt.versioned = true;
-        opt.version_suspended = false;
+        let opt = ObjectOptions {
+            version_id: Some(self.version_id.clone()),
+            versioned: true,
+            version_suspended: false,
+            ..Default::default()
+        };
 
         let object_info = match self.get_object_info(opt).await {
             Ok(info) => info,
@@ -2320,7 +2317,7 @@ impl ReplicateObjectInfo {
 
         // 设置对象大小
         //rinfo.size = object_info.actual_size.unwrap_or(0);
-        rinfo.size = object_info.actual_size.map_or(0, |v| v as i64);
+        rinfo.size = object_info.actual_size;
         //rinfo.replication_action = object_info.
 
         rinfo.replication_status = ReplicationStatusType::Completed;
@@ -2331,7 +2328,7 @@ impl ReplicateObjectInfo {
         //todo!() put replicationopts;
         if object_info.is_multipart() {
             debug!("version is multi part");
-            match replicate_object_with_multipart(&self, &object_info, &rinfo, target).await {
+            match replicate_object_with_multipart(self, &object_info, &rinfo, target).await {
                 Ok(_) => {
                     rinfo.replication_status = ReplicationStatusType::Completed;
                     println!("Object replicated successfully.");
@@ -2345,12 +2342,12 @@ impl ReplicateObjectInfo {
             //replicate_object_with_multipart(local_obj_info, target_info, tgt_cli)
         } else {
             let get_opts = ObjectOptions {
-                version_id: Some(object_info.version_id.clone().expect("REASON").to_string()),
+                version_id: Some(object_info.version_id.expect("REASON").to_string()),
                 versioned: true,
                 version_suspended: false,
                 ..Default::default()
             };
-            warn!("version id is:{:?}", get_opts.version_id.clone());
+            warn!("version id is:{:?}", get_opts.version_id);
             let h = HeaderMap::new();
             let gr = store
                 .get_object_reader(&object_info.bucket, &object_info.name, None, h, &get_opts)
@@ -2415,8 +2412,7 @@ impl ReplicateObjectInfo {
     async fn get_object_info(&self, opts: ObjectOptions) -> Result<ObjectInfo, Error> {
         let objectlayer = new_object_layer_fn();
         //let opts = ecstore::store_api::ObjectOptions { max_parity: (), mod_time: (), part_number: (), delete_prefix: (), version_id: (), no_lock: (), versioned: (), version_suspended: (), skip_decommissioned: (), skip_rebalancing: (), data_movement: (), src_pool_idx: (), user_defined: (), preserve_etag: (), metadata_chg: (), replication_request: (), delete_marker: () }
-        let res = objectlayer.unwrap().get_object_info(&self.bucket, &self.name, &opts).await;
-        res
+        objectlayer.unwrap().get_object_info(&self.bucket, &self.name, &opts).await
     }
 
     fn perform_replication(&self, target: &RemotePeerS3Client, object_info: &ObjectInfo) -> Result<(), String> {

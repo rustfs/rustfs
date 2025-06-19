@@ -2,14 +2,16 @@ use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
 };
-use ecstore::utils::{crypto::base64_encode, xml};
+use ecstore::bucket::utils::serialize;
 use http::StatusCode;
 use iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
 use matchit::Params;
 use policy::{auth::get_new_credentials_with_metadata, policy::Policy};
+use rustfs_utils::crypto::base64_encode;
 use s3s::{
+    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
-    s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    s3_error,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -136,7 +138,7 @@ impl Operation for AssumeRoleHandle {
         };
 
         // getAssumeRoleCredentials
-        let output = xml::serialize::<AssumeRoleOutput>(&resp).unwrap();
+        let output = serialize::<AssumeRoleOutput>(&resp).unwrap();
 
         Ok(S3Response::new((StatusCode::OK, Body::from(output))))
     }

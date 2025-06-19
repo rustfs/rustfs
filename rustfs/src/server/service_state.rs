@@ -1,8 +1,8 @@
 use atomic_enum::atomic_enum;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 
 // a configurable shutdown timeout
@@ -10,7 +10,7 @@ pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(target_os = "linux")]
 fn notify_systemd(state: &str) {
-    use libsystemd::daemon::{notify, NotifyState};
+    use libsystemd::daemon::{NotifyState, notify};
     use tracing::{debug, error};
     let notify_state = match state {
         "ready" => NotifyState::Ready,

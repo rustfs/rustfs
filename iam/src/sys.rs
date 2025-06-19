@@ -1,35 +1,36 @@
+use crate::error::Error as IamError;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
-use crate::error::Error as IamError;
+use crate::error::{Error, Result};
 use crate::get_global_action_cred;
+use crate::manager::IamCache;
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
-use crate::manager::IamCache;
 use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
-use common::error::{Error, Result};
-use ecstore::utils::crypto::base64_decode;
-use ecstore::utils::crypto::base64_encode;
+// use ecstore::utils::crypto::base64_decode;
+// use ecstore::utils::crypto::base64_encode;
 use madmin::AddOrUpdateUserReq;
 use madmin::GroupDesc;
 use policy::arn::ARN;
+use policy::auth::ACCOUNT_ON;
+use policy::auth::Credentials;
+use policy::auth::UserIdentity;
 use policy::auth::contains_reserved_chars;
 use policy::auth::create_new_credentials_with_metadata;
 use policy::auth::generate_credentials;
 use policy::auth::is_access_key_valid;
 use policy::auth::is_secret_key_valid;
-use policy::auth::Credentials;
-use policy::auth::UserIdentity;
-use policy::auth::ACCOUNT_ON;
-use policy::policy::iam_policy_claim_name_sa;
 use policy::policy::Args;
-use policy::policy::Policy;
-use policy::policy::PolicyDoc;
 use policy::policy::EMBEDDED_POLICY_TYPE;
 use policy::policy::INHERITED_POLICY_TYPE;
-use serde_json::json;
+use policy::policy::Policy;
+use policy::policy::PolicyDoc;
+use policy::policy::iam_policy_claim_name_sa;
+use rustfs_utils::crypto::{base64_decode, base64_encode};
 use serde_json::Value;
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -81,7 +82,7 @@ impl<T: Store> IamSys<T> {
     pub async fn delete_policy(&self, name: &str, notify: bool) -> Result<()> {
         for k in get_default_policyes().keys() {
             if k == name {
-                return Err(Error::msg("system policy can not be deleted"));
+                return Err(Error::other("system policy can not be deleted"));
             }
         }
 
@@ -123,11 +124,11 @@ impl<T: Store> IamSys<T> {
 
     pub async fn get_role_policy(&self, arn_str: &str) -> Result<(ARN, String)> {
         let Some(arn) = ARN::parse(arn_str).ok() else {
-            return Err(Error::msg("Invalid ARN"));
+            return Err(Error::other("Invalid ARN"));
         };
 
         let Some(policy) = self.roles_map.get(&arn) else {
-            return Err(Error::msg("No such role"));
+            return Err(Error::other("No such role"));
         };
 
         Ok((arn, policy.clone()))
@@ -157,7 +158,7 @@ impl<T: Store> IamSys<T> {
 
     pub async fn is_temp_user(&self, name: &str) -> Result<(bool, String)> {
         let Some(u) = self.store.get_user(name).await else {
-            return Err(IamError::NoSuchUser(name.to_string()).into());
+            return Err(IamError::NoSuchUser(name.to_string()));
         };
         if u.credentials.is_temp() {
             Ok((true, u.credentials.parent_user))
@@ -167,7 +168,7 @@ impl<T: Store> IamSys<T> {
     }
     pub async fn is_service_account(&self, name: &str) -> Result<(bool, String)> {
         let Some(u) = self.store.get_user(name).await else {
-            return Err(IamError::NoSuchUser(name.to_string()).into());
+            return Err(IamError::NoSuchUser(name.to_string()));
         };
 
         if u.credentials.is_service_account() {
@@ -193,22 +194,22 @@ impl<T: Store> IamSys<T> {
         opts: NewServiceAccountOpts,
     ) -> Result<(Credentials, OffsetDateTime)> {
         if parent_user.is_empty() {
-            return Err(IamError::InvalidArgument.into());
+            return Err(IamError::InvalidArgument);
         }
         if !opts.access_key.is_empty() && opts.secret_key.is_empty() {
-            return Err(IamError::NoSecretKeyWithAccessKey.into());
+            return Err(IamError::NoSecretKeyWithAccessKey);
         }
 
         if !opts.secret_key.is_empty() && opts.access_key.is_empty() {
-            return Err(IamError::NoAccessKeyWithSecretKey.into());
+            return Err(IamError::NoAccessKeyWithSecretKey);
         }
 
         if parent_user == opts.access_key {
-            return Err(IamError::IAMActionNotAllowed.into());
+            return Err(IamError::IAMActionNotAllowed);
         }
 
         if opts.expiration.is_none() {
-            return Err(IamError::InvalidExpiration.into());
+            return Err(IamError::InvalidExpiration);
         }
 
         // TODO: check allow_site_replicator_account
@@ -217,7 +218,7 @@ impl<T: Store> IamSys<T> {
             policy.validate()?;
             let buf = serde_json::to_vec(&policy)?;
             if buf.len() > MAX_SVCSESSION_POLICY_SIZE {
-                return Err(IamError::PolicyTooLarge.into());
+                return Err(IamError::PolicyTooLarge);
             }
 
             buf
@@ -304,7 +305,7 @@ impl<T: Store> IamSys<T> {
             Ok(res) => res,
             Err(err) => {
                 if is_err_no_such_account(&err) {
-                    return Err(IamError::NoSuchServiceAccount(access_key.to_string()).into());
+                    return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
                 }
 
                 return Err(err);
@@ -312,7 +313,7 @@ impl<T: Store> IamSys<T> {
         };
 
         if !sa.credentials.is_service_account() {
-            return Err(IamError::NoSuchServiceAccount(access_key.to_string()).into());
+            return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
         }
 
         let op_pt = claims.get(&iam_policy_claim_name_sa());
@@ -329,7 +330,7 @@ impl<T: Store> IamSys<T> {
 
     async fn get_account_with_claims(&self, access_key: &str) -> Result<(UserIdentity, HashMap<String, Value>)> {
         let Some(acc) = self.store.get_user(access_key).await else {
-            return Err(IamError::NoSuchAccount(access_key.to_string()).into());
+            return Err(IamError::NoSuchAccount(access_key.to_string()));
         };
 
         let m = extract_jwt_claims(&acc)?;
@@ -363,7 +364,7 @@ impl<T: Store> IamSys<T> {
             Ok(res) => res,
             Err(err) => {
                 if is_err_no_such_account(&err) {
-                    return Err(IamError::NoSuchTempAccount(access_key.to_string()).into());
+                    return Err(IamError::NoSuchTempAccount(access_key.to_string()));
                 }
 
                 return Err(err);
@@ -371,7 +372,7 @@ impl<T: Store> IamSys<T> {
         };
 
         if !sa.credentials.is_temp() {
-            return Err(IamError::NoSuchTempAccount(access_key.to_string()).into());
+            return Err(IamError::NoSuchTempAccount(access_key.to_string()));
         }
 
         let op_pt = claims.get(&iam_policy_claim_name_sa());
@@ -388,11 +389,11 @@ impl<T: Store> IamSys<T> {
 
     pub async fn get_claims_for_svc_acc(&self, access_key: &str) -> Result<HashMap<String, Value>> {
         let Some(u) = self.store.get_user(access_key).await else {
-            return Err(IamError::NoSuchServiceAccount(access_key.to_string()).into());
+            return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
         };
 
         if u.credentials.is_service_account() {
-            return Err(IamError::NoSuchServiceAccount(access_key.to_string()).into());
+            return Err(IamError::NoSuchServiceAccount(access_key.to_string()));
         }
 
         extract_jwt_claims(&u)
@@ -414,15 +415,15 @@ impl<T: Store> IamSys<T> {
 
     pub async fn create_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
         if !is_access_key_valid(access_key) {
-            return Err(IamError::InvalidAccessKeyLength.into());
+            return Err(IamError::InvalidAccessKeyLength);
         }
 
         if contains_reserved_chars(access_key) {
-            return Err(IamError::ContainsReservedChars.into());
+            return Err(IamError::ContainsReservedChars);
         }
 
         if !is_secret_key_valid(&args.secret_key) {
-            return Err(IamError::InvalidSecretKeyLength.into());
+            return Err(IamError::InvalidSecretKeyLength);
         }
 
         self.store.add_user(access_key, args).await
@@ -431,11 +432,11 @@ impl<T: Store> IamSys<T> {
 
     pub async fn set_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
         if !is_access_key_valid(access_key) {
-            return Err(IamError::InvalidAccessKeyLength.into());
+            return Err(IamError::InvalidAccessKeyLength);
         }
 
         if !is_secret_key_valid(secret_key) {
-            return Err(IamError::InvalidSecretKeyLength.into());
+            return Err(IamError::InvalidSecretKeyLength);
         }
 
         self.store.update_user_secret_key(access_key, secret_key).await
@@ -467,7 +468,7 @@ impl<T: Store> IamSys<T> {
 
     pub async fn add_users_to_group(&self, group: &str, users: Vec<String>) -> Result<OffsetDateTime> {
         if contains_reserved_chars(group) {
-            return Err(IamError::GroupNameContainsReservedChars.into());
+            return Err(IamError::GroupNameContainsReservedChars);
         }
         self.store.add_users_to_group(group, users).await
         // TODO: notification

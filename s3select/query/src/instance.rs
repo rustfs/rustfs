@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use api::{
+    QueryResult,
     query::{
-        dispatcher::QueryDispatcher, execution::QueryStateMachineRef, logical_planner::Plan, session::SessionCtxFactory, Query,
+        Query, dispatcher::QueryDispatcher, execution::QueryStateMachineRef, logical_planner::Plan, session::SessionCtxFactory,
     },
     server::dbms::{DatabaseManagerSystem, QueryHandle},
-    QueryResult,
 };
 use async_trait::async_trait;
 use derive_builder::Builder;

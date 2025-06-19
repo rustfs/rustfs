@@ -2,36 +2,32 @@
 
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
-use crate::config::storageclass;
 use crate::config::GLOBAL_StorageClass;
+use crate::config::storageclass;
 use crate::disk::endpoint::{Endpoint, EndpointType};
-use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions, MetaCacheEntry};
-use crate::error::clone_err;
-use crate::global::{
-    get_global_endpoints, is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer, DISK_ASSUME_UNKNOWN_SIZE,
-    DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP,
-    GLOBAL_LOCAL_DISK_SET_DRIVES,
+use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
+use crate::error::{
+    StorageError, is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum,
+    is_err_version_not_found, to_object_err,
 };
-use crate::heal::data_usage::{DataUsageInfo, DATA_USAGE_ROOT};
+use crate::global::{
+    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_endpoints, is_dist_erasure, is_erasure_sd,
+    set_global_deployment_id, set_object_layer,
+};
+use crate::heal::data_usage::{DATA_USAGE_ROOT, DataUsageInfo};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
-use crate::heal::heal_commands::{HealOpts, HealScanMode, HEAL_ITEM_METADATA};
+use crate::heal::heal_commands::{HEAL_ITEM_METADATA, HealOpts, HealScanMode};
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
-use crate::store_err::{
-    is_err_bucket_exists, is_err_decommission_already_running, is_err_invalid_upload_id, is_err_object_not_found,
-    is_err_read_quorum, is_err_version_not_found, to_object_err, StorageError,
-};
-use crate::store_init::ec_drives_no_config;
-use crate::utils::crypto::base64_decode;
-use crate::utils::path::{decode_dir_object, encode_dir_object, path_join_buf, SLASH_SEPARATOR};
-use crate::utils::xml;
+use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::{
     bucket::metadata::BucketMetadata,
-    disk::{error::DiskError, new_disk, DiskOption, DiskStore, BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
+    disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
     endpoints::EndpointServerPools,
     peer::S3PeerSys,
     sets::Sets,
@@ -42,15 +38,18 @@ use crate::{
     },
     store_init,
 };
+use rustfs_utils::crypto::base64_decode;
+use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
 
-use common::error::{Error, Result};
+use crate::error::{Error, Result};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use madmin::heal_commands::HealResultItem;
-use rand::Rng;
+use rand::Rng as _;
+use rustfs_filemeta::MetaCacheEntry;
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;
 use std::net::SocketAddr;
@@ -61,10 +60,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::{interval, sleep};
-use tracing::error;
 use tracing::{debug, info};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 const MAX_UPLOADS_LIST: usize = 10000;
@@ -150,7 +149,7 @@ impl ECStore {
             )
             .await;
 
-            DiskError::check_disk_fatal_errs(&errs)?;
+            check_disk_fatal_errs(&errs)?;
 
             let fm = {
                 let mut times = 0;
@@ -172,7 +171,7 @@ impl ECStore {
                         interval *= 2;
                     }
                     if times > 10 {
-                        return Err(Error::from_string("can not get formats"));
+                        return Err(Error::other("can not get formats"));
                     }
                     info!("retrying get formats after {:?}", interval);
                     select! {
@@ -191,7 +190,7 @@ impl ECStore {
             }
 
             if deployment_id != Some(fm.id) {
-                return Err(Error::msg("deployment_id not same in one pool"));
+                return Err(Error::other("deployment_id not same in one pool"));
             }
 
             if deployment_id.is_some() && deployment_id.unwrap().is_nil() {
@@ -247,7 +246,7 @@ impl ECStore {
                 sleep(Duration::from_secs(wait_sec)).await;
 
                 if exit_count > 10 {
-                    return Err(Error::msg("ec init faild"));
+                    return Err(Error::other("ec init failed"));
                 }
 
                 exit_count += 1;
@@ -297,7 +296,7 @@ impl ECStore {
             if let Some(idx) = endpoints.get_pool_idx(&p.cmd_line) {
                 pool_indeces.push(idx);
             } else {
-                return Err(Error::msg(format!(
+                return Err(Error::other(format!(
                     "unexpected state present for decommission status pool({}) not found",
                     p.cmd_line
                 )));
@@ -316,7 +315,7 @@ impl ECStore {
                     tokio::time::sleep(Duration::from_secs(60 * 3)).await;
 
                     if let Err(err) = store.decommission(rx.resubscribe(), pool_indeces.clone()).await {
-                        if is_err_decommission_already_running(&err) {
+                        if err == StorageError::DecommissionAlreadyRunning {
                             for i in pool_indeces.iter() {
                                 store.do_decommission_in_routine(rx.resubscribe(), *i).await;
                             }
@@ -347,7 +346,7 @@ impl ECStore {
     // define in store_list_objects.rs
     // pub async fn list_path(&self, opts: &ListPathOptions, delimiter: &str) -> Result<ListObjectsInfo> {
     //     // if opts.prefix.ends_with(SLASH_SEPARATOR) {
-    //     //     return Err(Error::msg("eof"));
+    //     //     return Err(Error::other("eof"));
     //     // }
 
     //     let mut opts = opts.clone();
@@ -620,7 +619,7 @@ impl ECStore {
                 if let Some(hit_idx) = self.get_available_pool_idx(bucket, object, size).await {
                     hit_idx
                 } else {
-                    return Err(Error::new(DiskError::DiskFull));
+                    return Err(Error::DiskFull);
                 }
             }
         };
@@ -639,7 +638,8 @@ impl ECStore {
                 if let Some(idx) = self.get_available_pool_idx(bucket, object, size).await {
                     idx
                 } else {
-                    return Err(to_object_err(Error::new(DiskError::DiskFull), vec![bucket, object]));
+                    warn!("get_pool_idx_no_lock: disk full {}/{}", bucket, object);
+                    return Err(Error::DiskFull);
                 }
             }
         };
@@ -737,7 +737,7 @@ impl ECStore {
 
             let err = pinfo.err.as_ref().unwrap();
 
-            if is_err_read_quorum(err) && !opts.metadata_chg {
+            if err == &Error::ErasureReadQuorum && !opts.metadata_chg {
                 return Ok((pinfo.clone(), self.pools_with_object(&ress, opts).await));
             }
 
@@ -745,7 +745,7 @@ impl ECStore {
             has_def_pool = true;
 
             if !is_err_object_not_found(err) && !is_err_version_not_found(err) {
-                return Err(clone_err(err));
+                return Err(err.clone());
             }
 
             if pinfo.object_info.delete_marker && !pinfo.object_info.name.is_empty() {
@@ -757,7 +757,7 @@ impl ECStore {
             return Ok((def_pool, Vec::new()));
         }
 
-        Err(to_object_err(Error::new(DiskError::FileNotFound), vec![bucket, object]))
+        Err(Error::ObjectNotFound(bucket.to_owned(), object.to_owned()))
     }
 
     async fn pools_with_object(&self, pools: &[PoolObjInfo], opts: &ObjectOptions) -> Vec<PoolErr> {
@@ -773,10 +773,10 @@ impl ECStore {
             }
 
             if let Some(err) = &pool.err {
-                if is_err_read_quorum(err) {
+                if err == &Error::ErasureReadQuorum {
                     errs.push(PoolErr {
                         index: Some(pool.index),
-                        err: Some(Error::new(StorageError::InsufficientReadQuorum)),
+                        err: Some(Error::ErasureReadQuorum),
                     });
                 }
             } else {
@@ -853,9 +853,26 @@ impl ECStore {
         let (update_closer_tx, mut update_close_rx) = mpsc::channel(10);
         let mut ctx_clone = cancel.subscribe();
         let all_buckets_clone = all_buckets.clone();
+        // 新增：从环境变量读取interval，默认30秒
+        let ns_scanner_interval_secs = std::env::var("RUSTFS_NS_SCANNER_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        // 检查是否跳过后台任务
+        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        if skip_background_task {
+            info!("跳过后台任务执行: RUSTFS_SKIP_BACKGROUND_TASK=true");
+            return Ok(());
+        }
+
         let task = tokio::spawn(async move {
             let mut last_update: Option<SystemTime> = None;
-            let mut interval = interval(Duration::from_secs(30));
+            let mut interval = interval(Duration::from_secs(ns_scanner_interval_secs));
             let all_merged = Arc::new(RwLock::new(DataUsageCache::default()));
             loop {
                 select! {
@@ -884,7 +901,7 @@ impl ECStore {
         }
         let _ = task.await;
         if let Some(err) = first_err.read().await.as_ref() {
-            return Err(clone_err(err));
+            return Err(err.clone());
         }
         Ok(())
     }
@@ -967,13 +984,13 @@ impl ECStore {
         let object = decode_dir_object(object);
 
         if opts.version_id.is_none() {
-            Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
+            Err(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned()))
         } else {
-            Err(Error::new(StorageError::VersionNotFound(
+            Err(StorageError::VersionNotFound(
                 bucket.to_owned(),
                 object.to_owned(),
                 opts.version_id.clone().unwrap_or_default(),
-            )))
+            ))
         }
     }
 
@@ -989,9 +1006,9 @@ impl ECStore {
 
         for pe in errs.iter() {
             if let Some(err) = &pe.err {
-                if is_err_read_quorum(err) {
+                if err == &StorageError::ErasureWriteQuorum {
                     objs.push(None);
-                    derrs.push(Some(Error::new(StorageError::InsufficientWriteQuorum)));
+                    derrs.push(Some(StorageError::ErasureWriteQuorum));
                     continue;
                 }
             }
@@ -1012,7 +1029,7 @@ impl ECStore {
         }
 
         if let Some(e) = &derrs[0] {
-            return Err(clone_err(e));
+            return Err(e.clone());
         }
 
         Ok(objs[0].as_ref().unwrap().clone())
@@ -1148,7 +1165,7 @@ impl Clone for PoolObjInfo {
         Self {
             index: self.index,
             object_info: self.object_info.clone(),
-            err: self.err.as_ref().map(clone_err),
+            err: self.err.clone(),
         }
     }
 }
@@ -1222,14 +1239,14 @@ impl ObjectIO for ECStore {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
-        let idx = self.get_pool_idx(bucket, &object, data.content_length as i64).await?;
+        let idx = self.get_pool_idx(bucket, &object, data.size()).await?;
 
         if opts.data_movement && idx == opts.src_pool_idx {
-            return Err(Error::new(StorageError::DataMovementOverwriteErr(
+            return Err(StorageError::DataMovementOverwriteErr(
                 bucket.to_owned(),
                 object.to_owned(),
                 opts.version_id.clone().unwrap_or_default(),
-            )));
+            ));
         }
 
         self.pools[idx].put_object(bucket, &object, data, opts).await
@@ -1326,14 +1343,14 @@ impl StorageAPI for ECStore {
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         if !is_meta_bucketname(bucket) {
             if let Err(err) = check_valid_bucket_name_strict(bucket) {
-                return Err(StorageError::BucketNameInvalid(err.to_string()).into());
+                return Err(StorageError::BucketNameInvalid(err.to_string()));
             }
 
             // TODO: nslock
         }
 
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
-            if !is_err_bucket_exists(&err) {
+            if !is_err_bucket_exists(&err.into()) {
                 let _ = self
                     .delete_bucket(
                         bucket,
@@ -1352,15 +1369,15 @@ impl StorageAPI for ECStore {
         meta.set_created(opts.created_at);
 
         if opts.lock_enabled {
-            meta.object_lock_config_xml = xml::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
-            meta.versioning_config_xml = xml::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.object_lock_config_xml = crate::bucket::utils::serialize::<ObjectLockConfiguration>(&enableObjcetLockConfig)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
         if opts.versioning_enabled {
-            meta.versioning_config_xml = xml::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
+            meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
-        meta.save().await.map_err(|e| to_object_err(e, vec![bucket]))?;
+        meta.save().await?;
 
         set_bucket_metadata(bucket.to_string(), meta).await?;
 
@@ -1369,11 +1386,7 @@ impl StorageAPI for ECStore {
 
     #[tracing::instrument(skip(self))]
     async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        let mut info = self
-            .peer_sys
-            .get_bucket_info(bucket, opts)
-            .await
-            .map_err(|e| to_object_err(e, vec![bucket]))?;
+        let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
 
         if let Ok(sys) = metadata_sys::get(bucket).await {
             info.created = Some(sys.created);
@@ -1401,11 +1414,11 @@ impl StorageAPI for ECStore {
     #[tracing::instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         if is_meta_bucketname(bucket) {
-            return Err(StorageError::BucketNameInvalid(bucket.to_string()).into());
+            return Err(StorageError::BucketNameInvalid(bucket.to_string()));
         }
 
         if let Err(err) = check_valid_bucket_name(bucket) {
-            return Err(StorageError::BucketNameInvalid(err.to_string()).into());
+            return Err(StorageError::BucketNameInvalid(err.to_string()));
         }
 
         // TODO: nslock
@@ -1419,7 +1432,7 @@ impl StorageAPI for ECStore {
         self.peer_sys
             .delete_bucket(bucket, &opts)
             .await
-            .map_err(|e| to_object_err(e, vec![bucket]))?;
+            .map_err(|e| to_object_err(e.into(), vec![bucket]))?;
 
         // TODO: replication opts.srdelete_op
 
@@ -1501,9 +1514,7 @@ impl StorageAPI for ECStore {
 
         // TODO: nslock
 
-        let pool_idx = self
-            .get_pool_idx_no_lock(src_bucket, &src_object, src_info.size as i64)
-            .await?;
+        let pool_idx = self.get_pool_idx_no_lock(src_bucket, &src_object, src_info.size).await?;
 
         if cp_src_dst_same {
             if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
@@ -1543,11 +1554,11 @@ impl StorageAPI for ECStore {
                 .await;
         }
 
-        Err(Error::new(StorageError::InvalidArgument(
+        Err(StorageError::InvalidArgument(
             src_bucket.to_owned(),
             src_object.to_owned(),
             "put_object_reader is none".to_owned(),
-        )))
+        ))
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
@@ -1569,7 +1580,7 @@ impl StorageAPI for ECStore {
             .await
             .map_err(|e| {
                 if is_err_read_quorum(&e) {
-                    Error::new(StorageError::InsufficientWriteQuorum)
+                    StorageError::ErasureWriteQuorum
                 } else {
                     e
                 }
@@ -1581,11 +1592,11 @@ impl StorageAPI for ECStore {
         }
 
         if opts.data_movement && opts.src_pool_idx == pinfo.index {
-            return Err(Error::new(StorageError::DataMovementOverwriteErr(
+            return Err(StorageError::DataMovementOverwriteErr(
                 bucket.to_owned(),
                 object.to_owned(),
                 opts.version_id.unwrap_or_default(),
-            )));
+            ));
         }
 
         if opts.data_movement {
@@ -1614,10 +1625,10 @@ impl StorageAPI for ECStore {
         }
 
         if let Some(ver) = opts.version_id {
-            return Err(Error::new(StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), ver)));
+            return Err(StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), ver));
         }
 
-        Err(Error::new(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())))
+        Err(StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned()))
     }
     // TODO: review
     #[tracing::instrument(skip(self))]
@@ -1849,11 +1860,11 @@ impl StorageAPI for ECStore {
 
         let idx = self.get_pool_idx(bucket, object, -1).await?;
         if opts.data_movement && idx == opts.src_pool_idx {
-            return Err(Error::new(StorageError::DataMovementOverwriteErr(
+            return Err(StorageError::DataMovementOverwriteErr(
                 bucket.to_owned(),
                 object.to_owned(),
                 "".to_owned(),
-            )));
+            ));
         }
 
         self.pools[idx].new_multipart_upload(bucket, object, opts).await
@@ -1920,11 +1931,7 @@ impl StorageAPI for ECStore {
             }
         }
 
-        Err(Error::new(StorageError::InvalidUploadID(
-            bucket.to_owned(),
-            object.to_owned(),
-            upload_id.to_owned(),
-        )))
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
     }
 
     #[tracing::instrument(skip(self))]
@@ -1957,11 +1964,7 @@ impl StorageAPI for ECStore {
             };
         }
 
-        Err(Error::new(StorageError::InvalidUploadID(
-            bucket.to_owned(),
-            object.to_owned(),
-            upload_id.to_owned(),
-        )))
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
     }
     #[tracing::instrument(skip(self))]
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
@@ -1982,11 +1985,7 @@ impl StorageAPI for ECStore {
                 Ok(_) => return Ok(()),
                 Err(err) => {
                     //
-                    if is_err_invalid_upload_id(&err) {
-                        None
-                    } else {
-                        Some(err)
-                    }
+                    if is_err_invalid_upload_id(&err) { None } else { Some(err) }
                 }
             };
 
@@ -1995,16 +1994,12 @@ impl StorageAPI for ECStore {
             }
         }
 
-        Err(Error::new(StorageError::InvalidUploadID(
-            bucket.to_owned(),
-            object.to_owned(),
-            upload_id.to_owned(),
-        )))
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
     }
 
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         object: &str,
         upload_id: &str,
@@ -2015,6 +2010,7 @@ impl StorageAPI for ECStore {
 
         if self.single_pool() {
             return self.pools[0]
+                .clone()
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await;
         }
@@ -2024,6 +2020,7 @@ impl StorageAPI for ECStore {
                 continue;
             }
 
+            let pool = pool.clone();
             let err = match pool
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
                 .await
@@ -2031,11 +2028,7 @@ impl StorageAPI for ECStore {
                 Ok(res) => return Ok(res),
                 Err(err) => {
                     //
-                    if is_err_invalid_upload_id(&err) {
-                        None
-                    } else {
-                        Some(err)
-                    }
+                    if is_err_invalid_upload_id(&err) { None } else { Some(err) }
                 }
             };
 
@@ -2044,11 +2037,7 @@ impl StorageAPI for ECStore {
             }
         }
 
-        Err(Error::new(StorageError::InvalidUploadID(
-            bucket.to_owned(),
-            object.to_owned(),
-            upload_id.to_owned(),
-        )))
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
     }
 
     #[tracing::instrument(skip(self))]
@@ -2056,7 +2045,7 @@ impl StorageAPI for ECStore {
         if pool_idx < self.pools.len() && set_idx < self.pools[pool_idx].disk_set.len() {
             self.pools[pool_idx].disk_set[set_idx].get_disks(0, 0).await
         } else {
-            Err(Error::msg(format!("pool idx {}, set idx {}, not found", pool_idx, set_idx)))
+            Err(Error::other(format!("pool idx {}, set idx {}, not found", pool_idx, set_idx)))
         }
     }
 
@@ -2135,8 +2124,8 @@ impl StorageAPI for ECStore {
         for pool in self.pools.iter() {
             let (mut result, err) = pool.heal_format(dry_run).await?;
             if let Some(err) = err {
-                match err.downcast_ref::<DiskError>() {
-                    Some(DiskError::NoHealRequired) => {
+                match err {
+                    StorageError::NoHealRequired => {
                         count_no_heal += 1;
                     }
                     _ => {
@@ -2151,7 +2140,7 @@ impl StorageAPI for ECStore {
         }
         if count_no_heal == self.pools.len() {
             info!("heal format success, NoHealRequired");
-            return Ok((r, Some(Error::new(DiskError::NoHealRequired))));
+            return Ok((r, Some(StorageError::NoHealRequired)));
         }
         info!("heal format success result: {:?}", r);
         Ok((r, None))
@@ -2159,7 +2148,9 @@ impl StorageAPI for ECStore {
 
     #[tracing::instrument(skip(self))]
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
-        self.peer_sys.heal_bucket(bucket, opts).await
+        let res = self.peer_sys.heal_bucket(bucket, opts).await?;
+
+        Ok(res)
     }
     #[tracing::instrument(skip(self))]
     async fn heal_object(
@@ -2218,10 +2209,12 @@ impl StorageAPI for ECStore {
         // No pool returned a nil error, return the first non 'not found' error
         for (index, err) in errs.iter().enumerate() {
             match err {
-                Some(err) => match err.downcast_ref::<DiskError>() {
-                    Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
-                    _ => return Ok((ress.remove(index), Some(clone_err(err)))),
-                },
+                Some(err) => {
+                    if is_err_object_not_found(err) || is_err_version_not_found(err) {
+                        continue;
+                    }
+                    return Ok((ress.remove(index), Some(err.clone())));
+                }
                 None => {
                     return Ok((ress.remove(index), None));
                 }
@@ -2230,10 +2223,10 @@ impl StorageAPI for ECStore {
 
         // At this stage, all errors are 'not found'
         if !version_id.is_empty() {
-            return Ok((HealResultItem::default(), Some(Error::new(DiskError::FileVersionNotFound))));
+            return Ok((HealResultItem::default(), Some(Error::FileVersionNotFound)));
         }
 
-        Ok((HealResultItem::default(), Some(Error::new(DiskError::FileNotFound))))
+        Ok((HealResultItem::default(), Some(Error::FileNotFound)))
     }
 
     #[tracing::instrument(skip(self))]
@@ -2272,12 +2265,14 @@ impl StorageAPI for ECStore {
                             HealSequence::heal_meta_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await
                         } else {
                             HealSequence::heal_object(hs_clone.clone(), &bucket, &entry.name, "", scan_mode).await
-                        }
+                        };
                     }
                 };
 
                 if opts_clone.remove && !opts_clone.dry_run {
-                    let Some(store) = new_object_layer_fn() else { return Err(Error::msg("errServerNotInitialized")) };
+                    let Some(store) = new_object_layer_fn() else {
+                        return Err(Error::other("errServerNotInitialized"));
+                    };
 
                     if let Err(err) = store.check_abandoned_parts(&bucket, &entry.name, &opts_clone).await {
                         info!("unable to check object {}/{} for abandoned data: {}", bucket, entry.name, err.to_string());
@@ -2294,8 +2289,8 @@ impl StorageAPI for ECStore {
                         )
                         .await
                         {
-                            match err.downcast_ref() {
-                                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                            match err {
+                                Error::FileNotFound | Error::FileVersionNotFound => {}
                                 _ => {
                                     return Err(err);
                                 }
@@ -2310,8 +2305,8 @@ impl StorageAPI for ECStore {
                     )
                     .await
                     {
-                        match err.downcast_ref() {
-                            Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                        match err {
+                            Error::FileNotFound | Error::FileVersionNotFound => {}
                             _ => {
                                 return Err(err);
                             }
@@ -2360,7 +2355,7 @@ impl StorageAPI for ECStore {
             }
         }
 
-        Err(Error::new(DiskError::DiskNotFound))
+        Err(Error::DiskNotFound)
     }
 
     #[tracing::instrument(skip(self))]
@@ -2379,7 +2374,7 @@ impl StorageAPI for ECStore {
         }
 
         if !errs.is_empty() {
-            return Err(clone_err(&errs[0]));
+            return Err(errs[0].clone());
         }
 
         Ok(())
@@ -2423,11 +2418,11 @@ fn is_valid_object_name(object: &str) -> bool {
 
 fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<()> {
     if object.len() > 1024 {
-        return Err(Error::new(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned())));
+        return Err(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned()));
     }
 
     if object.starts_with(SLASH_SEPARATOR) {
-        return Err(Error::new(StorageError::ObjectNamePrefixAsSlash(bucket.to_owned(), object.to_owned())));
+        return Err(StorageError::ObjectNamePrefixAsSlash(bucket.to_owned(), object.to_owned()));
     }
 
     #[cfg(target_os = "windows")]
@@ -2441,7 +2436,7 @@ fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<
             || object.contains('<')
             || object.contains('>')
         {
-            return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned())));
+            return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
         }
     }
 
@@ -2462,19 +2457,19 @@ fn check_del_obj_args(bucket: &str, object: &str) -> Result<()> {
 
 fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
-        return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
+        return Err(StorageError::BucketNameInvalid(bucket.to_string()));
     }
 
     if object.is_empty() {
-        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
     if !is_valid_object_prefix(object) {
-        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
     if cfg!(target_os = "windows") && object.contains('\\') {
-        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
     Ok(())
@@ -2482,11 +2477,11 @@ fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
 
 pub fn check_list_objs_args(bucket: &str, prefix: &str, _marker: &Option<String>) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
-        return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
+        return Err(StorageError::BucketNameInvalid(bucket.to_string()));
     }
 
     if !is_valid_object_prefix(prefix) {
-        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), prefix.to_string())));
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), prefix.to_string()));
     }
 
     Ok(())
@@ -2504,15 +2499,15 @@ fn check_list_multipart_args(
     if let Some(upload_id_marker) = upload_id_marker {
         if let Some(key_marker) = key_marker {
             if key_marker.ends_with('/') {
-                return Err(Error::new(StorageError::InvalidUploadIDKeyCombination(
+                return Err(StorageError::InvalidUploadIDKeyCombination(
                     upload_id_marker.to_string(),
                     key_marker.to_string(),
-                )));
+                ));
             }
         }
 
         if let Err(_e) = base64_decode(upload_id_marker.as_bytes()) {
-            return Err(Error::new(StorageError::MalformedUploadID(upload_id_marker.to_owned())));
+            return Err(StorageError::MalformedUploadID(upload_id_marker.to_owned()));
         }
     }
 
@@ -2521,13 +2516,13 @@ fn check_list_multipart_args(
 
 fn check_object_args(bucket: &str, object: &str) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
-        return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
+        return Err(StorageError::BucketNameInvalid(bucket.to_string()));
     }
 
     check_object_name_for_length_and_slash(bucket, object)?;
 
     if !is_valid_object_name(object) {
-        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
     Ok(())
@@ -2539,10 +2534,7 @@ fn check_new_multipart_args(bucket: &str, object: &str) -> Result<()> {
 
 fn check_multipart_object_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
     if let Err(e) = base64_decode(upload_id.as_bytes()) {
-        return Err(Error::new(StorageError::MalformedUploadID(format!(
-            "{}/{}-{},err:{}",
-            bucket, object, upload_id, e
-        ))));
+        return Err(StorageError::MalformedUploadID(format!("{}/{}-{},err:{}", bucket, object, upload_id, e)));
     };
     check_object_args(bucket, object)
 }
@@ -2566,13 +2558,13 @@ fn check_abort_multipart_args(bucket: &str, object: &str, upload_id: &str) -> Re
 #[tracing::instrument(level = "debug")]
 fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
-        return Err(Error::new(StorageError::BucketNameInvalid(bucket.to_string())));
+        return Err(StorageError::BucketNameInvalid(bucket.to_string()));
     }
 
     check_object_name_for_length_and_slash(bucket, object)?;
 
     if object.is_empty() || !is_valid_object_prefix(object) {
-        return Err(Error::new(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string())));
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
     Ok(())
@@ -2646,13 +2638,7 @@ impl ServerPoolsAvailableSpace {
 }
 
 pub async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> {
-    let size = {
-        if size < 0 {
-            DISK_ASSUME_UNKNOWN_SIZE
-        } else {
-            size as u64 * 2
-        }
-    };
+    let size = { if size < 0 { DISK_ASSUME_UNKNOWN_SIZE } else { size as u64 * 2 } };
 
     let mut available = 0;
     let mut total = 0;
@@ -2665,7 +2651,7 @@ pub async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> 
     }
 
     if disks_num < dis.len() / 2 || disks_num == 0 {
-        return Err(Error::msg(format!(
+        return Err(Error::other(format!(
             "not enough online disks to calculate the available space,need {}, found {}",
             (dis.len() / 2) + 1,
             disks_num,

@@ -1,17 +1,15 @@
-use crate::disk::{DiskAPI, DiskStore, MetaCacheEntries, MetaCacheEntry, WalkDirOptions};
-use crate::{
-    disk::error::{is_err_eof, is_err_file_not_found, is_err_volume_not_found, DiskError},
-    metacache::writer::MetacacheReader,
-};
-use common::error::{Error, Result};
+use crate::disk::error::DiskError;
+use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
 use futures::future::join_all;
+use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::{spawn, sync::broadcast::Receiver as B_Receiver};
 use tracing::error;
 
 pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
-pub type PartialFn = Box<dyn Fn(MetaCacheEntries, &[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
-type FinishedFn = Box<dyn Fn(&[Option<Error>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+pub type PartialFn =
+    Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 
 #[derive(Default)]
 pub struct ListPathRawOptions {
@@ -51,22 +49,22 @@ impl Clone for ListPathRawOptions {
     }
 }
 
-pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> Result<()> {
-    // println!("list_path_raw {},{}", &opts.bucket, &opts.path);
+pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -> disk::error::Result<()> {
     if opts.disks.is_empty() {
-        return Err(Error::from_string("list_path_raw: 0 drives provided"));
+        return Err(DiskError::other("list_path_raw: 0 drives provided"));
     }
 
-    let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), Error>>> = Vec::new();
+    let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = Arc::new(opts.fallback_disks.clone());
+
+    let (cancel_tx, cancel_rx) = tokio::sync::broadcast::channel::<bool>(1);
 
     for disk in opts.disks.iter() {
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
         let fds_clone = fds.clone();
-        // let (m_tx, m_rx) = mpsc::channel::<MetaCacheEntry>(100);
-        // readers.push(m_rx);
+        let mut cancel_rx_clone = cancel_rx.resubscribe();
         let (rd, mut wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
         jobs.push(spawn(async move {
@@ -94,7 +92,13 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 need_fallback = true;
             }
 
+            if cancel_rx_clone.try_recv().is_ok() {
+                // warn!("list_path_raw: cancel_rx_clone.try_recv().await.is_ok()");
+                return Ok(());
+            }
+
             while need_fallback {
+                // warn!("list_path_raw: while need_fallback start");
                 let disk = match fds_clone.iter().find(|d| d.is_some()) {
                     Some(d) => {
                         if let Some(disk) = d.clone() {
@@ -132,12 +136,13 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
             }
 
+            // warn!("list_path_raw: while need_fallback done");
             Ok(())
         }));
     }
 
     let revjob = spawn(async move {
-        let mut errs: Vec<Option<Error>> = Vec::with_capacity(readers.len());
+        let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
             errs.push(None);
         }
@@ -145,9 +150,15 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         loop {
             let mut current = MetaCacheEntry::default();
 
+            // warn!(
+            //     "list_path_raw: loop start, bucket: {}, path: {}, current: {:?}",
+            //     opts.bucket, opts.path, &current.name
+            // );
+
             if rx.try_recv().is_ok() {
-                return Err(Error::from_string("canceled"));
+                return Err(DiskError::other("canceled"));
             }
+
             let mut top_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
 
             let mut at_eof = 0;
@@ -170,30 +181,46 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                         } else {
                             // eof
                             at_eof += 1;
-
+                            // warn!("list_path_raw: peek eof, disk: {}", i);
                             continue;
                         }
                     }
                     Err(err) => {
-                        if is_err_eof(&err) {
+                        if err == rustfs_filemeta::Error::Unexpected {
                             at_eof += 1;
+                            // warn!("list_path_raw: peek err eof, disk: {}", i);
                             continue;
-                        } else if is_err_file_not_found(&err) {
+                        }
+
+                        // warn!("list_path_raw: peek err00, err: {:?}", err);
+
+                        if is_io_eof(&err) {
+                            at_eof += 1;
+                            // warn!("list_path_raw: peek eof, disk: {}", i);
+                            continue;
+                        }
+
+                        if err == rustfs_filemeta::Error::FileNotFound {
                             at_eof += 1;
                             fnf += 1;
+                            // warn!("list_path_raw: peek fnf, disk: {}", i);
                             continue;
-                        } else if is_err_volume_not_found(&err) {
+                        } else if err == rustfs_filemeta::Error::VolumeNotFound {
                             at_eof += 1;
                             fnf += 1;
                             vnf += 1;
+                            // warn!("list_path_raw: peek vnf, disk: {}", i);
                             continue;
                         } else {
                             has_err += 1;
-                            errs[i] = Some(err);
+                            errs[i] = Some(err.into());
+                            // warn!("list_path_raw: peek err, disk: {}", i);
                             continue;
                         }
                     }
                 };
+
+                // warn!("list_path_raw: loop entry: {:?}, disk: {}", &entry.name, i);
 
                 // If no current, add it.
                 if current.name.is_empty() {
@@ -230,11 +257,13 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
             }
 
             if vnf > 0 && vnf >= (readers.len() - opts.min_disks) {
-                return Err(Error::new(DiskError::VolumeNotFound));
+                // warn!("list_path_raw: vnf > 0 && vnf >= (readers.len() - opts.min_disks) break");
+                return Err(DiskError::VolumeNotFound);
             }
 
             if fnf > 0 && fnf >= (readers.len() - opts.min_disks) {
-                return Err(Error::new(DiskError::FileNotFound));
+                // warn!("list_path_raw: fnf > 0 && fnf >= (readers.len() - opts.min_disks) break");
+                return Err(DiskError::FileNotFound);
             }
 
             if has_err > 0 && has_err > opts.disks.len() - opts.min_disks {
@@ -252,7 +281,11 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                     _ => {}
                 });
 
-                return Err(Error::from_string(combined_err.join(", ")));
+                error!(
+                    "list_path_raw: has_err > 0 && has_err > opts.disks.len() - opts.min_disks break, err: {:?}",
+                    &combined_err.join(", ")
+                );
+                return Err(DiskError::other(combined_err.join(", ")));
             }
 
             // Break if all at EOF or error.
@@ -265,6 +298,7 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                     }
                 }
 
+                // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);
                 break;
             }
 
@@ -274,11 +308,15 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
                 }
 
                 if let Some(agreed_fn) = opts.agreed.as_ref() {
+                    // warn!("list_path_raw: agreed_fn start, current: {:?}", &current.name);
                     agreed_fn(current).await;
+                    // warn!("list_path_raw: agreed_fn done");
                 }
 
                 continue;
             }
+
+            // warn!("list_path_raw: skip start, current: {:?}", &current.name);
 
             for (i, r) in readers.iter_mut().enumerate() {
                 if top_entries[i].is_some() {
@@ -293,7 +331,12 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         Ok(())
     });
 
-    jobs.push(revjob);
+    if let Err(err) = revjob.await.map_err(std::io::Error::other)? {
+        error!("list_path_raw: revjob err {:?}", err);
+        let _ = cancel_tx.send(true);
+
+        return Err(err);
+    }
 
     let results = join_all(jobs).await;
     for result in results {
@@ -302,5 +345,6 @@ pub async fn list_path_raw(mut rx: B_Receiver<bool>, opts: ListPathRawOptions) -
         }
     }
 
+    // warn!("list_path_raw: done");
     Ok(())
 }

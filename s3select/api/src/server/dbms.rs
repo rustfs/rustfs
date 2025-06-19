@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 
 use crate::{
+    QueryResult,
     query::{
+        Query,
         execution::{Output, QueryStateMachineRef},
         logical_planner::Plan,
-        Query,
     },
-    QueryResult,
 };
 
 pub struct QueryHandle {

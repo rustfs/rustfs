@@ -1,17 +1,37 @@
 FROM alpine:latest
 
-# RUN apk add --no-cache <package-name>
+# Install runtime dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    && rm -rf /var/cache/apk/*
+
+# Create rustfs user and group
+RUN addgroup -g 1000 rustfs && \
+    adduser -D -s /bin/sh -u 1000 -G rustfs rustfs
 
 WORKDIR /app
 
-RUN mkdir -p /data/rustfs0  /data/rustfs1  /data/rustfs2  /data/rustfs3 
+# Create data directories
+RUN mkdir -p /data/rustfs{0,1,2,3} && \
+    chown -R rustfs:rustfs /data /app
 
-COPY ./target/x86_64-unknown-linux-musl/release/rustfs /app/rustfs
+# Copy binary based on target architecture
+COPY --chown=rustfs:rustfs \
+  target/*/release/rustfs \
+  /app/rustfs
 
 RUN chmod +x /app/rustfs
 
-EXPOSE 9000
-EXPOSE 9001
+# Switch to non-root user
+USER rustfs
 
+# Expose ports
+EXPOSE 9000 9001
 
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
+
+# Set default command
 CMD ["/app/rustfs"]

@@ -1,3 +1,18 @@
+use crate::bucket::metadata_sys;
+use crate::disk::error::{Error, Result};
+use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
+use crate::disk::{DiskAPI, DiskStore};
+use crate::global::GLOBAL_LOCAL_DISK_MAP;
+use crate::heal::heal_commands::{
+    DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET, HealOpts,
+};
+use crate::heal::heal_ops::RUSTFS_RESERVED_BUCKET;
+use crate::store::all_local_disk;
+use crate::{
+    disk::{self, VolumeInfo},
+    endpoints::{EndpointServerPools, Node},
+    store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
+};
 use async_trait::async_trait;
 use futures::future::join_all;
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
@@ -10,26 +25,6 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::sync::RwLock;
 use tonic::Request;
 use tracing::info;
-
-use crate::bucket::metadata_sys;
-use crate::disk::error::is_all_buckets_not_found;
-use crate::disk::{DiskAPI, DiskStore};
-use crate::error::clone_err;
-use crate::global::GLOBAL_LOCAL_DISK_MAP;
-use crate::heal::heal_commands::{
-    HealOpts, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_ITEM_BUCKET,
-};
-use crate::heal::heal_ops::RUSTFS_RESERVED_BUCKET;
-use crate::quorum::{bucket_op_ignored_errs, reduce_write_quorum_errs};
-use crate::store::all_local_disk;
-use crate::utils::proto_err_to_err;
-use crate::utils::wildcard::is_rustfs_meta_bucket_name;
-use crate::{
-    disk::{self, error::DiskError, VolumeInfo},
-    endpoints::{EndpointServerPools, Node},
-    store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
-};
-use common::error::{Error, Result};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
@@ -92,12 +87,12 @@ impl S3PeerSys {
             for (i, client) in self.clients.iter().enumerate() {
                 if let Some(v) = client.get_pools() {
                     if v.contains(&pool_idx) {
-                        per_pool_errs.push(errs[i].as_ref().map(clone_err));
+                        per_pool_errs.push(errs[i].clone());
                     }
                 }
             }
             let qu = per_pool_errs.len() / 2;
-            pool_errs.push(reduce_write_quorum_errs(&per_pool_errs, &bucket_op_ignored_errs(), qu));
+            pool_errs.push(reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, qu));
         }
 
         if !opts.recreate {
@@ -127,12 +122,12 @@ impl S3PeerSys {
             for (i, client) in self.clients.iter().enumerate() {
                 if let Some(v) = client.get_pools() {
                     if v.contains(&pool_idx) {
-                        per_pool_errs.push(errs[i].as_ref().map(clone_err));
+                        per_pool_errs.push(errs[i].clone());
                     }
                 }
             }
             let qu = per_pool_errs.len() / 2;
-            if let Some(pool_err) = reduce_write_quorum_errs(&per_pool_errs, &bucket_op_ignored_errs(), qu) {
+            if let Some(pool_err) = reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, qu) {
                 return Err(pool_err);
             }
         }
@@ -142,7 +137,7 @@ impl S3PeerSys {
                 return Ok(heal_bucket_results.read().await[i].clone());
             }
         }
-        Err(DiskError::VolumeNotFound.into())
+        Err(Error::VolumeNotFound)
     }
 
     pub async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
@@ -288,9 +283,7 @@ impl S3PeerSys {
             }
         }
 
-        ress.iter()
-            .find_map(|op| op.clone())
-            .ok_or(Error::new(DiskError::VolumeNotFound))
+        ress.iter().find_map(|op| op.clone()).ok_or(Error::VolumeNotFound)
     }
 
     pub fn get_pools(&self) -> Option<Vec<usize>> {
@@ -380,7 +373,7 @@ impl PeerS3Client for LocalPeerS3Client {
                 match disk.make_volume(bucket).await {
                     Ok(_) => Ok(()),
                     Err(e) => {
-                        if opts.force_create && DiskError::VolumeExists.is(&e) {
+                        if opts.force_create && matches!(e, Error::VolumeExists) {
                             return Ok(());
                         }
 
@@ -446,7 +439,7 @@ impl PeerS3Client for LocalPeerS3Client {
                     ..Default::default()
                 })
             })
-            .ok_or(Error::new(DiskError::VolumeNotFound))
+            .ok_or(Error::VolumeNotFound)
     }
 
     async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
@@ -467,7 +460,7 @@ impl PeerS3Client for LocalPeerS3Client {
             match res {
                 Ok(_) => errs.push(None),
                 Err(e) => {
-                    if DiskError::VolumeNotEmpty.is(&e) {
+                    if matches!(e, Error::VolumeNotEmpty) {
                         recreate = true;
                     }
                     errs.push(Some(e))
@@ -484,7 +477,7 @@ impl PeerS3Client for LocalPeerS3Client {
         }
 
         if recreate {
-            return Err(Error::new(DiskError::VolumeNotEmpty));
+            return Err(Error::VolumeNotEmpty);
         }
 
         // TODO: reduceWriteQuorumErrs
@@ -520,17 +513,17 @@ impl PeerS3Client for RemotePeerS3Client {
         let options: String = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+            .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
         let request = Request::new(HealBucketRequest {
             bucket: bucket.to_string(),
             options,
         });
         let response = client.heal_bucket(request).await?.into_inner();
         if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
+            return if let Some(err) = response.error {
+                Err(err.into())
             } else {
-                Err(Error::from_string(""))
+                Err(Error::other(""))
             };
         }
 
@@ -546,14 +539,14 @@ impl PeerS3Client for RemotePeerS3Client {
         let options = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+            .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
         let request = Request::new(ListBucketRequest { options });
         let response = client.list_bucket(request).await?.into_inner();
         if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
+            return if let Some(err) = response.error {
+                Err(err.into())
             } else {
-                Err(Error::from_string(""))
+                Err(Error::other(""))
             };
         }
         let bucket_infos = response
@@ -568,7 +561,7 @@ impl PeerS3Client for RemotePeerS3Client {
         let options = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+            .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
         let request = Request::new(MakeBucketRequest {
             name: bucket.to_string(),
             options,
@@ -577,10 +570,10 @@ impl PeerS3Client for RemotePeerS3Client {
 
         // TODO: deal with error
         if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
+            return if let Some(err) = response.error {
+                Err(err.into())
             } else {
-                Err(Error::from_string(""))
+                Err(Error::other(""))
             };
         }
 
@@ -590,17 +583,17 @@ impl PeerS3Client for RemotePeerS3Client {
         let options = serde_json::to_string(opts)?;
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+            .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
         let request = Request::new(GetBucketInfoRequest {
             bucket: bucket.to_string(),
             options,
         });
         let response = client.get_bucket_info(request).await?.into_inner();
         if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
+            return if let Some(err) = response.error {
+                Err(err.into())
             } else {
-                Err(Error::from_string(""))
+                Err(Error::other(""))
             };
         }
         let bucket_info = serde_json::from_str::<BucketInfo>(&response.bucket_info)?;
@@ -611,17 +604,17 @@ impl PeerS3Client for RemotePeerS3Client {
     async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         let mut client = node_service_time_out_client(&self.addr)
             .await
-            .map_err(|err| Error::from_string(format!("can not get client, err: {}", err)))?;
+            .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
 
         let request = Request::new(DeleteBucketRequest {
             bucket: bucket.to_string(),
         });
         let response = client.delete_bucket(request).await?.into_inner();
         if !response.success {
-            return if let Some(err) = &response.error {
-                Err(proto_err_to_err(err))
+            return if let Some(err) = response.error {
+                Err(err.into())
             } else {
-                Err(Error::from_string(""))
+                Err(Error::other(""))
             };
         }
 
@@ -632,18 +625,18 @@ impl PeerS3Client for RemotePeerS3Client {
 // 检查桶名是否有效
 fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
     if bucket_name.trim().is_empty() {
-        return Err(Error::msg("Bucket name cannot be empty"));
+        return Err(Error::other("Bucket name cannot be empty"));
     }
     if bucket_name.len() < 3 {
-        return Err(Error::msg("Bucket name cannot be shorter than 3 characters"));
+        return Err(Error::other("Bucket name cannot be shorter than 3 characters"));
     }
     if bucket_name.len() > 63 {
-        return Err(Error::msg("Bucket name cannot be longer than 63 characters"));
+        return Err(Error::other("Bucket name cannot be longer than 63 characters"));
     }
 
     let ip_address_regex = Regex::new(r"^(\d+\.){3}\d+$").unwrap();
     if ip_address_regex.is_match(bucket_name) {
-        return Err(Error::msg("Bucket name cannot be an IP address"));
+        return Err(Error::other("Bucket name cannot be an IP address"));
     }
 
     let valid_bucket_name_regex = if strict {
@@ -653,12 +646,12 @@ fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
     };
 
     if !valid_bucket_name_regex.is_match(bucket_name) {
-        return Err(Error::msg("Bucket name contains invalid characters"));
+        return Err(Error::other("Bucket name contains invalid characters"));
     }
 
     // 检查包含 "..", ".-", "-."
     if bucket_name.contains("..") || bucket_name.contains(".-") || bucket_name.contains("-.") {
-        return Err(Error::msg("Bucket name contains invalid characters"));
+        return Err(Error::other("Bucket name contains invalid characters"));
     }
 
     Ok(())
@@ -703,7 +696,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
                 None => {
                     bs_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
                     as_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
-                    return Some(Error::new(DiskError::DiskNotFound));
+                    return Some(Error::DiskNotFound);
                 }
             };
             bs_clone.write().await[index] = DRIVE_STATE_OK.to_string();
@@ -715,13 +708,13 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
 
             match disk.stat_volume(&bucket).await {
                 Ok(_) => None,
-                Err(err) => match err.downcast_ref() {
-                    Some(DiskError::DiskNotFound) => {
+                Err(err) => match err {
+                    Error::DiskNotFound => {
                         bs_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
                         as_clone.write().await[index] = DRIVE_STATE_OFFLINE.to_string();
                         Some(err)
                     }
-                    Some(DiskError::VolumeNotFound) => {
+                    Error::VolumeNotFound => {
                         bs_clone.write().await[index] = DRIVE_STATE_MISSING.to_string();
                         as_clone.write().await[index] = DRIVE_STATE_MISSING.to_string();
                         Some(err)
@@ -756,7 +749,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
         });
     }
 
-    if opts.remove && !is_rustfs_meta_bucket_name(bucket) && !is_all_buckets_not_found(&errs) {
+    if opts.remove && !bucket.starts_with(disk::RUSTFS_META_BUCKET) && !is_all_buckets_not_found(&errs) {
         let mut futures = Vec::new();
         for disk in disks.iter() {
             let disk = disk.clone();
@@ -769,7 +762,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
                         let _ = disk.delete_volume(&bucket).await;
                         None
                     }
-                    None => Some(Error::new(DiskError::DiskNotFound)),
+                    None => Some(Error::DiskNotFound),
                 }
             });
         }
@@ -784,7 +777,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
             let bucket = bucket.to_string();
             let bs_clone = before_state.clone();
             let as_clone = after_state.clone();
-            let errs_clone = errs.iter().map(|e| e.as_ref().map(clone_err)).collect::<Vec<_>>();
+            let errs_clone = errs.to_vec();
             futures.push(async move {
                 if bs_clone.read().await[idx] == DRIVE_STATE_MISSING {
                     info!("bucket not find, will recreate");
@@ -798,7 +791,7 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
                         }
                     }
                 }
-                errs_clone[idx].as_ref().map(clone_err)
+                errs_clone[idx].clone()
             });
         }
 

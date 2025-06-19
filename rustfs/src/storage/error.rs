@@ -1,6 +1,6 @@
 use common::error::Error;
-use ecstore::{bucket::error::BucketMetadataError, disk::error::is_err_file_not_found, store_err::StorageError};
-use s3s::{s3_error, S3Error, S3ErrorCode};
+use ecstore::error::StorageError;
+use s3s::{S3Error, S3ErrorCode, s3_error};
 pub fn to_s3_error(err: Error) -> S3Error {
     if let Some(storage_err) = err.downcast_ref::<StorageError>() {
         return match storage_err {
@@ -56,18 +56,6 @@ pub fn to_s3_error(err: Error) -> S3Error {
             StorageError::ObjectExistsAsDirectory(bucket, object) => {
                 s3_error!(InvalidArgument, "Object exists on :{} as directory {}", bucket, object)
             }
-            StorageError::InsufficientReadQuorum => {
-                s3_error!(SlowDown, "Storage resources are insufficient for the read operation")
-            }
-            StorageError::InsufficientWriteQuorum => {
-                s3_error!(SlowDown, "Storage resources are insufficient for the write operation")
-            }
-            StorageError::DecommissionNotStarted => s3_error!(InvalidArgument, "Decommission Not Started"),
-            StorageError::DecommissionAlreadyRunning => s3_error!(InternalError, "Decommission already running"),
-
-            StorageError::VolumeNotFound(bucket) => {
-                s3_error!(NoSuchBucket, "bucket not found {}", bucket)
-            }
             StorageError::InvalidPart(bucket, object, version_id) => {
                 s3_error!(
                     InvalidPart,
@@ -78,15 +66,6 @@ pub fn to_s3_error(err: Error) -> S3Error {
                 )
             }
             StorageError::DoneForNow => s3_error!(InternalError, "DoneForNow"),
-        };
-    }
-    //需要添加 not found bucket replication config
-    if let Some(meta_err) = err.downcast_ref::<BucketMetadataError>() {
-        return match meta_err {
-            BucketMetadataError::BucketReplicationConfigNotFound => {
-                S3Error::with_message(S3ErrorCode::ReplicationConfigurationNotFoundError, format!("{}", err))
-            }
-            _ => S3Error::with_message(S3ErrorCode::InternalError, format!("{}", err)), // 处理其他情况
         };
     }
 
@@ -196,10 +175,12 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::ServiceUnavailable);
-        assert!(s3_err
-            .message()
-            .unwrap()
-            .contains("Storage reached its minimum free drive threshold"));
+        assert!(
+            s3_err
+                .message()
+                .unwrap()
+                .contains("Storage reached its minimum free drive threshold")
+        );
     }
 
     #[test]
@@ -266,10 +247,12 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::InvalidArgument);
-        assert!(s3_err
-            .message()
-            .unwrap()
-            .contains("Object name contains forward slash as prefix"));
+        assert!(
+            s3_err
+                .message()
+                .unwrap()
+                .contains("Object name contains forward slash as prefix")
+        );
         assert!(s3_err.message().unwrap().contains("test-bucket"));
         assert!(s3_err.message().unwrap().contains("/invalid-object"));
     }
@@ -367,10 +350,12 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::SlowDown);
-        assert!(s3_err
-            .message()
-            .unwrap()
-            .contains("Storage resources are insufficient for the read operation"));
+        assert!(
+            s3_err
+                .message()
+                .unwrap()
+                .contains("Storage resources are insufficient for the read operation")
+        );
     }
 
     #[test]
@@ -380,10 +365,12 @@ mod tests {
         let s3_err = to_s3_error(err);
 
         assert_eq!(*s3_err.code(), S3ErrorCode::SlowDown);
-        assert!(s3_err
-            .message()
-            .unwrap()
-            .contains("Storage resources are insufficient for the write operation"));
+        assert!(
+            s3_err
+                .message()
+                .unwrap()
+                .contains("Storage resources are insufficient for the write operation")
+        );
     }
 
     #[test]

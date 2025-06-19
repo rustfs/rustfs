@@ -1,4 +1,3 @@
-use common::error::Result;
 use rsa::Pkcs1v15Encrypt;
 use rsa::{
     pkcs8::{DecodePrivateKey, DecodePublicKey},
@@ -6,6 +5,7 @@ use rsa::{
     RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
+use std::io::{Error, Result};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Token {
@@ -19,8 +19,8 @@ pub struct Token {
 // 返回 base64 处理的加密字符串
 pub fn gencode(token: &Token, key: &str) -> Result<String> {
     let data = serde_json::to_vec(token)?;
-    let public_key = RsaPublicKey::from_public_key_pem(key)?;
-    let encrypted_data = public_key.encrypt(&mut OsRng, Pkcs1v15Encrypt, &data)?;
+    let public_key = RsaPublicKey::from_public_key_pem(key).map_err(Error::other)?;
+    let encrypted_data = public_key.encrypt(&mut OsRng, Pkcs1v15Encrypt, &data).map_err(Error::other)?;
     Ok(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encrypted_data))
 }
 
@@ -29,9 +29,11 @@ pub fn gencode(token: &Token, key: &str) -> Result<String> {
 // [key] 私钥字符串
 // 返回 Token 对象
 pub fn parse(token: &str, key: &str) -> Result<Token> {
-    let encrypted_data = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(token.as_bytes())?;
-    let private_key = RsaPrivateKey::from_pkcs8_pem(key)?;
-    let decrypted_data = private_key.decrypt(Pkcs1v15Encrypt, &encrypted_data)?;
+    let encrypted_data = base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(token.as_bytes())
+        .map_err(Error::other)?;
+    let private_key = RsaPrivateKey::from_pkcs8_pem(key).map_err(Error::other)?;
+    let decrypted_data = private_key.decrypt(Pkcs1v15Encrypt, &encrypted_data).map_err(Error::other)?;
     let res: Token = serde_json::from_slice(&decrypted_data)?;
     Ok(res)
 }
@@ -50,7 +52,7 @@ pub fn parse_license(license: &str) -> Result<Token> {
     // }
 }
 
-static TEST_PRIVATE_KEY:&str ="-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCj86SrJIuxSxR6\nBJ/dlJEUIj6NeBRnhLQlCDdovuz61+7kJXVcxaR66w4m8W7SLEUP+IlPtnn6vmiG\n7XMhGNHIr7r1JsEVVLhZmL3tKI66DEZl786ZhG81BWqUlmcooIPS8UEPZNqJXLuz\nVGhxNyVGbj/tV7QC2pSISnKaixc+nrhxvo7w56p5qrm9tik0PjTgfZsUePkoBsSN\npoRkAauS14MAzK6HGB75CzG3dZqXUNWSWVocoWtQbZUwFGXyzU01ammsHQDvc2xu\nK1RQpd1qYH5bOWZ0N0aPFwT0r59HztFXg9sbjsnuhO1A7OiUOkc6iGVuJ0wm/9nA\nwZIBqzgjAgMBAAECggEAPMpeSEbotPhNw2BrllE76ec4omPfzPJbiU+em+wPGoNu\nRJHPDnMKJbl6Kd5jZPKdOOrCnxfd6qcnQsBQa/kz7+GYxMV12l7ra+1Cnujm4v0i\nLTHZvPpp8ZLsjeOmpF3AAzsJEJgon74OqtOlVjVIUPEYKvzV9ijt4gsYq0zfdYv0\nhrTMzyrGM4/UvKLsFIBROAfCeWfA7sXLGH8JhrRAyDrtCPzGtyyAmzoHKHtHafcB\nuyPFw/IP8otAgpDk5iiQPNkH0WwzAQIm12oHuNUa66NwUK4WEjXTnDg8KeWLHHNv\nIfN8vdbZchMUpMIvvkr7is315d8f2cHCB5gEO+GWAQKBgQDR/0xNll+FYaiUKCPZ\nvkOCAd3l5mRhsqnjPQ/6Ul1lAyYWpoJSFMrGGn/WKTa/FVFJRTGbBjwP+Mx10bfb\ngUg2GILDTISUh54fp4zngvTi9w4MWGKXrb7I1jPkM3vbJfC/v2fraQ/r7qHPpO2L\nf6ZbGxasIlSvr37KeGoelwcAQQKBgQDH3hmOTS2Hl6D4EXdq5meHKrfeoicGN7m8\noQK7u8iwn1R9zK5nh6IXxBhKYNXNwdCQtBZVRvFjjZ56SZJb7lKqa1BcTsgJfZCy\nnI3Uu4UykrECAH8AVCVqBXUDJmeA2yE+gDAtYEjvhSDHpUfWxoGHr0B/Oqk2Lxc/\npRy1qV5fYwKBgBWSL/hYVf+RhIuTg/s9/BlCr9SJ0g3nGGRrRVTlWQqjRCpXeFOO\nJzYqSq9pFGKUggEQxoOyJEFPwVDo9gXqRcyov+Xn2kaXl7qQr3yoixc1YZALFDWY\nd1ySBEqQr0xXnV9U/gvEgwotPRnjSzNlLWV2ZuHPtPtG/7M0o1H5GZMBAoGAKr3N\nW0gX53o+my4pCnxRQW+aOIsWq1a5aqRIEFudFGBOUkS2Oz+fI1P1GdrRfhnnfzpz\n2DK+plp/vIkFOpGhrf4bBlJ2psjqa7fdANRFLMaAAfyXLDvScHTQTCcnVUAHQPVq\n2BlSH56pnugyj7SNuLV6pnql+wdhAmRN2m9o1h8CgYAbX2juSr4ioXwnYjOUdrIY\n4+ERvHcXdjoJmmPcAm4y5NbSqLXyU0FQmplNMt2A5LlniWVJ9KNdjAQUt60FZw/+\nr76LdxXaHNZghyx0BOs7mtq5unSQXamZ8KixasfhE9uz3ij1jXjG6hafWkS8/68I\nuWbaZqgvy7a9oPHYlKH7Jg==\n-----END PRIVATE KEY-----\n";
+static TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCj86SrJIuxSxR6\nBJ/dlJEUIj6NeBRnhLQlCDdovuz61+7kJXVcxaR66w4m8W7SLEUP+IlPtnn6vmiG\n7XMhGNHIr7r1JsEVVLhZmL3tKI66DEZl786ZhG81BWqUlmcooIPS8UEPZNqJXLuz\nVGhxNyVGbj/tV7QC2pSISnKaixc+nrhxvo7w56p5qrm9tik0PjTgfZsUePkoBsSN\npoRkAauS14MAzK6HGB75CzG3dZqXUNWSWVocoWtQbZUwFGXyzU01ammsHQDvc2xu\nK1RQpd1qYH5bOWZ0N0aPFwT0r59HztFXg9sbjsnuhO1A7OiUOkc6iGVuJ0wm/9nA\nwZIBqzgjAgMBAAECggEAPMpeSEbotPhNw2BrllE76ec4omPfzPJbiU+em+wPGoNu\nRJHPDnMKJbl6Kd5jZPKdOOrCnxfd6qcnQsBQa/kz7+GYxMV12l7ra+1Cnujm4v0i\nLTHZvPpp8ZLsjeOmpF3AAzsJEJgon74OqtOlVjVIUPEYKvzV9ijt4gsYq0zfdYv0\nhrTMzyrGM4/UvKLsFIBROAfCeWfA7sXLGH8JhrRAyDrtCPzGtyyAmzoHKHtHafcB\nuyPFw/IP8otAgpDk5iiQPNkH0WwzAQIm12oHuNUa66NwUK4WEjXTnDg8KeWLHHNv\nIfN8vdbZchMUpMIvvkr7is315d8f2cHCB5gEO+GWAQKBgQDR/0xNll+FYaiUKCPZ\nvkOCAd3l5mRhsqnjPQ/6Ul1lAyYWpoJSFMrGGn/WKTa/FVFJRTGbBjwP+Mx10bfb\ngUg2GILDTISUh54fp4zngvTi9w4MWGKXrb7I1jPkM3vbJfC/v2fraQ/r7qHPpO2L\nf6ZbGxasIlSvr37KeGoelwcAQQKBgQDH3hmOTS2Hl6D4EXdq5meHKrfeoicGN7m8\noQK7u8iwn1R9zK5nh6IXxBhKYNXNwdCQtBZVRvFjjZ56SZJb7lKqa1BcTsgJfZCy\nnI3Uu4UykrECAH8AVCVqBXUDJmeA2yE+gDAtYEjvhSDHpUfWxoGHr0B/Oqk2Lxc/\npRy1qV5fYwKBgBWSL/hYVf+RhIuTg/s9/BlCr9SJ0g3nGGRrRVTlWQqjRCpXeFOO\nJzYqSq9pFGKUggEQxoOyJEFPwVDo9gXqRcyov+Xn2kaXl7qQr3yoixc1YZALFDWY\nd1ySBEqQr0xXnV9U/gvEgwotPRnjSzNlLWV2ZuHPtPtG/7M0o1H5GZMBAoGAKr3N\nW0gX53o+my4pCnxRQW+aOIsWq1a5aqRIEFudFGBOUkS2Oz+fI1P1GdrRfhnnfzpz\n2DK+plp/vIkFOpGhrf4bBlJ2psjqa7fdANRFLMaAAfyXLDvScHTQTCcnVUAHQPVq\n2BlSH56pnugyj7SNuLV6pnql+wdhAmRN2m9o1h8CgYAbX2juSr4ioXwnYjOUdrIY\n4+ERvHcXdjoJmmPcAm4y5NbSqLXyU0FQmplNMt2A5LlniWVJ9KNdjAQUt60FZw/+\nr76LdxXaHNZghyx0BOs7mtq5unSQXamZ8KixasfhE9uz3ij1jXjG6hafWkS8/68I\nuWbaZqgvy7a9oPHYlKH7Jg==\n-----END PRIVATE KEY-----\n";
 
 #[cfg(test)]
 mod tests {

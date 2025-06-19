@@ -1,6 +1,6 @@
 use crate::policy::function::condition::Condition;
 use serde::ser::SerializeMap;
-use serde::{de, Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer, de};
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -163,12 +163,12 @@ pub struct Value;
 
 #[cfg(test)]
 mod tests {
+    use crate::policy::Functions;
     use crate::policy::function::condition::Condition::*;
     use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::key::Key;
     use crate::policy::function::string::StringFunc;
     use crate::policy::function::string::StringFuncValue;
-    use crate::policy::Functions;
     use test_case::test_case;
 
     #[test_case(

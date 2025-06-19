@@ -1,16 +1,17 @@
 use ecstore::{
-    config::error::is_err_config_not_found,
+    StorageAPI,
+    error::StorageError,
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     rebalance::{DiskStat, RebalSaveOpt},
     store_api::BucketOptions,
-    StorageAPI,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+use time::OffsetDateTime;
 use tracing::warn;
 
 use crate::admin::router::Operation;
@@ -56,8 +57,8 @@ pub struct RebalanceAdminStatus {
     pub id: String, // Identifies the ongoing rebalance operation by a UUID
     #[serde(rename = "pools")]
     pub pools: Vec<RebalancePoolStatus>, // Contains all pools, including inactive
-    #[serde(rename = "stoppedAt")]
-    pub stopped_at: Option<SystemTime>, // Optional timestamp when rebalance was stopped
+    #[serde(rename = "stoppedAt", with = "offsetdatetime_rfc3339")]
+    pub stopped_at: Option<OffsetDateTime>, // Optional timestamp when rebalance was stopped
 }
 
 pub struct RebalanceStart {}
@@ -101,11 +102,13 @@ impl Operation for RebalanceStart {
             }
         };
 
+        store.start_rebalance().await;
+
         warn!("Rebalance started with id: {}", id);
         if let Some(notification_sys) = get_global_notification_sys() {
-            warn!("Loading rebalance meta");
+            warn!("RebalanceStart Loading rebalance meta start");
             notification_sys.load_rebalance_meta(true).await;
-            warn!("Rebalance meta loaded");
+            warn!("RebalanceStart Loading rebalance meta done");
         }
 
         let resp = RebalanceResp { id };
@@ -133,7 +136,7 @@ impl Operation for RebalanceStatus {
 
         let mut meta = RebalanceMeta::new();
         if let Err(err) = meta.load(store.pools[0].clone()).await {
-            if is_err_config_not_found(&err) {
+            if err == StorageError::ConfigNotFound {
                 return Err(s3_error!(NoSuchResource, "Pool rebalance is not started"));
             }
 
@@ -175,15 +178,14 @@ impl Operation for RebalanceStatus {
             let total_bytes_to_rebal = ps.init_capacity as f64 * meta.percent_free_goal - ps.init_free_space as f64;
 
             let mut elapsed = if let Some(start_time) = ps.info.start_time {
-                SystemTime::now()
-                    .duration_since(start_time)
-                    .map_err(|e| s3_error!(InternalError, "Failed to calculate elapsed time: {}", e))?
+                let now = OffsetDateTime::now_utc();
+                now - start_time
             } else {
                 return Err(s3_error!(InternalError, "Start time is not available"));
             };
 
             let mut eta = if ps.bytes > 0 {
-                Duration::from_secs_f64(total_bytes_to_rebal * elapsed.as_secs_f64() / ps.bytes as f64)
+                Duration::from_secs_f64(total_bytes_to_rebal * elapsed.as_seconds_f64() / ps.bytes as f64)
             } else {
                 Duration::ZERO
             };
@@ -193,10 +195,8 @@ impl Operation for RebalanceStatus {
             }
 
             if let Some(stopped_at) = stop_time {
-                if let Ok(du) = stopped_at.duration_since(ps.info.start_time.unwrap_or(stopped_at)) {
-                    elapsed = du;
-                } else {
-                    return Err(s3_error!(InternalError, "Failed to calculate elapsed time"));
+                if let Some(start_time) = ps.info.start_time {
+                    elapsed = stopped_at - start_time;
                 }
 
                 eta = Duration::ZERO;
@@ -208,7 +208,7 @@ impl Operation for RebalanceStatus {
                 bytes: ps.bytes,
                 bucket: ps.bucket.clone(),
                 object: ps.object.clone(),
-                elapsed: elapsed.as_secs(),
+                elapsed: elapsed.whole_seconds() as u64,
                 eta: eta.as_secs(),
             });
         }
@@ -244,10 +244,45 @@ impl Operation for RebalanceStop {
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to stop rebalance: {}", e))?;
 
+        warn!("handle RebalanceStop save_rebalance_stats done ");
         if let Some(notification_sys) = get_global_notification_sys() {
-            notification_sys.load_rebalance_meta(true).await;
+            warn!("handle RebalanceStop notification_sys load_rebalance_meta");
+            notification_sys.load_rebalance_meta(false).await;
+            warn!("handle RebalanceStop notification_sys load_rebalance_meta done");
         }
 
-        return Err(s3_error!(NotImplemented));
+        Ok(S3Response::new((StatusCode::OK, Body::empty())))
+    }
+}
+
+mod offsetdatetime_rfc3339 {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+    pub fn serialize<S>(dt: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match dt {
+            Some(dt) => {
+                let s = dt.format(&Rfc3339).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_some(&s)
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let dt = OffsetDateTime::parse(&s, &Rfc3339).map_err(serde::de::Error::custom)?;
+                Ok(Some(dt))
+            }
+            None => Ok(None),
+        }
     }
 }

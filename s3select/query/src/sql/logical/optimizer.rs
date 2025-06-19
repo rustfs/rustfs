@@ -1,22 +1,22 @@
 use std::sync::Arc;
 
 use api::{
-    query::{analyzer::AnalyzerRef, logical_planner::QueryPlan, session::SessionCtx},
     QueryResult,
+    query::{analyzer::AnalyzerRef, logical_planner::QueryPlan, session::SessionCtx},
 };
 use datafusion::{
     execution::SessionStateBuilder,
     logical_expr::LogicalPlan,
     optimizer::{
-        common_subexpr_eliminate::CommonSubexprEliminate, decorrelate_predicate_subquery::DecorrelatePredicateSubquery,
-        eliminate_cross_join::EliminateCrossJoin, eliminate_duplicated_expr::EliminateDuplicatedExpr,
-        eliminate_filter::EliminateFilter, eliminate_join::EliminateJoin, eliminate_limit::EliminateLimit,
-        eliminate_outer_join::EliminateOuterJoin, extract_equijoin_predicate::ExtractEquijoinPredicate,
-        filter_null_join_keys::FilterNullJoinKeys, propagate_empty_relation::PropagateEmptyRelation,
-        push_down_filter::PushDownFilter, push_down_limit::PushDownLimit,
+        OptimizerRule, common_subexpr_eliminate::CommonSubexprEliminate,
+        decorrelate_predicate_subquery::DecorrelatePredicateSubquery, eliminate_cross_join::EliminateCrossJoin,
+        eliminate_duplicated_expr::EliminateDuplicatedExpr, eliminate_filter::EliminateFilter, eliminate_join::EliminateJoin,
+        eliminate_limit::EliminateLimit, eliminate_outer_join::EliminateOuterJoin,
+        extract_equijoin_predicate::ExtractEquijoinPredicate, filter_null_join_keys::FilterNullJoinKeys,
+        propagate_empty_relation::PropagateEmptyRelation, push_down_filter::PushDownFilter, push_down_limit::PushDownLimit,
         replace_distinct_aggregate::ReplaceDistinctWithAggregate, scalar_subquery_to_join::ScalarSubqueryToJoin,
         simplify_expressions::SimplifyExpressions, single_distinct_to_groupby::SingleDistinctToGroupBy,
-        unwrap_cast_in_comparison::UnwrapCastInComparison, OptimizerRule,
+        unwrap_cast_in_comparison::UnwrapCastInComparison,
     },
 };
 use tracing::debug;

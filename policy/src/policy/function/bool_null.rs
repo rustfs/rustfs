@@ -1,6 +1,6 @@
 use super::func::InnerFunc;
 use serde::de::{Error, IgnoredAny, SeqAccess};
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{collections::HashMap, fmt};
 
 pub type BoolFunc = InnerFunc<BoolFuncValue>;

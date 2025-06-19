@@ -43,6 +43,7 @@ fn main() -> Result<(), AnyError> {
         // .file_descriptor_set_path(descriptor_set_path)
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_well_known_types(true)
+        .bytes(["."])
         .emit_rerun_if_changed(false)
         .compile_protos(proto_files, &[proto_dir.clone()])
         .map_err(|e| format!("Failed to generate protobuf file: {e}."))?;

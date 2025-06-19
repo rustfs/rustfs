@@ -6,15 +6,15 @@ use std::{
     pin::Pin,
     ptr,
     sync::{
-        atomic::{AtomicPtr, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicPtr, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{spawn, sync::Mutex};
 
-use common::error::Result;
+use std::io::Result;
 
 pub type UpdateFn<T> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<T>> + Send>> + Send + Sync + 'static>;
 

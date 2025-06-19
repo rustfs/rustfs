@@ -6,61 +6,62 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
 
 use super::{
-    data_scanner_metric::{globalScannerMetrics, ScannerMetric, ScannerMetrics},
-    data_usage::{store_data_usage_in_backend, DATA_USAGE_BLOOM_NAME_PATH},
+    data_scanner_metric::{ScannerMetric, ScannerMetrics, globalScannerMetrics},
+    data_usage::{DATA_USAGE_BLOOM_NAME_PATH, store_data_usage_in_backend},
     data_usage_cache::{DataUsageCache, DataUsageEntry, DataUsageHash},
-    heal_commands::{HealScanMode, HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN},
+    heal_commands::{HEAL_DEEP_SCAN, HEAL_NORMAL_SCAN, HealScanMode},
 };
-use crate::cmd::bucket_replication::queue_replication_heal;
+use crate::{bucket::metadata_sys, cmd::bucket_replication::queue_replication_heal};
 use crate::{
-    bucket::{metadata_sys, versioning::VersioningApi, versioning_sys::BucketVersioningSys},
+    bucket::{versioning::VersioningApi, versioning_sys::BucketVersioningSys},
     cmd::bucket_replication::ReplicationStatusType,
+    disk,
     heal::data_usage::DATA_USAGE_ROOT,
 };
 use crate::{
-    cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
+    cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
     config::{
         com::{read_config, save_config},
         heal::Config,
     },
-    disk::{error::DiskError, DiskInfoOptions, DiskStore, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams},
+    disk::{DiskInfoOptions, DiskStore},
     global::{GLOBAL_BackgroundHealState, GLOBAL_IsErasure, GLOBAL_IsErasureSD},
     heal::{
         data_usage::BACKGROUND_HEAL_INFO_PATH,
-        data_usage_cache::{hash_path, DataUsageHashMap},
+        data_usage_cache::{DataUsageHashMap, hash_path},
         error::ERR_IGNORE_FILE_CONTRIB,
         heal_commands::{HEAL_ITEM_BUCKET, HEAL_ITEM_OBJECT},
-        heal_ops::{HealSource, BG_HEALING_UUID},
+        heal_ops::{BG_HEALING_UUID, HealSource},
     },
     new_object_layer_fn,
     peer::is_reserved_or_invalid_bucket,
     store::ECStore,
-    utils::path::{path_join, path_to_bucket_object, path_to_bucket_object_with_base_path, SLASH_SEPARATOR},
+};
+use crate::{disk::DiskAPI, store_api::ObjectInfo};
+use crate::{
+    disk::error::DiskError,
+    error::{Error, Result},
 };
 use crate::{disk::local::LocalDisk, heal::data_scanner_metric::current_path_updater};
-use crate::{
-    disk::DiskAPI,
-    store_api::{FileInfo, ObjectInfo},
-};
 use chrono::{DateTime, Utc};
-use common::error::{Error, Result};
 use lazy_static::lazy_static;
 use rand::Rng;
 use rmp_serde::{Deserializer, Serializer};
+use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, ReplicationConfiguration, ReplicationRuleStatus};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{
-        broadcast,
+        RwLock, broadcast,
         mpsc::{self, Sender},
-        RwLock,
     },
     time::sleep,
 };
@@ -462,7 +463,7 @@ impl CurrentScannerCycle {
                         Deserialize::deserialize(&mut Deserializer::new(&buf[..])).expect("Deserialization failed");
                     self.cycle_completed = u;
                 }
-                name => return Err(Error::msg(format!("not support field name {}", name))),
+                name => return Err(Error::other(format!("not support field name {}", name))),
             }
         }
 
@@ -525,7 +526,7 @@ impl ScannerItem {
             cumulative_size += obj_info.size;
         }
 
-        if cumulative_size >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst) as usize {
+        if cumulative_size >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst) as i64 {
             //todo
         }
 
@@ -542,7 +543,12 @@ impl ScannerItem {
 
         if self.lifecycle.is_none() {
             for info in fives.iter() {
-                object_infos.push(info.to_object_info(&self.bucket, &self.object_path().to_string_lossy(), versioned));
+                object_infos.push(ObjectInfo::from_file_info(
+                    info,
+                    &self.bucket,
+                    &self.object_path().to_string_lossy(),
+                    versioned,
+                ));
             }
             return Ok(object_infos);
         }
@@ -552,7 +558,7 @@ impl ScannerItem {
         Ok(object_infos)
     }
 
-    pub async fn apply_actions(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) -> (bool, usize) {
+    pub async fn apply_actions(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) -> (bool, i64) {
         let done = ScannerMetrics::time(ScannerMetric::Ilm);
         //todo: lifecycle
         info!(
@@ -635,21 +641,21 @@ impl ScannerItem {
             match tgt_status {
                 ReplicationStatusType::Pending => {
                     tgt_size_s.pending_count += 1;
-                    tgt_size_s.pending_size += oi.size;
+                    tgt_size_s.pending_size += oi.size as usize;
                     size_s.pending_count += 1;
-                    size_s.pending_size += oi.size;
+                    size_s.pending_size += oi.size as usize;
                 }
                 ReplicationStatusType::Failed => {
                     tgt_size_s.failed_count += 1;
-                    tgt_size_s.failed_size += oi.size;
+                    tgt_size_s.failed_size += oi.size as usize;
                     size_s.failed_count += 1;
-                    size_s.failed_size += oi.size;
+                    size_s.failed_size += oi.size as usize;
                 }
                 ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
                     tgt_size_s.replicated_count += 1;
-                    tgt_size_s.replicated_size += oi.size;
+                    tgt_size_s.replicated_size += oi.size as usize;
                     size_s.replicated_count += 1;
-                    size_s.replicated_size += oi.size;
+                    size_s.replicated_size += oi.size as usize;
                 }
                 _ => {}
             }
@@ -657,7 +663,7 @@ impl ScannerItem {
 
         if matches!(oi.replication_status, ReplicationStatusType::Replica) {
             size_s.replica_count += 1;
-            size_s.replica_size += oi.size;
+            size_s.replica_size += oi.size as usize;
         }
     }
 }
@@ -697,7 +703,7 @@ struct CachedFolder {
 }
 
 pub type GetSizeFn =
-    Box<dyn Fn(&ScannerItem) -> Pin<Box<dyn Future<Output = Result<SizeSummary>> + Send>> + Send + Sync + 'static>;
+    Box<dyn Fn(&ScannerItem) -> Pin<Box<dyn Future<Output = std::io::Result<SizeSummary>> + Send>> + Send + Sync + 'static>;
 pub type UpdateCurrentPathFn = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type ShouldSleepFn = Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>;
 
@@ -1032,7 +1038,7 @@ impl FolderScanner {
                             }
                         })
                     })),
-                    partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
+                    partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                         Box::pin({
                             let update_current_path_partial = update_current_path_partial.clone();
                             // let tx_partial = tx_partial.clone();
@@ -1076,8 +1082,8 @@ impl FolderScanner {
                                             )
                                             .await
                                         {
-                                            match err.downcast_ref() {
-                                                Some(DiskError::FileNotFound) | Some(DiskError::FileVersionNotFound) => {}
+                                            match err {
+                                                Error::FileNotFound | Error::FileVersionNotFound => {}
                                                 _ => {
                                                     info!("{}", err.to_string());
                                                 }
@@ -1121,7 +1127,7 @@ impl FolderScanner {
                             }
                         })
                     })),
-                    finished: Some(Box::new(move |_: &[Option<Error>]| {
+                    finished: Some(Box::new(move |_: &[Option<DiskError>]| {
                         Box::pin({
                             let tx_finished = tx_finished.clone();
                             async move {
@@ -1180,7 +1186,7 @@ impl FolderScanner {
         if !into.compacted {
             self.new_cache.reduce_children_of(
                 &this_hash,
-                DATA_SCANNER_COMPACT_AT_CHILDREN.try_into()?,
+                DATA_SCANNER_COMPACT_AT_CHILDREN as usize,
                 self.new_cache.info.name != folder.name,
             );
         }
@@ -1337,9 +1343,9 @@ pub async fn scan_data_folder(
     get_size_fn: GetSizeFn,
     heal_scan_mode: HealScanMode,
     should_sleep: ShouldSleepFn,
-) -> Result<DataUsageCache> {
+) -> disk::error::Result<DataUsageCache> {
     if cache.info.name.is_empty() || cache.info.name == DATA_USAGE_ROOT {
-        return Err(Error::from_string("internal error: root scan attempted"));
+        return Err(DiskError::other("internal error: root scan attempted"));
     }
 
     let base_path = drive.to_string();

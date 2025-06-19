@@ -396,10 +396,12 @@ mod tests {
         // Should fail because no certificates found
         let result = load_all_certs_from_directory(temp_dir.path().to_str().unwrap());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No valid certificate/private key pair found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No valid certificate/private key pair found")
+        );
     }
 
     #[test]
@@ -412,10 +414,12 @@ mod tests {
 
         let result = load_all_certs_from_directory(unicode_dir.to_str().unwrap());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No valid certificate/private key pair found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No valid certificate/private key pair found")
+        );
     }
 
     #[test]

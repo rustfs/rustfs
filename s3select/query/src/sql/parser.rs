@@ -1,8 +1,8 @@
 use std::{collections::VecDeque, fmt::Display};
 
 use api::{
-    query::{ast::ExtStatement, parser::Parser as RustFsParser},
     ParserSnafu,
+    query::{ast::ExtStatement, parser::Parser as RustFsParser},
 };
 use datafusion::sql::sqlparser::{
     dialect::Dialect,

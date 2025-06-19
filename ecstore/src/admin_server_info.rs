@@ -1,8 +1,9 @@
+use crate::error::{Error, Result};
 use crate::{
     disk::endpoint::Endpoint,
-    global::{GLOBAL_Endpoints, GLOBAL_BOOT_TIME},
+    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
     heal::{
-        data_usage::{load_data_usage_from_backend, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT},
+        data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend},
         data_usage_cache::DataUsageCache,
         heal_commands::{DRIVE_STATE_OK, DRIVE_STATE_UNFORMATTED},
     },
@@ -11,10 +12,10 @@ use crate::{
     store_api::StorageAPI,
 };
 use common::{
-    error::{Error, Result},
+    // error::{Error, Result},
     globals::GLOBAL_Local_Node_Name,
 };
-use madmin::{BackendDisks, Disk, ErasureSetInfo, InfoMessage, ServerProperties, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE};
+use madmin::{BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties};
 use protos::{
     models::{PingBody, PingBodyBuilder},
     node_service_time_out_client,
@@ -87,12 +88,12 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
     // 创建客户端
     let mut client = node_service_time_out_client(&addr)
         .await
-        .map_err(|err| Error::msg(err.to_string()))?;
+        .map_err(|err| Error::other(err.to_string()))?;
 
     // 构造 PingRequest
     let request = Request::new(PingRequest {
         version: 1,
-        body: finished_data.to_vec(),
+        body: bytes::Bytes::copy_from_slice(finished_data),
     });
 
     // 发送请求并获取响应
@@ -332,7 +333,7 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
 
 async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, ErasureSetInfo>>> {
     let Some(store) = new_object_layer_fn() else {
-        return Err(Error::msg("ServerNotInitialized"));
+        return Err(Error::other("ServerNotInitialized"));
     };
 
     let mut pools_info: HashMap<i32, HashMap<i32, ErasureSetInfo>> = HashMap::new();

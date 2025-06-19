@@ -2,45 +2,44 @@ use super::router::Operation;
 use crate::auth::check_key_valid;
 use crate::auth::get_condition_values;
 use crate::auth::get_session_token;
-//use ecstore::error::Error as ec_Error;
-use crate::storage::error::to_s3_error;
+use crate::error::ApiError;
 use bytes::Bytes;
-use common::error::Error as ec_Error;
 use ecstore::admin_server_info::get_server_info;
 use ecstore::bucket::metadata_sys::{self, get_replication_config};
 use ecstore::bucket::target::BucketTarget;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
 use ecstore::cmd::bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
+use ecstore::error::StorageError;
 use ecstore::global::GLOBAL_ALlHealState;
 use ecstore::heal::data_usage::load_data_usage_from_backend;
 use ecstore::heal::heal_commands::HealOpts;
 use ecstore::heal::heal_ops::new_heal_sequence;
-use ecstore::metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType};
+use ecstore::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use ecstore::new_object_layer_fn;
 use ecstore::peer::is_reserved_or_invalid_bucket;
 use ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use ecstore::store::is_valid_object_prefix;
 use ecstore::store_api::BucketOptions;
 use ecstore::store_api::StorageAPI;
-use ecstore::utils::path::path_join;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, Uri};
 use hyper::StatusCode;
 use iam::get_global_action_cred;
 use iam::store::MappedPolicy;
+use rustfs_utils::path::path_join;
 // use lazy_static::lazy_static;
 use madmin::metrics::RealtimeMetrics;
 use madmin::utils::parse_duration;
 use matchit::Params;
-use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
+use policy::policy::Args;
+use policy::policy::BucketPolicy;
 use policy::policy::action::Action;
 use policy::policy::action::S3Action;
 use policy::policy::default::DEFAULT_POLICIES;
-use policy::policy::Args;
-use policy::policy::BucketPolicy;
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{s3_error, Body, S3Error, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use s3s::{S3ErrorCode, StdError};
 use serde::{Deserialize, Serialize};
 // use serde_json::to_vec;
@@ -666,7 +665,7 @@ impl Operation for HealHandler {
         #[derive(Default)]
         struct HealResp {
             resp_bytes: Vec<u8>,
-            _api_err: Option<ec_Error>,
+            _api_err: Option<StorageError>,
             _err_body: String,
         }
 
@@ -836,7 +835,7 @@ impl Operation for SetRemoteTargetHandler {
                 }
             }
 
-            let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|arg0| to_s3_error(arg0.into()))?; // 错误会被传播
+            let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(ApiError::other)?; // 错误会被传播
             remote_target.source_bucket = bucket.clone();
 
             info!("remote target {} And arn is:", remote_target.source_bucket.clone());

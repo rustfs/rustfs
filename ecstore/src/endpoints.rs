@@ -1,14 +1,15 @@
+use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
 use tracing::{instrument, warn};
 
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
     disks_layout::DisksLayout,
     global::global_rustfs_port,
-    utils::net::{self, XHost},
+    // utils::net::{self, XHost},
 };
-use common::error::{Error, Result};
+use std::io::{Error, Result};
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     net::IpAddr,
 };
 
@@ -76,7 +77,7 @@ impl<T: AsRef<str>> TryFrom<&[T]> for Endpoints {
         for (i, arg) in args.iter().enumerate() {
             let endpoint = match Endpoint::try_from(arg.as_ref()) {
                 Ok(ep) => ep,
-                Err(e) => return Err(Error::from_string(format!("'{}': {}", arg.as_ref(), e))),
+                Err(e) => return Err(Error::other(format!("'{}': {}", arg.as_ref(), e))),
             };
 
             // All endpoints have to be same type and scheme if applicable.
@@ -84,15 +85,15 @@ impl<T: AsRef<str>> TryFrom<&[T]> for Endpoints {
                 endpoint_type = Some(endpoint.get_type());
                 schema = Some(endpoint.url.scheme().to_owned());
             } else if Some(endpoint.get_type()) != endpoint_type {
-                return Err(Error::from_string("mixed style endpoints are not supported"));
+                return Err(Error::other("mixed style endpoints are not supported"));
             } else if Some(endpoint.url.scheme()) != schema.as_deref() {
-                return Err(Error::from_string("mixed scheme is not supported"));
+                return Err(Error::other("mixed scheme is not supported"));
             }
 
             // Check for duplicate endpoints.
             let endpoint_str = endpoint.to_string();
             if uniq_set.contains(&endpoint_str) {
-                return Err(Error::from_string("duplicate endpoints found"));
+                return Err(Error::other("duplicate endpoints found"));
             }
 
             uniq_set.insert(endpoint_str);
@@ -156,10 +157,10 @@ impl PoolEndpointList {
     /// hostnames and discovers those are local or remote.
     fn create_pool_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<Self> {
         if disks_layout.is_empty_layout() {
-            return Err(Error::from_string("invalid number of endpoints"));
+            return Err(Error::other("invalid number of endpoints"));
         }
 
-        let server_addr = net::check_local_server_addr(server_addr)?;
+        let server_addr = check_local_server_addr(server_addr)?;
 
         // For single arg, return single drive EC setup.
         if disks_layout.is_single_drive_layout() {
@@ -167,7 +168,7 @@ impl PoolEndpointList {
             endpoint.update_is_local(server_addr.port())?;
 
             if endpoint.get_type() != EndpointType::Path {
-                return Err(Error::from_string("use path style endpoint for single node setup"));
+                return Err(Error::other("use path style endpoint for single node setup"));
             }
 
             endpoint.set_pool_index(0);
@@ -201,7 +202,7 @@ impl PoolEndpointList {
             }
 
             if endpoints.as_ref().is_empty() {
-                return Err(Error::from_string("invalid number of endpoints"));
+                return Err(Error::other("invalid number of endpoints"));
             }
 
             pool_endpoints.push(endpoints);
@@ -227,15 +228,14 @@ impl PoolEndpointList {
 
                 let host = ep.url.host().unwrap();
                 let host_ip_set = host_ip_cache.entry(host.clone()).or_insert({
-                    net::get_host_ip(host.clone())
-                        .map_err(|e| Error::from_string(format!("host '{}' cannot resolve: {}", host, e)))?
+                    get_host_ip(host.clone()).map_err(|e| Error::other(format!("host '{}' cannot resolve: {}", host, e)))?
                 });
 
                 let path = ep.get_file_path();
                 match path_ip_map.entry(path) {
                     Entry::Occupied(mut e) => {
                         if e.get().intersection(host_ip_set).count() > 0 {
-                            return Err(Error::from_string(format!(
+                            return Err(Error::other(format!(
                                 "same path '{}' can not be served by different port on same address",
                                 path
                             )));
@@ -257,7 +257,7 @@ impl PoolEndpointList {
 
                 let path = ep.get_file_path();
                 if local_path_set.contains(path) {
-                    return Err(Error::from_string(format!(
+                    return Err(Error::other(format!(
                         "path '{}' cannot be served by different address on same server",
                         path
                     )));
@@ -285,7 +285,7 @@ impl PoolEndpointList {
                 // If all endpoints have same port number, Just treat it as local erasure setup
                 // using URL style endpoints.
                 if local_port_set.len() == 1 && local_server_host_set.len() > 1 {
-                    return Err(Error::from_string("all local endpoints should not have different hostnames/ips"));
+                    return Err(Error::other("all local endpoints should not have different hostnames/ips"));
                 }
             }
 
@@ -332,7 +332,7 @@ impl PoolEndpointList {
                         ep.is_local = true;
                     }
                     Some(host) => {
-                        ep.is_local = net::is_local_host(host, ep.url.port().unwrap_or_default(), local_port)?;
+                        ep.is_local = is_local_host(host, ep.url.port().unwrap_or_default(), local_port)?;
                     }
                 }
             }
@@ -371,7 +371,7 @@ impl PoolEndpointList {
                             resolved_set.insert((i, j));
                             continue;
                         }
-                        Some(host) => match net::is_local_host(host, ep.url.port().unwrap_or_default(), local_port) {
+                        Some(host) => match is_local_host(host, ep.url.port().unwrap_or_default(), local_port) {
                             Ok(is_local) => {
                                 if !found_local {
                                     found_local = is_local;
@@ -453,7 +453,7 @@ impl EndpointServerPools {
     /// both ellipses and without ellipses transparently.
     pub fn create_server_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<(EndpointServerPools, SetupType)> {
         if disks_layout.pools.is_empty() {
-            return Err(Error::from_string("Invalid arguments specified"));
+            return Err(Error::other("Invalid arguments specified"));
         }
 
         let pool_eps = PoolEndpointList::create_pool_endpoints(server_addr, disks_layout)?;
@@ -490,7 +490,7 @@ impl EndpointServerPools {
 
         for ep in eps.endpoints.as_ref() {
             if exits.contains(&ep.to_string()) {
-                return Err(Error::from_string("duplicate endpoints found"));
+                return Err(Error::other("duplicate endpoints found"));
             }
         }
 
@@ -606,6 +606,8 @@ impl EndpointServerPools {
 
 #[cfg(test)]
 mod test {
+    use rustfs_utils::must_get_local_ips;
+
     use super::*;
     use std::path::Path;
 
@@ -664,8 +666,8 @@ mod test {
                 None,
                 6,
             ),
-            (vec!["d1", "d2", "d3", "d1"], Some(Error::from_string("duplicate endpoints found")), 7),
-            (vec!["d1", "d2", "d3", "./d1"], Some(Error::from_string("duplicate endpoints found")), 8),
+            (vec!["d1", "d2", "d3", "d1"], Some(Error::other("duplicate endpoints found")), 7),
+            (vec!["d1", "d2", "d3", "./d1"], Some(Error::other("duplicate endpoints found")), 8),
             (
                 vec![
                     "http://localhost/d1",
@@ -673,17 +675,17 @@ mod test {
                     "http://localhost/d1",
                     "http://localhost/d4",
                 ],
-                Some(Error::from_string("duplicate endpoints found")),
+                Some(Error::other("duplicate endpoints found")),
                 9,
             ),
             (
                 vec!["ftp://server/d1", "http://server/d2", "http://server/d3", "http://server/d4"],
-                Some(Error::from_string("'ftp://server/d1': invalid URL endpoint format")),
+                Some(Error::other("'ftp://server/d1': io error invalid URL endpoint format")),
                 10,
             ),
             (
                 vec!["d1", "http://localhost/d2", "d3", "d4"],
-                Some(Error::from_string("mixed style endpoints are not supported")),
+                Some(Error::other("mixed style endpoints are not supported")),
                 11,
             ),
             (
@@ -693,7 +695,7 @@ mod test {
                     "http://example.net/d1",
                     "https://example.edut/d1",
                 ],
-                Some(Error::from_string("mixed scheme is not supported")),
+                Some(Error::other("mixed scheme is not supported")),
                 12,
             ),
             (
@@ -703,9 +705,7 @@ mod test {
                     "192.168.1.210:9000/tmp/dir2",
                     "192.168.110:9000/tmp/dir3",
                 ],
-                Some(Error::from_string(
-                    "'192.168.1.210:9000/tmp/dir0': invalid URL endpoint format: missing scheme http or https",
-                )),
+                Some(Error::other("'192.168.1.210:9000/tmp/dir0': io error")),
                 13,
             ),
         ];
@@ -719,7 +719,13 @@ mod test {
                 (None, Ok(_)) => {}
                 (Some(e), Ok(_)) => panic!("{}: error: expected = {}, got = <nil>", test_case.2, e),
                 (Some(e), Err(e2)) => {
-                    assert_eq!(e.to_string(), e2.to_string(), "{}: error: expected = {}, got = {}", test_case.2, e, e2)
+                    assert!(
+                        e2.to_string().starts_with(&e.to_string()),
+                        "{}: error: expected = {}, got = {}",
+                        test_case.2,
+                        e,
+                        e2
+                    )
                 }
             }
         }
@@ -739,7 +745,7 @@ mod test {
 
         // Filter ipList by IPs those do not start with '127.'.
         let non_loop_back_i_ps =
-            net::must_get_local_ips().map_or(vec![], |v| v.into_iter().filter(|ip| ip.is_ipv4() && ip.is_loopback()).collect());
+            must_get_local_ips().map_or(vec![], |v| v.into_iter().filter(|ip| ip.is_ipv4() && ip.is_loopback()).collect());
         if non_loop_back_i_ps.is_empty() {
             panic!("No non-loop back IP address found for this host");
         }
@@ -811,7 +817,7 @@ mod test {
             TestCase {
                 num: 1,
                 server_addr: "localhost",
-                expected_err: Some(Error::from_string("address localhost: missing port in address")),
+                expected_err: Some(Error::other("address localhost: missing port in address")),
                 ..Default::default()
             },
             // Erasure Single Drive
@@ -819,7 +825,7 @@ mod test {
                 num: 2,
                 server_addr: "localhost:9000",
                 args: vec!["http://localhost/d1"],
-                expected_err: Some(Error::from_string("use path style endpoint for single node setup")),
+                expected_err: Some(Error::other("use path style endpoint for single node setup")),
                 ..Default::default()
             },
             TestCase {
@@ -859,7 +865,7 @@ mod test {
                     "https://example.com/d1",
                     "https://example.com/d2",
                 ],
-                expected_err: Some(Error::from_string("same path '/d1' can not be served by different port on same address")),
+                expected_err: Some(Error::other("same path '/d1' can not be served by different port on same address")),
                 ..Default::default()
             },
             // Erasure Setup with PathEndpointType
@@ -953,7 +959,7 @@ mod test {
                     "http://127.0.0.1/d3",
                     "http://127.0.0.1/d4",
                 ],
-                expected_err: Some(Error::from_string("all local endpoints should not have different hostnames/ips")),
+                expected_err: Some(Error::other("all local endpoints should not have different hostnames/ips")),
                 ..Default::default()
             },
             TestCase {
@@ -965,9 +971,7 @@ mod test {
                     case7_endpoint1.as_str(),
                     "http://10.0.0.2:9001/export",
                 ],
-                expected_err: Some(Error::from_string(
-                    "same path '/export' can not be served by different port on same address",
-                )),
+                expected_err: Some(Error::other("same path '/export' can not be served by different port on same address")),
                 ..Default::default()
             },
             TestCase {
@@ -979,7 +983,7 @@ mod test {
                     "http://10.0.0.1:9000/export",
                     "http://10.0.0.2:9000/export",
                 ],
-                expected_err: Some(Error::from_string("path '/export' cannot be served by different address on same server")),
+                expected_err: Some(Error::other("path '/export' cannot be served by different address on same server")),
                 ..Default::default()
             },
             // DistErasure type

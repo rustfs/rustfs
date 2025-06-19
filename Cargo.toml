@@ -20,14 +20,17 @@ members = [
     "rustfs", # Core file system implementation
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
+    "crates/zip",
+    "crates/filemeta",
+    "crates/rio",
 ]
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.75"
+rust-version = "1.85"
 version = "0.0.1"
 
 [workspace.lints.rust]
@@ -54,6 +57,10 @@ rustfs-config = { path = "./crates/config", version = "0.0.1" }
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
 rustfs-notify = { path = "crates/notify", version = "0.0.1" }
 rustfs-utils = { path = "crates/utils", version = "0.0.1" }
+rustfs-rio = { path = "crates/rio", version = "0.0.1" }
+rustfs-filemeta = { path = "crates/filemeta", version = "0.0.1" }
+rustfs-disk = { path = "crates/disk", version = "0.0.1" }
+rustfs-error = { path = "crates/error", version = "0.0.1" }
 workers = { path = "./common/workers", version = "0.0.1" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 arc-swap = "1.7.1"
@@ -68,14 +75,16 @@ axum-extra = "0.10.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 backon = "1.5.1"
 base64-simd = "0.8.0"
+base64 = "0.22.1"
 blake2 = "0.10.6"
-bytes = "1.10.1"
+bytes = { version = "1.10.1", features = ["serde"] }
 bytesize = "2.0.1"
 byteorder = "1.5.0"
 cfg-if = "1.0.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
+config = "0.15.11"
 const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
 datafusion = "46.0.1"
@@ -84,7 +93,7 @@ dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
 dotenvy = "0.15.7"
 flatbuffers = "25.2.10"
-flexi_logger = { version = "0.30.2", features = ["trc"] }
+flexi_logger = { version = "0.30.2", features = ["trc", "dont_minimize_extra_stacks"] }
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
@@ -92,6 +101,7 @@ glob = "0.3.2"
 hex = "0.4.3"
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
+hmac = "0.12.1"
 hyper = "1.6.0"
 hyper-util = { version = "0.1.14", features = [
     "tokio",
@@ -141,6 +151,7 @@ opentelemetry-semantic-conventions = { version = "0.30.0", features = [
 parking_lot = "0.12.4"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
+blake3 = { version = "1.8.2" }
 pbkdf2 = "0.12.2"
 percent-encoding = "2.3.1"
 pin-project-lite = "0.2.16"
@@ -149,8 +160,13 @@ prost = "0.13.5"
 prost-build = "0.13.5"
 protobuf = "3.7"
 rand = "0.9.1"
+brotli = "8.0.1"
+flate2 = "1.1.1"
+zstd = "0.13.3"
+lz4 = "1.28.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
+reed-solomon-simd = { version = "3.0.0" }
 regex = { version = "1.11.1" }
 reqwest = { version = "0.12.19", default-features = false, features = [
     "rustls-tls",
@@ -186,7 +202,6 @@ serde_with = "3.12.0"
 sha2 = "0.10.9"
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
-
 snafu = "0.8.6"
 snap = "1.1.1"
 socket2 = "0.5.10"
@@ -241,10 +256,10 @@ inherits = "dev"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
-panic = "abort"   # Optional, remove the panic expansion code
-strip = true      # strip symbol information to reduce binary size
+#lto = "thin"
+#codegen-units = 1
+#panic = "abort"   # Optional, remove the panic expansion code
+#strip = true      # strip symbol information to reduce binary size
 
 [profile.production]
 inherits = "release"

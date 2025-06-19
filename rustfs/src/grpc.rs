@@ -1,31 +1,30 @@
 use std::{collections::HashMap, io::Cursor, pin::Pin};
 
-use common::error::Error as EcsError;
+// use common::error::Error as EcsError;
 use ecstore::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
     disk::{
         DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadOptions, UpdateMetadataOpts,
+        error::DiskError,
     },
     heal::{
         data_usage_cache::DataUsageCache,
-        heal_commands::{get_local_background_heal_status, HealOpts},
+        heal_commands::{HealOpts, get_local_background_heal_status},
     },
-    metrics_realtime::{collect_local_metrics, CollectMetricsOpts, MetricType},
+    metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
     peer::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
-    store_api::{BucketOptions, DeleteBucketOptions, FileInfo, MakeBucketOptions, StorageAPI},
-    store_err::StorageError,
-    utils::err_to_proto_err,
+    store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
 };
 use futures::{Stream, StreamExt};
 use futures_util::future::join_all;
-use lock::{lock_args::LockArgs, Locker, GLOBAL_LOCAL_SERVER};
+use lock::{GLOBAL_LOCAL_SERVER, Locker, lock_args::LockArgs};
 
 use common::globals::GLOBAL_Local_Node_Name;
-use ecstore::disk::error::is_err_eof;
-use ecstore::metacache::writer::MetacacheReader;
+
+use bytes::Bytes;
 use madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
 };
@@ -35,6 +34,7 @@ use protos::{
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
 use rmp_serde::{Deserializer, Serializer};
+use rustfs_filemeta::{FileInfo, MetacacheReader};
 use serde::{Deserialize, Serialize};
 use tokio::spawn;
 use tokio::sync::mpsc;
@@ -109,7 +109,7 @@ impl Node for NodeService {
 
         Ok(tonic::Response::new(PingResponse {
             version: 1,
-            body: finished_data.to_vec(),
+            body: Bytes::copy_from_slice(finished_data),
         }))
     }
 
@@ -121,11 +121,8 @@ impl Node for NodeService {
             Err(err) => {
                 return Ok(tonic::Response::new(HealBucketResponse {
                     success: false,
-                    error: Some(err_to_proto_err(
-                        &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                        &format!("decode HealOpts failed: {}", err),
-                    )),
-                }))
+                    error: Some(DiskError::other(format!("decode HealOpts failed: {}", err)).into()),
+                }));
             }
         };
 
@@ -137,7 +134,7 @@ impl Node for NodeService {
 
             Err(err) => Ok(tonic::Response::new(HealBucketResponse {
                 success: false,
-                error: Some(err_to_proto_err(&err, &format!("heal bucket failed: {}", err))),
+                error: Some(err.into()),
             })),
         }
     }
@@ -152,11 +149,8 @@ impl Node for NodeService {
                 return Ok(tonic::Response::new(ListBucketResponse {
                     success: false,
                     bucket_infos: Vec::new(),
-                    error: Some(err_to_proto_err(
-                        &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                        &format!("decode BucketOptions failed: {}", err),
-                    )),
-                }))
+                    error: Some(DiskError::other(format!("decode BucketOptions failed: {}", err)).into()),
+                }));
             }
         };
         match self.local_peer.list_bucket(&options).await {
@@ -175,7 +169,7 @@ impl Node for NodeService {
             Err(err) => Ok(tonic::Response::new(ListBucketResponse {
                 success: false,
                 bucket_infos: Vec::new(),
-                error: Some(err_to_proto_err(&err, &format!("list bucket failed: {}", err))),
+                error: Some(err.into()),
             })),
         }
     }
@@ -189,11 +183,8 @@ impl Node for NodeService {
             Err(err) => {
                 return Ok(tonic::Response::new(MakeBucketResponse {
                     success: false,
-                    error: Some(err_to_proto_err(
-                        &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                        &format!("decode MakeBucketOptions failed: {}", err),
-                    )),
-                }))
+                    error: Some(DiskError::other(format!("decode MakeBucketOptions failed: {}", err)).into()),
+                }));
             }
         };
         match self.local_peer.make_bucket(&request.name, &options).await {
@@ -203,7 +194,7 @@ impl Node for NodeService {
             })),
             Err(err) => Ok(tonic::Response::new(MakeBucketResponse {
                 success: false,
-                error: Some(err_to_proto_err(&err, &format!("make bucket failed: {}", err))),
+                error: Some(err.into()),
             })),
         }
     }
@@ -218,11 +209,8 @@ impl Node for NodeService {
                 return Ok(tonic::Response::new(GetBucketInfoResponse {
                     success: false,
                     bucket_info: String::new(),
-                    error: Some(err_to_proto_err(
-                        &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                        &format!("decode BucketOptions failed: {}", err),
-                    )),
-                }))
+                    error: Some(DiskError::other(format!("decode BucketOptions failed: {}", err)).into()),
+                }));
             }
         };
         match self.local_peer.get_bucket_info(&request.bucket, &options).await {
@@ -233,10 +221,7 @@ impl Node for NodeService {
                         return Ok(tonic::Response::new(GetBucketInfoResponse {
                             success: false,
                             bucket_info: String::new(),
-                            error: Some(err_to_proto_err(
-                                &EcsError::from_string("encode data failed"),
-                                &format!("encode data failed: {}", err),
-                            )),
+                            error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                         }));
                     }
                 };
@@ -253,7 +238,7 @@ impl Node for NodeService {
             Err(err) => Ok(tonic::Response::new(GetBucketInfoResponse {
                 success: false,
                 bucket_info: String::new(),
-                error: Some(err_to_proto_err(&err, &format!("get bucket info failed: {}", err))),
+                error: Some(err.into()),
             })),
         }
     }
@@ -279,7 +264,7 @@ impl Node for NodeService {
             })),
             Err(err) => Ok(tonic::Response::new(DeleteBucketResponse {
                 success: false,
-                error: Some(err_to_proto_err(&err, &format!("delete bucket failed: {}", err))),
+                error: Some(err.into()),
             })),
         }
     }
@@ -292,23 +277,20 @@ impl Node for NodeService {
             match disk.read_all(&request.volume, &request.path).await {
                 Ok(data) => Ok(tonic::Response::new(ReadAllResponse {
                     success: true,
-                    data: data.to_vec(),
+                    data,
                     error: None,
                 })),
                 Err(err) => Ok(tonic::Response::new(ReadAllResponse {
                     success: false,
-                    data: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("read all failed: {}", err))),
+                    data: Bytes::new(),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(ReadAllResponse {
                 success: false,
-                data: Vec::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                data: Bytes::new(),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -323,16 +305,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(WriteAllResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("write all failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(WriteAllResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -345,14 +324,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(DeleteResponse {
                         success: false,
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode DeleteOptions failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {}", err)).into()),
                     }));
                 }
             };
@@ -363,16 +335,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(DeleteResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("delete failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(DeleteResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -386,14 +355,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(VerifyFileResponse {
                         success: false,
                         check_parts_resp: "".to_string(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode FileInfo failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
                     }));
                 }
             };
@@ -405,10 +367,7 @@ impl Node for NodeService {
                             return Ok(tonic::Response::new(VerifyFileResponse {
                                 success: false,
                                 check_parts_resp: String::new(),
-                                error: Some(err_to_proto_err(
-                                    &EcsError::from_string("encode data failed"),
-                                    &format!("encode data failed: {}", err),
-                                )),
+                                error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                             }));
                         }
                     };
@@ -421,17 +380,14 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(VerifyFileResponse {
                     success: false,
                     check_parts_resp: "".to_string(),
-                    error: Some(err_to_proto_err(&err, &format!("verify file failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(VerifyFileResponse {
                 success: false,
                 check_parts_resp: "".to_string(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -445,14 +401,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(CheckPartsResponse {
                         success: false,
                         check_parts_resp: "".to_string(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode FileInfo failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
                     }));
                 }
             };
@@ -464,10 +413,7 @@ impl Node for NodeService {
                             return Ok(tonic::Response::new(CheckPartsResponse {
                                 success: false,
                                 check_parts_resp: String::new(),
-                                error: Some(err_to_proto_err(
-                                    &EcsError::from_string("encode data failed"),
-                                    &format!("encode data failed: {}", err),
-                                )),
+                                error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                             }));
                         }
                     };
@@ -480,22 +426,19 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(CheckPartsResponse {
                     success: false,
                     check_parts_resp: "".to_string(),
-                    error: Some(err_to_proto_err(&err, &format!("check parts failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(CheckPartsResponse {
                 success: false,
                 check_parts_resp: "".to_string(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
 
-    async fn rename_part(&self, request: Request<RenamePartRequst>) -> Result<Response<RenamePartResponse>, Status> {
+    async fn rename_part(&self, request: Request<RenamePartRequest>) -> Result<Response<RenamePartResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk
@@ -514,21 +457,18 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(RenamePartResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("rename part failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(RenamePartResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
 
-    async fn rename_file(&self, request: Request<RenameFileRequst>) -> Result<Response<RenameFileResponse>, Status> {
+    async fn rename_file(&self, request: Request<RenameFileRequest>) -> Result<Response<RenameFileResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk
@@ -541,16 +481,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(RenameFileResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("rename file failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(RenameFileResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -808,17 +745,14 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ListDirResponse {
                     success: false,
                     volumes: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("list dir failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(ListDirResponse {
                 success: false,
                 volumes: Vec::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -873,11 +807,38 @@ impl Node for NodeService {
                                 }
                             }
                             Err(err) => {
-                                if is_err_eof(&err) {
+                                if err == rustfs_filemeta::Error::Unexpected {
+                                    let _ = tx
+                                        .send(Ok(WalkDirResponse {
+                                            success: false,
+                                            meta_cache_entry: "".to_string(),
+                                            error_info: Some(err.to_string()),
+                                        }))
+                                        .await;
+
+                                    break;
+                                }
+
+                                if rustfs_filemeta::is_io_eof(&err) {
+                                    let _ = tx
+                                        .send(Ok(WalkDirResponse {
+                                            success: false,
+                                            meta_cache_entry: "".to_string(),
+                                            error_info: Some(err.to_string()),
+                                        }))
+                                        .await;
                                     break;
                                 }
 
                                 println!("get err {:?}", err);
+
+                                let _ = tx
+                                    .send(Ok(WalkDirResponse {
+                                        success: false,
+                                        meta_cache_entry: "".to_string(),
+                                        error_info: Some(err.to_string()),
+                                    }))
+                                    .await;
                                 break;
                             }
                         }
@@ -902,14 +863,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(RenameDataResponse {
                         success: false,
                         rename_data_resp: String::new(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode FileInfo failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
                     }));
                 }
             };
@@ -924,10 +878,7 @@ impl Node for NodeService {
                             return Ok(tonic::Response::new(RenameDataResponse {
                                 success: false,
                                 rename_data_resp: String::new(),
-                                error: Some(err_to_proto_err(
-                                    &EcsError::from_string("encode data failed"),
-                                    &format!("encode data failed: {}", err),
-                                )),
+                                error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                             }));
                         }
                     };
@@ -940,17 +891,14 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
-                    error: Some(err_to_proto_err(&err, &format!("rename data failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(RenameDataResponse {
                 success: false,
                 rename_data_resp: String::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -965,16 +913,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(MakeVolumesResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("make volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(MakeVolumesResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -989,16 +934,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(MakeVolumeResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("make volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(MakeVolumeResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1021,17 +963,14 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ListVolumesResponse {
                     success: false,
                     volume_infos: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("list volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(ListVolumesResponse {
                 success: false,
                 volume_infos: Vec::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1049,26 +988,20 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(StatVolumeResponse {
                         success: false,
                         volume_info: String::new(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::from_string("encode data failed"),
-                            &format!("encode data failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(StatVolumeResponse {
                     success: false,
                     volume_info: String::new(),
-                    error: Some(err_to_proto_err(&err, &format!("state volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(StatVolumeResponse {
                 success: false,
                 volume_info: String::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1083,16 +1016,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(DeletePathsResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("delte paths failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(DeletePathsResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1105,14 +1035,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(UpdateMetadataResponse {
                         success: false,
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode FileInfo failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1121,14 +1044,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(UpdateMetadataResponse {
                         success: false,
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode UpdateMetadataOpts failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode UpdateMetadataOpts failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1140,16 +1056,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(UpdateMetadataResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("update metadata failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(UpdateMetadataResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1162,14 +1075,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(WriteMetadataResponse {
                         success: false,
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode FileInfo failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1180,16 +1086,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(WriteMetadataResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("write metadata failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(WriteMetadataResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1203,14 +1106,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode ReadOptions failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode ReadOptions failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1227,26 +1123,20 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::from_string("encode data failed"),
-                            &format!("encode data failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(ReadVersionResponse {
                     success: false,
                     file_info: String::new(),
-                    error: Some(err_to_proto_err(&err, &format!("read version failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(ReadVersionResponse {
                 success: false,
                 file_info: String::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1264,26 +1154,20 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(ReadXlResponse {
                         success: false,
                         raw_file_info: String::new(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::from_string("encode data failed"),
-                            &format!("encode data failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(ReadXlResponse {
                     success: false,
                     raw_file_info: String::new(),
-                    error: Some(err_to_proto_err(&err, &format!("read xl failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(ReadXlResponse {
                 success: false,
                 raw_file_info: String::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1297,14 +1181,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(DeleteVersionResponse {
                         success: false,
                         raw_file_info: "".to_string(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode FileInfo failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1314,14 +1191,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(DeleteVersionResponse {
                         success: false,
                         raw_file_info: "".to_string(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode DeleteOptions failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1338,26 +1208,20 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(DeleteVersionResponse {
                         success: false,
                         raw_file_info: "".to_string(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::from_string("encode data failed"),
-                            &format!("encode data failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(DeleteVersionResponse {
                     success: false,
                     raw_file_info: "".to_string(),
-                    error: Some(err_to_proto_err(&err, &format!("read version failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(DeleteVersionResponse {
                 success: false,
                 raw_file_info: "".to_string(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1373,14 +1237,7 @@ impl Node for NodeService {
                         return Ok(tonic::Response::new(DeleteVersionsResponse {
                             success: false,
                             errors: Vec::new(),
-                            error: Some(err_to_proto_err(
-                                &EcsError::new(StorageError::InvalidArgument(
-                                    Default::default(),
-                                    Default::default(),
-                                    Default::default(),
-                                )),
-                                &format!("decode FileInfoVersions failed: {}", err),
-                            )),
+                            error: Some(DiskError::other(format!("decode FileInfoVersions failed: {}", err)).into()),
                         }));
                     }
                 };
@@ -1391,14 +1248,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(DeleteVersionsResponse {
                         success: false,
                         errors: Vec::new(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode DeleteOptions failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1421,17 +1271,14 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(DeleteVersionsResponse {
                     success: false,
                     errors: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("delete version failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(DeleteVersionsResponse {
                 success: false,
                 errors: Vec::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1445,14 +1292,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(ReadMultipleResponse {
                         success: false,
                         read_multiple_resps: Vec::new(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode ReadMultipleReq failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode ReadMultipleReq failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1472,17 +1312,14 @@ impl Node for NodeService {
                 Err(err) => Ok(tonic::Response::new(ReadMultipleResponse {
                     success: false,
                     read_multiple_resps: Vec::new(),
-                    error: Some(err_to_proto_err(&err, &format!("read multiple failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(ReadMultipleResponse {
                 success: false,
                 read_multiple_resps: Vec::new(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1497,16 +1334,13 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(DeleteVolumeResponse {
                     success: false,
-                    error: Some(err_to_proto_err(&err, &format!("delete volume failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(DeleteVolumeResponse {
                 success: false,
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1520,14 +1354,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(DiskInfoResponse {
                         success: false,
                         disk_info: "".to_string(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::new(StorageError::InvalidArgument(
-                                Default::default(),
-                                Default::default(),
-                                Default::default(),
-                            )),
-                            &format!("decode DiskInfoOptions failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("decode DiskInfoOptions failed: {}", err)).into()),
                     }));
                 }
             };
@@ -1541,26 +1368,20 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
                         success: false,
                         disk_info: "".to_string(),
-                        error: Some(err_to_proto_err(
-                            &EcsError::from_string("encode data failed"),
-                            &format!("encode data failed: {}", err),
-                        )),
+                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
                     success: false,
                     disk_info: "".to_string(),
-                    error: Some(err_to_proto_err(&err, &format!("disk info failed: {}", err))),
+                    error: Some(err.into()),
                 })),
             }
         } else {
             Ok(tonic::Response::new(DiskInfoResponse {
                 success: false,
                 disk_info: "".to_string(),
-                error: Some(err_to_proto_err(
-                    &EcsError::new(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-                    "can not find disk",
-                )),
+                error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
     }
@@ -1583,14 +1404,7 @@ impl Node for NodeService {
                                     success: false,
                                     update: "".to_string(),
                                     data_usage_cache: "".to_string(),
-                                    error: Some(err_to_proto_err(
-                                        &EcsError::new(StorageError::InvalidArgument(
-                                            Default::default(),
-                                            Default::default(),
-                                            Default::default(),
-                                        )),
-                                        &format!("decode DataUsageCache failed: {}", err),
-                                    )),
+                                    error: Some(DiskError::other(format!("decode DataUsageCache failed: {}", err)).into()),
                                 }))
                                 .await
                                 .expect("working rx");
@@ -1637,7 +1451,7 @@ impl Node for NodeService {
                                     success: false,
                                     update: "".to_string(),
                                     data_usage_cache: "".to_string(),
-                                    error: Some(err_to_proto_err(&err, &format!("scanner failed: {}", err))),
+                                    error: Some(err.into()),
                                 }))
                                 .await
                                 .expect("working rx");
@@ -1648,14 +1462,7 @@ impl Node for NodeService {
                             success: false,
                             update: "".to_string(),
                             data_usage_cache: "".to_string(),
-                            error: Some(err_to_proto_err(
-                                &EcsError::new(StorageError::InvalidArgument(
-                                    Default::default(),
-                                    Default::default(),
-                                    Default::default(),
-                                )),
-                                "can not find disk",
-                            )),
+                            error: Some(DiskError::other("can not find disk".to_string()).into()),
                         }))
                         .await
                         .expect("working rx");
@@ -1798,7 +1605,7 @@ impl Node for NodeService {
         let Some(store) = new_object_layer_fn() else {
             return Ok(tonic::Response::new(LocalStorageInfoResponse {
                 success: false,
-                storage_info: vec![],
+                storage_info: Bytes::new(),
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
@@ -1808,14 +1615,14 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(LocalStorageInfoResponse {
                 success: false,
-                storage_info: vec![],
+                storage_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
 
         Ok(tonic::Response::new(LocalStorageInfoResponse {
             success: true,
-            storage_info: buf,
+            storage_info: buf.into(),
             error_info: None,
         }))
     }
@@ -1826,13 +1633,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(ServerInfoResponse {
                 success: false,
-                server_properties: vec![],
+                server_properties: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(ServerInfoResponse {
             success: true,
-            server_properties: buf,
+            server_properties: buf.into(),
             error_info: None,
         }))
     }
@@ -1843,13 +1650,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetCpusResponse {
                 success: false,
-                cpus: vec![],
+                cpus: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetCpusResponse {
             success: true,
-            cpus: buf,
+            cpus: buf.into(),
             error_info: None,
         }))
     }
@@ -1861,13 +1668,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetNetInfoResponse {
                 success: false,
-                net_info: vec![],
+                net_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetNetInfoResponse {
             success: true,
-            net_info: buf,
+            net_info: buf.into(),
             error_info: None,
         }))
     }
@@ -1878,13 +1685,13 @@ impl Node for NodeService {
         if let Err(err) = partitions.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetPartitionsResponse {
                 success: false,
-                partitions: vec![],
+                partitions: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetPartitionsResponse {
             success: true,
-            partitions: buf,
+            partitions: buf.into(),
             error_info: None,
         }))
     }
@@ -1895,13 +1702,13 @@ impl Node for NodeService {
         if let Err(err) = os_info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetOsInfoResponse {
                 success: false,
-                os_info: vec![],
+                os_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetOsInfoResponse {
             success: true,
-            os_info: buf,
+            os_info: buf.into(),
             error_info: None,
         }))
     }
@@ -1916,13 +1723,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetSeLinuxInfoResponse {
                 success: false,
-                sys_services: vec![],
+                sys_services: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetSeLinuxInfoResponse {
             success: true,
-            sys_services: buf,
+            sys_services: buf.into(),
             error_info: None,
         }))
     }
@@ -1934,13 +1741,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetSysConfigResponse {
                 success: false,
-                sys_config: vec![],
+                sys_config: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetSysConfigResponse {
             success: true,
-            sys_config: buf,
+            sys_config: buf.into(),
             error_info: None,
         }))
     }
@@ -1952,13 +1759,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetSysErrorsResponse {
                 success: false,
-                sys_errors: vec![],
+                sys_errors: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetSysErrorsResponse {
             success: true,
-            sys_errors: buf,
+            sys_errors: buf.into(),
             error_info: None,
         }))
     }
@@ -1970,13 +1777,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetMemInfoResponse {
                 success: false,
-                mem_info: vec![],
+                mem_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetMemInfoResponse {
             success: true,
-            mem_info: buf,
+            mem_info: buf.into(),
             error_info: None,
         }))
     }
@@ -1995,13 +1802,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetMetricsResponse {
                 success: false,
-                realtime_metrics: vec![],
+                realtime_metrics: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetMetricsResponse {
             success: true,
-            realtime_metrics: buf,
+            realtime_metrics: buf.into(),
             error_info: None,
         }))
     }
@@ -2013,13 +1820,13 @@ impl Node for NodeService {
         if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(GetProcInfoResponse {
                 success: false,
-                proc_info: vec![],
+                proc_info: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(GetProcInfoResponse {
             success: true,
-            proc_info: buf,
+            proc_info: buf.into(),
             error_info: None,
         }))
     }
@@ -2306,7 +2113,7 @@ impl Node for NodeService {
         if !ok {
             return Ok(tonic::Response::new(BackgroundHealStatusResponse {
                 success: false,
-                bg_heal_state: vec![],
+                bg_heal_state: Bytes::new(),
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         }
@@ -2315,13 +2122,13 @@ impl Node for NodeService {
         if let Err(err) = state.serialize(&mut Serializer::new(&mut buf)) {
             return Ok(tonic::Response::new(BackgroundHealStatusResponse {
                 success: false,
-                bg_heal_state: vec![],
+                bg_heal_state: Bytes::new(),
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(tonic::Response::new(BackgroundHealStatusResponse {
             success: true,
-            bg_heal_state: buf,
+            bg_heal_state: buf.into(),
             error_info: None,
         }))
     }
@@ -2445,7 +2252,7 @@ mod tests {
         Mss, PingRequest, PingResponse, ReadAllRequest, ReadAllResponse, ReadMultipleRequest, ReadMultipleResponse,
         ReadVersionRequest, ReadVersionResponse, ReadXlRequest, ReadXlResponse, ReloadPoolMetaRequest, ReloadPoolMetaResponse,
         ReloadSiteReplicationConfigRequest, ReloadSiteReplicationConfigResponse, RenameDataRequest, RenameDataResponse,
-        RenameFileRequst, RenameFileResponse, RenamePartRequst, RenamePartResponse, ServerInfoRequest, ServerInfoResponse,
+        RenameFileRequest, RenameFileResponse, RenamePartRequest, RenamePartResponse, ServerInfoRequest, ServerInfoResponse,
         SignalServiceRequest, SignalServiceResponse, StatVolumeRequest, StatVolumeResponse, StopRebalanceRequest,
         StopRebalanceResponse, UpdateMetadataRequest, UpdateMetadataResponse, VerifyFileRequest, VerifyFileResponse,
         WriteAllRequest, WriteAllResponse, WriteMetadataRequest, WriteMetadataResponse,
@@ -2478,7 +2285,7 @@ mod tests {
 
         let request = Request::new(PingRequest {
             version: 1,
-            body: fbb.finished_data().to_vec(),
+            body: Bytes::copy_from_slice(fbb.finished_data()),
         });
 
         let response = service.ping(request).await;
@@ -2495,7 +2302,7 @@ mod tests {
 
         let request = Request::new(PingRequest {
             version: 1,
-            body: vec![0x00, 0x01, 0x02], // Invalid flatbuffer data
+            body: vec![0x00, 0x01, 0x02].into(), // Invalid flatbuffer data
         });
 
         let response = service.ping(request).await;
@@ -2618,7 +2425,7 @@ mod tests {
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
-            data: vec![1, 2, 3, 4],
+            data: vec![1, 2, 3, 4].into(),
         });
 
         let response = service.write_all(request).await;
@@ -2729,13 +2536,13 @@ mod tests {
     async fn test_rename_part_invalid_disk() {
         let service = create_test_node_service();
 
-        let request = Request::new(RenamePartRequst {
+        let request = Request::new(RenamePartRequest {
             disk: "invalid-disk-path".to_string(),
             src_volume: "src-volume".to_string(),
             src_path: "src-path".to_string(),
             dst_volume: "dst-volume".to_string(),
             dst_path: "dst-path".to_string(),
-            meta: vec![],
+            meta: Bytes::new(),
         });
 
         let response = service.rename_part(request).await;
@@ -2750,7 +2557,7 @@ mod tests {
     async fn test_rename_file_invalid_disk() {
         let service = create_test_node_service();
 
-        let request = Request::new(RenameFileRequst {
+        let request = Request::new(RenameFileRequest {
             disk: "invalid-disk-path".to_string(),
             src_volume: "src-volume".to_string(),
             src_path: "src-path".to_string(),

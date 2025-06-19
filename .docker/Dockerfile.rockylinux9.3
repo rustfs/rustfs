@@ -1,4 +1,4 @@
-FROM m.daocloud.io/docker.io/library/rockylinux:9.3 AS builder
+FROM rockylinux:9.3 AS builder
 
 ENV LANG C.UTF-8
 
@@ -25,10 +25,7 @@ RUN wget https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.
     && rm -rf Linux.flatc.binary.g++-13.zip
 
 # install rust
-ENV RUSTUP_DIST_SERVER="https://rsproxy.cn"
-ENV RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
-RUN curl -o rustup-init.sh --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
-    && sh rustup-init.sh -y && rm -rf rustup-init.sh
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 COPY .docker/cargo.config.toml /root/.cargo/config.toml
 
