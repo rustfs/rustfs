@@ -8,6 +8,7 @@ use crate::heal::heal_commands::{
 };
 use crate::heal::heal_ops::RUSTFS_RESERVED_BUCKET;
 use crate::store::all_local_disk;
+use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     disk::{self, VolumeInfo},
     endpoints::{EndpointServerPools, Node},
@@ -20,7 +21,6 @@ use protos::node_service_time_out_client;
 use protos::proto_gen::node_service::{
     DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
 };
-use regex::Regex;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::sync::RwLock;
 use tonic::Request;
@@ -620,63 +620,6 @@ impl PeerS3Client for RemotePeerS3Client {
 
         Ok(())
     }
-}
-
-// 检查桶名是否有效
-fn check_bucket_name(bucket_name: &str, strict: bool) -> Result<()> {
-    if bucket_name.trim().is_empty() {
-        return Err(Error::other("Bucket name cannot be empty"));
-    }
-    if bucket_name.len() < 3 {
-        return Err(Error::other("Bucket name cannot be shorter than 3 characters"));
-    }
-    if bucket_name.len() > 63 {
-        return Err(Error::other("Bucket name cannot be longer than 63 characters"));
-    }
-
-    let ip_address_regex = Regex::new(r"^(\d+\.){3}\d+$").unwrap();
-    if ip_address_regex.is_match(bucket_name) {
-        return Err(Error::other("Bucket name cannot be an IP address"));
-    }
-
-    let valid_bucket_name_regex = if strict {
-        Regex::new(r"^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$").unwrap()
-    } else {
-        Regex::new(r"^[A-Za-z0-9][A-Za-z0-9\.\-_:]{1,61}[A-Za-z0-9]$").unwrap()
-    };
-
-    if !valid_bucket_name_regex.is_match(bucket_name) {
-        return Err(Error::other("Bucket name contains invalid characters"));
-    }
-
-    // 检查包含 "..", ".-", "-."
-    if bucket_name.contains("..") || bucket_name.contains(".-") || bucket_name.contains("-.") {
-        return Err(Error::other("Bucket name contains invalid characters"));
-    }
-
-    Ok(())
-}
-
-// 检查是否为  元数据桶
-fn is_meta_bucket(bucket_name: &str) -> bool {
-    bucket_name == disk::RUSTFS_META_BUCKET
-}
-
-// 检查是否为 保留桶
-fn is_reserved_bucket(bucket_name: &str) -> bool {
-    bucket_name == "rustfs"
-}
-
-// 检查桶名是否为保留名或无效名
-pub fn is_reserved_or_invalid_bucket(bucket_entry: &str, strict: bool) -> bool {
-    if bucket_entry.is_empty() {
-        return true;
-    }
-
-    let bucket_entry = bucket_entry.trim_end_matches('/');
-    let result = check_bucket_name(bucket_entry, strict).is_err();
-
-    result || is_meta_bucket(bucket_entry) || is_reserved_bucket(bucket_entry)
 }
 
 pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {

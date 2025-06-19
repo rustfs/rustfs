@@ -6,7 +6,6 @@ pub mod format;
 pub mod fs;
 pub mod local;
 pub mod os;
-pub mod remote;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
@@ -22,13 +21,13 @@ use crate::heal::{
     data_usage_cache::{DataUsageCache, DataUsageEntry},
     heal_commands::{HealScanMode, HealingTracker},
 };
+use crate::rpc::RemoteDisk;
 use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
 use error::{Error, Result};
 use local::LocalDisk;
 use madmin::info_commands::DiskMetrics;
-use remote::RemoteDisk;
 use rustfs_filemeta::{FileInfo, RawFileInfo};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc};

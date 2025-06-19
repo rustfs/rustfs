@@ -1,7 +1,6 @@
 use super::router::AdminOperation;
 use super::router::Operation;
 use super::router::S3Router;
-use crate::storage::ecfs::bytes_stream;
 use ecstore::disk::DiskAPI;
 use ecstore::disk::WalkDirOptions;
 use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -10,6 +9,7 @@ use futures::StreamExt;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
+use rustfs_utils::net::bytes_stream;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;

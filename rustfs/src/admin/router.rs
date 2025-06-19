@@ -1,5 +1,4 @@
-use base64::{Engine as _, engine::general_purpose};
-use hmac::{Hmac, Mac};
+use ecstore::rpc::verify_rpc_signature;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -14,80 +13,11 @@ use s3s::S3Result;
 use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
-use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::error;
 
 use super::ADMIN_PREFIX;
 use super::RUSTFS_ADMIN_PREFIX;
 use super::rpc::RPC_PREFIX;
-use iam::get_global_action_cred;
-
-type HmacSha256 = Hmac<Sha256>;
-
-const SIGNATURE_HEADER: &str = "x-rustfs-signature";
-const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
-const SIGNATURE_VALID_DURATION: u64 = 300; // 5 minutes
-
-/// Get the shared secret for HMAC signing
-fn get_shared_secret() -> String {
-    if let Some(cred) = get_global_action_cred() {
-        cred.secret_key
-    } else {
-        // Fallback to environment variable if global credentials are not available
-        std::env::var("RUSTFS_RPC_SECRET").unwrap_or_else(|_| "rustfs-default-secret".to_string())
-    }
-}
-
-/// Generate HMAC-SHA256 signature for the given data
-fn generate_signature(secret: &str, url: &str, method: &str, timestamp: u64) -> String {
-    let data = format!("{}|{}|{}", url, method, timestamp);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(data.as_bytes());
-    let result = mac.finalize();
-    general_purpose::STANDARD.encode(result.into_bytes())
-}
-
-/// Verify the request signature for RPC requests
-fn verify_rpc_signature(req: &S3Request<Body>) -> S3Result<()> {
-    let secret = get_shared_secret();
-
-    // Get signature from header
-    let signature = req
-        .headers
-        .get(SIGNATURE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| s3_error!(InvalidArgument, "Missing signature header"))?;
-
-    // Get timestamp from header
-    let timestamp_str = req
-        .headers
-        .get(TIMESTAMP_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| s3_error!(InvalidArgument, "Missing timestamp header"))?;
-
-    let timestamp: u64 = timestamp_str
-        .parse()
-        .map_err(|_| s3_error!(InvalidArgument, "Invalid timestamp format"))?;
-
-    // Check timestamp validity (prevent replay attacks)
-    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-    if current_time.saturating_sub(timestamp) > SIGNATURE_VALID_DURATION {
-        return Err(s3_error!(InvalidArgument, "Request timestamp expired"));
-    }
-
-    // Generate expected signature
-    let url = req.uri.to_string();
-    let method = req.method.as_str();
-    let expected_signature = generate_signature(&secret, &url, method, timestamp);
-
-    // Compare signatures
-    if signature != expected_signature {
-        return Err(s3_error!(AccessDenied, "Invalid signature"));
-    }
-
-    Ok(())
-}
 
 pub struct S3Router<T> {
     router: Router<T>,
@@ -160,7 +90,10 @@ where
         if req.uri.path().starts_with(RPC_PREFIX) {
             // Skip signature verification for HEAD requests (health checks)
             if req.method != Method::HEAD {
-                verify_rpc_signature(req)?;
+                verify_rpc_signature(&req.uri.to_string(), &req.method, &req.headers).map_err(|e| {
+                    error!("RPC signature verification failed: {}", e);
+                    s3_error!(AccessDenied, "{}", e)
+                })?;
             }
             return Ok(());
         }

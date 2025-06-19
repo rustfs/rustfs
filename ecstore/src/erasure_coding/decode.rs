@@ -102,7 +102,7 @@ where
                     }
                 }
                 Err(e) => {
-                    error!("Error reading shard {}: {}", i, e);
+                    // error!("Error reading shard {}: {}", i, e);
                     errs[i] = Some(e);
                 }
             }

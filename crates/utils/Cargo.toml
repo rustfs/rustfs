@@ -34,6 +34,10 @@ brotli = { workspace = true , optional = true}
 zstd =  { workspace = true , optional = true}
 snap =  { workspace = true , optional = true}
 lz4 = { workspace = true , optional = true}
+rand = { workspace = true, optional = true }
+futures= { workspace = true, optional = true }
+transform-stream= { workspace = true, optional = true }
+bytes= { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -49,11 +53,11 @@ workspace = true
 default = ["ip"]  # features that are enabled by default
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
-net = ["ip","dep:url", "dep:netif", "dep:lazy_static"]  # empty network features
+net = ["ip","dep:url", "dep:netif", "dep:lazy_static", "dep:futures", "dep:transform-stream", "dep:bytes"]  # empty network features
 io = ["dep:tokio"]
 path = []
 compress =["dep:flate2","dep:brotli","dep:snap","dep:lz4","dep:zstd"]
-string = ["dep:regex","dep:lazy_static"]
+string = ["dep:regex","dep:lazy_static","dep:rand"]
 crypto = ["dep:base64-simd","dep:hex-simd"]
 hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher"]
 os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities

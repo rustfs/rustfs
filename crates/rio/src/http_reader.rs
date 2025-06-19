@@ -40,6 +40,7 @@ pin_project! {
         url:String,
         method: Method,
         headers: HeaderMap,
+        #[pin]
         inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
     }
 }

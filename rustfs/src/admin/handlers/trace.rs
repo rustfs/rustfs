@@ -1,4 +1,4 @@
-use ecstore::{GLOBAL_Endpoints, peer_rest_client::PeerRestClient};
+use ecstore::{GLOBAL_Endpoints, rpc::PeerRestClient};
 use http::StatusCode;
 use hyper::Uri;
 use madmin::service_commands::ServiceTraceOpts;
