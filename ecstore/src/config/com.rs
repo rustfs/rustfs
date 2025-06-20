@@ -8,7 +8,6 @@ use rustfs_utils::path::SLASH_SEPARATOR;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{error, warn};
-use crate::disk::fs::SLASH_SEPARATOR;
 
 pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";

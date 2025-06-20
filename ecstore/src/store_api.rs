@@ -18,7 +18,6 @@ use std::fmt::Debug;
 use std::io::Cursor;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use sha2::digest::HashReader;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::warn;
@@ -904,7 +903,7 @@ pub trait StorageAPI: ObjectIO {
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)>;
     async fn heal_objects(&self, bucket: &str, prefix: &str, opts: &HealOpts, hs: Arc<HealSequence>, is_meta: bool)
-        -> Result<()>;
+    -> Result<()>;
     async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)>;
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()>;
 }

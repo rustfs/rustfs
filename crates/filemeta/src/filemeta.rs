@@ -10,11 +10,10 @@ use bytes::Bytes;
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::convert::TryFrom;
 use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::{collections::HashMap, io::Cursor};
-use std::convert::TryFrom;
-use std::fs::File;
 use time::OffsetDateTime;
 use tokio::io::AsyncRead;
 use uuid::Uuid;
@@ -518,11 +517,7 @@ impl FileMeta {
         let has_vid = {
             if !version_id.is_empty() {
                 let id = Uuid::parse_str(version_id)?;
-                if !id.is_nil() {
-                    Some(id)
-                } else {
-                    None
-                }
+                if !id.is_nil() { Some(id) } else { None }
             } else {
                 None
             }
@@ -1253,11 +1248,7 @@ impl FileMetaVersionHeader {
         cur.read_exact(&mut buf)?;
         self.version_id = {
             let id = Uuid::from_bytes(buf);
-            if id.is_nil() {
-                None
-            } else {
-                Some(id)
-            }
+            if id.is_nil() { None } else { Some(id) }
         };
 
         // mod_time
@@ -1431,11 +1422,7 @@ impl MetaObject {
                     cur.read_exact(&mut buf)?;
                     self.version_id = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
                 "DDir" => {
@@ -1444,11 +1431,7 @@ impl MetaObject {
                     cur.read_exact(&mut buf)?;
                     self.data_dir = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
                 "EcAlgo" => {
@@ -2017,11 +2000,7 @@ impl MetaDeleteMarker {
                     cur.read_exact(&mut buf)?;
                     self.version_id = {
                         let id = Uuid::from_bytes(buf);
-                        if id.is_nil() {
-                            None
-                        } else {
-                            Some(id)
-                        }
+                        if id.is_nil() { None } else { Some(id) }
                     };
                 }
 

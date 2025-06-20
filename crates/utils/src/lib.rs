@@ -28,6 +28,9 @@ pub mod crypto;
 #[cfg(feature = "compress")]
 pub mod compress;
 
+#[cfg(feature = "path")]
+pub mod dirs;
+
 #[cfg(feature = "tls")]
 pub use certs::*;
 #[cfg(feature = "hash")]

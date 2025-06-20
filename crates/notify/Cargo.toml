@@ -12,7 +12,6 @@ async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 const-str = { workspace = true }
 ecstore = { workspace = true }
-libc = { workspace = true }
 once_cell = { workspace = true }
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 reqwest = { workspace = true }
@@ -31,9 +30,9 @@ wildmatch = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-mockito = "1.7"
 reqwest = { workspace = true, default-features = false, features = ["rustls-tls", "charset", "http2", "system-proxy", "stream", "json", "blocking"] }
 axum = { workspace = true }
+rustfs-utils = { workspace = true, features = ["path"] }
 
 [lints]
 workspace = true

@@ -1,9 +1,8 @@
-use notify::arn::TargetID;
-use notify::global::notification_system;
-// 1. 使用全局访问器
-use notify::{
-    init_logger, BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, KVS,
-};
+// Using Global Accessories
+use rustfs_config::notify;
+use rustfs_notify::arn::TargetID;
+use rustfs_notify::global::notification_system;
+use rustfs_notify::{init_logger, BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, KVS};
 use std::time::Duration;
 use tracing::info;
 
@@ -11,11 +10,12 @@ use tracing::info;
 async fn main() -> Result<(), NotificationError> {
     init_logger(LogLevel::Debug);
 
-    // 获取全局 NotificationSystem 实例
+    // Get global NotificationSystem instance
     let system = notification_system();
 
-    // --- 初始配置 ---
-    let mut config = notify::Config::new();
+    // --- Initial configuration ---
+    let mut config = rustfs_notify::Config::new();
+    let current_root = rustfs_utils::dirs::get_project_root().expect("failed to get project root");
     // Webhook target
     let mut webhook_kvs = KVS::new();
     webhook_kvs.set("enable", "on");
@@ -23,20 +23,25 @@ async fn main() -> Result<(), NotificationError> {
     // webhook_kvs.set("queue_dir", "./logs/webhook");
     webhook_kvs.set(
         "queue_dir",
-        "/Users/qun/Documents/rust/rustfs/notify/logs/webhook",
+        current_root
+            .clone()
+            .join("/deploy/logs/notify/webhook")
+            .to_str()
+            .unwrap()
+            .to_string(),
     );
     let mut webhook_targets = std::collections::HashMap::new();
     webhook_targets.insert("1".to_string(), webhook_kvs);
     config.insert("notify_webhook".to_string(), webhook_targets);
 
-    // 加载初始配置并初始化系统
+    // Load the initial configuration and initialize the system
     *system.config.write().await = config;
     system.init().await?;
     info!("✅ System initialized with Webhook target.");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // --- 2. 动态更新系统配置：添加一个 MQTT Target ---
+    // --- Dynamically update system configuration: Add an MQTT Target ---
     info!("\n---> Dynamically adding MQTT target...");
     let mut mqtt_kvs = KVS::new();
     mqtt_kvs.set("enable", "on");
@@ -47,18 +52,13 @@ async fn main() -> Result<(), NotificationError> {
     mqtt_kvs.set("password", "123456");
     mqtt_kvs.set("queue_limit", "10000");
     // mqtt_kvs.set("queue_dir", "./logs/mqtt");
-    mqtt_kvs.set(
-        "queue_dir",
-        "/Users/qun/Documents/rust/rustfs/notify/logs/mqtt",
-    );
-    system
-        .set_target_config("notify_mqtt", "1", mqtt_kvs)
-        .await?;
+    mqtt_kvs.set("queue_dir", current_root.join("/deploy/logs/notify/mqtt").to_str().unwrap().to_string());
+    system.set_target_config("notify_mqtt", "1", mqtt_kvs).await?;
     info!("✅ MQTT target added and system reloaded.");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // --- 3. 加载和管理 Bucket 配置 ---
+    // --- Loading and managing Bucket configurations ---
     info!("\n---> Loading bucket notification config...");
     let mut bucket_config = BucketNotificationConfig::new("us-east-1");
     bucket_config.add_rule(
@@ -71,12 +71,10 @@ async fn main() -> Result<(), NotificationError> {
         "*".to_string(),
         TargetID::new("1".to_string(), "mqtt".to_string()),
     );
-    system
-        .load_bucket_notification_config("my-bucket", &bucket_config)
-        .await?;
+    system.load_bucket_notification_config("my-bucket", &bucket_config).await?;
     info!("✅ Bucket 'my-bucket' config loaded.");
 
-    // --- 发送事件 ---
+    // --- Send events ---
     info!("\n---> Sending an event...");
     let event = Event::new_test_event("my-bucket", "document.pdf", EventName::ObjectCreatedPut);
     system
@@ -86,7 +84,7 @@ async fn main() -> Result<(), NotificationError> {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // --- 动态移除配置 ---
+    // --- Dynamically remove configuration ---
     info!("\n---> Dynamically removing Webhook target...");
     system.remove_target_config("notify_webhook", "1").await?;
     info!("✅ Webhook target removed and system reloaded.");

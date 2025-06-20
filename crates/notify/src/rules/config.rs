@@ -39,7 +39,7 @@ impl BucketNotificationConfig {
 
     /// Parses notification configuration from XML.
     /// `arn_list` is a list of valid ARN strings for validation.
-    pub fn from_xml<R: Read>(
+    pub fn from_xml<R: Read + std::io::BufRead>(
         reader: R,
         current_region: &str,
         arn_list: &[String],
@@ -72,11 +72,7 @@ impl BucketNotificationConfig {
     /// However, Go's Config has a Validate method.
     /// The primary validation now happens during `from_xml` via `NotificationConfiguration::validate`.
     /// This method could re-check against an updated arn_list or region if needed.
-    pub fn validate(
-        &self,
-        current_region: &str,
-        arn_list: &[String],
-    ) -> Result<(), BucketNotificationConfigError> {
+    pub fn validate(&self, current_region: &str, arn_list: &[String]) -> Result<(), BucketNotificationConfigError> {
         if self.region != current_region {
             return Err(BucketNotificationConfigError::RegionMismatch {
                 config_region: self.region.clone(),
@@ -93,9 +89,7 @@ impl BucketNotificationConfig {
                     // Construct the ARN string for this target_id and self.region
                     let arn_to_check = target_id.to_arn(&self.region); // Assuming TargetID has to_arn
                     if !arn_list.contains(&arn_to_check.to_arn_string()) {
-                        return Err(BucketNotificationConfigError::ArnNotFound(
-                            arn_to_check.to_arn_string(),
-                        ));
+                        return Err(BucketNotificationConfigError::ArnNotFound(arn_to_check.to_arn_string()));
                     }
                 }
             }

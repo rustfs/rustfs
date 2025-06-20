@@ -22,12 +22,7 @@ impl RulesMap {
     /// target_id: Notify the target.
     ///
     /// This method expands the composite event name.
-    pub fn add_rule_config(
-        &mut self,
-        event_names: &[EventName],
-        pattern: String,
-        target_id: TargetID,
-    ) {
+    pub fn add_rule_config(&mut self, event_names: &[EventName], pattern: String, target_id: TargetID) {
         let mut effective_pattern = pattern;
         if effective_pattern.is_empty() {
             effective_pattern = "*".to_string(); // Match all by default
@@ -55,8 +50,7 @@ impl RulesMap {
         }
     }
 
-    /// 从当前 RulesMap 中移除另一个 RulesMap 中定义的规则。
-    /// 对应 Go 的 `RulesMap.Remove(rulesMap2 RulesMap)`
+    /// Remove another rule defined in the RulesMap from the current RulesMap.
     pub fn remove_map(&mut self, other_map: &Self) {
         let mut events_to_remove = Vec::new();
         for (event_name, self_pattern_rules) in &mut self.map {
@@ -72,24 +66,24 @@ impl RulesMap {
         }
     }
 
-    /// 匹配给定事件名称和对象键的规则，返回所有匹配的 TargetID。
+    ///Rules matching the given event name and object key, returning all matching TargetIDs.
     pub fn match_rules(&self, event_name: EventName, object_key: &str) -> TargetIdSet {
-        // 首先尝试直接匹配事件名称
+        // First try to directly match the event name
         if let Some(pattern_rules) = self.map.get(&event_name) {
             let targets = pattern_rules.match_targets(object_key);
             if !targets.is_empty() {
                 return targets;
             }
         }
-        // Go 的 RulesMap[eventName] 直接获取，如果不存在则为空 Rules。
-        // Rust 的 HashMap::get 返回 Option。如果事件名不存在，则没有规则。
-        // 复合事件（如 ObjectCreatedAll）在 add_rule_config 时已展开为单一事件。
-        // 因此，查询时应使用单一事件名称。
-        // 如果 event_name 本身就是单一类型，则直接查找。
-        // 如果 event_name 是复合类型，Go 的逻辑是在添加时展开。
-        // 这里的 match_rules 应该接收已经可能是单一的事件。
-        // 如果调用者传入的是复合事件，它应该先自行展开或此函数处理。
-        // 假设 event_name 已经是具体的、可用于查找的事件。
+        // Go's RulesMap[eventName] is directly retrieved, and if it does not exist, it is empty Rules.
+        // Rust's HashMap::get returns Option. If the event name does not exist, there is no rule.
+        // Compound events (such as ObjectCreatedAll) have been expanded as a single event when add_rule_config.
+        // Therefore, a single event name should be used when querying.
+        // If event_name itself is a single type, look it up directly.
+        // If event_name is a compound type, Go's logic is expanded when added.
+        // Here match_rules should receive events that may already be single.
+        // If the caller passes in a compound event, it should expand itself or handle this function first.
+        // Assume that event_name is already a specific event that can be used for searching.
         self.map
             .get(&event_name)
             .map_or_else(TargetIdSet::new, |pr| pr.match_targets(object_key))
@@ -99,7 +93,7 @@ impl RulesMap {
         self.map.is_empty()
     }
 
-    /// 返回内部规则的克隆，用于 BucketNotificationConfig::validate 等场景。
+    /// Returns a clone of internal rules for use in scenarios such as BucketNotificationConfig::validate.
     pub fn inner(&self) -> &HashMap<EventName, PatternRules> {
         &self.map
     }

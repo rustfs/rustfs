@@ -3,23 +3,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-/// 当解析事件名称字符串失败时返回的错误。
+/// Error returned when parsing event name string fails。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseEventNameError(String);
 
 impl fmt::Display for ParseEventNameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "无效的事件名称：{}", self.0)
+        write!(f, "Invalid event name:{}", self.0)
     }
 }
 
 impl std::error::Error for ParseEventNameError {}
 
-/// 表示对象上发生的事件类型。
-/// 基于 AWS S3 事件类型，并包含 RustFS 扩展。
+/// Represents the type of event that occurs on the object.
+/// Based on AWS S3 event type and includes RustFS extension.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum EventName {
-    // 单一事件类型 (值为 1-32 以兼容掩码逻辑)
+    // Single event type (values are 1-32 for compatible mask logic)
     ObjectAccessedGet = 1,
     ObjectAccessedGetRetention = 2,
     ObjectAccessedGetLegalHold = 3,
@@ -48,23 +48,23 @@ pub enum EventName {
     ObjectRestoreCompleted = 26,
     ObjectTransitionFailed = 27,
     ObjectTransitionComplete = 28,
-    ScannerManyVersions = 29,                // 对应 Go 的 ObjectManyVersions
-    ScannerLargeVersions = 30,               // 对应 Go 的 ObjectLargeVersions
-    ScannerBigPrefix = 31,                   // 对应 Go 的 PrefixManyFolders
-    LifecycleDelMarkerExpirationDelete = 32, // 对应 Go 的 ILMDelMarkerExpirationDelete
+    ScannerManyVersions = 29,                // ObjectManyVersions corresponding to Go
+    ScannerLargeVersions = 30,               // ObjectLargeVersions corresponding to Go
+    ScannerBigPrefix = 31,                   // PrefixManyFolders corresponding to Go
+    LifecycleDelMarkerExpirationDelete = 32, // ILMDelMarkerExpirationDelete corresponding to Go
 
-    // 复合 "All" 事件类型 (没有用于掩码的顺序值)
+    // Compound "All" event type (no sequential value for mask)
     ObjectAccessedAll,
     ObjectCreatedAll,
     ObjectRemovedAll,
     ObjectReplicationAll,
     ObjectRestoreAll,
     ObjectTransitionAll,
-    ObjectScannerAll, // 新增，来自 Go
-    Everything,       // 新增，来自 Go
+    ObjectScannerAll, // New, from Go
+    Everything,       // New, from Go
 }
 
-// 用于 Everything.expand() 的单一事件类型顺序数组
+// Single event type sequential array for Everything.expand()
 const SINGLE_EVENT_NAMES_IN_ORDER: [EventName; 32] = [
     EventName::ObjectAccessedGet,
     EventName::ObjectAccessedGetRetention,
@@ -103,7 +103,7 @@ const SINGLE_EVENT_NAMES_IN_ORDER: [EventName; 32] = [
 const LAST_SINGLE_TYPE_VALUE: u32 = EventName::LifecycleDelMarkerExpirationDelete as u32;
 
 impl EventName {
-    /// 解析字符串为 EventName。
+    /// The parsed string is EventName.
     pub fn parse(s: &str) -> Result<Self, ParseEventNameError> {
         match s {
             "s3:BucketCreated:*" => Ok(EventName::BucketCreated),
@@ -115,9 +115,7 @@ impl EventName {
             "s3:ObjectAccessed:Head" => Ok(EventName::ObjectAccessedHead),
             "s3:ObjectAccessed:Attributes" => Ok(EventName::ObjectAccessedAttributes),
             "s3:ObjectCreated:*" => Ok(EventName::ObjectCreatedAll),
-            "s3:ObjectCreated:CompleteMultipartUpload" => {
-                Ok(EventName::ObjectCreatedCompleteMultipartUpload)
-            }
+            "s3:ObjectCreated:CompleteMultipartUpload" => Ok(EventName::ObjectCreatedCompleteMultipartUpload),
             "s3:ObjectCreated:Copy" => Ok(EventName::ObjectCreatedCopy),
             "s3:ObjectCreated:Post" => Ok(EventName::ObjectCreatedPost),
             "s3:ObjectCreated:Put" => Ok(EventName::ObjectCreatedPut),
@@ -127,25 +125,15 @@ impl EventName {
             "s3:ObjectCreated:DeleteTagging" => Ok(EventName::ObjectCreatedDeleteTagging),
             "s3:ObjectRemoved:*" => Ok(EventName::ObjectRemovedAll),
             "s3:ObjectRemoved:Delete" => Ok(EventName::ObjectRemovedDelete),
-            "s3:ObjectRemoved:DeleteMarkerCreated" => {
-                Ok(EventName::ObjectRemovedDeleteMarkerCreated)
-            }
+            "s3:ObjectRemoved:DeleteMarkerCreated" => Ok(EventName::ObjectRemovedDeleteMarkerCreated),
             "s3:ObjectRemoved:NoOP" => Ok(EventName::ObjectRemovedNoOP),
             "s3:ObjectRemoved:DeleteAllVersions" => Ok(EventName::ObjectRemovedDeleteAllVersions),
-            "s3:LifecycleDelMarkerExpiration:Delete" => {
-                Ok(EventName::LifecycleDelMarkerExpirationDelete)
-            }
+            "s3:LifecycleDelMarkerExpiration:Delete" => Ok(EventName::LifecycleDelMarkerExpirationDelete),
             "s3:Replication:*" => Ok(EventName::ObjectReplicationAll),
             "s3:Replication:OperationFailedReplication" => Ok(EventName::ObjectReplicationFailed),
-            "s3:Replication:OperationCompletedReplication" => {
-                Ok(EventName::ObjectReplicationComplete)
-            }
-            "s3:Replication:OperationMissedThreshold" => {
-                Ok(EventName::ObjectReplicationMissedThreshold)
-            }
-            "s3:Replication:OperationReplicatedAfterThreshold" => {
-                Ok(EventName::ObjectReplicationReplicatedAfterThreshold)
-            }
+            "s3:Replication:OperationCompletedReplication" => Ok(EventName::ObjectReplicationComplete),
+            "s3:Replication:OperationMissedThreshold" => Ok(EventName::ObjectReplicationMissedThreshold),
+            "s3:Replication:OperationReplicatedAfterThreshold" => Ok(EventName::ObjectReplicationReplicatedAfterThreshold),
             "s3:Replication:OperationNotTracked" => Ok(EventName::ObjectReplicationNotTracked),
             "s3:ObjectRestore:*" => Ok(EventName::ObjectRestoreAll),
             "s3:ObjectRestore:Post" => Ok(EventName::ObjectRestorePost),
@@ -156,12 +144,12 @@ impl EventName {
             "s3:Scanner:ManyVersions" => Ok(EventName::ScannerManyVersions),
             "s3:Scanner:LargeVersions" => Ok(EventName::ScannerLargeVersions),
             "s3:Scanner:BigPrefix" => Ok(EventName::ScannerBigPrefix),
-            // ObjectScannerAll 和 Everything 不能从字符串解析，因为 Go 版本也没有定义它们的字符串表示
+            // ObjectScannerAll and Everything cannot be parsed from strings, because the Go version also does not define their string representation.
             _ => Err(ParseEventNameError(s.to_string())),
         }
     }
 
-    /// 返回事件类型的字符串表示。
+    /// Returns a string representation of the event type.
     pub fn as_str(&self) -> &'static str {
         match self {
             EventName::BucketCreated => "s3:BucketCreated:*",
@@ -173,9 +161,7 @@ impl EventName {
             EventName::ObjectAccessedHead => "s3:ObjectAccessed:Head",
             EventName::ObjectAccessedAttributes => "s3:ObjectAccessed:Attributes",
             EventName::ObjectCreatedAll => "s3:ObjectCreated:*",
-            EventName::ObjectCreatedCompleteMultipartUpload => {
-                "s3:ObjectCreated:CompleteMultipartUpload"
-            }
+            EventName::ObjectCreatedCompleteMultipartUpload => "s3:ObjectCreated:CompleteMultipartUpload",
             EventName::ObjectCreatedCopy => "s3:ObjectCreated:Copy",
             EventName::ObjectCreatedPost => "s3:ObjectCreated:Post",
             EventName::ObjectCreatedPut => "s3:ObjectCreated:Put",
@@ -188,19 +174,13 @@ impl EventName {
             EventName::ObjectRemovedDeleteMarkerCreated => "s3:ObjectRemoved:DeleteMarkerCreated",
             EventName::ObjectRemovedNoOP => "s3:ObjectRemoved:NoOP",
             EventName::ObjectRemovedDeleteAllVersions => "s3:ObjectRemoved:DeleteAllVersions",
-            EventName::LifecycleDelMarkerExpirationDelete => {
-                "s3:LifecycleDelMarkerExpiration:Delete"
-            }
+            EventName::LifecycleDelMarkerExpirationDelete => "s3:LifecycleDelMarkerExpiration:Delete",
             EventName::ObjectReplicationAll => "s3:Replication:*",
             EventName::ObjectReplicationFailed => "s3:Replication:OperationFailedReplication",
             EventName::ObjectReplicationComplete => "s3:Replication:OperationCompletedReplication",
             EventName::ObjectReplicationNotTracked => "s3:Replication:OperationNotTracked",
-            EventName::ObjectReplicationMissedThreshold => {
-                "s3:Replication:OperationMissedThreshold"
-            }
-            EventName::ObjectReplicationReplicatedAfterThreshold => {
-                "s3:Replication:OperationReplicatedAfterThreshold"
-            }
+            EventName::ObjectReplicationMissedThreshold => "s3:Replication:OperationMissedThreshold",
+            EventName::ObjectReplicationReplicatedAfterThreshold => "s3:Replication:OperationReplicatedAfterThreshold",
             EventName::ObjectRestoreAll => "s3:ObjectRestore:*",
             EventName::ObjectRestorePost => "s3:ObjectRestore:Post",
             EventName::ObjectRestoreCompleted => "s3:ObjectRestore:Completed",
@@ -210,13 +190,13 @@ impl EventName {
             EventName::ScannerManyVersions => "s3:Scanner:ManyVersions",
             EventName::ScannerLargeVersions => "s3:Scanner:LargeVersions",
             EventName::ScannerBigPrefix => "s3:Scanner:BigPrefix",
-            // Go 的 String() 对 ObjectScannerAll 和 Everything 返回 ""
-            EventName::ObjectScannerAll => "s3:Scanner:*", // 遵循 Go Expand 中的模式
-            EventName::Everything => "",                   // Go String() 对未处理的返回 ""
+            // Go's String() returns "" for ObjectScannerAll and Everything
+            EventName::ObjectScannerAll => "s3:Scanner:*", // Follow the pattern in Go Expand
+            EventName::Everything => "",                   // Go String() returns "" to unprocessed
         }
     }
 
-    /// 返回缩写事件类型的扩展值。
+    /// Returns the extended value of the abbreviation event type.
     pub fn expand(&self) -> Vec<Self> {
         match self {
             EventName::ObjectAccessedAll => vec![
@@ -249,41 +229,35 @@ impl EventName {
                 EventName::ObjectReplicationMissedThreshold,
                 EventName::ObjectReplicationReplicatedAfterThreshold,
             ],
-            EventName::ObjectRestoreAll => vec![
-                EventName::ObjectRestorePost,
-                EventName::ObjectRestoreCompleted,
-            ],
-            EventName::ObjectTransitionAll => vec![
-                EventName::ObjectTransitionFailed,
-                EventName::ObjectTransitionComplete,
-            ],
+            EventName::ObjectRestoreAll => vec![EventName::ObjectRestorePost, EventName::ObjectRestoreCompleted],
+            EventName::ObjectTransitionAll => vec![EventName::ObjectTransitionFailed, EventName::ObjectTransitionComplete],
             EventName::ObjectScannerAll => vec![
-                // 新增
+                // New
                 EventName::ScannerManyVersions,
                 EventName::ScannerLargeVersions,
                 EventName::ScannerBigPrefix,
             ],
             EventName::Everything => {
-                // 新增
+                // New
                 SINGLE_EVENT_NAMES_IN_ORDER.to_vec()
             }
-            // 单一类型直接返回自身
+            // A single type returns to itself directly
             _ => vec![*self],
         }
     }
 
-    /// 返回类型的掩码。
-    /// 复合 "All" 类型会被展开。
+    /// Returns the mask of type.
+    /// The compound "All" type will be expanded.
     pub fn mask(&self) -> u64 {
         let value = *self as u32;
         if value > 0 && value <= LAST_SINGLE_TYPE_VALUE {
-            // 是单一类型
+            // It's a single type
             1u64 << (value - 1)
         } else {
-            // 是复合类型
+            // It's a compound type
             let mut mask = 0u64;
             for n in self.expand() {
-                mask |= n.mask(); // 递归调用 mask
+                mask |= n.mask(); // Recursively call mask
             }
             mask
         }
@@ -296,7 +270,7 @@ impl fmt::Display for EventName {
     }
 }
 
-/// 根据字符串转换为 `EventName`
+/// Convert to `EventName` according to string
 impl From<&str> for EventName {
     fn from(event_str: &str) -> Self {
         EventName::parse(event_str).unwrap_or_else(|e| panic!("{}", e))
@@ -399,28 +373,16 @@ impl Event {
     pub fn new_test_event(bucket: &str, key: &str, event_name: EventName) -> Self {
         let mut user_metadata = HashMap::new();
         user_metadata.insert("x-amz-meta-test".to_string(), "value".to_string());
-        user_metadata.insert(
-            "x-amz-storage-storage-options".to_string(),
-            "value".to_string(),
-        );
+        user_metadata.insert("x-amz-storage-storage-options".to_string(), "value".to_string());
         user_metadata.insert("x-amz-meta-".to_string(), "value".to_string());
         user_metadata.insert("x-rustfs-meta-".to_string(), "rustfs-value".to_string());
         user_metadata.insert("x-request-id".to_string(), "request-id-123".to_string());
         user_metadata.insert("x-bucket".to_string(), "bucket".to_string());
         user_metadata.insert("x-object".to_string(), "object".to_string());
-        user_metadata.insert(
-            "x-rustfs-origin-endpoint".to_string(),
-            "http://127.0.0.1".to_string(),
-        );
+        user_metadata.insert("x-rustfs-origin-endpoint".to_string(), "http://127.0.0.1".to_string());
         user_metadata.insert("x-rustfs-user-metadata".to_string(), "metadata".to_string());
-        user_metadata.insert(
-            "x-rustfs-deployment-id".to_string(),
-            "deployment-id-123".to_string(),
-        );
-        user_metadata.insert(
-            "x-rustfs-origin-endpoint-code".to_string(),
-            "http://127.0.0.1".to_string(),
-        );
+        user_metadata.insert("x-rustfs-deployment-id".to_string(), "deployment-id-123".to_string());
+        user_metadata.insert("x-rustfs-origin-endpoint-code".to_string(), "http://127.0.0.1".to_string());
         user_metadata.insert("x-rustfs-bucket-name".to_string(), "bucket".to_string());
         user_metadata.insert("x-rustfs-object-key".to_string(), key.to_string());
         user_metadata.insert("x-rustfs-object-size".to_string(), "1024".to_string());
@@ -466,7 +428,7 @@ impl Event {
             },
         }
     }
-    /// 返回事件掩码
+    /// Return event mask
     pub fn mask(&self) -> u64 {
         self.event_name.mask()
     }

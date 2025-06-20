@@ -1,9 +1,8 @@
-use core::slice::SlicePattern;
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::disk::error_reduce::{reduce_read_quorum_errs, reduce_write_quorum_errs, OBJECT_OP_IGNORED_ERRS};
 use crate::disk::{
-    self, conv_part_err_to_int, has_part_err, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND,
-    CHECK_PART_SUCCESS,
+    self, conv_part_err_to_int, has_part_err, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT,
+    CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS,
 };
 use crate::erasure_coding;
 use crate::erasure_coding::bitrot_verify;
@@ -17,8 +16,8 @@ use crate::{
     config::{storageclass, GLOBAL_StorageClass},
     disk::{
         endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo,
-        DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+        DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp,
+        ReadOptions, UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
     },
     error::{to_object_err, StorageError},
     global::{
@@ -58,10 +57,10 @@ use md5::{Digest as Md5Digest, Md5};
 use rand::{seq::SliceRandom, Rng};
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{
-    file_info_from_raw,
-    headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
-    merge_file_meta_versions, FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry,
-    MetadataResolutionParams, ObjectPartInfo, RawFileInfo,
+    file_info_from_raw, headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS}, merge_file_meta_versions, FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries,
+    MetaCacheEntry, MetadataResolutionParams,
+    ObjectPartInfo,
+    RawFileInfo,
 };
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
 use rustfs_utils::{
@@ -80,7 +79,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use sha2::digest::HashReader;
 use time::OffsetDateTime;
 use tokio::{
     io::AsyncWrite,
@@ -95,7 +93,6 @@ use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use workers::workers::Workers;
-use crate::disk::fs::SLASH_SEPARATOR;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -404,11 +401,7 @@ impl SetDisks {
             }
         }
 
-        if max >= write_quorum {
-            data_dir
-        } else {
-            None
-        }
+        if max >= write_quorum { data_dir } else { None }
     }
 
     #[allow(dead_code)]
@@ -739,11 +732,7 @@ impl SetDisks {
 
     fn common_time(times: &[Option<OffsetDateTime>], quorum: usize) -> Option<OffsetDateTime> {
         let (time, count) = Self::common_time_and_occurrence(times);
-        if count >= quorum {
-            time
-        } else {
-            None
-        }
+        if count >= quorum { time } else { None }
     }
 
     fn common_time_and_occurrence(times: &[Option<OffsetDateTime>]) -> (Option<OffsetDateTime>, usize) {
@@ -784,11 +773,7 @@ impl SetDisks {
 
     fn common_etag(etags: &[Option<String>], quorum: usize) -> Option<String> {
         let (etag, count) = Self::common_etags(etags);
-        if count >= quorum {
-            etag
-        } else {
-            None
-        }
+        if count >= quorum { etag } else { None }
     }
 
     fn common_etags(etags: &[Option<String>]) -> (Option<String>, usize) {
@@ -4069,7 +4054,7 @@ impl StorageAPI for SetDisks {
     async fn local_storage_info(&self) -> madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
-        let mut local_disks: Vec<Option<Arc<crate::disk::Disk>>> = Vec::new();
+        let mut local_disks: Vec<Option<Arc<disk::Disk>>> = Vec::new();
         let mut local_endpoints = Vec::new();
 
         for (i, ep) in self.set_endpoints.iter().enumerate() {

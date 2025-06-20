@@ -1,4 +1,4 @@
-//! RustFs Notify - A flexible and extensible event notification system for object storage.
+//! RustFS Notify - A flexible and extensible event notification system for object storage.
 //!
 //! This library provides a Rust implementation of a storage bucket notification system,
 //! similar to RustFS's notification system. It supports sending events to various targets
@@ -35,7 +35,7 @@ use tracing_subscriber::{fmt, prelude::*, util::SubscriberInitExt, EnvFilter};
 ///
 /// # Example
 /// ```
-/// notify::init_logger(notify::LogLevel::Info);
+/// rustfs_notify::init_logger(rustfs_notify::LogLevel::Info);
 /// ```
 pub fn init_logger(level: LogLevel) {
     let filter = EnvFilter::default().add_directive(level.into());

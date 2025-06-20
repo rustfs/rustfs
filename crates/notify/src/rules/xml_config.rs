@@ -9,7 +9,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ParseConfigError {
     #[error("XML parsing error:{0}")]
-    XmlError(#[from] quick_xml::errors::Error),
+    XmlError(#[from] quick_xml::errors::serialize::DeError),
     #[error("Invalid filter value:{0}")]
     InvalidFilterValue(String),
     #[error("Invalid filter name: {0}, only 'prefix' or 'suffix' is allowed")]
@@ -193,10 +193,10 @@ impl QueueConfig {
 pub struct LambdaConfigDetail {
     #[serde(rename = "CloudFunction")]
     pub arn: String,
-    // 根据 AWS S3 文档，<CloudFunctionConfiguration> 通常还包含 Id, Event, Filter
-    // 但为了严格对应提供的 Go `lambda` 结构体，这里只包含 ARN。
-    // 如果需要完整支持，可以添加其他字段。
-    // 例如：
+    // According to AWS S3 documentation, <CloudFunctionConfiguration> usually also contains Id, Event, Filter
+    // But in order to strictly correspond to the Go `lambda` structure provided, only ARN is included here.
+    // If full support is required, additional fields can be added.
+    // For example:
     // #[serde(rename = "Id", skip_serializing_if = "Option::is_none")]
     // pub id: Option<String>,
     // #[serde(rename = "Event", default, skip_serializing_if = "Vec::is_empty")]
@@ -211,7 +211,7 @@ pub struct LambdaConfigDetail {
 pub struct TopicConfigDetail {
     #[serde(rename = "Topic")]
     pub arn: String,
-    // 类似于 LambdaConfigDetail，可以根据需要扩展以包含 Id, Event, Filter 等字段。
+    // Similar to LambdaConfigDetail, it can be extended to include fields such as Id, Event, Filter, etc.
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -236,8 +236,8 @@ pub struct NotificationConfiguration {
 }
 
 impl NotificationConfiguration {
-    pub fn from_reader<R: Read>(reader: R) -> Result<Self, ParseConfigError> {
-        let config: NotificationConfiguration = quick_xml::reader::Reader::from_reader(reader)?;
+    pub fn from_reader<R: Read + std::io::BufRead>(reader: R) -> Result<Self, ParseConfigError> {
+        let config: NotificationConfiguration = quick_xml::de::from_reader(reader)?;
         Ok(config)
     }
 
@@ -268,7 +268,7 @@ impl NotificationConfiguration {
         if self.xmlns.is_none() {
             self.xmlns = Some("http://s3.amazonaws.com/doc/2006-03-01/".to_string());
         }
-        // 注意：如果 LambdaConfigDetail 和 TopicConfigDetail 将来包含区域等信息，
-        // 也可能需要在这里设置默认值。但根据当前定义，它们只包含 ARN 字符串。
+        // Note: If LambdaConfigDetail and TopicConfigDetail contain information such as regions in the future,
+        // You may also need to set the default value here. But according to the current definition, they only contain ARN strings.
     }
 }

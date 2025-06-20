@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 /// Streams events from the store to the target
 pub async fn stream_events(
-    store: &mut (dyn Store<crate::event::Event, Error = StoreError, Key = Key> + Send),
+    store: &mut (dyn Store<Event, Error = StoreError, Key = Key> + Send),
     target: &dyn Target,
     mut cancel_rx: mpsc::Receiver<()>,
 ) {
@@ -42,10 +42,7 @@ pub async fn stream_events(
         for key in keys {
             // Check for cancellation before processing each event
             if cancel_rx.try_recv().is_ok() {
-                info!(
-                    "Cancellation received during processing for target: {}",
-                    target.name()
-                );
+                info!("Cancellation received during processing for target: {}", target.name());
                 return;
             }
 
@@ -70,7 +67,7 @@ pub async fn stream_events(
                             TargetError::Timeout(_) => {
                                 warn!("Timeout for target {}, retrying...", target.name());
                                 retry_count += 1;
-                                sleep(Duration::from_secs((retry_count * 5) as u64)).await; // 指数退避
+                                sleep(Duration::from_secs((retry_count * 5) as u64)).await; // Exponential backoff
                             }
                             _ => {
                                 // Permanent error, skip this event
@@ -84,11 +81,7 @@ pub async fn stream_events(
 
             // Remove event from store if successfully sent
             if retry_count >= MAX_RETRIES && !success {
-                warn!(
-                    "Max retries exceeded for event {}, target: {}, skipping",
-                    key.to_string(),
-                    target.name()
-                );
+                warn!("Max retries exceeded for event {}, target: {}, skipping", key.to_string(), target.name());
             }
         }
 
@@ -120,10 +113,7 @@ pub fn start_event_stream_with_batching(
     semaphore: Arc<Semaphore>,
 ) -> mpsc::Sender<()> {
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
-    debug!(
-        "Starting event stream with batching for target: {}",
-        target.name()
-    );
+    debug!("Starting event stream with batching for target: {}", target.name());
     tokio::spawn(async move {
         stream_events_with_batching(&mut *store, &*target, cancel_rx, metrics, semaphore).await;
         info!("Event stream stopped for target: {}", target.name());
@@ -132,7 +122,7 @@ pub fn start_event_stream_with_batching(
     cancel_tx
 }
 
-/// 带批处理的事件流处理
+/// Event stream processing with batch processing
 pub async fn stream_events_with_batching(
     store: &mut (dyn Store<Event, Error = StoreError, Key = Key> + Send),
     target: &dyn Target,
@@ -140,10 +130,7 @@ pub async fn stream_events_with_batching(
     metrics: Arc<NotificationMetrics>,
     semaphore: Arc<Semaphore>,
 ) {
-    info!(
-        "Starting event stream with batching for target: {}",
-        target.name()
-    );
+    info!("Starting event stream with batching for target: {}", target.name());
 
     // Configuration parameters
     const DEFAULT_BATCH_SIZE: usize = 1;
@@ -160,106 +147,64 @@ pub async fn stream_events_with_batching(
     let mut last_flush = Instant::now();
 
     loop {
-        // 检查取消信号
+        // Check the cancel signal
         if cancel_rx.try_recv().is_ok() {
             info!("Cancellation received for target: {}", target.name());
             return;
         }
 
-        // 获取存储中的事件列表
+        // Get a list of events in storage
         let keys = store.list();
-        debug!(
-            "Found {} keys in store for target: {}",
-            keys.len(),
-            target.name()
-        );
+        debug!("Found {} keys in store for target: {}", keys.len(), target.name());
         if keys.is_empty() {
-            // 如果批处理中有数据且超时，则刷新批处理
+            // If there is data in the batch and timeout, refresh the batch
             if !batch.is_empty() && last_flush.elapsed() >= BATCH_TIMEOUT {
-                process_batch(
-                    &mut batch,
-                    &mut batch_keys,
-                    target,
-                    MAX_RETRIES,
-                    BASE_RETRY_DELAY,
-                    &metrics,
-                    &semaphore,
-                )
-                .await;
+                process_batch(&mut batch, &mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore).await;
                 last_flush = Instant::now();
             }
 
-            // 无事件，等待后再检查
+            // No event, wait before checking
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
 
-        // 处理每个事件
+        // Handle each event
         for key in keys {
-            // 再次检查取消信号
+            // Check the cancel signal again
             if cancel_rx.try_recv().is_ok() {
-                info!(
-                    "Cancellation received during processing for target: {}",
-                    target.name()
-                );
+                info!("Cancellation received during processing for target: {}", target.name());
 
-                // 在退出前处理已收集的批次
+                // Processing collected batches before exiting
                 if !batch.is_empty() {
-                    process_batch(
-                        &mut batch,
-                        &mut batch_keys,
-                        target,
-                        MAX_RETRIES,
-                        BASE_RETRY_DELAY,
-                        &metrics,
-                        &semaphore,
-                    )
-                    .await;
+                    process_batch(&mut batch, &mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore).await;
                 }
                 return;
             }
 
-            // 尝试从存储中获取事件
+            // Try to get events from storage
             match store.get(&key) {
                 Ok(event) => {
-                    // 添加到批处理
+                    // Add to batch
                     batch.push(event);
                     batch_keys.push(key);
                     metrics.increment_processing();
 
-                    // 如果批次已满或距离上次刷新已经过了足够时间，则处理批次
+                    // If the batch is full or enough time has passed since the last refresh, the batch will be processed
                     if batch.len() >= batch_size || last_flush.elapsed() >= BATCH_TIMEOUT {
-                        process_batch(
-                            &mut batch,
-                            &mut batch_keys,
-                            target,
-                            MAX_RETRIES,
-                            BASE_RETRY_DELAY,
-                            &metrics,
-                            &semaphore,
-                        )
-                        .await;
+                        process_batch(&mut batch, &mut batch_keys, target, MAX_RETRIES, BASE_RETRY_DELAY, &metrics, &semaphore)
+                            .await;
                         last_flush = Instant::now();
                     }
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to target: {}, get event {} from store: {}",
-                        target.name(),
-                        key.to_string(),
-                        e
-                    );
-                    // 可以考虑删除无法读取的事件，防止无限循环尝试读取
+                    error!("Failed to target: {}, get event {} from store: {}", target.name(), key.to_string(), e);
+                    // Consider deleting unreadable events to prevent infinite loops from trying to read
                     match store.del(&key) {
                         Ok(_) => {
                             info!("Deleted corrupted event {} from store", key.to_string());
                         }
                         Err(del_err) => {
-                            error!(
-                                "Failed to delete corrupted event {}: {}",
-                                key.to_string(),
-                                del_err
-                            );
+                            error!("Failed to delete corrupted event {}: {}", key.to_string(), del_err);
                         }
                     }
 
@@ -268,12 +213,12 @@ pub async fn stream_events_with_batching(
             }
         }
 
-        // 小延迟再进行下一轮检查
+        // A small delay will be conducted to check the next round
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// 处理事件批次
+/// Processing event batches
 async fn process_batch(
     batch: &mut Vec<Event>,
     batch_keys: &mut Vec<Key>,
@@ -283,16 +228,12 @@ async fn process_batch(
     metrics: &Arc<NotificationMetrics>,
     semaphore: &Arc<Semaphore>,
 ) {
-    debug!(
-        "Processing batch of {} events for target: {}",
-        batch.len(),
-        target.name()
-    );
+    debug!("Processing batch of {} events for target: {}", batch.len(), target.name());
     if batch.is_empty() {
         return;
     }
 
-    // 获取信号量许可，限制并发
+    // Obtain semaphore permission to limit concurrency
     let permit = match semaphore.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => {
@@ -301,30 +242,26 @@ async fn process_batch(
         }
     };
 
-    // 处理批次中的每个事件
+    // Handle every event in the batch
     for (_event, key) in batch.iter().zip(batch_keys.iter()) {
         let mut retry_count = 0;
         let mut success = false;
 
-        // 重试逻辑
+        // Retry logic
         while retry_count < max_retries && !success {
             match target.send_from_store(key.clone()).await {
                 Ok(_) => {
-                    info!(
-                        "Successfully sent event for target: {}, Key: {}",
-                        target.name(),
-                        key.to_string()
-                    );
+                    info!("Successfully sent event for target: {}, Key: {}", target.name(), key.to_string());
                     success = true;
                     metrics.increment_processed();
                 }
                 Err(e) => {
-                    // 根据错误类型采用不同的重试策略
+                    // Different retry strategies are adopted according to the error type
                     match &e {
                         TargetError::NotConnected => {
                             warn!("Target {} not connected, retrying...", target.name());
                             retry_count += 1;
-                            tokio::time::sleep(base_delay * (1 << retry_count)).await; // 指数退避
+                            tokio::time::sleep(base_delay * (1 << retry_count)).await; // Exponential backoff
                         }
                         TargetError::Timeout(_) => {
                             warn!("Timeout for target {}, retrying...", target.name());
@@ -332,7 +269,7 @@ async fn process_batch(
                             tokio::time::sleep(base_delay * (1 << retry_count)).await;
                         }
                         _ => {
-                            // 永久性错误，跳过此事件
+                            // Permanent error, skip this event
                             error!("Permanent error for target {}: {}", target.name(), e);
                             metrics.increment_failed();
                             break;
@@ -342,21 +279,17 @@ async fn process_batch(
             }
         }
 
-        // 处理最大重试次数耗尽的情况
+        // Handle the situation where the maximum number of retry exhaustion is exhausted
         if retry_count >= max_retries && !success {
-            warn!(
-                "Max retries exceeded for event {}, target: {}, skipping",
-                key.to_string(),
-                target.name()
-            );
+            warn!("Max retries exceeded for event {}, target: {}, skipping", key.to_string(), target.name());
             metrics.increment_failed();
         }
     }
 
-    // 清空已处理的批次
+    // Clear processed batches
     batch.clear();
     batch_keys.clear();
 
-    // 释放信号量许可（通过 drop）
+    // Release semaphore permission (via drop)
     drop(permit);
 }

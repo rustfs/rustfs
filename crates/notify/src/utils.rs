@@ -1,17 +1,14 @@
-use std::env;
 use std::fmt;
-
 #[cfg(unix)]
-use libc::uname;
-#[cfg(unix)]
-use std::ffi::CStr;
+use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
-use std::process::Command;
+use std::os::windows::process::ExitStatusExt;
+use std::{env, process};
 
-// 定义 Rustfs 版本
+// Define Rustfs version
 const RUSTFS_VERSION: &str = "1.0.0";
 
-// 业务类型枚举
+// Business Type Enumeration
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServiceType {
     Basis,
@@ -33,7 +30,7 @@ impl ServiceType {
     }
 }
 
-// UserAgent 结构体
+// UserAgent structure
 struct UserAgent {
     os_platform: String,
     arch: String,
@@ -42,7 +39,7 @@ struct UserAgent {
 }
 
 impl UserAgent {
-    // 创建新的 UserAgent 实例，接受业务类型参数
+    // Create a new UserAgent instance and accept business type parameters
     fn new(service: ServiceType) -> Self {
         let os_platform = Self::get_os_platform();
         let arch = env::consts::ARCH.to_string();
@@ -56,7 +53,7 @@ impl UserAgent {
         }
     }
 
-    // 获取操作系统平台信息
+    // Obtain operating system platform information
     fn get_os_platform() -> String {
         if cfg!(target_os = "windows") {
             Self::get_windows_platform()
@@ -69,14 +66,18 @@ impl UserAgent {
         }
     }
 
-    // 获取 Windows 平台信息
+    // Get Windows platform information
     #[cfg(windows)]
     fn get_windows_platform() -> String {
-        // 使用 cmd /c ver 获取版本
-        let output = Command::new("cmd")
+        // Use cmd /c ver to get the version
+        let output = process::Command::new("cmd")
             .args(&["/C", "ver"])
             .output()
-            .unwrap_or_default();
+            .unwrap_or_else(|_| process::Output {
+                status: process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
         let version = String::from_utf8_lossy(&output.stdout);
         let version = version
             .lines()
@@ -92,27 +93,29 @@ impl UserAgent {
         "N/A".to_string()
     }
 
-    // 获取 macOS 平台信息
+    // Get macOS platform information
     #[cfg(target_os = "macos")]
     fn get_macos_platform() -> String {
-        unsafe {
-            let mut name = std::mem::zeroed();
-            if uname(&mut name) == 0 {
-                let release = CStr::from_ptr(name.release.as_ptr()).to_string_lossy();
-                // 映射内核版本（如 23.5.0）到 User-Agent 格式（如 14_5_0）
-                let major = release
-                    .split('.')
-                    .next()
-                    .unwrap_or("14")
-                    .parse::<i32>()
-                    .unwrap_or(14);
-                let minor = if major >= 20 { major - 9 } else { 14 };
-                let patch = release.split('.').nth(1).unwrap_or("0");
-                format!("Macintosh; Intel Mac OS X {}_{}_{}", minor, patch, 0)
-            } else {
-                "Macintosh; Intel Mac OS X 14_5_0".to_string()
-            }
-        }
+        let output = process::Command::new("sw_vers")
+            .args(&["-productVersion"])
+            .output()
+            .unwrap_or_else(|_| process::Output {
+                status: process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let parts: Vec<&str> = version.split('.').collect();
+        let major = parts.get(0).unwrap_or(&"10").parse::<i32>().unwrap_or(10);
+        let minor = parts.get(1).map_or("15", |&m| m);
+        let patch = parts.get(2).map_or("0", |&p| p);
+
+        // Detect whether it is an Apple Silicon chip
+        let arch = env::consts::ARCH;
+        let cpu_info = if arch == "aarch64" { "Apple" } else { "Intel" };
+
+        // Convert to User-Agent format
+        format!("Macintosh; {} Mac OS X {}_{}_{}", cpu_info, major, minor, patch)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -120,17 +123,22 @@ impl UserAgent {
         "N/A".to_string()
     }
 
-    // 获取 Linux 平台信息
+    // Get Linux platform information
     #[cfg(target_os = "linux")]
     fn get_linux_platform() -> String {
-        unsafe {
-            let mut name = std::mem::zeroed();
-            if uname(&mut name) == 0 {
-                let release = CStr::from_ptr(name.release.as_ptr()).to_string_lossy();
-                format!("X11; Linux {}", release)
-            } else {
-                "X11; Linux Unknown".to_string()
-            }
+        let output = process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .unwrap_or_else(|_| process::Output {
+                status: process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        if output.status.success() {
+            let release = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            format!("X11; Linux {}", release)
+        } else {
+            "X11; Linux Unknown".to_string()
         }
     }
 
@@ -140,15 +148,11 @@ impl UserAgent {
     }
 }
 
-// 实现 Display trait 以格式化 User-Agent
+// Implement Display trait to format User-Agent
 impl fmt::Display for UserAgent {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.service == ServiceType::Basis {
-            return write!(
-                f,
-                "Mozilla/5.0 ({}; {}) Rustfs/{}",
-                self.os_platform, self.arch, self.version
-            );
+            return write!(f, "Mozilla/5.0 ({}; {}) Rustfs/{}", self.os_platform, self.arch, self.version);
         }
         write!(
             f,
@@ -161,7 +165,7 @@ impl fmt::Display for UserAgent {
     }
 }
 
-// 获取 User-Agent 字符串，接受业务类型参数
+// Get the User-Agent string and accept business type parameters
 pub fn get_user_agent(service: ServiceType) -> String {
     UserAgent::new(service).to_string()
 }
