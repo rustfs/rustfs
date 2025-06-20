@@ -5,7 +5,7 @@ use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::error::Error;
 use crate::new_object_layer_fn;
-use crate::peer::RemotePeerS3Client;
+use crate::rpc::RemotePeerS3Client;
 use crate::store;
 use crate::store_api::ObjectIO;
 use crate::store_api::ObjectInfo;

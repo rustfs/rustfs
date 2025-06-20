@@ -82,6 +82,8 @@ shadow-rs.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
+futures-util.workspace = true
+serde_urlencoded.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }

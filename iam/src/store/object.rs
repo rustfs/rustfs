@@ -3,7 +3,6 @@ use crate::error::{Error, Result, is_err_config_not_found};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_policy, is_err_no_such_user},
-    get_global_action_cred,
     manager::{extract_jwt_claims, get_default_policyes},
 };
 use ecstore::{
@@ -11,6 +10,7 @@ use ecstore::{
         RUSTFS_CONFIG_PREFIX,
         com::{delete_config, read_config, read_config_with_metadata, save_config},
     },
+    global::get_global_action_cred,
     store::ECStore,
     store_api::{ObjectInfo, ObjectOptions},
     store_list_objects::{ObjectInfoOrErr, WalkOptions},

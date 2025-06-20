@@ -4,7 +4,7 @@ mod config;
 mod console;
 mod error;
 mod event;
-mod grpc;
+// mod grpc;
 pub mod license;
 mod logging;
 mod server;
@@ -27,6 +27,7 @@ use ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use ecstore::config as ecconfig;
 use ecstore::config::GLOBAL_ConfigSys;
 use ecstore::heal::background_heal_ops::init_auto_heal;
+use ecstore::rpc::make_server;
 use ecstore::store_api::BucketOptions;
 use ecstore::StorageAPI;
 use ecstore::{
@@ -37,7 +38,6 @@ use ecstore::{
     update_erasure_type,
 };
 use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
-use grpc::make_server;
 use http::{HeaderMap, Request as HttpRequest, Response};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::{
@@ -129,7 +129,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     debug!("server_address {}", &server_address);
 
     // Set up AK and SK
-    iam::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()))?;
+    ecstore::global::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
 
     set_global_rustfs_port(server_port);
 

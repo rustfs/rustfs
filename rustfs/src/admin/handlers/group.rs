@@ -1,8 +1,6 @@
+use ecstore::global::get_global_action_cred;
 use http::{HeaderMap, StatusCode};
-use iam::{
-    error::{is_err_no_such_group, is_err_no_such_user},
-    get_global_action_cred,
-};
+use iam::error::{is_err_no_such_group, is_err_no_such_user};
 use madmin::GroupAddRemove;
 use matchit::Params;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};

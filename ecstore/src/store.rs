@@ -29,7 +29,7 @@ use crate::{
     bucket::metadata::BucketMetadata,
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
     endpoints::EndpointServerPools,
-    peer::S3PeerSys,
+    rpc::S3PeerSys,
     sets::Sets,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,

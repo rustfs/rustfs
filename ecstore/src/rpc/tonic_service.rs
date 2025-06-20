@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Cursor, pin::Pin};
 
 // use common::error::Error as EcsError;
-use ecstore::{
+use crate::{
     admin_server_info::get_local_server_property,
     bucket::{metadata::load_bucket_metadata, metadata_sys},
     disk::{
@@ -14,7 +14,7 @@ use ecstore::{
     },
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
-    peer::{LocalPeerS3Client, PeerS3Client},
+    rpc::{LocalPeerS3Client, PeerS3Client},
     store::{all_local_disk_path, find_local_disk},
     store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
 };
@@ -226,7 +226,6 @@ impl Node for NodeService {
                     }
                 };
 
-                println!("bucket info {}", bucket_info.clone());
                 Ok(tonic::Response::new(GetBucketInfoResponse {
                     success: true,
                     bucket_info,

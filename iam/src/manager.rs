@@ -2,14 +2,13 @@ use crate::error::{is_err_config_not_found, Error, Result};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
-    get_global_action_cred,
     store::{object::IAM_CONFIG_PREFIX, GroupInfo, MappedPolicy, Store, UserType},
     sys::{
-        UpdateServiceAccountOpts, MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED,
-        STATUS_DISABLED, STATUS_ENABLED,
+        UpdateServiceAccountOpts, MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED,
+        STATUS_ENABLED,
     },
 };
-// use ecstore::utils::crypto::base64_encode;
+use ecstore::global::get_global_action_cred;
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use policy::{
     arn::ARN,
@@ -39,8 +38,8 @@ use tokio::{
         mpsc::{Receiver, Sender},
     },
 };
-use tracing::error;
 use tracing::warn;
+use tracing::{error, info};
 
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
@@ -108,18 +107,18 @@ where
                     loop {
                         select! {
                             _ = ticker.tick() => {
-                                warn!("iam load ticker");
+                                info!("iam load ticker");
                                 if let Err(err) =s.clone().load().await{
                                     error!("iam load err {:?}", err);
                                 }
                             },
                             i = reciver.recv() => {
-                                warn!("iam load reciver");
+                                info!("iam load reciver");
                                 match i {
                                     Some(t) => {
                                         let last = s.last_timestamp.load(Ordering::Relaxed);
                                         if last <= t {
-                                            warn!("iam load reciver load");
+                                            info!("iam load reciver load");
                                             if let Err(err) =s.clone().load().await{
                                                 error!("iam load err {:?}", err);
                                             }
@@ -698,7 +697,7 @@ where
 
         for group in self
             .cache
-            .user_group_memeberships
+            .user_group_memberships
             .load()
             .get(name)
             .cloned()
@@ -823,7 +822,7 @@ where
     pub async fn get_user_info(&self, name: &str) -> Result<madmin::UserInfo> {
         let users = self.cache.users.load();
         let policies = self.cache.user_policies.load();
-        let group_members = self.cache.user_group_memeberships.load();
+        let group_members = self.cache.user_group_memberships.load();
 
         let u = match users.get(name) {
             Some(u) => u,
@@ -862,7 +861,7 @@ where
 
         let users = self.cache.users.load();
         let policies = self.cache.user_policies.load();
-        let group_members = self.cache.user_group_memeberships.load();
+        let group_members = self.cache.user_group_memberships.load();
 
         for (k, v) in users.iter() {
             if v.credentials.is_temp() || v.credentials.is_service_account() {
@@ -896,7 +895,7 @@ where
     pub async fn get_bucket_users(&self, bucket_name: &str) -> Result<HashMap<String, madmin::UserInfo>> {
         let users = self.cache.users.load();
         let policies_cache = self.cache.user_policies.load();
-        let group_members = self.cache.user_group_memeberships.load();
+        let group_members = self.cache.user_group_memberships.load();
         let group_policy_cache = self.cache.group_policies.load();
 
         let mut ret = HashMap::new();
@@ -995,7 +994,7 @@ where
         }
 
         if utype == UserType::Reg {
-            if let Some(member_of) = self.cache.user_group_memeberships.load().get(access_key) {
+            if let Some(member_of) = self.cache.user_group_memberships.load().get(access_key) {
                 for member in member_of.iter() {
                     let _ = self
                         .remove_members_from_group(member, vec![access_key.to_string()], false)
@@ -1169,12 +1168,12 @@ where
 
         Cache::add_or_update(&self.cache.groups, group, &gi, OffsetDateTime::now_utc());
 
-        let user_group_memeberships = self.cache.user_group_memeberships.load();
+        let user_group_memberships = self.cache.user_group_memberships.load();
         members.iter().for_each(|member| {
-            if let Some(m) = user_group_memeberships.get(member) {
+            if let Some(m) = user_group_memberships.get(member) {
                 let mut m = m.clone();
                 m.insert(group.to_string());
-                Cache::add_or_update(&self.cache.user_group_memeberships, member, &m, OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
             }
         });
 
@@ -1254,12 +1253,12 @@ where
 
         Cache::add_or_update(&self.cache.groups, name, &gi, OffsetDateTime::now_utc());
 
-        let user_group_memeberships = self.cache.user_group_memeberships.load();
+        let user_group_memberships = self.cache.user_group_memberships.load();
         members.iter().for_each(|member| {
-            if let Some(m) = user_group_memeberships.get(member) {
+            if let Some(m) = user_group_memberships.get(member) {
                 let mut m = m.clone();
                 m.remove(name);
-                Cache::add_or_update(&self.cache.user_group_memeberships, member, &m, OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
             }
         });
 
@@ -1310,23 +1309,23 @@ where
     }
 
     fn remove_group_from_memberships_map(&self, group: &str) {
-        let user_group_memeberships = self.cache.user_group_memeberships.load();
-        for (k, v) in user_group_memeberships.iter() {
+        let user_group_memberships = self.cache.user_group_memberships.load();
+        for (k, v) in user_group_memberships.iter() {
             if v.contains(group) {
                 let mut m = v.clone();
                 m.remove(group);
-                Cache::add_or_update(&self.cache.user_group_memeberships, k, &m, OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_group_memberships, k, &m, OffsetDateTime::now_utc());
             }
         }
     }
 
     fn update_group_memberships_map(&self, group: &str, gi: &GroupInfo) {
-        let user_group_memeberships = self.cache.user_group_memeberships.load();
+        let user_group_memberships = self.cache.user_group_memberships.load();
         for member in gi.members.iter() {
-            if let Some(m) = user_group_memeberships.get(member) {
+            if let Some(m) = user_group_memberships.get(member) {
                 let mut m = m.clone();
                 m.insert(group.to_string());
-                Cache::add_or_update(&self.cache.user_group_memeberships, member, &m, OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
             }
         }
     }
@@ -1444,7 +1443,7 @@ where
                 Cache::delete(&self.cache.users, name, OffsetDateTime::now_utc());
             }
 
-            let member_of = self.cache.user_group_memeberships.load();
+            let member_of = self.cache.user_group_memberships.load();
             if let Some(m) = member_of.get(name) {
                 for group in m.iter() {
                     if let Err(err) = self.remove_members_from_group(group, vec![name.to_string()], true).await {
