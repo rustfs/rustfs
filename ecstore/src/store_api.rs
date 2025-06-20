@@ -134,13 +134,11 @@ impl GetObjectReader {
                 return Err(Error::other(format!("invalid decompressed size {}", actual_size)));
             };
 
-            warn!("actual_size: {}", actual_size);
             let dec_reader = LimitReader::new(dec_reader, actual_size);
 
             let mut oi = oi.clone();
             oi.size = dec_length;
 
-            warn!("oi.size: {}, off: {}, length: {}", oi.size, off, length);
             return Ok((
                 GetObjectReader {
                     stream: Box::new(dec_reader),

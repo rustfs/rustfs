@@ -18,7 +18,7 @@ use crate::disk::fs::{
 use crate::disk::os::{check_path_length, is_empty_dir};
 use crate::disk::{
     CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN, CHECK_PART_VOLUME_NOT_FOUND,
-    FileReader, conv_part_err_to_int,
+    FileReader, RUSTFS_META_TMP_DELETED_BUCKET, conv_part_err_to_int,
 };
 use crate::disk::{FileWriter, STORAGE_FORMAT_FILE};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
@@ -36,6 +36,7 @@ use rustfs_utils::path::{
     GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
     path_join, path_join_buf,
 };
+use tokio::time::interval;
 
 use crate::erasure_coding::bitrot_verify;
 use bytes::Bytes;
@@ -105,6 +106,15 @@ pub struct LocalDisk {
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
     // pub format_last_check: Mutex<Option<OffsetDateTime>>,
+    exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
+}
+
+impl Drop for LocalDisk {
+    fn drop(&mut self) {
+        if let Some(exit_signal) = self.exit_signal.take() {
+            let _ = exit_signal.send(());
+        }
+    }
 }
 
 impl Debug for LocalDisk {
@@ -209,6 +219,7 @@ impl LocalDisk {
             // format_file_info: Mutex::new(format_meta),
             // format_data: Mutex::new(format_data),
             // format_last_check: Mutex::new(format_last_check),
+            exit_signal: None,
         };
         let (info, _root) = get_disk_info(root).await?;
         disk.major = info.major;
@@ -229,7 +240,59 @@ impl LocalDisk {
 
         disk.make_meta_volumes().await?;
 
+        let (exit_tx, exit_rx) = tokio::sync::broadcast::channel(1);
+        disk.exit_signal = Some(exit_tx);
+
+        let root = disk.root.clone();
+        tokio::spawn(Self::cleanup_deleted_objects_loop(root, exit_rx));
+
         Ok(disk)
+    }
+
+    async fn cleanup_deleted_objects_loop(root: PathBuf, mut exit_rx: tokio::sync::broadcast::Receiver<()>) {
+        let mut interval = interval(Duration::from_secs(60 * 5));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
+                        error!("cleanup_deleted_objects error: {:?}", err);
+                    }
+                }
+                _ = exit_rx.recv() => {
+                    info!("cleanup_deleted_objects_loop exit");
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+        let trash = path_join(&[root, RUSTFS_META_TMP_DELETED_BUCKET.into()]);
+        let mut entries = fs::read_dir(&trash).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+
+            let file_type = entry.file_type().await?;
+
+            let path = path_join(&[trash.clone(), name.into()]);
+
+            if file_type.is_dir() {
+                if let Err(e) = tokio::fs::remove_dir_all(path).await {
+                    if e.kind() != ErrorKind::NotFound {
+                        return Err(e.into());
+                    }
+                }
+            } else if let Err(e) = tokio::fs::remove_file(path).await {
+                if e.kind() != ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn is_valid_volname(volname: &str) -> bool {
@@ -268,7 +331,14 @@ impl LocalDisk {
         let multipart = format!("{}/{}", RUSTFS_META_BUCKET, "multipart");
         let config = format!("{}/{}", RUSTFS_META_BUCKET, "config");
         let tmp = format!("{}/{}", RUSTFS_META_BUCKET, "tmp");
-        let defaults = vec![buckets.as_str(), multipart.as_str(), config.as_str(), tmp.as_str()];
+
+        let defaults = vec![
+            buckets.as_str(),
+            multipart.as_str(),
+            config.as_str(),
+            tmp.as_str(),
+            RUSTFS_META_TMP_DELETED_BUCKET,
+        ];
 
         self.make_volumes(defaults).await
     }
@@ -308,22 +378,22 @@ impl LocalDisk {
     #[allow(unreachable_code)]
     #[allow(unused_variables)]
     pub async fn move_to_trash(&self, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
-        if recursive {
-            remove_all_std(delete_path).map_err(to_volume_error)?;
-        } else {
-            remove_std(delete_path).map_err(to_file_error)?;
-        }
+        // if recursive {
+        //     remove_all_std(delete_path).map_err(to_volume_error)?;
+        // } else {
+        //     remove_std(delete_path).map_err(to_file_error)?;
+        // }
 
-        return Ok(());
+        // return Ok(());
 
         // TODO: 异步通知 检测硬盘空间 清空回收站
 
         let trash_path = self.get_object_path(super::RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
-        if let Some(parent) = trash_path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).await?;
-            }
-        }
+        // if let Some(parent) = trash_path.parent() {
+        //     if !parent.exists() {
+        //         fs::create_dir_all(parent).await?;
+        //     }
+        // }
 
         let err = if recursive {
             rename_all(delete_path, trash_path, self.get_bucket_path(super::RUSTFS_META_TMP_DELETED_BUCKET)?)

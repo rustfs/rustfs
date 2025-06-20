@@ -6,6 +6,7 @@ use std::{
 use super::error::Result;
 use crate::disk::error_conv::to_file_error;
 use tokio::fs;
+use tracing::warn;
 
 use super::error::DiskError;
 
@@ -113,7 +114,7 @@ pub async fn rename_all(
     Ok(())
 }
 
-pub async fn reliable_rename(
+async fn reliable_rename(
     src_file_path: impl AsRef<Path>,
     dst_file_path: impl AsRef<Path>,
     base_dir: impl AsRef<Path>,
@@ -128,17 +129,21 @@ pub async fn reliable_rename(
     let mut i = 0;
     loop {
         if let Err(e) = super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
-            if e.kind() == io::ErrorKind::NotFound && i == 0 {
+            if e.kind() == io::ErrorKind::NotFound {
+                break;
+            }
+
+            if i == 0 {
                 i += 1;
                 continue;
             }
-            // info!(
-            //     "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
-            //     src_file_path.as_ref(),
-            //     dst_file_path.as_ref(),
-            //     base_dir.as_ref(),
-            //     e
-            // );
+            warn!(
+                "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
+                src_file_path.as_ref(),
+                dst_file_path.as_ref(),
+                base_dir.as_ref(),
+                e
+            );
             return Err(e);
         }
 

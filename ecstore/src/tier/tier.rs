@@ -458,5 +458,5 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
 }
 
 pub fn is_err_config_not_found(err: &StorageError) -> bool {
-    matches!(err, StorageError::ObjectNotFound(_, _))
+    matches!(err, StorageError::ObjectNotFound(_, _)) || err == &StorageError::ConfigNotFound
 }
