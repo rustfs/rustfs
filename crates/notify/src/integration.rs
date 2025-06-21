@@ -1,14 +1,10 @@
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
 use crate::{
-    config::{parse_config, Config}, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry,
-    rules::BucketNotificationConfig,
-    stream,
-    Event,
-    StoreError,
-    Target,
-    KVS,
+    error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream, Event,
+    StoreError, Target,
 };
+use ecstore::config::{Config, KVS};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -122,12 +118,8 @@ impl NotificationSystem {
         info!("Initialize notification system...");
 
         let config = self.config.read().await;
-        debug!(
-            "Initializing notification system with config: {:?}",
-            *config
-        );
-        let targets: Vec<Box<dyn Target + Send + Sync>> =
-            self.registry.create_targets_from_config(&config).await?;
+        debug!("Initializing notification system with config: {:?}", *config);
+        let targets: Vec<Box<dyn Target + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
 
@@ -141,11 +133,7 @@ impl NotificationSystem {
                 error!("Target {} Initialization failed:{}", target.id(), e);
                 continue;
             }
-            debug!(
-                "Target {} initialized successfully,enabled:{}",
-                target_id,
-                target.is_enabled()
-            );
+            debug!("Target {} initialized successfully,enabled:{}", target_id, target.is_enabled());
             // Check if the target is enabled and has storage
             if target.is_enabled() {
                 if let Some(store) = target.store() {
@@ -161,31 +149,17 @@ impl NotificationSystem {
                     let semaphore = self.concurrency_limiter.clone();
 
                     // Encapsulated enhanced version of start_event_stream
-                    let cancel_tx = self.enhanced_start_event_stream(
-                        store_clone,
-                        target_arc,
-                        metrics,
-                        semaphore,
-                    );
+                    let cancel_tx = self.enhanced_start_event_stream(store_clone, target_arc, metrics, semaphore);
 
                     // Start event stream processing and save cancel sender
                     let target_id_clone = target_id.clone();
                     cancellers.insert(target_id, cancel_tx);
-                    info!(
-                        "Event stream processing for target {} is started successfully",
-                        target_id_clone
-                    );
+                    info!("Event stream processing for target {} is started successfully", target_id_clone);
                 } else {
-                    info!(
-                        "Target {} No storage is configured, event stream processing is skipped",
-                        target_id
-                    );
+                    info!("Target {} No storage is configured, event stream processing is skipped", target_id);
                 }
             } else {
-                info!(
-                    "Target {} is not enabled, event stream processing is skipped",
-                    target_id
-                );
+                info!("Target {} is not enabled, event stream processing is skipped", target_id);
             }
         }
 
@@ -205,70 +179,56 @@ impl NotificationSystem {
         self.notifier.target_list().read().await.keys()
     }
 
-    /// 通过 TargetID 精确地移除一个 Target 及其相关资源。
+    /// Accurately remove a Target and its related resources through TargetID.
     ///
-    /// 这个过程包括：
-    /// 1. 停止与该 Target 关联的事件流（如果存在）。
-    /// 2. 从 Notifier 的活动列表中移除该 Target 实例。
-    /// 3. 从系统配置中移除该 Target 的配置项。
+    /// This process includes:
+    /// 1. Stop the event stream associated with the Target (if present).
+    /// 2. Remove the Target instance from the activity list of Notifier.
+    /// 3. Remove the configuration item of the Target from the system configuration.
     ///
-    /// # 参数
-    /// * `target_id` - 要移除的 Target 的唯一标识符。
+    /// # Parameters
+    /// * `target_id` - The unique identifier of the Target to be removed.
     ///
-    /// # 返回
-    /// 如果成功，则返回 `Ok(())`。
-    pub async fn remove_target(
-        &self,
-        target_id: &TargetID,
-        target_type: &str,
-    ) -> Result<(), NotificationError> {
+    /// # return
+    /// If successful, return `Ok(())`.
+    pub async fn remove_target(&self, target_id: &TargetID, target_type: &str) -> Result<(), NotificationError> {
         info!("Attempting to remove target: {}", target_id);
 
-        // 步骤 1: 停止事件流 (如果存在)
+        // Step 1: Stop the event stream (if present)
         let mut cancellers_guard = self.stream_cancellers.write().await;
         if let Some(cancel_tx) = cancellers_guard.remove(target_id) {
             info!("Stopping event stream for target {}", target_id);
-            // 发送停止信号，即使失败也继续执行，因为接收端可能已经关闭
+            // Send a stop signal and continue execution even if it fails, because the receiver may have been closed
             if let Err(e) = cancel_tx.send(()).await {
-                error!(
-                    "Failed to send stop signal to target {} stream: {}",
-                    target_id, e
-                );
+                error!("Failed to send stop signal to target {} stream: {}", target_id, e);
             }
         } else {
-            info!(
-                "No active event stream found for target {}, skipping stop.",
-                target_id
-            );
+            info!("No active event stream found for target {}, skipping stop.", target_id);
         }
         drop(cancellers_guard);
 
-        // 步骤 2: 从 Notifier 的活动列表中移除 Target 实例
-        // TargetList::remove_target_only 会调用 target.close()
+        // Step 2: Remove the Target instance from the activity list of Notifier
+        // TargetList::remove_target_only will call target.close()
         let target_list = self.notifier.target_list();
         let mut target_list_guard = target_list.write().await;
-        if target_list_guard
-            .remove_target_only(target_id)
-            .await
-            .is_some()
-        {
+        if target_list_guard.remove_target_only(target_id).await.is_some() {
             info!("Removed target {} from the active list.", target_id);
         } else {
             warn!("Target {} was not found in the active list.", target_id);
         }
         drop(target_list_guard);
 
-        // 步骤 3: 从持久化配置中移除 Target
+        // Step 3: Remove Target from persistent configuration
         let mut config_guard = self.config.write().await;
         let mut changed = false;
-        if let Some(targets_of_type) = config_guard.get_mut(target_type) {
+        if let Some(targets_of_type) = config_guard.0.get_mut(target_type) {
             if targets_of_type.remove(&target_id.name).is_some() {
                 info!("Removed target {} from the configuration.", target_id);
                 changed = true;
             }
-            // 如果该类型下已无任何 target，则移除该类型条目
+            // If there are no targets under this type, remove the entry for this type
             if targets_of_type.is_empty() {
-                config_guard.remove(target_type);
+                config_guard.0.remove(target_type);
             }
         }
 
@@ -291,18 +251,11 @@ impl NotificationSystem {
     /// Result<(), NotificationError>
     /// If the target configuration is successfully set, it returns Ok(()).
     /// If the target configuration is invalid, it returns Err(NotificationError::Configuration).
-    pub async fn set_target_config(
-        &self,
-        target_type: &str,
-        target_name: &str,
-        kvs: KVS,
-    ) -> Result<(), NotificationError> {
-        info!(
-            "Setting config for target {} of type {}",
-            target_name, target_type
-        );
+    pub async fn set_target_config(&self, target_type: &str, target_name: &str, kvs: KVS) -> Result<(), NotificationError> {
+        info!("Setting config for target {} of type {}", target_name, target_type);
         let mut config_guard = self.config.write().await;
         config_guard
+            .0
             .entry(target_type.to_string())
             .or_default()
             .insert(target_name.to_string(), kvs);
@@ -331,24 +284,17 @@ impl NotificationSystem {
     ///
     /// If the target configuration is successfully removed, it returns Ok(()).
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
-    pub async fn remove_target_config(
-        &self,
-        target_type: &str,
-        target_name: &str,
-    ) -> Result<(), NotificationError> {
-        info!(
-            "Removing config for target {} of type {}",
-            target_name, target_type
-        );
+    pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
+        info!("Removing config for target {} of type {}", target_name, target_type);
         let mut config_guard = self.config.write().await;
         let mut changed = false;
 
-        if let Some(targets) = config_guard.get_mut(target_type) {
+        if let Some(targets) = config_guard.0.get_mut(target_type) {
             if targets.remove(target_name).is_some() {
                 changed = true;
             }
             if targets.is_empty() {
-                config_guard.remove(target_type);
+                config_guard.0.remove(target_type);
             }
         }
 
@@ -358,10 +304,7 @@ impl NotificationSystem {
             drop(config_guard);
             self.reload_config(new_config).await
         } else {
-            info!(
-                "Target {} of type {} not found, no changes made.",
-                target_name, target_type
-            );
+            info!("Target {} of type {} not found, no changes made.", target_name, target_type);
             Ok(())
         }
     }
@@ -402,10 +345,7 @@ impl NotificationSystem {
             .await
             .map_err(NotificationError::Target)?;
 
-        info!(
-            "{} notification targets were created from the new configuration",
-            targets.len()
-        );
+        info!("{} notification targets were created from the new configuration", targets.len());
 
         // Start new event stream processing for each storage enabled target
         let mut new_cancellers = HashMap::new();
@@ -432,32 +372,18 @@ impl NotificationSystem {
                     let semaphore = self.concurrency_limiter.clone();
 
                     // Encapsulated enhanced version of start_event_stream
-                    let cancel_tx = self.enhanced_start_event_stream(
-                        store_clone,
-                        target_arc,
-                        metrics,
-                        semaphore,
-                    );
+                    let cancel_tx = self.enhanced_start_event_stream(store_clone, target_arc, metrics, semaphore);
 
                     // Start event stream processing and save cancel sender
                     // let cancel_tx = start_event_stream(store_clone, target_clone);
                     let target_id_clone = target_id.clone();
                     new_cancellers.insert(target_id, cancel_tx);
-                    info!(
-                        "Event stream processing of target {} is restarted successfully",
-                        target_id_clone
-                    );
+                    info!("Event stream processing of target {} is restarted successfully", target_id_clone);
                 } else {
-                    info!(
-                        "Target {} No storage is configured, event stream processing is skipped",
-                        target_id
-                    );
+                    info!("Target {} No storage is configured, event stream processing is skipped", target_id);
                 }
             } else {
-                info!(
-                    "Target {} disabled, event stream processing is skipped",
-                    target_id
-                );
+                info!("Target {} disabled, event stream processing is skipped", target_id);
             }
         }
 
@@ -478,17 +404,12 @@ impl NotificationSystem {
     ) -> Result<(), NotificationError> {
         let arn_list = self.notifier.get_arn_list(&config.region).await;
         if arn_list.is_empty() {
-            return Err(NotificationError::Configuration(
-                "No targets configured".to_string(),
-            ));
+            return Err(NotificationError::Configuration("No targets configured".to_string()));
         }
         info!("Available ARNs: {:?}", arn_list);
         // Validate the configuration against the available ARNs
         if let Err(e) = config.validate(&config.region, &arn_list) {
-            debug!(
-                "Bucket notification config validation region:{} failed: {}",
-                &config.region, e
-            );
+            debug!("Bucket notification config validation region:{} failed: {}", &config.region, e);
             if !e.to_string().contains("ARN not found") {
                 return Err(NotificationError::BucketNotification(e.to_string()));
             } else {
@@ -498,46 +419,24 @@ impl NotificationSystem {
 
         // let rules_map = config.to_rules_map();
         let rules_map = config.get_rules_map();
-        self.notifier
-            .add_rules_map(bucket_name, rules_map.clone())
-            .await;
+        self.notifier.add_rules_map(bucket_name, rules_map.clone()).await;
         info!("Loaded notification config for bucket: {}", bucket_name);
         Ok(())
     }
 
     /// Sends an event
-    pub async fn send_event(
-        &self,
-        bucket_name: &str,
-        event_name: &str,
-        object_key: &str,
-        event: Event,
-    ) {
-        self.notifier
-            .send(bucket_name, event_name, object_key, event)
-            .await;
+    pub async fn send_event(&self, bucket_name: &str, event_name: &str, object_key: &str, event: Event) {
+        self.notifier.send(bucket_name, event_name, object_key, event).await;
     }
 
     /// Obtain system status information
     pub fn get_status(&self) -> HashMap<String, String> {
         let mut status = HashMap::new();
 
-        status.insert(
-            "uptime_seconds".to_string(),
-            self.metrics.uptime().as_secs().to_string(),
-        );
-        status.insert(
-            "processing_events".to_string(),
-            self.metrics.processing_count().to_string(),
-        );
-        status.insert(
-            "processed_events".to_string(),
-            self.metrics.processed_count().to_string(),
-        );
-        status.insert(
-            "failed_events".to_string(),
-            self.metrics.failed_count().to_string(),
-        );
+        status.insert("uptime_seconds".to_string(), self.metrics.uptime().as_secs().to_string());
+        status.insert("processing_events".to_string(), self.metrics.processing_count().to_string());
+        status.insert("processed_events".to_string(), self.metrics.processed_count().to_string());
+        status.insert("failed_events".to_string(), self.metrics.failed_count().to_string());
 
         status
     }
@@ -548,10 +447,7 @@ impl NotificationSystem {
 
         // Get the number of active targets
         let active_targets = self.stream_cancellers.read().await.len();
-        info!(
-            "Stops {} active event stream processing tasks",
-            active_targets
-        );
+        info!("Stops {} active event stream processing tasks", active_targets);
 
         let mut cancellers = self.stream_cancellers.write().await;
         for (target_id, cancel_tx) in cancellers.drain() {
@@ -579,16 +475,12 @@ impl Drop for NotificationSystem {
 }
 
 /// Loads configuration from a file
-pub async fn load_config_from_file(
-    path: &str,
-    system: &NotificationSystem,
-) -> Result<(), NotificationError> {
-    let config_str = tokio::fs::read_to_string(path).await.map_err(|e| {
-        NotificationError::Configuration(format!("Failed to read config file: {}", e))
-    })?;
+pub async fn load_config_from_file(path: &str, system: &NotificationSystem) -> Result<(), NotificationError> {
+    let config_data = tokio::fs::read(path)
+        .await
+        .map_err(|e| NotificationError::Configuration(format!("Failed to read config file: {}", e)))?;
 
-    let config = parse_config(&config_str)
+    let config = Config::unmarshal(config_data.as_slice())
         .map_err(|e| NotificationError::Configuration(format!("Failed to parse config: {}", e)))?;
-
     system.reload_config(config).await
 }

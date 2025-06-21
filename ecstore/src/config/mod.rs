@@ -5,7 +5,7 @@ pub mod storageclass;
 
 use crate::error::Result;
 use crate::store::ECStore;
-use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
+use com::{lookup_configs, read_config_without_migrate, STORAGE_CLASS_SUB_SYS};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,7 +64,7 @@ pub struct KV {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct KVS(Vec<KV>);
+pub struct KVS(pub Vec<KV>);
 
 impl Default for KVS {
     fn default() -> Self {
@@ -91,7 +91,7 @@ impl KVS {
 }
 
 #[derive(Debug, Clone)]
-pub struct Config(HashMap<String, HashMap<String, KVS>>);
+pub struct Config(pub HashMap<String, HashMap<String, KVS>>);
 
 impl Default for Config {
     fn default() -> Self {

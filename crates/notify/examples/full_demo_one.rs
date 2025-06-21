@@ -1,8 +1,13 @@
+use ecstore::config::{Config, KV, KVS};
 // Using Global Accessories
-use rustfs_config::notify;
 use rustfs_notify::arn::TargetID;
+use rustfs_notify::factory::{
+    DEFAULT_TARGET, ENABLE, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
+    NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+};
 use rustfs_notify::global::notification_system;
-use rustfs_notify::{init_logger, BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, KVS};
+use rustfs_notify::store::DEFAULT_LIMIT;
+use rustfs_notify::{init_logger, BucketNotificationConfig, Event, EventName, LogLevel, NotificationError};
 use std::time::Duration;
 use tracing::info;
 
@@ -14,25 +19,46 @@ async fn main() -> Result<(), NotificationError> {
     let system = notification_system();
 
     // --- Initial configuration ---
-    let mut config = rustfs_notify::Config::new();
+    let mut config = Config::new();
     let current_root = rustfs_utils::dirs::get_project_root().expect("failed to get project root");
     // Webhook target
-    let mut webhook_kvs = KVS::new();
-    webhook_kvs.set("enable", "on");
-    webhook_kvs.set("endpoint", "http://127.0.0.1:3020/webhook");
-    // webhook_kvs.set("queue_dir", "./logs/webhook");
-    webhook_kvs.set(
-        "queue_dir",
-        current_root
-            .clone()
-            .join("/deploy/logs/notify/webhook")
-            .to_str()
-            .unwrap()
-            .to_string(),
-    );
+    let webhook_kvs_vec = vec![
+        KV {
+            key: ENABLE.to_string(),
+            value: "on".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_ENDPOINT.to_string(),
+            value: "http://127.0.0.1:3020/webhook".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_AUTH_TOKEN.to_string(),
+            value: "secret-token".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_QUEUE_DIR.to_string(),
+            value: current_root
+                .clone()
+                .join("../../deploy/logs/notify/webhook")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_QUEUE_LIMIT.to_string(),
+            value: DEFAULT_LIMIT.to_string(),
+            hidden_if_empty: false,
+        },
+    ];
+    let webhook_kvs = KVS(webhook_kvs_vec);
+
     let mut webhook_targets = std::collections::HashMap::new();
-    webhook_targets.insert("1".to_string(), webhook_kvs);
-    config.insert("notify_webhook".to_string(), webhook_targets);
+    webhook_targets.insert(DEFAULT_TARGET.to_string(), webhook_kvs);
+    config.0.insert(NOTIFY_WEBHOOK_SUB_SYS.to_string(), webhook_targets);
 
     // Load the initial configuration and initialize the system
     *system.config.write().await = config;
@@ -43,17 +69,61 @@ async fn main() -> Result<(), NotificationError> {
 
     // --- Dynamically update system configuration: Add an MQTT Target ---
     info!("\n---> Dynamically adding MQTT target...");
-    let mut mqtt_kvs = KVS::new();
-    mqtt_kvs.set("enable", "on");
-    mqtt_kvs.set("broker", "mqtt://localhost:1883");
-    mqtt_kvs.set("topic", "rustfs/events");
-    mqtt_kvs.set("qos", "1");
-    mqtt_kvs.set("username", "test");
-    mqtt_kvs.set("password", "123456");
-    mqtt_kvs.set("queue_limit", "10000");
-    // mqtt_kvs.set("queue_dir", "./logs/mqtt");
-    mqtt_kvs.set("queue_dir", current_root.join("/deploy/logs/notify/mqtt").to_str().unwrap().to_string());
-    system.set_target_config("notify_mqtt", "1", mqtt_kvs).await?;
+
+    let mqtt_kvs_vec = vec![
+        KV {
+            key: ENABLE.to_string(),
+            value: "on".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_BROKER.to_string(),
+            value: "mqtt://localhost:1883".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_TOPIC.to_string(),
+            value: "rustfs/events".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_QOS.to_string(),
+            value: "1".to_string(), // AtLeastOnce
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_USERNAME.to_string(),
+            value: "test".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_PASSWORD.to_string(),
+            value: "123456".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_QUEUE_DIR.to_string(),
+            value: current_root
+                .join("../../deploy/logs/notify/mqtt")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_QUEUE_LIMIT.to_string(),
+            value: DEFAULT_LIMIT.to_string(),
+            hidden_if_empty: false,
+        },
+    ];
+
+    let mqtt_kvs = KVS(mqtt_kvs_vec);
+    // let mut mqtt_targets = std::collections::HashMap::new();
+    // mqtt_targets.insert(DEFAULT_TARGET.to_string(), mqtt_kvs.clone());
+
+    system
+        .set_target_config(NOTIFY_MQTT_SUB_SYS, DEFAULT_TARGET, mqtt_kvs)
+        .await?;
     info!("✅ MQTT target added and system reloaded.");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -64,12 +134,12 @@ async fn main() -> Result<(), NotificationError> {
     bucket_config.add_rule(
         &[EventName::ObjectCreatedPut],
         "*".to_string(),
-        TargetID::new("1".to_string(), "webhook".to_string()),
+        TargetID::new(DEFAULT_TARGET.to_string(), "webhook".to_string()),
     );
     bucket_config.add_rule(
         &[EventName::ObjectCreatedPut],
         "*".to_string(),
-        TargetID::new("1".to_string(), "mqtt".to_string()),
+        TargetID::new(DEFAULT_TARGET.to_string(), "mqtt".to_string()),
     );
     system.load_bucket_notification_config("my-bucket", &bucket_config).await?;
     info!("✅ Bucket 'my-bucket' config loaded.");

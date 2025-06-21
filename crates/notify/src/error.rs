@@ -23,7 +23,7 @@ pub enum StoreError {
     NotFound,
 
     #[error("Invalid entry: {0}")]
-    Internal(String), // 新增内部错误类型
+    Internal(String), // Added internal error type
 }
 
 /// Error types for targets

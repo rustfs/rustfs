@@ -6,7 +6,6 @@
 
 pub mod args;
 pub mod arn;
-pub mod config;
 pub mod error;
 pub mod event;
 pub mod factory;
@@ -21,7 +20,6 @@ pub mod target;
 pub mod utils;
 
 // Re-exports
-pub use config::{parse_config, Config, KV, KVS};
 pub use error::{NotificationError, StoreError, TargetError};
 pub use event::{Event, EventLog, EventName};
 pub use integration::NotificationSystem;

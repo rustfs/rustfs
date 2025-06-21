@@ -3,7 +3,6 @@ use crate::store::{Key, Store};
 use crate::{Event, StoreError, TargetError};
 use async_trait::async_trait;
 
-pub mod constants;
 pub mod mqtt;
 pub mod webhook;
 

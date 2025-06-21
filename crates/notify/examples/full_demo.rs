@@ -1,5 +1,11 @@
+use ecstore::config::{Config, KV, KVS};
 use rustfs_notify::arn::TargetID;
+use rustfs_notify::factory::{
+    DEFAULT_TARGET, ENABLE, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
+    NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+};
 use rustfs_notify::global::notification_system;
+use rustfs_notify::store::DEFAULT_LIMIT;
 use rustfs_notify::{init_logger, BucketNotificationConfig, Event, EventName, LogLevel, NotificationError};
 use std::time::Duration;
 use tracing::info;
@@ -11,51 +17,100 @@ async fn main() -> Result<(), NotificationError> {
     let system = notification_system();
 
     // --- Initial configuration (Webhook and MQTT) ---
-    let mut config = rustfs_notify::Config::new();
+    let mut config = Config::new();
     let current_root = rustfs_utils::dirs::get_project_root().expect("failed to get project root");
     println!("Current project root: {}", current_root.display());
-    // Webhook target configuration
-    let mut webhook_kvs = rustfs_notify::KVS::new();
-    webhook_kvs.set("enable", "on");
-    webhook_kvs.set("endpoint", "http://127.0.0.1:3020/webhook");
-    webhook_kvs.set("auth_token", "secret-token");
-    // webhook_kvs.set("queue_dir", "/tmp/data/webhook");
-    webhook_kvs.set(
-        "queue_dir",
-        current_root
-            .clone()
-            .join("../../deploy/logs/notify/webhook")
-            .to_str()
-            .unwrap()
-            .to_string(),
-    );
-    webhook_kvs.set("queue_limit", "10000");
+
+    let webhook_kvs_vec = vec![
+        KV {
+            key: ENABLE.to_string(),
+            value: "on".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_ENDPOINT.to_string(),
+            value: "http://127.0.0.1:3020/webhook".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_AUTH_TOKEN.to_string(),
+            value: "secret-token".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_QUEUE_DIR.to_string(),
+            value: current_root
+                .clone()
+                .join("../../deploy/logs/notify/webhook")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: WEBHOOK_QUEUE_LIMIT.to_string(),
+            value: DEFAULT_LIMIT.to_string(),
+            hidden_if_empty: false,
+        },
+    ];
+    let webhook_kvs = KVS(webhook_kvs_vec);
+
     let mut webhook_targets = std::collections::HashMap::new();
-    webhook_targets.insert("1".to_string(), webhook_kvs);
-    config.insert("notify_webhook".to_string(), webhook_targets);
+    webhook_targets.insert(DEFAULT_TARGET.to_string(), webhook_kvs);
+    config.0.insert(NOTIFY_WEBHOOK_SUB_SYS.to_string(), webhook_targets);
 
     // MQTT target configuration
-    let mut mqtt_kvs = rustfs_notify::KVS::new();
-    mqtt_kvs.set("enable", "on");
-    mqtt_kvs.set("broker", "mqtt://localhost:1883");
-    mqtt_kvs.set("topic", "rustfs/events");
-    mqtt_kvs.set("qos", "1"); // AtLeastOnce
-    mqtt_kvs.set("username", "test");
-    mqtt_kvs.set("password", "123456");
-    // webhook_kvs.set("queue_dir", "/tmp/data/mqtt");
-    mqtt_kvs.set(
-        "queue_dir",
-        current_root
-            .join("../../deploy/logs/notify/mqtt")
-            .to_str()
-            .unwrap()
-            .to_string(),
-    );
-    mqtt_kvs.set("queue_limit", "10000");
+    let mqtt_kvs_vec = vec![
+        KV {
+            key: ENABLE.to_string(),
+            value: "on".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_BROKER.to_string(),
+            value: "mqtt://localhost:1883".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_TOPIC.to_string(),
+            value: "rustfs/events".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_QOS.to_string(),
+            value: "1".to_string(), // AtLeastOnce
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_USERNAME.to_string(),
+            value: "test".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_PASSWORD.to_string(),
+            value: "123456".to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_QUEUE_DIR.to_string(),
+            value: current_root
+                .join("../../deploy/logs/notify/mqtt")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MQTT_QUEUE_LIMIT.to_string(),
+            value: DEFAULT_LIMIT.to_string(),
+            hidden_if_empty: false,
+        },
+    ];
 
+    let mqtt_kvs = KVS(mqtt_kvs_vec);
     let mut mqtt_targets = std::collections::HashMap::new();
-    mqtt_targets.insert("1".to_string(), mqtt_kvs);
-    config.insert("notify_mqtt".to_string(), mqtt_targets);
+    mqtt_targets.insert(DEFAULT_TARGET.to_string(), mqtt_kvs);
+    config.0.insert(NOTIFY_MQTT_SUB_SYS.to_string(), mqtt_targets);
 
     // Load the configuration and initialize the system
     *system.config.write().await = config;
@@ -71,15 +126,15 @@ async fn main() -> Result<(), NotificationError> {
 
     // --- Exactly delete a Target (e.g. MQTT) ---
     info!("\n---> Removing MQTT target...");
-    let mqtt_target_id = TargetID::new("1".to_string(), "mqtt".to_string());
-    system.remove_target(&mqtt_target_id, "notify_mqtt").await?;
+    let mqtt_target_id = TargetID::new(DEFAULT_TARGET.to_string(), "mqtt".to_string());
+    system.remove_target(&mqtt_target_id, NOTIFY_MQTT_SUB_SYS).await?;
     info!("✅ MQTT target removed.");
 
     // --- Query the activity's Target again ---
     let active_targets_after_removal = system.get_active_targets().await;
     info!("\n---> Active targets after removal: {:?}", active_targets_after_removal);
     assert_eq!(active_targets_after_removal.len(), 1);
-    assert_eq!(active_targets_after_removal[0].id, "1".to_string());
+    assert_eq!(active_targets_after_removal[0].id, DEFAULT_TARGET.to_string());
 
     // --- Send events for verification ---
     // Configure a rule to point to the Webhook and deleted MQTT
@@ -87,12 +142,12 @@ async fn main() -> Result<(), NotificationError> {
     bucket_config.add_rule(
         &[EventName::ObjectCreatedPut],
         "*".to_string(),
-        TargetID::new("1".to_string(), "webhook".to_string()),
+        TargetID::new(DEFAULT_TARGET.to_string(), "webhook".to_string()),
     );
     bucket_config.add_rule(
         &[EventName::ObjectCreatedPut],
         "*".to_string(),
-        TargetID::new("1".to_string(), "mqtt".to_string()), // This rule will match, but the Target cannot be found
+        TargetID::new(DEFAULT_TARGET.to_string(), "mqtt".to_string()), // This rule will match, but the Target cannot be found
     );
     system.load_bucket_notification_config("my-bucket", &bucket_config).await?;
 
