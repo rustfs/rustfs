@@ -38,6 +38,7 @@ rand = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 transform-stream = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+sysinfo = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -62,4 +63,5 @@ crypto = ["dep:base64-simd", "dep:hex-simd"]
 hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher"]
 os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
 integration = []  # integration test features
-full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress"]  # all features
+sys = ["dep:sysinfo"]  # system information features
+full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "sys"]  # all features

@@ -33,10 +33,13 @@ pub mod dirs;
 
 #[cfg(feature = "tls")]
 pub use certs::*;
+
 #[cfg(feature = "hash")]
 pub use hash::*;
+
 #[cfg(feature = "io")]
 pub use io::*;
+
 #[cfg(feature = "ip")]
 pub use ip::*;
 
@@ -45,3 +48,6 @@ pub use crypto::*;
 
 #[cfg(feature = "compress")]
 pub use compress::*;
+
+#[cfg(feature = "sys")]
+pub mod sys;
