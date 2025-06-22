@@ -92,6 +92,12 @@ pub enum NotificationError {
 
     #[error("System initialization error: {0}")]
     Initialization(String),
+
+    #[error("Notification system has already been initialized")]
+    AlreadyInitialized,
+
+    #[error("Io error: {0}")]
+    Io(std::io::Error),
 }
 
 impl From<url::ParseError> for TargetError {

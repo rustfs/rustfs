@@ -16,8 +16,8 @@ use bytes::Bytes;
 use chrono::DateTime;
 use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
-use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
 use ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
@@ -32,13 +32,13 @@ use ecstore::bucket::tagging::decode_tags;
 use ecstore::bucket::tagging::encode_tags;
 use ecstore::bucket::utils::serialize;
 use ecstore::bucket::versioning_sys::BucketVersioningSys;
-use ecstore::cmd::bucket_replication::ReplicationStatusType;
-use ecstore::cmd::bucket_replication::ReplicationType;
 use ecstore::cmd::bucket_replication::get_must_replicate_options;
 use ecstore::cmd::bucket_replication::must_replicate;
 use ecstore::cmd::bucket_replication::schedule_replication;
-use ecstore::compress::MIN_COMPRESSIBLE_SIZE;
+use ecstore::cmd::bucket_replication::ReplicationStatusType;
+use ecstore::cmd::bucket_replication::ReplicationType;
 use ecstore::compress::is_compressible;
+use ecstore::compress::MIN_COMPRESSIBLE_SIZE;
 use ecstore::error::StorageError;
 use ecstore::new_object_layer_fn;
 use ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -52,40 +52,42 @@ use ecstore::store_api::ObjectIO;
 use ecstore::store_api::ObjectOptions;
 use ecstore::store_api::ObjectToDelete;
 use ecstore::store_api::PutObjReader;
-use ecstore::store_api::StorageAPI; // use ecstore::store_api::RESERVED_METADATA_PREFIX;
+use ecstore::store_api::StorageAPI;
+// use ecstore::store_api::RESERVED_METADATA_PREFIX;
 use futures::StreamExt;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use policy::auth;
+use policy::policy::action::Action;
+use policy::policy::action::S3Action;
 use policy::policy::BucketPolicy;
 use policy::policy::BucketPolicyArgs;
 use policy::policy::Validator;
-use policy::policy::action::Action;
-use policy::policy::action::S3Action;
 use query::instance::make_rustfsms;
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
+use rustfs_notify::EventName;
 use rustfs_rio::CompressReader;
 use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
-use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::path::path_join_buf;
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_zip::CompressionFormat;
-use s3s::S3;
+use s3s::dto::*;
+use s3s::s3_error;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
-use s3s::dto::*;
-use s3s::s3_error;
+use s3s::S3;
 use s3s::{S3Request, S3Response};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
@@ -222,6 +224,21 @@ impl FS {
                 //     e_tag,
                 //     ..Default::default()
                 // };
+
+                // let event_args = rustfs_notify::event::EventArgs {
+                //     event_name: EventName::ObjectCreatedPut, // 或者其他相应的事件类型
+                //     bucket_name: bucket.clone(),
+                //     object: _obj_info.clone(), // clone() 或传递所需字段
+                //     req_params: crate::storage::global::extract_req_params(&req), // 假设有一个辅助函数来提取请求参数
+                //     resp_elements: crate::storage::global::extract_resp_elements(&output), // 假设有一个辅助函数来提取响应元素
+                //     host: crate::storage::global::get_request_host(&req.headers), // 假设的辅助函数
+                //     user_agent: crate::storage::global::get_request_user_agent(&req.headers), // 假设的辅助函数
+                // };
+                //
+                // // 异步调用，不会阻塞当前请求的响应
+                // tokio::spawn(async move {
+                //     rustfs_notify::notifier::GLOBAL_NOTIFIER.notify(event_args).await;
+                // });
             }
         }
 

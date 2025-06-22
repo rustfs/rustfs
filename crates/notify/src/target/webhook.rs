@@ -4,7 +4,6 @@ use crate::{
     arn::TargetID, error::TargetError,
     event::{Event, EventLog},
     store::{Key, Store},
-    utils,
     StoreError,
     Target,
 };
@@ -56,18 +55,14 @@ impl WebhookArgs {
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
-                return Err(TargetError::Configuration(
-                    "webhook queueDir path should be absolute".to_string(),
-                ));
+                return Err(TargetError::Configuration("webhook queueDir path should be absolute".to_string()));
             }
         }
 
         if !self.client_cert.is_empty() && self.client_key.is_empty()
             || self.client_cert.is_empty() && !self.client_key.is_empty()
         {
-            return Err(TargetError::Configuration(
-                "cert and key must be specified as a pair".to_string(),
-            ));
+            return Err(TargetError::Configuration("cert and key must be specified as a pair".to_string()));
         }
 
         Ok(())
@@ -79,7 +74,7 @@ pub struct WebhookTarget {
     id: TargetID,
     args: WebhookArgs,
     http_client: Arc<Client>,
-    // 添加 Send + Sync 约束确保线程安全
+    // Add Send + Sync constraints to ensure thread safety
     store: Option<Box<dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
     addr: String,
@@ -103,36 +98,35 @@ impl WebhookTarget {
     /// Creates a new WebhookTarget
     #[instrument(skip(args), fields(target_id = %id))]
     pub fn new(id: String, args: WebhookArgs) -> Result<Self, TargetError> {
-        // 首先验证参数
+        // First verify the parameters
         args.validate()?;
-        // 创建 TargetID
+        // Create a TargetID
         let target_id = TargetID::new(id, ChannelTargetType::Webhook.as_str().to_string());
-        // 构建 HTTP client
+        // Build HTTP client
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(utils::get_user_agent(utils::ServiceType::Basis));
+            .user_agent(rustfs_utils::sys::get_user_agent(rustfs_utils::sys::ServiceType::Basis));
 
-        // 补充证书处理逻辑
+        // Supplementary certificate processing logic
         if !args.client_cert.is_empty() && !args.client_key.is_empty() {
-            // 添加客户端证书
-            let cert = std::fs::read(&args.client_cert).map_err(|e| {
-                TargetError::Configuration(format!("Failed to read client cert: {}", e))
-            })?;
-            let key = std::fs::read(&args.client_key).map_err(|e| {
-                TargetError::Configuration(format!("Failed to read client key: {}", e))
-            })?;
+            // Add client certificate
+            let cert = std::fs::read(&args.client_cert)
+                .map_err(|e| TargetError::Configuration(format!("Failed to read client cert: {}", e)))?;
+            let key = std::fs::read(&args.client_key)
+                .map_err(|e| TargetError::Configuration(format!("Failed to read client key: {}", e)))?;
 
-            let identity = reqwest::Identity::from_pem(&[cert, key].concat()).map_err(|e| {
-                TargetError::Configuration(format!("Failed to create identity: {}", e))
-            })?;
+            let identity = reqwest::Identity::from_pem(&[cert, key].concat())
+                .map_err(|e| TargetError::Configuration(format!("Failed to create identity: {}", e)))?;
             client_builder = client_builder.identity(identity);
         }
 
-        let http_client = Arc::new(client_builder.build().map_err(|e| {
-            TargetError::Configuration(format!("Failed to build HTTP client: {}", e))
-        })?);
+        let http_client = Arc::new(
+            client_builder
+                .build()
+                .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {}", e)))?,
+        );
 
-        // 构建存储
+        // Build storage
         let queue_store = if !args.queue_dir.is_empty() {
             let queue_dir = PathBuf::from(&args.queue_dir).join(format!(
                 "rustfs-{}-{}-{}",
@@ -140,43 +134,30 @@ impl WebhookTarget {
                 target_id.name,
                 target_id.id
             ));
-            let store = super::super::store::QueueStore::<Event>::new(
-                queue_dir,
-                args.queue_limit,
-                STORE_EXTENSION,
-            );
+            let store = super::super::store::QueueStore::<Event>::new(queue_dir, args.queue_limit, STORE_EXTENSION);
 
             if let Err(e) = store.open() {
-                error!(
-                    "Failed to open store for Webhook target {}: {}",
-                    target_id.id, e
-                );
+                error!("Failed to open store for Webhook target {}: {}", target_id.id, e);
                 return Err(TargetError::Storage(format!("{}", e)));
             }
 
-            // 确保 QueueStore 实现的 Store trait 匹配预期的错误类型
-            Some(Box::new(store)
-                as Box<
-                    dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync,
-                >)
+            // Make sure that the Store trait implemented by QueueStore matches the expected error type
+            Some(Box::new(store) as Box<dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync>)
         } else {
             None
         };
 
-        // 解析地址
+        // resolved address
         let addr = {
             let host = args.endpoint.host_str().unwrap_or("localhost");
-            let port = args.endpoint.port().unwrap_or_else(|| {
-                if args.endpoint.scheme() == "https" {
-                    443
-                } else {
-                    80
-                }
-            });
+            let port = args
+                .endpoint
+                .port()
+                .unwrap_or_else(|| if args.endpoint.scheme() == "https" { 443 } else { 80 });
             format!("{}:{}", host, port)
         };
 
-        // 创建取消通道
+        // Create a cancel channel
         let (cancel_sender, _) = mpsc::channel(1);
         info!(target_id = %target_id.id, "Webhook target created");
         Ok(WebhookTarget {
@@ -202,10 +183,7 @@ impl WebhookTarget {
                     return Err(TargetError::NotConnected);
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to check if Webhook target {} is active: {}",
-                        self.id, e
-                    );
+                    error!("Failed to check if Webhook target {} is active: {}", self.id, e);
                     return Err(e);
                 }
             }
@@ -228,17 +206,13 @@ impl WebhookTarget {
             records: vec![event.clone()],
         };
 
-        let data = serde_json::to_vec(&log)
-            .map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {}", e)))?;
+        let data =
+            serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {}", e)))?;
 
         // Vec<u8> 转换为 String
-        let data_string = String::from_utf8(data.clone()).map_err(|e| {
-            TargetError::Encoding(format!("Failed to convert event data to UTF-8: {}", e))
-        })?;
-        debug!(
-            "Sending event to webhook target: {}, event log: {}",
-            self.id, data_string
-        );
+        let data_string = String::from_utf8(data.clone())
+            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {}", e)))?;
+        debug!("Sending event to webhook target: {}, event log: {}", self.id, data_string);
 
         // 构建请求
         let mut req_builder = self
@@ -256,8 +230,7 @@ impl WebhookTarget {
                 }
                 1 => {
                     // 只有令牌，需要添加 "Bearer" 前缀
-                    req_builder = req_builder
-                        .header("Authorization", format!("Bearer {}", self.args.auth_token));
+                    req_builder = req_builder.header("Authorization", format!("Bearer {}", self.args.auth_token));
                 }
                 _ => {
                     // 空字符串或其他情况，不添加认证头
@@ -305,16 +278,8 @@ impl Target for WebhookTarget {
             .map_err(|e| TargetError::Network(format!("Failed to resolve host: {}", e)))?
             .next()
             .ok_or_else(|| TargetError::Network("No address found".to_string()))?;
-        debug!(
-            "is_active socket addr: {},target id:{}",
-            socket_addr, self.id.id
-        );
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(socket_addr),
-        )
-        .await
-        {
+        debug!("is_active socket addr: {},target id:{}", socket_addr, self.id.id);
+        match tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(socket_addr)).await {
             Ok(Ok(_)) => {
                 debug!("Connection to {} is active", self.addr);
                 Ok(true)
@@ -334,9 +299,9 @@ impl Target for WebhookTarget {
     async fn save(&self, event: Event) -> Result<(), TargetError> {
         if let Some(store) = &self.store {
             // Call the store method directly, no longer need to acquire the lock
-            store.put(event).map_err(|e| {
-                TargetError::Storage(format!("Failed to save event to store: {}", e))
-            })?;
+            store
+                .put(event)
+                .map_err(|e| TargetError::Storage(format!("Failed to save event to store: {}", e)))?;
             debug!("Event saved to store for target: {}", self.id);
             Ok(())
         } else {
@@ -373,10 +338,7 @@ impl Target for WebhookTarget {
             Ok(event) => event,
             Err(StoreError::NotFound) => return Ok(()),
             Err(e) => {
-                return Err(TargetError::Storage(format!(
-                    "Failed to get event from store: {}",
-                    e
-                )));
+                return Err(TargetError::Storage(format!("Failed to get event from store: {}", e)));
             }
         };
 
@@ -388,23 +350,12 @@ impl Target for WebhookTarget {
         }
 
         // Use the immutable reference of the store to delete the event content corresponding to the key
-        debug!(
-            "Deleting event from store for target: {}, key:{}, start",
-            self.id,
-            key.to_string()
-        );
+        debug!("Deleting event from store for target: {}, key:{}, start", self.id, key.to_string());
         match store.del(&key) {
-            Ok(_) => debug!(
-                "Event deleted from store for target: {}, key:{}, end",
-                self.id,
-                key.to_string()
-            ),
+            Ok(_) => debug!("Event deleted from store for target: {}, key:{}, end", self.id, key.to_string()),
             Err(e) => {
                 error!("Failed to delete event from store: {}", e);
-                return Err(TargetError::Storage(format!(
-                    "Failed to delete event from store: {}",
-                    e
-                )));
+                return Err(TargetError::Storage(format!("Failed to delete event from store: {}", e)));
             }
         }
 
@@ -433,10 +384,7 @@ impl Target for WebhookTarget {
     async fn init(&self) -> Result<(), TargetError> {
         // If the target is disabled, return to success directly
         if !self.is_enabled() {
-            debug!(
-                "Webhook target {} is disabled, skipping initialization",
-                self.id
-            );
+            debug!("Webhook target {} is disabled, skipping initialization", self.id);
             return Ok(());
         }
 

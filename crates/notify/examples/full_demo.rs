@@ -1,7 +1,7 @@
-use ecstore::config::{Config, KV, KVS};
+use ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KV, KVS};
 use rustfs_notify::arn::TargetID;
 use rustfs_notify::factory::{
-    DEFAULT_TARGET, ENABLE, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
+    DEFAULT_TARGET, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
     NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
 use rustfs_notify::global::notification_system;
@@ -9,12 +9,20 @@ use rustfs_notify::store::DEFAULT_LIMIT;
 use rustfs_notify::{init_logger, BucketNotificationConfig, Event, EventName, LogLevel, NotificationError};
 use std::time::Duration;
 use tracing::info;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[tokio::main]
 async fn main() -> Result<(), NotificationError> {
     init_logger(LogLevel::Debug);
 
-    let system = notification_system();
+    let system = match notification_system() {
+        Some(sys) => sys,
+        None => {
+            let config = Config::new();
+            notification_system::initialize(config).await?;
+            notification_system().expect("Failed to initialize notification system")
+        }
+    };
 
     // --- Initial configuration (Webhook and MQTT) ---
     let mut config = Config::new();
@@ -23,8 +31,8 @@ async fn main() -> Result<(), NotificationError> {
 
     let webhook_kvs_vec = vec![
         KV {
-            key: ENABLE.to_string(),
-            value: "on".to_string(),
+            key: ENABLE_KEY.to_string(),
+            value: ENABLE_ON.to_string(),
             hidden_if_empty: false,
         },
         KV {
@@ -62,8 +70,8 @@ async fn main() -> Result<(), NotificationError> {
     // MQTT target configuration
     let mqtt_kvs_vec = vec![
         KV {
-            key: ENABLE.to_string(),
-            value: "on".to_string(),
+            key: ENABLE_KEY.to_string(),
+            value: ENABLE_ON.to_string(),
             hidden_if_empty: false,
         },
         KV {

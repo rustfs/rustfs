@@ -4,7 +4,6 @@
 //! similar to RustFS's notification system. It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
-pub mod args;
 pub mod arn;
 pub mod error;
 pub mod event;
@@ -17,11 +16,11 @@ pub mod rules;
 pub mod store;
 pub mod stream;
 pub mod target;
-pub mod utils;
 
 // Re-exports
 pub use error::{NotificationError, StoreError, TargetError};
-pub use event::{Event, EventLog, EventName};
+pub use event::{Event, EventArgs, EventLog, EventName};
+pub use global::{initialize, notification_system};
 pub use integration::NotificationSystem;
 pub use rules::BucketNotificationConfig;
 use std::io::IsTerminal;

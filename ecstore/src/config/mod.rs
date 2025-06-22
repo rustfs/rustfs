@@ -107,8 +107,8 @@ impl Config {
         cfg
     }
 
-    pub fn get_value(&self, subsys: &str, key: &str) -> Option<KVS> {
-        if let Some(m) = self.0.get(subsys) {
+    pub fn get_value(&self, sub_sys: &str, key: &str) -> Option<KVS> {
+        if let Some(m) = self.0.get(sub_sys) {
             m.get(key).cloned()
         } else {
             None

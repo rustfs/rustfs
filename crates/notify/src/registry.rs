@@ -4,7 +4,7 @@ use crate::{
     factory::{MQTTTargetFactory, TargetFactory, WebhookTargetFactory},
     target::Target,
 };
-use ecstore::config::{Config, KVS};
+use ecstore::config::{Config, ENABLE_KEY, ENABLE_OFF, ENABLE_ON, KVS};
 use std::collections::HashMap;
 use tracing::{error, info};
 
@@ -74,7 +74,7 @@ impl TargetRegistry {
             // Iterate through subsections (each representing a target instance)
             for (target_id, target_config) in subsections {
                 // Skip disabled targets
-                if target_config.lookup("enable").unwrap_or_else(|| "off".to_string()) != "on" {
+                if target_config.lookup(ENABLE_KEY).unwrap_or_else(|| ENABLE_OFF.to_string()) != ENABLE_ON {
                     continue;
                 }
 
@@ -93,10 +93,4 @@ impl TargetRegistry {
 
         Ok(targets)
     }
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn test_target_registry() {}
 }

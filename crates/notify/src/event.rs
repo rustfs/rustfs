@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use url::form_urlencoded;
 
 /// Error returned when parsing event name string fails。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,7 +297,7 @@ pub struct Bucket {
 }
 
 /// Represents the object that the event occurred on
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Object {
     /// The key (name) of the object
     pub key: String,
@@ -323,6 +324,7 @@ pub struct Object {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     /// The schema version of the event
+    #[serde(rename = "s3SchemaVersion")]
     pub schema_version: String,
     /// The ID of the configuration that triggered the event
     pub configuration_id: String,
@@ -340,11 +342,13 @@ pub struct Source {
     /// The port on the host
     pub port: String,
     /// The user agent that caused the event
+    #[serde(rename = "userAgent")]
     pub user_agent: String,
 }
 
 /// Represents a storage event
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Event {
     /// The version of the event
     pub event_version: String,
@@ -432,6 +436,85 @@ impl Event {
     pub fn mask(&self) -> u64 {
         self.event_name.mask()
     }
+
+    pub fn new(args: EventArgs) -> Self {
+        let event_time = Utc::now().naive_local();
+        let unique_id = match args.object.mod_time {
+            Some(t) => format!("{:X}", t.unix_timestamp_nanos()),
+            None => format!("{:X}", event_time.and_utc().timestamp_nanos_opt().unwrap_or(0)),
+        };
+
+        let mut resp_elements = args.resp_elements.clone();
+        resp_elements
+            .entry("x-amz-request-id".to_string())
+            .or_insert_with(|| "".to_string());
+        resp_elements
+            .entry("x-amz-id-2".to_string())
+            .or_insert_with(|| "".to_string());
+        // ... Filling of other response elements
+
+        // URL encoding of object keys
+        let key_name = form_urlencoded::byte_serialize(args.object.name.as_bytes()).collect::<String>();
+
+        let principal_id = args.req_params.get("principalId").cloned().unwrap_or_default();
+        let owner_identity = Identity {
+            principal_id: principal_id.clone(),
+        };
+        let user_identity = Identity { principal_id };
+
+        let mut s3_metadata = Metadata {
+            schema_version: "1.0".to_string(),
+            configuration_id: "Config".to_string(), // or from args
+            bucket: Bucket {
+                name: args.bucket_name.clone(),
+                owner_identity,
+                arn: format!("arn:aws:s3:::{}", args.bucket_name),
+            },
+            object: Object {
+                key: key_name,
+                version_id: Some(args.object.version_id.unwrap().to_string()),
+                sequencer: unique_id,
+                ..Default::default()
+            },
+        };
+
+        let is_removed_event = matches!(
+            args.event_name,
+            EventName::ObjectRemovedDelete | EventName::ObjectRemovedDeleteMarkerCreated
+        );
+
+        if !is_removed_event {
+            s3_metadata.object.size = Some(args.object.size);
+            s3_metadata.object.etag = args.object.etag.clone();
+            s3_metadata.object.content_type = args.object.content_type.clone();
+            // Filter out internal reserved metadata
+            let user_metadata = args
+                .object
+                .user_defined
+                .iter()
+                .filter(|&(k, v)| !k.to_lowercase().starts_with("x-amz-meta-internal-"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<String, String>>();
+            s3_metadata.object.user_metadata = Some(user_metadata);
+        }
+
+        Self {
+            event_version: "2.1".to_string(),
+            event_source: "rustfs:s3".to_string(),
+            aws_region: args.req_params.get("region").cloned().unwrap_or_default(),
+            event_time: event_time.and_utc(),
+            event_name: args.event_name,
+            user_identity,
+            request_parameters: args.req_params,
+            response_elements: resp_elements,
+            s3: s3_metadata,
+            source: Source {
+                host: args.host,
+                port: "".to_string(),
+                user_agent: args.user_agent,
+            },
+        }
+    }
 }
 
 /// Represents a log of events for sending to targets
@@ -443,4 +526,22 @@ pub struct EventLog {
     pub key: String,
     /// The list of events
     pub records: Vec<Event>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventArgs {
+    pub event_name: EventName,
+    pub bucket_name: String,
+    pub object: ecstore::store_api::ObjectInfo,
+    pub req_params: HashMap<String, String>,
+    pub resp_elements: HashMap<String, String>,
+    pub host: String,
+    pub user_agent: String,
+}
+
+impl EventArgs {
+    // Helper function to check if it is a copy request
+    pub fn is_replication_request(&self) -> bool {
+        self.req_params.contains_key("x-rustfs-source-replication-request")
+    }
 }

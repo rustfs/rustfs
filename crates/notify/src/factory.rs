@@ -4,7 +4,7 @@ use crate::{
     target::{mqtt::MQTTArgs, webhook::WebhookArgs, Target},
 };
 use async_trait::async_trait;
-use ecstore::config::KVS;
+use ecstore::config::{ENABLE_KEY, ENABLE_ON, KVS};
 use rumqttc::QoS;
 use std::time::Duration;
 use tracing::warn;
@@ -13,7 +13,6 @@ use url::Url;
 // --- Configuration Constants ---
 
 // General
-pub const ENABLE: &str = "enable";
 
 pub const DEFAULT_TARGET: &str = "1";
 
@@ -36,6 +35,9 @@ pub const NOTIFY_POSTGRES_SUB_SYS: &str = "notify_postgres";
 #[allow(dead_code)]
 pub const NOTIFY_REDIS_SUB_SYS: &str = "notify_redis";
 pub const NOTIFY_WEBHOOK_SUB_SYS: &str = "notify_webhook";
+
+#[allow(dead_code)]
+pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS];
 
 // Webhook Keys
 pub const WEBHOOK_ENDPOINT: &str = "endpoint";
@@ -111,8 +113,8 @@ impl TargetFactory for WebhookTargetFactory {
     async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target + Send + Sync>, TargetError> {
         let get = |base_env_key: &str, config_key: &str| get_config_value(&id, base_env_key, config_key, config);
 
-        let enable = get(ENV_WEBHOOK_ENABLE, ENABLE)
-            .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+        let enable = get(ENV_WEBHOOK_ENABLE, ENABLE_KEY)
+            .map(|v| v.eq_ignore_ascii_case(ENABLE_ON) || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
         if !enable {
@@ -151,8 +153,8 @@ impl TargetFactory for WebhookTargetFactory {
     fn validate_config(&self, id: &str, config: &KVS) -> Result<(), TargetError> {
         let get = |base_env_key: &str, config_key: &str| get_config_value(id, base_env_key, config_key, config);
 
-        let enable = get(ENV_WEBHOOK_ENABLE, ENABLE)
-            .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+        let enable = get(ENV_WEBHOOK_ENABLE, ENABLE_KEY)
+            .map(|v| v.eq_ignore_ascii_case(ENABLE_ON) || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
         if !enable {
@@ -189,8 +191,8 @@ impl TargetFactory for MQTTTargetFactory {
     async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target + Send + Sync>, TargetError> {
         let get = |base_env_key: &str, config_key: &str| get_config_value(&id, base_env_key, config_key, config);
 
-        let enable = get(ENV_MQTT_ENABLE, ENABLE)
-            .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+        let enable = get(ENV_MQTT_ENABLE, ENABLE_KEY)
+            .map(|v| v.eq_ignore_ascii_case(ENABLE_ON) || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
         if !enable {
@@ -252,8 +254,8 @@ impl TargetFactory for MQTTTargetFactory {
     fn validate_config(&self, id: &str, config: &KVS) -> Result<(), TargetError> {
         let get = |base_env_key: &str, config_key: &str| get_config_value(id, base_env_key, config_key, config);
 
-        let enable = get(ENV_MQTT_ENABLE, ENABLE)
-            .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+        let enable = get(ENV_MQTT_ENABLE, ENABLE_KEY)
+            .map(|v| v.eq_ignore_ascii_case(ENABLE_ON) || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
         if !enable {

@@ -40,7 +40,7 @@ impl NotificationMetrics {
         }
     }
 
-    // 提供公共方法增加计数
+    // Provide public methods to increase count
     pub fn increment_processing(&self) {
         self.processing_events.fetch_add(1, Ordering::Relaxed);
     }
@@ -55,7 +55,7 @@ impl NotificationMetrics {
         self.failed_events.fetch_add(1, Ordering::Relaxed);
     }
 
-    // 提供公共方法获取计数
+    // Provide public methods to get count
     pub fn processing_count(&self) -> usize {
         self.processing_events.load(Ordering::Relaxed)
     }
@@ -89,19 +89,13 @@ pub struct NotificationSystem {
     metrics: Arc<NotificationMetrics>,
 }
 
-impl Default for NotificationSystem {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NotificationSystem {
     /// Creates a new NotificationSystem
-    pub fn new() -> Self {
+    pub fn new(config: Config) -> Self {
         NotificationSystem {
             notifier: Arc::new(EventNotifier::new()),
             registry: Arc::new(TargetRegistry::new()),
-            config: Arc::new(RwLock::new(Config::new())),
+            config: Arc::new(RwLock::new(config)),
             stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
             concurrency_limiter: Arc::new(Semaphore::new(
                 std::env::var("RUSTFS_TARGET_STREAM_CONCURRENCY")
@@ -194,49 +188,43 @@ impl NotificationSystem {
     pub async fn remove_target(&self, target_id: &TargetID, target_type: &str) -> Result<(), NotificationError> {
         info!("Attempting to remove target: {}", target_id);
 
-        // Step 1: Stop the event stream (if present)
-        let mut cancellers_guard = self.stream_cancellers.write().await;
-        if let Some(cancel_tx) = cancellers_guard.remove(target_id) {
-            info!("Stopping event stream for target {}", target_id);
-            // Send a stop signal and continue execution even if it fails, because the receiver may have been closed
-            if let Err(e) = cancel_tx.send(()).await {
-                error!("Failed to send stop signal to target {} stream: {}", target_id, e);
-            }
-        } else {
-            info!("No active event stream found for target {}, skipping stop.", target_id);
-        }
-        drop(cancellers_guard);
+        let Some(store) = ecstore::global::new_object_layer_fn() else {
+            return Err(NotificationError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "errServerNotInitialized",
+            )));
+        };
 
-        // Step 2: Remove the Target instance from the activity list of Notifier
-        // TargetList::remove_target_only will call target.close()
-        let target_list = self.notifier.target_list();
-        let mut target_list_guard = target_list.write().await;
-        if target_list_guard.remove_target_only(target_id).await.is_some() {
-            info!("Removed target {} from the active list.", target_id);
-        } else {
-            warn!("Target {} was not found in the active list.", target_id);
-        }
-        drop(target_list_guard);
+        let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
+            .await
+            .map_err(|e| NotificationError::Configuration(format!("Failed to read notification config: {}", e)))?;
 
-        // Step 3: Remove Target from persistent configuration
-        let mut config_guard = self.config.write().await;
         let mut changed = false;
-        if let Some(targets_of_type) = config_guard.0.get_mut(target_type) {
+        if let Some(targets_of_type) = new_config.0.get_mut(target_type) {
             if targets_of_type.remove(&target_id.name).is_some() {
                 info!("Removed target {} from the configuration.", target_id);
                 changed = true;
             }
-            // If there are no targets under this type, remove the entry for this type
             if targets_of_type.is_empty() {
-                config_guard.0.remove(target_type);
+                new_config.0.remove(target_type);
             }
         }
 
         if !changed {
             warn!("Target {} was not found in the configuration.", target_id);
+            return Ok(());
         }
 
-        Ok(())
+        if let Err(e) = ecstore::config::com::save_server_config(store, &new_config).await {
+            error!("Failed to save config for target removal: {}", e);
+            return Err(NotificationError::Configuration(format!("Failed to save config: {}", e)));
+        }
+
+        info!(
+            "Configuration updated and persisted for target {} removal. Reloading system...",
+            target_id
+        );
+        self.reload_config(new_config).await
     }
 
     /// Set or update a Target configuration.
@@ -253,18 +241,49 @@ impl NotificationSystem {
     /// If the target configuration is invalid, it returns Err(NotificationError::Configuration).
     pub async fn set_target_config(&self, target_type: &str, target_name: &str, kvs: KVS) -> Result<(), NotificationError> {
         info!("Setting config for target {} of type {}", target_name, target_type);
-        let mut config_guard = self.config.write().await;
-        config_guard
+        // 1. Get the storage handle
+        let Some(store) = ecstore::global::new_object_layer_fn() else {
+            return Err(NotificationError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "errServerNotInitialized",
+            )));
+        };
+
+        // 2. Read the latest configuration from storage
+        let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
+            .await
+            .map_err(|e| NotificationError::Configuration(format!("Failed to read notification config: {}", e)))?;
+
+        // 3. Modify the configuration copy
+        new_config
             .0
             .entry(target_type.to_string())
             .or_default()
             .insert(target_name.to_string(), kvs);
 
-        let new_config = config_guard.clone();
-        // Release the lock before calling reload_config
-        drop(config_guard);
+        // 4. Persist the new configuration
+        if let Err(e) = ecstore::config::com::save_server_config(store, &new_config).await {
+            error!("Failed to save notification config: {}", e);
+            return Err(NotificationError::Configuration(format!("Failed to save notification config: {}", e)));
+        }
 
-        self.reload_config(new_config).await
+        // 5. After the persistence is successful, the system will be reloaded to apply changes.
+        match self.reload_config(new_config).await {
+            Ok(_) => {
+                info!(
+                    "Target {} of type {} configuration updated and reloaded successfully",
+                    target_name, target_type
+                );
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to reload config for target {} of type {}: {}", target_name, target_type, e);
+                Err(NotificationError::Configuration(format!(
+                    "Configuration saved, but failed to reload: {}",
+                    e
+                )))
+            }
+        }
     }
 
     /// Removes all notification configurations for a bucket.
@@ -286,27 +305,42 @@ impl NotificationSystem {
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         info!("Removing config for target {} of type {}", target_name, target_type);
-        let mut config_guard = self.config.write().await;
-        let mut changed = false;
+        let Some(store) = ecstore::global::new_object_layer_fn() else {
+            return Err(NotificationError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "errServerNotInitialized",
+            )));
+        };
 
-        if let Some(targets) = config_guard.0.get_mut(target_type) {
+        let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
+            .await
+            .map_err(|e| NotificationError::Configuration(format!("Failed to read notification config: {}", e)))?;
+
+        let mut changed = false;
+        if let Some(targets) = new_config.0.get_mut(target_type) {
             if targets.remove(target_name).is_some() {
                 changed = true;
             }
             if targets.is_empty() {
-                config_guard.0.remove(target_type);
+                new_config.0.remove(target_type);
             }
         }
 
-        if changed {
-            let new_config = config_guard.clone();
-            // Release the lock before calling reload_config
-            drop(config_guard);
-            self.reload_config(new_config).await
-        } else {
+        if !changed {
             info!("Target {} of type {} not found, no changes made.", target_name, target_type);
-            Ok(())
+            return Ok(());
         }
+
+        if let Err(e) = ecstore::config::com::save_server_config(store, &new_config).await {
+            error!("Failed to save config for target removal: {}", e);
+            return Err(NotificationError::Configuration(format!("Failed to save config: {}", e)));
+        }
+
+        info!(
+            "Configuration updated and persisted for target {} removal. Reloading system...",
+            target_name
+        );
+        self.reload_config(new_config).await
     }
 
     /// Enhanced event stream startup function, including monitoring and concurrency control

@@ -115,59 +115,62 @@ async fn new_and_save_server_config<S: StorageAPI>(api: Arc<S>) -> Result<Config
     Ok(cfg)
 }
 
-pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
-    let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
-    let data = match read_config(api.clone(), config_file.as_str()).await {
-        Ok(res) => res,
-        Err(err) => {
-            return if err == Error::ConfigNotFound {
-                warn!("config not found, start to init");
-                let cfg = new_and_save_server_config(api).await?;
-                warn!("config init done");
-                Ok(cfg)
-            } else {
-                error!("read config err {:?}", &err);
-                Err(err)
-            };
-        }
-    };
+fn get_config_file() -> String {
+    format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE)
+}
 
-    read_server_config(api, data.as_slice()).await
+/// Handle the situation where the configuration file does not exist, create and save a new configuration
+async fn handle_missing_config<S: StorageAPI>(api: Arc<S>, context: &str) -> Result<Config> {
+    warn!("Configuration not found ({}): Start initializing new configuration", context);
+    let cfg = new_and_save_server_config(api).await?;
+    warn!("Configuration initialization complete ({})", context);
+    Ok(cfg)
+}
+
+/// Handle configuration file read errors
+fn handle_config_read_error(err: Error, file_path: &str) -> Result<Config> {
+    error!("Read configuration failed (path: '{}'): {:?}", file_path, err);
+    Err(err)
+}
+
+pub async fn read_config_without_migrate<S: StorageAPI>(api: Arc<S>) -> Result<Config> {
+    let config_file = get_config_file();
+
+    // Try to read the configuration file
+    match read_config(api.clone(), &config_file).await {
+        Ok(data) => read_server_config(api, &data).await,
+        Err(Error::ConfigNotFound) => handle_missing_config(api, "Read the main configuration").await,
+        Err(err) => handle_config_read_error(err, &config_file),
+    }
 }
 
 async fn read_server_config<S: StorageAPI>(api: Arc<S>, data: &[u8]) -> Result<Config> {
-    let cfg = {
-        if data.is_empty() {
-            let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
-            let cfg_data = match read_config(api.clone(), config_file.as_str()).await {
-                Ok(res) => res,
-                Err(err) => {
-                    return if err == Error::ConfigNotFound {
-                        warn!("config not found init start");
-                        let cfg = new_and_save_server_config(api).await?;
-                        warn!("config not found init done");
-                        Ok(cfg)
-                    } else {
-                        error!("read config err {:?}", &err);
-                        Err(err)
-                    };
-                }
-            };
-            // TODO: decrypt
+    // If the provided data is empty, try to read from the file again
+    if data.is_empty() {
+        let config_file = get_config_file();
+        warn!("Received empty configuration data, try to reread from '{}'", config_file);
 
-            Config::unmarshal(cfg_data.as_slice())?
-        } else {
-            Config::unmarshal(data)?
+        // Try to read the configuration again
+        match read_config(api.clone(), &config_file).await {
+            Ok(cfg_data) => {
+                // TODO: decrypt
+                let cfg = Config::unmarshal(&cfg_data)?;
+                return Ok(cfg.merge());
+            }
+            Err(Error::ConfigNotFound) => return handle_missing_config(api, "Read alternate configuration").await,
+            Err(err) => return handle_config_read_error(err, &config_file),
         }
-    };
+    }
 
+    // Process non-empty configuration data
+    let cfg = Config::unmarshal(data)?;
     Ok(cfg.merge())
 }
 
-async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Result<()> {
+pub async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Result<()> {
     let data = cfg.marshal()?;
 
-    let config_file = format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE);
+    let config_file = get_config_file();
 
     save_config(api, &config_file, data).await
 }

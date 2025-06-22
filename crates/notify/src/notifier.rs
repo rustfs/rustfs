@@ -96,57 +96,42 @@ impl EventNotifier {
             let target_ids_len = target_ids.len();
             let mut handles = vec![];
 
-            // 使用作用域来限制 target_list 的借用范围
+            // Use scope to limit the borrow scope of target_list
             {
                 let target_list_guard = self.target_list.read().await;
                 info!("Sending event to targets: {:?}", target_ids);
                 for target_id in target_ids {
                     // `get` now returns Option<Arc<dyn Target + Send + Sync>>
                     if let Some(target_arc) = target_list_guard.get(&target_id) {
-                        // 克隆 Arc<Box<dyn Target>> (target_list 存储的就是这个类型) 以便移入异步任务
+                        // Clone an Arc<Box<dyn Target>> (which is where target_list is stored) to move into an asynchronous task
                         // target_arc is already Arc, clone it for the async task
                         let cloned_target_for_task = target_arc.clone();
                         let event_clone = event.clone();
-                        let target_name_for_task = cloned_target_for_task.name(); // 在生成任务前获取名称
-                        debug!(
-                            "Preparing to send event to target: {}",
-                            target_name_for_task
-                        );
-                        // 在闭包中使用克隆的数据，避免借用冲突
+                        let target_name_for_task = cloned_target_for_task.name(); // Get the name before generating the task
+                        debug!("Preparing to send event to target: {}", target_name_for_task);
+                        // Use cloned data in closures to avoid borrowing conflicts
                         let handle = tokio::spawn(async move {
                             if let Err(e) = cloned_target_for_task.save(event_clone).await {
-                                error!(
-                                    "Failed to send event to target {}: {}",
-                                    target_name_for_task, e
-                                );
+                                error!("Failed to send event to target {}: {}", target_name_for_task, e);
                             } else {
-                                debug!(
-                                    "Successfully saved event to target {}",
-                                    target_name_for_task
-                                );
+                                debug!("Successfully saved event to target {}", target_name_for_task);
                             }
                         });
                         handles.push(handle);
                     } else {
-                        warn!(
-                            "Target ID {:?} found in rules but not in target list.",
-                            target_id
-                        );
+                        warn!("Target ID {:?} found in rules but not in target list.", target_id);
                     }
                 }
-                // target_list 在这里自动释放
+                // target_list is automatically released here
             }
 
-            // 等待所有任务完成
+            // Wait for all tasks to be completed
             for handle in handles {
                 if let Err(e) = handle.await {
                     error!("Task for sending/saving event failed: {}", e);
                 }
             }
-            info!(
-                "Event processing initiated for {} targets for bucket: {}",
-                target_ids_len, bucket_name
-            );
+            info!("Event processing initiated for {} targets for bucket: {}", target_ids_len, bucket_name);
         } else {
             debug!("No rules found for bucket: {}", bucket_name);
         }
@@ -158,22 +143,22 @@ impl EventNotifier {
         &self,
         targets_to_init: Vec<Box<dyn Target + Send + Sync>>,
     ) -> Result<(), NotificationError> {
-        // 当前激活的、更简单的逻辑：
-        let mut target_list_guard = self.target_list.write().await; // 获取 TargetList 的写锁
+        // Currently active, simpler logic
+        let mut target_list_guard = self.target_list.write().await; //Gets a write lock for the TargetList
         for target_boxed in targets_to_init {
-            // 遍历传入的 Box<dyn Target>
+            // Traverse the incoming Box<dyn Target >
             debug!("init bucket target: {}", target_boxed.name());
-            // TargetList::add 方法期望 Arc<dyn Target + Send + Sync>
-            // 因此，需要将 Box<dyn Target + Send + Sync> 转换为 Arc<dyn Target + Send + Sync>
+            // TargetList::add method expectations Arc<dyn Target + Send + Sync>
+            // Therefore, you need to convert Box<dyn Target + Send + Sync> to Arc<dyn Target + Send + Sync>
             let target_arc: Arc<dyn Target + Send + Sync> = Arc::from(target_boxed);
-            target_list_guard.add(target_arc)?; // 将 Arc<dyn Target> 添加到列表中
+            target_list_guard.add(target_arc)?; // Add Arc<dyn Target> to the list
         }
         info!(
-            "Initialized {} targets, list size: {}", // 更清晰的日志
+            "Initialized {} targets, list size: {}", // Clearer logs
             target_list_guard.len(),
             target_list_guard.len()
         );
-        Ok(()) // 确保返回 Result
+        Ok(()) // Make sure to return a Result
     }
 }
 
@@ -191,9 +176,7 @@ impl Default for TargetList {
 impl TargetList {
     /// Creates a new TargetList
     pub fn new() -> Self {
-        TargetList {
-            targets: HashMap::new(),
-        }
+        TargetList { targets: HashMap::new() }
     }
 
     /// Adds a target to the list
@@ -201,10 +184,7 @@ impl TargetList {
         let id = target.id();
         if self.targets.contains_key(&id) {
             // Potentially update or log a warning/error if replacing an existing target.
-            warn!(
-                "Target with ID {} already exists in TargetList. It will be overwritten.",
-                id
-            );
+            warn!("Target with ID {} already exists in TargetList. It will be overwritten.", id);
         }
         self.targets.insert(id, target);
         Ok(())
@@ -212,10 +192,7 @@ impl TargetList {
 
     /// Removes a target by ID. Note: This does not stop its associated event stream.
     /// Stream cancellation should be handled by EventNotifier.
-    pub async fn remove_target_only(
-        &mut self,
-        id: &TargetID,
-    ) -> Option<Arc<dyn Target + Send + Sync>> {
+    pub async fn remove_target_only(&mut self, id: &TargetID) -> Option<Arc<dyn Target + Send + Sync>> {
         if let Some(target_arc) = self.targets.remove(id) {
             if let Err(e) = target_arc.close().await {
                 // Target's own close logic
