@@ -3,6 +3,7 @@ use s3s::{S3Request, S3Response};
 use std::collections::HashMap;
 
 /// Extract request parameters from S3Request, mainly header information.
+#[allow(dead_code)]
 pub fn extract_req_params<T>(req: &S3Request<T>) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for (key, value) in req.headers.iter() {
@@ -14,6 +15,7 @@ pub fn extract_req_params<T>(req: &S3Request<T>) -> HashMap<String, String> {
 }
 
 /// Extract response elements from S3Response, mainly header information.
+#[allow(dead_code)]
 pub fn extract_resp_elements<T>(resp: &S3Response<T>) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for (key, value) in resp.headers.iter() {
@@ -25,6 +27,7 @@ pub fn extract_resp_elements<T>(resp: &S3Response<T>) -> HashMap<String, String>
 }
 
 /// Get host from header information.
+#[allow(dead_code)]
 pub fn get_request_host(headers: &HeaderMap) -> String {
     headers
         .get("host")
@@ -34,6 +37,7 @@ pub fn get_request_host(headers: &HeaderMap) -> String {
 }
 
 /// Get user-agent from header information.
+#[allow(dead_code)]
 pub fn get_request_user_agent(headers: &HeaderMap) -> String {
     headers
         .get("user-agent")

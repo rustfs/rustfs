@@ -4,12 +4,11 @@ use rustfs_notify::factory::{
     DEFAULT_TARGET, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
     NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
-use rustfs_notify::global::notification_system;
 use rustfs_notify::store::DEFAULT_LIMIT;
 use rustfs_notify::{init_logger, BucketNotificationConfig, Event, EventName, LogLevel, NotificationError};
+use rustfs_notify::{initialize, notification_system};
 use std::time::Duration;
 use tracing::info;
-use tracing_subscriber::util::SubscriberInitExt;
 
 #[tokio::main]
 async fn main() -> Result<(), NotificationError> {
@@ -19,7 +18,7 @@ async fn main() -> Result<(), NotificationError> {
         Some(sys) => sys,
         None => {
             let config = Config::new();
-            notification_system::initialize(config).await?;
+            initialize(config).await?;
             notification_system().expect("Failed to initialize notification system")
         }
     };

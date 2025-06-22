@@ -488,13 +488,12 @@ impl Event {
             s3_metadata.object.etag = args.object.etag.clone();
             s3_metadata.object.content_type = args.object.content_type.clone();
             // Filter out internal reserved metadata
-            let user_metadata = args
-                .object
-                .user_defined
-                .iter()
-                .filter(|&(k, v)| !k.to_lowercase().starts_with("x-amz-meta-internal-"))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<HashMap<String, String>>();
+            let mut user_metadata = HashMap::new();
+            for (k, v) in &args.object.user_defined.unwrap_or_default() {
+                if !k.to_lowercase().starts_with("x-amz-meta-internal-") {
+                    user_metadata.insert(k.clone(), v.clone());
+                }
+            }
             s3_metadata.object.user_metadata = Some(user_metadata);
         }
 

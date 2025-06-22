@@ -516,7 +516,7 @@ async fn run(opt: config::Opt) -> Result<()> {
     // GLOBAL_EVENT_SYS.init(store.clone()).await?;
 
     // Initialize event notifier
-    event::init_event_notifier(opt.event_config).await;
+    event::init_event_notifier().await;
 
     let buckets_list = store
         .list_bucket(&BucketOptions {

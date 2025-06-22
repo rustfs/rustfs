@@ -66,7 +66,6 @@ use policy::policy::Validator;
 use query::instance::make_rustfsms;
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
-use rustfs_notify::EventName;
 use rustfs_rio::CompressReader;
 use rustfs_rio::HashReader;
 use rustfs_rio::Reader;

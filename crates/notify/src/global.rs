@@ -32,7 +32,7 @@ pub struct Notifier {
     // Rely on getting an instance of NotificationSystem from the outside.
 }
 
-impl crate::notifier::Notifier {
+impl Notifier {
     /// Notify an event asynchronously.
     /// This is the only entry point for all event notifications in the system.
     pub async fn notify(&self, args: EventArgs) {
