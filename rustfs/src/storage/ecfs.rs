@@ -17,6 +17,7 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
+use ecstore::bucket::error::BucketMetadataError;
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
 use ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
@@ -52,6 +53,7 @@ use ecstore::bucket::utils::serialize;
 use ecstore::cmd::bucket_replication::ReplicationStatusType;
 use ecstore::cmd::bucket_replication::ReplicationType;
 use ecstore::store_api::RESERVED_METADATA_PREFIX_LOWER;
+use ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
@@ -92,6 +94,14 @@ use tracing::info;
 use tracing::warn;
 use transform_stream::AsyncTryStream;
 use uuid::Uuid;
+
+use ecstore::bucket::{
+    lifecycle::{
+        lifecycle::Lifecycle,
+        bucket_lifecycle_ops::ERR_INVALID_STORAGECLASS
+    },
+    object_lock::objectlock_sys::BucketObjectLockSys,
+};
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -1590,11 +1600,25 @@ impl S3 for FS {
             ..
         } = req.input;
 
-        // warn!("lifecycle_configuration {:?}", &lifecycle_configuration);
+        let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
+        if rcfg.is_err() {
+            return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockIsNotExist".into()), "bucket lock is not exist."));
+        }
+        let rcfg = rcfg.expect("get_lifecycle_config err!").0;
 
-        // TODO: objcetLock
+        //info!("lifecycle_configuration: {:?}", &lifecycle_configuration);
 
         let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+
+        if let Err(err) = input_cfg.validate(&rcfg).await {
+            //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), "bucket lock validate failed."));
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), format!("{}", err.to_string())));
+        }
+        
+        if let Err(err) = validate_transition_tier(&input_cfg).await {
+            //warn!("lifecycle_configuration add failed, err: {:?}", err);
+            return Err(S3Error::with_message(S3ErrorCode::Custom("CustomError".into()), format!("{}", err.to_string())));
+        }
 
         let data = try_!(serialize(&input_cfg));
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
@@ -2032,6 +2056,27 @@ impl S3 for FS {
         Ok(S3Response::new(GetObjectAclOutput {
             grants: Some(grants),
             owner: Some(RUSTFS_OWNER.to_owned()),
+            ..Default::default()
+        }))
+    }
+
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        let GetObjectAttributesInput { bucket, key, .. } = req.input;
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        if let Err(e) = store.get_object_reader(&bucket, &key, None, HeaderMap::new(), &ObjectOptions::default()).await {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+        }
+
+        Ok(S3Response::new(GetObjectAttributesOutput {
+            delete_marker: None,
+            object_parts: None,
             ..Default::default()
         }))
     }

@@ -2,14 +2,22 @@ use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use crate::error::{Error, Result};
+use rustfs_utils::path::decode_dir_object;
 use crate::heal::heal_ops::HealSequence;
 use crate::store_utils::clean_metadata;
-use crate::{disk::DiskStore, heal::heal_commands::HealOpts};
+use crate::{disk::DiskStore, heal::heal_commands::HealOpts,};
+use crate::{
+    bucket::lifecycle::{
+        lifecycle::TransitionOptions,
+        bucket_lifecycle_ops::TransitionedObject,
+    },
+    bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent,
+    bucket::lifecycle::lifecycle::ExpirationOptions,
+};
 use http::{HeaderMap, HeaderValue};
 use madmin::heal_commands::HealResultItem;
 use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
 use rustfs_rio::{HashReader, Reader};
-use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -236,6 +244,10 @@ pub struct ObjectOptions {
     pub replication_request: bool,
     pub delete_marker: bool,
 
+    pub transition: TransitionOptions,
+    pub expiration: ExpirationOptions,
+    pub lifecycle_audit_event: LcAuditEvent,
+
     pub eval_metadata: Option<HashMap<String, String>>,
 }
 
@@ -307,6 +319,7 @@ pub struct ObjectInfo {
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
     pub delete_marker: bool,
+    pub transitioned_object: TransitionedObject,
     pub user_tags: String,
     pub parts: Vec<ObjectPartInfo>,
     pub is_latest: bool,
@@ -340,6 +353,7 @@ impl Clone for ObjectInfo {
             data_blocks: self.data_blocks,
             version_id: self.version_id,
             delete_marker: self.delete_marker,
+            transitioned_object: self.transitioned_object.clone(),
             user_tags: self.user_tags.clone(),
             parts: self.parts.clone(),
             is_latest: self.is_latest,
@@ -430,7 +444,15 @@ impl ObjectInfo {
 
         // TODO:expires
         // TODO:ReplicationState
-        // TODO:TransitionedObject
+        
+        let transitioned_object = TransitionedObject {
+            name:          fi.transitioned_objname.clone(),
+            version_id:    if let Some(transition_version_id) = fi.transition_version_id { transition_version_id.to_string() } else { "".to_string() },
+            status:        fi.transition_status.clone(),
+            free_version:  fi.tier_free_version(),
+            tier:          fi.transition_tier.clone(),
+        };
+
 
         let metadata = {
             let mut v = fi.metadata.clone();
@@ -473,6 +495,7 @@ impl ObjectInfo {
             etag,
             inlined,
             user_defined: metadata,
+            transitioned_object,
             ..Default::default()
         }
     }
@@ -746,6 +769,7 @@ pub trait StorageAPI: ObjectIO {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo>;
+    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()>;
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
     async fn delete_objects(
         &self,
@@ -820,6 +844,9 @@ pub trait StorageAPI: ObjectIO {
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     // DecomTieredObject
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String>;
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()>;
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
+    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
 

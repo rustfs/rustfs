@@ -65,6 +65,7 @@ pub mod service_account;
 pub mod sts;
 pub mod trace;
 pub mod user;
+pub mod tier;
 use urlencoding::decode;
 
 #[derive(Debug, Serialize, Default)]

@@ -10,3 +10,4 @@ pub mod target;
 pub mod utils;
 pub mod versioning;
 pub mod versioning_sys;
+pub mod lifecycle;

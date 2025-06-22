@@ -34,9 +34,12 @@ serde.workspace = true
 time.workspace = true
 bytesize.workspace = true
 serde_json.workspace = true
+serde-xml-rs.workspace = true
+serde_urlencoded.workspace = true
 tracing-error.workspace = true
 s3s.workspace = true
 http.workspace = true
+http-body-util = "0.1.1"
 highway = { workspace = true }
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
@@ -56,14 +59,25 @@ tokio-util = { workspace = true, features = ["io", "compat"] }
 crc32fast = { workspace = true }
 siphasher = { workspace = true }
 base64-simd = { workspace = true }
-sha2 = { version = "0.11.0-pre.4" }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
 hex-simd = { workspace = true }
 path-clean = { workspace = true }
 tempfile.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+rustls.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
 tokio-stream = { workspace = true }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
+tower.workspace = true
+async-channel.workspace = true
+num = "0.4.3"
+enumset = "1.1.5"
+hmac.workspace = true
+std-next.workspace = true
 num_cpus = { workspace = true }
 rand.workspace = true
 pin-project-lite.workspace = true
@@ -80,6 +94,7 @@ shadow-rs.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils ={workspace = true, features=["full"]}
 rustfs-rio.workspace = true
+reader = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { workspace = true }

@@ -1,6 +1,7 @@
 #![allow(clippy::map_entry)]
 use std::{collections::HashMap, sync::Arc};
 
+use rustfs_filemeta::FileInfo;
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::{
@@ -460,6 +461,11 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix && !opts.delete_prefix_object {
             self.delete_prefix(bucket, object).await?;
@@ -573,6 +579,22 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object).transition_object(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
+        self.get_disks_by_key(object).add_partial(bucket, object, version_id).await;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object).restore_transitioned_object(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
         _src_bucket: &str,
@@ -665,6 +687,8 @@ impl StorageAPI for Sets {
             .put_object_tags(bucket, object, tags, opts)
             .await
     }
+
+
 
     #[tracing::instrument(skip(self))]
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {

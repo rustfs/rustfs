@@ -129,6 +129,58 @@ const OBJECTS_VERSION_COUNT_INTERVALS: [ObjectHistogramInterval; DATA_USAGE_VERS
     },
 ];
 
+#[derive(Clone, Copy, Default)]
+pub struct TierStats {
+    pub total_size: u64,
+    pub num_versions: i32,
+    pub num_objects: i32,
+}
+
+impl TierStats {
+    pub fn add(&self, u: &TierStats) -> TierStats {
+        TierStats {
+            total_size:   self.total_size + u.total_size,
+            num_versions: self.num_versions + u.num_versions,
+            num_objects:  self.num_objects + u.num_objects,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AllTierStats {
+    tiers: HashMap<String, TierStats>,
+}
+
+impl AllTierStats {
+    pub fn new() -> Self {
+        Self {
+            tiers: HashMap::new(),
+        }
+    }
+
+    fn add_sizes(&mut self, tiers: HashMap<String, TierStats>) {
+        for (tier, st) in tiers {
+            self.tiers.insert(tier.clone(), self.tiers[&tier].add(&st));
+        }
+    }
+
+    fn merge(&mut self, other: AllTierStats) {
+        for (tier, st) in other.tiers {
+            self.tiers.insert(tier.clone(), self.tiers[&tier].add(&st));
+        }
+    }
+
+    fn populate_stats(&self, stats: &mut HashMap<String, TierStats>) {
+        for (tier, st) in &self.tiers {
+            stats.insert(tier.clone(), TierStats {
+                total_size:   st.total_size.clone(),
+                num_versions: st.num_versions.clone(),
+                num_objects:  st.num_objects.clone(),
+            });
+        }
+    }
+}
+
 // sizeHistogram is a size histogram.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SizeHistogram(Vec<u64>);
@@ -346,8 +398,7 @@ pub struct DataUsageCacheInfo {
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
     #[serde(skip)]
-    pub life_cycle: Option<BucketLifecycleConfiguration>,
-    // pub life_cycle:
+    pub lifecycle: Option<BucketLifecycleConfiguration>,
     #[serde(skip)]
     pub updates: Option<Sender<DataUsageEntry>>,
     #[serde(skip)]

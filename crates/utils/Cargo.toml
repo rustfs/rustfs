@@ -23,12 +23,18 @@ rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 siphasher = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
 tracing = { workspace = true }
 url = { workspace = true , optional = true}
+hyper.workspace = true
+hyper-util.workspace = true
+common.workspace = true
+sha1 = { workspace = true }
+sha2 = { workspace = true, optional = true }
+hmac.workspace = true
+s3s.workspace = true
 
 
 [dev-dependencies]

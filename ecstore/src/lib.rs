@@ -26,6 +26,13 @@ mod store_init;
 pub mod store_list_objects;
 mod store_utils;
 
+pub mod checksum;
+pub mod event;
+pub mod event_notification;
+pub mod client;
+pub mod tier;
+pub mod signer;
+
 pub use global::new_object_layer_fn;
 pub use global::set_global_endpoints;
 pub use global::update_erasure_type;

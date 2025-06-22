@@ -1,3 +1,5 @@
+use s3s::header::X_AMZ_RESTORE;
+use crate::error::ObjectApiError;
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
 use crate::disk::{
@@ -20,6 +22,8 @@ use crate::{
         UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
     error::{StorageError, to_object_err},
+    event::name::EventName, event_notification::{send_event, EventArgs},
+    bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, put_restore_opts, get_transitioned_object_reader,},
     global::{
         GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id,
         is_dist_erasure,
@@ -40,11 +44,16 @@ use crate::{
     },
     store_init::load_format_erasure,
 };
+use crate::client::{
+    object_api_utils::extract_etag,
+    transition_api::ReaderImpl,
+};
 use crate::{disk::STORAGE_FORMAT_FILE, heal::mrf::PartialOperation};
 use crate::{
     heal::data_scanner::{HEAL_DELETE_DANGLING, globalHealConfig},
     store_api::ListObjectVersionsInfo,
 };
+use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use bytesize::ByteSize;
 use chrono::Utc;
 use futures::future::join_all;
@@ -91,6 +100,7 @@ use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use workers::workers::Workers;
+use crate::global::{GLOBAL_TierConfigMgr, GLOBAL_LocalNodeName};
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -3666,6 +3676,29 @@ impl SetDisks {
 
         Ok(())
     }
+
+    pub async fn update_restore_metadata(&self, bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+        let mut oi = obj_info.clone();
+        oi.metadata_only = true;
+
+        if let Some(user_defined) = &mut oi.user_defined {
+            user_defined.remove(X_AMZ_RESTORE.as_str());
+        }
+
+        let version_id = oi.version_id.clone().map(|v| v.to_string());
+        let obj = self.copy_object(bucket, object, bucket, object, &mut oi, &ObjectOptions {
+            version_id: version_id.clone(),
+            ..Default::default()
+        }, &ObjectOptions {
+            version_id: version_id,
+            ..Default::default()
+        }).await;
+        if let Err(err) = obj {
+            //storagelogif(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
+            return Err(err);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -4126,6 +4159,45 @@ impl StorageAPI for SetDisks {
         ))
     }
     #[tracing::instrument(skip(self))]
+    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        let disks = self.get_disks(0, 0).await?;
+        let write_quorum = disks.len() / 2 + 1;
+
+        let mut futures = Vec::with_capacity(disks.len());
+        let mut errs = Vec::with_capacity(disks.len());
+
+        for disk in disks.iter() {
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    match disk.delete_version(&bucket, &object, fi.clone(), force_del_marker, DeleteOptions::default()).await {
+                        Ok(r) => Ok(r),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(_) => {
+                    errs.push(None);
+                }
+                Err(e) => {
+                    errs.push(Some(e));
+                }
+            }
+        }
+
+        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn delete_objects(
         &self,
         bucket: &str,
@@ -4319,6 +4391,21 @@ impl StorageAPI for SetDisks {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
+        GLOBAL_MRFState.add_partial(PartialOperation {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: Some(version_id.to_string()),
+            queued: Utc::now(),
+            set_index: self.set_index,
+            pool_index: self.pool_index,
+            ..Default::default()
+        })
+        .await;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // TODO: nslock
 
@@ -4402,6 +4489,201 @@ impl StorageAPI for SetDisks {
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
         let oi = self.get_object_info(bucket, object, opts).await?;
         Ok(oi.user_tags)
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
+            Ok(client) => client,
+            Err(err) => {
+                return Err(Error::other(err.to_string()));
+            }
+        };
+
+        /*if !opts.no_lock {
+            let lk = self.new_ns_lock(bucket, object);
+            let lkctx = lk.get_lock(globalDeleteOperationTimeout)?;
+            //ctx = lkctx.Context()
+            //defer lk.Unlock(lkctx)
+        }*/
+
+        let (mut fi, mut meta_arr, mut online_disks) = self.get_object_fileinfo(&bucket, &object, &opts, true).await?;
+        /*if err != nil {
+            return Err(to_object_err(err, vec![bucket, object]));
+        }*/
+        /*if fi.deleted {
+            if opts.version_id.is_none() {
+                return Err(to_object_err(DiskError::FileNotFound, vec![bucket, object]));
+            }
+            return Err(to_object_err(ERR_METHOD_NOT_ALLOWED, vec![bucket, object]));
+        }*/
+        if !opts.mod_time.expect("err").unix_timestamp() == fi.mod_time.as_ref().expect("err").unix_timestamp() || !(opts.transition.etag == extract_etag(&fi.metadata)) {
+            return Err(to_object_err(Error::from(DiskError::FileNotFound), vec![bucket, object]));
+        }
+        if fi.transition_status == TRANSITION_COMPLETE {
+            return Ok(());
+        }
+
+        /*if fi.xlv1 {
+            if let Err(err) = self.heal_object(bucket, object, "", &HealOpts {no_lock: true, ..Default::default()}) {
+                return err.expect("err");
+            }
+            (fi, meta_arr, online_disks) = self.get_object_fileinfo(&bucket, &object, &opts, true);
+            if err != nil {
+                return to_object_err(err, vec![bucket, object]);
+            }
+        }*/
+        //let traceFn = GLOBAL_LifecycleSys.trace(fi.to_object_info(bucket, object, opts.Versioned || opts.VersionSuspended));
+
+        let dest_obj = gen_transition_objname(bucket);
+        if let Err(err) = dest_obj {
+            //traceFn(ILMTransition, nil, err)
+            return Err(to_object_err(err, vec![]));
+        }
+        let dest_obj = dest_obj.unwrap();
+
+        let oi = ObjectInfo::from_file_info(&fi, &bucket, &object, opts.versioned || opts.version_suspended);
+
+        let (pr, mut pw) = tokio::io::duplex(fi.erasure.block_size);
+        //let h = HeaderMap::new();
+        //let reader = ReaderImpl::ObjectBody(GetObjectReader {stream: StreamingBlob::wrap(tokio_util::io::ReaderStream::new(pr)), object_info: oi});
+        let reader = ReaderImpl::ObjectBody(GetObjectReader {stream: Box::new(pr), object_info: oi});
+
+        let cloned_bucket = bucket.to_string();
+        let cloned_object = object.to_string();
+        let cloned_fi = fi.clone();
+        let set_index = self.set_index;
+        let pool_index = self.pool_index;
+        tokio::spawn(async move {
+            if let Err(e) = Self::get_object_with_fileinfo(
+                &cloned_bucket, &cloned_object, 0, cloned_fi.size, &mut pw, cloned_fi, meta_arr, &online_disks, set_index, pool_index
+            )
+            .await
+            {
+                error!("get_object_with_fileinfo err {:?}", e);
+            };
+        });
+
+        let rv = tgt_client.put_with_meta(&dest_obj, reader, fi.size as i64, {
+            let mut m = HashMap::<String, String>::new();
+            m.insert("name".to_string(), object.to_string());
+            m
+        }).await;
+        //pr.CloseWithError(err);
+        if let Err(err) = rv {
+            //traceFn(ILMTransition, nil, err)
+            return Err(StorageError::Io(err));
+        }
+        let rv = rv.unwrap();
+        fi.transition_status = TRANSITION_COMPLETE.to_string();
+        fi.transitioned_objname = dest_obj;
+        fi.transition_tier = opts.transition.tier.clone();
+        fi.transition_version_id = if rv=="" { None } else { Some(Uuid::parse_str(&rv)?) };
+        let mut event_name = EventName::ObjectTransitionComplete.as_ref();
+
+        let disks = self.get_disks(0, 0).await?;
+
+        if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
+            event_name = EventName::ObjectTransitionFailed.as_ref();
+        }
+
+        for disk in disks.iter() {
+            if let Some(disk) = disk {
+                if disk.is_online().await {
+                    continue;
+                }
+            }
+            self.add_partial(bucket, object, &opts.version_id.as_ref().expect("err")).await;
+            break;
+        }
+
+        let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        send_event(EventArgs {
+            event_name: event_name.to_string(),
+            bucket_name: bucket.to_string(),
+            object:      obj_info,
+            user_agent:  "Internal: [ILM-Transition]".to_string(),
+            host:        GLOBAL_LocalNodeName.to_string(),
+            ..Default::default()
+        });
+        //let tags = opts.lifecycle_audit_event.tags();
+        //auditLogLifecycle(ctx, objInfo, ILMTransition, tags, traceFn)
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let set_restore_header_fn = async move |oi: &mut ObjectInfo, rerr: Option<Error>| -> Result<()> {
+            if rerr.is_none() {
+                return Ok(());
+            }
+            self.update_restore_metadata(bucket, object, oi, opts).await?;
+            Err(rerr.unwrap())
+        };
+        let mut oi = ObjectInfo::default();
+        let fi = self.get_object_fileinfo(&bucket, &object, &opts, true).await;
+        if let Err(err) = fi {
+            return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
+        }
+        let (mut actual_fi, _, _) = fi.unwrap();
+
+        oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi);
+        /*if oi.parts.len() == 1 {
+            let mut rs: HTTPRangeSpec;
+            let gr = get_transitioned_object_reader(bucket, object, rs, HeaderMap::new(), oi, opts);
+            //if err != nil {
+            //    return set_restore_header_fn(&mut oi, Some(toObjectErr(err, bucket, object)));
+            //}
+            //defer gr.Close()
+            let hash_reader = HashReader::new(gr, gr.obj_info.size, "", "", gr.obj_info.size);
+            let p_reader = PutObjReader::new(StreamingBlob::from(Box::pin(hash_reader)), hash_reader.size());
+            if let Err(err) = self.put_object(bucket, object, &mut p_reader, &ropts).await {
+                return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object])));
+            } else {
+                return Ok(());
+            }
+        }
+
+        let res = self.new_multipart_upload(bucket, object, &ropts).await?;
+        //if err != nil {
+        //    return set_restore_header_fn(&mut oi, err);
+        //}
+
+        let mut uploaded_parts: Vec<CompletePart> = vec![];
+        let mut rs: HTTPRangeSpec;
+        let gr = get_transitioned_object_reader(bucket, object, rs, HeaderMap::new(), oi, opts).await?;
+        //if err != nil {
+        //    return set_restore_header_fn(&mut oi, err);
+        //}
+
+        for part_info in oi.parts {
+            //let hr = HashReader::new(LimitReader(gr, part_info.size), part_info.size, "", "", part_info.size);
+            let hr = HashReader::new(gr, part_info.size as i64, part_info.size as i64, None, false);
+            //if err != nil {
+            //    return set_restore_header_fn(&mut oi, err);
+            //}
+            let mut p_reader = PutObjReader::new(hr, hr.size());
+            let p_info = self.put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default()).await?;
+            //if let Err(err) = p_info {
+            //    return set_restore_header_fn(&mut oi, err);
+            //}
+            if p_info.size != part_info.size {
+                return set_restore_header_fn(&mut oi, Some(Error::from(ObjectApiError::InvalidObjectState(GenericError{bucket: bucket.to_string(), object: object.to_string(), ..Default::default()}))));
+            }
+            uploaded_parts.push(CompletePart {
+                part_num: p_info.part_num,
+                etag: p_info.etag,
+            });
+        }
+        if let Err(err) = self.complete_multipart_upload(bucket, object, &res.upload_id, uploaded_parts, &ObjectOptions {
+            mod_time: oi.mod_time,
+            ..Default::default()
+        }).await {
+            set_restore_header_fn(&mut oi, Some(err));
+        }*/
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self))]

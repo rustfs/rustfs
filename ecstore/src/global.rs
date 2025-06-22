@@ -12,6 +12,9 @@ use crate::{
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
     heal::{background_heal_ops::HealRoutine, heal_ops::AllHealState},
+    bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
+    tier::tier::TierConfigMgr,
+    event_notification::EventNotifier,
     store::ECStore,
 };
 
@@ -19,6 +22,8 @@ pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
 pub const DISK_MIN_INODES: u64 = 1000;
 pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
+
+pub const DEFAULT_PORT: u16 = 9000;
 
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
@@ -33,11 +38,17 @@ lazy_static! {
     pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
     pub static ref GLOBAL_BackgroundHealRoutine: Arc<HealRoutine> = HealRoutine::new();
     pub static ref GLOBAL_BackgroundHealState: Arc<AllHealState> = AllHealState::new(false);
+    pub static ref GLOBAL_TierConfigMgr: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
+    pub static ref GLOBAL_LifecycleSys: Arc<LifecycleSys> = LifecycleSys::new();
+    pub static ref GLOBAL_EventNotifier: Arc<RwLock<EventNotifier>> = EventNotifier::new();
+    //pub static ref GLOBAL_RemoteTargetTransport
     pub static ref GLOBAL_ALlHealState: Arc<AllHealState> = AllHealState::new(false);
     pub static ref GLOBAL_MRFState: Arc<MRFState> = Arc::new(MRFState::new());
     static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
-}
+    pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
+    pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
+    pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();}
 
 /// Get the global rustfs port
 pub fn global_rustfs_port() -> u16 {

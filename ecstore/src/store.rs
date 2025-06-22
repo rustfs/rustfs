@@ -1,5 +1,6 @@
 #![allow(clippy::map_entry)]
 
+use rustfs_filemeta::FileInfo;
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::config::GLOBAL_StorageClass;
@@ -13,7 +14,7 @@ use crate::error::{
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
     GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_endpoints, is_dist_erasure, is_erasure_sd,
-    set_global_deployment_id, set_object_layer,
+    set_global_deployment_id, set_object_layer, GLOBAL_TierConfigMgr,
 };
 use crate::heal::data_usage::{DATA_USAGE_ROOT, DataUsageInfo};
 use crate::heal::data_usage_cache::{DataUsageCache, DataUsageCacheInfo};
@@ -26,7 +27,10 @@ use crate::rebalance::RebalanceMeta;
 use crate::store_api::{ListMultipartsInfo, ListObjectVersionsInfo, MultipartInfo, ObjectIO};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::{
-    bucket::metadata::BucketMetadata,
+    bucket::{
+        metadata::BucketMetadata,
+        lifecycle::bucket_lifecycle_ops::TransitionState
+    },
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
     endpoints::EndpointServerPools,
     peer::S3PeerSys,
@@ -40,7 +44,7 @@ use crate::{
 };
 use rustfs_utils::crypto::base64_decode;
 use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
-
+use crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry;
 use crate::error::{Error, Result};
 use common::globals::{GLOBAL_Local_Node_Name, GLOBAL_Rustfs_Host, GLOBAL_Rustfs_Port};
 use futures::future::join_all;
@@ -322,6 +326,14 @@ impl ECStore {
                     }
                 });
             }
+        }
+
+        init_background_expiry(self.clone()).await;
+
+        TransitionState::init(self.clone()).await;
+
+        if let Err(err) =  GLOBAL_TierConfigMgr.write().await.init(self.clone()).await {
+            info!("TierConfigMgr init error: {}", err);
         }
 
         Ok(())
@@ -1836,7 +1848,6 @@ impl StorageAPI for ECStore {
                 return self.pools[idx].new_multipart_upload(bucket, object, opts).await;
             }
         }
-
         let idx = self.get_pool_idx(bucket, object, -1).await?;
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(StorageError::DataMovementOverwriteErr(
@@ -1847,6 +1858,47 @@ impl StorageAPI for ECStore {
         }
 
         self.pools[idx].new_multipart_upload(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
+        let object = encode_dir_object(object);
+
+        if self.single_pool() {
+            self.pools[0].add_partial(bucket, object.as_str(), version_id).await;
+        }
+
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), &ObjectOptions::default()).await?;
+
+        self.pools[idx].add_partial(bucket, object.as_str(), version_id).await;
+        Ok(())
+    }
+    #[tracing::instrument(skip(self))]
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let object = encode_dir_object(object);
+        if self.single_pool() {
+            return self.pools[0].transition_object(bucket, &object, opts).await;
+        }
+
+        //opts.skip_decommissioned = true;
+        //opts.no_lock = true;
+        let idx = self.get_pool_idx_existing_with_opts(bucket, &object, opts).await?;
+
+        self.pools[idx].transition_object(bucket, &object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let object = encode_dir_object(object);
+        if self.single_pool() {
+            return self.pools[0].restore_transitioned_object(bucket, &object, opts).await;
+        }
+
+        //opts.skip_decommissioned = true;
+        //opts.nolock = true;
+        let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
+
+        self.pools[idx].restore_transitioned_object(bucket, &object, opts).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -2073,6 +2125,18 @@ impl StorageAPI for ECStore {
         let idx = self.get_pool_idx_existing_with_opts(bucket, object.as_str(), opts).await?;
 
         self.pools[idx].put_object_tags(bucket, object.as_str(), tags, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        check_del_obj_args(bucket, object)?;
+
+        let object = rustfs_utils::path::encode_dir_object(object);
+
+        if self.single_pool() {
+            return self.pools[0].delete_object_version(bucket, object.as_str(), fi, force_del_marker).await;
+        }
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]

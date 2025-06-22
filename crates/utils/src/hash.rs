@@ -61,6 +61,8 @@ impl HashAlgorithm {
 use crc32fast::Hasher;
 use siphasher::sip::SipHasher;
 
+pub const EMPTY_STRING_SHA256_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 pub fn sip_hash(key: &str, cardinality: usize, id: &[u8; 16]) -> usize {
     //  你的密钥，必须是 16 字节
 

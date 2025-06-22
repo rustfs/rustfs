@@ -3612,6 +3612,7 @@ dependencies = [
 name = "ecstore"
 version = "0.0.1"
 dependencies = [
+ "async-channel",
  "async-trait",
  "aws-sdk-s3",
  "backon",
@@ -3624,18 +3625,25 @@ dependencies = [
  "common",
  "crc32fast",
  "criterion",
+ "enumset",
  "flatbuffers 25.2.10",
  "futures",
  "glob",
  "hex-simd",
  "highway",
+ "hmac 0.12.1",
  "http 1.3.1",
+ "http-body-util",
+ "hyper 1.6.0",
+ "hyper-rustls 0.27.7",
+ "hyper-util",
  "lazy_static",
  "lock",
  "madmin",
  "md-5",
  "netif",
  "nix 0.30.1",
+ "num",
  "num_cpus",
  "once_cell",
  "path-absolutize",
@@ -3644,6 +3652,7 @@ dependencies = [
  "policy",
  "protos",
  "rand 0.9.1",
+ "reader",
  "reed-solomon-erasure",
  "reed-solomon-simd",
  "regex",
@@ -3655,13 +3664,18 @@ dependencies = [
  "rustfs-rio",
  "rustfs-rsc",
  "rustfs-utils",
+ "rustls 0.23.27",
  "s3s",
  "serde",
+ "serde-xml-rs 0.8.1",
  "serde_json",
- "sha2 0.11.0-pre.5",
+ "serde_urlencoded",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
  "shadow-rs",
  "siphasher 1.0.1",
  "smallvec",
+ "std-next",
  "tempfile",
  "thiserror 2.0.12",
  "time",
@@ -3669,6 +3683,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tower",
  "tracing",
  "tracing-error",
  "transform-stream",
@@ -4852,6 +4867,7 @@ dependencies = [
  "http 1.3.1",
  "hyper 1.6.0",
  "hyper-util",
+ "log",
  "rustls 0.23.27",
  "rustls-native-certs 0.8.1",
  "rustls-pki-types",
@@ -7833,6 +7849,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "reader"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "base64-simd",
+ "bytes",
+ "common",
+ "futures",
+ "hex-simd",
+ "md-5",
+ "pin-project-lite",
+ "s3s",
+ "sha2 0.11.0-pre.5",
+ "thiserror 2.0.12",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "readme-rustdocifier"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8362,6 +8397,7 @@ dependencies = [
  "rmp",
  "rmp-serde",
  "rustfs-utils",
+ "s3s",
  "serde",
  "thiserror 2.0.12",
  "time",
@@ -8473,7 +8509,7 @@ dependencies = [
  "regex",
  "reqwest",
  "serde",
- "serde-xml-rs",
+ "serde-xml-rs 0.6.0",
  "sha2 0.10.9",
  "urlencoding",
 ]
@@ -8484,9 +8520,13 @@ version = "0.0.1"
 dependencies = [
  "base64-simd",
  "blake3",
+ "common",
  "crc32fast",
  "hex-simd",
  "highway",
+ "hmac 0.12.1",
+ "hyper 1.6.0",
+ "hyper-util",
  "lazy_static",
  "local-ip-address",
  "md-5",
@@ -8497,7 +8537,9 @@ dependencies = [
  "rustls 0.23.27",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
+ "s3s",
  "serde",
+ "sha1 0.10.6",
  "sha2 0.10.9",
  "siphasher 1.0.1",
  "tempfile",
@@ -8901,6 +8943,18 @@ name = "serde-xml-rs"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb3aa78ecda1ebc9ec9847d5d3aba7d618823446a049ba2491940506da6e2782"
+dependencies = [
+ "log",
+ "serde",
+ "thiserror 1.0.69",
+ "xml-rs",
+]
+
+[[package]]
+name = "serde-xml-rs"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53630160a98edebde0123eb4dfd0fce6adff091b2305db3154a9e920206eb510"
 dependencies = [
  "log",
  "serde",

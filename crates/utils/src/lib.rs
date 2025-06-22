@@ -7,6 +7,8 @@ pub mod net;
 #[cfg(feature = "net")]
 pub use net::*;
 
+pub mod retry;
+
 #[cfg(feature = "io")]
 pub mod io;
 

@@ -1,3 +1,6 @@
+pub mod objectlock;
+pub mod objectlock_sys;
+
 use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
 
 pub trait ObjectLockApi {

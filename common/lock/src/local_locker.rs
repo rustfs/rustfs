@@ -7,7 +7,7 @@ use std::{
 
 use crate::{Locker, lock_args::LockArgs};
 
-const MAX_DELETE_LIST: usize = 1000;
+pub const MAX_DELETE_LIST: usize = 1000;
 
 #[derive(Clone, Debug)]
 struct LockRequesterInfo {

@@ -1,3 +1,5 @@
+use s3s::{S3ErrorCode, S3Error};
+
 use rustfs_utils::path::decode_dir_object;
 
 use crate::disk::error::DiskError;
@@ -722,6 +724,248 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
 
         _ => err,
     }
+}
+
+pub fn is_network_or_host_down(err: &str, expect_timeouts: bool) -> bool {
+    err.contains("Connection closed by foreign host") ||
+    err.contains("TLS handshake timeout") ||
+    err.contains("i/o timeout") ||
+    err.contains("connection timed out") ||
+    err.contains("connection reset by peer") ||
+    err.contains("broken pipe") ||
+    err.to_lowercase().contains("503 service unavailable") ||
+    err.contains("use of closed network connection") ||
+    err.contains("An existing connection was forcibly closed by the remote host") ||
+    err.contains("client error (Connect)")
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GenericError {
+    pub bucket: String,
+    pub object: String,
+    pub version_id: String,
+    //pub err:       Error,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ObjectApiError {
+    #[error("Operation timed out")]
+    OperationTimedOut,
+
+    #[error("etag of the object has changed")]
+    InvalidETag,
+
+    #[error("BackendDown")]
+    BackendDown(String),
+
+    #[error("Unsupported headers in Metadata")]
+    UnsupportedMetadata,
+
+    #[error("Method not allowed: {}/{}", .0.bucket, .0.object)]
+    MethodNotAllowed(GenericError),
+
+    #[error("The operation is not valid for the current state of the object {}/{}({})", .0.bucket, .0.object, .0.version_id)]
+    InvalidObjectState(GenericError),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{}", .message)]
+pub struct ErrorResponse {
+    pub code: S3ErrorCode,
+    pub message: String,
+    pub key: Option<String>,
+    pub bucket_name: Option<String>,
+    pub region: Option<String>,
+    pub request_id: Option<String>,
+    pub host_id: String,
+}
+
+pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::io::Error {
+    let mut bucket = "";
+    let mut object = "";
+    let mut version_id = "";
+    if params.len() >= 1 {
+        bucket = params[0];
+    }
+    if params.len() >= 2 {
+        object = params[1];
+    }
+    if params.len() >= 3 {
+        version_id = params[2];
+    }
+
+    if is_network_or_host_down(&err.to_string(), false) {
+        return std::io::Error::other(ObjectApiError::BackendDown(format!("{}", err)));
+    }
+
+    let mut err_ = std::io::Error::other(err.to_string());
+    let r_err = err;
+    let mut err = err_;
+    let bucket = bucket.to_string();
+    let object = object.to_string();
+    let version_id = version_id.to_string();
+
+    match r_err.code {
+        /*S3ErrorCode::SlowDownWrite => {
+            err = StorageError::InsufficientWriteQuorum;//{bucket: bucket, object: object};
+        }*/
+        /*S3ErrorCode::SlowDown/* SlowDownRead */ => {
+            err = std::io::Error::other(StorageError::InsufficientReadQuorum.to_string());
+        }*/
+        /*S3ErrorCode::PreconditionFailed => {
+            err = Error::from(StorageError::PreConditionFailed);
+        }*/
+        /*S3ErrorCode::InvalidRange => {
+            err = Error::from(StorageError::InvalidRange);
+        }*/
+        /*S3ErrorCode::BucketAlreadyOwnedByYou => {
+            err = Error::from(StorageError::BucketAlreadyOwnedByYou);
+        }*/
+        S3ErrorCode::BucketNotEmpty => {
+            err = std::io::Error::other(StorageError::BucketNotEmpty("".to_string()).to_string());
+        }
+        /*S3ErrorCode::NoSuchBucketPolicy => {
+            err = Error::from(StorageError::BucketPolicyNotFound);
+        }*/
+        /*S3ErrorCode::NoSuchLifecycleConfiguration => {
+            err = Error::from(StorageError::BucketLifecycleNotFound);
+        }*/
+        S3ErrorCode::InvalidBucketName => {
+            err = std::io::Error::other(StorageError::BucketNameInvalid(bucket));
+        }
+        S3ErrorCode::InvalidPart => {
+            err = std::io::Error::other(StorageError::InvalidPart(0, bucket, object/* , version_id */));
+        }
+        S3ErrorCode::NoSuchBucket => {
+            err = std::io::Error::other(StorageError::BucketNotFound(bucket));
+        }
+        S3ErrorCode::NoSuchKey => {
+            if object != "" {
+                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object));
+            } else {
+                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
+            }
+        }
+        S3ErrorCode::NoSuchVersion => {
+            if object != "" {
+                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object));//, version_id);
+            } else {
+                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
+            }
+        }
+        /*S3ErrorCode::XRustFsInvalidObjectName => {
+            err = Error::from(StorageError::ObjectNameInvalid(bucket, object));
+        }*/
+        S3ErrorCode::AccessDenied => {
+            err = std::io::Error::other(StorageError::PrefixAccessDenied(bucket, object));
+        }
+        /*S3ErrorCode::XAmzContentSHA256Mismatch => {
+            err = hash.SHA256Mismatch{};
+        }*/
+        S3ErrorCode::NoSuchUpload => {
+            err = std::io::Error::other(StorageError::InvalidUploadID(bucket, object, version_id));
+        }
+        /*S3ErrorCode::EntityTooSmall => {
+            err = std::io::Error::other(StorageError::PartTooSmall);
+        }*/
+        /*S3ErrorCode::ReplicationPermissionCheck => {
+            err = std::io::Error::other(StorageError::ReplicationPermissionCheck);
+        }*/
+        _ => {
+            err = std::io::Error::other("err");
+        }
+    }
+
+    err
+}
+
+pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
+    let storage_err = &err;
+    let mut bucket: String = "".to_string();
+    let mut object: String = "".to_string();
+    if params.len() >= 1 {
+        bucket = params[0].to_string();
+    }
+    if params.len() >= 2 {
+        object = decode_dir_object(params[1]);
+    }
+    return match storage_err {
+        /*StorageError::NotImplemented => s3_error!(NotImplemented),
+        StorageError::InvalidArgument(bucket, object, version_id) => {
+            s3_error!(InvalidArgument, "Invalid arguments provided for {}/{}-{}", bucket, object, version_id)
+        }*/
+        StorageError::MethodNotAllowed => {
+            S3Error::with_message(S3ErrorCode::MethodNotAllowed, ObjectApiError::MethodNotAllowed(GenericError {bucket: bucket, object: object, ..Default::default()}).to_string())
+        }
+        /*StorageError::BucketNotFound(bucket) => {
+            s3_error!(NoSuchBucket, "bucket not found {}", bucket)
+        }
+        StorageError::BucketNotEmpty(bucket) => s3_error!(BucketNotEmpty, "bucket not empty {}", bucket),
+        StorageError::BucketNameInvalid(bucket) => s3_error!(InvalidBucketName, "invalid bucket name {}", bucket),
+        StorageError::ObjectNameInvalid(bucket, object) => {
+            s3_error!(InvalidArgument, "invalid object name {}/{}", bucket, object)
+        }
+        StorageError::BucketExists(bucket) => s3_error!(BucketAlreadyExists, "{}", bucket),
+        StorageError::StorageFull => s3_error!(ServiceUnavailable, "Storage reached its minimum free drive threshold."),
+        StorageError::SlowDown => s3_error!(SlowDown, "Please reduce your request rate"),
+        StorageError::PrefixAccessDenied(bucket, object) => {
+            s3_error!(AccessDenied, "PrefixAccessDenied {}/{}", bucket, object)
+        }
+        StorageError::InvalidUploadIDKeyCombination(bucket, object) => {
+            s3_error!(InvalidArgument, "Invalid UploadID KeyCombination:  {}/{}", bucket, object)
+        }
+        StorageError::MalformedUploadID(bucket) => s3_error!(InvalidArgument, "Malformed UploadID: {}", bucket),
+        StorageError::ObjectNameTooLong(bucket, object) => {
+            s3_error!(InvalidArgument, "Object name too long: {}/{}", bucket, object)
+        }
+        StorageError::ObjectNamePrefixAsSlash(bucket, object) => {
+            s3_error!(InvalidArgument, "Object name contains forward slash as prefix: {}/{}", bucket, object)
+        }
+        StorageError::ObjectNotFound(bucket, object) => s3_error!(NoSuchKey, "{}/{}", bucket, object),
+        StorageError::VersionNotFound(bucket, object, version_id) => {
+            s3_error!(NoSuchVersion, "{}/{}/{}", bucket, object, version_id)
+        }
+        StorageError::InvalidUploadID(bucket, object, version_id) => {
+            s3_error!(InvalidPart, "Invalid upload id:  {}/{}-{}", bucket, object, version_id)
+        }
+        StorageError::InvalidVersionID(bucket, object, version_id) => {
+            s3_error!(InvalidArgument, "Invalid version id: {}/{}-{}", bucket, object, version_id)
+        }
+        // extended
+        StorageError::DataMovementOverwriteErr(bucket, object, version_id) => s3_error!(
+            InvalidArgument,
+            "invalid data movement operation, source and destination pool are the same for : {}/{}-{}",
+            bucket,
+            object,
+            version_id
+        ),
+        // extended
+        StorageError::ObjectExistsAsDirectory(bucket, object) => {
+            s3_error!(InvalidArgument, "Object exists on :{} as directory {}", bucket, object)
+        }
+        StorageError::InsufficientReadQuorum => {
+            s3_error!(SlowDown, "Storage resources are insufficient for the read operation")
+        }
+        StorageError::InsufficientWriteQuorum => {
+            s3_error!(SlowDown, "Storage resources are insufficient for the write operation")
+        }
+        StorageError::DecommissionNotStarted => s3_error!(InvalidArgument, "Decommission Not Started"),
+
+        StorageError::VolumeNotFound(bucket) => {
+            s3_error!(NoSuchBucket, "bucket not found {}", bucket)
+        }
+        StorageError::InvalidPart(bucket, object, version_id) => {
+            s3_error!(
+                InvalidPart,
+                "Specified part could not be found. PartNumber {}, Expected {}, got {}",
+                bucket,
+                object,
+                version_id
+            )
+        }
+        StorageError::DoneForNow => s3_error!(InternalError, "DoneForNow"),*/
+        _ => s3s::S3Error::with_message(S3ErrorCode::Custom("err".into()), err.to_string()),
+    };
 }
 
 #[cfg(test)]

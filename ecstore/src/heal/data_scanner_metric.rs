@@ -15,14 +15,13 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 use super::data_scanner::CurrentScannerCycle;
+use crate::bucket::lifecycle::lifecycle;
 
 lazy_static! {
     pub static ref globalScannerMetrics: Arc<ScannerMetrics> = Arc::new(ScannerMetrics::new());
 }
 
-/// Scanner metric types, matching the Go version exactly
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum ScannerMetric {
     // START Realtime metrics, that only records
     // last minute latencies and total operation count.
@@ -196,7 +195,8 @@ pub struct ScannerMetrics {
     // All fields must be accessed atomically and aligned.
     operations: Vec<AtomicU64>,
     latency: Vec<LockedLastMinuteLatency>,
-
+    actions: Vec<AtomicU64>,
+    actions_latency: Vec<LockedLastMinuteLatency>,
     // Current paths contains disk -> tracker mappings
     current_paths: Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
 
@@ -215,6 +215,8 @@ impl ScannerMetrics {
         Self {
             operations,
             latency,
+            actions: (0..ScannerMetric::Last as usize).map(|_| AtomicU64::new(0)).collect(),
+            actions_latency: vec![LockedLastMinuteLatency::default(); ScannerMetric::LastRealtime as usize],
             current_paths: Arc::new(RwLock::new(HashMap::new())),
             cycle_info: Arc::new(RwLock::new(None)),
         }
@@ -222,16 +224,17 @@ impl ScannerMetrics {
 
     /// Log scanner action with custom metadata - compatible with existing usage
     pub fn log(metric: ScannerMetric) -> impl Fn(&HashMap<String, String>) {
+        let metric = metric as usize;
         let start_time = SystemTime::now();
         move |_custom: &HashMap<String, String>| {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
 
             // Update operation count
-            globalScannerMetrics.operations[metric as usize].fetch_add(1, Ordering::Relaxed);
+            globalScannerMetrics.operations[metric].fetch_add(1, Ordering::Relaxed);
 
             // Update latency for realtime metrics (spawn async task for this)
-            if (metric as usize) < ScannerMetric::LastRealtime as usize {
-                let metric_index = metric as usize;
+            if (metric) < ScannerMetric::LastRealtime as usize {
+                let metric_index = metric;
                 tokio::spawn(async move {
                     globalScannerMetrics.latency[metric_index].add(duration).await;
                 });
@@ -239,23 +242,24 @@ impl ScannerMetrics {
 
             // Log trace metrics
             if metric as u8 > ScannerMetric::StartTrace as u8 {
-                debug!(metric = metric.as_str(), duration_ms = duration.as_millis(), "Scanner trace metric");
+                //debug!(metric = metric.as_str(), duration_ms = duration.as_millis(), "Scanner trace metric");
             }
         }
     }
 
     /// Time scanner action with size - returns function that takes size
     pub fn time_size(metric: ScannerMetric) -> impl Fn(u64) {
+        let metric = metric as usize;
         let start_time = SystemTime::now();
         move |size: u64| {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
 
             // Update operation count
-            globalScannerMetrics.operations[metric as usize].fetch_add(1, Ordering::Relaxed);
+            globalScannerMetrics.operations[metric].fetch_add(1, Ordering::Relaxed);
 
             // Update latency for realtime metrics with size (spawn async task)
-            if (metric as usize) < ScannerMetric::LastRealtime as usize {
-                let metric_index = metric as usize;
+            if (metric) < ScannerMetric::LastRealtime as usize {
+                let metric_index = metric;
                 tokio::spawn(async move {
                     globalScannerMetrics.latency[metric_index].add_size(duration, size).await;
                 });
@@ -265,16 +269,17 @@ impl ScannerMetrics {
 
     /// Time a scanner action - returns a closure to call when done
     pub fn time(metric: ScannerMetric) -> impl Fn() {
+        let metric = metric as usize;
         let start_time = SystemTime::now();
         move || {
             let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
 
             // Update operation count
-            globalScannerMetrics.operations[metric as usize].fetch_add(1, Ordering::Relaxed);
+            globalScannerMetrics.operations[metric].fetch_add(1, Ordering::Relaxed);
 
             // Update latency for realtime metrics (spawn async task)
-            if (metric as usize) < ScannerMetric::LastRealtime as usize {
-                let metric_index = metric as usize;
+            if (metric) < ScannerMetric::LastRealtime as usize {
+                let metric_index = metric;
                 tokio::spawn(async move {
                     globalScannerMetrics.latency[metric_index].add(duration).await;
                 });
@@ -284,17 +289,18 @@ impl ScannerMetrics {
 
     /// Time N scanner actions - returns function that takes count, then returns completion function
     pub fn time_n(metric: ScannerMetric) -> Box<dyn Fn(usize) -> Box<dyn Fn() + Send + Sync> + Send + Sync> {
+        let metric = metric as usize;
         let start_time = SystemTime::now();
         Box::new(move |count: usize| {
             Box::new(move || {
                 let duration = SystemTime::now().duration_since(start_time).unwrap_or_default();
 
                 // Update operation count
-                globalScannerMetrics.operations[metric as usize].fetch_add(count as u64, Ordering::Relaxed);
+                globalScannerMetrics.operations[metric].fetch_add(count as u64, Ordering::Relaxed);
 
                 // Update latency for realtime metrics (spawn async task)
-                if (metric as usize) < ScannerMetric::LastRealtime as usize {
-                    let metric_index = metric as usize;
+                if (metric) < ScannerMetric::LastRealtime as usize {
+                    let metric_index = metric;
                     tokio::spawn(async move {
                         globalScannerMetrics.latency[metric_index].add(duration).await;
                     });
@@ -303,31 +309,53 @@ impl ScannerMetrics {
         })
     }
 
+    pub fn time_ilm(a: lifecycle::IlmAction) -> Box<dyn Fn(u64) -> Box<dyn Fn() + Send + Sync> + Send + Sync> {
+        let a_clone = a as usize;
+        if a_clone == lifecycle::IlmAction::NoneAction as usize || a_clone >= lifecycle::IlmAction::ActionCount as usize {
+            return Box::new(move |_: u64| {
+                Box::new(move || {})
+            });
+        }
+        let start = SystemTime::now();
+        Box::new(move |versions: u64| {
+            Box::new(move || {
+                let duration = SystemTime::now().duration_since(start).unwrap_or(Duration::from_secs(0));
+                tokio::spawn(async move {
+                    globalScannerMetrics.actions[a_clone].fetch_add(versions, Ordering::Relaxed);
+                    globalScannerMetrics.actions_latency[a_clone].add(duration).await;
+                });
+            })
+        })
+    }
+
     /// Increment time with specific duration
     pub async fn inc_time(metric: ScannerMetric, duration: Duration) {
+        let metric = metric as usize;
         // Update operation count
-        globalScannerMetrics.operations[metric as usize].fetch_add(1, Ordering::Relaxed);
+        globalScannerMetrics.operations[metric].fetch_add(1, Ordering::Relaxed);
 
         // Update latency for realtime metrics
-        if (metric as usize) < ScannerMetric::LastRealtime as usize {
-            globalScannerMetrics.latency[metric as usize].add(duration).await;
+        if (metric) < ScannerMetric::LastRealtime as usize {
+            globalScannerMetrics.latency[metric].add(duration).await;
         }
     }
 
     /// Get lifetime operation count for a metric
     pub fn lifetime(&self, metric: ScannerMetric) -> u64 {
-        if (metric as usize) >= ScannerMetric::Last as usize {
+        let metric = metric as usize;
+        if (metric) >= ScannerMetric::Last as usize {
             return 0;
         }
-        self.operations[metric as usize].load(Ordering::Relaxed)
+        self.operations[metric].load(Ordering::Relaxed)
     }
 
     /// Get last minute statistics for a metric
     pub async fn last_minute(&self, metric: ScannerMetric) -> AccElem {
-        if (metric as usize) >= ScannerMetric::LastRealtime as usize {
+        let metric = metric as usize;
+        if (metric) >= ScannerMetric::LastRealtime as usize {
             return AccElem::default();
         }
-        self.latency[metric as usize].total().await
+        self.latency[metric].total().await
     }
 
     /// Set current cycle information
