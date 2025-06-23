@@ -1,5 +1,5 @@
 /// Metric descriptors related to cluster configuration
-use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 
 lazy_static::lazy_static! {
     pub static ref CONFIG_RRS_PARITY_MD: MetricDescriptor =

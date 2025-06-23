@@ -1,7 +1,7 @@
 use crate::store::DEFAULT_LIMIT;
 use crate::{
     error::TargetError,
-    target::{mqtt::MQTTArgs, webhook::WebhookArgs, Target},
+    target::{Target, mqtt::MQTTArgs, webhook::WebhookArgs},
 };
 use async_trait::async_trait;
 use ecstore::config::{ENABLE_KEY, ENABLE_ON, KVS};

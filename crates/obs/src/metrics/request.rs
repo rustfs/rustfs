@@ -1,4 +1,4 @@
-use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName, MetricSubsystem};
+use crate::metrics::{MetricDescriptor, MetricName, MetricSubsystem, new_counter_md, new_gauge_md, subsystems};
 
 lazy_static::lazy_static! {
     pub static ref API_REJECTED_AUTH_TOTAL_MD: MetricDescriptor =

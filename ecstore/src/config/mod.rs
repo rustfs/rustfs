@@ -5,7 +5,7 @@ pub mod storageclass;
 
 use crate::error::Result;
 use crate::store::ECStore;
-use com::{lookup_configs, read_config_without_migrate, STORAGE_CLASS_SUB_SYS};
+use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

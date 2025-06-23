@@ -1,5 +1,5 @@
 /// A descriptor for metrics related to webhook logs
-use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 
 /// Define label constants for webhook metrics
 /// name label

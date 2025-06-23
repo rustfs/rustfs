@@ -167,7 +167,7 @@ flate2 = "1.1.1"
 zstd = "0.13.3"
 lz4 = "1.28.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
-reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
+
 reed-solomon-simd = { version = "3.0.0" }
 regex = { version = "1.11.1" }
 reqwest = { version = "0.12.20", default-features = false, features = [

@@ -78,10 +78,7 @@ mod tests {
         assert_eq!(new_pattern(Some(""), Some("b")), "*b");
         assert_eq!(new_pattern(None, None), "");
         assert_eq!(new_pattern(Some("prefix"), Some("suffix")), "prefix*suffix");
-        assert_eq!(
-            new_pattern(Some("prefix/"), Some("/suffix")),
-            "prefix/*suffix"
-        ); // prefix/* + */suffix -> prefix/**/suffix -> prefix/*/suffix
+        assert_eq!(new_pattern(Some("prefix/"), Some("/suffix")), "prefix/*suffix"); // prefix/* + */suffix -> prefix/**/suffix -> prefix/*/suffix
     }
 
     #[test]

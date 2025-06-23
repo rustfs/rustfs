@@ -1,5 +1,5 @@
 /// IAM related metric descriptors
-use crate::metrics::{new_counter_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, subsystems};
 
 lazy_static::lazy_static! {
     pub static ref LAST_SYNC_DURATION_MILLIS_MD: MetricDescriptor =

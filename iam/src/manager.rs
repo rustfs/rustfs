@@ -1,21 +1,21 @@
-use crate::error::{is_err_config_not_found, Error, Result};
+use crate::error::{Error, Result, is_err_config_not_found};
 use crate::{
     cache::{Cache, CacheEntity},
-    error::{is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user, Error as IamError},
-    store::{object::IAM_CONFIG_PREFIX, GroupInfo, MappedPolicy, Store, UserType},
+    error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
+    store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
     sys::{
-        UpdateServiceAccountOpts, MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED,
-        STATUS_ENABLED,
+        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
+        UpdateServiceAccountOpts,
     },
 };
 use ecstore::global::get_global_action_cred;
 use madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use policy::{
     arn::ARN,
-    auth::{self, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign, Credentials, UserIdentity},
+    auth::{self, Credentials, UserIdentity, get_claims_from_token_with_secret, is_secret_key_valid, jwt_sign},
     format::Format,
     policy::{
-        default::DEFAULT_POLICIES, iam_policy_claim_name_sa, Policy, PolicyDoc, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE,
+        EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa,
     },
 };
 use rustfs_utils::crypto::base64_encode;
@@ -25,8 +25,8 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::Duration,
 };

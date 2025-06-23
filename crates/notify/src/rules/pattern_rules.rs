@@ -23,9 +23,7 @@ impl PatternRules {
 
     /// Checks if there are any rules that match the given object name.
     pub fn match_simple(&self, object_name: &str) -> bool {
-        self.rules
-            .keys()
-            .any(|p| pattern::match_simple(p, object_name))
+        self.rules.keys().any(|p| pattern::match_simple(p, object_name))
     }
 
     /// Returns all TargetIDs that match the object name.
@@ -61,8 +59,7 @@ impl PatternRules {
         for (pattern, self_targets) in &self.rules {
             match other.rules.get(pattern) {
                 Some(other_targets) => {
-                    let diff_targets: TargetIdSet =
-                        self_targets.difference(other_targets).cloned().collect();
+                    let diff_targets: TargetIdSet = self_targets.difference(other_targets).cloned().collect();
                     if !diff_targets.is_empty() {
                         result_rules.insert(pattern.clone(), diff_targets);
                     }
@@ -73,8 +70,6 @@ impl PatternRules {
                 }
             }
         }
-        PatternRules {
-            rules: result_rules,
-        }
+        PatternRules { rules: result_rules }
     }
 }
