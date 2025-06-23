@@ -6,10 +6,12 @@ use crate::headers::{
     RESERVED_METADATA_PREFIX_LOWER, VERSION_PURGE_STATUS_KEY,
 };
 use byteorder::ByteOrder;
+use bytes::Bytes;
 use rmp::Marker;
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::convert::TryFrom;
 use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::{collections::HashMap, io::Cursor};
@@ -433,7 +435,7 @@ impl FileMeta {
 
         if let Some(ref data) = fi.data {
             let key = vid.unwrap_or_default().to_string();
-            self.data.replace(&key, data.clone())?;
+            self.data.replace(&key, data.to_vec())?;
         }
 
         let version = FileMetaVersion::from(fi);
@@ -629,7 +631,10 @@ impl FileMeta {
             }
 
             if read_data {
-                fi.data = self.data.find(fi.version_id.unwrap_or_default().to_string().as_str())?;
+                fi.data = self
+                    .data
+                    .find(fi.version_id.unwrap_or_default().to_string().as_str())?
+                    .map(bytes::Bytes::from);
             }
 
             fi.num_versions = self.versions.len();
@@ -1462,9 +1467,9 @@ pub struct MetaObject {
     pub part_numbers: Vec<usize>,           // Part Numbers
     pub part_etags: Vec<String>,            // Part ETags
     pub part_sizes: Vec<usize>,             // Part Sizes
-    pub part_actual_sizes: Vec<usize>,      // Part ActualSizes (compression)
-    pub part_indices: Vec<Vec<u8>>,         // Part Indexes (compression)
-    pub size: usize,                        // Object version size
+    pub part_actual_sizes: Vec<i64>,        // Part ActualSizes (compression)
+    pub part_indices: Vec<Bytes>,           // Part Indexes (compression)
+    pub size: i64,                          // Object version size
     pub mod_time: Option<OffsetDateTime>,   // Object version modified time
     pub meta_sys: HashMap<String, Vec<u8>>, // Object version internal metadata
     pub meta_user: HashMap<String, String>, // Object version metadata set by user
@@ -1621,7 +1626,7 @@ impl MetaObject {
                         let mut buf = vec![0u8; blen as usize];
                         cur.read_exact(&mut buf)?;
 
-                        indices.push(buf);
+                        indices.push(Bytes::from(buf));
                     }
 
                     self.part_indices = indices;
@@ -1893,13 +1898,16 @@ impl MetaObject {
         }
 
         for (k, v) in &self.meta_sys {
+            if k == AMZ_STORAGE_CLASS && v == b"STANDARD" {
+                continue;
+            }
+
             if k.starts_with(RESERVED_METADATA_PREFIX)
                 || k.starts_with(RESERVED_METADATA_PREFIX_LOWER)
                 || k == VERSION_PURGE_STATUS_KEY
             {
-                continue;
+                metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
             }
-            metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
         }
 
         // todo: ReplicationState,Delete
@@ -2616,7 +2624,6 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
 }
 #[cfg(test)]
 mod test {
-
     use super::*;
     use crate::test_data::*;
 
@@ -2736,7 +2743,7 @@ mod test {
 
         // 验证基本属性
         assert_eq!(fm.meta_ver, XL_META_VERSION);
-        assert_eq!(fm.versions.len(), 3, "应该有3个版本（1个对象，1个删除标记，1个Legacy）");
+        assert_eq!(fm.versions.len(), 3, "应该有 3 个版本（1 个对象，1 个删除标记，1 个 Legacy）");
 
         // 验证版本类型
         let mut object_count = 0;
@@ -2752,9 +2759,9 @@ mod test {
             }
         }
 
-        assert_eq!(object_count, 1, "应该有1个对象版本");
-        assert_eq!(delete_count, 1, "应该有1个删除标记");
-        assert_eq!(legacy_count, 1, "应该有1个Legacy版本");
+        assert_eq!(object_count, 1, "应该有 1 个对象版本");
+        assert_eq!(delete_count, 1, "应该有 1 个删除标记");
+        assert_eq!(legacy_count, 1, "应该有 1 个 Legacy 版本");
 
         // 验证兼容性
         assert!(fm.is_compatible_with_meta(), "应该与 xl 格式兼容");
@@ -2777,7 +2784,7 @@ mod test {
         let fm = FileMeta::load(&data).expect("解析复杂数据失败");
 
         // 验证版本数量
-        assert!(fm.versions.len() >= 10, "应该有至少10个版本");
+        assert!(fm.versions.len() >= 10, "应该有至少 10 个版本");
 
         // 验证版本排序
         assert!(fm.is_sorted_by_mod_time(), "版本应该按修改时间排序");
@@ -2798,7 +2805,7 @@ mod test {
         let data = create_xlmeta_with_inline_data().expect("创建内联数据测试失败");
         let fm = FileMeta::load(&data).expect("解析内联数据失败");
 
-        assert_eq!(fm.versions.len(), 1, "应该有1个版本");
+        assert_eq!(fm.versions.len(), 1, "应该有 1 个版本");
         assert!(!fm.data.as_slice().is_empty(), "应该包含内联数据");
 
         // 验证内联数据内容
@@ -2845,7 +2852,7 @@ mod test {
 
         for version in &fm.versions {
             let signature = version.header.get_signature();
-            assert_eq!(signature.len(), 4, "签名应该是4字节");
+            assert_eq!(signature.len(), 4, "签名应该是 4 字节");
 
             // 验证相同版本的签名一致性
             let signature2 = version.header.get_signature();
@@ -2888,7 +2895,7 @@ mod test {
         // 验证版本内容一致性
         for (v1, v2) in fm.versions.iter().zip(fm2.versions.iter()) {
             assert_eq!(v1.header.version_type, v2.header.version_type, "版本类型应该一致");
-            assert_eq!(v1.header.version_id, v2.header.version_id, "版本ID应该一致");
+            assert_eq!(v1.header.version_id, v2.header.version_id, "版本 ID 应该一致");
         }
     }
 
@@ -2909,26 +2916,26 @@ mod test {
         let _serialized = fm.marshal_msg().expect("序列化失败");
         let serialization_time = start.elapsed();
 
-        println!("性能测试结果:");
-        println!("  创建时间: {:?}", creation_time);
-        println!("  解析时间: {:?}", parsing_time);
-        println!("  序列化时间: {:?}", serialization_time);
+        println!("性能测试结果：");
+        println!("  创建时间：{:?}", creation_time);
+        println!("  解析时间：{:?}", parsing_time);
+        println!("  序列化时间：{:?}", serialization_time);
 
         // 基本性能断言（这些值可能需要根据实际性能调整）
-        assert!(parsing_time.as_millis() < 100, "解析时间应该小于100ms");
-        assert!(serialization_time.as_millis() < 100, "序列化时间应该小于100ms");
+        assert!(parsing_time.as_millis() < 100, "解析时间应该小于 100ms");
+        assert!(serialization_time.as_millis() < 100, "序列化时间应该小于 100ms");
     }
 
     #[test]
     fn test_edge_cases() {
         // 测试边界情况
 
-        // 1. 测试空版本ID
+        // 1. 测试空版本 ID
         let mut fm = FileMeta::new();
         let version = FileMetaVersion {
             version_type: VersionType::Object,
             object: Some(MetaObject {
-                version_id: None, // 空版本ID
+                version_id: None, // 空版本 ID
                 data_dir: None,
                 erasure_algorithm: crate::fileinfo::ErasureAlgo::ReedSolomon,
                 erasure_m: 1,
@@ -2961,13 +2968,13 @@ mod test {
 
         // 2. 测试极大的文件大小
         let large_object = MetaObject {
-            size: usize::MAX,
+            size: i64::MAX,
             part_sizes: vec![usize::MAX],
             ..Default::default()
         };
 
         // 应该能够处理大数值
-        assert_eq!(large_object.size, usize::MAX);
+        assert_eq!(large_object.size, i64::MAX);
     }
 
     #[tokio::test]
@@ -3024,9 +3031,9 @@ mod test {
         let large_size = mem::size_of_val(&large_fm);
         println!("Large FileMeta size: {} bytes", large_size);
 
-        // 验证内存使用是合理的（注意：size_of_val只计算栈上的大小，不包括堆分配）
-        // 对于包含Vec的结构体，size_of_val可能相同，因为Vec的容量在堆上
-        println!("版本数量: {}", large_fm.versions.len());
+        // 验证内存使用是合理的（注意：size_of_val 只计算栈上的大小，不包括堆分配）
+        // 对于包含 Vec 的结构体，size_of_val 可能相同，因为 Vec 的容量在堆上
+        println!("版本数量：{}", large_fm.versions.len());
         assert!(!large_fm.versions.is_empty(), "应该有版本数据");
     }
 
@@ -3097,8 +3104,8 @@ mod test {
             };
 
             // 验证参数的合理性
-            assert!(obj.erasure_m > 0, "数据块数量必须大于0");
-            assert!(obj.erasure_n > 0, "校验块数量必须大于0");
+            assert!(obj.erasure_m > 0, "数据块数量必须大于 0");
+            assert!(obj.erasure_n > 0, "校验块数量必须大于 0");
             assert_eq!(obj.erasure_dist.len(), data_blocks + parity_blocks);
 
             // 验证序列化和反序列化
@@ -3259,7 +3266,7 @@ mod test {
         // 测试多个版本列表的合并
         let merged = merge_file_meta_versions(1, false, 0, &[versions1.clone(), versions2.clone()]);
         // 合并结果可能为空，这取决于版本的兼容性，这是正常的
-        println!("合并结果数量: {}", merged.len());
+        println!("合并结果数量：{}", merged.len());
     }
 
     #[test]
@@ -3269,12 +3276,12 @@ mod test {
 
         for flag in flags {
             let flag_value = flag as u8;
-            assert!(flag_value > 0, "标志位值应该大于0");
+            assert!(flag_value > 0, "标志位值应该大于 0");
 
             // 测试标志位组合
             let combined = Flags::FreeVersion as u8 | Flags::UsesDataDir as u8;
             // 对于位运算，组合值可能不总是大于单个值，这是正常的
-            assert!(combined > 0, "组合标志位应该大于0");
+            assert!(combined > 0, "组合标志位应该大于 0");
         }
     }
 
@@ -3410,7 +3417,7 @@ mod test {
             ("tabs", "col1\tcol2\tcol3"),
             ("quotes", "\"quoted\" and 'single'"),
             ("backslashes", "path\\to\\file"),
-            ("mixed", "Mixed: 中文, English, 123, !@#$%"),
+            ("mixed", "Mixed: 中文，English, 123, !@#$%"),
         ];
 
         for (key, value) in special_cases {
@@ -3432,7 +3439,7 @@ mod test {
             ("tabs", "col1\tcol2\tcol3"),
             ("quotes", "\"quoted\" and 'single'"),
             ("backslashes", "path\\to\\file"),
-            ("mixed", "Mixed: 中文, English, 123, !@#$%"),
+            ("mixed", "Mixed: 中文，English, 123, !@#$%"),
         ] {
             assert_eq!(obj2.meta_user.get(key), Some(&expected_value.to_string()));
         }
@@ -3529,7 +3536,7 @@ pub struct DetailedVersionStats {
     pub free_versions: usize,
     pub versions_with_data_dir: usize,
     pub versions_with_inline_data: usize,
-    pub total_size: usize,
+    pub total_size: i64,
     pub latest_mod_time: Option<OffsetDateTime>,
 }
 

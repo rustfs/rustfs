@@ -1,21 +1,34 @@
-use rustfs_event_notifier::NotifierConfig;
+use ecstore::config::GLOBAL_ServerConfig;
 use tracing::{error, info, instrument};
 
 #[instrument]
-pub(crate) async fn init_event_notifier(notifier_config: Option<String>) {
-    // Initialize event notifier
-    if notifier_config.is_some() {
-        info!("event_config is not empty");
-        tokio::spawn(async move {
-            let config = NotifierConfig::event_load_config(notifier_config);
-            let result = rustfs_event_notifier::initialize(config).await;
-            if let Err(e) = result {
-                error!("Failed to initialize event notifier: {}", e);
-            } else {
-                info!("Event notifier initialized successfully");
-            }
-        });
-    } else {
-        info!("event_config is empty");
+pub(crate) async fn init_event_notifier() {
+    info!("Initializing event notifier...");
+
+    // 1. Get the global configuration loaded by ecstore
+    let server_config = match GLOBAL_ServerConfig.get() {
+        Some(config) => config.clone(), // Clone the config to pass ownership
+        None => {
+            error!("Event notifier initialization failed: Global server config not loaded.");
+            return;
+        }
+    };
+
+    // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
+    if server_config.get_value("notify", "_").is_none() {
+        info!("'notify' subsystem not configured, skipping event notifier initialization.");
+        return;
     }
+
+    info!("Event notifier configuration found, proceeding with initialization.");
+
+    // 3. Initialize the notification system asynchronously with a global configuration
+    // Put it into a separate task to avoid blocking the main initialization process
+    tokio::spawn(async move {
+        if let Err(e) = rustfs_notify::initialize(server_config).await {
+            error!("Failed to initialize event notifier system: {}", e);
+        } else {
+            info!("Event notifier system initialized successfully.");
+        }
+    });
 }

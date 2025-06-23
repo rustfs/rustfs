@@ -1,6 +1,9 @@
+use bytes::Bytes;
 use pin_project_lite::pin_project;
-use rustfs_utils::{HashAlgorithm, read_full, write_all};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use rustfs_utils::HashAlgorithm;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::error;
+use uuid::Uuid;
 
 pin_project! {
     /// BitrotReader reads (hash+data) blocks from an async reader and verifies hash integrity.
@@ -11,10 +14,11 @@ pin_project! {
         shard_size: usize,
         buf: Vec<u8>,
         hash_buf: Vec<u8>,
-        hash_read: usize,
-        data_buf: Vec<u8>,
-        data_read: usize,
-        hash_checked: bool,
+        // hash_read: usize,
+        // data_buf: Vec<u8>,
+        // data_read: usize,
+        // hash_checked: bool,
+        id: Uuid,
     }
 }
 
@@ -31,10 +35,11 @@ where
             shard_size,
             buf: Vec::new(),
             hash_buf: vec![0u8; hash_size],
-            hash_read: 0,
-            data_buf: Vec::new(),
-            data_read: 0,
-            hash_checked: false,
+            // hash_read: 0,
+            // data_buf: Vec::new(),
+            // data_read: 0,
+            // hash_checked: false,
+            id: Uuid::new_v4(),
         }
     }
 
@@ -50,30 +55,31 @@ where
 
         let hash_size = self.hash_algo.size();
         // Read hash
-        let mut hash_buf = vec![0u8; hash_size];
+
         if hash_size > 0 {
-            self.inner.read_exact(&mut hash_buf).await?;
+            self.inner.read_exact(&mut self.hash_buf).await.map_err(|e| {
+                error!("bitrot reader read hash error: {}", e);
+                e
+            })?;
         }
 
-        let data_len = read_full(&mut self.inner, out).await?;
-
-        // // Read data
-        // let mut data_len = 0;
-        // while data_len < out.len() {
-        //     let n = self.inner.read(&mut out[data_len..]).await?;
-        //     if n == 0 {
-        //         break;
-        //     }
-        //     data_len += n;
-        //     // Only read up to one shard_size block
-        //     if data_len >= self.shard_size {
-        //         break;
-        //     }
-        // }
+        // Read data
+        let mut data_len = 0;
+        while data_len < out.len() {
+            let n = self.inner.read(&mut out[data_len..]).await.map_err(|e| {
+                error!("bitrot reader read data error: {}", e);
+                e
+            })?;
+            if n == 0 {
+                break;
+            }
+            data_len += n;
+        }
 
         if hash_size > 0 {
             let actual_hash = self.hash_algo.hash_encode(&out[..data_len]);
-            if actual_hash != hash_buf {
+            if actual_hash.as_ref() != self.hash_buf.as_slice() {
+                error!("bitrot reader hash mismatch, id={} data_len={}, out_len={}", self.id, data_len, out.len());
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
             }
         }
@@ -139,26 +145,24 @@ where
 
         if hash_algo.size() > 0 {
             let hash = hash_algo.hash_encode(buf);
-            self.buf.extend_from_slice(&hash);
+            self.buf.extend_from_slice(hash.as_ref());
         }
 
         self.buf.extend_from_slice(buf);
 
-        // Write hash+data in one call
-        let mut n = write_all(&mut self.inner, &self.buf).await?;
+        self.inner.write_all(&self.buf).await?;
 
-        if n < hash_algo.size() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "short write: not enough bytes written",
-            ));
-        }
+        // self.inner.flush().await?;
 
-        n -= hash_algo.size();
+        let n = buf.len();
 
         self.buf.clear();
 
         Ok(n)
+    }
+
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.shutdown().await
     }
 }
 
@@ -174,7 +178,7 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     want_size: usize,
     part_size: usize,
     algo: HashAlgorithm,
-    _want: Vec<u8>,
+    _want: Bytes, // FIXME: useless parameter?
     mut shard_size: usize,
 ) -> std::io::Result<()> {
     let mut hash_buf = vec![0; algo.size()];
@@ -196,7 +200,7 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
         let read = r.read_exact(&mut buf).await?;
 
         let actual_hash = algo.hash_encode(&buf);
-        if actual_hash != hash_buf[0..n] {
+        if actual_hash.as_ref() != &hash_buf[0..n] {
             return Err(std::io::Error::other("bitrot hash mismatch"));
         }
 
@@ -327,6 +331,10 @@ impl BitrotWriterWrapper {
     /// Write data to the bitrot writer
     pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.bitrot_writer.write(buf).await
+    }
+
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.bitrot_writer.shutdown().await
     }
 
     /// Extract the inline buffer data, consuming the wrapper

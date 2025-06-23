@@ -651,7 +651,7 @@ impl StorageAPI for Sets {
 
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         object: &str,
         upload_id: &str,

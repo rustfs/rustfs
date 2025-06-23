@@ -34,6 +34,7 @@ mod config;
 mod entry;
 mod global;
 mod logger;
+mod metrics;
 mod sinks;
 mod system;
 mod telemetry;

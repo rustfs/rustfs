@@ -19,7 +19,7 @@ mkdir -p ./target/volume/test{0..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-   export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
+    export RUST_LOG="rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -55,11 +55,13 @@ export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
 #export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000
 #export RUSTFS_SINKS_FILE_FLUSH_THRESHOLD=100
 #
+# Kafka sink 配置
 #export RUSTFS_SINKS_KAFKA_BROKERS=localhost:9092
 #export RUSTFS_SINKS_KAFKA_TOPIC=logs
 #export RUSTFS_SINKS_KAFKA_BATCH_SIZE=100
 #export RUSTFS_SINKS_KAFKA_BATCH_TIMEOUT_MS=1000
 #
+# Webhook sink 配置
 #export RUSTFS_SINKS_WEBHOOK_ENDPOINT=http://localhost:8080/webhook
 #export RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN=you-auth-token
 #export RUSTFS_SINKS_WEBHOOK_BATCH_SIZE=100
@@ -72,6 +74,11 @@ export OTEL_INSTRUMENTATION_VERSION="0.1.1"
 export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
+export RUSTFS_NS_SCANNER_INTERVAL=60  # 对象扫描间隔时间，单位为秒
+# exportRUSTFS_SKIP_BACKGROUND_TASK=true
+
+export RUSTFS_COMPRESSION_ENABLED=true # 是否启用压缩
+
 # 事件消息配置
 #export RUSTFS_EVENT_CONFIG="./deploy/config/event.example.toml"
 
@@ -80,6 +87,6 @@ if [ -n "$1" ]; then
 fi
 
 # 启动 webhook 服务器
-#cargo run --example webhook -p rustfs-event-notifier &
+#cargo run --example webhook -p rustfs-event &
 # 启动主服务
 cargo run --bin rustfs

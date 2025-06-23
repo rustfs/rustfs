@@ -63,8 +63,8 @@ use crate::{
         heal_ops::{BG_HEALING_UUID, HealSource},
     },
     new_object_layer_fn,
-    peer::is_reserved_or_invalid_bucket,
     store::ECStore,
+    store_utils::is_reserved_or_invalid_bucket,
 };
 use crate::{disk::DiskAPI, store_api::ObjectInfo};
 use crate::{
@@ -612,7 +612,7 @@ impl ScannerItem {
             cumulative_size += obj_info.size;
         }
 
-        if cumulative_size >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst) as usize {
+        if cumulative_size >= SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL_SIZE.load(Ordering::SeqCst) as i64 {
             //todo
         }
 
@@ -718,7 +718,7 @@ impl ScannerItem {
         Ok(object_infos)
     }
 
-    pub async fn apply_actions(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) -> (bool, usize) {
+    pub async fn apply_actions(&mut self, oi: &ObjectInfo, _size_s: &mut SizeSummary) -> (bool, i64) {
         let done = ScannerMetrics::time(ScannerMetric::Ilm);
 
         let (action, size) = self.apply_lifecycle(oi).await;
@@ -807,21 +807,21 @@ impl ScannerItem {
             match tgt_status {
                 ReplicationStatusType::Pending => {
                     tgt_size_s.pending_count += 1;
-                    tgt_size_s.pending_size += oi.size;
+                    tgt_size_s.pending_size += oi.size as usize;
                     size_s.pending_count += 1;
-                    size_s.pending_size += oi.size;
+                    size_s.pending_size += oi.size as usize;
                 }
                 ReplicationStatusType::Failed => {
                     tgt_size_s.failed_count += 1;
-                    tgt_size_s.failed_size += oi.size;
+                    tgt_size_s.failed_size += oi.size as usize;
                     size_s.failed_count += 1;
-                    size_s.failed_size += oi.size;
+                    size_s.failed_size += oi.size as usize;
                 }
                 ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
                     tgt_size_s.replicated_count += 1;
-                    tgt_size_s.replicated_size += oi.size;
+                    tgt_size_s.replicated_size += oi.size as usize;
                     size_s.replicated_count += 1;
-                    size_s.replicated_size += oi.size;
+                    size_s.replicated_size += oi.size as usize;
                 }
                 _ => {}
             }
@@ -829,7 +829,7 @@ impl ScannerItem {
 
         if matches!(oi.replication_status, ReplicationStatusType::Replica) {
             size_s.replica_count += 1;
-            size_s.replica_size += oi.size;
+            size_s.replica_size += oi.size as usize;
         }
     }
 }

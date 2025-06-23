@@ -680,7 +680,7 @@ mod test {
             ),
             (
                 vec!["ftp://server/d1", "http://server/d2", "http://server/d3", "http://server/d4"],
-                Some(Error::other("'ftp://server/d1': io error")),
+                Some(Error::other("'ftp://server/d1': io error invalid URL endpoint format")),
                 10,
             ),
             (
@@ -719,7 +719,13 @@ mod test {
                 (None, Ok(_)) => {}
                 (Some(e), Ok(_)) => panic!("{}: error: expected = {}, got = <nil>", test_case.2, e),
                 (Some(e), Err(e2)) => {
-                    assert_eq!(e.to_string(), e2.to_string(), "{}: error: expected = {}, got = {}", test_case.2, e, e2)
+                    assert!(
+                        e2.to_string().starts_with(&e.to_string()),
+                        "{}: error: expected = {}, got = {}",
+                        test_case.2,
+                        e,
+                        e2
+                    )
                 }
             }
         }

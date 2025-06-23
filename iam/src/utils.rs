@@ -3,6 +3,20 @@ use rand::{Rng, RngCore};
 use serde::{Serialize, de::DeserializeOwned};
 use std::io::{Error, Result};
 
+/// Generates a random access key of the specified length.
+///
+/// # Arguments
+///
+/// * `length` - The length of the access key to be generated.
+///
+/// # Returns
+///
+/// * `Result<String>` - A result containing the generated access key or an error if the length is invalid.
+///
+/// # Errors
+///
+/// * Returns an error if the length is less than 3.
+///
 pub fn gen_access_key(length: usize) -> Result<String> {
     const ALPHA_NUMERIC_TABLE: [char; 36] = [
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
@@ -23,6 +37,20 @@ pub fn gen_access_key(length: usize) -> Result<String> {
     Ok(result)
 }
 
+/// Generates a random secret key of the specified length.
+///
+/// # Arguments
+///
+/// * `length` - The length of the secret key to be generated.
+///
+/// # Returns
+///
+/// * `Result<String>` - A result containing the generated secret key or an error if the length is invalid.
+///
+/// # Errors
+///
+/// * Returns an error if the length is less than 8.
+///
 pub fn gen_secret_key(length: usize) -> Result<String> {
     use base64_simd::URL_SAFE_NO_PAD;
 

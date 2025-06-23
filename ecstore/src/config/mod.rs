@@ -18,6 +18,14 @@ lazy_static! {
     pub static ref GLOBAL_ConfigSys: ConfigSys = ConfigSys::new();
 }
 
+/// Standard config keys and values.
+pub const ENABLE_KEY: &str = "enable";
+pub const COMMENT_KEY: &str = "comment";
+
+/// Enable values
+pub const ENABLE_ON: &str = "on";
+pub const ENABLE_OFF: &str = "off";
+
 pub const ENV_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 pub const ENV_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
 pub const ENV_ROOT_USER: &str = "RUSTFS_ROOT_USER";
@@ -56,7 +64,7 @@ pub struct KV {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct KVS(Vec<KV>);
+pub struct KVS(pub Vec<KV>);
 
 impl Default for KVS {
     fn default() -> Self {
@@ -83,7 +91,7 @@ impl KVS {
 }
 
 #[derive(Debug, Clone)]
-pub struct Config(HashMap<String, HashMap<String, KVS>>);
+pub struct Config(pub HashMap<String, HashMap<String, KVS>>);
 
 impl Default for Config {
     fn default() -> Self {
@@ -99,8 +107,8 @@ impl Config {
         cfg
     }
 
-    pub fn get_value(&self, subsys: &str, key: &str) -> Option<KVS> {
-        if let Some(m) = self.0.get(subsys) {
+    pub fn get_value(&self, sub_sys: &str, key: &str) -> Option<KVS> {
+        if let Some(m) = self.0.get(sub_sys) {
             m.get(key).cloned()
         } else {
             None

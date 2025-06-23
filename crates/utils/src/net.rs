@@ -1,3 +1,6 @@
+use bytes::Bytes;
+use futures::pin_mut;
+use futures::{Stream, StreamExt};
 use hyper::client::conn::http2::Builder;
 use hyper_util::rt::TokioExecutor;
 use lazy_static::lazy_static;
@@ -6,6 +9,7 @@ use std::{
     fmt::Display,
     net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
 };
+use transform_stream::AsyncTryStream;
 use url::{Host, Url};
 //use hyper::{client::conn::http2::Builder, rt::Executor};
 //use tonic::{SharedExec, UserAgent};
@@ -276,6 +280,27 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
         addr
     };
     Ok(resolved_addr)
+}
+
+#[allow(dead_code)]
+pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static
+where
+    S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    AsyncTryStream::<Bytes, E, _>::new(|mut y| async move {
+        pin_mut!(stream);
+        let mut remaining: usize = content_length;
+        while let Some(result) = stream.next().await {
+            let mut bytes = result?;
+            if bytes.len() > remaining {
+                bytes.truncate(remaining);
+            }
+            remaining -= bytes.len();
+            y.yield_ok(bytes).await;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

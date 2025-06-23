@@ -6,7 +6,6 @@ pub mod format;
 pub mod fs;
 pub mod local;
 pub mod os;
-pub mod remote;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
@@ -22,12 +21,13 @@ use crate::heal::{
     data_usage_cache::{DataUsageCache, DataUsageEntry},
     heal_commands::{HealScanMode, HealingTracker},
 };
+use crate::rpc::RemoteDisk;
+use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
 use error::{Error, Result};
 use local::LocalDisk;
 use madmin::info_commands::DiskMetrics;
-use remote::RemoteDisk;
 use rustfs_filemeta::{FileInfo, RawFileInfo};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc};
@@ -36,7 +36,6 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc::Sender,
 };
-use tracing::warn;
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Disk>;
@@ -303,7 +302,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: usize) -> Result<FileWriter> {
+    async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
         match self {
             Disk::Local(local_disk) => local_disk.create_file(_origvolume, volume, path, _file_size).await,
             Disk::Remote(remote_disk) => remote_disk.create_file(_origvolume, volume, path, _file_size).await,
@@ -319,7 +318,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()> {
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.rename_part(src_volume, src_path, dst_volume, dst_path, meta).await,
             Disk::Remote(remote_disk) => {
@@ -363,7 +362,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()> {
+    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.write_all(volume, path, data).await,
             Disk::Remote(remote_disk) => remote_disk.write_all(volume, path, data).await,
@@ -371,7 +370,7 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>> {
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         match self {
             Disk::Local(local_disk) => local_disk.read_all(volume, path).await,
             Disk::Remote(remote_disk) => remote_disk.read_all(volume, path).await,
@@ -490,10 +489,10 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: usize) -> Result<FileWriter>;
+    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
-    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Vec<u8>) -> Result<()>;
+    async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     // VerifyFile
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
@@ -503,8 +502,8 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // ReadParts
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
-    async fn write_all(&self, volume: &str, path: &str, data: Vec<u8>) -> Result<()>;
-    async fn read_all(&self, volume: &str, path: &str) -> Result<Vec<u8>>;
+    async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
+    async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     async fn ns_scanner(
         &self,

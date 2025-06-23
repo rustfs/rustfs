@@ -232,7 +232,7 @@ impl HealingTracker {
 
         if let Some(disk) = &self.disk {
             let file_path = Path::new(BUCKET_META_PREFIX).join(HEALING_TRACKER_FILENAME);
-            disk.write_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap(), htracker_bytes)
+            disk.write_all(RUSTFS_META_BUCKET, file_path.to_str().unwrap(), htracker_bytes.into())
                 .await?;
         }
         Ok(())

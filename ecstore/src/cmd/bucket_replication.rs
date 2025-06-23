@@ -6,7 +6,7 @@ use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::error::Error;
 use crate::new_object_layer_fn;
-use crate::peer::RemotePeerS3Client;
+use crate::rpc::RemotePeerS3Client;
 use crate::store;
 use crate::store_api::ObjectIO;
 use crate::store_api::ObjectInfo;
@@ -26,8 +26,6 @@ use futures::stream::FuturesUnordered;
 use http::HeaderMap;
 use http::Method;
 use lazy_static::lazy_static;
-use std::str::FromStr;
-use std::sync::Arc;
 // use std::time::SystemTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -44,6 +42,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::iter::Iterator;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 use std::vec;
@@ -512,8 +512,8 @@ pub async fn get_heal_replicate_object_info(
 
     let mut result = ReplicateObjectInfo {
         name: oi.name.clone(),
-        size: oi.size as i64,
-        actual_size: asz as i64,
+        size: oi.size,
+        actual_size: asz,
         bucket: oi.bucket.clone(),
         //version_id: oi.version_id.clone(),
         version_id: oi
@@ -815,8 +815,8 @@ impl ReplicationPool {
             vsender.pop(); // Dropping the sender will close the channel
         }
         self.workers_sender = vsender;
-        warn!("self sender size is {:?}", self.workers_sender.len());
-        warn!("self sender size is {:?}", self.workers_sender.len());
+        // warn!("self sender size is {:?}", self.workers_sender.len());
+        // warn!("self sender size is {:?}", self.workers_sender.len());
     }
 
     async fn resize_failed_workers(&self, _count: usize) {
@@ -1759,13 +1759,13 @@ pub async fn schedule_replication(oi: ObjectInfo, o: Arc<store::ECStore>, dsc: R
     let replication_timestamp = Utc::now(); // Placeholder for timestamp parsing
     let replication_state = oi.replication_state();
 
-    let actual_size = oi.actual_size.unwrap_or(0);
+    let actual_size = oi.actual_size;
     //let ssec = oi.user_defined.contains_key("ssec");
     let ssec = false;
 
     let ri = ReplicateObjectInfo {
         name: oi.name,
-        size: oi.size as i64,
+        size: oi.size,
         bucket: oi.bucket,
         version_id: oi
             .version_id
@@ -2019,8 +2019,8 @@ impl ReplicateObjectInfo {
             mod_time: Some(
                 OffsetDateTime::from_unix_timestamp(self.mod_time.timestamp()).unwrap_or_else(|_| OffsetDateTime::now_utc()),
             ),
-            size: self.size as usize,
-            actual_size: Some(self.actual_size as usize),
+            size: self.size,
+            actual_size: self.actual_size,
             is_dir: false,
             user_defined: None, // 可以按需从别处导入
             parity_blocks: 0,
@@ -2319,7 +2319,7 @@ impl ReplicateObjectInfo {
 
         // 设置对象大小
         //rinfo.size = object_info.actual_size.unwrap_or(0);
-        rinfo.size = object_info.actual_size.map_or(0, |v| v as i64);
+        rinfo.size = object_info.actual_size;
         //rinfo.replication_action = object_info.
 
         rinfo.replication_status = ReplicationStatusType::Completed;

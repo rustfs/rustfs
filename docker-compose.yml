@@ -1,0 +1,221 @@
+version: '3.8'
+
+services:
+  # RustFS main service
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs-server
+    build:
+      context: .
+      dockerfile: Dockerfile.multi-stage
+      args:
+        TARGETPLATFORM: linux/amd64
+    ports:
+      - "9000:9000"  # S3 API port
+      - "9001:9001"  # Console port
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_LOG_LEVEL=info
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
+    volumes:
+      - rustfs_data_0:/data/rustfs0
+      - rustfs_data_1:/data/rustfs1
+      - rustfs_data_2:/data/rustfs2
+      - rustfs_data_3:/data/rustfs3
+      - ./logs:/app/logs
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - otel-collector
+
+  # Development environment
+  rustfs-dev:
+    image: rustfs/rustfs:devenv
+    container_name: rustfs-dev
+    build:
+      context: .
+      dockerfile: .docker/Dockerfile.devenv
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs0,/data/rustfs1
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_ACCESS_KEY=devadmin
+      - RUSTFS_SECRET_KEY=devadmin
+      - RUSTFS_LOG_LEVEL=debug
+    volumes:
+      - .:/root/s3-rustfs
+      - rustfs_dev_data:/data
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - dev
+
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command:
+      - --config=/etc/otelcol-contrib/otel-collector.yml
+    volumes:
+      - ./.docker/observability/otel-collector.yml:/etc/otelcol-contrib/otel-collector.yml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "8888:8888"   # Prometheus metrics
+      - "8889:8889"   # Prometheus exporter metrics
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - observability
+
+  # Jaeger for tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14250:14250"  # Jaeger gRPC
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - observability
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./.docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - observability
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./.docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./.docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - observability
+
+  # MinIO for S3 API testing
+  minio:
+    image: minio/minio:latest
+    container_name: minio-test
+    ports:
+      - "9020:9000"
+      - "9021:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - testing
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - cache
+
+  # NGINX reverse proxy (optional)
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./.docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./.docker/nginx/ssl:/etc/nginx/ssl:ro
+    networks:
+      - rustfs-network
+    restart: unless-stopped
+    profiles:
+      - proxy
+    depends_on:
+      - rustfs
+
+networks:
+  rustfs-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  rustfs_data_0:
+    driver: local
+  rustfs_data_1:
+    driver: local
+  rustfs_data_2:
+    driver: local
+  rustfs_data_3:
+    driver: local
+  rustfs_dev_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  minio_data:
+    driver: local
+  redis_data:
+    driver: local

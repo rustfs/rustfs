@@ -27,6 +27,7 @@ use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::fmt::time::LocalTime;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// A guard object that manages the lifecycle of OpenTelemetry components.
@@ -224,6 +225,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             let fmt_layer = {
                 let enable_color = std::io::stdout().is_terminal();
                 let mut layer = tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTime::rfc_3339())
                     .with_target(true)
                     .with_ansi(enable_color)
                     .with_thread_names(true)

@@ -1,3 +1,4 @@
+use ecstore::rpc::verify_rpc_signature;
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -12,6 +13,7 @@ use s3s::S3Result;
 use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
+use tracing::error;
 
 use super::ADMIN_PREFIX;
 use super::RUSTFS_ADMIN_PREFIX;
@@ -84,10 +86,19 @@ where
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
-        // TODO: check access by req.credentials
+        // Check RPC signature verification
         if req.uri.path().starts_with(RPC_PREFIX) {
+            // Skip signature verification for HEAD requests (health checks)
+            if req.method != Method::HEAD {
+                verify_rpc_signature(&req.uri.to_string(), &req.method, &req.headers).map_err(|e| {
+                    error!("RPC signature verification failed: {}", e);
+                    s3_error!(AccessDenied, "{}", e)
+                })?;
+            }
             return Ok(());
         }
+
+        // For non-RPC admin requests, check credentials
         match req.credentials {
             Some(_) => Ok(()),
             None => Err(s3_error!(AccessDenied, "Signature is required")),

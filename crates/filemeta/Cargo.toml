@@ -15,7 +15,7 @@ time.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
-
+bytes.workspace = true
 rustfs-utils = {workspace = true, features= ["hash"]}
 byteorder = "1.5.0"
 tracing.workspace = true

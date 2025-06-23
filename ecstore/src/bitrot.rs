@@ -28,7 +28,7 @@ pub async fn create_bitrot_reader(
     checksum_algo: HashAlgorithm,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
     // Calculate the total length to read, including the checksum overhead
-    let length = offset.div_ceil(shard_size) * checksum_algo.size() + length;
+    let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
 
     if let Some(data) = inline_data {
         // Use inline data
@@ -68,14 +68,20 @@ pub async fn create_bitrot_writer(
     disk: Option<&DiskStore>,
     volume: &str,
     path: &str,
-    length: usize,
+    length: i64,
     shard_size: usize,
     checksum_algo: HashAlgorithm,
 ) -> disk::error::Result<BitrotWriterWrapper> {
     let writer = if is_inline_buffer {
         CustomWriter::new_inline_buffer()
     } else if let Some(disk) = disk {
-        let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
+        let length = if length > 0 {
+            let length = length as usize;
+            (length.div_ceil(shard_size) * checksum_algo.size() + length) as i64
+        } else {
+            0
+        };
+
         let file = disk.create_file("", volume, path, length).await?;
         CustomWriter::new_tokio_writer(file)
     } else {

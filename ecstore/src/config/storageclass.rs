@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use tracing::warn;
 
-// default_parity_count 默认配置，根据磁盘总数分配校验磁盘数量
+/// Default parity count for a given drive count
+/// The default configuration allocates the number of check disks based on the total number of disks
 pub fn default_parity_count(drive: usize) -> usize {
     match drive {
         1 => 0,
@@ -112,7 +113,13 @@ impl Config {
         }
     }
 
-    pub fn should_inline(&self, shard_size: usize, versioned: bool) -> bool {
+    pub fn should_inline(&self, shard_size: i64, versioned: bool) -> bool {
+        if shard_size < 0 {
+            return false;
+        }
+
+        let shard_size = shard_size as usize;
+
         let mut inline_block = DEFAULT_INLINE_BLOCK;
         if self.initialized {
             inline_block = self.inline_block;

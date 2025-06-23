@@ -1,5 +1,7 @@
 use crate::error::{Error, Result};
 use crate::headers::RESERVED_METADATA_PREFIX_LOWER;
+use crate::headers::RUSTFS_HEALING;
+use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use serde::Deserialize;
@@ -7,9 +9,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-use crate::headers::RESERVED_METADATA_PREFIX;
-use crate::headers::RUSTFS_HEALING;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
@@ -27,10 +26,10 @@ pub struct ObjectPartInfo {
     pub etag: String,
     pub number: usize,
     pub size: usize,
-    pub actual_size: usize, // Original data size
+    pub actual_size: i64, // Original data size
     pub mod_time: Option<OffsetDateTime>,
     // Index holds the index of the part in the erasure coding
-    pub index: Option<Vec<u8>>,
+    pub index: Option<Bytes>,
     // Checksums holds checksums of the part
     pub checksums: Option<HashMap<String, String>>,
 }
@@ -40,7 +39,7 @@ pub struct ObjectPartInfo {
 pub struct ChecksumInfo {
     pub part_number: usize,
     pub algorithm: HashAlgorithm,
-    pub hash: Vec<u8>,
+    pub hash: Bytes,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Default, Clone)]
@@ -121,15 +120,21 @@ impl ErasureInfo {
     }
     /// Calculate the total erasure file size for a given original size.
     // Returns the final erasure size from the original size
-    pub fn shard_file_size(&self, total_length: usize) -> usize {
+    pub fn shard_file_size(&self, total_length: i64) -> i64 {
         if total_length == 0 {
             return 0;
         }
 
+        if total_length < 0 {
+            return total_length;
+        }
+
+        let total_length = total_length as usize;
+
         let num_shards = total_length / self.block_size;
         let last_block_size = total_length % self.block_size;
         let last_shard_size = calc_shard_size(last_block_size, self.data_blocks);
-        num_shards * self.shard_size() + last_shard_size
+        (num_shards * self.shard_size() + last_shard_size) as i64
     }
 
     /// Check if this ErasureInfo equals another ErasureInfo
@@ -158,7 +163,7 @@ pub struct FileInfo {
     pub expire_restored: bool,
     pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
-    pub size: usize,
+    pub size: i64,
     // File mode bits
     pub mode: Option<u32>,
     // WrittenByVersion is the unix time stamp of the version that created this version of the object
@@ -170,13 +175,13 @@ pub struct FileInfo {
     pub mark_deleted: bool,
     // ReplicationState - Internal replication state to be passed back in ObjectInfo
     // pub replication_state: Option<ReplicationState>, // TODO: implement ReplicationState
-    pub data: Option<Vec<u8>>,
+    pub data: Option<Bytes>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
     pub fresh: bool,
     pub idx: usize,
     // Combined checksum when object was uploaded
-    pub checksum: Option<Vec<u8>>,
+    pub checksum: Option<Bytes>,
     pub versioned: bool,
 }
 
@@ -261,7 +266,8 @@ impl FileInfo {
         etag: String,
         part_size: usize,
         mod_time: Option<OffsetDateTime>,
-        actual_size: usize,
+        actual_size: i64,
+        index: Option<Bytes>,
     ) {
         let part = ObjectPartInfo {
             etag,
@@ -269,7 +275,7 @@ impl FileInfo {
             size: part_size,
             mod_time,
             actual_size,
-            index: None,
+            index,
             checksums: None,
         };
 
@@ -341,6 +347,12 @@ impl FileInfo {
         self.metadata
             .insert(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).to_owned(), "true".to_owned());
     }
+
+    pub fn set_data_moved(&mut self) {
+        self.metadata
+            .insert(format!("{}data-moved", RESERVED_METADATA_PREFIX_LOWER).to_owned(), "true".to_owned());
+    }
+
     pub fn inline_data(&self) -> bool {
         self.metadata
             .contains_key(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).as_str())
@@ -350,7 +362,7 @@ impl FileInfo {
     /// Check if the object is compressed
     pub fn is_compressed(&self) -> bool {
         self.metadata
-            .contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX))
+            .contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER))
     }
 
     /// Check if the object is remote (transitioned to another tier)
@@ -464,7 +476,7 @@ impl FileInfoVersions {
     }
 
     /// Calculate the total size of all versions for this object
-    pub fn size(&self) -> usize {
+    pub fn size(&self) -> i64 {
         self.versions.iter().map(|v| v.size).sum()
     }
 }

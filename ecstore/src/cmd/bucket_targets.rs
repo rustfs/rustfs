@@ -4,11 +4,11 @@ use crate::{
     StorageAPI,
     bucket::{metadata_sys, target::BucketTarget},
     endpoints::Node,
-    peer::{PeerS3Client, RemotePeerS3Client},
+    rpc::{PeerS3Client, RemotePeerS3Client},
 };
 use crate::{
     bucket::{self, target::BucketTargets},
-    new_object_layer_fn, peer, store_api,
+    new_object_layer_fn, store_api,
 };
 //use tokio::sync::RwLock;
 use aws_sdk_s3::Client as S3Client;
@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 
 pub struct TClient {
     pub s3cli: S3Client,
-    pub remote_peer_client: peer::RemotePeerS3Client,
+    pub remote_peer_client: RemotePeerS3Client,
     pub arn: String,
 }
 impl TClient {
@@ -444,7 +444,7 @@ impl BucketTargetSys {
             grid_host: "".to_string(),
         };
 
-        let cli = peer::RemotePeerS3Client::new(Some(node), None);
+        let cli = RemotePeerS3Client::new(Some(node), None);
 
         match cli
             .get_bucket_info(&tgt.target_bucket, &store_api::BucketOptions::default())

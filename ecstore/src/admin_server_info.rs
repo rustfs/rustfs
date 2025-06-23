@@ -93,7 +93,7 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
     // 构造 PingRequest
     let request = Request::new(PingRequest {
         version: 1,
-        body: finished_data.to_vec(),
+        body: bytes::Bytes::copy_from_slice(finished_data),
     });
 
     // 发送请求并获取响应

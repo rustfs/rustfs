@@ -1,6 +1,8 @@
 use crate::admin::{router::Operation, utils::has_space_be};
+use ecstore::global::get_global_action_cred;
 use http::{HeaderMap, StatusCode};
-use iam::{error::is_err_no_such_user, get_global_action_cred, store::MappedPolicy};
+use iam::error::is_err_no_such_user;
+use iam::store::MappedPolicy;
 use matchit::Params;
 use policy::policy::Policy;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};

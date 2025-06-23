@@ -31,7 +31,7 @@ use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
     endpoints::EndpointServerPools,
-    peer::S3PeerSys,
+    rpc::S3PeerSys,
     sets::Sets,
     store_api::{
         BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
@@ -53,6 +53,7 @@ use rustfs_utils::crypto::base64_decode;
 use rustfs_utils::path::{SLASH_SEPARATOR, decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::cmp::Ordering;
+use std::net::SocketAddr;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
@@ -101,7 +102,7 @@ pub struct ECStore {
 impl ECStore {
     #[allow(clippy::new_ret_no_self)]
     #[tracing::instrument(level = "debug", skip(endpoint_pools))]
-    pub async fn new(_address: String, endpoint_pools: EndpointServerPools) -> Result<Arc<Self>> {
+    pub async fn new(address: SocketAddr, endpoint_pools: EndpointServerPools) -> Result<Arc<Self>> {
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
         let mut deployment_id = None;
@@ -115,12 +116,17 @@ impl ECStore {
 
         let mut local_disks = Vec::new();
 
-        init_local_peer(
-            &endpoint_pools,
-            &GLOBAL_Rustfs_Host.read().await.to_string(),
-            &GLOBAL_Rustfs_Port.read().await.to_string(),
-        )
-        .await;
+        info!("ECStore new address: {}", address.to_string());
+        let mut host = address.ip().to_string();
+        if host.is_empty() {
+            host = GLOBAL_Rustfs_Host.read().await.to_string()
+        }
+        let mut port = address.port().to_string();
+        if port.is_empty() {
+            port = GLOBAL_Rustfs_Port.read().await.to_string()
+        }
+        info!("ECStore new host: {}, port: {}", host, port);
+        init_local_peer(&endpoint_pools, &host, &port).await;
 
         // debug!("endpoint_pools: {:?}", endpoint_pools);
 
@@ -856,9 +862,26 @@ impl ECStore {
         let (update_closer_tx, mut update_close_rx) = mpsc::channel(10);
         let mut ctx_clone = cancel.subscribe();
         let all_buckets_clone = all_buckets.clone();
+        // 新增：从环境变量读取interval，默认30秒
+        let ns_scanner_interval_secs = std::env::var("RUSTFS_NS_SCANNER_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        // 检查是否跳过后台任务
+        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        if skip_background_task {
+            info!("跳过后台任务执行: RUSTFS_SKIP_BACKGROUND_TASK=true");
+            return Ok(());
+        }
+
         let task = tokio::spawn(async move {
             let mut last_update: Option<SystemTime> = None;
-            let mut interval = interval(Duration::from_secs(30));
+            let mut interval = interval(Duration::from_secs(ns_scanner_interval_secs));
             let all_merged = Arc::new(RwLock::new(DataUsageCache::default()));
             loop {
                 select! {
@@ -1225,7 +1248,7 @@ impl ObjectIO for ECStore {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
 
-        let idx = self.get_pool_idx(bucket, &object, data.content_length as i64).await?;
+        let idx = self.get_pool_idx(bucket, &object, data.size()).await?;
 
         if opts.data_movement && idx == opts.src_pool_idx {
             return Err(StorageError::DataMovementOverwriteErr(
@@ -1500,9 +1523,7 @@ impl StorageAPI for ECStore {
 
         // TODO: nslock
 
-        let pool_idx = self
-            .get_pool_idx_no_lock(src_bucket, &src_object, src_info.size as i64)
-            .await?;
+        let pool_idx = self.get_pool_idx_no_lock(src_bucket, &src_object, src_info.size).await?;
 
         if cp_src_dst_same {
             if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
@@ -2029,7 +2050,7 @@ impl StorageAPI for ECStore {
 
     #[tracing::instrument(skip(self))]
     async fn complete_multipart_upload(
-        &self,
+        self: Arc<Self>,
         bucket: &str,
         object: &str,
         upload_id: &str,
@@ -2040,6 +2061,7 @@ impl StorageAPI for ECStore {
 
         if self.single_pool() {
             return self.pools[0]
+                .clone()
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await;
         }
@@ -2049,6 +2071,7 @@ impl StorageAPI for ECStore {
                 continue;
             }
 
+            let pool = pool.clone();
             let err = match pool
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
                 .await

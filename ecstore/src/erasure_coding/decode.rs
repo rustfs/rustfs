@@ -30,7 +30,7 @@ where
     // readers传入前应处理disk错误，确保每个reader达到可用数量的BitrotReader
     pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
         let shard_size = e.shard_size();
-        let shard_file_size = e.shard_file_size(total_length);
+        let shard_file_size = e.shard_file_size(total_length as i64) as usize;
 
         let offset = (offset / e.block_size) * shard_size;
 
@@ -67,36 +67,34 @@ where
         }
 
         // 使用并发读取所有分片
+        let mut read_futs = Vec::with_capacity(self.readers.len());
 
-        let read_futs: Vec<_> = self
-            .readers
-            .iter_mut()
-            .enumerate()
-            .map(|(i, opt_reader)| {
-                if let Some(reader) = opt_reader.as_mut() {
+        for (i, opt_reader) in self.readers.iter_mut().enumerate() {
+            let future = if let Some(reader) = opt_reader.as_mut() {
+                Box::pin(async move {
                     let mut buf = vec![0u8; shard_size];
-                    // 需要move i, buf
-                    Some(async move {
-                        match reader.read(&mut buf).await {
-                            Ok(n) => {
-                                buf.truncate(n);
-                                (i, Ok(buf))
-                            }
-                            Err(e) => (i, Err(Error::from(e))),
+                    match reader.read(&mut buf).await {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            (i, Ok(buf))
                         }
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+                        Err(e) => (i, Err(Error::from(e))),
+                    }
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
+            } else {
+                // reader是None时返回FileNotFound错误
+                Box::pin(async move { (i, Err(Error::FileNotFound)) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
+            };
+            read_futs.push(future);
+        }
 
-        // 过滤掉None，join_all
-        let mut results = join_all(read_futs.into_iter().flatten()).await;
+        let results = join_all(read_futs).await;
 
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; self.readers.len()];
         let mut errs = vec![None; self.readers.len()];
-        for (i, shard) in results.drain(..) {
+
+        for (i, shard) in results.into_iter() {
             match shard {
                 Ok(data) => {
                     if !data.is_empty() {
@@ -104,7 +102,7 @@ where
                     }
                 }
                 Err(e) => {
-                    error!("Error reading shard {}: {}", i, e);
+                    // error!("Error reading shard {}: {}", i, e);
                     errs[i] = Some(e);
                 }
             }
@@ -142,6 +140,7 @@ where
     W: tokio::io::AsyncWrite + Send + Sync + Unpin,
 {
     if get_data_block_len(en_blocks, data_blocks) < length {
+        error!("write_data_blocks get_data_block_len < length");
         return Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough data blocks to write"));
     }
 
@@ -150,6 +149,7 @@ where
 
     for block_op in &en_blocks[..data_blocks] {
         if block_op.is_none() {
+            error!("write_data_blocks block_op.is_none()");
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "Missing data block"));
         }
 
@@ -164,7 +164,10 @@ where
         offset = 0;
 
         if write_left < block.len() {
-            writer.write_all(&block_slice[..write_left]).await?;
+            writer.write_all(&block_slice[..write_left]).await.map_err(|e| {
+                error!("write_data_blocks write_all err: {}", e);
+                e
+            })?;
 
             total_written += write_left;
             break;
@@ -172,7 +175,10 @@ where
 
         let n = block_slice.len();
 
-        writer.write_all(block_slice).await?;
+        writer.write_all(block_slice).await.map_err(|e| {
+            error!("write_data_blocks write_all2 err: {}", e);
+            e
+        })?;
 
         write_left -= n;
 
@@ -228,6 +234,7 @@ impl Erasure {
             };
 
             if block_length == 0 {
+                // error!("erasure decode decode block_length == 0");
                 break;
             }
 
@@ -242,12 +249,14 @@ impl Erasure {
             }
 
             if !reader.can_decode(&shards) {
+                error!("erasure decode can_decode errs: {:?}", &errs);
                 ret_err = Some(Error::ErasureReadQuorum.into());
                 break;
             }
 
             // Decode the shards
             if let Err(e) = self.decode_data(&mut shards) {
+                error!("erasure decode decode_data err: {:?}", e);
                 ret_err = Some(e);
                 break;
             }
@@ -255,6 +264,7 @@ impl Erasure {
             let n = match write_data_blocks(writer, &shards, self.data_shards, block_offset, block_length).await {
                 Ok(n) => n,
                 Err(e) => {
+                    error!("erasure decode write_data_blocks err: {:?}", e);
                     ret_err = Some(e);
                     break;
                 }

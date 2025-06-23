@@ -2,7 +2,7 @@ use crate::StorageAPI;
 use crate::admin_server_info::get_commit_id;
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
-use crate::peer_rest_client::PeerRestClient;
+use crate::rpc::PeerRestClient;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use futures::future::join_all;
 use lazy_static::lazy_static;
@@ -143,7 +143,11 @@ impl NotificationSys {
     #[tracing::instrument(skip(self))]
     pub async fn load_rebalance_meta(&self, start: bool) {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for client in self.peer_clients.iter().flatten() {
+        for (i, client) in self.peer_clients.iter().flatten().enumerate() {
+            warn!(
+                "notification load_rebalance_meta start: {}, index: {}, client: {:?}",
+                start, i, client.host
+            );
             futures.push(client.load_rebalance_meta(start));
         }
 
@@ -158,10 +162,15 @@ impl NotificationSys {
     }
 
     pub async fn stop_rebalance(&self) {
+        warn!("notification stop_rebalance start");
         let Some(store) = new_object_layer_fn() else {
             error!("stop_rebalance: not init");
             return;
         };
+
+        // warn!("notification stop_rebalance load_rebalance_meta");
+        // self.load_rebalance_meta(false).await;
+        // warn!("notification stop_rebalance load_rebalance_meta done");
 
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().flatten() {
@@ -175,7 +184,9 @@ impl NotificationSys {
             }
         }
 
+        warn!("notification stop_rebalance stop_rebalance start");
         let _ = store.stop_rebalance().await;
+        warn!("notification stop_rebalance stop_rebalance done");
     }
 }
 

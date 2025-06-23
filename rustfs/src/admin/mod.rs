@@ -13,7 +13,7 @@ use handlers::{
 use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};
 use hyper::Method;
 use router::{AdminOperation, S3Router};
-use rpc::regist_rpc_route;
+use rpc::register_rpc_route;
 use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
@@ -25,7 +25,7 @@ pub fn make_admin_route() -> std::io::Result<impl S3Route> {
     // 1
     r.insert(Method::POST, "/", AdminOperation(&sts::AssumeRoleHandle {}))?;
 
-    regist_rpc_route(&mut r)?;
+    register_rpc_route(&mut r)?;
     register_user_route(&mut r)?;
 
     r.insert(

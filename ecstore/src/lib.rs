@@ -1,9 +1,12 @@
+extern crate core;
+
 pub mod admin_server_info;
 pub mod bitrot;
 pub mod bucket;
 pub mod cache_value;
 mod chunk_stream;
 pub mod cmd;
+pub mod compress;
 pub mod config;
 pub mod disk;
 pub mod disks_layout;
@@ -14,17 +17,16 @@ pub mod global;
 pub mod heal;
 pub mod metrics_realtime;
 pub mod notification_sys;
-pub mod peer;
-pub mod peer_rest_client;
 pub mod pools;
 pub mod rebalance;
+pub mod rpc;
 pub mod set_disk;
 mod sets;
 pub mod store;
 pub mod store_api;
 mod store_init;
 pub mod store_list_objects;
-mod store_utils;
+pub mod store_utils;
 
 pub mod checksum;
 pub mod client;

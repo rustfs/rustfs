@@ -24,7 +24,7 @@ use futures::future::BoxFuture;
 use http::HeaderMap;
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_rio::HashReader;
+use rustfs_rio::{HashReader, WarpReader};
 use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::broadcast::Receiver as B_Receiver;
 use tracing::{error, info, warn};
 
@@ -1254,6 +1254,7 @@ impl ECStore {
             }
 
             if let Err(err) = self
+                .clone()
                 .complete_multipart_upload(
                     &bucket,
                     &object_info.name,
@@ -1275,10 +1276,9 @@ impl ECStore {
             return Ok(());
         }
 
-        let mut data = PutObjReader::new(
-            HashReader::new(rd.stream, object_info.size as i64, object_info.size as i64, None, false)?,
-            object_info.size,
-        );
+        let reader = BufReader::new(rd.stream);
+        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, false)?;
+        let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self
             .put_object(

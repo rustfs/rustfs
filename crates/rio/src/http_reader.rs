@@ -1,15 +1,26 @@
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Client, Method, RequestBuilder};
+use std::error::Error as _;
 use std::io::{self, Error};
+use std::ops::Not as _;
 use std::pin::Pin;
+use std::sync::LazyLock;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc;
+use tokio_util::io::StreamReader;
 
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
+
+fn get_http_client() -> Client {
+    // Reuse the HTTP connection pool in the global `reqwest::Client` instance
+    // TODO: interact with load balancing?
+    static CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+    CLIENT.clone()
+}
 
 static HTTP_DEBUG_LOG: bool = false;
 #[inline(always)]
@@ -29,88 +40,68 @@ pin_project! {
         url:String,
         method: Method,
         headers: HeaderMap,
-        inner: DuplexStream,
-        err_rx: oneshot::Receiver<std::io::Error>,
+        #[pin]
+        inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
     }
 }
 
 impl HttpReader {
-    pub async fn new(url: String, method: Method, headers: HeaderMap) -> io::Result<Self> {
-        http_log!("[HttpReader::new] url: {url}, method: {method:?}, headers: {headers:?}");
-        Self::with_capacity(url, method, headers, 0).await
+    pub async fn new(url: String, method: Method, headers: HeaderMap, body: Option<Vec<u8>>) -> io::Result<Self> {
+        // http_log!("[HttpReader::new] url: {url}, method: {method:?}, headers: {headers:?}");
+        Self::with_capacity(url, method, headers, body, 0).await
     }
     /// Create a new HttpReader from a URL. The request is performed immediately.
-    pub async fn with_capacity(url: String, method: Method, headers: HeaderMap, mut read_buf_size: usize) -> io::Result<Self> {
-        http_log!(
-            "[HttpReader::with_capacity] url: {url}, method: {method:?}, headers: {headers:?}, buf_size: {}",
-            read_buf_size
-        );
+    pub async fn with_capacity(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        _read_buf_size: usize,
+    ) -> io::Result<Self> {
+        // http_log!(
+        //     "[HttpReader::with_capacity] url: {url}, method: {method:?}, headers: {headers:?}, buf_size: {}",
+        //     _read_buf_size
+        // );
         // First, check if the connection is available (HEAD)
-        let client = Client::new();
+        let client = get_http_client();
         let head_resp = client.head(&url).headers(headers.clone()).send().await;
         match head_resp {
             Ok(resp) => {
                 http_log!("[HttpReader::new] HEAD status: {}", resp.status());
                 if !resp.status().is_success() {
-                    return Err(Error::other(format!("HEAD failed: status {}", resp.status())));
+                    return Err(Error::other(format!("HEAD failed: url: {}, status {}", url, resp.status())));
                 }
             }
             Err(e) => {
                 http_log!("[HttpReader::new] HEAD error: {e}");
-                return Err(Error::other(format!("HEAD request failed: {e}")));
+                return Err(Error::other(e.source().map(|s| s.to_string()).unwrap_or_else(|| e.to_string())));
             }
         }
 
-        let url_clone = url.clone();
-        let method_clone = method.clone();
-        let headers_clone = headers.clone();
-
-        if read_buf_size == 0 {
-            read_buf_size = 8192; // Default buffer size
+        let client = get_http_client();
+        let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
+        if let Some(body) = body {
+            request = request.body(body);
         }
-        let (rd, mut wd) = tokio::io::duplex(read_buf_size);
-        let (err_tx, err_rx) = oneshot::channel::<io::Error>();
-        tokio::spawn(async move {
-            let client = Client::new();
-            let request: RequestBuilder = client.request(method_clone, url_clone).headers(headers_clone);
 
-            let response = request.send().await;
-            match response {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        let mut stream = resp.bytes_stream();
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(data) => {
-                                    if let Err(e) = wd.write_all(&data).await {
-                                        let _ = err_tx.send(Error::other(format!("HttpReader write error: {}", e)));
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = err_tx.send(Error::other(format!("HttpReader stream error: {}", e)));
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        http_log!("[HttpReader::spawn] HTTP request failed with status: {}", resp.status());
-                        let _ = err_tx.send(Error::other(format!(
-                            "HttpReader HTTP request failed with non-200 status {}",
-                            resp.status()
-                        )));
-                    }
-                }
-                Err(e) => {
-                    let _ = err_tx.send(Error::other(format!("HttpReader HTTP request error: {}", e)));
-                }
-            }
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| Error::other(format!("HttpReader HTTP request error: {}", e)))?;
 
-            http_log!("[HttpReader::spawn] HTTP request completed, exiting");
-        });
+        if resp.status().is_success().not() {
+            return Err(Error::other(format!(
+                "HttpReader HTTP request failed with non-200 status {}",
+                resp.status()
+            )));
+        }
+
+        let stream = resp
+            .bytes_stream()
+            .map_err(|e| Error::other(format!("HttpReader stream error: {}", e)));
+
         Ok(Self {
-            inner: rd,
-            err_rx,
+            inner: StreamReader::new(Box::pin(stream)),
             url,
             method,
             headers,
@@ -129,20 +120,12 @@ impl HttpReader {
 
 impl AsyncRead for HttpReader {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        http_log!(
-            "[HttpReader::poll_read] url: {}, method: {:?}, buf.remaining: {}",
-            self.url,
-            self.method,
-            buf.remaining()
-        );
-        // Check for errors from the request
-        match Pin::new(&mut self.err_rx).try_recv() {
-            Ok(e) => return Poll::Ready(Err(e)),
-            Err(oneshot::error::TryRecvError::Empty) => {}
-            Err(oneshot::error::TryRecvError::Closed) => {
-                // return Poll::Ready(Err(Error::new(ErrorKind::Other, "HTTP request closed")));
-            }
-        }
+        // http_log!(
+        //     "[HttpReader::poll_read] url: {}, method: {:?}, buf.remaining: {}",
+        //     self.url,
+        //     self.method,
+        //     buf.remaining()
+        // );
         // Read from the inner stream
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
@@ -175,20 +158,20 @@ impl Stream for ReceiverStream {
     type Item = Result<Bytes, std::io::Error>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = Pin::new(&mut self.receiver).poll_recv(cx);
-        match &poll {
-            Poll::Ready(Some(Some(bytes))) => {
-                http_log!("[ReceiverStream] poll_next: got {} bytes", bytes.len());
-            }
-            Poll::Ready(Some(None)) => {
-                http_log!("[ReceiverStream] poll_next: sender shutdown");
-            }
-            Poll::Ready(None) => {
-                http_log!("[ReceiverStream] poll_next: channel closed");
-            }
-            Poll::Pending => {
-                // http_log!("[ReceiverStream] poll_next: pending");
-            }
-        }
+        // match &poll {
+        //     Poll::Ready(Some(Some(bytes))) => {
+        //         // http_log!("[ReceiverStream] poll_next: got {} bytes", bytes.len());
+        //     }
+        //     Poll::Ready(Some(None)) => {
+        //         // http_log!("[ReceiverStream] poll_next: sender shutdown");
+        //     }
+        //     Poll::Ready(None) => {
+        //         // http_log!("[ReceiverStream] poll_next: channel closed");
+        //     }
+        //     Poll::Pending => {
+        //         // http_log!("[ReceiverStream] poll_next: pending");
+        //     }
+        // }
         match poll {
             Poll::Ready(Some(Some(bytes))) => Poll::Ready(Some(Ok(bytes))),
             Poll::Ready(Some(None)) => Poll::Ready(None), // Sender shutdown
@@ -214,23 +197,23 @@ pin_project! {
 impl HttpWriter {
     /// Create a new HttpWriter for the given URL. The HTTP request is performed in the background.
     pub async fn new(url: String, method: Method, headers: HeaderMap) -> io::Result<Self> {
-        http_log!("[HttpWriter::new] url: {url}, method: {method:?}, headers: {headers:?}");
+        // http_log!("[HttpWriter::new] url: {url}, method: {method:?}, headers: {headers:?}");
         let url_clone = url.clone();
         let method_clone = method.clone();
         let headers_clone = headers.clone();
 
         // First, try to write empty data to check if writable
-        let client = Client::new();
+        let client = get_http_client();
         let resp = client.put(&url).headers(headers.clone()).body(Vec::new()).send().await;
         match resp {
             Ok(resp) => {
-                http_log!("[HttpWriter::new] empty PUT status: {}", resp.status());
+                // http_log!("[HttpWriter::new] empty PUT status: {}", resp.status());
                 if !resp.status().is_success() {
                     return Err(Error::other(format!("Empty PUT failed: status {}", resp.status())));
                 }
             }
             Err(e) => {
-                http_log!("[HttpWriter::new] empty PUT error: {e}");
+                // http_log!("[HttpWriter::new] empty PUT error: {e}");
                 return Err(Error::other(format!("Empty PUT failed: {e}")));
             }
         }
@@ -241,11 +224,11 @@ impl HttpWriter {
         let handle = tokio::spawn(async move {
             let stream = ReceiverStream { receiver };
             let body = reqwest::Body::wrap_stream(stream);
-            http_log!(
-                "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
-            );
+            // http_log!(
+            //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
+            // );
 
-            let client = Client::new();
+            let client = get_http_client();
             let request = client
                 .request(method_clone, url_clone.clone())
                 .headers(headers_clone.clone())
@@ -256,7 +239,7 @@ impl HttpWriter {
 
             match response {
                 Ok(resp) => {
-                    http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
+                    // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
                         let _ = err_tx.send(Error::other(format!(
                             "HttpWriter HTTP request failed with non-200 status {}",
@@ -266,17 +249,17 @@ impl HttpWriter {
                     }
                 }
                 Err(e) => {
-                    http_log!("[HttpWriter::spawn] HTTP request error: {e}");
+                    // http_log!("[HttpWriter::spawn] HTTP request error: {e}");
                     let _ = err_tx.send(Error::other(format!("HTTP request failed: {}", e)));
                     return Err(Error::other(format!("HTTP request failed: {}", e)));
                 }
             }
 
-            http_log!("[HttpWriter::spawn] HTTP request completed, exiting");
+            // http_log!("[HttpWriter::spawn] HTTP request completed, exiting");
             Ok(())
         });
 
-        http_log!("[HttpWriter::new] connection established successfully");
+        // http_log!("[HttpWriter::new] connection established successfully");
         Ok(Self {
             url,
             method,
@@ -303,12 +286,12 @@ impl HttpWriter {
 
 impl AsyncWrite for HttpWriter {
     fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        http_log!(
-            "[HttpWriter::poll_write] url: {}, method: {:?}, buf.len: {}",
-            self.url,
-            self.method,
-            buf.len()
-        );
+        // http_log!(
+        //     "[HttpWriter::poll_write] url: {}, method: {:?}, buf.len: {}",
+        //     self.url,
+        //     self.method,
+        //     buf.len()
+        // );
         if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
             return Poll::Ready(Err(e));
         }
@@ -325,12 +308,19 @@ impl AsyncWrite for HttpWriter {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        // let url = self.url.clone();
+        // let method = self.method.clone();
+
         if !self.finish {
-            http_log!("[HttpWriter::poll_shutdown] url: {}, method: {:?}", self.url, self.method);
+            // http_log!("[HttpWriter::poll_shutdown] url: {}, method: {:?}", url, method);
             self.sender
                 .try_send(None)
                 .map_err(|e| Error::other(format!("HttpWriter shutdown error: {}", e)))?;
-            http_log!("[HttpWriter::poll_shutdown] sent shutdown signal to HTTP request");
+            // http_log!(
+            //     "[HttpWriter::poll_shutdown] sent shutdown signal to HTTP request, url: {}, method: {:?}",
+            //     url,
+            //     method
+            // );
 
             self.finish = true;
         }
@@ -338,13 +328,18 @@ impl AsyncWrite for HttpWriter {
         use futures::FutureExt;
         match Pin::new(&mut self.get_mut().handle).poll_unpin(_cx) {
             Poll::Ready(Ok(_)) => {
-                http_log!("[HttpWriter::poll_shutdown] HTTP request finished successfully");
+                // http_log!(
+                //     "[HttpWriter::poll_shutdown] HTTP request finished successfully, url: {}, method: {:?}",
+                //     url,
+                //     method
+                // );
             }
             Poll::Ready(Err(e)) => {
-                http_log!("[HttpWriter::poll_shutdown] HTTP request failed: {e}");
+                // http_log!("[HttpWriter::poll_shutdown] HTTP request failed: {e}, url: {}, method: {:?}", url, method);
                 return Poll::Ready(Err(Error::other(format!("HTTP request failed: {}", e))));
             }
             Poll::Pending => {
+                // http_log!("[HttpWriter::poll_shutdown] HTTP request pending, url: {}, method: {:?}", url, method);
                 return Poll::Pending;
             }
         }

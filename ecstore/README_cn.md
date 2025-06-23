@@ -1,38 +1,15 @@
 # ECStore - Erasure Coding Storage
 
-ECStore provides erasure coding functionality for the RustFS project, supporting multiple Reed-Solomon implementations for optimal performance and compatibility.
+ECStore provides erasure coding functionality for the RustFS project, using high-performance Reed-Solomon SIMD implementation for optimal performance.
 
-## Reed-Solomon Implementations
+## Reed-Solomon Implementation
 
-### Available Backends
+### SIMD Backend (Only)
 
-#### `reed-solomon-erasure` (Default)
-- **Stability**: Mature and well-tested implementation
-- **Performance**: Good performance with SIMD acceleration when available
-- **Compatibility**: Works with any shard size
-- **Memory**: Efficient memory usage
-- **Use case**: Recommended for production use
-
-#### `reed-solomon-simd` (Optional)
-- **Performance**: Optimized SIMD implementation for maximum speed
-- **Limitations**: Has restrictions on shard sizes (must be >= 64 bytes typically)
-- **Memory**: May use more memory for small shards
-- **Use case**: Best for large data blocks where performance is critical
-
-### Feature Flags
-
-Configure the Reed-Solomon implementation using Cargo features:
-
-```toml
-# Use default implementation (reed-solomon-erasure)
-ecstore = "0.0.1"
-
-# Use SIMD implementation for maximum performance
-ecstore = { version = "0.0.1", features = ["reed-solomon-simd"], default-features = false }
-
-# Use traditional implementation explicitly
-ecstore = { version = "0.0.1", features = ["reed-solomon-erasure"], default-features = false }
-```
+- **Performance**: Uses SIMD optimization for high-performance encoding/decoding
+- **Compatibility**: Works with any shard size through SIMD implementation
+- **Reliability**: High-performance SIMD implementation for large data processing
+- **Use case**: Optimized for maximum performance in large data processing scenarios
 
 ### Usage Example
 
@@ -68,42 +45,52 @@ assert_eq!(&recovered, data);
 
 ## Performance Considerations
 
-### When to use `reed-solomon-simd`
-- Large block sizes (>= 1KB recommended)
-- High-throughput scenarios
-- CPU-intensive workloads where encoding/decoding is the bottleneck
-
-### When to use `reed-solomon-erasure`
-- Small block sizes
-- Memory-constrained environments
-- General-purpose usage
-- Production deployments requiring maximum stability
+### SIMD Implementation Benefits
+- **High Throughput**: Optimized for large block sizes (>= 1KB recommended)
+- **CPU Optimization**: Leverages modern CPU SIMD instructions
+- **Scalability**: Excellent performance for high-throughput scenarios
 
 ### Implementation Details
 
-#### `reed-solomon-erasure`
-- **Instance Reuse**: The encoder instance is cached and reused across multiple operations
-- **Thread Safety**: Thread-safe with interior mutability
-- **Memory Efficiency**: Lower memory footprint for small data
-
 #### `reed-solomon-simd`
-- **Instance Creation**: New encoder/decoder instances are created for each operation
-- **API Design**: The SIMD implementation's API is designed for single-use instances
-- **Performance Trade-off**: While instances are created per operation, the SIMD optimizations provide significant performance benefits for large data blocks
-- **Optimization**: Future versions may implement instance pooling if the underlying API supports reuse
+- **Instance Caching**: Encoder/decoder instances are cached and reused for optimal performance
+- **Thread Safety**: Thread-safe with RwLock-based caching
+- **SIMD Optimization**: Leverages CPU SIMD instructions for maximum performance
+- **Reset Capability**: Cached instances are reset for different parameters, avoiding unnecessary allocations
 
 ### Performance Tips
 
 1. **Batch Operations**: When possible, batch multiple small operations into larger blocks
-2. **Block Size Optimization**: Use block sizes that are multiples of 64 bytes for SIMD implementations
+2. **Block Size Optimization**: Use block sizes that are multiples of 64 bytes for optimal SIMD performance
 3. **Memory Allocation**: Pre-allocate buffers when processing multiple blocks
-4. **Feature Selection**: Choose the appropriate feature based on your data size and performance requirements
+4. **Cache Warming**: Initial operations may be slower due to cache setup, subsequent operations benefit from caching
 
 ## Cross-Platform Compatibility
 
-Both implementations support:
-- x86_64 with SIMD acceleration
-- aarch64 (ARM64) with optimizations
+The SIMD implementation supports:
+- x86_64 with advanced SIMD instructions (AVX2, SSE)
+- aarch64 (ARM64) with NEON SIMD optimizations
 - Other architectures with fallback implementations
 
-The `reed-solomon-erasure` implementation provides better cross-platform compatibility and is recommended for most use cases. 
+The implementation automatically selects the best available SIMD instructions for the target platform, providing optimal performance across different architectures.
+
+## Testing and Benchmarking
+
+Run performance benchmarks:
+```bash
+# Run erasure coding benchmarks
+cargo bench --bench erasure_benchmark
+
+# Run comparison benchmarks
+cargo bench --bench comparison_benchmark
+
+# Generate benchmark reports
+./run_benchmarks.sh
+```
+
+## Error Handling
+
+All operations return `Result` types with comprehensive error information:
+- Encoding errors: Invalid parameters, insufficient memory
+- Decoding errors: Too many missing shards, corrupted data
+- Configuration errors: Invalid shard counts, unsupported parameters 

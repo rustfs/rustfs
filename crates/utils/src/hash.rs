@@ -24,24 +24,56 @@ pub enum HashAlgorithm {
     None,
 }
 
+enum HashEncoded {
+    Md5([u8; 16]),
+    Sha256([u8; 32]),
+    HighwayHash256([u8; 32]),
+    HighwayHash256S([u8; 32]),
+    Blake2b512(blake3::Hash),
+    None,
+}
+
+impl AsRef<[u8]> for HashEncoded {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            HashEncoded::Md5(hash) => hash.as_ref(),
+            HashEncoded::Sha256(hash) => hash.as_ref(),
+            HashEncoded::HighwayHash256(hash) => hash.as_ref(),
+            HashEncoded::HighwayHash256S(hash) => hash.as_ref(),
+            HashEncoded::Blake2b512(hash) => hash.as_bytes(),
+            HashEncoded::None => &[],
+        }
+    }
+}
+
+#[inline]
+fn u8x32_from_u64x4(input: [u64; 4]) -> [u8; 32] {
+    let mut output = [0u8; 32];
+    for (i, &n) in input.iter().enumerate() {
+        output[i * 8..(i + 1) * 8].copy_from_slice(&n.to_le_bytes());
+    }
+    output
+}
+
 impl HashAlgorithm {
     /// Hash the input data and return the hash result as Vec<u8>.
-    pub fn hash_encode(&self, data: &[u8]) -> Vec<u8> {
+    pub fn hash_encode(&self, data: &[u8]) -> impl AsRef<[u8]> {
         match self {
-            HashAlgorithm::Md5 => Md5::digest(data).to_vec(),
+            HashAlgorithm::Md5 => HashEncoded::Md5(Md5::digest(data).into()),
             HashAlgorithm::HighwayHash256 => {
                 let mut hasher = HighwayHasher::new(Key(HIGHWAY_HASH256_KEY));
                 hasher.append(data);
-                hasher.finalize256().iter().flat_map(|&n| n.to_le_bytes()).collect()
+                HashEncoded::HighwayHash256(u8x32_from_u64x4(hasher.finalize256()))
             }
-            HashAlgorithm::SHA256 => Sha256::digest(data).to_vec(),
+            HashAlgorithm::SHA256 => HashEncoded::Sha256(Sha256::digest(data).into()),
             HashAlgorithm::HighwayHash256S => {
                 let mut hasher = HighwayHasher::new(Key(HIGHWAY_HASH256_KEY));
                 hasher.append(data);
-                hasher.finalize256().iter().flat_map(|&n| n.to_le_bytes()).collect()
+                HashEncoded::HighwayHash256S(u8x32_from_u64x4(hasher.finalize256()))
             }
-            HashAlgorithm::BLAKE2b512 => blake3::hash(data).as_bytes().to_vec(),
-            HashAlgorithm::None => Vec::new(),
+            HashAlgorithm::BLAKE2b512 => HashEncoded::Blake2b512(blake3::hash(data)),
+            HashAlgorithm::None => HashEncoded::None,
         }
     }
 
@@ -100,6 +132,7 @@ mod tests {
     fn test_hash_encode_none() {
         let data = b"test data";
         let hash = HashAlgorithm::None.hash_encode(data);
+        let hash = hash.as_ref();
         assert_eq!(hash.len(), 0);
     }
 
@@ -107,9 +140,11 @@ mod tests {
     fn test_hash_encode_md5() {
         let data = b"test data";
         let hash = HashAlgorithm::Md5.hash_encode(data);
+        let hash = hash.as_ref();
         assert_eq!(hash.len(), 16);
         // MD5 should be deterministic
         let hash2 = HashAlgorithm::Md5.hash_encode(data);
+        let hash2 = hash2.as_ref();
         assert_eq!(hash, hash2);
     }
 
@@ -117,9 +152,11 @@ mod tests {
     fn test_hash_encode_highway() {
         let data = b"test data";
         let hash = HashAlgorithm::HighwayHash256.hash_encode(data);
+        let hash = hash.as_ref();
         assert_eq!(hash.len(), 32);
         // HighwayHash should be deterministic
         let hash2 = HashAlgorithm::HighwayHash256.hash_encode(data);
+        let hash2 = hash2.as_ref();
         assert_eq!(hash, hash2);
     }
 
@@ -127,9 +164,11 @@ mod tests {
     fn test_hash_encode_sha256() {
         let data = b"test data";
         let hash = HashAlgorithm::SHA256.hash_encode(data);
+        let hash = hash.as_ref();
         assert_eq!(hash.len(), 32);
         // SHA256 should be deterministic
         let hash2 = HashAlgorithm::SHA256.hash_encode(data);
+        let hash2 = hash2.as_ref();
         assert_eq!(hash, hash2);
     }
 
@@ -137,9 +176,11 @@ mod tests {
     fn test_hash_encode_blake2b512() {
         let data = b"test data";
         let hash = HashAlgorithm::BLAKE2b512.hash_encode(data);
+        let hash = hash.as_ref();
         assert_eq!(hash.len(), 32); // blake3 outputs 32 bytes by default
         // BLAKE2b512 should be deterministic
         let hash2 = HashAlgorithm::BLAKE2b512.hash_encode(data);
+        let hash2 = hash2.as_ref();
         assert_eq!(hash, hash2);
     }
 
@@ -150,18 +191,18 @@ mod tests {
 
         let md5_hash1 = HashAlgorithm::Md5.hash_encode(data1);
         let md5_hash2 = HashAlgorithm::Md5.hash_encode(data2);
-        assert_ne!(md5_hash1, md5_hash2);
+        assert_ne!(md5_hash1.as_ref(), md5_hash2.as_ref());
 
         let highway_hash1 = HashAlgorithm::HighwayHash256.hash_encode(data1);
         let highway_hash2 = HashAlgorithm::HighwayHash256.hash_encode(data2);
-        assert_ne!(highway_hash1, highway_hash2);
+        assert_ne!(highway_hash1.as_ref(), highway_hash2.as_ref());
 
         let sha256_hash1 = HashAlgorithm::SHA256.hash_encode(data1);
         let sha256_hash2 = HashAlgorithm::SHA256.hash_encode(data2);
-        assert_ne!(sha256_hash1, sha256_hash2);
+        assert_ne!(sha256_hash1.as_ref(), sha256_hash2.as_ref());
 
         let blake_hash1 = HashAlgorithm::BLAKE2b512.hash_encode(data1);
         let blake_hash2 = HashAlgorithm::BLAKE2b512.hash_encode(data2);
-        assert_ne!(blake_hash1, blake_hash2);
+        assert_ne!(blake_hash1.as_ref(), blake_hash2.as_ref());
     }
 }
