@@ -445,12 +445,8 @@ impl Event {
         };
 
         let mut resp_elements = args.resp_elements.clone();
-        resp_elements
-            .entry("x-amz-request-id".to_string())
-            .or_insert_with(|| "".to_string());
-        resp_elements
-            .entry("x-amz-id-2".to_string())
-            .or_insert_with(|| "".to_string());
+        resp_elements.entry("x-amz-request-id".to_string()).or_default();
+        resp_elements.entry("x-amz-id-2".to_string()).or_default();
         // ... Filling of other response elements
 
         // URL encoding of object keys

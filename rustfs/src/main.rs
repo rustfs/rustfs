@@ -502,11 +502,9 @@ async fn run(opt: config::Opt) -> Result<()> {
     });
 
     // init store
-    let store = ECStore::new(server_addr.clone(), endpoint_pools.clone())
-        .await
-        .inspect_err(|err| {
-            error!("ECStore::new {:?}", err);
-        })?;
+    let store = ECStore::new(server_addr, endpoint_pools.clone()).await.inspect_err(|err| {
+        error!("ECStore::new {:?}", err);
+    })?;
 
     ecconfig::init();
     // config system configuration

@@ -189,10 +189,7 @@ impl NotificationSystem {
         info!("Attempting to remove target: {}", target_id);
 
         let Some(store) = ecstore::global::new_object_layer_fn() else {
-            return Err(NotificationError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "errServerNotInitialized",
-            )));
+            return Err(NotificationError::Io(std::io::Error::other("errServerNotInitialized")));
         };
 
         let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
@@ -243,10 +240,7 @@ impl NotificationSystem {
         info!("Setting config for target {} of type {}", target_name, target_type);
         // 1. Get the storage handle
         let Some(store) = ecstore::global::new_object_layer_fn() else {
-            return Err(NotificationError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "errServerNotInitialized",
-            )));
+            return Err(NotificationError::Io(std::io::Error::other("errServerNotInitialized")));
         };
 
         // 2. Read the latest configuration from storage
@@ -306,10 +300,7 @@ impl NotificationSystem {
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         info!("Removing config for target {} of type {}", target_name, target_type);
         let Some(store) = ecstore::global::new_object_layer_fn() else {
-            return Err(NotificationError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "errServerNotInitialized",
-            )));
+            return Err(NotificationError::Io(std::io::Error::other("errServerNotInitialized")));
         };
 
         let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
