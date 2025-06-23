@@ -74,6 +74,7 @@ use query::instance::make_rustfsms;
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING};
 use rustfs_rio::CompressReader;
+use rustfs_rio::EtagReader;
 use rustfs_rio::HashReader;
 use rustfs_rio::Reader;
 use rustfs_rio::WarpReader;
@@ -341,7 +342,7 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, None)
+        let dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, HashMap::new())
             .await
             .map_err(ApiError::from)?;
 
@@ -368,13 +369,50 @@ impl S3 for FS {
             src_info.metadata_only = true;
         }
 
-        let reader = Box::new(WarpReader::new(gr.stream));
-        let hrd = HashReader::new(reader, gr.object_info.size, gr.object_info.size, None, false).map_err(ApiError::from)?;
+        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(gr.stream));
+
+        let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
+
+        let mut length = actual_size;
+
+        let mut compress_metadata = HashMap::new();
+
+        if is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64 {
+            compress_metadata.insert(
+                format!("{}compression", RESERVED_METADATA_PREFIX_LOWER),
+                CompressionAlgorithm::default().to_string(),
+            );
+            compress_metadata.insert(format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER,), actual_size.to_string());
+
+            let hrd = EtagReader::new(reader, None);
+
+            // let hrd = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
+
+            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
+            length = -1;
+        } else {
+            src_info
+                .user_defined
+                .remove(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER));
+            src_info
+                .user_defined
+                .remove(&format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER));
+            src_info
+                .user_defined
+                .remove(&format!("{}compression-size", RESERVED_METADATA_PREFIX_LOWER));
+        }
+
+        let hrd = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
 
         src_info.put_object_reader = Some(PutObjReader::new(hrd));
 
         // check quota
         // TODO: src metadada
+
+        for (k, v) in compress_metadata {
+            src_info.user_defined.insert(k, v);
+        }
+
         // TODO: src tags
 
         let oi = store
@@ -429,7 +467,7 @@ impl S3 for FS {
 
         let metadata = extract_metadata(&req.headers);
 
-        let opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
+        let opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
 
@@ -499,7 +537,7 @@ impl S3 for FS {
 
         let metadata = extract_metadata(&req.headers);
 
-        let opts: ObjectOptions = del_opts(&bucket, "", None, &req.headers, Some(metadata))
+        let opts: ObjectOptions = del_opts(&bucket, "", None, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
 
@@ -736,7 +774,7 @@ impl S3 for FS {
             content_type,
             last_modified,
             e_tag: info.etag,
-            metadata,
+            metadata: Some(metadata),
             version_id: info.version_id.map(|v| v.to_string()),
             // metadata: object_metadata,
             ..Default::default()
@@ -856,7 +894,7 @@ impl S3 for FS {
                 let mut obj = Object {
                     key: Some(v.name.to_owned()),
                     last_modified: v.mod_time.map(Timestamp::from),
-                    size: Some(v.size),
+                    size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone(),
                     ..Default::default()
                 };
@@ -1055,7 +1093,7 @@ impl S3 for FS {
         let mt = metadata.clone();
         let mt2 = metadata.clone();
 
-        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(mt))
+        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, mt)
             .await
             .map_err(ApiError::from)?;
 
@@ -1065,14 +1103,12 @@ impl S3 for FS {
         let dsc = must_replicate(&bucket, &key, &repoptions).await;
         // warn!("dsc {}", &dsc.replicate_any().clone());
         if dsc.replicate_any() {
-            if let Some(metadata) = opts.user_defined.as_mut() {
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp");
             let now: DateTime<Utc> = Utc::now();
             let formatted_time = now.to_rfc3339();
-            metadata.insert(k, formatted_time);
+            opts.user_defined.insert(k, formatted_time);
             let k = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-status");
-            metadata.insert(k, dsc.pending_status());
-        }
+            opts.user_defined.insert(k, dsc.pending_status());
         }
 
         let obj_info = store
@@ -1133,7 +1169,7 @@ impl S3 for FS {
             );
         }
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, Some(metadata))
+        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
 
@@ -2314,11 +2350,10 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let legal_hold = if let Some(ud) = object_info.user_defined {
-            ud.get("x-amz-object-lock-legal-hold").map(|v| v.as_str().to_string())
-        } else {
-            None
-        };
+        let legal_hold = object_info
+            .user_defined
+            .get("x-amz-object-lock-legal-hold")
+            .map(|v| v.as_str().to_string());
 
         let status = if let Some(v) = legal_hold {
             v
@@ -2415,20 +2450,16 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        let mode = if let Some(ref ud) = object_info.user_defined {
-            ud.get("x-amz-object-lock-mode")
-                .map(|v| ObjectLockRetentionMode::from(v.as_str().to_string()))
-        } else {
-            None
-        };
+        let mode = object_info
+            .user_defined
+            .get("x-amz-object-lock-mode")
+            .map(|v| ObjectLockRetentionMode::from(v.as_str().to_string()));
 
-        let retain_until_date = if let Some(ref ud) = object_info.user_defined {
-            ud.get("x-amz-object-lock-retain-until-date")
+        let retain_until_date = object_info
+            .user_defined
+            .get("x-amz-object-lock-retain-until-date")
                 .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
-                .map(Timestamp::from)
-        } else {
-            None
-        };
+            .map(Timestamp::from);
 
         Ok(S3Response::new(GetObjectRetentionOutput {
             retention: Some(ObjectLockRetention { mode, retain_until_date }),

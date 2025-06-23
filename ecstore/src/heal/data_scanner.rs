@@ -735,8 +735,7 @@ impl ScannerItem {
         let mut oi = oi.clone();
         oi.replication_status = ReplicationStatusType::from(
             oi.user_defined
-                .as_ref()
-                .and_then(|map| map.get("x-amz-bucket-replication-status"))
+                .get("x-amz-bucket-replication-status")
                 .unwrap_or(&"PENDING".to_string()),
         );
         info!("apply status is: {:?}", oi.replication_status);

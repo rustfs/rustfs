@@ -418,21 +418,16 @@ pub async fn get_heal_replicate_object_info(
         //     .map(|(k, v)| (k.clone(), v.clone()))
         //     .collect::<HashMap<String, String>>()
         //     .collect();
-        let to_replace: Vec<(String, String)> = match &user_defined {
-            Some(map) => map
-                .iter()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(&(RESERVED_METADATA_PREFIX_LOWER.to_owned() + REPLICATION_RESET)))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            None => Vec::new(),
-        };
+        let to_replace: Vec<(String, String)> = user_defined
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(&(RESERVED_METADATA_PREFIX_LOWER.to_owned() + REPLICATION_RESET)))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
         // 第二步：apply 修改
         for (k, v) in to_replace {
-            if let Some(mp) = user_defined.as_mut() {
-                mp.remove(&k);
-                mp.insert(target_reset_header(&rcfg.role), v);
-            }
+            user_defined.remove(&k);
+            user_defined.insert(target_reset_header(&rcfg.role), v);
         }
     }
     //}
@@ -469,13 +464,8 @@ pub async fn get_heal_replicate_object_info(
             mod_time: oi.mod_time,
             ..Default::default()
         };
-        let repoptions = get_must_replicate_options(
-            mt2.as_ref().unwrap_or(&HashMap::new()),
-            "",
-            ReplicationStatusType::Unknown,
-            ReplicationType::ObjectReplicationType,
-            &opts,
-        );
+        let repoptions =
+            get_must_replicate_options(&mt2, "", ReplicationStatusType::Unknown, ReplicationType::ObjectReplicationType, &opts);
 
         let decision = must_replicate(&oi.bucket, &oi.name, &repoptions).await;
         error!("decision:");
@@ -491,11 +481,10 @@ pub async fn get_heal_replicate_object_info(
     //     .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
     //     .map(|dt| dt.with_timezone(&Utc));
 
-    let tm = user_defined.as_ref().and_then(|map| {
-        map.get(&(RESERVED_METADATA_PREFIX_LOWER.to_owned() + REPLICATION_TIMESTAMP))
-            .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-    });
+    let tm = user_defined
+        .get(&(RESERVED_METADATA_PREFIX_LOWER.to_owned() + REPLICATION_TIMESTAMP))
+        .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
+        .map(|dt| dt.with_timezone(&Utc));
 
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
@@ -504,8 +493,6 @@ pub async fn get_heal_replicate_object_info(
 
     let key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, REPLICATION_TIMESTAMP);
     let tm: Option<DateTime<Utc>> = user_defined
-        .as_ref()
-        .unwrap()
         .get(&key)
         .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
         .map(|dt| dt.with_timezone(&Utc));
@@ -1732,14 +1719,14 @@ impl TraitForObjectInfo for ObjectInfo {
         rs.purge_targets = version_purge_statuses_map("");
 
         // Process reset statuses map
-        if self.user_defined.is_some() {
-            for (k, v) in self.user_defined.as_ref().unwrap() {
-                if k.starts_with(&(RESERVED_METADATA_PREFIX_LOWER.to_owned() + REPLICATION_RESET)) {
-                    let arn = k.trim_start_matches(&(RESERVED_METADATA_PREFIX_LOWER.to_owned() + REPLICATION_RESET));
-                    rs.reset_statuses_map.insert(arn.to_string(), v.clone());
-                }
+
+        for (k, v) in self.user_defined.iter() {
+            if k.starts_with(&(RESERVED_METADATA_PREFIX_LOWER.to_owned() + REPLICATION_RESET)) {
+                let arn = k.trim_start_matches(&(RESERVED_METADATA_PREFIX_LOWER.to_owned() + REPLICATION_RESET));
+                rs.reset_statuses_map.insert(arn.to_string(), v.clone());
             }
         }
+
         rs
     }
 }
@@ -2022,7 +2009,7 @@ impl ReplicateObjectInfo {
             size: self.size,
             actual_size: self.actual_size,
             is_dir: false,
-            user_defined: None, // 可以按需从别处导入
+            user_defined: HashMap::new(), // 可以按需从别处导入
             parity_blocks: 0,
             data_blocks: 0,
             version_id: Uuid::try_parse(&self.version_id).ok(),

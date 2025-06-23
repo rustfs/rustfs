@@ -288,7 +288,7 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub src_pool_idx: usize,
-    pub user_defined: Option<HashMap<String, String>>,
+    pub user_defined: HashMap<String, String>,
     pub preserve_etag: Option<String>,
     pub metadata_chg: bool,
 
@@ -366,7 +366,7 @@ pub struct ObjectInfo {
     // Actual size is the real size of the object uploaded by client.
     pub actual_size: i64,
     pub is_dir: bool,
-    pub user_defined: Option<HashMap<String, String>>,
+    pub user_defined: HashMap<String, String>,
     pub parity_blocks: usize,
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
@@ -429,18 +429,15 @@ impl Clone for ObjectInfo {
 
 impl ObjectInfo {
     pub fn is_compressed(&self) -> bool {
-        if let Some(meta) = &self.user_defined {
-            meta.contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER))
-        } else {
-            false
-        }
+        self.user_defined
+            .contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER))
     }
 
     pub fn is_compressed_ok(&self) -> Result<(CompressionAlgorithm, bool)> {
         let scheme = self
             .user_defined
-            .as_ref()
-            .and_then(|meta| meta.get(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER)).cloned());
+            .get(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER))
+            .cloned();
 
         if let Some(scheme) = scheme {
             let algorithm = CompressionAlgorithm::from_str(&scheme)?;
@@ -460,16 +457,16 @@ impl ObjectInfo {
         }
 
         if self.is_compressed() {
-            if let Some(meta) = &self.user_defined {
-                if let Some(size_str) = meta.get(&format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER)) {
-                    if !size_str.is_empty() {
-                        // Todo: deal with error
-                        let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
-                        return Ok(size);
-                    }
+            if let Some(size_str) = self
+                .user_defined
+                .get(&format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER))
+            {
+                if !size_str.is_empty() {
+                    // Todo: deal with error
+                    let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
+                    return Ok(size);
                 }
             }
-
             let mut actual_size = 0;
             self.parts.iter().for_each(|part| {
                 actual_size += part.actual_size;
@@ -527,7 +524,7 @@ impl ObjectInfo {
         let metadata = {
             let mut v = fi.metadata.clone();
             clean_metadata(&mut v);
-            Some(v)
+            v
         };
 
         // Convert parts from rustfs_filemeta::ObjectPartInfo to store_api::ObjectPartInfo
