@@ -1,10 +1,4 @@
-use std::collections::HashSet;
-use std::sync::OnceLock;
-use std::time::Duration;
-use std::{collections::HashMap, sync::Arc};
-
 use crate::StorageAPI;
-use crate::bucket::error::BucketMetadataError;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::cmd::bucket_targets;
@@ -18,6 +12,10 @@ use s3s::dto::{
     BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ReplicationConfiguration,
     ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration,
 };
+use std::collections::HashSet;
+use std::sync::OnceLock;
+use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -400,85 +398,46 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
-        let bm = match self.get_config(bucket).await {
-            Ok((res, _)) => res,
-            Err(err) => {
-                warn!("get_bucket_policy err {:?}", &err);
-                return if err == Error::ConfigNotFound {
-                    Err(BucketMetadataError::BucketPolicyNotFound.into())
-                } else {
-                    Err(err)
-                };
-            }
-        };
+        let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.policy_config {
             Ok((config.clone(), bm.policy_config_updated_at))
         } else {
-            Err(BucketMetadataError::BucketPolicyNotFound.into())
+            Err(Error::ConfigNotFound)
         }
     }
 
     pub async fn get_tagging_config(&self, bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
-        let bm = match self.get_config(bucket).await {
-            Ok((res, _)) => res,
-            Err(err) => {
-                warn!("get_tagging_config err {:?}", &err);
-                return if err == Error::ConfigNotFound {
-                    Err(BucketMetadataError::TaggingNotFound.into())
-                } else {
-                    Err(err)
-                };
-            }
-        };
+        let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.tagging_config {
             Ok((config.clone(), bm.tagging_config_updated_at))
         } else {
-            Err(BucketMetadataError::TaggingNotFound.into())
+            Err(Error::ConfigNotFound)
         }
     }
 
     pub async fn get_object_lock_config(&self, bucket: &str) -> Result<(ObjectLockConfiguration, OffsetDateTime)> {
-        let bm = match self.get_config(bucket).await {
-            Ok((res, _)) => res,
-            Err(err) => {
-                return if err == Error::ConfigNotFound {
-                    Err(BucketMetadataError::BucketObjectLockConfigNotFound.into())
-                } else {
-                    Err(err)
-                };
-            }
-        };
+        let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.object_lock_config {
             Ok((config.clone(), bm.object_lock_config_updated_at))
         } else {
-            Err(BucketMetadataError::BucketObjectLockConfigNotFound.into())
+            Err(Error::ConfigNotFound)
         }
     }
 
     pub async fn get_lifecycle_config(&self, bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
-        let bm = match self.get_config(bucket).await {
-            Ok((res, _)) => res,
-            Err(err) => {
-                warn!("get_lifecycle_config err {:?}", &err);
-                return if err == Error::ConfigNotFound {
-                    Err(BucketMetadataError::BucketLifecycleNotFound.into())
-                } else {
-                    Err(err)
-                };
-            }
-        };
+        let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.lifecycle_config {
             if config.rules.is_empty() {
-                Err(BucketMetadataError::BucketLifecycleNotFound.into())
+                Err(Error::ConfigNotFound)
             } else {
                 Ok((config.clone(), bm.lifecycle_config_updated_at))
             }
         } else {
-            Err(BucketMetadataError::BucketLifecycleNotFound.into())
+            Err(Error::ConfigNotFound)
         }
     }
 
@@ -499,22 +458,12 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_sse_config(&self, bucket: &str) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime)> {
-        let bm = match self.get_config(bucket).await {
-            Ok((res, _)) => res,
-            Err(err) => {
-                warn!("get_sse_config err {:?}", &err);
-                return if err == Error::ConfigNotFound {
-                    Err(BucketMetadataError::BucketSSEConfigNotFound.into())
-                } else {
-                    Err(err)
-                };
-            }
-        };
+        let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.sse_config {
             Ok((config.clone(), bm.encryption_config_updated_at))
         } else {
-            Err(BucketMetadataError::BucketSSEConfigNotFound.into())
+            Err(Error::ConfigNotFound)
         }
     }
 
@@ -530,42 +479,17 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_quota_config(&self, bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
-        let bm = match self.get_config(bucket).await {
-            Ok((res, _)) => res,
-            Err(err) => {
-                warn!("get_quota_config err {:?}", &err);
-                return if err == Error::ConfigNotFound {
-                    Err(BucketMetadataError::BucketQuotaConfigNotFound.into())
-                } else {
-                    Err(err)
-                };
-            }
-        };
+        let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.quota_config {
             Ok((config.clone(), bm.quota_config_updated_at))
         } else {
-            Err(BucketMetadataError::BucketQuotaConfigNotFound.into())
+            Err(Error::ConfigNotFound)
         }
     }
 
     pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
-        let (bm, reload) = match self.get_config(bucket).await {
-            Ok(res) => {
-                if res.0.replication_config.is_none() {
-                    return Err(BucketMetadataError::BucketReplicationConfigNotFound.into());
-                }
-                res
-            }
-            Err(err) => {
-                warn!("get_replication_config err {:?}", &err);
-                return if err == Error::ConfigNotFound {
-                    Err(BucketMetadataError::BucketReplicationConfigNotFound.into())
-                } else {
-                    Err(err)
-                };
-            }
-        };
+        let (bm, reload) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.replication_config {
             if reload {
@@ -574,24 +498,12 @@ impl BucketMetadataSys {
             //println!("549 {:?}", config.clone());
             Ok((config.clone(), bm.replication_config_updated_at))
         } else {
-            Err(BucketMetadataError::BucketReplicationConfigNotFound.into())
+            Err(Error::ConfigNotFound)
         }
     }
 
     pub async fn get_bucket_targets_config(&self, bucket: &str) -> Result<BucketTargets> {
-        let (bm, reload) = match self.get_config(bucket).await {
-            Ok(res) => res,
-            Err(err) => {
-                warn!("get_replication_config err {:?}", &err);
-                return if err == Error::ConfigNotFound {
-                    Err(BucketMetadataError::BucketRemoteTargetNotFound.into())
-                } else {
-                    Err(err)
-                };
-            }
-        };
-
-        println!("573");
+        let (bm, reload) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.bucket_target_config {
             if reload {
@@ -601,7 +513,7 @@ impl BucketMetadataSys {
 
             Ok(config.clone())
         } else {
-            Err(BucketMetadataError::BucketRemoteTargetNotFound.into())
+            Err(Error::ConfigNotFound)
         }
     }
 }
