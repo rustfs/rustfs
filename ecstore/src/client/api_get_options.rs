@@ -1,6 +1,6 @@
 #![allow(clippy::map_entry)]
-use std::collections::HashMap;
 use http::{HeaderMap, HeaderName, HeaderValue};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::warn;
 
@@ -8,9 +8,9 @@ use crate::client::api_error_response::err_invalid_argument;
 
 #[derive(Default)]
 pub struct AdvancedGetOptions {
-    replication_deletemarker:              bool,
+    replication_deletemarker: bool,
     is_replication_ready_for_deletemarker: bool,
-    replication_proxy_request:             String,
+    replication_proxy_request: String,
 }
 
 pub struct GetObjectOptions {
@@ -50,7 +50,7 @@ impl GetObjectOptions {
             }
         }
         if self.checksum {
-           headers.insert("x-amz-checksum-mode", "ENABLED".parse().expect("err"));
+            headers.insert("x-amz-checksum-mode", "ENABLED".parse().expect("err"));
         }
         headers
     }
@@ -96,15 +96,15 @@ impl GetObjectOptions {
     pub fn set_range(&mut self, start: i64, end: i64) -> Result<(), std::io::Error> {
         if start == 0 && end < 0 {
             self.set("Range", &format!("bytes={}", end));
-        }
-        else if 0 < start && end == 0 {
+        } else if 0 < start && end == 0 {
             self.set("Range", &format!("bytes={}-", start));
-        }
-        else if 0 <= start && start <= end {
+        } else if 0 <= start && start <= end {
             self.set("Range", &format!("bytes={}-{}", start, end));
-        }
-        else {
-            return Err(std::io::Error::other(err_invalid_argument(&format!("Invalid range specified: start={} end={}", start, end))));
+        } else {
+            return Err(std::io::Error::other(err_invalid_argument(&format!(
+                "Invalid range specified: start={} end={}",
+                start, end
+            ))));
         }
         Ok(())
     }

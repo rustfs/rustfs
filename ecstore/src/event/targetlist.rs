@@ -4,9 +4,9 @@ use super::targetid::TargetID;
 
 #[derive(Default)]
 pub struct TargetList {
-    pub current_send_calls:  AtomicI64,
-    pub total_events:        AtomicI64,
-    pub events_skipped:      AtomicI64,
+    pub current_send_calls: AtomicI64,
+    pub total_events: AtomicI64,
+    pub events_skipped: AtomicI64,
     pub events_errors_total: AtomicI64,
     //pub targets: HashMap<TargetID, Target>,
     //pub queue:   AsyncEvent,
@@ -26,6 +26,6 @@ struct TargetStat {
 }
 
 struct TargetIDResult {
-    id:  TargetID,
+    id: TargetID,
     err: std::io::Error,
 }

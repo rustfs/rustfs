@@ -1,53 +1,49 @@
+use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
+use futures::Future;
+use http::HeaderMap;
+use lazy_static::lazy_static;
+use s3s::Body;
+use sha2::{Digest, Sha256};
 use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::env;
 use std::io::{Cursor, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use futures::Future;
-use lazy_static::lazy_static;
-use s3s::Body;
-use std::collections::HashMap;
-use tracing::{error, info, warn};
-use sha2::{Digest, Sha256};
-use xxhash_rust::xxh64;
-use uuid::Uuid;
-use http::HeaderMap;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{mpsc, RwLock};
-use async_channel::{bounded, Receiver as A_Receiver, Sender as A_Sender};
+use tokio::sync::{RwLock, mpsc};
+use tracing::{error, info, warn};
+use uuid::Uuid;
+use xxhash_rust::xxh64;
 
-use s3s::dto::BucketLifecycleConfiguration;
+use super::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
+use super::lifecycle::{self, ExpirationOptions, IlmAction, Lifecycle, TransitionOptions};
+use super::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
+use super::tier_sweeper::{Jentry, delete_object_from_remote_tier};
+use crate::bucket::{metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
+use crate::client::object_api_utils::new_getobjectreader;
 use crate::error::Error;
-use crate::event::name::EventName;
-use crate::store::ECStore;
-use crate::store_api::StorageAPI;
-use crate::store_api::{ObjectInfo, ObjectOptions, ObjectToDelete, GetObjectReader, HTTPRangeSpec,};
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
+use crate::event::name::EventName;
+use crate::event_notification::{EventArgs, send_event};
+use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
-use crate::client::object_api_utils::{new_getobjectreader,};
-use crate::event_notification::{send_event, EventArgs};
 use crate::heal::{
+    data_scanner::{apply_expiry_on_non_transitioned_objects, apply_expiry_on_transitioned_object},
     data_scanner_metric::ScannerMetrics,
-    data_scanner::{
-      apply_expiry_on_transitioned_object, apply_expiry_on_non_transitioned_objects,
-    },
     data_usage_cache::TierStats,
 };
-use crate::global::GLOBAL_LocalNodeName;
-use crate::bucket::{
-    metadata_sys::get_lifecycle_config,
-    versioning_sys::BucketVersioningSys,
-};
+use crate::store::ECStore;
+use crate::store_api::StorageAPI;
+use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete};
 use crate::tier::warm_backend::WarmBackendGetOpts;
-use super::lifecycle::{self, ExpirationOptions, IlmAction, Lifecycle, TransitionOptions};
-use super::tier_last_day_stats::{LastDayTierStats, DailyAllTierStats};
-use super::tier_sweeper::{delete_object_from_remote_tier, Jentry};
-use super::bucket_lifecycle_audit::{LcEventSrc, LcAuditEvent};
+use s3s::dto::BucketLifecycleConfiguration;
 
 pub type TimeFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
-pub type TraceFn = Arc<dyn Fn(String, HashMap<String, String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+pub type TraceFn =
+    Arc<dyn Fn(String, HashMap<String, String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 
 static XXHASH_SEED: u64 = 0;
@@ -74,8 +70,7 @@ impl LifecycleSys {
         Some(lc)
     }
 
-    pub fn trace(oi: &ObjectInfo) -> TraceFn
-    {
+    pub fn trace(oi: &ObjectInfo) -> TraceFn {
         todo!();
     }
 }
@@ -132,11 +127,11 @@ pub trait ExpiryOp: 'static {
 
 #[derive(Debug, Default, Clone)]
 pub struct TransitionedObject {
-    pub name:         String,
-    pub version_id:   String,
-    pub tier:         String,
+    pub name: String,
+    pub version_id: String,
+    pub tier: String,
     pub free_version: bool,
-    pub status:       String,
+    pub status: String,
 }
 
 struct FreeVersionTask(ObjectInfo);
@@ -181,8 +176,6 @@ pub struct ExpiryState {
     stats: Option<ExpiryStats>,
 }
 
-
-
 impl ExpiryState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<RwLock<Self>> {
@@ -203,7 +196,7 @@ impl ExpiryState {
         if rxs.len() == 0 {
             return 0;
         }
-        let mut tasks=0;
+        let mut tasks = 0;
         for rx in rxs.iter() {
             tasks += rx.lock().await.len();
         }
@@ -244,7 +237,11 @@ impl ExpiryState {
     }
 
     pub async fn enqueue_by_days(&mut self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
-        let task = ExpiryTask {obj_info: oi.clone(), event: event.clone(), src: src.clone()};
+        let task = ExpiryTask {
+            obj_info: oi.clone(),
+            event: event.clone(),
+            src: src.clone(),
+        };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
             *self.stats.as_mut().expect("err").missed_expiry_tasks.get_mut() += 1;
@@ -265,7 +262,11 @@ impl ExpiryState {
             return;
         }
 
-        let task = NewerNoncurrentTask {bucket: String::from(bucket), versions: versions, event: lc_event};
+        let task = NewerNoncurrentTask {
+            bucket: String::from(bucket),
+            versions: versions,
+            event: lc_event,
+        };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
             *self.stats.as_mut().expect("err").missed_expiry_tasks.get_mut() += 1;
@@ -285,7 +286,7 @@ impl ExpiryState {
         if self.tasks_tx.len() == 0 {
             return None;
         }
-        Some(self.tasks_tx[h as usize %self.tasks_tx.len()].clone())
+        Some(self.tasks_tx[h as usize % self.tasks_tx.len()].clone())
     }
 
     pub async fn resize_workers(n: usize, api: Arc<ECStore>) {
@@ -311,10 +312,10 @@ impl ExpiryState {
 
         let mut l = state.tasks_tx.len();
         while l > n {
-            let worker = state.tasks_tx[l-1].clone();
+            let worker = state.tasks_tx[l - 1].clone();
             worker.send(None).await.unwrap_or(());
-            state.tasks_tx.remove(l-1);
-            state.tasks_rx.remove(l-1);
+            state.tasks_tx.remove(l - 1);
+            state.tasks_rx.remove(l - 1);
             *state.stats.as_mut().expect("err").workers.get_mut() -= 1;
             l -= 1;
         }
@@ -357,7 +358,7 @@ impl ExpiryState {
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("err!");
                         let oi = v.0.clone();
-                        
+
                     }
                     else {
                         //info!("Invalid work type - {:?}", v);
@@ -422,7 +423,11 @@ impl TransitionState {
     }
 
     pub async fn queue_transition_task(&self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
-        let task = TransitionTask {obj_info: oi.clone(), src: src.clone(), event: event.clone()};
+        let task = TransitionTask {
+            obj_info: oi.clone(),
+            src: src.clone(),
+            event: event.clone(),
+        };
         select! {
             //_ -> t.ctx.Done() => (),
             _ = self.transition_tx.send(Some(task)) => (),
@@ -438,8 +443,8 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let mut n = 10;//globalAPIConfig.getTransitionWorkers();
-        let tw = 10;//globalILMConfig.getTransitionWorkers(); 
+        let mut n = 10; //globalAPIConfig.getTransitionWorkers();
+        let tw = 10; //globalILMConfig.getTransitionWorkers(); 
         if tw > 0 {
             n = tw;
         }
@@ -512,8 +517,10 @@ impl TransitionState {
 
     pub fn add_lastday_stats(&self, tier: &str, ts: TierStats) {
         let mut tier_stats = self.last_day_stats.lock().unwrap();
-        tier_stats.entry(tier.to_string()).and_modify(|e| e.add_stats(ts))
-        .or_insert(LastDayTierStats::default());
+        tier_stats
+            .entry(tier.to_string())
+            .and_modify(|e| e.add_stats(ts))
+            .or_insert(LastDayTierStats::default());
     }
 
     pub fn get_daily_all_tier_stats(&self) -> DailyAllTierStats {
@@ -574,7 +581,10 @@ impl AuditTierOp {
     }
 
     pub fn string(&self) -> String {
-        format!("tier:{},respNS:{},tx:{},err:{}", self.tier, self.time_to_responsens, self.output_bytes, self.error)
+        format!(
+            "tier:{},respNS:{},tx:{},err:{}",
+            self.tier, self.time_to_responsens, self.output_bytes, self.error
+        )
     }
 }
 
@@ -636,16 +646,21 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
                 }
                 GLOBAL_TransitionState.queue_transition_task(oi, &event, &src).await;
             }
-            _ => ()
+            _ => (),
         }
     }
 }
 
-pub async fn expire_transitioned_object(api: Arc<ECStore>, oi: &ObjectInfo, lc_event: &lifecycle::Event, src: &LcEventSrc) -> Result<ObjectInfo, std::io::Error> {
+pub async fn expire_transitioned_object(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    src: &LcEventSrc,
+) -> Result<ObjectInfo, std::io::Error> {
     //let traceFn = GLOBAL_LifecycleSys.trace(oi);
     let mut opts = ObjectOptions {
-        versioned:  BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
-        expiration: ExpirationOptions {expire: true},
+        versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
+        expiration: ExpirationOptions { expire: true },
         ..Default::default()
     };
     if lc_event.action == IlmAction::DeleteVersionAction {
@@ -660,10 +675,15 @@ pub async fn expire_transitioned_object(api: Arc<ECStore>, oi: &ObjectInfo, lc_e
                 return Ok(dobj);
             }
             Err(err) => return Err(std::io::Error::other(err)),
-        }        
+        }
     }
 
-    let ret = delete_object_from_remote_tier(&oi.transitioned_object.name, &oi.transitioned_object.version_id, &oi.transitioned_object.tier).await;
+    let ret = delete_object_from_remote_tier(
+        &oi.transitioned_object.name,
+        &oi.transitioned_object.version_id,
+        &oi.transitioned_object.tier,
+    )
+    .await;
     if ret.is_ok() {
         opts.skip_decommissioned = true;
     } else {
@@ -679,8 +699,8 @@ pub async fn expire_transitioned_object(api: Arc<ECStore>, oi: &ObjectInfo, lc_e
         event_name = EventName::ObjectRemovedDeleteMarkerCreated;
     }
     let obj_info = ObjectInfo {
-        name:         oi.name.clone(),
-        version_id:    oi.version_id,
+        name: oi.name.clone(),
+        version_id: oi.version_id,
         delete_marker: oi.delete_marker,
         ..Default::default()
     };
@@ -712,15 +732,15 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
     let opts = ObjectOptions {
         transition: TransitionOptions {
             status: lifecycle::TRANSITION_PENDING.to_string(),
-            tier:   lae.event.storage_class,
-            etag:   oi.etag.clone().expect("err").to_string(),
+            tier: lae.event.storage_class,
+            etag: oi.etag.clone().expect("err").to_string(),
             ..Default::default()
         },
         //lifecycle_audit_event: lae,
-        version_id:           Some(oi.version_id.expect("err").to_string()),
-        versioned:            BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
-        version_suspended:    BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
-        mod_time:             oi.mod_time,
+        version_id: Some(oi.version_id.expect("err").to_string()),
+        versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
+        version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
+        mod_time: oi.mod_time,
         ..Default::default()
     };
     time_ilm(1);
@@ -731,7 +751,14 @@ pub fn audit_tier_actions(api: ECStore, tier: &str, bytes: i64) -> TimeFn {
     todo!();
 }
 
-pub async fn get_transitioned_object_reader(bucket: &str, object: &str, rs: HTTPRangeSpec, h: HeaderMap, oi: ObjectInfo, opts: &ObjectOptions) -> Result<GetObjectReader, std::io::Error> {
+pub async fn get_transitioned_object_reader(
+    bucket: &str,
+    object: &str,
+    rs: HTTPRangeSpec,
+    h: HeaderMap,
+    oi: ObjectInfo,
+    opts: &ObjectOptions,
+) -> Result<GetObjectReader, std::io::Error> {
     let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
     let tgt_client = match tier_config_mgr.get_driver(&oi.transitioned_object.tier).await {
         Ok(d) => d,
@@ -752,7 +779,9 @@ pub async fn get_transitioned_object_reader(bucket: &str, object: &str, rs: HTTP
 
     //return Ok(HttpFileReader::new(rs, &oi, opts, &h));
     //timeTierAction := auditTierActions(oi.transitioned_object.Tier, length)
-    let reader = tgt_client.get(&oi.transitioned_object.name, &oi.transitioned_object.version_id, gopts).await?;
+    let reader = tgt_client
+        .get(&oi.transitioned_object.name, &oi.transitioned_object.version_id, gopts)
+        .await?;
     Ok(get_fn(reader, h))
 }
 
@@ -771,18 +800,18 @@ pub trait LifecycleOps {
 impl LifecycleOps for ObjectInfo {
     fn to_lifecycle_opts(&self) -> lifecycle::ObjectOpts {
         lifecycle::ObjectOpts {
-            name:               self.name.clone(),
-            user_tags:          self.user_tags.clone(),
-            version_id:         self.version_id.expect("err").to_string(),
-            mod_time:           self.mod_time,
-            size:               self.size,
-            is_latest:          self.is_latest,
-            num_versions:       self.num_versions,
-            delete_marker:      self.delete_marker,
+            name: self.name.clone(),
+            user_tags: self.user_tags.clone(),
+            version_id: self.version_id.expect("err").to_string(),
+            mod_time: self.mod_time,
+            size: self.size,
+            is_latest: self.is_latest,
+            num_versions: self.num_versions,
+            delete_marker: self.delete_marker,
             successor_mod_time: self.successor_mod_time,
             //restore_ongoing:    self.restore_ongoing,
             //restore_expires:    self.restore_expires,
-            transition_status:  self.transitioned_object.status.clone(),
+            transition_status: self.transitioned_object.status.clone(),
             ..Default::default()
         }
     }
@@ -790,9 +819,9 @@ impl LifecycleOps for ObjectInfo {
 
 #[derive(Debug, Default, Clone)]
 pub struct S3Location {
-    pub bucketname:    String,
+    pub bucketname: String,
     //pub encryption:    Encryption,
-    pub prefix:        String,
+    pub prefix: String,
     pub storage_class: String,
     //pub tagging:       Tags,
     pub user_metadata: HashMap<String, String>,
@@ -803,13 +832,12 @@ pub struct OutputLocation(pub S3Location);
 
 #[derive(Debug, Default, Clone)]
 pub struct RestoreObjectRequest {
-    pub days:               i64,
-    pub ror_type:           String,
-    pub tier:               String,
-    pub description:        String,
+    pub days: i64,
+    pub ror_type: String,
+    pub tier: String,
+    pub description: String,
     //pub select_parameters: SelectParameters,
-    pub output_location:   OutputLocation,
+    pub output_location: OutputLocation,
 }
 
 const MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;
-

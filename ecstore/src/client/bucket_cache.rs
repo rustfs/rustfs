@@ -1,20 +1,20 @@
 #![allow(clippy::map_entry)]
 use http::Request;
+use hyper::StatusCode;
 use hyper::body::Incoming;
 use std::{collections::HashMap, sync::Arc};
 use tracing::warn;
-use tracing::{error, info, debug};
-use hyper::StatusCode;
+use tracing::{debug, error, info};
 
-use reader::hasher::{Hasher, Sha256};
-use s3s::S3ErrorCode;
-use s3s::Body;
 use crate::client::{
     api_error_response::{http_resp_to_error_response, to_error_response},
-    transition_api::{TransitionClient, Document},
+    transition_api::{Document, TransitionClient},
 };
 use crate::signer;
+use reader::hasher::{Hasher, Sha256};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use s3s::Body;
+use s3s::S3ErrorCode;
 
 use super::constants::UNSIGNED_PAYLOAD;
 use super::credentials::SignatureType;
@@ -25,9 +25,7 @@ pub struct BucketLocationCache {
 
 impl BucketLocationCache {
     pub fn new() -> BucketLocationCache {
-        BucketLocationCache{
-            items: HashMap::new(),
-        }
+        BucketLocationCache { items: HashMap::new() }
     }
 
     pub fn get(&self, bucket_name: &str) -> Option<String> {
@@ -50,7 +48,7 @@ impl TransitionClient {
 
     async fn get_bucket_location_inner(&self, bucket_name: &str) -> Result<String, std::io::Error> {
         if self.region != "" {
-            return Ok(self.region.clone())
+            return Ok(self.region.clone());
         }
 
         let mut location;
@@ -81,11 +79,7 @@ impl TransitionClient {
         let mut target_url = self.endpoint_url.clone();
         let scheme = self.endpoint_url.scheme();
         let h = target_url.host().expect("host is none.");
-        let default_port = if scheme == "https" {
-            443
-        } else {
-            80
-        };
+        let default_port = if scheme == "https" { 443 } else { 80 };
         let p = target_url.port().unwrap_or(default_port);
 
         let is_virtual_style = self.is_virtual_host_style_request(&target_url, bucket_name);
@@ -128,9 +122,9 @@ impl TransitionClient {
         }
 
         let mut signer_type = value.signer_type.clone();
-        let mut access_key_id      = value.access_key_id;
-        let mut secret_access_key  = value.secret_access_key;
-        let mut session_token      = value.session_token;
+        let mut access_key_id = value.access_key_id;
+        let mut secret_access_key = value.secret_access_key;
+        let mut session_token = value.session_token;
 
         if self.override_signer_type != SignatureType::SignatureDefault {
             signer_type = self.override_signer_type.clone();
@@ -164,7 +158,10 @@ impl TransitionClient {
             content_sha256 = UNSIGNED_PAYLOAD.to_string();
         }
 
-        req_builder.headers_mut().expect("err").insert("X-Amz-Content-Sha256", content_sha256.parse().unwrap());
+        req_builder
+            .headers_mut()
+            .expect("err")
+            .insert("X-Amz-Content-Sha256", content_sha256.parse().unwrap());
         let req_builder = signer::sign_v4(req_builder, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
         let req = match req_builder.body(Body::empty()) {
             Ok(req) => return Ok(req),
@@ -177,9 +174,9 @@ impl TransitionClient {
 
 async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket_name: &str) -> Result<String, std::io::Error> {
     //if resp != nil {
-        if resp.status() != StatusCode::OK {
-            let err_resp = http_resp_to_error_response(resp, vec![], bucket_name, "");
-            match err_resp.code {
+    if resp.status() != StatusCode::OK {
+        let err_resp = http_resp_to_error_response(resp, vec![], bucket_name, "");
+        match err_resp.code {
                 S3ErrorCode::NotImplemented => {
                     match err_resp.server.as_str() {
                         "AmazonSnowball" => {
@@ -205,13 +202,13 @@ async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket
                     return Err(std::io::Error::other(err_resp));
                 }
             }
-        }
+    }
     //}
 
     let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
     let Document(location_constraint) = serde_xml_rs::from_str::<Document>(&String::from_utf8(b).unwrap()).unwrap();
 
-    let  mut location = location_constraint;
+    let mut location = location_constraint;
     if location == "" {
         location = "us-east-1".to_string();
     }

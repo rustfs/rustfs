@@ -1,23 +1,36 @@
 #![allow(clippy::map_entry)]
-use std::collections::HashMap;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
+use std::collections::HashMap;
 
 use crate::client::{
     api_error_response::http_resp_to_error_response,
+    api_s3_datatypes::{
+        ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult, ListObjectPartsResult, ListVersionsResult, ObjectPart,
+    },
     credentials,
-    api_s3_datatypes::{ListBucketV2Result, ListMultipartUploadsResult, ListBucketResult, ListObjectPartsResult, ListVersionsResult, ObjectPart},
-    transition_api::{ReaderImpl, TransitionClient, RequestMetadata,},
+    transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
-use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use crate::store_api::BucketInfo;
+use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
 impl TransitionClient {
     pub fn list_buckets(&self) -> Result<Vec<BucketInfo>, std::io::Error> {
         todo!();
     }
 
-    pub async fn list_objects_v2_query(&self, bucket_name: &str, object_prefix: &str, continuation_token: &str, fetch_owner: bool, metadata: bool, delimiter: &str, start_after: &str, max_keys: i64, headers: HeaderMap) -> Result<ListBucketV2Result, std::io::Error> {
+    pub async fn list_objects_v2_query(
+        &self,
+        bucket_name: &str,
+        object_prefix: &str,
+        continuation_token: &str,
+        fetch_owner: bool,
+        metadata: bool,
+        delimiter: &str,
+        start_after: &str,
+        max_keys: i64,
+        headers: HeaderMap,
+    ) -> Result<ListBucketV2Result, std::io::Error> {
         let mut url_values = HashMap::new();
 
         url_values.insert("list-type".to_string(), "2".to_string());
@@ -43,23 +56,28 @@ impl TransitionClient {
             url_values.insert("max-keys".to_string(), max_keys.to_string());
         }
 
-        let mut resp = self.execute_method(http::Method::GET, &mut RequestMetadata {
-            bucket_name: bucket_name.to_string(),
-            object_name: "".to_string(),
-            query_values:       url_values,
-            content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-            custom_header:     headers,
-            content_body:      ReaderImpl::Body(Bytes::new()),
-            content_length:    0,
-            content_md5_base64: "".to_string(),
-            stream_sha256:     false,
-            trailer:           HeaderMap::new(),
-            pre_sign_url:      Default::default(),
-            add_crc: Default::default(),
-            extra_pre_sign_header: Default::default(),
-            bucket_location:   Default::default(),
-            expires:           Default::default(),
-        }).await?;
+        let mut resp = self
+            .execute_method(
+                http::Method::GET,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: "".to_string(),
+                    query_values: url_values,
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    custom_header: headers,
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
         if resp.status() != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, "")));
         }
@@ -76,12 +94,12 @@ impl TransitionClient {
 
         if list_bucket_result.is_truncated && list_bucket_result.next_continuation_token == "" {
             return Err(std::io::Error::other(credentials::ErrorResponse {
-              sts_error: credentials::STSError {
-                  r#type:  "".to_string(),
-                  code:    "NotImplemented".to_string(),
-                  message: "Truncated response should have continuation token set".to_string(),
-              },
-              request_id: "".to_string(),
+                sts_error: credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: "Truncated response should have continuation token set".to_string(),
+                },
+                request_id: "".to_string(),
             }));
         }
 
@@ -97,7 +115,14 @@ impl TransitionClient {
         Ok(list_bucket_result)
     }
 
-    pub fn list_object_versions_query(&self, bucket_name: &str, opts: &ListObjectsOptions, key_marker: &str, version_id_marker: &str, delimiter: &str) -> Result<ListVersionsResult, std::io::Error> {
+    pub fn list_object_versions_query(
+        &self,
+        bucket_name: &str,
+        opts: &ListObjectsOptions,
+        key_marker: &str,
+        version_id_marker: &str,
+        delimiter: &str,
+    ) -> Result<ListVersionsResult, std::io::Error> {
         /*if err := s3utils.CheckValidBucketName(bucketName); err != nil {
           return ListVersionsResult{}, err
         }
@@ -177,15 +202,36 @@ impl TransitionClient {
         todo!();
     }
 
-    pub fn list_objects_query(&self, bucket_name: &str, object_prefix: &str, object_marker: &str, delimiter: &str, max_keys: i64, headers: HeaderMap) -> Result<ListBucketResult, std::io::Error> {
+    pub fn list_objects_query(
+        &self,
+        bucket_name: &str,
+        object_prefix: &str,
+        object_marker: &str,
+        delimiter: &str,
+        max_keys: i64,
+        headers: HeaderMap,
+    ) -> Result<ListBucketResult, std::io::Error> {
         todo!();
     }
 
-    pub fn list_multipart_uploads_query(&self, bucket_name: &str, key_marker: &str, upload_id_marker: &str, prefix: &str, delimiter: &str, max_uploads: i64) -> Result<ListMultipartUploadsResult, std::io::Error> {
+    pub fn list_multipart_uploads_query(
+        &self,
+        bucket_name: &str,
+        key_marker: &str,
+        upload_id_marker: &str,
+        prefix: &str,
+        delimiter: &str,
+        max_uploads: i64,
+    ) -> Result<ListMultipartUploadsResult, std::io::Error> {
         todo!();
     }
 
-    pub fn list_object_parts(&self, bucket_name: &str, object_name: &str, upload_id: &str) -> Result<HashMap<i64, ObjectPart>, std::io::Error> {
+    pub fn list_object_parts(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        upload_id: &str,
+    ) -> Result<HashMap<i64, ObjectPart>, std::io::Error> {
         todo!();
     }
 
@@ -193,7 +239,14 @@ impl TransitionClient {
         todo!();
     }
 
-    pub async fn list_object_parts_query(&self, bucket_name: &str, object_name: &str, upload_id: &str, part_number_marker: i64, max_parts: i64) -> Result<ListObjectPartsResult, std::io::Error> {
+    pub async fn list_object_parts_query(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        upload_id: &str,
+        part_number_marker: i64,
+        max_parts: i64,
+    ) -> Result<ListObjectPartsResult, std::io::Error> {
         todo!();
     }
 }

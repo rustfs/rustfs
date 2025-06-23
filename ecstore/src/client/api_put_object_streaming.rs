@@ -1,28 +1,28 @@
 #![allow(clippy::map_entry)]
-use std::sync::RwLock;
-use std::{collections::HashMap, sync::Arc};
 use bytes::Bytes;
 use futures::future::join_all;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use time::{format_description, OffsetDateTime};
+use std::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
+use time::{OffsetDateTime, format_description};
 use tokio::{select, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
-use reader::hasher::Hasher;
+use crate::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum};
 use crate::client::{
-    constants::ISO8601_DATEFORMAT,
+    api_error_response::{err_invalid_argument, err_unexpected_eof, http_resp_to_error_response},
     api_put_object::PutObjectOptions,
+    api_put_object_common::{is_object, optimal_part_info},
     api_put_object_multipart::UploadPartParams,
     api_s3_datatypes::{CompleteMultipartUpload, CompletePart, ObjectPart},
-    transition_api::{TransitionClient, RequestMetadata, UploadInfo, ReaderImpl},
-    api_put_object_common::{is_object, optimal_part_info,},
-    api_error_response::{err_invalid_argument, http_resp_to_error_response, err_unexpected_eof},
+    constants::ISO8601_DATEFORMAT,
+    transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
+use reader::hasher::Hasher;
 use rustfs_utils::{crypto::base64_encode, path::trim_etag};
-use crate::checksum::{add_auto_checksum_headers, apply_auto_checksum, ChecksumMode};
+use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 
 pub struct UploadedPartRes {
     pub error: std::io::Error,
@@ -37,23 +37,39 @@ pub struct UploadPartReq {
 }
 
 impl TransitionClient {
-    pub async fn put_object_multipart_stream(self: Arc<Self>, bucket_name: &str, object_name: &str,
-        mut reader: ReaderImpl, size: i64, opts: &PutObjectOptions
+    pub async fn put_object_multipart_stream(
+        self: Arc<Self>,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl,
+        size: i64,
+        opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
         let info: UploadInfo;
         if opts.concurrent_stream_parts && opts.num_threads > 1 {
-            info = self.put_object_multipart_stream_parallel(bucket_name, object_name, reader, opts).await?;
+            info = self
+                .put_object_multipart_stream_parallel(bucket_name, object_name, reader, opts)
+                .await?;
         } else if !is_object(&reader) && !opts.send_content_md5 {
-            info = self.put_object_multipart_stream_from_readat(bucket_name, object_name, reader, size, opts).await?;
+            info = self
+                .put_object_multipart_stream_from_readat(bucket_name, object_name, reader, size, opts)
+                .await?;
         } else {
-            info = self.put_object_multipart_stream_optional_checksum(bucket_name, object_name, reader, size, opts).await?;
+            info = self
+                .put_object_multipart_stream_optional_checksum(bucket_name, object_name, reader, size, opts)
+                .await?;
         }
-        
+
         Ok(info)
     }
 
-    pub async fn put_object_multipart_stream_from_readat(&self, bucket_name: &str, object_name: &str,
-        mut reader: ReaderImpl, size: i64, opts: &PutObjectOptions
+    pub async fn put_object_multipart_stream_from_readat(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl,
+        size: i64,
+        opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
         let ret = optimal_part_info(size, opts.part_size)?;
         let (total_parts_count, part_size, lastpart_size) = ret;
@@ -68,8 +84,13 @@ impl TransitionClient {
         todo!();
     }
 
-    pub async fn put_object_multipart_stream_optional_checksum(&self, bucket_name: &str, object_name: &str,
-        mut reader: ReaderImpl, size: i64, opts: &PutObjectOptions
+    pub async fn put_object_multipart_stream_optional_checksum(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl,
+        size: i64,
+        opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
         let mut opts = opts.clone();
         if opts.checksum.is_set() {
@@ -130,7 +151,7 @@ impl TransitionClient {
                 }
             }
 
-            let hooked = ReaderImpl::Body(Bytes::from(buf));//newHook(BufferReader::new(buf), opts.progress);
+            let hooked = ReaderImpl::Body(Bytes::from(buf)); //newHook(BufferReader::new(buf), opts.progress);
             let mut p = UploadPartParams {
                 bucket_name: bucket_name.to_string(),
                 object_name: object_name.to_string(),
@@ -154,7 +175,12 @@ impl TransitionClient {
 
         if size > 0 {
             if total_uploaded_size != size {
-                return Err(std::io::Error::other(err_unexpected_eof(total_uploaded_size, size, bucket_name, object_name)));
+                return Err(std::io::Error::other(err_unexpected_eof(
+                    total_uploaded_size,
+                    size,
+                    bucket_name,
+                    object_name,
+                )));
             }
         }
 
@@ -167,12 +193,12 @@ impl TransitionClient {
 
             all_parts.push(part.clone());
             compl_multipart_upload.parts.push(CompletePart {
-                etag:               part.etag,
-                part_num:           part.part_num,
-                checksum_crc32:     part.checksum_crc32,
-                checksum_crc32c:    part.checksum_crc32c,
-                checksum_sha1:      part.checksum_sha1,
-                checksum_sha256:    part.checksum_sha256,
+                etag: part.etag,
+                part_num: part.part_num,
+                checksum_crc32: part.checksum_crc32,
+                checksum_crc32c: part.checksum_crc32c,
+                checksum_sha1: part.checksum_sha1,
+                checksum_sha256: part.checksum_sha256,
                 checksum_crc64nvme: part.checksum_crc64nvme,
             });
         }
@@ -181,18 +207,24 @@ impl TransitionClient {
 
         let mut opts = PutObjectOptions {
             //server_side_encryption: opts.server_side_encryption,
-            auto_checksum:          opts.auto_checksum,
+            auto_checksum: opts.auto_checksum,
             ..Default::default()
         };
         apply_auto_checksum(&mut opts, &mut all_parts);
-        let mut upload_info = self.complete_multipart_upload(bucket_name, object_name, &upload_id, compl_multipart_upload, &opts).await?;
+        let mut upload_info = self
+            .complete_multipart_upload(bucket_name, object_name, &upload_id, compl_multipart_upload, &opts)
+            .await?;
 
         upload_info.size = total_uploaded_size;
         Ok(upload_info)
     }
 
-    pub async fn put_object_multipart_stream_parallel(self: Arc<Self>, bucket_name: &str, object_name: &str,
-        mut reader: ReaderImpl/*GetObjectReader*/, opts: &PutObjectOptions
+    pub async fn put_object_multipart_stream_parallel(
+        self: Arc<Self>,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl, /*GetObjectReader*/
+        opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
         let mut opts = opts.clone();
         if opts.checksum.is_set() {
@@ -239,7 +271,11 @@ impl TransitionClient {
             }
 
             if buf.len() != part_size as usize {
-                return Err(std::io::Error::other(format!("read buffer < {} than expected partSize: {}", buf.len(), part_size)));
+                return Err(std::io::Error::other(format!(
+                    "read buffer < {} than expected partSize: {}",
+                    buf.len(),
+                    part_size
+                )));
             }
 
             match &mut reader {
@@ -286,21 +322,21 @@ impl TransitionClient {
 
                 //defer wg.Done()
                 let mut p = UploadPartParams {
-                    bucket_name:  bucket_name.to_string(),
-                    object_name:  object_name.to_string(),
+                    bucket_name: bucket_name.to_string(),
+                    object_name: object_name.to_string(),
                     upload_id: clone_upload_id,
-                    reader:        ReaderImpl::Body(Bytes::from(buf.clone())),
+                    reader: ReaderImpl::Body(Bytes::from(buf.clone())),
                     part_number,
                     md5_base64,
-                    size:          length as i64,
+                    size: length as i64,
                     //sse:           opts.server_side_encryption,
                     stream_sha256: !opts.disable_content_sha256,
                     custom_header,
-                    sha256_hex:    "".to_string(),
-                    trailer:       HeaderMap::new(),
+                    sha256_hex: "".to_string(),
+                    trailer: HeaderMap::new(),
                 };
                 let obj_part = clone_self.upload_part(&mut p).await.expect("err");
-                
+
                 let mut clone_parts_info = clone_parts_info.write().unwrap();
                 clone_parts_info.entry(part_number).or_insert(obj_part);
 
@@ -328,12 +364,12 @@ impl TransitionClient {
 
             all_parts.push(part.clone());
             compl_multipart_upload.parts.push(CompletePart {
-                etag:               part.etag,
-                part_num:           part.part_num,
-                checksum_crc32:     part.checksum_crc32,
-                checksum_crc32c:    part.checksum_crc32c,
-                checksum_sha1:      part.checksum_sha1,
-                checksum_sha256:    part.checksum_sha256,
+                etag: part.etag,
+                part_num: part.part_num,
+                checksum_crc32: part.checksum_crc32,
+                checksum_crc32c: part.checksum_crc32c,
+                checksum_sha1: part.checksum_sha1,
+                checksum_sha256: part.checksum_sha256,
                 checksum_crc64nvme: part.checksum_crc64nvme,
                 ..Default::default()
             });
@@ -343,41 +379,60 @@ impl TransitionClient {
 
         let mut opts = PutObjectOptions {
             //server_side_encryption: opts.server_side_encryption,
-            auto_checksum:          opts.auto_checksum,
+            auto_checksum: opts.auto_checksum,
             ..Default::default()
         };
         apply_auto_checksum(&mut opts, &mut all_parts);
 
-        let mut upload_info = self.complete_multipart_upload(bucket_name, object_name, &upload_id, compl_multipart_upload, &opts).await?;
+        let mut upload_info = self
+            .complete_multipart_upload(bucket_name, object_name, &upload_id, compl_multipart_upload, &opts)
+            .await?;
 
         upload_info.size = total_uploaded_size;
         Ok(upload_info)
     }
 
-    pub async fn put_object_gcs(&self, bucket_name: &str, object_name: &str, mut reader: ReaderImpl, size: i64, opts: &PutObjectOptions) -> Result<UploadInfo, std::io::Error> {
+    pub async fn put_object_gcs(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl,
+        size: i64,
+        opts: &PutObjectOptions,
+    ) -> Result<UploadInfo, std::io::Error> {
         let mut opts = opts.clone();
         if opts.checksum.is_set() {
             opts.send_content_md5 = false;
         }
 
         let mut md5_base64: String = "".to_string();
-        let progress_reader = reader;//newHook(reader, opts.progress);
+        let progress_reader = reader; //newHook(reader, opts.progress);
 
-        self.put_object_do(bucket_name, object_name, progress_reader, &md5_base64, "", size, &opts).await
+        self.put_object_do(bucket_name, object_name, progress_reader, &md5_base64, "", size, &opts)
+            .await
     }
 
-    pub async fn put_object_do(&self, bucket_name: &str, object_name: &str, reader: ReaderImpl, md5_base64: &str, sha256_hex: &str, size: i64, opts: &PutObjectOptions) -> Result<UploadInfo, std::io::Error> {
+    pub async fn put_object_do(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        reader: ReaderImpl,
+        md5_base64: &str,
+        sha256_hex: &str,
+        size: i64,
+        opts: &PutObjectOptions,
+    ) -> Result<UploadInfo, std::io::Error> {
         let custom_header = opts.header();
 
         let mut req_metadata = RequestMetadata {
-            bucket_name:      bucket_name.to_string(),
-            object_name:      object_name.to_string(),
+            bucket_name: bucket_name.to_string(),
+            object_name: object_name.to_string(),
             custom_header,
-            content_body:      reader,
-            content_length:    size,
+            content_body: reader,
+            content_length: size,
             content_md5_base64: md5_base64.to_string(),
             content_sha256_hex: sha256_hex.to_string(),
-            stream_sha256:     !opts.disable_content_sha256,
+            stream_sha256: !opts.disable_content_sha256,
             add_crc: Default::default(),
             bucket_location: Default::default(),
             pre_sign_url: Default::default(),
@@ -386,7 +441,7 @@ impl TransitionClient {
             expires: Default::default(),
             trailer: Default::default(),
         };
-        let mut add_crc = false;//self.trailing_header_support && md5_base64 == "" && !s3utils.IsGoogleEndpoint(self.endpoint_url) && (opts.disable_content_sha256 || self.secure);
+        let mut add_crc = false; //self.trailing_header_support && md5_base64 == "" && !s3utils.IsGoogleEndpoint(self.endpoint_url) && (opts.disable_content_sha256 || self.secure);
         let mut opts = opts.clone();
         if opts.checksum.is_set() {
             req_metadata.add_crc = opts.checksum;
@@ -422,25 +477,49 @@ impl TransitionClient {
         let (exp_time, rule_id) = if let Some(h_x_amz_expiration) = resp.headers().get(X_AMZ_EXPIRATION) {
             (
                 OffsetDateTime::parse(h_x_amz_expiration.to_str().unwrap(), ISO8601_DATEFORMAT).unwrap(),
-                "".to_string()
+                "".to_string(),
             )
         } else {
             (OffsetDateTime::now_utc(), "".to_string())
         };
         let h = resp.headers();
         Ok(UploadInfo {
-            bucket:           bucket_name.to_string(),
-            key:              object_name.to_string(),
-            etag:             trim_etag(h.get("ETag").expect("err").to_str().expect("err")),
-            version_id:       if let Some(h_x_amz_version_id) = h.get(X_AMZ_VERSION_ID) { h_x_amz_version_id.to_str().expect("err").to_string() } else { "".to_string() },
-            size:             size,
-            expiration:       exp_time,
+            bucket: bucket_name.to_string(),
+            key: object_name.to_string(),
+            etag: trim_etag(h.get("ETag").expect("err").to_str().expect("err")),
+            version_id: if let Some(h_x_amz_version_id) = h.get(X_AMZ_VERSION_ID) {
+                h_x_amz_version_id.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            size: size,
+            expiration: exp_time,
             expiration_rule_id: rule_id,
-            checksum_crc32:     if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) { h_checksum_crc32.to_str().expect("err").to_string() } else { "".to_string() },
-            checksum_crc32c:    if let Some(h_checksum_crc32c) = h.get(ChecksumMode::ChecksumCRC32C.key()) { h_checksum_crc32c.to_str().expect("err").to_string() } else { "".to_string() },
-            checksum_sha1:      if let Some(h_checksum_sha1) = h.get(ChecksumMode::ChecksumSHA1.key()) { h_checksum_sha1.to_str().expect("err").to_string() } else { "".to_string() },
-            checksum_sha256:    if let Some(h_checksum_sha256) = h.get(ChecksumMode::ChecksumSHA256.key()) { h_checksum_sha256.to_str().expect("err").to_string() } else { "".to_string() },
-            checksum_crc64nvme: if let Some(h_checksum_crc64nvme) = h.get(ChecksumMode::ChecksumCRC64NVME.key()) { h_checksum_crc64nvme.to_str().expect("err").to_string() } else { "".to_string() },
+            checksum_crc32: if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) {
+                h_checksum_crc32.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            checksum_crc32c: if let Some(h_checksum_crc32c) = h.get(ChecksumMode::ChecksumCRC32C.key()) {
+                h_checksum_crc32c.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            checksum_sha1: if let Some(h_checksum_sha1) = h.get(ChecksumMode::ChecksumSHA1.key()) {
+                h_checksum_sha1.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            checksum_sha256: if let Some(h_checksum_sha256) = h.get(ChecksumMode::ChecksumSHA256.key()) {
+                h_checksum_sha256.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            checksum_crc64nvme: if let Some(h_checksum_crc64nvme) = h.get(ChecksumMode::ChecksumCRC64NVME.key()) {
+                h_checksum_crc64nvme.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
             ..Default::default()
         })
     }

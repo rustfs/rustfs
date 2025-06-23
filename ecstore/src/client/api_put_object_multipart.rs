@@ -1,50 +1,61 @@
 #![allow(clippy::map_entry)]
+use bytes::Bytes;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use s3s::S3ErrorCode;
 use std::io::Read;
 use std::{collections::HashMap, sync::Arc};
-use bytes::Bytes;
-use s3s::S3ErrorCode;
-use time::{format_description, OffsetDateTime};
-use uuid::Uuid;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use url::form_urlencoded::Serializer;
+use time::{OffsetDateTime, format_description};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
+use url::form_urlencoded::Serializer;
+use uuid::Uuid;
 
-use s3s::{dto::StreamingBlob, Body};
-use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 use reader::hasher::Hasher;
+use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
+use s3s::{Body, dto::StreamingBlob};
 //use crate::disk::{Reader, BufferReader};
 use crate::client::{
-    transition_api::{RequestMetadata, TransitionClient, UploadInfo, ReaderImpl,},
-    api_error_response::{err_entity_too_large, err_entity_too_small, err_invalid_argument, http_resp_to_error_response, to_error_response},
+    api_error_response::{
+        err_entity_too_large, err_entity_too_small, err_invalid_argument, http_resp_to_error_response, to_error_response,
+    },
     api_put_object::PutObjectOptions,
     api_put_object_common::optimal_part_info,
-    api_s3_datatypes::{CompleteMultipartUpload, CompleteMultipartUploadResult, CompletePart, InitiateMultipartUploadResult, ObjectPart},
-    constants::{ABS_MIN_PART_SIZE, MAX_PART_SIZE, MAX_SINGLE_PUT_OBJECT_SIZE, ISO8601_DATEFORMAT, },
-};
-use rustfs_utils::{
-    path::trim_etag,
-    crypto::base64_encode,
+    api_s3_datatypes::{
+        CompleteMultipartUpload, CompleteMultipartUploadResult, CompletePart, InitiateMultipartUploadResult, ObjectPart,
+    },
+    constants::{ABS_MIN_PART_SIZE, ISO8601_DATEFORMAT, MAX_PART_SIZE, MAX_SINGLE_PUT_OBJECT_SIZE},
+    transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
 use crate::{
-    disk::DiskAPI,
-    store_api::{
-        GetObjectReader, StorageAPI,
-    },
     checksum::ChecksumMode,
+    disk::DiskAPI,
+    store_api::{GetObjectReader, StorageAPI},
 };
+use rustfs_utils::{crypto::base64_encode, path::trim_etag};
 
 impl TransitionClient {
-    pub async fn put_object_multipart(&self, bucket_name: &str, object_name: &str, mut reader: ReaderImpl, size: i64,
-        opts: &PutObjectOptions
+    pub async fn put_object_multipart(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl,
+        size: i64,
+        opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
-        let info = self.put_object_multipart_no_stream(bucket_name, object_name, &mut reader, opts).await;
+        let info = self
+            .put_object_multipart_no_stream(bucket_name, object_name, &mut reader, opts)
+            .await;
         if let Err(err) = &info {
             let err_resp = to_error_response(err);
             if err_resp.code == S3ErrorCode::AccessDenied && err_resp.message.contains("Access Denied") {
                 if size > MAX_SINGLE_PUT_OBJECT_SIZE {
-                    return Err(std::io::Error::other(err_entity_too_large(size, MAX_SINGLE_PUT_OBJECT_SIZE, bucket_name, object_name)));
+                    return Err(std::io::Error::other(err_entity_too_large(
+                        size,
+                        MAX_SINGLE_PUT_OBJECT_SIZE,
+                        bucket_name,
+                        object_name,
+                    )));
                 }
                 return self.put_object_gcs(bucket_name, object_name, reader, size, opts).await;
             }
@@ -52,7 +63,13 @@ impl TransitionClient {
         Ok(info?)
     }
 
-    pub async fn put_object_multipart_no_stream(&self, bucket_name: &str, object_name: &str, reader: &mut ReaderImpl, opts: &PutObjectOptions) -> Result<UploadInfo, std::io::Error> {
+    pub async fn put_object_multipart_no_stream(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        reader: &mut ReaderImpl,
+        opts: &PutObjectOptions,
+    ) -> Result<UploadInfo, std::io::Error> {
         let mut total_uploaded_size: i64 = 0;
         let mut compl_multipart_upload = CompleteMultipartUpload::default();
 
@@ -91,10 +108,10 @@ impl TransitionClient {
             let mut sha256_hex: String;
 
             //if hash_sums["md5"] != nil {
-                md5_base64 = base64_encode(&hash_sums["md5"]);
+            md5_base64 = base64_encode(&hash_sums["md5"]);
             //}
             //if hash_sums["sha256"] != nil {
-                sha256_hex = hex_simd::encode_to_string(hash_sums["sha256"].clone(), hex_simd::AsciiCase::Lower);
+            sha256_hex = hex_simd::encode_to_string(hash_sums["sha256"].clone(), hex_simd::AsciiCase::Lower);
             //}
             if hash_sums.len() == 0 {
                 let csum;
@@ -137,12 +154,12 @@ impl TransitionClient {
             let part = parts_info[&i].clone();
             all_parts.push(part.clone());
             compl_multipart_upload.parts.push(CompletePart {
-                etag:               part.etag,
-                part_num:           part.part_num,
-                checksum_crc32:     part.checksum_crc32,
-                checksum_crc32c:    part.checksum_crc32c,
-                checksum_sha1:      part.checksum_sha1,
-                checksum_sha256:    part.checksum_sha256,
+                etag: part.etag,
+                part_num: part.part_num,
+                checksum_crc32: part.checksum_crc32,
+                checksum_crc32c: part.checksum_crc32c,
+                checksum_sha1: part.checksum_sha1,
+                checksum_sha256: part.checksum_sha256,
                 checksum_crc64nvme: part.checksum_crc64nvme,
                 ..Default::default()
             });
@@ -151,18 +168,25 @@ impl TransitionClient {
         compl_multipart_upload.parts.sort();
         let mut opts = PutObjectOptions {
             //server_side_encryption: opts.server_side_encryption,
-            auto_checksum:          opts.auto_checksum,
+            auto_checksum: opts.auto_checksum,
             ..Default::default()
         };
         //apply_auto_checksum(&mut opts, all_parts);
 
-        let mut upload_info = self.complete_multipart_upload(bucket_name, object_name, &upload_id, compl_multipart_upload, &opts).await?;
+        let mut upload_info = self
+            .complete_multipart_upload(bucket_name, object_name, &upload_id, compl_multipart_upload, &opts)
+            .await?;
 
         upload_info.size = total_uploaded_size;
         Ok(upload_info)
     }
 
-    pub async fn initiate_multipart_upload(&self, bucket_name: &str, object_name: &str, opts: &PutObjectOptions) -> Result<InitiateMultipartUploadResult, std::io::Error> {
+    pub async fn initiate_multipart_upload(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        opts: &PutObjectOptions,
+    ) -> Result<InitiateMultipartUploadResult, std::io::Error> {
         let mut url_values = HashMap::new();
         url_values.insert("uploads".to_string(), "".to_string());
 
@@ -180,9 +204,9 @@ impl TransitionClient {
         let mut req_metadata = RequestMetadata {
             bucket_name: bucket_name.to_string(),
             object_name: object_name.to_string(),
-            query_values:  url_values,
+            query_values: url_values,
             custom_header,
-            content_body:  ReaderImpl::Body(Bytes::new()),
+            content_body: ReaderImpl::Body(Bytes::new()),
             content_length: 0,
             content_md5_base64: "".to_string(),
             content_sha256_hex: "".to_string(),
@@ -197,9 +221,9 @@ impl TransitionClient {
 
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
         //if resp.is_none() {
-            if resp.status() != StatusCode::OK {
-                return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
-            }
+        if resp.status() != StatusCode::OK {
+            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
+        }
         //}
         let initiate_multipart_upload_result = InitiateMultipartUploadResult::default();
         Ok(initiate_multipart_upload_result)
@@ -207,13 +231,20 @@ impl TransitionClient {
 
     pub async fn upload_part(&self, p: &mut UploadPartParams) -> Result<ObjectPart, std::io::Error> {
         if p.size > MAX_PART_SIZE {
-            return Err(std::io::Error::other(err_entity_too_large(p.size, MAX_PART_SIZE, &p.bucket_name, &p.object_name)));
+            return Err(std::io::Error::other(err_entity_too_large(
+                p.size,
+                MAX_PART_SIZE,
+                &p.bucket_name,
+                &p.object_name,
+            )));
         }
         if p.size <= -1 {
             return Err(std::io::Error::other(err_entity_too_small(p.size, &p.bucket_name, &p.object_name)));
         }
         if p.part_number <= 0 {
-            return Err(std::io::Error::other(err_invalid_argument("Part number cannot be negative or equal to zero.")));
+            return Err(std::io::Error::other(err_invalid_argument(
+                "Part number cannot be negative or equal to zero.",
+            )));
         }
         if p.upload_id == "" {
             return Err(std::io::Error::other(err_invalid_argument("UploadID cannot be empty.")));
@@ -224,55 +255,85 @@ impl TransitionClient {
         url_values.insert("uploadId".to_string(), p.upload_id.clone());
 
         let buf = match &mut p.reader {
-            ReaderImpl::Body(content_body) => {
-                content_body.to_vec()
-            }
-            ReaderImpl::ObjectBody(content_body) => {
-                content_body.read_all().await?
-            }
+            ReaderImpl::Body(content_body) => content_body.to_vec(),
+            ReaderImpl::ObjectBody(content_body) => content_body.read_all().await?,
         };
         let mut req_metadata = RequestMetadata {
-            bucket_name:       p.bucket_name.clone(),
-            object_name:       p.object_name.clone(),
-            query_values:      url_values,
-            custom_header:     p.custom_header.clone(),
-            content_body:      ReaderImpl::Body(Bytes::from(buf)),
-            content_length:    p.size,
+            bucket_name: p.bucket_name.clone(),
+            object_name: p.object_name.clone(),
+            query_values: url_values,
+            custom_header: p.custom_header.clone(),
+            content_body: ReaderImpl::Body(Bytes::from(buf)),
+            content_length: p.size,
             content_md5_base64: p.md5_base64.clone(),
             content_sha256_hex: p.sha256_hex.clone(),
-            stream_sha256:     p.stream_sha256,
-            trailer:           p.trailer.clone(),
-            pre_sign_url:      Default::default(),
+            stream_sha256: p.stream_sha256,
+            trailer: p.trailer.clone(),
+            pre_sign_url: Default::default(),
             add_crc: Default::default(),
             extra_pre_sign_header: Default::default(),
-            bucket_location:   Default::default(),
-            expires:           Default::default(),
+            bucket_location: Default::default(),
+            expires: Default::default(),
         };
 
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
         //defer closeResponse(resp)
         //if resp.is_none() {
-            if resp.status() != StatusCode::OK {
-                return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], &p.bucket_name.clone(), &p.object_name)));
-            }
+        if resp.status() != StatusCode::OK {
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp,
+                vec![],
+                &p.bucket_name.clone(),
+                &p.object_name,
+            )));
+        }
         //}
         let h = resp.headers();
         let mut obj_part = ObjectPart {
-            checksum_crc32:     if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) { h_checksum_crc32.to_str().expect("err").to_string() } else { "".to_string() },
-            checksum_crc32c:    if let Some(h_checksum_crc32c) = h.get(ChecksumMode::ChecksumCRC32C.key()) { h_checksum_crc32c.to_str().expect("err").to_string() } else { "".to_string() },
-            checksum_sha1:      if let Some(h_checksum_sha1) = h.get(ChecksumMode::ChecksumSHA1.key()) { h_checksum_sha1.to_str().expect("err").to_string() } else { "".to_string() },
-            checksum_sha256:    if let Some(h_checksum_sha256) = h.get(ChecksumMode::ChecksumSHA256.key()) { h_checksum_sha256.to_str().expect("err").to_string() } else { "".to_string() },
-            checksum_crc64nvme: if let Some(h_checksum_crc64nvme) = h.get(ChecksumMode::ChecksumCRC64NVME.key()) { h_checksum_crc64nvme.to_str().expect("err").to_string() } else { "".to_string() },
+            checksum_crc32: if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) {
+                h_checksum_crc32.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            checksum_crc32c: if let Some(h_checksum_crc32c) = h.get(ChecksumMode::ChecksumCRC32C.key()) {
+                h_checksum_crc32c.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            checksum_sha1: if let Some(h_checksum_sha1) = h.get(ChecksumMode::ChecksumSHA1.key()) {
+                h_checksum_sha1.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            checksum_sha256: if let Some(h_checksum_sha256) = h.get(ChecksumMode::ChecksumSHA256.key()) {
+                h_checksum_sha256.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            checksum_crc64nvme: if let Some(h_checksum_crc64nvme) = h.get(ChecksumMode::ChecksumCRC64NVME.key()) {
+                h_checksum_crc64nvme.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
             ..Default::default()
         };
         obj_part.size = p.size;
         obj_part.part_num = p.part_number;
-        obj_part.etag = if let Some(h_etag) = h.get("ETag") { h_etag.to_str().expect("err").trim_matches('"').to_string() } else { "".to_string() };
+        obj_part.etag = if let Some(h_etag) = h.get("ETag") {
+            h_etag.to_str().expect("err").trim_matches('"').to_string()
+        } else {
+            "".to_string()
+        };
         Ok(obj_part)
     }
 
-    pub async fn complete_multipart_upload(&self, bucket_name: &str, object_name: &str, upload_id: &str,
-        complete: CompleteMultipartUpload, opts: &PutObjectOptions
+    pub async fn complete_multipart_upload(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        upload_id: &str,
+        complete: CompleteMultipartUpload,
+        opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
         let mut url_values = HashMap::new();
         url_values.insert("uploadId".to_string(), upload_id.to_string());
@@ -284,19 +345,19 @@ impl TransitionClient {
         let mut req_metadata = RequestMetadata {
             bucket_name: bucket_name.to_string(),
             object_name: object_name.to_string(),
-            query_values:      url_values,
-            content_body:      ReaderImpl::Body(complete_multipart_upload_buffer),
-            content_length:    100,//complete_multipart_upload_bytes.len(),
-            content_sha256_hex: "".to_string(),//hex_simd::encode_to_string(complete_multipart_upload_bytes, hex_simd::AsciiCase::Lower),
-            custom_header:     headers,
-            stream_sha256:     Default::default(),
-            trailer:           Default::default(),
+            query_values: url_values,
+            content_body: ReaderImpl::Body(complete_multipart_upload_buffer),
+            content_length: 100,                //complete_multipart_upload_bytes.len(),
+            content_sha256_hex: "".to_string(), //hex_simd::encode_to_string(complete_multipart_upload_bytes, hex_simd::AsciiCase::Lower),
+            custom_header: headers,
+            stream_sha256: Default::default(),
+            trailer: Default::default(),
             content_md5_base64: "".to_string(),
-            pre_sign_url:      Default::default(),
+            pre_sign_url: Default::default(),
             add_crc: Default::default(),
             extra_pre_sign_header: Default::default(),
-            bucket_location:   Default::default(),
-            expires:           Default::default(),
+            bucket_location: Default::default(),
+            expires: Default::default(),
         };
 
         let resp = self.execute_method(http::Method::POST, &mut req_metadata).await?;
@@ -307,7 +368,7 @@ impl TransitionClient {
         let (exp_time, rule_id) = if let Some(h_x_amz_expiration) = resp.headers().get(X_AMZ_EXPIRATION) {
             (
                 OffsetDateTime::parse(h_x_amz_expiration.to_str().unwrap(), ISO8601_DATEFORMAT).unwrap(),
-                "".to_string()
+                "".to_string(),
             )
         } else {
             (OffsetDateTime::now_utc(), "".to_string())
@@ -315,17 +376,21 @@ impl TransitionClient {
 
         let h = resp.headers();
         Ok(UploadInfo {
-            bucket:           complete_multipart_upload_result.bucket,
-            key:              complete_multipart_upload_result.key,
-            etag:             trim_etag(&complete_multipart_upload_result.etag),
-            version_id:       if let Some(h_x_amz_version_id) = h.get(X_AMZ_VERSION_ID) { h_x_amz_version_id.to_str().expect("err").to_string() } else { "".to_string() },
-            location:         complete_multipart_upload_result.location,
-            expiration:       exp_time,
+            bucket: complete_multipart_upload_result.bucket,
+            key: complete_multipart_upload_result.key,
+            etag: trim_etag(&complete_multipart_upload_result.etag),
+            version_id: if let Some(h_x_amz_version_id) = h.get(X_AMZ_VERSION_ID) {
+                h_x_amz_version_id.to_str().expect("err").to_string()
+            } else {
+                "".to_string()
+            },
+            location: complete_multipart_upload_result.location,
+            expiration: exp_time,
             expiration_rule_id: rule_id,
-            checksum_sha256:    complete_multipart_upload_result.checksum_sha256,
-            checksum_sha1:      complete_multipart_upload_result.checksum_sha1,
-            checksum_crc32:     complete_multipart_upload_result.checksum_crc32,
-            checksum_crc32c:    complete_multipart_upload_result.checksum_crc32c,
+            checksum_sha256: complete_multipart_upload_result.checksum_sha256,
+            checksum_sha1: complete_multipart_upload_result.checksum_sha1,
+            checksum_crc32: complete_multipart_upload_result.checksum_crc32,
+            checksum_crc32c: complete_multipart_upload_result.checksum_crc32c,
             checksum_crc64nvme: complete_multipart_upload_result.checksum_crc64nvme,
             ..Default::default()
         })

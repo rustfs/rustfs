@@ -18,8 +18,8 @@ pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 pub const NULL_VERSION_ID: &str = "null";
 // pub const RUSTFS_ERASURE_UPGRADED: &str = "x-rustfs-internal-erasure-upgraded";
 
-pub const TIER_FV_ID: &str      = "tier-free-versionID";
-pub const TIER_FV_MARKER: &str  = "tier-free-marker";
+pub const TIER_FV_ID: &str = "tier-free-versionID";
+pub const TIER_FV_MARKER: &str = "tier-free-marker";
 pub const TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -309,7 +309,8 @@ impl FileInfo {
     }
 
     pub fn set_tier_free_version_id(&mut self, version_id: &str) {
-        self.metadata.insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_ID), version_id.to_string());
+        self.metadata
+            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_ID), version_id.to_string());
     }
 
     pub fn tier_free_version_id(&self) -> String {
@@ -317,19 +318,23 @@ impl FileInfo {
     }
 
     pub fn set_tier_free_version(&mut self) {
-        self.metadata.insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_MARKER), "".to_string());
+        self.metadata
+            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_MARKER), "".to_string());
     }
 
     pub fn set_skip_tier_free_version(&mut self) {
-        self.metadata.insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_SKIP_FV_ID), "".to_string());
+        self.metadata
+            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_SKIP_FV_ID), "".to_string());
     }
 
     pub fn skip_tier_free_version(&self) -> bool {
-        self.metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_SKIP_FV_ID))
+        self.metadata
+            .contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_SKIP_FV_ID))
     }
 
     pub fn tier_free_version(&self) -> bool {
-        self.metadata.contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_MARKER))
+        self.metadata
+            .contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_MARKER))
     }
 
     pub fn set_inline_data(&mut self) {

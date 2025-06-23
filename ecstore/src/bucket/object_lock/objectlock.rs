@@ -3,13 +3,8 @@ use std::collections::HashMap;
 use time::{OffsetDateTime, format_description};
 use tracing::{error, warn};
 
-use s3s::dto::{
-    ObjectLockRetentionMode, ObjectLockRetention, ObjectLockLegalHoldStatus, ObjectLockLegalHold,
-    Date,
-};
-use s3s::header::{
-    X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_OBJECT_LOCK_LEGAL_HOLD,
-};
+use s3s::dto::{Date, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode};
+use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 
 //const AMZ_OBJECTLOCK_BYPASS_RET_GOVERNANCE: &str = "X-Amz-Bypass-Governance-Retention";
 //const AMZ_OBJECTLOCK_RETAIN_UNTIL_DATE: &str     = "X-Amz-Object-Lock-Retain-Until-Date";
@@ -17,12 +12,14 @@ use s3s::header::{
 //const AMZ_OBJECTLOCK_LEGALHOLD: &str             = "X-Amz-Object-Lock-Legal-Hold";
 
 const ERR_MALFORMED_BUCKET_OBJECT_CONFIG: &str = "invalid bucket object lock config";
-const ERR_INVALID_RETENTION_DATE: &str         = "date must be provided in ISO 8601 format";
-const ERR_PAST_OBJECTLOCK_RETAIN_DATE: &str    = "the retain until date must be in the future";
-const ERR_UNKNOWN_WORMMODE_DIRECTIVE: &str     = "unknown WORM mode directive";
-const ERR_OBJECTLOCK_MISSING_CONTENT_MD5: &str = "content-MD5 HTTP header is required for Put Object requests with Object Lock parameters";
-const ERR_OBJECTLOCK_INVALID_HEADERS: &str     = "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
-const ERR_MALFORMED_XML: &str                  = "the XML you provided was not well-formed or did not validate against our published schema";
+const ERR_INVALID_RETENTION_DATE: &str = "date must be provided in ISO 8601 format";
+const ERR_PAST_OBJECTLOCK_RETAIN_DATE: &str = "the retain until date must be in the future";
+const ERR_UNKNOWN_WORMMODE_DIRECTIVE: &str = "unknown WORM mode directive";
+const ERR_OBJECTLOCK_MISSING_CONTENT_MD5: &str =
+    "content-MD5 HTTP header is required for Put Object requests with Object Lock parameters";
+const ERR_OBJECTLOCK_INVALID_HEADERS: &str =
+    "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
+const ERR_MALFORMED_XML: &str = "the XML you provided was not well-formed or did not validate against our published schema";
 
 pub fn utc_now_ntp() -> OffsetDateTime {
     return OffsetDateTime::now_utc();
@@ -39,7 +36,10 @@ pub fn get_object_retention_meta(meta: HashMap<String, String>) -> ObjectLockRet
     if let Some(mode_str) = mode_str {
         mode = parse_ret_mode(mode_str.as_str());
     } else {
-        return ObjectLockRetention {mode: None, retain_until_date: None};
+        return ObjectLockRetention {
+            mode: None,
+            retain_until_date: None,
+        };
     }
 
     let mut till_str = meta.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_lowercase().as_str());
@@ -49,10 +49,13 @@ pub fn get_object_retention_meta(meta: HashMap<String, String>) -> ObjectLockRet
     if let Some(till_str) = till_str {
         let t = OffsetDateTime::parse(till_str, &format_description::well_known::Iso8601::DEFAULT);
         if t.is_err() {
-            retain_until_date = Date::from(t.expect("err"));  //TODO: utc
+            retain_until_date = Date::from(t.expect("err")); //TODO: utc
         }
     }
-    ObjectLockRetention {mode: Some(mode), retain_until_date: Some(retain_until_date)}
+    ObjectLockRetention {
+        mode: Some(mode),
+        retain_until_date: Some(retain_until_date),
+    }
 }
 
 pub fn get_object_legalhold_meta(meta: HashMap<String, String>) -> ObjectLockLegalHold {
@@ -61,9 +64,11 @@ pub fn get_object_legalhold_meta(meta: HashMap<String, String>) -> ObjectLockLeg
         hold_str = Some(&meta[X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()]);
     }
     if let Some(hold_str) = hold_str {
-        return ObjectLockLegalHold {status: Some(parse_legalhold_status(hold_str))};
+        return ObjectLockLegalHold {
+            status: Some(parse_legalhold_status(hold_str)),
+        };
     }
-    ObjectLockLegalHold {status: None}
+    ObjectLockLegalHold { status: None }
 }
 
 pub fn parse_ret_mode(mode_str: &str) -> ObjectLockRetentionMode {
@@ -75,7 +80,7 @@ pub fn parse_ret_mode(mode_str: &str) -> ObjectLockRetentionMode {
         "COMPLIANCE" => {
             mode = ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE);
         }
-        _ => unreachable!()
+        _ => unreachable!(),
     }
     mode
 }
@@ -89,7 +94,7 @@ pub fn parse_legalhold_status(hold_str: &str) -> ObjectLockLegalHoldStatus {
         "OFF" => {
             st = ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF);
         }
-        _ => unreachable!()
+        _ => unreachable!(),
     }
     st
 }

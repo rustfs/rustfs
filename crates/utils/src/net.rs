@@ -122,7 +122,9 @@ pub fn get_endpoint_url(endpoint: &str, secure: bool) -> Result<Url, std::io::Er
     }
 
     let endpoint_url_str = format!("{scheme}://{endpoint}");
-    let Ok(endpoint_url) = Url::parse(&endpoint_url_str) else { return Err(std::io::Error::other("url parse error.")); };
+    let Ok(endpoint_url) = Url::parse(&endpoint_url_str) else {
+        return Err(std::io::Error::other("url parse error."));
+    };
 
     //is_valid_endpoint_url(endpoint_url)?;
     Ok(endpoint_url)
@@ -137,42 +139,40 @@ pub fn new_remotetarget_http_transport(insecure: bool) -> Builder<TokioExecutor>
 lazy_static! {
     static ref SUPPORTED_QUERY_VALUES: HashMap<String, bool> = {
         let mut m = HashMap::new();
-        m.insert("attributes".to_string(),                   true);
-        m.insert("partNumber".to_string(),                   true);
-        m.insert("versionId".to_string(),                    true);
-        m.insert("response-cache-control".to_string(),       true);
+        m.insert("attributes".to_string(), true);
+        m.insert("partNumber".to_string(), true);
+        m.insert("versionId".to_string(), true);
+        m.insert("response-cache-control".to_string(), true);
         m.insert("response-content-disposition".to_string(), true);
-        m.insert("response-content-encoding".to_string(),    true);
-        m.insert("response-content-language".to_string(),    true);
-        m.insert("response-content-type".to_string(),        true);
-        m.insert("response-expires".to_string(),             true);
+        m.insert("response-content-encoding".to_string(), true);
+        m.insert("response-content-language".to_string(), true);
+        m.insert("response-content-type".to_string(), true);
+        m.insert("response-expires".to_string(), true);
         m
     };
-
     static ref SUPPORTED_HEADERS: HashMap<String, bool> = {
         let mut m = HashMap::new();
-        m.insert("content-type".to_string(),                        true);
-        m.insert("cache-control".to_string(),                       true);
-        m.insert("content-encoding".to_string(),                    true);
-        m.insert("content-disposition".to_string(),                 true);
-        m.insert("content-language".to_string(),                    true);
-        m.insert("x-amz-website-redirect-location".to_string(),     true);
-        m.insert("x-amz-object-lock-mode".to_string(),              true);
-        m.insert("x-amz-metadata-directive".to_string(),            true);
+        m.insert("content-type".to_string(), true);
+        m.insert("cache-control".to_string(), true);
+        m.insert("content-encoding".to_string(), true);
+        m.insert("content-disposition".to_string(), true);
+        m.insert("content-language".to_string(), true);
+        m.insert("x-amz-website-redirect-location".to_string(), true);
+        m.insert("x-amz-object-lock-mode".to_string(), true);
+        m.insert("x-amz-metadata-directive".to_string(), true);
         m.insert("x-amz-object-lock-retain-until-date".to_string(), true);
-        m.insert("expires".to_string(),                             true);
-        m.insert("x-amz-replication-status".to_string(),            true);
+        m.insert("expires".to_string(), true);
+        m.insert("x-amz-replication-status".to_string(), true);
         m
     };
-
     static ref SSE_HEADERS: HashMap<String, bool> = {
         let mut m = HashMap::new();
-        m.insert("x-amz-server-side-encryption".to_string(),                    true);
-        m.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(),     true);
-        m.insert("x-amz-server-side-encryption-context".to_string(),            true);
+        m.insert("x-amz-server-side-encryption".to_string(), true);
+        m.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), true);
+        m.insert("x-amz-server-side-encryption-context".to_string(), true);
         m.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), true);
-        m.insert("x-amz-server-side-encryption-customer-key".to_string(),       true);
-        m.insert("x-amz-server-side-encryption-customer-key-md5".to_string(),   true);
+        m.insert("x-amz-server-side-encryption-customer-key".to_string(), true);
+        m.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), true);
         m
     };
 }
@@ -201,7 +201,11 @@ pub fn is_sse_header(header_key: &str) -> bool {
 
 pub fn is_amz_header(header_key: &str) -> bool {
     let key = header_key.to_lowercase();
-    key.starts_with("x-amz-meta-") || key.starts_with("x-amz-grant-") || key == "x-amz-acl" || is_sse_header(header_key) || key.starts_with("x-amz-checksum-")
+    key.starts_with("x-amz-meta-")
+        || key.starts_with("x-amz-grant-")
+        || key == "x-amz-acl"
+        || is_sse_header(header_key)
+        || key.starts_with("x-amz-checksum-")
 }
 
 pub fn is_rustfs_header(header_key: &str) -> bool {

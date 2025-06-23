@@ -1,33 +1,30 @@
 #![allow(clippy::map_entry)]
-use std::{collections::HashMap, sync::Arc};
 use bytes::Bytes;
-use time::{OffsetDateTime, macros::format_description, Duration};
 use http::{HeaderMap, HeaderName, HeaderValue};
+use std::{collections::HashMap, sync::Arc};
+use time::{Duration, OffsetDateTime, macros::format_description};
 use tracing::{error, info, warn};
 
-use s3s::dto::{
-    ObjectLockRetentionMode, ObjectLockLegalHoldStatus,
-    ReplicationStatus,
-};
-use s3s::header::{
-    X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_OBJECT_LOCK_LEGAL_HOLD,
-    X_AMZ_STORAGE_CLASS, X_AMZ_WEBSITE_REDIRECT_LOCATION, X_AMZ_REPLICATION_STATUS,
-};
 use reader::hasher::Hasher;
-//use crate::disk::{BufferReader, Reader};
-use rustfs_utils::{
-    crypto::base64_encode,
-    net::{is_amz_header, is_standard_header, is_storageclass_header, is_rustfs_header, is_minio_header},
+use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus};
+use s3s::header::{
+    X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
+    X_AMZ_STORAGE_CLASS, X_AMZ_WEBSITE_REDIRECT_LOCATION,
 };
+//use crate::disk::{BufferReader, Reader};
 use crate::checksum::ChecksumMode;
 use crate::client::{
-    api_s3_datatypes::{CompletePart, ObjectPart, CompleteMultipartUpload},
+    api_error_response::{err_entity_too_large, err_invalid_argument},
     api_put_object_common::optimal_part_info,
-    transition_api::{TransitionClient, UploadInfo, ReaderImpl},
-    api_error_response::{err_invalid_argument, err_entity_too_large},
     api_put_object_multipart::UploadPartParams,
+    api_s3_datatypes::{CompleteMultipartUpload, CompletePart, ObjectPart},
+    constants::{ISO8601_DATEFORMAT, MAX_MULTIPART_PUT_OBJECT_SIZE, MIN_PART_SIZE, TOTAL_WORKERS},
     credentials::SignatureType,
-    constants::{MAX_MULTIPART_PUT_OBJECT_SIZE, TOTAL_WORKERS, MIN_PART_SIZE, ISO8601_DATEFORMAT,},
+    transition_api::{ReaderImpl, TransitionClient, UploadInfo},
+};
+use rustfs_utils::{
+    crypto::base64_encode,
+    net::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header},
 };
 
 #[derive(Debug, Clone)]
@@ -123,17 +120,21 @@ impl Default for PutObjectOptions {
 impl PutObjectOptions {
     fn set_matche_tag(&mut self, etag: &str) {
         if etag == "*" {
-            self.custom_header.insert("If-Match", HeaderValue::from_str("*").expect("err"));
+            self.custom_header
+                .insert("If-Match", HeaderValue::from_str("*").expect("err"));
         } else {
-            self.custom_header.insert("If-Match", HeaderValue::from_str(&format!("\"{}\"", etag)).expect("err"));
+            self.custom_header
+                .insert("If-Match", HeaderValue::from_str(&format!("\"{}\"", etag)).expect("err"));
         }
     }
 
     fn set_matche_tag_except(&mut self, etag: &str) {
         if etag == "*" {
-            self.custom_header.insert("If-None-Match", HeaderValue::from_str("*").expect("err"));
+            self.custom_header
+                .insert("If-None-Match", HeaderValue::from_str("*").expect("err"));
         } else {
-            self.custom_header.insert("If-None-Match", HeaderValue::from_str(&format!("\"{etag}\"")).expect("err"));
+            self.custom_header
+                .insert("If-None-Match", HeaderValue::from_str(&format!("\"{etag}\"")).expect("err"));
         }
     }
 
@@ -160,7 +161,10 @@ impl PutObjectOptions {
         }
 
         if self.expires.unix_timestamp() != 0 {
-            header.insert("Expires", HeaderValue::from_str(&self.expires.format(ISO8601_DATEFORMAT).unwrap()).expect("err"));  //rustfs invalid heade
+            header.insert(
+                "Expires",
+                HeaderValue::from_str(&self.expires.format(ISO8601_DATEFORMAT).unwrap()).expect("err"),
+            ); //rustfs invalid heade
         }
 
         if self.mode.as_str() != "" {
@@ -168,7 +172,10 @@ impl PutObjectOptions {
         }
 
         if self.retain_until_date.unix_timestamp() != 0 {
-            header.insert(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, HeaderValue::from_str(&self.retain_until_date.format(ISO8601_DATEFORMAT).unwrap()).expect("err"));
+            header.insert(
+                X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+                HeaderValue::from_str(&self.retain_until_date.format(ISO8601_DATEFORMAT).unwrap()).expect("err"),
+            );
         }
 
         if self.legalhold.as_str() != "" {
@@ -180,15 +187,22 @@ impl PutObjectOptions {
         }
 
         if self.website_redirect_location != "" {
-            header.insert(X_AMZ_WEBSITE_REDIRECT_LOCATION, HeaderValue::from_str(&self.website_redirect_location).expect("err"));
+            header.insert(
+                X_AMZ_WEBSITE_REDIRECT_LOCATION,
+                HeaderValue::from_str(&self.website_redirect_location).expect("err"),
+            );
         }
 
         if !self.internal.replication_status.as_str().is_empty() {
-            header.insert(X_AMZ_REPLICATION_STATUS, HeaderValue::from_str(self.internal.replication_status.as_str()).expect("err"));
+            header.insert(
+                X_AMZ_REPLICATION_STATUS,
+                HeaderValue::from_str(self.internal.replication_status.as_str()).expect("err"),
+            );
         }
 
         for (k, v) in &self.user_metadata {
-            if is_amz_header(k) || is_standard_header(k) || is_storageclass_header(k) || is_rustfs_header(k) || is_minio_header(k) {
+            if is_amz_header(k) || is_standard_header(k) || is_storageclass_header(k) || is_rustfs_header(k) || is_minio_header(k)
+            {
                 if let Ok(header_name) = HeaderName::from_bytes(k.as_bytes()) {
                     header.insert(header_name, HeaderValue::from_str(&v).unwrap());
                 }
@@ -208,12 +222,12 @@ impl PutObjectOptions {
 
     fn validate(&self, c: TransitionClient) -> Result<(), std::io::Error> {
         //if self.checksum.is_set() {
-            /*if !self.trailing_header_support {
-                return Err(Error::from(err_invalid_argument("Checksum requires Client with TrailingHeaders enabled")));
-            }*/
-            /*else if self.override_signer_type == SignatureType::SignatureV2 {
-                return Err(Error::from(err_invalid_argument("Checksum cannot be used with v2 signatures")));
-            }*/
+        /*if !self.trailing_header_support {
+            return Err(Error::from(err_invalid_argument("Checksum requires Client with TrailingHeaders enabled")));
+        }*/
+        /*else if self.override_signer_type == SignatureType::SignatureV2 {
+            return Err(Error::from(err_invalid_argument("Checksum cannot be used with v2 signatures")));
+        }*/
         //}
 
         Ok(())
@@ -221,19 +235,37 @@ impl PutObjectOptions {
 }
 
 impl TransitionClient {
-    pub async fn put_object(self: Arc<Self>, bucket_name: &str, object_name: &str, mut reader: ReaderImpl, object_size: i64,
-        opts: &PutObjectOptions
+    pub async fn put_object(
+        self: Arc<Self>,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl,
+        object_size: i64,
+        opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
         if object_size < 0 && opts.disable_multipart {
             return Err(std::io::Error::other("object size must be provided with disable multipart upload"));
         }
 
-        self.put_object_common(bucket_name, object_name, reader, object_size, opts).await
+        self.put_object_common(bucket_name, object_name, reader, object_size, opts)
+            .await
     }
 
-    pub async fn put_object_common(self: Arc<Self>, bucket_name: &str, object_name: &str, mut reader: ReaderImpl, size: i64, opts: &PutObjectOptions) -> Result<UploadInfo, std::io::Error> {
+    pub async fn put_object_common(
+        self: Arc<Self>,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl,
+        size: i64,
+        opts: &PutObjectOptions,
+    ) -> Result<UploadInfo, std::io::Error> {
         if size > MAX_MULTIPART_PUT_OBJECT_SIZE {
-            return Err(std::io::Error::other(err_entity_too_large(size, MAX_MULTIPART_PUT_OBJECT_SIZE, bucket_name, object_name)));
+            return Err(std::io::Error::other(err_entity_too_large(
+                size,
+                MAX_MULTIPART_PUT_OBJECT_SIZE,
+                bucket_name,
+                object_name,
+            )));
         }
         let mut opts = opts.clone();
         opts.auto_checksum.set_default(ChecksumMode::ChecksumCRC32C);
@@ -255,19 +287,30 @@ impl TransitionClient {
                 return Err(std::io::Error::other("no length provided and multipart disabled"));
             }
             if opts.concurrent_stream_parts && opts.num_threads > 1 {
-                return self.put_object_multipart_stream_parallel(bucket_name, object_name, reader, &opts).await;
+                return self
+                    .put_object_multipart_stream_parallel(bucket_name, object_name, reader, &opts)
+                    .await;
             }
-            return self.put_object_multipart_stream_no_length(bucket_name, object_name, reader, &opts).await;
+            return self
+                .put_object_multipart_stream_no_length(bucket_name, object_name, reader, &opts)
+                .await;
         }
 
         if size <= part_size || opts.disable_multipart {
             return self.put_object_gcs(bucket_name, object_name, reader, size, &opts).await;
         }
 
-        self.put_object_multipart_stream(bucket_name, object_name, reader, size, &opts).await
+        self.put_object_multipart_stream(bucket_name, object_name, reader, size, &opts)
+            .await
     }
 
-    pub async fn put_object_multipart_stream_no_length(&self, bucket_name: &str, object_name: &str, mut reader: ReaderImpl, opts: &PutObjectOptions) -> Result<UploadInfo, std::io::Error> {
+    pub async fn put_object_multipart_stream_no_length(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        mut reader: ReaderImpl,
+        opts: &PutObjectOptions,
+    ) -> Result<UploadInfo, std::io::Error> {
         let mut total_uploaded_size: i64 = 0;
 
         let mut compl_multipart_upload = CompleteMultipartUpload::default();
@@ -295,12 +338,8 @@ impl TransitionClient {
 
         while part_number <= total_parts_count {
             buf = match &mut reader {
-                ReaderImpl::Body(content_body) => {
-                    content_body.to_vec()
-                }
-                ReaderImpl::ObjectBody(content_body) => {
-                    content_body.read_all().await?
-                }
+                ReaderImpl::Body(content_body) => content_body.to_vec(),
+                ReaderImpl::ObjectBody(content_body) => content_body.read_all().await?,
             };
             let length = buf.len();
 
@@ -354,13 +393,13 @@ impl TransitionClient {
             let part = parts_info[&i].clone();
             all_parts.push(part.clone());
             compl_multipart_upload.parts.push(CompletePart {
-                etag:                part.etag,
-                part_num:            part.part_num,
-                checksum_crc32:      part.checksum_crc32,
-                checksum_crc32c:     part.checksum_crc32c,
-                checksum_sha1:       part.checksum_sha1,
-                checksum_sha256:     part.checksum_sha256,
-                checksum_crc64nvme:  part.checksum_crc64nvme,
+                etag: part.etag,
+                part_num: part.part_num,
+                checksum_crc32: part.checksum_crc32,
+                checksum_crc32c: part.checksum_crc32c,
+                checksum_sha1: part.checksum_sha1,
+                checksum_sha256: part.checksum_sha256,
+                checksum_crc64nvme: part.checksum_crc64nvme,
                 ..Default::default()
             });
         }
@@ -374,7 +413,9 @@ impl TransitionClient {
         };
         //apply_auto_checksum(&mut opts, all_parts);
 
-        let mut upload_info = self.complete_multipart_upload(bucket_name, object_name, &upload_id, compl_multipart_upload, &opts).await?;
+        let mut upload_info = self
+            .complete_multipart_upload(bucket_name, object_name, &upload_id, compl_multipart_upload, &opts)
+            .await?;
 
         upload_info.size = total_uploaded_size;
         Ok(upload_info)

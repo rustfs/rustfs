@@ -1,46 +1,49 @@
-use std::{
-    collections::{hash_map::Entry, HashMap}, io::Cursor, sync::Arc, time::{Duration,}
-};
 use bytes::Bytes;
-use serde::{Serialize, Deserialize};
-use time::OffsetDateTime;
-use tokio::{select, sync::RwLock, time::interval};
-use rand::Rng;
-use tracing::{info, debug, warn, error};
 use http::status::StatusCode;
 use lazy_static::lazy_static;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    io::Cursor,
+    sync::Arc,
+    time::Duration,
+};
+use time::OffsetDateTime;
 use tokio::io::BufReader;
+use tokio::{select, sync::RwLock, time::interval};
+use tracing::{debug, error, info, warn};
 
-use s3s::S3ErrorCode;
-use crate::error::{Error, Result, StorageError};
-use rustfs_utils::path::{path_join, SLASH_SEPARATOR};
-use crate::{
-    config::com::{read_config, CONFIG_PREFIX},
-    disk::RUSTFS_META_BUCKET,
-    store::ECStore, store_api::{ObjectOptions, PutObjReader}, StorageAPI
-};
 use crate::client::admin_handler_utils::AdminError;
-use crate::tier::{
-    warm_backend::{check_warm_backend, new_warm_backend},
-    tier_handlers::{
-        ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_ALREADY_EXISTS, ERR_TIER_NOT_FOUND,
-    },
-    tier_admin::TierCreds,
-    tier_config::{TierType, TierConfig,},
-};
+use crate::error::{Error, Result, StorageError};
 use crate::new_object_layer_fn;
+use crate::tier::{
+    tier_admin::TierCreds,
+    tier_config::{TierConfig, TierType},
+    tier_handlers::{ERR_TIER_ALREADY_EXISTS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND},
+    warm_backend::{check_warm_backend, new_warm_backend},
+};
+use crate::{
+    StorageAPI,
+    config::com::{CONFIG_PREFIX, read_config},
+    disk::RUSTFS_META_BUCKET,
+    store::ECStore,
+    store_api::{ObjectOptions, PutObjReader},
+};
 use rustfs_rio::HashReader;
+use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
+use s3s::S3ErrorCode;
 
 use super::{
-    tier_handlers::{ERR_TIER_PERM_ERR, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_BUCKET_NOT_FOUND},
+    tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},
     warm_backend::WarmBackendImpl,
 };
 
 const TIER_CFG_REFRESH: Duration = Duration::from_secs(15 * 60);
 
-pub const TIER_CONFIG_FILE: &str   = "tier-config.json";
-pub const TIER_CONFIG_FORMAT: u16  = 1;
-pub const TIER_CONFIG_V1: u16      = 1;
+pub const TIER_CONFIG_FILE: &str = "tier-config.json";
+pub const TIER_CONFIG_FORMAT: u16 = 1;
+pub const TIER_CONFIG_V1: u16 = 1;
 pub const TIER_CONFIG_VERSION: u16 = 1;
 
 lazy_static! {
@@ -50,32 +53,32 @@ lazy_static! {
 const TIER_CFG_REFRESH_AT_HDR: &str = "X-RustFS-TierCfg-RefreshedAt";
 
 pub const ERR_TIER_MISSING_CREDENTIALS: AdminError = AdminError {
-    code:        "XRustFSAdminTierMissingCredentials",
-    message:     "Specified remote credentials are empty",
+    code: "XRustFSAdminTierMissingCredentials",
+    message: "Specified remote credentials are empty",
     status_code: StatusCode::FORBIDDEN,
 };
 
 pub const ERR_TIER_BACKEND_IN_USE: AdminError = AdminError {
-    code:        "XRustFSAdminTierBackendInUse",
-    message:     "Specified remote tier is already in use",
+    code: "XRustFSAdminTierBackendInUse",
+    message: "Specified remote tier is already in use",
     status_code: StatusCode::CONFLICT,
 };
 
 pub const ERR_TIER_TYPE_UNSUPPORTED: AdminError = AdminError {
-    code:        "XRustFSAdminTierTypeUnsupported",
-    message:     "Specified tier type is unsupported",
+    code: "XRustFSAdminTierTypeUnsupported",
+    message: "Specified tier type is unsupported",
     status_code: StatusCode::BAD_REQUEST,
 };
 
 pub const ERR_TIER_BACKEND_NOT_EMPTY: AdminError = AdminError {
-    code:        "XRustFSAdminTierBackendNotEmpty",
-    message:     "Specified remote backend is not empty",
+    code: "XRustFSAdminTierBackendNotEmpty",
+    message: "Specified remote backend is not empty",
     status_code: StatusCode::BAD_REQUEST,
 };
 
 pub const ERR_TIER_INVALID_CONFIG: AdminError = AdminError {
-    code:        "XRustFSAdminTierInvalidConfig",
-    message:     "Unable to setup remote tier, check tier configuration",
+    code: "XRustFSAdminTierInvalidConfig",
+    message: "Unable to setup remote tier, check tier configuration",
     status_code: StatusCode::BAD_REQUEST,
 };
 
@@ -147,22 +150,22 @@ impl TierConfigMgr {
         if !force {
             let in_use = d.in_use().await;
             match in_use {
-              Ok(b) => {
-                  if b {
-                    return Err(ERR_TIER_BACKEND_IN_USE);
-                  }
-              }
-              Err(err) => {
-                  warn!("tier add failed, err: {:?}", err);
-                  if err.to_string().contains("connect") {
-                      return Err(ERR_TIER_CONNECT_ERR);
-                  } else if err.to_string().contains("authorization") {
-                      return Err(ERR_TIER_INVALID_CREDENTIALS);
-                  } else if err.to_string().contains("bucket") {
-                      return Err(ERR_TIER_BUCKET_NOT_FOUND);
-                  }
-                  return Err(ERR_TIER_PERM_ERR);
-              }
+                Ok(b) => {
+                    if b {
+                        return Err(ERR_TIER_BACKEND_IN_USE);
+                    }
+                }
+                Err(err) => {
+                    warn!("tier add failed, err: {:?}", err);
+                    if err.to_string().contains("connect") {
+                        return Err(ERR_TIER_CONNECT_ERR);
+                    } else if err.to_string().contains("authorization") {
+                        return Err(ERR_TIER_INVALID_CREDENTIALS);
+                    } else if err.to_string().contains("bucket") {
+                        return Err(ERR_TIER_BUCKET_NOT_FOUND);
+                    }
+                    return Err(ERR_TIER_PERM_ERR);
+                }
             }
         }
 
@@ -279,7 +282,7 @@ impl TierConfigMgr {
                 minio.access_key = creds.access_key;
                 minio.secret_key = creds.secret_key;
             }
-            _ => ()
+            _ => (),
         }
 
         let d = new_warm_backend(&cfg, true).await?;
@@ -290,9 +293,7 @@ impl TierConfigMgr {
 
     pub async fn get_driver<'a>(&'a mut self, tier_name: &str) -> std::result::Result<&'a WarmBackendImpl, AdminError> {
         Ok(match self.driver_cache.entry(tier_name.to_string()) {
-            Entry::Occupied(e) => {
-                e.into_mut()
-            }
+            Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
                 let t = self.tiers.get(tier_name);
                 if t.is_none() {
@@ -326,7 +327,9 @@ impl TierConfigMgr {
 
     #[tracing::instrument(level = "debug", name = "tier_save", skip(self))]
     pub async fn save(&self) -> std::result::Result<(), std::io::Error> {
-        let Some(api) = new_object_layer_fn() else { return Err(std::io::Error::other("errServerNotInitialized")) };
+        let Some(api) = new_object_layer_fn() else {
+            return Err(std::io::Error::other("errServerNotInitialized"));
+        };
         //let (pr, opts) = GLOBAL_TierConfigMgr.write().config_reader()?;
 
         self.save_tiering_config(api).await
@@ -340,7 +343,12 @@ impl TierConfigMgr {
         self.save_config(api, &config_file, data).await
     }
 
-    pub async fn save_config<S: StorageAPI>(&self, api: Arc<S>, file: &str, data: Bytes) -> std::result::Result<(), std::io::Error> {
+    pub async fn save_config<S: StorageAPI>(
+        &self,
+        api: Arc<S>,
+        file: &str,
+        data: Bytes,
+    ) -> std::result::Result<(), std::io::Error> {
         self.save_config_with_opts(
             api,
             file,
@@ -353,7 +361,13 @@ impl TierConfigMgr {
         .await
     }
 
-    pub async fn save_config_with_opts<S: StorageAPI>(&self, api: Arc<S>, file: &str, data: Bytes, opts: &ObjectOptions) -> std::result::Result<(), std::io::Error> {
+    pub async fn save_config_with_opts<S: StorageAPI>(
+        &self,
+        api: Arc<S>,
+        file: &str,
+        data: Bytes,
+        opts: &ObjectOptions,
+    ) -> std::result::Result<(), std::io::Error> {
         debug!("save tier config:{}", file);
         let _ = api
             .put_object(RUSTFS_META_BUCKET, file, &mut PutObjReader::from_vec(data.to_vec()), opts)
@@ -365,9 +379,7 @@ impl TierConfigMgr {
         //let r = rand.New(rand.NewSource(time.Now().UnixNano()));
         let mut rng = rand::rng();
         let r = rng.random_range(0.0..1.0);
-        let rand_interval = || {
-            Duration::from_secs((r * 60_f64).round() as u64)
-        };
+        let rand_interval = || Duration::from_secs((r * 60_f64).round() as u64);
 
         let mut t = interval(TIER_CFG_REFRESH + rand_interval());
         loop {
@@ -394,10 +406,10 @@ impl TierConfigMgr {
 
 async fn new_and_save_tiering_config<S: StorageAPI>(api: Arc<S>) -> Result<TierConfigMgr> {
     let mut cfg = TierConfigMgr {
-            driver_cache: HashMap::new(),
-            tiers: HashMap::new(),
-            last_refreshed_at: OffsetDateTime::now_utc(),
-        };
+        driver_cache: HashMap::new(),
+        tiers: HashMap::new(),
+        last_refreshed_at: OffsetDateTime::now_utc(),
+    };
     //lookup_configs(&mut cfg, api.clone()).await;
     cfg.save_tiering_config(api).await?;
 
@@ -420,7 +432,7 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
     }
 
     let cfg;
-    let version = 1;//LittleEndian::read_u16(&data[2..4]);
+    let version = 1; //LittleEndian::read_u16(&data[2..4]);
     match version {
         TIER_CONFIG_V1/*  | TIER_CONFIG_VERSION */ => {
             cfg = match TierConfigMgr::unmarshal(&data.unwrap()) {

@@ -1,15 +1,15 @@
-use std::collections::HashMap;
+use bytes::{Bytes, BytesMut};
 use http::request;
 use hyper::Uri;
-use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
 use std::fmt::Write;
-use time::{OffsetDateTime, macros::format_description, format_description};
+use time::{OffsetDateTime, format_description, macros::format_description};
 
 use rustfs_utils::crypto::{base64_encode, hex, hmac_sha1};
 
 use super::utils::get_host_addr;
 
-const SIGN_V4_ALGORITHM: &str   = "AWS4-HMAC-SHA256";
+const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
 
 fn encode_url2path(req: &request::Builder, virtual_host: bool) -> String {
@@ -20,7 +20,13 @@ fn encode_url2path(req: &request::Builder, virtual_host: bool) -> String {
     path
 }
 
-pub fn pre_sign_v2(mut req: request::Builder, access_key_id: &str, secret_access_key: &str, expires: i64, virtual_host: bool) -> request::Builder {
+pub fn pre_sign_v2(
+    mut req: request::Builder,
+    access_key_id: &str,
+    secret_access_key: &str,
+    expires: i64,
+    virtual_host: bool,
+) -> request::Builder {
     if access_key_id == "" || secret_access_key == "" {
         return req;
     }
@@ -50,7 +56,11 @@ pub fn pre_sign_v2(mut req: request::Builder, access_key_id: &str, secret_access
 
     let uri = req.uri_ref().unwrap().clone();
     let mut parts = req.uri_ref().unwrap().clone().into_parts();
-    parts.path_and_query = Some(format!("{}?{}&Signature={}", uri.path(), serde_urlencoded::to_string(&query).unwrap(), signature).parse().unwrap());
+    parts.path_and_query = Some(
+        format!("{}?{}&Signature={}", uri.path(), serde_urlencoded::to_string(&query).unwrap(), signature)
+            .parse()
+            .unwrap(),
+    );
     let req = req.uri(Uri::from_parts(parts).unwrap());
 
     req
@@ -61,7 +71,13 @@ fn post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> S
     signature
 }
 
-pub fn sign_v2(mut req: request::Builder, content_len: i64, access_key_id: &str, secret_access_key: &str, virtual_host: bool) -> request::Builder {
+pub fn sign_v2(
+    mut req: request::Builder,
+    content_len: i64,
+    access_key_id: &str,
+    secret_access_key: &str,
+    virtual_host: bool,
+) -> request::Builder {
     if access_key_id == "" || secret_access_key == "" {
         return req;
     }
@@ -74,7 +90,14 @@ pub fn sign_v2(mut req: request::Builder, content_len: i64, access_key_id: &str,
 
     let date = headers.get("Date").unwrap();
     if date.to_str().unwrap() == "" {
-        headers.insert("Date", d2.format(&format_description::well_known::Rfc2822).unwrap().to_string().parse().unwrap());
+        headers.insert(
+            "Date",
+            d2.format(&format_description::well_known::Rfc2822)
+                .unwrap()
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
     }
 
     let mut auth_header = format!("{} {}:", SIGN_V2_ALGORITHM, access_key_id);
@@ -130,21 +153,27 @@ fn write_canonicalized_headers(buf: &mut BytesMut, req: &request::Builder) {
         let lk = k.as_str().to_lowercase();
         if lk.starts_with("x-amz") {
             proto_headers.push(lk.clone());
-            let vv = req.headers_ref().expect("err").get_all(k).iter().map(|e| e.to_str().unwrap().to_string()).collect();
+            let vv = req
+                .headers_ref()
+                .expect("err")
+                .get_all(k)
+                .iter()
+                .map(|e| e.to_str().unwrap().to_string())
+                .collect();
             vals.insert(lk, vv);
         }
     }
     proto_headers.sort();
     for k in proto_headers {
-      buf.write_str(&k);
-      buf.write_char(':');
-      for (idx, v) in vals[&k].iter().enumerate() {
-          if idx > 0 {
-              buf.write_char(',');
-          }
-          buf.write_str(v);
-      }
-      buf.write_char('\n');
+        buf.write_str(&k);
+        buf.write_char(':');
+        for (idx, v) in vals[&k].iter().enumerate() {
+            if idx > 0 {
+                buf.write_char(',');
+            }
+            buf.write_str(v);
+        }
+        buf.write_char('\n');
     }
 }
 
@@ -181,7 +210,7 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Builder, virt
         let mut vals = result.unwrap_or_default();
         for resource in INCLUDED_QUERY {
             let vv = &vals[*resource];
-            if  vv.len() > 0 {
+            if vv.len() > 0 {
                 n += 1;
                 match n {
                     1 => {

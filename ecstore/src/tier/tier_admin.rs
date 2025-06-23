@@ -1,13 +1,10 @@
-use std::{
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use rand::Rng;
-use tracing::warn;
 use http::status::StatusCode;
-use serde::{Serialize, Deserialize};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
-#[derive(Serialize, Deserialize)]
-#[derive(Default, Debug, Clone)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct TierCreds {
     #[serde(rename = "accessKey")]

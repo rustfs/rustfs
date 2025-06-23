@@ -2,21 +2,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
-use crate::error::ErrorResponse;
-use crate::error::error_resp_to_object_err;
 use crate::client::{
     api_get_options::GetObjectOptions,
-    credentials::{Credentials, Static, Value, SignatureType},
-    transition_api::{ReaderImpl, ReadCloser},
     api_put_object::PutObjectOptions,
     api_remove::RemoveObjectOptions,
-    transition_api::{Options, TransitionClient, TransitionCore,},
+    credentials::{Credentials, SignatureType, Static, Value},
+    transition_api::{Options, TransitionClient, TransitionCore},
+    transition_api::{ReadCloser, ReaderImpl},
 };
-use rustfs_utils::path::SLASH_SEPARATOR;
+use crate::error::ErrorResponse;
+use crate::error::error_resp_to_object_err;
 use crate::tier::{
     tier_config::TierS3,
-    warm_backend::{WarmBackend, WarmBackendGetOpts,}
+    warm_backend::{WarmBackend, WarmBackendGetOpts},
 };
+use rustfs_utils::path::SLASH_SEPARATOR;
 
 pub struct WarmBackendS3 {
     pub client: Arc<TransitionClient>,
@@ -35,16 +35,22 @@ impl WarmBackendS3 {
             }
         };
 
-        if conf.aws_role_web_identity_token_file == "" && conf.aws_role_arn != "" || conf.aws_role_web_identity_token_file != "" && conf.aws_role_arn == "" {
+        if conf.aws_role_web_identity_token_file == "" && conf.aws_role_arn != ""
+            || conf.aws_role_web_identity_token_file != "" && conf.aws_role_arn == ""
+        {
             return Err(std::io::Error::other("both the token file and the role ARN are required"));
-        }
-        else if conf.access_key == "" && conf.secret_key != "" || conf.access_key != "" && conf.secret_key == "" {
+        } else if conf.access_key == "" && conf.secret_key != "" || conf.access_key != "" && conf.secret_key == "" {
             return Err(std::io::Error::other("both the access and secret keys are required"));
-        }
-        else if conf.aws_role && (conf.aws_role_web_identity_token_file != "" || conf.aws_role_arn != "" || conf.access_key != "" || conf.secret_key != "") {
-            return Err(std::io::Error::other("AWS Role cannot be activated with static credentials or the web identity token file"));
-        }
-        else if conf.bucket == "" {
+        } else if conf.aws_role
+            && (conf.aws_role_web_identity_token_file != ""
+                || conf.aws_role_arn != ""
+                || conf.access_key != ""
+                || conf.secret_key != "")
+        {
+            return Err(std::io::Error::other(
+                "AWS Role cannot be activated with static credentials or the web identity token file",
+            ));
+        } else if conf.bucket == "" {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
@@ -53,19 +59,18 @@ impl WarmBackendS3 {
         if conf.access_key != "" && conf.secret_key != "" {
             //creds = Credentials::new_static_v4(conf.access_key, conf.secret_key, "");
             creds = Credentials::new(Static(Value {
-                access_key_id:     conf.access_key.clone(),
+                access_key_id: conf.access_key.clone(),
                 secret_access_key: conf.secret_key.clone(),
-                session_token:     "".to_string(),
+                session_token: "".to_string(),
                 signer_type: SignatureType::SignatureV4,
                 ..Default::default()
             }));
-        }
-        else {
+        } else {
             return Err(std::io::Error::other("insufficient parameters for S3 backend authentication"));
         }
         let opts = Options {
-            creds:     creds,
-            secure:    u.scheme() == "https",
+            creds: creds,
+            secure: u.scheme() == "https",
             //transport: GLOBAL_RemoteTargetTransport,
             ..Default::default()
         };
@@ -77,8 +82,8 @@ impl WarmBackendS3 {
         Ok(Self {
             client,
             core,
-            bucket:        conf.bucket.clone(),
-            prefix:        conf.prefix.clone().trim_matches('/').to_string(),
+            bucket: conf.bucket.clone(),
+            prefix: conf.prefix.clone().trim_matches('/').to_string(),
             storage_class: conf.storage_class.clone(),
         })
     }
@@ -103,14 +108,28 @@ impl WarmBackendS3 {
 
 #[async_trait::async_trait]
 impl WarmBackend for WarmBackendS3 {
-    async fn put_with_meta(&self, object: &str, r: ReaderImpl, length: i64, meta: HashMap<String, String>) -> Result<String, std::io::Error> {
+    async fn put_with_meta(
+        &self,
+        object: &str,
+        r: ReaderImpl,
+        length: i64,
+        meta: HashMap<String, String>,
+    ) -> Result<String, std::io::Error> {
         let client = self.client.clone();
-        let res = client.put_object(&self.bucket, &self.get_dest(object), r, length, &PutObjectOptions {
-            send_content_md5: true,
-            storage_class: self.storage_class.clone(),
-            user_metadata: meta,
-            ..Default::default()
-        }).await?;
+        let res = client
+            .put_object(
+                &self.bucket,
+                &self.get_dest(object),
+                r,
+                length,
+                &PutObjectOptions {
+                    send_content_md5: true,
+                    storage_class: self.storage_class.clone(),
+                    user_metadata: meta,
+                    ..Default::default()
+                },
+            )
+            .await?;
         Ok(res.version_id)
     }
 
@@ -125,7 +144,7 @@ impl WarmBackend for WarmBackendS3 {
             gopts.version_id = rv.to_string();
         }
         if opts.start_offset >= 0 && opts.length > 0 {
-            if let Err(err) = gopts.set_range(opts.start_offset, opts.start_offset+opts.length-1) {
+            if let Err(err) = gopts.set_range(opts.start_offset, opts.start_offset + opts.length - 1) {
                 return Err(std::io::Error::other(err));
             }
         }
@@ -146,7 +165,10 @@ impl WarmBackend for WarmBackendS3 {
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
-        let result = self.core.list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR, 1).await?;
+        let result = self
+            .core
+            .list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR, 1)
+            .await?;
 
         Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)
     }

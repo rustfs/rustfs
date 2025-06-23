@@ -1,21 +1,21 @@
 use bytes::{Bytes, BytesMut};
-use http::header::TRAILER;
+use http::HeaderMap;
 use http::Uri;
+use http::header::TRAILER;
+use http::request::{self, Request};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::fmt::Write;
-use tracing::{error, info, warn, debug};
-use time::{OffsetDateTime, macros::datetime, macros::format_description, format_description};
-use http::request::{self, Request};
-use http::HeaderMap;
+use time::{OffsetDateTime, format_description, macros::datetime, macros::format_description};
+use tracing::{debug, error, info, warn};
 
-use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
-use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
-use crate::client::constants::UNSIGNED_PAYLOAD;
 use super::ordered_qs::OrderedQs;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
 use super::utils::stable_sort_by_first;
 use super::utils::{get_host_addr, sign_v4_trim_all};
+use crate::client::constants::UNSIGNED_PAYLOAD;
+use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
+use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE_TYPE_S3: &str = "s3";
@@ -69,7 +69,7 @@ fn get_credential(access_key_id: &str, location: &str, t: OffsetDateTime, servic
 fn get_hashed_payload(req: &request::Builder) -> String {
     let headers = req.headers_ref().unwrap();
     let mut hashed_payload = "";
-    if let Some(payload)= headers.get("X-Amz-Content-Sha256") {
+    if let Some(payload) = headers.get("X-Amz-Content-Sha256") {
         hashed_payload = payload.to_str().unwrap();
     }
     if hashed_payload == "" {
@@ -86,7 +86,13 @@ fn get_canonical_headers(req: &request::Builder, ignored_headers: &HashMap<Strin
             continue;
         }
         headers.push(k.as_str().to_lowercase());
-        let vv = req.headers_ref().expect("err").get_all(k).iter().map(|e| e.to_str().unwrap().to_string()).collect();
+        let vv = req
+            .headers_ref()
+            .expect("err")
+            .get_all(k)
+            .iter()
+            .map(|e| e.to_str().unwrap().to_string())
+            .collect();
         vals.insert(k.as_str().to_lowercase(), vv);
     }
     if !header_exists("host", &headers) {
@@ -155,7 +161,7 @@ fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<Strin
         canonical_query_string = query.join("&");
         canonical_query_string = canonical_query_string.replace("+", "%20");
     }
-    
+
     let mut canonical_request = <Vec<String>>::new();
     canonical_request.push(req.method_ref().unwrap().to_string());
     canonical_request.push(req.uri_ref().unwrap().path().to_string());
@@ -178,7 +184,15 @@ fn get_string_to_sign_v4(t: OffsetDateTime, location: &str, canonical_request: &
     string_to_sign
 }
 
-pub fn pre_sign_v4(req: request::Builder, access_key_id: &str, secret_access_key: &str, session_token: &str, location: &str, expires: i64, t: OffsetDateTime) -> request::Builder {
+pub fn pre_sign_v4(
+    req: request::Builder,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+    expires: i64,
+    t: OffsetDateTime,
+) -> request::Builder {
     if access_key_id == "" || secret_access_key == "" {
         return req;
     }
@@ -208,9 +222,13 @@ pub fn pre_sign_v4(req: request::Builder, access_key_id: &str, secret_access_key
 
     let uri = req.uri_ref().unwrap().clone();
     let mut parts = req.uri_ref().unwrap().clone().into_parts();
-    parts.path_and_query = Some(format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap()).parse().unwrap());
+    parts.path_and_query = Some(
+        format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap())
+            .parse()
+            .unwrap(),
+    );
     let req = req.uri(Uri::from_parts(parts).unwrap());
-    
+
     let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
     let string_to_sign = get_string_to_sign_v4(t, location, &canonical_request, SERVICE_TYPE_S3);
     //println!("canonical_request: \n{}\n", canonical_request);
@@ -220,7 +238,16 @@ pub fn pre_sign_v4(req: request::Builder, access_key_id: &str, secret_access_key
 
     let uri = req.uri_ref().unwrap().clone();
     let mut parts = req.uri_ref().unwrap().clone().into_parts();
-    parts.path_and_query = Some(format!("{}?{}&X-Amz-Signature={}", uri.path(), serde_urlencoded::to_string(&query).unwrap(), signature).parse().unwrap());
+    parts.path_and_query = Some(
+        format!(
+            "{}?{}&X-Amz-Signature={}",
+            uri.path(),
+            serde_urlencoded::to_string(&query).unwrap(),
+            signature
+        )
+        .parse()
+        .unwrap(),
+    );
     let req = req.uri(Uri::from_parts(parts).unwrap());
 
     req
@@ -236,7 +263,16 @@ fn sign_v4_sts(mut req: request::Builder, access_key_id: &str, secret_access_key
     sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new())
 }
 
-fn sign_v4_inner(mut req: request::Builder, content_len: i64, access_key_id: &str, secret_access_key: &str, session_token: &str, location: &str, service_type: &str, trailer: HeaderMap) -> request::Builder {
+fn sign_v4_inner(
+    mut req: request::Builder,
+    content_len: i64,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+    service_type: &str,
+    trailer: HeaderMap,
+) -> request::Builder {
     if access_key_id == "" || secret_access_key == "" {
         return req;
     }
@@ -252,7 +288,7 @@ fn sign_v4_inner(mut req: request::Builder, content_len: i64, access_key_id: &st
         headers.insert("X-Amz-Security-Token", session_token.parse().unwrap());
     }
 
-    if trailer.len() > 0{
+    if trailer.len() > 0 {
         for (k, _) in &trailer {
             headers.append("X-Amz-Trailer", k.as_str().to_lowercase().parse().unwrap());
         }
@@ -276,9 +312,12 @@ fn sign_v4_inner(mut req: request::Builder, content_len: i64, access_key_id: &st
 
     let mut headers = req.headers_mut().expect("err");
 
-    let auth = format!("{} Credential={}, SignedHeaders={}, Signature={}", SIGN_V4_ALGORITHM, credential, signed_headers, signature);
+    let auth = format!(
+        "{} Credential={}, SignedHeaders={}, Signature={}",
+        SIGN_V4_ALGORITHM, credential, signed_headers, signature
+    );
     headers.insert("Authorization", auth.parse().unwrap());
-    
+
     if trailer.len() > 0 {
         //req.Trailer = trailer;
         for (_, v) in &trailer {
@@ -315,12 +354,44 @@ fn unsigned_trailer(mut req: request::Builder, content_len: i64, trailer: Header
     streaming_unsigned_v4(req, "", content_len, t);
 }
 
-pub fn sign_v4(mut req: request::Builder, content_len: i64, access_key_id: &str, secret_access_key: &str, session_token: &str, location: &str) -> request::Builder {
-    sign_v4_inner(req, content_len, access_key_id, secret_access_key, session_token, location, SERVICE_TYPE_S3, HeaderMap::new())
+pub fn sign_v4(
+    mut req: request::Builder,
+    content_len: i64,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+) -> request::Builder {
+    sign_v4_inner(
+        req,
+        content_len,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        location,
+        SERVICE_TYPE_S3,
+        HeaderMap::new(),
+    )
 }
 
-pub fn sign_v4_trailer(req: request::Builder, access_key_id: &str, secret_access_key: &str, session_token: &str, location: &str, trailer: HeaderMap) -> request::Builder {
-    sign_v4_inner(req, 0, access_key_id, secret_access_key, session_token, location, SERVICE_TYPE_S3, trailer)
+pub fn sign_v4_trailer(
+    req: request::Builder,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+    trailer: HeaderMap,
+) -> request::Builder {
+    sign_v4_inner(
+        req,
+        0,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        location,
+        SERVICE_TYPE_S3,
+        trailer,
+    )
 }
 
 #[cfg(test)]
@@ -338,10 +409,17 @@ mod tests {
         let service = "s3";
         let path = "/";
 
-        let mut req = Request::builder().method(http::Method::GET).uri("http://examplebucket.s3.amazonaws.com/?");
+        let mut req = Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/?");
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
-        headers.insert("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+        );
         headers.insert("x-amz-date", timestamp.parse().unwrap());
 
         let mut query = <Vec<(String, String)>>::new();
@@ -349,7 +427,11 @@ mod tests {
         query.push(("prefix".to_string(), "J".to_string()));
         let uri = req.uri_ref().unwrap().clone();
         let mut parts = req.uri_ref().unwrap().clone().into_parts();
-        parts.path_and_query = Some(format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap()).parse().unwrap());
+        parts.path_and_query = Some(
+            format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap())
+                .parse()
+                .unwrap(),
+        );
         let req = req.uri(Uri::from_parts(parts).unwrap());
 
         let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
@@ -361,7 +443,9 @@ mod tests {
                 "max-keys=2&prefix=J\n",
                 "host:examplebucket.s3.amazonaws.com\n",
                 "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
-                "x-amz-date:", "20130524T000000Z", "\n",
+                "x-amz-date:",
+                "20130524T000000Z",
+                "\n",
                 "\n",
                 "host;x-amz-content-sha256;x-amz-date\n",
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -373,7 +457,8 @@ mod tests {
             string_to_sign,
             concat!(
                 "AWS4-HMAC-SHA256\n",
-                "20130524T000000Z", "\n",
+                "20130524T000000Z",
+                "\n",
                 "20130524/us-east-1/s3/aws4_request\n",
                 "df57d21db20da04d7fa30298dd4488ba3a2b47ca3a489c74750e0f1e7df1b9b7",
             )
@@ -396,17 +481,28 @@ mod tests {
         let service = "s3";
         let path = "/mblock2/";
 
-        let mut req = Request::builder().method(http::Method::GET).uri("http://192.168.1.11:9020/mblock2/?");
-        
+        let mut req = Request::builder()
+            .method(http::Method::GET)
+            .uri("http://192.168.1.11:9020/mblock2/?");
+
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "192.168.1.11:9020".parse().unwrap());
-        headers.insert("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+        );
         headers.insert("x-amz-date", timestamp.parse().unwrap());
 
         let mut query: Vec<(String, String)> = Vec::new();
         let uri = req.uri_ref().unwrap().clone();
         let mut parts = req.uri_ref().unwrap().clone().into_parts();
-        parts.path_and_query = Some(format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap()).parse().unwrap());
+        parts.path_and_query = Some(
+            format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap())
+                .parse()
+                .unwrap(),
+        );
         let req = req.uri(Uri::from_parts(parts).unwrap());
 
         let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
@@ -419,7 +515,9 @@ mod tests {
                 "\n",
                 "host:192.168.1.11:9020\n",
                 "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
-                "x-amz-date:", "20250505T011054Z", "\n",
+                "x-amz-date:",
+                "20250505T011054Z",
+                "\n",
                 "\n",
                 "host;x-amz-content-sha256;x-amz-date\n",
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -432,7 +530,8 @@ mod tests {
             string_to_sign,
             concat!(
                 "AWS4-HMAC-SHA256\n",
-                "20250505T011054Z", "\n",
+                "20250505T011054Z",
+                "\n",
                 "20250505/us-east-1/s3/aws4_request\n",
                 "c2960d00cc7de7bed3e2e2d1330ec298ded8f78a231c1d32dedac72ebec7f9b0",
             )
@@ -456,10 +555,15 @@ mod tests {
         let path = "/mblock2/";
 
         let mut req = Request::builder().method(http::Method::GET).uri("http://192.168.1.11:9020/mblock2/?list-type=2&encoding-type=url&prefix=mypre&delimiter=%2F&fetch-owner=true&max-keys=1");
-        
+
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "192.168.1.11:9020".parse().unwrap());
-        headers.insert("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+        );
         headers.insert("x-amz-date", timestamp.parse().unwrap());
 
         /*let uri = req.uri_ref().unwrap().clone();
@@ -475,7 +579,7 @@ mod tests {
         let mut parts = req.uri_ref().unwrap().clone().into_parts();
         parts.path_and_query = Some(format!("{}?{}", uri.path(), canonical_query_string).parse().unwrap());
         let req = req.uri(Uri::from_parts(parts).unwrap());*/
-println!("{:?}", req.uri_ref().unwrap().query());
+        println!("{:?}", req.uri_ref().unwrap().query());
         let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
         println!("canonical_request: \n{}\n", canonical_request);
         assert_eq!(
@@ -486,7 +590,9 @@ println!("{:?}", req.uri_ref().unwrap().query());
                 "delimiter=%2F&encoding-type=url&fetch-owner=true&list-type=2&max-keys=1&prefix=mypre\n",
                 "host:192.168.1.11:9020\n",
                 "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
-                "x-amz-date:", "20250507T051030Z", "\n",
+                "x-amz-date:",
+                "20250507T051030Z",
+                "\n",
                 "\n",
                 "host;x-amz-content-sha256;x-amz-date\n",
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -499,7 +605,8 @@ println!("{:?}", req.uri_ref().unwrap().query());
             string_to_sign,
             concat!(
                 "AWS4-HMAC-SHA256\n",
-                "20250507T051030Z", "\n",
+                "20250507T051030Z",
+                "\n",
                 "20250507/us-east-1/s3/aws4_request\n",
                 "e6db9e09e9c873aff0b9ca170998b4753f6a6c36c90bc2dca80613affb47f999",
             )
@@ -525,8 +632,10 @@ println!("{:?}", req.uri_ref().unwrap().query());
         let path = "/";
         let session_token = "";
 
-        let mut req = Request::builder().method(http::Method::GET).uri("http://examplebucket.s3.amazonaws.com/test.txt");
-        
+        let mut req = Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/test.txt");
+
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
 
@@ -573,7 +682,7 @@ println!("{:?}", req.uri_ref().unwrap().query());
         let session_token = "";
 
         let mut req = Request::builder().method(http::Method::GET).uri("http://192.168.1.11:9020/mblock2/test.txt?delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2");
-        
+
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "192.168.1.11:9020".parse().unwrap());
 

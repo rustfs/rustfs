@@ -13,9 +13,9 @@ use crate::{
 };
 
 // use futures::stream::Stream;
-use std::io::{Error, Result};
-use super::hasher::{Hasher, Sha256, MD5};
+use super::hasher::{Hasher, MD5, Sha256};
 use futures::Stream;
+use std::io::{Error, Result};
 
 pin_project_lite::pin_project! {
     #[derive(Default)]
@@ -101,20 +101,8 @@ pin_project_lite::pin_project! {
 
 impl<S> HashReader<S> {
     pub fn new(inner: S, size: usize, md5_hex: Option<String>, sha256_hex: Option<String>, actual_size: usize) -> Self {
-        let md5 = {
-            if md5_hex.is_some() {
-                Some(MD5::new())
-            } else {
-                None
-            }
-        };
-        let sha256 = {
-            if sha256_hex.is_some() {
-                Some(Sha256::new())
-            } else {
-                None
-            }
-        };
+        let md5 = { if md5_hex.is_some() { Some(MD5::new()) } else { None } };
+        let sha256 = { if sha256_hex.is_some() { Some(Sha256::new()) } else { None } };
         Self {
             inner,
             size,

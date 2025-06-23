@@ -3,12 +3,10 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::{error, warn};
 
-use s3s::dto::{
-    DefaultRetention, ObjectLockRetentionMode, ObjectLockLegalHoldStatus,
-};
+use s3s::dto::{DefaultRetention, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 
-use crate::store_api::ObjectInfo;
 use crate::bucket::metadata_sys::get_object_lock_config;
+use crate::store_api::ObjectInfo;
 
 use super::objectlock;
 
@@ -21,7 +19,12 @@ impl BucketObjectLockSys {
     }
 
     pub async fn get(bucket: &str) -> Option<DefaultRetention> {
-        if let Some(object_lock_rule) = get_object_lock_config(bucket).await.expect("get_object_lock_config err!").0.rule {
+        if let Some(object_lock_rule) = get_object_lock_config(bucket)
+            .await
+            .expect("get_object_lock_config err!")
+            .0
+            .rule
+        {
             return object_lock_rule.default_retention;
         }
         None
@@ -35,10 +38,10 @@ pub fn enforce_retention_for_deletion(obj_info: &ObjectInfo) -> bool {
 
     let lhold = objectlock::get_object_legalhold_meta(obj_info.user_defined.clone().expect("err"));
     match lhold.status {
-        Some(st) if st.as_str()==ObjectLockLegalHoldStatus::ON => {
+        Some(st) if st.as_str() == ObjectLockLegalHoldStatus::ON => {
             return true;
         }
-        _ => ()
+        _ => (),
     }
 
     let ret = objectlock::get_object_retention_meta(obj_info.user_defined.clone().expect("err"));
@@ -49,7 +52,7 @@ pub fn enforce_retention_for_deletion(obj_info: &ObjectInfo) -> bool {
                 return true;
             }
         }
-        _ => ()
+        _ => (),
     }
     false
 }

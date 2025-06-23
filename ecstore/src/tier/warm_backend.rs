@@ -1,20 +1,20 @@
-use std::collections::HashMap;
 use bytes::Bytes;
+use std::collections::HashMap;
 
 use crate::client::{
     admin_handler_utils::AdminError,
-    transition_api::{ReadCloser, ReaderImpl,},
+    transition_api::{ReadCloser, ReaderImpl},
 };
 use crate::error::is_err_bucket_not_found;
-use tracing::{info, warn};
 use crate::tier::{
-    tier_config::{TierType, TierConfig},
+    tier::{ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
+    tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_PERM_ERR},
-    tier::{ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED,},
-    warm_backend_s3::WarmBackendS3,
-    warm_backend_rustfs::WarmBackendRustFS,
     warm_backend_minio::WarmBackendMinIO,
+    warm_backend_rustfs::WarmBackendRustFS,
+    warm_backend_s3::WarmBackendS3,
 };
+use tracing::{info, warn};
 
 pub type WarmBackendImpl = Box<dyn WarmBackend + Send + Sync + 'static>;
 
@@ -29,7 +29,13 @@ pub struct WarmBackendGetOpts {
 #[async_trait::async_trait]
 pub trait WarmBackend {
     async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error>;
-    async fn put_with_meta(&self, object: &str, r: ReaderImpl, length: i64, meta: HashMap<String, String>) -> Result<String, std::io::Error>;
+    async fn put_with_meta(
+        &self,
+        object: &str,
+        r: ReaderImpl,
+        length: i64,
+        meta: HashMap<String, String>,
+    ) -> Result<String, std::io::Error>;
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error>;
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error>;
     async fn in_use(&self) -> Result<bool, std::io::Error>;
@@ -37,7 +43,9 @@ pub trait WarmBackend {
 
 pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), AdminError> {
     let w = w.expect("err");
-    let remote_version_id = w.put(PROBE_OBJECT, ReaderImpl::Body(Bytes::from("RustFS".as_bytes().to_vec())), 5).await;
+    let remote_version_id = w
+        .put(PROBE_OBJECT, ReaderImpl::Body(Bytes::from("RustFS".as_bytes().to_vec())), 5)
+        .await;
     if let Err(err) = remote_version_id {
         return Err(ERR_TIER_PERM_ERR);
     }
@@ -52,7 +60,7 @@ pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), Admin
             return Err(ERR_TIER_MISSING_CREDENTIALS);
         }*/
         //else {
-            return Err(ERR_TIER_PERM_ERR);
+        return Err(ERR_TIER_PERM_ERR);
         //}
     }
     if let Err(err) = w.remove(PROBE_OBJECT, &remote_version_id.expect("err")).await {

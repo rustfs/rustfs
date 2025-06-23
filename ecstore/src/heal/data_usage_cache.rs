@@ -139,9 +139,9 @@ pub struct TierStats {
 impl TierStats {
     pub fn add(&self, u: &TierStats) -> TierStats {
         TierStats {
-            total_size:   self.total_size + u.total_size,
+            total_size: self.total_size + u.total_size,
             num_versions: self.num_versions + u.num_versions,
-            num_objects:  self.num_objects + u.num_objects,
+            num_objects: self.num_objects + u.num_objects,
         }
     }
 }
@@ -153,9 +153,7 @@ struct AllTierStats {
 
 impl AllTierStats {
     pub fn new() -> Self {
-        Self {
-            tiers: HashMap::new(),
-        }
+        Self { tiers: HashMap::new() }
     }
 
     fn add_sizes(&mut self, tiers: HashMap<String, TierStats>) {
@@ -172,11 +170,14 @@ impl AllTierStats {
 
     fn populate_stats(&self, stats: &mut HashMap<String, TierStats>) {
         for (tier, st) in &self.tiers {
-            stats.insert(tier.clone(), TierStats {
-                total_size:   st.total_size.clone(),
-                num_versions: st.num_versions.clone(),
-                num_objects:  st.num_objects.clone(),
-            });
+            stats.insert(
+                tier.clone(),
+                TierStats {
+                    total_size: st.total_size.clone(),
+                    num_versions: st.num_versions.clone(),
+                    num_objects: st.num_objects.clone(),
+                },
+            );
         }
     }
 }

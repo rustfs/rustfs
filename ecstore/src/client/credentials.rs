@@ -19,8 +19,7 @@ pub struct Credentials<P: Provider + Default> {
     provider: P,
 }
 
-impl<P: Provider + Default> Credentials<P>
-{
+impl<P: Provider + Default> Credentials<P> {
     pub fn new(provider: P) -> Self {
         Self {
             provider: provider,
@@ -109,8 +108,8 @@ impl Provider for Static {
 
 #[derive(Debug, Clone, Default)]
 pub struct STSError {
-    pub r#type:  String,
-    pub code:    String,
+    pub r#type: String,
+    pub code: String,
     pub message: String,
 }
 
@@ -128,21 +127,21 @@ impl Display for ErrorResponse {
 
 impl ErrorResponse {
     fn error(&self) -> String {
-      if self.sts_error.message == "" {
-          return format!("Error response code {}.", self.sts_error.code);
-      }
-      return self.sts_error.message.clone();
+        if self.sts_error.message == "" {
+            return format!("Error response code {}.", self.sts_error.code);
+        }
+        return self.sts_error.message.clone();
     }
 }
 
 struct Error {
-    code:       String,
-    message:    String,
+    code: String,
+    message: String,
     bucket_name: String,
-    key:        String,
-    resource:   String,
-    request_id:  String,
-    host_id:     String,
+    key: String,
+    resource: String,
+    request_id: String,
+    host_id: String,
     region: String,
     server: String,
     status_code: i64,

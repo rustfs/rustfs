@@ -1,11 +1,11 @@
 #![allow(clippy::map_entry)]
-use std::collections::HashMap;
-use http::{HeaderMap, StatusCode};
 use bytes::Bytes;
+use http::{HeaderMap, StatusCode};
+use std::collections::HashMap;
 
 use crate::client::{
     api_error_response::http_resp_to_error_response,
-    transition_api::{RequestMetadata, TransitionClient, ReaderImpl}
+    transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
@@ -23,9 +23,9 @@ impl TransitionClient {
         url_values.insert("policy".to_string(), "".to_string());
 
         let mut req_metadata = RequestMetadata {
-            bucket_name:    bucket_name.to_string(),
-            query_values:   url_values,
-            content_body:   ReaderImpl::Body(Bytes::from(policy.as_bytes().to_vec())),
+            bucket_name: bucket_name.to_string(),
+            query_values: url_values,
+            content_body: ReaderImpl::Body(Bytes::from(policy.as_bytes().to_vec())),
             content_length: policy.len() as i64,
             object_name: "".to_string(),
             custom_header: HeaderMap::new(),
@@ -43,9 +43,9 @@ impl TransitionClient {
         let resp = self.execute_method(http::Method::PUT, &mut req_metadata).await?;
         //defer closeResponse(resp)
         //if resp != nil {
-            if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
-                return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, "")));
-            }
+        if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
+            return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, "")));
+        }
         //}
         Ok(())
     }
@@ -54,23 +54,28 @@ impl TransitionClient {
         let mut url_values = HashMap::new();
         url_values.insert("policy".to_string(), "".to_string());
 
-        let resp = self.execute_method(http::Method::DELETE, &mut RequestMetadata {
-            bucket_name:       bucket_name.to_string(),
-            query_values:      url_values,
-            content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-            object_name: "".to_string(),
-            custom_header: HeaderMap::new(),
-            content_body:  ReaderImpl::Body(Bytes::new()),
-            content_length: 0,
-            content_md5_base64: "".to_string(),
-            stream_sha256: false,
-            trailer: HeaderMap::new(),
-            pre_sign_url: Default::default(),
-            add_crc: Default::default(),
-            extra_pre_sign_header: Default::default(),
-            bucket_location: Default::default(),
-            expires: Default::default(),
-        }).await?;
+        let resp = self
+            .execute_method(
+                http::Method::DELETE,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    query_values: url_values,
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    object_name: "".to_string(),
+                    custom_header: HeaderMap::new(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
         //defer closeResponse(resp)
 
         if resp.status() != StatusCode::NO_CONTENT {
@@ -89,23 +94,28 @@ impl TransitionClient {
         let mut url_values = HashMap::new();
         url_values.insert("policy".to_string(), "".to_string());
 
-        let resp = self.execute_method(http::Method::GET, &mut RequestMetadata {
-            bucket_name:       bucket_name.to_string(),
-            query_values:      url_values,
-            content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-            object_name: "".to_string(),
-            custom_header: HeaderMap::new(),
-            content_body:  ReaderImpl::Body(Bytes::new()),
-            content_length: 0,
-            content_md5_base64: "".to_string(),
-            stream_sha256: false,
-            trailer: HeaderMap::new(),
-            pre_sign_url: Default::default(),
-            add_crc: Default::default(),
-            extra_pre_sign_header: Default::default(),
-            bucket_location: Default::default(),
-            expires: Default::default(),
-        }).await?;
+        let resp = self
+            .execute_method(
+                http::Method::GET,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    query_values: url_values,
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    object_name: "".to_string(),
+                    custom_header: HeaderMap::new(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
 
         let policy = String::from_utf8_lossy(&resp.body().bytes().expect("err").to_vec()).to_string();
         Ok(policy)

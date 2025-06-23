@@ -1,10 +1,9 @@
-use s3s::dto::{
-    LifecycleRuleFilter, Transition,
-};
+use s3s::dto::{LifecycleRuleFilter, Transition};
 
-const ERR_TRANSITION_INVALID_DAYS: &str      = "Days must be 0 or greater when used with Transition";
-const ERR_TRANSITION_INVALID_DATE: &str      = "Date must be provided in ISO 8601 format";
-const ERR_TRANSITION_INVALID: &str           = "Exactly one of Days (0 or greater) or Date (positive ISO 8601 format) should be present in Transition.";
+const ERR_TRANSITION_INVALID_DAYS: &str = "Days must be 0 or greater when used with Transition";
+const ERR_TRANSITION_INVALID_DATE: &str = "Date must be provided in ISO 8601 format";
+const ERR_TRANSITION_INVALID: &str =
+    "Exactly one of Days (0 or greater) or Date (positive ISO 8601 format) should be present in Transition.";
 const ERR_TRANSITION_DATE_NOT_MIDNIGHT: &str = "'Date' must be at midnight GMT";
 
 pub trait Filter {
@@ -38,7 +37,6 @@ impl TransitionOps for Transition {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod test {

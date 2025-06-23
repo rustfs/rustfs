@@ -24,9 +24,6 @@ pub struct LcAuditEvent {
 
 impl LcAuditEvent {
     pub fn new(event: lifecycle::Event, source: LcEventSrc) -> Self {
-        Self {
-            event,
-            source,
-        }
+        Self { event, source }
     }
 }

@@ -1,8 +1,4 @@
-//use tokio_stream::Stream;
-use std::future::Future;
-use std::time::{Duration, Instant};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::time::Duration;
 
 // MaxRetry is the maximum number of retries before stopping.
 pub const MAX_RETRY: i64 = 10;

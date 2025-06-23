@@ -1,11 +1,11 @@
 use sha2::{Digest, Sha256};
-use xxhash_rust::xxh64;
 use std::any::Any;
 use std::io::{Cursor, Write};
+use xxhash_rust::xxh64;
 
-use crate::global::GLOBAL_TierConfigMgr;
 use super::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
 use super::lifecycle::{self, ObjectOpts};
+use crate::global::GLOBAL_TierConfigMgr;
 
 static XXHASH_SEED: u64 = 0;
 
@@ -44,9 +44,9 @@ impl ObjSweeper {
     }
 
     pub fn get_opts(&self) -> lifecycle::ObjectOpts {
-        let mut opts = ObjectOpts{
-            version_id:        self.version_id.clone(),
-            versioned:         self.versioned,
+        let mut opts = ObjectOpts {
+            version_id: self.version_id.clone(),
+            versioned: self.versioned,
             version_suspended: self.suspended,
             ..Default::default()
         };
@@ -69,16 +69,18 @@ impl ObjSweeper {
         }
 
         let mut del_tier = false;
-        if !self.versioned || self.suspended { // 1, 2.a, 2.b
+        if !self.versioned || self.suspended {
+            // 1, 2.a, 2.b
             del_tier = true;
-        } else if self.versioned && self.version_id != "" { // 3.a
+        } else if self.versioned && self.version_id != "" {
+            // 3.a
             del_tier = true;
         }
         if del_tier {
             return Some(Jentry {
-                obj_name:   self.remote_object.clone(),
+                obj_name: self.remote_object.clone(),
                 version_id: self.transition_version_id.clone(),
-                tier_name:  self.transition_tier.clone(),
+                tier_name: self.transition_tier.clone(),
             });
         }
         None
@@ -123,8 +125,5 @@ pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_na
     w.remove(obj_name, rv_id).await
 }
 
-
 #[cfg(test)]
-mod test {
-
-}
+mod test {}

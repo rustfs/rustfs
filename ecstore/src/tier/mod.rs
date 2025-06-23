@@ -1,9 +1,9 @@
-pub mod warm_backend_s3;
-pub mod warm_backend_minio;
-pub mod warm_backend_rustfs;
-pub mod warm_backend;
+pub mod tier;
 pub mod tier_admin;
 pub mod tier_config;
-pub mod tier;
 pub mod tier_gen;
 pub mod tier_handlers;
+pub mod warm_backend;
+pub mod warm_backend_minio;
+pub mod warm_backend_rustfs;
+pub mod warm_backend_s3;

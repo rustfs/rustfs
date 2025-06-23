@@ -312,9 +312,7 @@ impl ScannerMetrics {
     pub fn time_ilm(a: lifecycle::IlmAction) -> Box<dyn Fn(u64) -> Box<dyn Fn() + Send + Sync> + Send + Sync> {
         let a_clone = a as usize;
         if a_clone == lifecycle::IlmAction::NoneAction as usize || a_clone >= lifecycle::IlmAction::ActionCount as usize {
-            return Box::new(move |_: u64| {
-                Box::new(move || {})
-            });
+            return Box::new(move |_: u64| Box::new(move || {}));
         }
         let start = SystemTime::now();
         Box::new(move |versions: u64| {

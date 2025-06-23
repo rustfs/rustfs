@@ -1,61 +1,63 @@
 #![allow(clippy::map_entry)]
-use std::pin::Pin;
 use bytes::Bytes;
 use futures::Future;
 use http::{HeaderMap, HeaderName};
-use serde::{Serialize, Deserialize};
-use uuid::Uuid;
+use http::{
+    HeaderValue, Response, StatusCode,
+    request::{Builder, Request},
+};
+use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
+use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use rand::Rng;
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use serde::{Deserialize, Serialize};
+use std::io::Cursor;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::task::{Context, Poll};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use time::Duration;
 use time::OffsetDateTime;
-use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
-use hyper_util::{client::legacy::Client, rt::TokioExecutor, client::legacy::connect::HttpConnector};
-use http::{StatusCode, HeaderValue, request::{Request, Builder}, Response};
-use tracing::{error, debug};
-use url::{form_urlencoded, Url};
 use tokio::io::BufReader;
-use std::io::Cursor;
+use tracing::{debug, error};
+use url::{Url, form_urlencoded};
+use uuid::Uuid;
 
-use s3s::S3ErrorCode;
-use s3s::{dto::Owner, Body};
-use s3s::dto::ReplicationStatus;
 use crate::client::bucket_cache::BucketLocationCache;
-use reader::hasher::{Sha256, MD5,};
+use crate::client::{
+    api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
+    api_get_options::GetObjectOptions,
+    api_put_object::PutObjectOptions,
+    api_put_object_multipart::UploadPartParams,
+    api_s3_datatypes::{
+        CompleteMultipartUpload, CompletePart, ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult,
+        ListObjectPartsResult, ObjectPart,
+    },
+    constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
+    credentials::{CredContext, Credentials, SignatureType, Static},
+};
+use crate::signer;
+use crate::{checksum::ChecksumMode, store_api::GetObjectReader};
+use reader::hasher::{MD5, Sha256};
 use rustfs_rio::HashReader;
 use rustfs_utils::{
     net::get_endpoint_url,
-    retry::{new_retry_timer, MAX_RETRY},
+    retry::{MAX_RETRY, new_retry_timer},
 };
-use crate::{
-    store_api::GetObjectReader,
-    checksum::ChecksumMode,
-};
-use crate::signer;
-use crate::client::{
-    constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
-    credentials::{Credentials, SignatureType, CredContext, Static,},
-    api_error_response::{to_error_response, http_resp_to_error_response, err_invalid_argument},
-    api_put_object_multipart::UploadPartParams,
-    api_put_object::PutObjectOptions,
-    api_get_options::GetObjectOptions,
-    api_s3_datatypes::{CompleteMultipartUpload, CompletePart, ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult, ListObjectPartsResult, ObjectPart},
-};
+use s3s::S3ErrorCode;
+use s3s::dto::ReplicationStatus;
+use s3s::{Body, dto::Owner};
 
 const C_USER_AGENT_PREFIX: &str = "RustFS (linux; x86)";
-const C_USER_AGENT: &str        = "RustFS (linux; x86)";
+const C_USER_AGENT: &str = "RustFS (linux; x86)";
 
-const SUCCESS_STATUS: [StatusCode; 3] = [
-    StatusCode::OK,
-    StatusCode::NO_CONTENT,
-    StatusCode::PARTIAL_CONTENT,
-];
+const SUCCESS_STATUS: [StatusCode; 3] = [StatusCode::OK, StatusCode::NO_CONTENT, StatusCode::PARTIAL_CONTENT];
 
 const C_UNKNOWN: i32 = -1;
 const C_OFFLINE: i32 = 0;
-const C_ONLINE: i32  = 1;
+const C_ONLINE: i32 = 1;
 
 //pub type ReaderImpl = Box<dyn Reader + Send + Sync + 'static>;
 pub enum ReaderImpl {
@@ -71,7 +73,7 @@ pub struct TransitionClient {
     pub override_signer_type: SignatureType,
     /*app_info: TODO*/
     pub secure: bool,
-    pub http_client:     Client<HttpsConnector<HttpConnector>, Body>,
+    pub http_client: Client<HttpsConnector<HttpConnector>, Body>,
     //pub http_trace:      Httptrace.ClientTrace,
     pub bucket_loc_cache: Arc<Mutex<BucketLocationCache>>,
     pub is_trace_enabled: Arc<Mutex<bool>>,
@@ -83,7 +85,7 @@ pub struct TransitionClient {
     pub random: u64,
     pub lookup: BucketLookupType,
     //pub lookupFn: func(u url.URL, bucketName string) BucketLookupType,
-    pub md5_hasher:    Arc<Mutex<Option<MD5>>>,
+    pub md5_hasher: Arc<Mutex<Option<MD5>>>,
     pub sha256_hasher: Option<Sha256>,
     pub health_status: AtomicI32,
     pub trailing_header_support: bool,
@@ -92,16 +94,16 @@ pub struct TransitionClient {
 
 #[derive(Debug, Default)]
 pub struct Options {
-    pub creds:        Credentials<Static>,
-    pub secure:       bool,
+    pub creds: Credentials<Static>,
+    pub secure: bool,
     //pub transport:    http.RoundTripper,
     //pub trace:        *httptrace.ClientTrace,
-    pub region:        String,
+    pub region: String,
     pub bucket_lookup: BucketLookupType,
     //pub custom_region_via_url: func(u url.URL) string,
     //pub bucket_lookup_via_url: func(u url.URL, bucketName string) BucketLookupType,
     pub trailing_headers: bool,
-    pub custom_md5:    Option<MD5>,
+    pub custom_md5: Option<MD5>,
     pub custom_sha256: Option<Sha256>,
     pub max_retries: i64,
 }
@@ -136,15 +138,13 @@ impl TransitionClient {
         //if scheme == "https" {
         //    client = Client::builder(TokioExecutor::new()).build_http();
         //} else {
-            let tls = rustls::ClientConfig::builder()
-                .with_native_roots()?
-                .with_no_client_auth();
-            let https = hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(tls)
-                .https_or_http()
-                .enable_http1()
-                .build();
-            client = Client::builder(TokioExecutor::new()).build(https);
+        let tls = rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth();
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .build();
+        client = Client::builder(TokioExecutor::new()).build(https);
         //}
 
         let mut clnt = TransitionClient {
@@ -167,7 +167,7 @@ impl TransitionClient {
             trailing_header_support: opts.trailing_headers,
             max_retries: opts.max_retries,
         };
-        
+
         {
             let mut md5_hasher = clnt.md5_hasher.lock().unwrap();
             if md5_hasher.is_none() {
@@ -218,7 +218,11 @@ impl TransitionClient {
         todo!();
     }
 
-    pub fn hash_materials(&self, is_md5_requested: bool, is_sha256_requested: bool) -> (HashMap<String, MD5>, HashMap<String, Vec<u8>>) {
+    pub fn hash_materials(
+        &self,
+        is_md5_requested: bool,
+        is_sha256_requested: bool,
+    ) -> (HashMap<String, MD5>, HashMap<String, Vec<u8>>) {
         todo!();
     }
 
@@ -227,7 +231,8 @@ impl TransitionClient {
     }
 
     fn mark_offline(&self) {
-        self.health_status.compare_exchange(C_ONLINE, C_OFFLINE, Ordering::SeqCst, Ordering::SeqCst);
+        self.health_status
+            .compare_exchange(C_ONLINE, C_OFFLINE, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     fn is_offline(&self) -> bool {
@@ -261,7 +266,9 @@ impl TransitionClient {
             debug!("endpoint_url: {}", self.endpoint_url.as_str().to_string());
             resp = http_client.request(req);
         }
-        let resp = resp.await/*.map_err(Into::into)*/.map(|res| res.map(Body::from));
+        let resp = resp
+            .await /*.map_err(Into::into)*/
+            .map(|res| res.map(Body::from));
         debug!("http_client url: {} {}", req_method, req_uri);
         debug!("http_client headers: {:?}", req_headers);
         if let Err(err) = resp {
@@ -282,7 +289,11 @@ impl TransitionClient {
         Ok(resp)
     }
 
-    pub async fn execute_method(&self, method: http::Method, metadata: &mut RequestMetadata) -> Result<http::Response<Body>, std::io::Error> {
+    pub async fn execute_method(
+        &self,
+        method: http::Method,
+        metadata: &mut RequestMetadata,
+    ) -> Result<http::Response<Body>, std::io::Error> {
         if self.is_offline() {
             let mut s = self.endpoint_url.to_string();
             s.push_str(" is offline.");
@@ -295,16 +306,18 @@ impl TransitionClient {
         let mut resp: http::Response<Body>;
 
         //if metadata.content_body != nil {
-            //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
-            retryable = true;
-            if !retryable {
-                req_retry = 1;
-            }
+        //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
+        retryable = true;
+        if !retryable {
+            req_retry = 1;
+        }
         //}
 
         //let mut retry_timer = RetryTimer::new();
         //while let Some(v) = retry_timer.next().await {
-        for _ in [1;1]/*new_retry_timer(req_retry, DefaultRetryUnit, DefaultRetryCap, MaxJitter)*/ {
+        for _ in [1; 1]
+        /*new_retry_timer(req_retry, DefaultRetryUnit, DefaultRetryCap, MaxJitter)*/
+        {
             let req = self.new_request(method, metadata).await?;
 
             resp = self.doit(req).await?;
@@ -355,7 +368,11 @@ impl TransitionClient {
         Err(std::io::Error::other("resp err"))
     }
 
-    async fn new_request(&self, method: http::Method, metadata: &mut RequestMetadata) -> Result<http::Request<Body>, std::io::Error> {
+    async fn new_request(
+        &self,
+        method: http::Method,
+        metadata: &mut RequestMetadata,
+    ) -> Result<http::Request<Body>, std::io::Error> {
         let location = metadata.bucket_location.clone();
         if location == "" {
             if metadata.bucket_name != "" {
@@ -366,8 +383,13 @@ impl TransitionClient {
         let is_makebucket = metadata.object_name == "" && method == http::Method::PUT && metadata.query_values.len() == 0;
         let is_virtual_host = self.is_virtual_host_style_request(&self.endpoint_url, &metadata.bucket_name) && !is_makebucket;
 
-        let target_url = self.make_target_url(&metadata.bucket_name, &metadata.object_name, &location,
-            is_virtual_host, &metadata.query_values)?;
+        let target_url = self.make_target_url(
+            &metadata.bucket_name,
+            &metadata.object_name,
+            &location,
+            is_virtual_host,
+            &metadata.query_values,
+        )?;
 
         let mut req_builder = Request::builder().method(method).uri(target_url.to_string());
 
@@ -377,10 +399,10 @@ impl TransitionClient {
             value = creds_provider.get_with_context(Some(self.cred_context()))?;
         }
 
-        let mut signer_type   = value.signer_type.clone();
-        let access_key_id     = value.access_key_id;
+        let mut signer_type = value.signer_type.clone();
+        let access_key_id = value.access_key_id;
         let secret_access_key = value.secret_access_key;
-        let session_token     = value.session_token;
+        let session_token = value.session_token;
 
         if self.override_signer_type != SignatureType::SignatureDefault {
             signer_type = self.override_signer_type.clone();
@@ -392,24 +414,39 @@ impl TransitionClient {
 
         if metadata.expires != 0 && metadata.pre_sign_url {
             if signer_type == SignatureType::SignatureAnonymous {
-                return Err(std::io::Error::other(err_invalid_argument("Presigned URLs cannot be generated with anonymous credentials.")));
+                return Err(std::io::Error::other(err_invalid_argument(
+                    "Presigned URLs cannot be generated with anonymous credentials.",
+                )));
             }
             if metadata.extra_pre_sign_header.is_some() {
                 if signer_type == SignatureType::SignatureV2 {
-                    return Err(std::io::Error::other(err_invalid_argument("Extra signed headers for Presign with Signature V2 is not supported.")));
+                    return Err(std::io::Error::other(err_invalid_argument(
+                        "Extra signed headers for Presign with Signature V2 is not supported.",
+                    )));
                 }
                 for (k, v) in metadata.extra_pre_sign_header.as_ref().unwrap() {
                     req_builder = req_builder.header(k, v);
                 }
             }
             if signer_type == SignatureType::SignatureV2 {
-                req_builder = signer::pre_sign_v2(req_builder, &access_key_id, &secret_access_key, metadata.expires, is_virtual_host);
+                req_builder =
+                    signer::pre_sign_v2(req_builder, &access_key_id, &secret_access_key, metadata.expires, is_virtual_host);
             } else if signer_type == SignatureType::SignatureV4 {
-                req_builder = signer::pre_sign_v4(req_builder, &access_key_id, &secret_access_key, &session_token, &location, metadata.expires, OffsetDateTime::now_utc());
+                req_builder = signer::pre_sign_v4(
+                    req_builder,
+                    &access_key_id,
+                    &secret_access_key,
+                    &session_token,
+                    &location,
+                    metadata.expires,
+                    OffsetDateTime::now_utc(),
+                );
             }
             let req = match req_builder.body(Body::empty()) {
                 Ok(req) => req,
-                Err(err) => { return Err(std::io::Error::other(err)); }
+                Err(err) => {
+                    return Err(std::io::Error::other(err));
+                }
             };
             return Ok(req);
         }
@@ -423,7 +460,10 @@ impl TransitionClient {
         //req.content_length = metadata.content_length;
         if metadata.content_length <= -1 {
             let chunked_value = HeaderValue::from_str(&vec!["chunked"].join(",")).expect("err");
-            req_builder.headers_mut().expect("err").insert(http::header::TRANSFER_ENCODING, chunked_value);
+            req_builder
+                .headers_mut()
+                .expect("err")
+                .insert(http::header::TRANSFER_ENCODING, chunked_value);
         }
 
         if metadata.content_md5_base64.len() > 0 {
@@ -434,15 +474,17 @@ impl TransitionClient {
         if signer_type == SignatureType::SignatureAnonymous {
             let req = match req_builder.body(Body::empty()) {
                 Ok(req) => req,
-                Err(err) => { return Err(std::io::Error::other(err)); }
+                Err(err) => {
+                    return Err(std::io::Error::other(err));
+                }
             };
             return Ok(req);
         }
 
         if signer_type == SignatureType::SignatureV2 {
-            req_builder = signer::sign_v2(req_builder, metadata.content_length, &access_key_id, &secret_access_key, is_virtual_host);
-        }
-        else if metadata.stream_sha256 && !self.secure {
+            req_builder =
+                signer::sign_v2(req_builder, metadata.content_length, &access_key_id, &secret_access_key, is_virtual_host);
+        } else if metadata.stream_sha256 && !self.secure {
             if metadata.trailer.len() > 0 {
                 //req.Trailer = metadata.trailer;
                 for (_, v) in &metadata.trailer {
@@ -451,8 +493,7 @@ impl TransitionClient {
             }
             //req_builder = signer::streaming_sign_v4(req_builder, &access_key_id,
             //  &secret_access_key, &session_token, &location, metadata.content_length, OffsetDateTime::now_utc(), self.sha256_hasher());
-        }
-        else {
+        } else {
             let mut sha_header = UNSIGNED_PAYLOAD.to_string();
             if metadata.content_sha256_hex != "" {
                 sha_header = metadata.content_sha256_hex.clone();
@@ -462,9 +503,17 @@ impl TransitionClient {
             } else if metadata.trailer.len() > 0 {
                 sha_header = UNSIGNED_PAYLOAD_TRAILER.to_string();
             }
-            req_builder = req_builder.header::<HeaderName, HeaderValue>("X-Amz-Content-Sha256".parse().unwrap(), sha_header.parse().expect("err"));
+            req_builder = req_builder
+                .header::<HeaderName, HeaderValue>("X-Amz-Content-Sha256".parse().unwrap(), sha_header.parse().expect("err"));
 
-            req_builder = signer::sign_v4_trailer(req_builder, &access_key_id, &secret_access_key, &session_token, &location, metadata.trailer.clone());
+            req_builder = signer::sign_v4_trailer(
+                req_builder,
+                &access_key_id,
+                &secret_access_key,
+                &session_token,
+                &location,
+                metadata.trailer.clone(),
+            );
         }
 
         let req;
@@ -482,11 +531,9 @@ impl TransitionClient {
             //req = req_builder.body(s3s::Body::from(metadata.content_body.read_all().await?));
         }
 
-        match req { 
+        match req {
             Ok(req) => Ok(req),
-            Err(err) => {
-                Err(std::io::Error::other(err))   
-            }
+            Err(err) => Err(std::io::Error::other(err)),
         }
     }
 
@@ -498,14 +545,17 @@ impl TransitionClient {
         }*/
     }
 
-    fn make_target_url(&self, bucket_name: &str, object_name: &str, bucket_location: &str, is_virtual_host_style: bool, query_values: &HashMap<String, String>) -> Result<Url, std::io::Error> {
+    fn make_target_url(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        bucket_location: &str,
+        is_virtual_host_style: bool,
+        query_values: &HashMap<String, String>,
+    ) -> Result<Url, std::io::Error> {
         let scheme = self.endpoint_url.scheme();
         let host = self.endpoint_url.host().unwrap();
-        let default_port = if scheme == "https" {
-            443
-        } else {
-            80
-        };
+        let default_port = if scheme == "https" { 443 } else { 80 };
         let port = self.endpoint_url.port().unwrap_or(default_port);
 
         let mut url_str = format!("{scheme}://{host}:{port}/");
@@ -562,7 +612,7 @@ impl TransitionClient {
 }
 
 struct LockedRandSource {
-    src: u64,//rand.Source,
+    src: u64, //rand.Source,
 }
 
 impl LockedRandSource {
@@ -604,76 +654,159 @@ impl TransitionCore {
         Ok(Self(Arc::new(client)))
     }
 
-    pub fn list_objects(&self, bucket: &str, prefix: &str, marker: &str, delimiter: &str, max_keys: i64) -> Result<ListBucketResult, std::io::Error> {
+    pub fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        marker: &str,
+        delimiter: &str,
+        max_keys: i64,
+    ) -> Result<ListBucketResult, std::io::Error> {
         let client = self.0.clone();
         client.list_objects_query(bucket, prefix, marker, delimiter, max_keys, HeaderMap::new())
     }
 
-    pub async fn list_objects_v2(&self, bucket_name: &str, object_prefix: &str, start_after: &str, continuation_token: &str, delimiter: &str, max_keys: i64) -> Result<ListBucketV2Result, std::io::Error> {
+    pub async fn list_objects_v2(
+        &self,
+        bucket_name: &str,
+        object_prefix: &str,
+        start_after: &str,
+        continuation_token: &str,
+        delimiter: &str,
+        max_keys: i64,
+    ) -> Result<ListBucketV2Result, std::io::Error> {
         let client = self.0.clone();
-        client.list_objects_v2_query(bucket_name, object_prefix, continuation_token, true, false, delimiter, start_after, max_keys, HeaderMap::new()).await
+        client
+            .list_objects_v2_query(
+                bucket_name,
+                object_prefix,
+                continuation_token,
+                true,
+                false,
+                delimiter,
+                start_after,
+                max_keys,
+                HeaderMap::new(),
+            )
+            .await
     }
 
     /*pub fn copy_object(&self, source_bucket: &str, source_object: &str, dest_bucket: &str, dest_object: &str, metadata: HashMap<String, String>, src_opts: CopySrcOptions, dst_opts: PutObjectOptions) -> Result<ObjectInfo> {
         self.0.copy_object_do(source_bucket, source_object, dest_bucket, dest_object, metadata, src_opts, dst_opts)
     }*/
 
-    pub fn copy_object_part(&self, src_bucket: &str, src_object: &str, dest_bucket: &str, dest_object: &str, upload_id: &str,
-        part_id: i32, start_offset: i32, length: i64, metadata: HashMap<String, String>,
+    pub fn copy_object_part(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dest_bucket: &str,
+        dest_object: &str,
+        upload_id: &str,
+        part_id: i32,
+        start_offset: i32,
+        length: i64,
+        metadata: HashMap<String, String>,
     ) -> Result<CompletePart, std::io::Error> {
         //self.0.copy_object_part_do(src_bucket, src_object, dest_bucket, dest_object, upload_id,
         //    part_id, start_offset, length, metadata)
         todo!();
     }
 
-    pub async fn put_object(&self, bucket: &str, object: &str, data: ReaderImpl, size: i64, md5_base64: &str, sha256_hex: &str, opts: &PutObjectOptions) -> Result<UploadInfo, std::io::Error> {
-        let hook_reader = data;//newHook(data, opts.progress);
+    pub async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: ReaderImpl,
+        size: i64,
+        md5_base64: &str,
+        sha256_hex: &str,
+        opts: &PutObjectOptions,
+    ) -> Result<UploadInfo, std::io::Error> {
+        let hook_reader = data; //newHook(data, opts.progress);
         let client = self.0.clone();
-        client.put_object_do(bucket, object, hook_reader, md5_base64, sha256_hex, size, opts).await
+        client
+            .put_object_do(bucket, object, hook_reader, md5_base64, sha256_hex, size, opts)
+            .await
     }
 
-    pub async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: PutObjectOptions) -> Result<String, std::io::Error> {
+    pub async fn new_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: PutObjectOptions,
+    ) -> Result<String, std::io::Error> {
         let client = self.0.clone();
         let result = client.initiate_multipart_upload(bucket, object, &opts).await?;
         Ok(result.upload_id)
     }
 
-    pub fn list_multipart_uploads(&self, bucket: &str, prefix: &str, key_marker: &str, upload_id_marker: &str, delimiter: &str, max_uploads: i64) -> Result<ListMultipartUploadsResult, std::io::Error> {
+    pub fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: &str,
+        upload_id_marker: &str,
+        delimiter: &str,
+        max_uploads: i64,
+    ) -> Result<ListMultipartUploadsResult, std::io::Error> {
         let client = self.0.clone();
         client.list_multipart_uploads_query(bucket, key_marker, upload_id_marker, prefix, delimiter, max_uploads)
     }
 
-    pub async fn put_object_part(&self, bucket: &str, object: &str, upload_id: &str, part_id: i64,
-        data: ReaderImpl, size: i64, opts: PutObjectPartOptions
+    pub async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: i64,
+        data: ReaderImpl,
+        size: i64,
+        opts: PutObjectPartOptions,
     ) -> Result<ObjectPart, std::io::Error> {
         let mut p = UploadPartParams {
-            bucket_name:   bucket.to_string(),
-            object_name:   object.to_string(),
-            upload_id:     upload_id.to_string(),
-            reader:        data,
-            part_number:   part_id,
-            md5_base64:    opts.md5_base64,
-            sha256_hex:    opts.sha256_hex,
-            size:          size,
+            bucket_name: bucket.to_string(),
+            object_name: object.to_string(),
+            upload_id: upload_id.to_string(),
+            reader: data,
+            part_number: part_id,
+            md5_base64: opts.md5_base64,
+            sha256_hex: opts.sha256_hex,
+            size: size,
             //sse:           opts.sse,
             stream_sha256: !opts.disable_content_sha256,
             custom_header: opts.custom_header,
-            trailer:       opts.trailer,
+            trailer: opts.trailer,
         };
         let client = self.0.clone();
         client.upload_part(&mut p).await
     }
 
-    pub async fn list_object_parts(&self, bucket: &str, object: &str, upload_id: &str, part_number_marker: i64, max_parts: i64) -> Result<ListObjectPartsResult, std::io::Error> {
+    pub async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: i64,
+        max_parts: i64,
+    ) -> Result<ListObjectPartsResult, std::io::Error> {
         let client = self.0.clone();
-        client.list_object_parts_query(bucket, object, upload_id, part_number_marker, max_parts).await
+        client
+            .list_object_parts_query(bucket, object, upload_id, part_number_marker, max_parts)
+            .await
     }
 
-    pub async fn complete_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, parts: &[CompletePart], opts: PutObjectOptions) -> Result<UploadInfo, std::io::Error> {
+    pub async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        parts: &[CompletePart],
+        opts: PutObjectOptions,
+    ) -> Result<UploadInfo, std::io::Error> {
         let client = self.0.clone();
-        let res = client.complete_multipart_upload(bucket, object, upload_id, CompleteMultipartUpload {
-            parts: parts.to_vec(),
-        }, &opts).await?;
+        let res = client
+            .complete_multipart_upload(bucket, object, upload_id, CompleteMultipartUpload { parts: parts.to_vec() }, &opts)
+            .await?;
         Ok(res)
     }
 
@@ -692,7 +825,12 @@ impl TransitionCore {
         client.put_bucket_policy(bucket_name, bucket_policy).await
     }
 
-    pub async fn get_object(&self, bucket_name: &str, object_name: &str, opts: &GetObjectOptions) -> Result<(ObjectInfo, HeaderMap, ReadCloser), std::io::Error> {
+    pub async fn get_object(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        opts: &GetObjectOptions,
+    ) -> Result<(ObjectInfo, HeaderMap, ReadCloser), std::io::Error> {
         let client = self.0.clone();
         client.get_object_inner(bucket_name, object_name, opts).await
     }
@@ -709,8 +847,8 @@ pub struct PutObjectPartOptions {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ObjectInfo {
-    pub etag:          String,
-    pub name:           String,
+    pub etag: String,
+    pub name: String,
     pub mod_time: OffsetDateTime,
     pub size: usize,
     pub content_type: Option<String>,
@@ -730,16 +868,16 @@ pub struct ObjectInfo {
     #[serde(skip, default = "replication_status_default")]
     pub replication_status: ReplicationStatus,
     pub replication_ready: bool,
-    pub expiration:    OffsetDateTime,
+    pub expiration: OffsetDateTime,
     pub expiration_rule_id: String,
     pub num_versions: usize,
-    
+
     pub restore: RestoreInfo,
 
-    pub checksum_crc32:     String,
-    pub checksum_crc32c:    String,
-    pub checksum_sha1:      String,
-    pub checksum_sha256:    String,
+    pub checksum_crc32: String,
+    pub checksum_crc32c: String,
+    pub checksum_sha1: String,
+    pub checksum_sha256: String,
     pub checksum_crc64nvme: String,
     pub checksum_mode: String,
 }
@@ -767,22 +905,21 @@ impl Default for ObjectInfo {
             version_id: Uuid::nil(),
             replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
             replication_ready: false,
-            expiration:    OffsetDateTime::now_utc(),
+            expiration: OffsetDateTime::now_utc(),
             expiration_rule_id: "".to_string(),
             num_versions: 0,
             restore: RestoreInfo::default(),
-            checksum_crc32:     "".to_string(),
-            checksum_crc32c:    "".to_string(),
-            checksum_sha1:      "".to_string(),
-            checksum_sha256:    "".to_string(),
+            checksum_crc32: "".to_string(),
+            checksum_crc32c: "".to_string(),
+            checksum_sha1: "".to_string(),
+            checksum_sha256: "".to_string(),
             checksum_crc64nvme: "".to_string(),
             checksum_mode: "".to_string(),
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RestoreInfo {
     ongoing_restore: bool,
     expiry_time: OffsetDateTime,
@@ -809,19 +946,19 @@ pub struct ObjectMultipartInfo {
 }
 
 pub struct UploadInfo {
-    pub bucket:        String,
-    pub key:           String,
-    pub etag:          String,
-    pub size:          i64,
+    pub bucket: String,
+    pub key: String,
+    pub etag: String,
+    pub size: i64,
     pub last_modified: OffsetDateTime,
-    pub location:      String,
-    pub version_id:    String,
-    pub expiration:    OffsetDateTime,
+    pub location: String,
+    pub version_id: String,
+    pub expiration: OffsetDateTime,
     pub expiration_rule_id: String,
-    pub checksum_crc32:     String,
-    pub checksum_crc32c:    String,
-    pub checksum_sha1:      String,
-    pub checksum_sha256:    String,
+    pub checksum_crc32: String,
+    pub checksum_crc32c: String,
+    pub checksum_sha1: String,
+    pub checksum_sha256: String,
     pub checksum_crc64nvme: String,
     pub checksum_mode: String,
 }

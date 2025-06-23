@@ -1,6 +1,6 @@
 pub struct TargetID {
-  id:   String,
-  name: String,
+    id: String,
+    name: String,
 }
 
 impl TargetID {

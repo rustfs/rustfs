@@ -1,24 +1,23 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tracing::warn;
 use crate::client::{
     admin_handler_utils::AdminError,
-    transition_api::{Options, ReaderImpl, ReadCloser, TransitionClient, TransitionCore},
-    credentials::{Credentials, SignatureType, Static, Value},
     api_put_object::PutObjectOptions,
+    credentials::{Credentials, SignatureType, Static, Value},
+    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
 use crate::tier::{
     tier_config::TierMinIO,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
     warm_backend_s3::WarmBackendS3,
 };
-
+use tracing::warn;
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
-const MAX_PARTS_COUNT: i64               = 10000;
-const MAX_PART_SIZE: i64                 = 1024 * 1024 * 1024 * 5;
-const MIN_PART_SIZE: i64                 = 1024 * 1024 * 128;
+const MAX_PARTS_COUNT: i64 = 10000;
+const MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
+const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
 pub struct WarmBackendMinIO(WarmBackendS3);
 
@@ -40,26 +39,23 @@ impl WarmBackendMinIO {
         };
 
         let creds = Credentials::new(Static(Value {
-            access_key_id:     conf.access_key.clone(),
+            access_key_id: conf.access_key.clone(),
             secret_access_key: conf.secret_key.clone(),
-            session_token:     "".to_string(),
+            session_token: "".to_string(),
             signer_type: SignatureType::SignatureV4,
             ..Default::default()
         }));
         let opts = Options {
-            creds:     creds,
-            secure:    u.scheme() == "https",
+            creds: creds,
+            secure: u.scheme() == "https",
             //transport: GLOBAL_RemoteTargetTransport,
             trailing_headers: true,
             ..Default::default()
         };
         let scheme = u.scheme();
-        let default_port = if scheme == "https" {
-            443
-        } else {
-            80
-        };
-        let client = TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts).await?;
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let client =
+            TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts).await?;
         //client.set_appinfo(format!("minio-tier-{}", tier), ReleaseTag);
 
         let client = Arc::new(client);
@@ -67,8 +63,8 @@ impl WarmBackendMinIO {
         Ok(Self(WarmBackendS3 {
             client,
             core,
-            bucket:        conf.bucket.clone(),
-            prefix:        conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
+            bucket: conf.bucket.clone(),
+            prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
             storage_class: "".to_string(),
         }))
     }
@@ -76,16 +72,30 @@ impl WarmBackendMinIO {
 
 #[async_trait::async_trait]
 impl WarmBackend for WarmBackendMinIO {
-    async fn put_with_meta(&self, object: &str, r: ReaderImpl, length: i64, meta: HashMap<String, String>) -> Result<String, std::io::Error> {
+    async fn put_with_meta(
+        &self,
+        object: &str,
+        r: ReaderImpl,
+        length: i64,
+        meta: HashMap<String, String>,
+    ) -> Result<String, std::io::Error> {
         let part_size = optimal_part_size(length)?;
         let client = self.0.client.clone();
-        let res = client.put_object(&self.0.bucket, &self.0.get_dest(object), r, length, &PutObjectOptions {
-            storage_class: self.0.storage_class.clone(),
-            part_size: part_size as u64,
-            disable_content_sha256: true,
-            user_metadata: meta,
-            ..Default::default()
-        }).await?;
+        let res = client
+            .put_object(
+                &self.0.bucket,
+                &self.0.get_dest(object),
+                r,
+                length,
+                &PutObjectOptions {
+                    storage_class: self.0.storage_class.clone(),
+                    part_size: part_size as u64,
+                    disable_content_sha256: true,
+                    user_metadata: meta,
+                    ..Default::default()
+                },
+            )
+            .await?;
         //self.ToObjectError(err, object)
         Ok(res.version_id)
     }

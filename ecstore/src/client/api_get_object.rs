@@ -1,13 +1,13 @@
 #![allow(clippy::map_entry)]
 use bytes::Bytes;
 use http::HeaderMap;
-use tokio::io::BufReader;
 use std::io::Cursor;
+use tokio::io::BufReader;
 
 use crate::client::{
-    transition_api::{ObjectInfo, to_object_info, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient},
     api_error_response::err_invalid_argument,
     api_get_options::GetObjectOptions,
+    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
@@ -16,24 +16,34 @@ impl TransitionClient {
         todo!();
     }
 
-    pub async fn get_object_inner(&self, bucket_name: &str, object_name: &str, opts: &GetObjectOptions) -> Result<(ObjectInfo, HeaderMap, ReadCloser), std::io::Error> {
-        let resp = self.execute_method(http::Method::GET, &mut RequestMetadata {
-            bucket_name: bucket_name.to_string(),
-            object_name: object_name.to_string(),
-            query_values:      opts.to_query_values(),
-            custom_header:     opts.header(),
-            content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-            content_body:  ReaderImpl::Body(Bytes::new()),
-            content_length: 0,
-            content_md5_base64: "".to_string(),
-            stream_sha256: false,
-            trailer: HeaderMap::new(),
-            pre_sign_url: Default::default(),
-            add_crc: Default::default(),
-            extra_pre_sign_header: Default::default(),
-            bucket_location: Default::default(),
-            expires: Default::default(),
-        }).await?;
+    pub async fn get_object_inner(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        opts: &GetObjectOptions,
+    ) -> Result<(ObjectInfo, HeaderMap, ReadCloser), std::io::Error> {
+        let resp = self
+            .execute_method(
+                http::Method::GET,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: object_name.to_string(),
+                    query_values: opts.to_query_values(),
+                    custom_header: opts.header(),
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
 
         let resp = &resp;
         let object_stat = to_object_info(bucket_name, object_name, resp.headers())?;
@@ -45,20 +55,20 @@ impl TransitionClient {
 
 #[derive(Default)]
 struct GetRequest {
-    pub buffer:              Vec<u8>,
-    pub offset:              i64,
-    pub did_offset_change:   bool,
-    pub been_read:           bool,
-    pub is_read_at:           bool,
-    pub is_read_op:           bool,
-    pub is_first_req:         bool,
+    pub buffer: Vec<u8>,
+    pub offset: i64,
+    pub did_offset_change: bool,
+    pub been_read: bool,
+    pub is_read_at: bool,
+    pub is_read_op: bool,
+    pub is_first_req: bool,
     pub setting_object_info: bool,
 }
 
 struct GetResponse {
-    pub size:        i64,
+    pub size: i64,
     //pub error:       error,
-    pub did_read:    bool,
+    pub did_read: bool,
     pub object_info: ObjectInfo,
 }
 
@@ -79,9 +89,7 @@ struct Object {
 
 impl Object {
     pub fn new() -> Object {
-        Self {
-          ..Default::default()
-        }
+        Self { ..Default::default() }
     }
 
     fn do_get_request(&self, request: &GetRequest) -> Result<GetResponse, std::io::Error> {
@@ -121,7 +129,7 @@ impl Object {
     fn stat(&self) -> Result<ObjectInfo, std::io::Error> {
         if !self.is_started || !self.object_info_set {
             let _ = self.do_get_request(&GetRequest {
-                is_first_req:        !self.is_started,
+                is_first_req: !self.is_started,
                 setting_object_info: !self.object_info_set,
                 ..Default::default()
             })?;
@@ -134,12 +142,12 @@ impl Object {
         self.curr_offset = offset;
 
         let mut read_at_req = GetRequest {
-            is_read_op:        true,
-            is_read_at:        true,
+            is_read_op: true,
+            is_read_at: true,
             did_offset_change: true,
-            been_read:         self.been_read,
+            been_read: self.been_read,
             offset,
-            buffer:            b.to_vec(),
+            buffer: b.to_vec(),
             ..Default::default()
         };
 
@@ -160,8 +168,8 @@ impl Object {
     fn seek(&mut self, offset: i64, whence: i64) -> Result<i64, std::io::Error> {
         if !self.is_started || !self.object_info_set {
             let seek_req = GetRequest {
-                is_read_op:   false,
-                offset:     offset,
+                is_read_op: false,
+                offset: offset,
                 is_first_req: true,
                 ..Default::default()
             };

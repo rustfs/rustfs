@@ -1,4 +1,4 @@
-use s3s::{S3ErrorCode, S3Error};
+use s3s::{S3Error, S3ErrorCode};
 
 use rustfs_utils::path::decode_dir_object;
 
@@ -727,16 +727,16 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
 }
 
 pub fn is_network_or_host_down(err: &str, expect_timeouts: bool) -> bool {
-    err.contains("Connection closed by foreign host") ||
-    err.contains("TLS handshake timeout") ||
-    err.contains("i/o timeout") ||
-    err.contains("connection timed out") ||
-    err.contains("connection reset by peer") ||
-    err.contains("broken pipe") ||
-    err.to_lowercase().contains("503 service unavailable") ||
-    err.contains("use of closed network connection") ||
-    err.contains("An existing connection was forcibly closed by the remote host") ||
-    err.contains("client error (Connect)")
+    err.contains("Connection closed by foreign host")
+        || err.contains("TLS handshake timeout")
+        || err.contains("i/o timeout")
+        || err.contains("connection timed out")
+        || err.contains("connection reset by peer")
+        || err.contains("broken pipe")
+        || err.to_lowercase().contains("503 service unavailable")
+        || err.contains("use of closed network connection")
+        || err.contains("An existing connection was forcibly closed by the remote host")
+        || err.contains("client error (Connect)")
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -834,7 +834,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
             err = std::io::Error::other(StorageError::BucketNameInvalid(bucket));
         }
         S3ErrorCode::InvalidPart => {
-            err = std::io::Error::other(StorageError::InvalidPart(0, bucket, object/* , version_id */));
+            err = std::io::Error::other(StorageError::InvalidPart(0, bucket, object /* , version_id */));
         }
         S3ErrorCode::NoSuchBucket => {
             err = std::io::Error::other(StorageError::BucketNotFound(bucket));
@@ -848,7 +848,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         }
         S3ErrorCode::NoSuchVersion => {
             if object != "" {
-                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object));//, version_id);
+                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object)); //, version_id);
             } else {
                 err = std::io::Error::other(StorageError::BucketNotFound(bucket));
             }
@@ -894,9 +894,15 @@ pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
         StorageError::InvalidArgument(bucket, object, version_id) => {
             s3_error!(InvalidArgument, "Invalid arguments provided for {}/{}-{}", bucket, object, version_id)
         }*/
-        StorageError::MethodNotAllowed => {
-            S3Error::with_message(S3ErrorCode::MethodNotAllowed, ObjectApiError::MethodNotAllowed(GenericError {bucket: bucket, object: object, ..Default::default()}).to_string())
-        }
+        StorageError::MethodNotAllowed => S3Error::with_message(
+            S3ErrorCode::MethodNotAllowed,
+            ObjectApiError::MethodNotAllowed(GenericError {
+                bucket: bucket,
+                object: object,
+                ..Default::default()
+            })
+            .to_string(),
+        ),
         /*StorageError::BucketNotFound(bucket) => {
             s3_error!(NoSuchBucket, "bucket not found {}", bucket)
         }

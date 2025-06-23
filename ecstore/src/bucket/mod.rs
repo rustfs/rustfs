@@ -1,4 +1,5 @@
 pub mod error;
+pub mod lifecycle;
 pub mod metadata;
 pub mod metadata_sys;
 pub mod object_lock;
@@ -10,4 +11,3 @@ pub mod target;
 pub mod utils;
 pub mod versioning;
 pub mod versioning_sys;
-pub mod lifecycle;

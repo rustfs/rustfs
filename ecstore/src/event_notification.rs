@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::store_api::ObjectInfo;
+use crate::bucket::metadata::BucketMetadata;
 use crate::event::name::EventName;
 use crate::event::targetlist::TargetList;
 use crate::store::ECStore;
-use crate::bucket::metadata::BucketMetadata;
+use crate::store_api::ObjectInfo;
 
 pub struct EventNotifier {
     target_list: TargetList,
@@ -16,7 +16,7 @@ pub struct EventNotifier {
 impl EventNotifier {
     pub fn new() -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
-            target_list:     TargetList::new(),
+            target_list: TargetList::new(),
             //bucket_rules_map: HashMap::new(),
         }))
     }
@@ -54,8 +54,6 @@ pub struct EventArgs {
     pub user_agent: String,
 }
 
-impl EventArgs {
-}
+impl EventArgs {}
 
-pub fn send_event(args: EventArgs) {
-}
+pub fn send_event(args: EventArgs) {}

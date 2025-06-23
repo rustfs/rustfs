@@ -2,22 +2,19 @@ use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::cmd::bucket_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use crate::error::{Error, Result};
-use rustfs_utils::path::decode_dir_object;
 use crate::heal::heal_ops::HealSequence;
 use crate::store_utils::clean_metadata;
-use crate::{disk::DiskStore, heal::heal_commands::HealOpts,};
 use crate::{
-    bucket::lifecycle::{
-        lifecycle::TransitionOptions,
-        bucket_lifecycle_ops::TransitionedObject,
-    },
     bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent,
     bucket::lifecycle::lifecycle::ExpirationOptions,
+    bucket::lifecycle::{bucket_lifecycle_ops::TransitionedObject, lifecycle::TransitionOptions},
 };
+use crate::{disk::DiskStore, heal::heal_commands::HealOpts};
 use http::{HeaderMap, HeaderValue};
 use madmin::heal_commands::HealResultItem;
 use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, headers::AMZ_OBJECT_TAGGING};
 use rustfs_rio::{HashReader, Reader};
+use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -444,15 +441,18 @@ impl ObjectInfo {
 
         // TODO:expires
         // TODO:ReplicationState
-        
-        let transitioned_object = TransitionedObject {
-            name:          fi.transitioned_objname.clone(),
-            version_id:    if let Some(transition_version_id) = fi.transition_version_id { transition_version_id.to_string() } else { "".to_string() },
-            status:        fi.transition_status.clone(),
-            free_version:  fi.tier_free_version(),
-            tier:          fi.transition_tier.clone(),
-        };
 
+        let transitioned_object = TransitionedObject {
+            name: fi.transitioned_objname.clone(),
+            version_id: if let Some(transition_version_id) = fi.transition_version_id {
+                transition_version_id.to_string()
+            } else {
+                "".to_string()
+            },
+            status: fi.transition_status.clone(),
+            free_version: fi.tier_free_version(),
+            tier: fi.transition_tier.clone(),
+        };
 
         let metadata = {
             let mut v = fi.metadata.clone();

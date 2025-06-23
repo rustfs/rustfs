@@ -1,26 +1,24 @@
 #![allow(clippy::map_entry)]
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use s3s::S3ErrorCode;
+use s3s::dto::ReplicationStatus;
+use s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION;
 use std::fmt::Display;
 use std::{collections::HashMap, sync::Arc};
-use bytes::Bytes;
-use s3s::header::X_AMZ_BYPASS_GOVERNANCE_RETENTION;
-use s3s::S3ErrorCode;
 use time::OffsetDateTime;
-use s3s::dto::ReplicationStatus;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
-use reader::hasher::{sum_sha256_hex, sum_md5_base64};
-use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use crate::client::{
+    api_error_response::{ErrorResponse, http_resp_to_error_response, to_error_response},
+    transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
+};
 use crate::{
     disk::DiskAPI,
-    store_api::{
-        GetObjectReader, ObjectInfo, StorageAPI,
-    },
+    store_api::{GetObjectReader, ObjectInfo, StorageAPI},
 };
-use crate::client::{
-    transition_api::{TransitionClient, RequestMetadata, ReaderImpl},
-    api_error_response::{http_resp_to_error_response, to_error_response, ErrorResponse,},
-};
+use reader::hasher::{sum_md5_base64, sum_sha256_hex};
+use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
 struct RemoveBucketOptions {
     forced_elete: bool,
@@ -62,23 +60,28 @@ impl TransitionClient {
             headers.insert(rustFSForceDelete, "true");
         }*/
 
-        let resp = self.execute_method(Method::DELETE, &mut RequestMetadata {
-            bucket_name:        bucket_name.to_string(),
-            content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-            custom_header:      headers,
-            object_name: "".to_string(),
-            query_values:  Default::default(),
-            content_body:  ReaderImpl::Body(Bytes::new()),
-            content_length: 0,
-            content_md5_base64: "".to_string(),
-            stream_sha256: false,
-            trailer: HeaderMap::new(),
-            pre_sign_url: Default::default(),
-            add_crc: Default::default(),
-            extra_pre_sign_header: Default::default(),
-            bucket_location: Default::default(),
-            expires: Default::default(),
-        }).await?;
+        let resp = self
+            .execute_method(
+                Method::DELETE,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    custom_header: headers,
+                    object_name: "".to_string(),
+                    query_values: Default::default(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
 
         {
             let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
@@ -88,23 +91,28 @@ impl TransitionClient {
     }
 
     pub async fn remove_bucket(&self, bucket_name: &str) -> Result<(), std::io::Error> {
-        let resp = self.execute_method(http::Method::DELETE, &mut RequestMetadata {
-            bucket_name:        bucket_name.to_string(),
-            content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-            custom_header: Default::default(),
-            object_name: "".to_string(),
-            query_values:  Default::default(),
-            content_body:  ReaderImpl::Body(Bytes::new()),
-            content_length: 0,
-            content_md5_base64: "".to_string(),
-            stream_sha256: false,
-            trailer: HeaderMap::new(),
-            pre_sign_url: Default::default(),
-            add_crc: Default::default(),
-            extra_pre_sign_header: Default::default(),
-            bucket_location: Default::default(),
-            expires: Default::default(),
-        }).await?;
+        let resp = self
+            .execute_method(
+                http::Method::DELETE,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    custom_header: Default::default(),
+                    object_name: "".to_string(),
+                    query_values: Default::default(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
 
         {
             let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
@@ -119,7 +127,12 @@ impl TransitionClient {
         res.err
     }
 
-    pub async fn remove_object_inner(&self, bucket_name: &str, object_name: &str, opts: RemoveObjectOptions) -> Result<RemoveObjectResult, std::io::Error> {
+    pub async fn remove_object_inner(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        opts: RemoveObjectOptions,
+    ) -> Result<RemoveObjectResult, std::io::Error> {
         let mut url_values = HashMap::new();
 
         if opts.version_id != "" {
@@ -129,49 +142,72 @@ impl TransitionClient {
         let mut headers = HeaderMap::new();
 
         if opts.governance_bypass {
-            headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, "true".parse().expect("err"));//amzBypassGovernance
+            headers.insert(X_AMZ_BYPASS_GOVERNANCE_RETENTION, "true".parse().expect("err")); //amzBypassGovernance
         }
 
-        let resp = self.execute_method(http::Method::DELETE, &mut RequestMetadata {
-            bucket_name:       bucket_name.to_string(),
-            object_name:       object_name.to_string(),
-            content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-            query_values:      url_values,
-            custom_header:     headers,
-            content_body:  ReaderImpl::Body(Bytes::new()),
-            content_length: 0,
-            content_md5_base64: "".to_string(),
-            stream_sha256: false,
-            trailer: HeaderMap::new(),
-            pre_sign_url: Default::default(),
-            add_crc: Default::default(),
-            extra_pre_sign_header: Default::default(),
-            bucket_location: Default::default(),
-            expires: Default::default(),
-        }).await?;
+        let resp = self
+            .execute_method(
+                http::Method::DELETE,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: object_name.to_string(),
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    query_values: url_values,
+                    custom_header: headers,
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
 
         Ok(RemoveObjectResult {
             object_name: object_name.to_string(),
-            object_version_id:        opts.version_id,
-            delete_marker:            resp.headers().get("x-amz-delete-marker").expect("err") == "true",
-            delete_marker_version_id: resp.headers().get("x-amz-version-id").expect("err").to_str().expect("err").to_string(),
+            object_version_id: opts.version_id,
+            delete_marker: resp.headers().get("x-amz-delete-marker").expect("err") == "true",
+            delete_marker_version_id: resp
+                .headers()
+                .get("x-amz-version-id")
+                .expect("err")
+                .to_str()
+                .expect("err")
+                .to_string(),
             ..Default::default()
         })
     }
 
-    pub async fn remove_objects_with_result(self: Arc<Self>, bucket_name: &str, objects_rx: Receiver<ObjectInfo>, opts: RemoveObjectsOptions) -> Receiver<RemoveObjectResult> {
+    pub async fn remove_objects_with_result(
+        self: Arc<Self>,
+        bucket_name: &str,
+        objects_rx: Receiver<ObjectInfo>,
+        opts: RemoveObjectsOptions,
+    ) -> Receiver<RemoveObjectResult> {
         let (result_tx, mut result_rx) = mpsc::channel(1);
 
         let self_clone = Arc::clone(&self);
         let bucket_name_owned = bucket_name.to_string();
 
         tokio::spawn(async move {
-            self_clone.remove_objects_inner(&bucket_name_owned, objects_rx, &result_tx, opts).await;
+            self_clone
+                .remove_objects_inner(&bucket_name_owned, objects_rx, &result_tx, opts)
+                .await;
         });
         result_rx
     }
 
-    pub async fn remove_objects(self: Arc<Self>, bucket_name: &str, objects_rx: Receiver<ObjectInfo>, opts: RemoveObjectsOptions) -> Receiver<RemoveObjectError> {
+    pub async fn remove_objects(
+        self: Arc<Self>,
+        bucket_name: &str,
+        objects_rx: Receiver<ObjectInfo>,
+        opts: RemoveObjectsOptions,
+    ) -> Receiver<RemoveObjectError> {
         let (error_tx, mut error_rx) = mpsc::channel(1);
 
         let self_clone = Arc::clone(&self);
@@ -179,26 +215,36 @@ impl TransitionClient {
 
         let (result_tx, mut result_rx) = mpsc::channel(1);
         tokio::spawn(async move {
-            self_clone.remove_objects_inner(&bucket_name_owned, objects_rx, &result_tx, opts).await;
+            self_clone
+                .remove_objects_inner(&bucket_name_owned, objects_rx, &result_tx, opts)
+                .await;
         });
         tokio::spawn(async move {
             while let Some(res) = result_rx.recv().await {
                 if res.err.is_none() {
                     continue;
                 }
-                error_tx.send(RemoveObjectError {
-                    object_name: res.object_name,
-                    version_id:  res.object_version_id,
-                    err:         res.err,
-                    ..Default::default()
-                }).await;
+                error_tx
+                    .send(RemoveObjectError {
+                        object_name: res.object_name,
+                        version_id: res.object_version_id,
+                        err: res.err,
+                        ..Default::default()
+                    })
+                    .await;
             }
         });
 
         error_rx
     }
 
-    pub async fn remove_objects_inner(&self, bucket_name: &str, mut objects_rx: Receiver<ObjectInfo>, result_tx: &Sender<RemoveObjectResult>, opts: RemoveObjectsOptions) -> Result<(), std::io::Error> {
+    pub async fn remove_objects_inner(
+        &self,
+        bucket_name: &str,
+        mut objects_rx: Receiver<ObjectInfo>,
+        result_tx: &Sender<RemoveObjectResult>,
+        opts: RemoveObjectsOptions,
+    ) -> Result<(), std::io::Error> {
         let max_entries = 1000;
         let mut finish = false;
         let mut url_values = HashMap::new();
@@ -213,11 +259,17 @@ impl TransitionClient {
 
             while let Some(object) = objects_rx.recv().await {
                 if has_invalid_xml_char(&object.name) {
-                    let remove_result = self.remove_object_inner(bucket_name, &object.name, RemoveObjectOptions {
-                        version_id:        object.version_id.expect("err").to_string(),
-                        governance_bypass: opts.governance_bypass,
-                        ..Default::default()
-                    }).await?;
+                    let remove_result = self
+                        .remove_object_inner(
+                            bucket_name,
+                            &object.name,
+                            RemoveObjectOptions {
+                                version_id: object.version_id.expect("err").to_string(),
+                                governance_bypass: opts.governance_bypass,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
                     let remove_result_clone = remove_result.clone();
                     if !remove_result.err.is_none() {
                         match to_error_response(&remove_result.err.expect("err")).code {
@@ -241,7 +293,7 @@ impl TransitionClient {
             }
             if count == 0 {
                 break;
-            } 
+            }
             if count < max_entries {
                 finish = true;
             }
@@ -252,23 +304,28 @@ impl TransitionClient {
             }
 
             let remove_bytes = generate_remove_multi_objects_request(&batch);
-            let resp = self.execute_method(http::Method::POST, &mut RequestMetadata {
-                bucket_name:       bucket_name.to_string(),
-                query_values:      url_values.clone(),
-                content_body:      ReaderImpl::Body(Bytes::from(remove_bytes.clone())),
-                content_length:    remove_bytes.len() as i64,
-                content_md5_base64: sum_md5_base64(&remove_bytes),
-                content_sha256_hex: sum_sha256_hex(&remove_bytes),
-                custom_header:     headers,
-                object_name: "".to_string(),
-                stream_sha256: false,
-                trailer: HeaderMap::new(),
-                pre_sign_url: Default::default(),
-                add_crc: Default::default(),
-                extra_pre_sign_header: Default::default(),
-                bucket_location: Default::default(),
-                expires: Default::default(),
-            }).await?;
+            let resp = self
+                .execute_method(
+                    http::Method::POST,
+                    &mut RequestMetadata {
+                        bucket_name: bucket_name.to_string(),
+                        query_values: url_values.clone(),
+                        content_body: ReaderImpl::Body(Bytes::from(remove_bytes.clone())),
+                        content_length: remove_bytes.len() as i64,
+                        content_md5_base64: sum_md5_base64(&remove_bytes),
+                        content_sha256_hex: sum_sha256_hex(&remove_bytes),
+                        custom_header: headers,
+                        object_name: "".to_string(),
+                        stream_sha256: false,
+                        trailer: HeaderMap::new(),
+                        pre_sign_url: Default::default(),
+                        add_crc: Default::default(),
+                        extra_pre_sign_header: Default::default(),
+                        bucket_location: Default::default(),
+                        expires: Default::default(),
+                    },
+                )
+                .await?;
 
             let body_bytes: Vec<u8> = resp.body().bytes().expect("err").to_vec();
             process_remove_multi_objects_response(ReaderImpl::Body(Bytes::from(body_bytes)), result_tx.clone());
@@ -285,49 +342,77 @@ impl TransitionClient {
         Ok(())
     }
 
-    pub async fn abort_multipart_upload(&self, bucket_name: &str, object_name: &str, upload_id: &str) -> Result<(), std::io::Error> {
+    pub async fn abort_multipart_upload(
+        &self,
+        bucket_name: &str,
+        object_name: &str,
+        upload_id: &str,
+    ) -> Result<(), std::io::Error> {
         let mut url_values = HashMap::new();
         url_values.insert("uploadId".to_string(), upload_id.to_string());
 
-        let resp = self.execute_method(http::Method::DELETE, &mut RequestMetadata {
-            bucket_name:       bucket_name.to_string(),
-            object_name:       object_name.to_string(),
-            query_values:       url_values,
-            content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
-            custom_header: HeaderMap::new(),
-            content_body:  ReaderImpl::Body(Bytes::new()),
-            content_length: 0,
-            content_md5_base64: "".to_string(),
-            stream_sha256: false,
-            trailer: HeaderMap::new(),
-            pre_sign_url: Default::default(),
-            add_crc: Default::default(),
-            extra_pre_sign_header: Default::default(),
-            bucket_location: Default::default(),
-            expires: Default::default(),
-        }).await?;
+        let resp = self
+            .execute_method(
+                http::Method::DELETE,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: object_name.to_string(),
+                    query_values: url_values,
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    custom_header: HeaderMap::new(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
         //if resp.is_some() {
-            if resp.status() != StatusCode::NO_CONTENT {
-                let error_response: ErrorResponse;
-                match resp.status() {
-                    StatusCode::NOT_FOUND => {
-                        error_response = ErrorResponse {
-                            code:        S3ErrorCode::NoSuchUpload,
-                            message:     "The specified multipart upload does not exist.".to_string(),
-                            bucket_name: bucket_name.to_string(),
-                            key:         object_name.to_string(),
-                            request_id:  resp.headers().get("x-amz-request-id").expect("err").to_str().expect("err").to_string(),
-                            host_id:     resp.headers().get("x-amz-id-2").expect("err").to_str().expect("err").to_string(),
-                            region:      resp.headers().get("x-amz-bucket-region").expect("err").to_str().expect("err").to_string(),
-                            ..Default::default()
-                        };
-                    }
-                    _ => {
-                        return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
-                    }
+        if resp.status() != StatusCode::NO_CONTENT {
+            let error_response: ErrorResponse;
+            match resp.status() {
+                StatusCode::NOT_FOUND => {
+                    error_response = ErrorResponse {
+                        code: S3ErrorCode::NoSuchUpload,
+                        message: "The specified multipart upload does not exist.".to_string(),
+                        bucket_name: bucket_name.to_string(),
+                        key: object_name.to_string(),
+                        request_id: resp
+                            .headers()
+                            .get("x-amz-request-id")
+                            .expect("err")
+                            .to_str()
+                            .expect("err")
+                            .to_string(),
+                        host_id: resp
+                            .headers()
+                            .get("x-amz-id-2")
+                            .expect("err")
+                            .to_str()
+                            .expect("err")
+                            .to_string(),
+                        region: resp
+                            .headers()
+                            .get("x-amz-bucket-region")
+                            .expect("err")
+                            .to_str()
+                            .expect("err")
+                            .to_string(),
+                        ..Default::default()
+                    };
                 }
-                return Err(std::io::Error::other(error_response));
+                _ => {
+                    return Err(std::io::Error::other(http_resp_to_error_response(resp, vec![], bucket_name, object_name)));
+                }
             }
+            return Err(std::io::Error::other(error_response));
+        }
         //}
         Ok(())
     }
@@ -336,8 +421,8 @@ impl TransitionClient {
 #[derive(Debug, Default)]
 struct RemoveObjectError {
     object_name: String,
-    version_id:  String,
-    err:        Option<std::io::Error>,
+    version_id: String,
+    err: Option<std::io::Error>,
 }
 
 impl Display for RemoveObjectError {
@@ -367,7 +452,7 @@ impl Clone for RemoveObjectResult {
             delete_marker_version_id: self.delete_marker_version_id.clone(),
             err: None, //err
         }
-    }    
+    }
 }
 
 pub struct RemoveObjectsOptions {

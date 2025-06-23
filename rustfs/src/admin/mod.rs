@@ -7,7 +7,7 @@ pub mod utils;
 use handlers::{
     group, policys, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
-    sts, user, tier,
+    sts, tier, user,
 };
 
 use handlers::{GetReplicationMetricsHandler, ListRemoteTargetHandler, RemoveRemoteTargetHandler, SetRemoteTargetHandler};

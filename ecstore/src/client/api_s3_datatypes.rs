@@ -1,12 +1,12 @@
 #![allow(clippy::map_entry)]
-use std::collections::HashMap;
 use s3s::dto::Owner;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
-use rustfs_utils::crypto::base64_decode;
 use crate::checksum::ChecksumMode;
 use crate::client::transition_api::ObjectMultipartInfo;
+use rustfs_utils::crypto::base64_decode;
 
 use super::transition_api;
 
@@ -31,15 +31,15 @@ pub struct ListBucketV2Result {
     pub name: String,
     pub next_continuation_token: String,
     pub continuation_token: String,
-    pub prefix:             String,
+    pub prefix: String,
     pub fetch_owner: String,
     pub start_after: String,
 }
 
 pub struct Version {
-    etag:         String,
-    is_latest:    bool,
-    key:          String,
+    etag: String,
+    is_latest: bool,
+    key: String,
     last_modified: OffsetDateTime,
     owner: Owner,
     size: i64,
@@ -53,15 +53,15 @@ pub struct Version {
 pub struct ListVersionsResult {
     versions: Vec<Version>,
     common_prefixes: Vec<CommonPrefix>,
-    name:                String,
-    prefix:              String,
-    delimiter:           String,
-    max_keys:            i64,
-    encoding_type:       String,
-    is_truncated:        bool,
-    key_marker:          String,
-    version_id_marker:      String,
-    next_key_marker:        String,
+    name: String,
+    prefix: String,
+    delimiter: String,
+    max_keys: i64,
+    encoding_type: String,
+    is_truncated: bool,
+    key_marker: String,
+    version_id_marker: String,
+    next_key_marker: String,
     next_version_id_marker: String,
 }
 
@@ -77,35 +77,35 @@ pub struct ListBucketResult {
     delimiter: String,
     encoding_type: String,
     is_truncated: bool,
-    marker:       String,
-    max_keys:     i64,
-    name:         String,
-    next_marker:  String,
-    prefix:       String,
+    marker: String,
+    max_keys: i64,
+    name: String,
+    next_marker: String,
+    prefix: String,
 }
 
 pub struct ListMultipartUploadsResult {
-    bucket:                String,
-    key_marker:            String,
-    upload_id_marker:      String,
-    next_key_marker:       String,
+    bucket: String,
+    key_marker: String,
+    upload_id_marker: String,
+    next_key_marker: String,
     next_upload_id_marker: String,
-    encoding_type:         String,
-    max_uploads:           i64,
-    is_truncated:          bool,
-    uploads:            Vec<ObjectMultipartInfo>,
-    prefix:             String,
-    delimiter:          String,
-    common_prefixes:    Vec<CommonPrefix>,
+    encoding_type: String,
+    max_uploads: i64,
+    is_truncated: bool,
+    uploads: Vec<ObjectMultipartInfo>,
+    prefix: String,
+    delimiter: String,
+    common_prefixes: Vec<CommonPrefix>,
 }
 
 pub struct Initiator {
-    id:           String,
+    id: String,
     display_name: String,
 }
 
 pub struct CopyObjectResult {
-    pub etag:          String,
+    pub etag: String,
     pub last_modified: OffsetDateTime,
 }
 
@@ -115,10 +115,10 @@ pub struct ObjectPart {
     pub part_num: i64,
     pub last_modified: OffsetDateTime,
     pub size: i64,
-    pub checksum_crc32:     String,
-    pub checksum_crc32c:    String,
-    pub checksum_sha1:      String,
-    pub checksum_sha256:    String,
+    pub checksum_crc32: String,
+    pub checksum_crc32c: String,
+    pub checksum_sha1: String,
+    pub checksum_sha256: String,
     pub checksum_crc64nvme: String,
 }
 
@@ -129,14 +129,13 @@ impl Default for ObjectPart {
             part_num: 0,
             last_modified: OffsetDateTime::now_utc(),
             size: 0,
-            checksum_crc32:     Default::default(),
-            checksum_crc32c:    Default::default(),
-            checksum_sha1:      Default::default(),
-            checksum_sha256:    Default::default(),
+            checksum_crc32: Default::default(),
+            checksum_crc32c: Default::default(),
+            checksum_sha1: Default::default(),
+            checksum_sha256: Default::default(),
             checksum_crc64nvme: Default::default(),
         }
     }
-    
 }
 
 impl ObjectPart {
@@ -216,15 +215,15 @@ pub struct CompleteMultipartUploadResult {
     pub checksum_crc64nvme: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(serde::Serialize)]
-pub struct CompletePart { //api has
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct CompletePart {
+    //api has
     pub etag: String,
     pub part_num: i64,
-    pub checksum_crc32:     String,
-    pub checksum_crc32c:    String,
-    pub checksum_sha1:      String,
-    pub checksum_sha256:    String,
+    pub checksum_crc32: String,
+    pub checksum_crc32c: String,
+    pub checksum_sha1: String,
+    pub checksum_sha256: String,
     pub checksum_crc64nvme: String,
 }
 
@@ -258,8 +257,7 @@ pub struct CopyObjectPartResult {
     pub last_modified: OffsetDateTime,
 }
 
-#[derive(Debug, Default)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct CompleteMultipartUpload {
     pub parts: Vec<CompletePart>,
 }
@@ -287,12 +285,14 @@ pub struct CreateBucketConfiguration {
 }
 
 #[derive(serde::Serialize)]
-pub struct DeleteObject {  //api has
+pub struct DeleteObject {
+    //api has
     pub key: String,
     pub version_id: String,
 }
 
-pub struct DeletedObject {  //s3s has
+pub struct DeletedObject {
+    //s3s has
     pub key: String,
     pub version_id: String,
     pub deletemarker: bool,
@@ -300,15 +300,15 @@ pub struct DeletedObject {  //s3s has
 }
 
 pub struct NonDeletedObject {
-    pub key:        String,
-    pub code:       String,
-    pub message:    String,
+    pub key: String,
+    pub code: String,
+    pub message: String,
     pub version_id: String,
 }
 
 #[derive(serde::Serialize)]
 pub struct DeleteMultiObjects {
-    pub quiet:   bool,
+    pub quiet: bool,
     pub objects: Vec<DeleteObject>,
 }
 
@@ -331,6 +331,6 @@ impl DeleteMultiObjects {
 }
 
 pub struct DeleteMultiObjectsResult {
-    pub deleted_objects:   Vec<DeletedObject>,
+    pub deleted_objects: Vec<DeletedObject>,
     pub undeleted_objects: Vec<NonDeletedObject>,
 }

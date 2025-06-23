@@ -1,7 +1,6 @@
 #![allow(clippy::map_entry)]
 use std::{collections::HashMap, sync::Arc};
 
-use rustfs_filemeta::FileInfo;
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::{
@@ -30,6 +29,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use rustfs_filemeta::FileInfo;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -591,7 +591,9 @@ impl StorageAPI for Sets {
 
     #[tracing::instrument(skip(self))]
     async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.get_disks_by_key(object).restore_transitioned_object(bucket, object, opts).await
+        self.get_disks_by_key(object)
+            .restore_transitioned_object(bucket, object, opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -687,8 +689,6 @@ impl StorageAPI for Sets {
             .put_object_tags(bucket, object, tags, opts)
             .await
     }
-
-
 
     #[tracing::instrument(skip(self))]
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {

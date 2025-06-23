@@ -1,6 +1,6 @@
-use s3s::header::X_AMZ_RESTORE;
-use crate::error::ObjectApiError;
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
+use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+use crate::client::{object_api_utils::extract_etag, transition_api::ReaderImpl};
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
 use crate::disk::{
     self, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS,
@@ -8,12 +8,15 @@ use crate::disk::{
 };
 use crate::erasure_coding;
 use crate::erasure_coding::bitrot_verify;
+use crate::error::ObjectApiError;
 use crate::error::{Error, Result};
 use crate::global::GLOBAL_MRFState;
+use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::heal::data_usage_cache::DataUsageCache;
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::store_api::ObjectToDelete;
 use crate::{
+    bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, get_transitioned_object_reader, put_restore_opts},
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
     config::{GLOBAL_StorageClass, storageclass},
     disk::{
@@ -22,8 +25,8 @@ use crate::{
         UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
     error::{StorageError, to_object_err},
-    event::name::EventName, event_notification::{send_event, EventArgs},
-    bucket::lifecycle::bucket_lifecycle_ops::{gen_transition_objname, put_restore_opts, get_transitioned_object_reader,},
+    event::name::EventName,
+    event_notification::{EventArgs, send_event},
     global::{
         GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id,
         is_dist_erasure,
@@ -44,16 +47,11 @@ use crate::{
     },
     store_init::load_format_erasure,
 };
-use crate::client::{
-    object_api_utils::extract_etag,
-    transition_api::ReaderImpl,
-};
 use crate::{disk::STORAGE_FORMAT_FILE, heal::mrf::PartialOperation};
 use crate::{
     heal::data_scanner::{HEAL_DELETE_DANGLING, globalHealConfig},
     store_api::ListObjectVersionsInfo,
 };
-use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use bytesize::ByteSize;
 use chrono::Utc;
 use futures::future::join_all;
@@ -75,6 +73,7 @@ use rustfs_utils::{
     crypto::{base64_decode, base64_encode, hex},
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
+use s3s::header::X_AMZ_RESTORE;
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem;
@@ -100,7 +99,6 @@ use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use workers::workers::Workers;
-use crate::global::{GLOBAL_TierConfigMgr, GLOBAL_LocalNodeName};
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -3677,7 +3675,13 @@ impl SetDisks {
         Ok(())
     }
 
-    pub async fn update_restore_metadata(&self, bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+    pub async fn update_restore_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        obj_info: &ObjectInfo,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
         let mut oi = obj_info.clone();
         oi.metadata_only = true;
 
@@ -3686,13 +3690,23 @@ impl SetDisks {
         }
 
         let version_id = oi.version_id.clone().map(|v| v.to_string());
-        let obj = self.copy_object(bucket, object, bucket, object, &mut oi, &ObjectOptions {
-            version_id: version_id.clone(),
-            ..Default::default()
-        }, &ObjectOptions {
-            version_id: version_id,
-            ..Default::default()
-        }).await;
+        let obj = self
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut oi,
+                &ObjectOptions {
+                    version_id: version_id.clone(),
+                    ..Default::default()
+                },
+                &ObjectOptions {
+                    version_id: version_id,
+                    ..Default::default()
+                },
+            )
+            .await;
         if let Err(err) = obj {
             //storagelogif(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
             return Err(err);
@@ -4169,7 +4183,10 @@ impl StorageAPI for SetDisks {
         for disk in disks.iter() {
             futures.push(async move {
                 if let Some(disk) = disk {
-                    match disk.delete_version(&bucket, &object, fi.clone(), force_del_marker, DeleteOptions::default()).await {
+                    match disk
+                        .delete_version(&bucket, &object, fi.clone(), force_del_marker, DeleteOptions::default())
+                        .await
+                    {
                         Ok(r) => Ok(r),
                         Err(e) => Err(e),
                     }
@@ -4392,16 +4409,17 @@ impl StorageAPI for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        GLOBAL_MRFState.add_partial(PartialOperation {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-            version_id: Some(version_id.to_string()),
-            queued: Utc::now(),
-            set_index: self.set_index,
-            pool_index: self.pool_index,
-            ..Default::default()
-        })
-        .await;
+        GLOBAL_MRFState
+            .add_partial(PartialOperation {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                version_id: Some(version_id.to_string()),
+                queued: Utc::now(),
+                set_index: self.set_index,
+                pool_index: self.pool_index,
+                ..Default::default()
+            })
+            .await;
         Ok(())
     }
 
@@ -4518,7 +4536,9 @@ impl StorageAPI for SetDisks {
             }
             return Err(to_object_err(ERR_METHOD_NOT_ALLOWED, vec![bucket, object]));
         }*/
-        if !opts.mod_time.expect("err").unix_timestamp() == fi.mod_time.as_ref().expect("err").unix_timestamp() || !(opts.transition.etag == extract_etag(&fi.metadata)) {
+        if !opts.mod_time.expect("err").unix_timestamp() == fi.mod_time.as_ref().expect("err").unix_timestamp()
+            || !(opts.transition.etag == extract_etag(&fi.metadata))
+        {
             return Err(to_object_err(Error::from(DiskError::FileNotFound), vec![bucket, object]));
         }
         if fi.transition_status == TRANSITION_COMPLETE {
@@ -4548,7 +4568,10 @@ impl StorageAPI for SetDisks {
         let (pr, mut pw) = tokio::io::duplex(fi.erasure.block_size);
         //let h = HeaderMap::new();
         //let reader = ReaderImpl::ObjectBody(GetObjectReader {stream: StreamingBlob::wrap(tokio_util::io::ReaderStream::new(pr)), object_info: oi});
-        let reader = ReaderImpl::ObjectBody(GetObjectReader {stream: Box::new(pr), object_info: oi});
+        let reader = ReaderImpl::ObjectBody(GetObjectReader {
+            stream: Box::new(pr),
+            object_info: oi,
+        });
 
         let cloned_bucket = bucket.to_string();
         let cloned_object = object.to_string();
@@ -4557,7 +4580,16 @@ impl StorageAPI for SetDisks {
         let pool_index = self.pool_index;
         tokio::spawn(async move {
             if let Err(e) = Self::get_object_with_fileinfo(
-                &cloned_bucket, &cloned_object, 0, cloned_fi.size, &mut pw, cloned_fi, meta_arr, &online_disks, set_index, pool_index
+                &cloned_bucket,
+                &cloned_object,
+                0,
+                cloned_fi.size,
+                &mut pw,
+                cloned_fi,
+                meta_arr,
+                &online_disks,
+                set_index,
+                pool_index,
             )
             .await
             {
@@ -4565,11 +4597,13 @@ impl StorageAPI for SetDisks {
             };
         });
 
-        let rv = tgt_client.put_with_meta(&dest_obj, reader, fi.size as i64, {
-            let mut m = HashMap::<String, String>::new();
-            m.insert("name".to_string(), object.to_string());
-            m
-        }).await;
+        let rv = tgt_client
+            .put_with_meta(&dest_obj, reader, fi.size as i64, {
+                let mut m = HashMap::<String, String>::new();
+                m.insert("name".to_string(), object.to_string());
+                m
+            })
+            .await;
         //pr.CloseWithError(err);
         if let Err(err) = rv {
             //traceFn(ILMTransition, nil, err)
@@ -4579,7 +4613,7 @@ impl StorageAPI for SetDisks {
         fi.transition_status = TRANSITION_COMPLETE.to_string();
         fi.transitioned_objname = dest_obj;
         fi.transition_tier = opts.transition.tier.clone();
-        fi.transition_version_id = if rv=="" { None } else { Some(Uuid::parse_str(&rv)?) };
+        fi.transition_version_id = if rv == "" { None } else { Some(Uuid::parse_str(&rv)?) };
         let mut event_name = EventName::ObjectTransitionComplete.as_ref();
 
         let disks = self.get_disks(0, 0).await?;
@@ -4594,7 +4628,8 @@ impl StorageAPI for SetDisks {
                     continue;
                 }
             }
-            self.add_partial(bucket, object, &opts.version_id.as_ref().expect("err")).await;
+            self.add_partial(bucket, object, &opts.version_id.as_ref().expect("err"))
+                .await;
             break;
         }
 
@@ -4602,9 +4637,9 @@ impl StorageAPI for SetDisks {
         send_event(EventArgs {
             event_name: event_name.to_string(),
             bucket_name: bucket.to_string(),
-            object:      obj_info,
-            user_agent:  "Internal: [ILM-Transition]".to_string(),
-            host:        GLOBAL_LocalNodeName.to_string(),
+            object: obj_info,
+            user_agent: "Internal: [ILM-Transition]".to_string(),
+            host: GLOBAL_LocalNodeName.to_string(),
             ..Default::default()
         });
         //let tags = opts.lifecycle_audit_event.tags();

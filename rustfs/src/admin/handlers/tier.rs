@@ -3,28 +3,28 @@ use std::str::from_utf8;
 use http::{HeaderMap, StatusCode};
 use iam::get_global_action_cred;
 use matchit::Params;
-use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
-use tracing::{warn, debug, info};
+use tracing::{debug, info, warn};
 
-use crypto::{encrypt_data, decrypt_data};
 use crate::{
     admin::{router::Operation, utils::has_space_be},
     auth::{check_key_valid, get_session_token},
 };
+use crypto::{decrypt_data, encrypt_data};
 use ecstore::{
     client::admin_handler_utils::AdminError,
     config::storageclass,
     global::GLOBAL_TierConfigMgr,
     tier::{
+        tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
         tier_admin::TierCreds,
         tier_config::{TierConfig, TierType},
         tier_handlers::{
-            ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_ALREADY_EXISTS, ERR_TIER_NOT_FOUND, ERR_TIER_CONNECT_ERR,
-            ERR_TIER_INVALID_CREDENTIALS,
+            ERR_TIER_ALREADY_EXISTS, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
+            ERR_TIER_NOT_FOUND,
         },
-        tier::{ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_BACKEND_IN_USE},
     },
 };
 
@@ -92,29 +92,44 @@ impl Operation for AddTier {
         }
         match args.name.as_str() {
             storageclass::STANDARD | storageclass::RRS => {
-              warn!("tier reserved name, args.name: {}", args.name);
-              return Err(s3_error!(InvalidRequest, "Cannot use reserved tier name"));
+                warn!("tier reserved name, args.name: {}", args.name);
+                return Err(s3_error!(InvalidRequest, "Cannot use reserved tier name"));
             }
-            &_ => ()
+            &_ => (),
         }
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         //tier_config_mgr.reload(api);
         match tier_config_mgr.add(args, force).await {
             Err(ERR_TIER_ALREADY_EXISTS) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNameAlreadyExist".into()), "tier name already exists!"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierNameAlreadyExist".into()),
+                    "tier name already exists!",
+                ));
             }
             Err(ERR_TIER_NAME_NOT_UPPERCASE) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNameNotUppercase".into()), "tier name not uppercase!"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierNameNotUppercase".into()),
+                    "tier name not uppercase!",
+                ));
             }
             Err(ERR_TIER_BACKEND_IN_USE) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNameBackendInUse!".into()), "tier name backend in use!"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierNameBackendInUse!".into()),
+                    "tier name backend in use!",
+                ));
             }
             Err(ERR_TIER_CONNECT_ERR) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierConnectError".into()), "tier connect error!"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierConnectError".into()),
+                    "tier connect error!",
+                ));
             }
             Err(ERR_TIER_INVALID_CREDENTIALS) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom(ERR_TIER_INVALID_CREDENTIALS.code.into()), ERR_TIER_INVALID_CREDENTIALS.message));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom(ERR_TIER_INVALID_CREDENTIALS.code.into()),
+                    ERR_TIER_INVALID_CREDENTIALS.message,
+                ));
             }
             Err(e) => {
                 warn!("tier_config_mgr add failed, e: {:?}", e);
@@ -182,7 +197,10 @@ impl Operation for EditTier {
                 return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found!"));
             }
             Err(ERR_TIER_MISSING_CREDENTIALS) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierMissingCredentials".into()), "tier missing credentials!"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierMissingCredentials".into()),
+                    "tier missing credentials!",
+                ));
             }
             Err(e) => {
                 warn!("tier_config_mgr edit failed, e: {:?}", e);
@@ -281,7 +299,10 @@ impl Operation for RemoveTier {
             }
             Err(e) => {
                 warn!("tier_config_mgr remove failed, e: {:?}", e);
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierRemoveFailed".into()), "tier remove failed"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierRemoveFailed".into()),
+                    "tier remove failed",
+                ));
             }
             Ok(_) => (),
         }

@@ -1,9 +1,9 @@
 use sha2::Sha256;
 
 use std::collections::HashMap;
+use std::ops::Sub;
 use time::OffsetDateTime;
 use tracing::{error, warn};
-use std::ops::Sub;
 
 use crate::heal::data_usage_cache::TierStats;
 
@@ -79,8 +79,5 @@ impl LastDayTierStats {
     }
 }
 
-
 #[cfg(test)]
-mod test {
-
-}
+mod test {}

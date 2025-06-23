@@ -1,7 +1,7 @@
 use md5::{Digest as Md5Digest, Md5};
 use sha2::{
-    digest::{Reset, Update},
     Digest, Sha256 as sha_sha256,
+    digest::{Reset, Update},
 };
 pub trait Hasher {
     fn write(&mut self, bytes: &[u8]);

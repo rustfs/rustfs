@@ -1,23 +1,17 @@
 #![allow(clippy::map_entry)]
-use std::{collections::HashMap, sync::Arc};
-use std::ops::{BitAnd, BitOr};
 use lazy_static::lazy_static;
+use std::ops::{BitAnd, BitOr};
+use std::{collections::HashMap, sync::Arc};
 
+use crate::client::{api_put_object::PutObjectOptions, api_s3_datatypes::ObjectPart};
+use crate::{disk::DiskAPI, store_api::GetObjectReader};
 use reader::hasher::{Hasher, Sha256};
+use rustfs_utils::crypto::{base64_decode, base64_encode};
 use s3s::header::{
     X_AMZ_CHECKSUM_ALGORITHM, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_CRC32C, X_AMZ_CHECKSUM_SHA1, X_AMZ_CHECKSUM_SHA256,
 };
-use crate::client::{
-    api_put_object::PutObjectOptions,
-    api_s3_datatypes::ObjectPart,
-};
-use rustfs_utils::crypto::{base64_decode, base64_encode};
-use crate::{
-    disk::DiskAPI,
-    store_api::GetObjectReader,
-};
 
-use enumset::{enum_set, EnumSet, EnumSetType};
+use enumset::{EnumSet, EnumSetType, enum_set};
 
 #[derive(Debug, EnumSetType, Default)]
 #[enumset(repr = "u8")]
@@ -38,8 +32,10 @@ lazy_static! {
         s.remove(ChecksumMode::ChecksumFullObject);
         s
     };
-    static ref C_ChecksumFullObjectCRC32: EnumSet<ChecksumMode> = enum_set!(ChecksumMode::ChecksumCRC32 | ChecksumMode::ChecksumFullObject);
-    static ref C_ChecksumFullObjectCRC32C: EnumSet<ChecksumMode> = enum_set!(ChecksumMode::ChecksumCRC32C | ChecksumMode::ChecksumFullObject);
+    static ref C_ChecksumFullObjectCRC32: EnumSet<ChecksumMode> =
+        enum_set!(ChecksumMode::ChecksumCRC32 | ChecksumMode::ChecksumFullObject);
+    static ref C_ChecksumFullObjectCRC32C: EnumSet<ChecksumMode> =
+        enum_set!(ChecksumMode::ChecksumCRC32C | ChecksumMode::ChecksumFullObject);
 }
 const AMZ_CHECKSUM_CRC64NVME: &str = "x-amz-checksum-crc64nvme";
 
@@ -49,24 +45,12 @@ impl ChecksumMode {
     pub fn base(&self) -> ChecksumMode {
         let s = EnumSet::from(*self).intersection(*C_ChecksumMask);
         match s.as_u8() {
-            1_u8 => {
-                ChecksumMode::ChecksumNone
-            }
-            2_u8 => {
-                ChecksumMode::ChecksumSHA256
-            }
-            4_u8 => {
-                ChecksumMode::ChecksumSHA1
-            }
-            8_u8 => {
-                ChecksumMode::ChecksumCRC32
-            }
-            16_u8 => {
-                ChecksumMode::ChecksumCRC32C
-            }
-            32_u8 => {
-                ChecksumMode::ChecksumCRC64NVME
-            }
+            1_u8 => ChecksumMode::ChecksumNone,
+            2_u8 => ChecksumMode::ChecksumSHA256,
+            4_u8 => ChecksumMode::ChecksumSHA1,
+            8_u8 => ChecksumMode::ChecksumCRC32,
+            16_u8 => ChecksumMode::ChecksumCRC32C,
+            32_u8 => ChecksumMode::ChecksumCRC64NVME,
             _ => panic!("enum err."),
         }
     }
@@ -119,17 +103,13 @@ impl ChecksumMode {
         let u = EnumSet::from(*self).intersection(*C_ChecksumMask).as_u8();
         if u == ChecksumMode::ChecksumCRC32 as u8 || u == ChecksumMode::ChecksumCRC32C as u8 {
             4
-        }
-        else if u == ChecksumMode::ChecksumSHA1 as u8 {
-            4//sha1.size
-        }
-        else if u == ChecksumMode::ChecksumSHA256 as u8 {
-            4//sha256.size
-        }
-        else if u == ChecksumMode::ChecksumCRC64NVME as u8 {
-            4//crc64.size
-        }
-        else {
+        } else if u == ChecksumMode::ChecksumSHA1 as u8 {
+            4 //sha1.size
+        } else if u == ChecksumMode::ChecksumSHA256 as u8 {
+            4 //sha256.size
+        } else if u == ChecksumMode::ChecksumCRC64NVME as u8 {
+            4 //crc64.size
+        } else {
             0
         }
     }
@@ -196,7 +176,7 @@ impl ChecksumMode {
             ChecksumMode::ChecksumCRC64NVME => {
                 return "CRC64NVME".to_string();
             }
-            _=> {
+            _ => {
                 return "<invalid>".to_string();
             }
         }
@@ -226,10 +206,13 @@ impl ChecksumMode {
             }
         });
         let c = self.base();
-        let mut crc_bytes = Vec::<u8>::with_capacity(p.len()*self.raw_byte_len() as usize);
+        let mut crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len() as usize);
         let mut h = self.hasher()?;
         h.write(&crc_bytes);
-        Ok(Checksum {checksum_type: self.clone(), r: h.sum().as_bytes().to_vec()})
+        Ok(Checksum {
+            checksum_type: self.clone(),
+            r: h.sum().as_bytes().to_vec(),
+        })
     }
 
     pub fn full_object_checksum(&self, p: &mut [ObjectPart]) -> Result<Checksum, std::io::Error> {
@@ -246,7 +229,10 @@ struct Checksum {
 impl Checksum {
     fn new(t: ChecksumMode, b: &[u8]) -> Checksum {
         if t.is_set() && b.len() == t.raw_byte_len() {
-            return Checksum {checksum_type: t, r: b.to_vec()};
+            return Checksum {
+                checksum_type: t,
+                r: b.to_vec(),
+            };
         }
         Checksum::default()
     }
@@ -257,7 +243,7 @@ impl Checksum {
             Err(err) => return Err(std::io::Error::other(err.to_string())),
         };
         if t.is_set() && b.len() == t.raw_byte_len() {
-            return Ok(Checksum {checksum_type: t, r: b});
+            return Ok(Checksum { checksum_type: t, r: b });
         }
         Ok(Checksum::default())
     }
@@ -282,28 +268,30 @@ impl Checksum {
 }
 
 pub fn add_auto_checksum_headers(opts: &mut PutObjectOptions) {
-    opts.user_metadata.insert("X-Amz-Checksum-Algorithm".to_string(), opts.auto_checksum.to_string());
+    opts.user_metadata
+        .insert("X-Amz-Checksum-Algorithm".to_string(), opts.auto_checksum.to_string());
     if opts.auto_checksum.full_object_requested() {
-        opts.user_metadata.insert("X-Amz-Checksum-Type".to_string(), "FULL_OBJECT".to_string());
+        opts.user_metadata
+            .insert("X-Amz-Checksum-Type".to_string(), "FULL_OBJECT".to_string());
     }
 }
 
 pub fn apply_auto_checksum(opts: &mut PutObjectOptions, all_parts: &mut [ObjectPart]) -> Result<(), std::io::Error> {
     if opts.auto_checksum.can_composite() && !opts.auto_checksum.is(ChecksumMode::ChecksumFullObject) {
         let crc = opts.auto_checksum.composite_checksum(all_parts)?;
-            opts.user_metadata = {
-                let mut hm = HashMap::new();
-                hm.insert(opts.auto_checksum.key(), crc.encoded());
-                hm
-            }
+        opts.user_metadata = {
+            let mut hm = HashMap::new();
+            hm.insert(opts.auto_checksum.key(), crc.encoded());
+            hm
+        }
     } else if opts.auto_checksum.can_merge_crc() {
         let crc = opts.auto_checksum.full_object_checksum(all_parts)?;
-            opts.user_metadata = {
-                let mut hm = HashMap::new();
-                hm.insert(opts.auto_checksum.key_capitalized(), crc.encoded());
-                hm.insert("X-Amz-Checksum-Type".to_string(), "FULL_OBJECT".to_string());
-                hm
-            }
+        opts.user_metadata = {
+            let mut hm = HashMap::new();
+            hm.insert(opts.auto_checksum.key_capitalized(), crc.encoded());
+            hm.insert("X-Amz-Checksum-Type".to_string(), "FULL_OBJECT".to_string());
+            hm
+        }
     }
 
     Ok(())
