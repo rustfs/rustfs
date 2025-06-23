@@ -109,7 +109,7 @@ pub struct ObjectStore {
 }
 
 impl ObjectStore {
-    const BUCKET_NAME: &str = ".rustfs.sys";
+    const BUCKET_NAME: &'static str = ".rustfs.sys";
 
     pub fn new(object_api: Arc<ECStore>) -> Self {
         Self { object_api }

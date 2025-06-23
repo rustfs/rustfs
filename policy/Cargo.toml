@@ -29,6 +29,7 @@ tracing.workspace = true
 madmin.workspace = true
 lazy_static.workspace = true
 regex = { workspace = true }
+common.workspace = true
 
 [dev-dependencies]
 test-case.workspace = true

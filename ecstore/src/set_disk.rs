@@ -1,8 +1,8 @@
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
-use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
+use crate::disk::error_reduce::{reduce_read_quorum_errs, reduce_write_quorum_errs, OBJECT_OP_IGNORED_ERRS};
 use crate::disk::{
-    self, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS,
-    conv_part_err_to_int, has_part_err,
+    self, conv_part_err_to_int, has_part_err, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT,
+    CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS,
 };
 use crate::erasure_coding;
 use crate::erasure_coding::bitrot_verify;
@@ -12,24 +12,24 @@ use crate::heal::data_usage_cache::DataUsageCache;
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::store_api::ObjectToDelete;
 use crate::{
-    cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
-    config::{GLOBAL_StorageClass, storageclass},
+    cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
+    config::{storageclass, GLOBAL_StorageClass},
     disk::{
-        CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
-        RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
+        endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo,
+        DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp,
+        ReadOptions, UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
     },
-    error::{StorageError, to_object_err},
+    error::{to_object_err, StorageError},
     global::{
-        GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id,
-        is_dist_erasure,
+        get_global_deployment_id, is_dist_erasure, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP,
+        GLOBAL_LOCAL_DISK_SET_DRIVES,
     },
     heal::{
         data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT},
         data_usage_cache::{DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo},
         heal_commands::{
-            DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_DEEP_SCAN, HEAL_ITEM_OBJECT,
-            HEAL_NORMAL_SCAN, HealOpts, HealScanMode, HealingTracker,
+            HealOpts, HealScanMode, HealingTracker, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE,
+            DRIVE_STATE_OK, HEAL_DEEP_SCAN, HEAL_ITEM_OBJECT, HEAL_NORMAL_SCAN,
         },
         heal_ops::BG_HEALING_UUID,
     },
@@ -42,7 +42,7 @@ use crate::{
 };
 use crate::{disk::STORAGE_FORMAT_FILE, heal::mrf::PartialOperation};
 use crate::{
-    heal::data_scanner::{HEAL_DELETE_DANGLING, globalHealConfig},
+    heal::data_scanner::{globalHealConfig, HEAL_DELETE_DANGLING},
     store_api::ListObjectVersionsInfo,
 };
 use bytes::Bytes;
@@ -51,22 +51,22 @@ use chrono::Utc;
 use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
-use lock::{LockApi, namespace_lock::NsLockMap};
+use lock::{namespace_lock::NsLockMap, LockApi};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use md5::{Digest as Md5Digest, Md5};
-use rand::{Rng, seq::SliceRandom};
+use rand::{seq::SliceRandom, Rng};
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{
-    FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, file_info_from_raw,
-    headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
-    merge_file_meta_versions,
+    file_info_from_raw, headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS}, merge_file_meta_versions, FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries,
+    MetaCacheEntry, MetadataResolutionParams,
+    ObjectPartInfo,
+    RawFileInfo,
 };
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
 use rustfs_utils::{
-    HashAlgorithm,
     crypto::{base64_decode, base64_encode, hex},
-    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
+    path::{encode_dir_object, has_suffix, path_join_buf, SLASH_SEPARATOR},
+    HashAlgorithm,
 };
 use sha2::Sha256;
 use std::hash::Hash;
@@ -82,7 +82,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::{
     io::AsyncWrite,
-    sync::{RwLock, broadcast},
+    sync::{broadcast, RwLock},
 };
 use tokio::{
     select,
@@ -3021,7 +3021,7 @@ impl SetDisks {
         }
 
         let (buckets_results_tx, mut buckets_results_rx) = mpsc::channel::<DataUsageEntryInfo>(disks.len());
-        // 新增：从环境变量读取基础间隔，默认30秒
+        // 新增：从环境变量读取基础间隔，默认 30 秒
         let set_disk_update_interval_secs = std::env::var("RUSTFS_NS_SCANNER_INTERVAL")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -4054,7 +4054,7 @@ impl StorageAPI for SetDisks {
     async fn local_storage_info(&self) -> madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
-        let mut local_disks: Vec<Option<Arc<crate::disk::Disk>>> = Vec::new();
+        let mut local_disks: Vec<Option<Arc<disk::Disk>>> = Vec::new();
         let mut local_endpoints = Vec::new();
 
         for (i, ep) in self.set_endpoints.iter().enumerate() {
@@ -5837,9 +5837,9 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::error::DiskError;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
-    use crate::disk::error::DiskError;
     use crate::store_api::CompletePart;
     use rustfs_filemeta::ErasureInfo;
     use std::collections::HashMap;
@@ -5850,7 +5850,7 @@ mod tests {
         // Test that all CHECK_PART constants have expected values
         assert_eq!(CHECK_PART_UNKNOWN, 0);
         assert_eq!(CHECK_PART_SUCCESS, 1);
-        assert_eq!(CHECK_PART_FILE_NOT_FOUND, 4); // 实际值是4，不是2
+        assert_eq!(CHECK_PART_FILE_NOT_FOUND, 4); // 实际值是 4，不是 2
         assert_eq!(CHECK_PART_VOLUME_NOT_FOUND, 3);
         assert_eq!(CHECK_PART_FILE_CORRUPT, 5);
     }
@@ -6115,7 +6115,7 @@ mod tests {
         assert_eq!(conv_part_err_to_int(&Some(disk_err)), CHECK_PART_FILE_NOT_FOUND);
 
         let other_err = DiskError::other("other error");
-        assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_UNKNOWN); // other错误应该返回UNKNOWN，不是SUCCESS
+        assert_eq!(conv_part_err_to_int(&Some(other_err)), CHECK_PART_UNKNOWN); // other 错误应该返回 UNKNOWN，不是 SUCCESS
     }
 
     #[test]

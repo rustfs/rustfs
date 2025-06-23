@@ -36,7 +36,6 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc::Sender,
 };
-use tracing::warn;
 use uuid::Uuid;
 
 pub type DiskStore = Arc<Disk>;

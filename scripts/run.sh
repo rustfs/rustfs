@@ -55,11 +55,13 @@ export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
 #export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000
 #export RUSTFS_SINKS_FILE_FLUSH_THRESHOLD=100
 #
+# Kafka sink 配置
 #export RUSTFS_SINKS_KAFKA_BROKERS=localhost:9092
 #export RUSTFS_SINKS_KAFKA_TOPIC=logs
 #export RUSTFS_SINKS_KAFKA_BATCH_SIZE=100
 #export RUSTFS_SINKS_KAFKA_BATCH_TIMEOUT_MS=1000
 #
+# Webhook sink 配置
 #export RUSTFS_SINKS_WEBHOOK_ENDPOINT=http://localhost:8080/webhook
 #export RUSTFS_SINKS_WEBHOOK_AUTH_TOKEN=you-auth-token
 #export RUSTFS_SINKS_WEBHOOK_BATCH_SIZE=100
@@ -85,6 +87,6 @@ if [ -n "$1" ]; then
 fi
 
 # 启动 webhook 服务器
-#cargo run --example webhook -p rustfs-event-notifier &
+#cargo run --example webhook -p rustfs-event &
 # 启动主服务
 cargo run --bin rustfs

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
@@ -18,6 +16,7 @@ use s3s::{
 use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
+use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
 
@@ -52,7 +51,7 @@ impl Operation for AssumeRoleHandle {
         let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &user.access_key).await?;
 
-        // // TODO: Check permissions, do not allow STS access
+        // TODO: Check permissions, do not allow STS access
         if cred.is_temp() || cred.is_service_account() {
             return Err(s3_error!(InvalidRequest, "AccessDenied"));
         }
@@ -70,11 +69,11 @@ impl Operation for AssumeRoleHandle {
         let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "get body failed"))?;
 
         if body.action.as_str() != ASSUME_ROLE_ACTION {
-            return Err(s3_error!(InvalidArgument, "not suport action"));
+            return Err(s3_error!(InvalidArgument, "not support action"));
         }
 
         if body.version.as_str() != ASSUME_ROLE_VERSION {
-            return Err(s3_error!(InvalidArgument, "not suport version"));
+            return Err(s3_error!(InvalidArgument, "not support version"));
         }
 
         let mut claims = cred.claims.unwrap_or_default();

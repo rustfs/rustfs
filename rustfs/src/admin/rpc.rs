@@ -10,12 +10,12 @@ use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_utils::net::bytes_stream;
+use s3s::dto::StreamingBlob;
+use s3s::s3_error;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
-use s3s::dto::StreamingBlob;
-use s3s::s3_error;
 use serde_urlencoded::from_bytes;
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
@@ -23,7 +23,7 @@ use tracing::warn;
 
 pub const RPC_PREFIX: &str = "/rustfs/rpc";
 
-pub fn regist_rpc_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+pub fn register_rpc_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
         format!("{}{}", RPC_PREFIX, "/read_file_stream").as_str(),

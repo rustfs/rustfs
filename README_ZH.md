@@ -72,9 +72,9 @@ export RUSTFS_OBS_ENDPOINT="http://localhost:4317"
 ./rustfs /data/rustfs
 ```
 
-### 可观测性系统
+## 可观测性系统 Otel 和 OpenObserve
 
-#### 部署
+### OpenTelemetry Collector 和 Jaeger、Grafana、Prometheus、Loki
 
 1. 进入可观测性目录：
    ```bash
@@ -97,3 +97,25 @@ export RUSTFS_OBS_ENDPOINT="http://localhost:4317"
 ```
 OpenTelemetry Collector 地址(endpoint):  http://localhost:4317 
 ```
+
+--- 
+
+### OpenObserve 和 OpenTelemetry Collector
+
+1. 进入 OpenObserve 和 OpenTelemetry 目录：
+   ```bash
+   cd .docker/openobserve-otel
+   ```
+2. 启动 OpenObserve 和 OpenTelemetry Collector 服务：
+   ```bash
+   docker compose -f docker-compose.yml up -d
+   ```
+3. 访问 OpenObserve UI：
+   OpenObserve UI: `http://localhost:5080`
+    - 默认凭据：
+        - 用户名：`root@rustfs.com`
+        - 密码：`rustfs123`
+    - 开放端口：
+        - 5080：HTTP API 和 UI
+        - 5081：OTLP gRPC
+

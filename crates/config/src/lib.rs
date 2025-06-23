@@ -1,11 +1,7 @@
-use crate::observability::config::ObservabilityConfig;
-
-mod config;
-mod constants;
-mod event;
-mod observability;
-
-pub use config::RustFsConfig;
+#[cfg(feature = "constants")]
+pub mod constants;
+#[cfg(feature = "constants")]
 pub use constants::app::*;
 
-pub use event::config::NotifierConfig;
+#[cfg(feature = "observability")]
+pub mod observability;

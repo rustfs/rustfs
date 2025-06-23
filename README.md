@@ -73,9 +73,9 @@ export RUSTFS_OBS_ENDPOINT="http://localhost:4317"
 ./rustfs /data/rustfs
 ```
 
-### Observability Stack
+## Observability Stack Otel and OpenObserve
 
-#### Deployment
+### OpenTelemetry Collector 和 Jaeger、Grafana、Prometheus、Loki
 
 1. Navigate to the observability directory:
    ```bash
@@ -92,3 +92,30 @@ export RUSTFS_OBS_ENDPOINT="http://localhost:4317"
 - Grafana: `http://localhost:3000` (credentials: `admin`/`admin`)
 - Jaeger: `http://localhost:16686`
 - Prometheus: `http://localhost:9090`
+
+#### Configure observability
+
+```
+OpenTelemetry Collector address(endpoint):  http://localhost:4317 
+```
+
+---
+
+### OpenObserve and OpenTelemetry Collector
+
+1. Navigate to the OpenObserve and OpenTelemetry directory:
+   ```bash
+   cd .docker/openobserve-otel
+   ```
+2. Start the OpenObserve and OpenTelemetry Collector services:
+   ```bash
+    docker compose -f docker-compose.yml up -d
+    ```
+3. Access the OpenObserve UI:
+   OpenObserve UI: `http://localhost:5080`
+    - Default credentials:
+        - Username: `root@rustfs.com`
+        - Password: `rustfs123`
+    - Exposed ports:
+        - 5080: HTTP API and UI
+        - 5081: OTLP gRPC

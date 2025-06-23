@@ -8,9 +8,9 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let stat = statfs(p.as_ref())?;
 
     let bsize = stat.block_size() as u64;
-    let bfree = stat.blocks_free() as u64;
-    let bavail = stat.blocks_available() as u64;
-    let blocks = stat.blocks() as u64;
+    let bfree = stat.blocks_free();
+    let bavail = stat.blocks_available();
+    let blocks = stat.blocks();
 
     let reserved = match bfree.checked_sub(bavail) {
         Some(reserved) => reserved,

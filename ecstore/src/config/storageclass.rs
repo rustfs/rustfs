@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use tracing::warn;
 
-// default_parity_count 默认配置，根据磁盘总数分配校验磁盘数量
+/// Default parity count for a given drive count
+/// The default configuration allocates the number of check disks based on the total number of disks
 pub fn default_parity_count(drive: usize) -> usize {
     match drive {
         1 => 0,

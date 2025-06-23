@@ -3,13 +3,16 @@ members = [
     "appauth", # Application authentication and authorization
     "cli/rustfs-gui", # Graphical user interface client
     "common/common", # Shared utilities and data structures
+    "crates/filemeta", # File metadata management
     "common/lock", # Distributed locking implementation
     "common/protos", # Protocol buffer definitions
     "common/workers", # Worker thread pools and task scheduling
     "crates/config", # Configuration management
-    "crates/event-notifier", # Event notification system
+    "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
+    "crates/rio", # Rust I/O utilities and abstractions
     "crates/utils", # Utility functions and helpers
+    "crates/zip", # ZIP file handling and compression
     "crypto", # Cryptography and security features
     "ecstore", # Erasure coding storage implementation
     "e2e_test", # End-to-end test suite
@@ -18,9 +21,7 @@ members = [
     "rustfs", # Core file system implementation
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
-    "crates/zip",
-    "crates/filemeta",
-    "crates/rio",
+
 
 ]
 resolver = "2"
@@ -54,7 +55,7 @@ rustfs = { path = "./rustfs", version = "0.0.1" }
 rustfs-zip = { path = "./crates/zip", version = "0.0.1" }
 rustfs-config = { path = "./crates/config", version = "0.0.1" }
 rustfs-obs = { path = "crates/obs", version = "0.0.1" }
-rustfs-event-notifier = { path = "crates/event-notifier", version = "0.0.1" }
+rustfs-notify = { path = "crates/notify", version = "0.0.1" }
 rustfs-utils = { path = "crates/utils", version = "0.0.1" }
 rustfs-rio = { path = "crates/rio", version = "0.0.1" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.1" }
@@ -88,11 +89,12 @@ const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
 datafusion = "46.0.1"
 derive_builder = "0.20.2"
-dotenvy = "0.15.7"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
+dotenvy = "0.15.7"
 flatbuffers = "25.2.10"
-flexi_logger = { version = "0.30.2", features = ["trc","dont_minimize_extra_stacks"] }  
+flexi_logger = { version = "0.30.2", features = ["trc", "dont_minimize_extra_stacks"] }
+form_urlencoded = "1.2.1"
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
@@ -158,17 +160,17 @@ pin-project-lite = "0.2.16"
 prost = "0.13.5"
 prost-build = "0.13.5"
 protobuf = "3.7"
+quick-xml = "0.37.5"
 rand = "0.9.1"
 brotli = "8.0.1"
 flate2 = "1.1.1"
 zstd = "0.13.3"
 lz4 = "1.28.1"
-snap = "1.1.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 reed-solomon-simd = { version = "3.0.0" }
 regex = { version = "1.11.1" }
-reqwest = { version = "0.12.19", default-features = false, features = [
+reqwest = { version = "0.12.20", default-features = false, features = [
     "rustls-tls",
     "charset",
     "http2",
@@ -186,6 +188,7 @@ rmp-serde = "1.3.0"
 rsa = "0.9.8"
 rumqttc = { version = "0.24" }
 rust-embed = { version = "8.7.2" }
+rust-i18n = { version = "3.1.4" }
 rustfs-rsc = "2025.506.1"
 rustls = { version = "0.23.27" }
 rustls-pki-types = "1.12.0"
@@ -202,6 +205,7 @@ sha2 = "0.10.9"
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 snafu = "0.8.6"
+snap = "1.1.1"
 socket2 = "0.5.10"
 strum = { version = "0.27.1", features = ["derive"] }
 sysinfo = "0.35.2"
@@ -215,13 +219,14 @@ time = { version = "0.3.41", features = [
     "macros",
     "serde",
 ] }
+
 tokio = { version = "1.45.1", features = ["fs", "rt-multi-thread"] }
-tonic = { version = "0.13.1", features = ["gzip"] }
-tonic-build = { version = "0.13.1" }
 tokio-rustls = { version = "0.26.2", default-features = false }
 tokio-stream = { version = "0.1.17" }
 tokio-tar = "0.3.1"
 tokio-util = { version = "0.7.15", features = ["io", "compat"] }
+tonic = { version = "0.13.1", features = ["gzip"] }
+tonic-build = { version = "0.13.1" }
 tower = { version = "0.5.2", features = ["timeout"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
@@ -238,6 +243,7 @@ uuid = { version = "1.17.0", features = [
     "fast-rng",
     "macro-diagnostics",
 ] }
+wildmatch = { version = "2.4.0", features = ["serde"] }
 winapi = { version = "0.3.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
 

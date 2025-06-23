@@ -1,3 +1,5 @@
+extern crate core;
+
 pub mod admin_server_info;
 pub mod bitrot;
 pub mod bucket;

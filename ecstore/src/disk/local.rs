@@ -1137,7 +1137,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
-        // 本地不需要设置
+        // No setup is required locally
         // TODO: add check_id_store
         let mut format_info = self.format_info.write().await;
         format_info.id = id;

@@ -1,0 +1,60 @@
+services:
+  emqx:
+    image: emqx/emqx:latest
+    container_name: emqx
+    restart: unless-stopped
+    environment:
+      - EMQX_NODE__NAME=emqx@127.0.0.1
+      - EMQX_NODE__COOKIE=aBcDeFgHiJkLmNoPqRsTuVwXyZ012345
+      - EMQX_NODE__DATA_DIR=/opt/emqx/data
+      - EMQX_LOG__CONSOLE__LEVEL=info
+      - EMQX_LOG__CONSOLE__ENABLE=true
+      - EMQX_LOG__FILE__PATH=/opt/emqx/log/emqx.log
+      - EMQX_LOG__FILE__LEVEL=info
+      - EMQX_LOG__FILE__ENABLE=true
+      - EMQX_LISTENERS__TCP__DEFAULT__BIND=0.0.0.0:1883
+      - EMQX_LISTENERS__TCP__DEFAULT__MAX_CONNECTIONS=1000000
+      - EMQX_LISTENERS__TCP__DEFAULT__ENABLE=true
+      - EMQX_LISTENERS__SSL__DEFAULT__BIND=0.0.0.0:8883
+      - EMQX_LISTENERS__SSL__DEFAULT__ENABLE=false
+      - EMQX_LISTENERS__WS__DEFAULT__BIND=0.0.0.0:8083
+      - EMQX_LISTENERS__WS__DEFAULT__ENABLE=true
+      - EMQX_LISTENERS__WSS__DEFAULT__BIND=0.0.0.0:8084
+      - EMQX_LISTENERS__WSS__DEFAULT__ENABLE=false
+      - EMQX_DASHBOARD__LISTENERS__HTTP__BIND=0.0.0.0:18083
+      - EMQX_DASHBOARD__LISTENERS__HTTP__ENABLE=true
+      - EMQX_MANAGEMENT__LISTENERS__HTTP__BIND=0.0.0.0:8081
+      - EMQX_MANAGEMENT__LISTENERS__HTTP__ENABLE=true
+      - EMQX_AUTHENTICATION__1__ENABLE=true
+      - EMQX_AUTHENTICATION__1__MECHANISM=password_based
+      - EMQX_AUTHENTICATION__1__BACKEND=built_in_database
+      - EMQX_AUTHENTICATION__1__USER_ID_TYPE=username
+      - EMQX_AUTHORIZATION__SOURCES__1__TYPE=built_in_database
+      - EMQX_AUTHORIZATION__SOURCES__1__ENABLE=true
+    ports:
+      - "1883:1883"    # MQTT TCP
+      - "8883:8883"    # MQTT SSL
+      - "8083:8083"    # MQTT WebSocket
+      - "8084:8084"    # MQTT WebSocket SSL
+      - "18083:18083"  # Web 管理控制台
+      - "8081:8081"    # HTTP API
+    volumes:
+      - ./data:/opt/emqx/data
+      - ./log:/opt/emqx/log
+      - ./config:/opt/emqx/etc
+    networks:
+      - mqtt-net
+    healthcheck:
+      test: [ "CMD", "/opt/emqx/bin/emqx_ctl", "status" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+networks:
+  mqtt-net:
+    driver: bridge

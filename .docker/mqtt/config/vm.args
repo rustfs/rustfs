@@ -1,0 +1,9 @@
+-name emqx@127.0.0.1
+-setcookie aBcDeFgHiJkLmNoPqRsTuVwXyZ012345
++P 2097152
++t 1048576
++zdbbl 32768
+-kernel inet_dist_listen_min 6000
+-kernel inet_dist_listen_max 6100
+-smp enable
+-mnesia dir "/opt/emqx/data/mnesia"

@@ -1,0 +1,15 @@
+services:
+  emqx:
+    image: emqx/emqx:latest
+    container_name: emqx
+    ports:
+      - "1883:1883"
+      - "8083:8083"
+      - "8084:8084"
+      - "8883:8883"
+      - "18083:18083"
+    restart: unless-stopped
+
+networks:
+  default:
+    driver: bridge

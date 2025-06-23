@@ -31,7 +31,8 @@ tracing.workspace = true
 madmin.workspace = true
 lazy_static.workspace = true
 regex = { workspace = true }
-rustfs-utils= { workspace = true, features = ["path"] }
+common.workspace = true
+rustfs-utils = { workspace = true, features = ["path"] }
 
 [dev-dependencies]
 test-case.workspace = true
