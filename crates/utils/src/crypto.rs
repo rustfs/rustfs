@@ -15,20 +15,6 @@ pub fn hex(data: impl AsRef<[u8]>) -> String {
     hex_simd::encode_to_string(data, hex_simd::AsciiCase::Lower)
 }
 
-// #[cfg(windows)]
-// pub fn sha256(data: &[u8]) -> impl AsRef<[u8; 32]> {
-//     use sha2::{Digest, Sha256};
-//     <Sha256 as Digest>::digest(data)
-// }
-
-// #[cfg(not(windows))]
-// pub fn sha256(data: &[u8]) -> impl AsRef<[u8]> {
-//     use openssl::hash::{Hasher, MessageDigest};
-//     let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
-//     h.update(data).unwrap();
-//     h.finish().unwrap()
-// }
-
 /// verify sha256 checksum string
 pub fn is_sha256_checksum(s: &str) -> bool {
     // TODO: optimize
@@ -63,34 +49,16 @@ fn hex_bytes32<R>(src: impl AsRef<[u8]>, f: impl FnOnce(&str) -> R) -> R {
     f(ans)
 }
 
-#[cfg(not(all(feature = "openssl", not(windows))))]
 fn sha256(data: &[u8]) -> impl AsRef<[u8; 32]> + use<> {
     use sha2::{Digest, Sha256};
     <Sha256 as Digest>::digest(data)
 }
 
-#[cfg(all(feature = "openssl", not(windows)))]
-fn sha256(data: &[u8]) -> impl AsRef<[u8]> {
-    use openssl::hash::{Hasher, MessageDigest};
-    let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
-    h.update(data).unwrap();
-    h.finish().unwrap()
-}
-
-#[cfg(not(all(feature = "openssl", not(windows))))]
 fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use<> {
     use sha2::{Digest, Sha256};
     let mut h = <Sha256 as Digest>::new();
     chunk.iter().for_each(|data| h.update(data));
     h.finalize()
-}
-
-#[cfg(all(feature = "openssl", not(windows)))]
-fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8]> {
-    use openssl::hash::{Hasher, MessageDigest};
-    let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
-    chunk.iter().for_each(|data| h.update(data).unwrap());
-    h.finish().unwrap()
 }
 
 /// `f(hex(sha256(data)))`
