@@ -221,24 +221,24 @@ impl WebhookTarget {
             .header("Content-Type", "application/json");
 
         if !self.args.auth_token.is_empty() {
-            // 分割 auth_token 字符串，检查是否已包含认证类型
+            // Split auth_token string to check if the authentication type is included
             let tokens: Vec<&str> = self.args.auth_token.split_whitespace().collect();
             match tokens.len() {
                 2 => {
-                    // 已经包含认证类型和令牌，如 "Bearer token123"
+                    // Already include authentication type and token, such as "Bearer token123"
                     req_builder = req_builder.header("Authorization", &self.args.auth_token);
                 }
                 1 => {
-                    // 只有令牌，需要添加 "Bearer" 前缀
+                    // Only tokens, need to add "Bearer" prefix
                     req_builder = req_builder.header("Authorization", format!("Bearer {}", self.args.auth_token));
                 }
                 _ => {
-                    // 空字符串或其他情况，不添加认证头
+                    // Empty string or other situations, no authentication header is added
                 }
             }
         }
 
-        // 发送请求
+        // Send a request
         let resp = req_builder.body(data).send().await.map_err(|e| {
             if e.is_timeout() || e.is_connect() {
                 TargetError::NotConnected
@@ -271,7 +271,7 @@ impl Target for WebhookTarget {
         self.id.clone()
     }
 
-    // 确保 Future 是 Send
+    // Make sure Future is Send
     async fn is_active(&self) -> Result<bool, TargetError> {
         let socket_addr = lookup_host(&self.addr)
             .await
@@ -296,7 +296,7 @@ impl Target for WebhookTarget {
         }
     }
 
-    async fn save(&self, event: Event) -> Result<(), TargetError> {
+    async fn save(&self, event: Arc<Event>) -> Result<(), TargetError> {
         if let Some(store) = &self.store {
             // Call the store method directly, no longer need to acquire the lock
             store

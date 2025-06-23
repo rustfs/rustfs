@@ -463,7 +463,7 @@ impl Target for MQTTTarget {
     }
 
     #[instrument(skip(self, event), fields(target_id = %self.id))]
-    async fn save(&self, event: Event) -> Result<(), TargetError> {
+    async fn save(&self, event: Arc<Event>) -> Result<(), TargetError> {
         if let Some(store) = &self.store {
             debug!(target_id = %self.id, "Event saved to store start");
             // If store is configured, ONLY put the event into the store.

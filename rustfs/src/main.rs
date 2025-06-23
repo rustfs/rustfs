@@ -12,9 +12,9 @@ mod service;
 mod storage;
 
 use crate::auth::IAMAuth;
-use crate::console::{CONSOLE_CONFIG, init_console_cfg};
+use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 // Ensure the correct path for parse_license is imported
-use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, wait_for_shutdown};
+use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
 use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
@@ -22,7 +22,6 @@ use common::{
     // error::{Error, Result},
     globals::set_global_addr,
 };
-use ecstore::StorageAPI;
 use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use ecstore::config as ecconfig;
@@ -30,11 +29,12 @@ use ecstore::config::GLOBAL_ConfigSys;
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::rpc::make_server;
 use ecstore::store_api::BucketOptions;
+use ecstore::StorageAPI;
 use ecstore::{
     endpoints::EndpointServerPools,
     heal::data_scanner::init_data_scanner,
     set_global_endpoints,
-    store::{ECStore, init_local_disks},
+    store::{init_local_disks, ECStore},
     update_erasure_type,
 };
 use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
@@ -49,7 +49,7 @@ use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_obs::{SystemObserver, init_obs, set_global_guard};
+use rustfs_obs::{init_obs, set_global_guard, SystemObserver};
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
@@ -60,13 +60,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
-use tonic::{Request, Status, metadata::MetadataValue};
+use tonic::{metadata::MetadataValue, Request, Status};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{Span, instrument};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn, Span};
 
 const MI_B: usize = 1024 * 1024;
 
@@ -118,9 +117,6 @@ async fn main() -> Result<()> {
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
-
-    // Initialize event notifier
-    // event::init_event_notifier(opt.event_config).await;
 
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
@@ -509,9 +505,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     ecconfig::init();
     // config system configuration
     GLOBAL_ConfigSys.init(store.clone()).await?;
-
-    // event system configuration
-    // GLOBAL_EVENT_SYS.init(store.clone()).await?;
 
     // Initialize event notifier
     event::init_event_notifier().await;

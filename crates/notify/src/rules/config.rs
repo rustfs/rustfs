@@ -8,7 +8,6 @@ use crate::rules::pattern_rules;
 use crate::rules::target_id_set;
 use std::collections::HashMap;
 use std::io::Read;
-// Assuming this is the XML config structure
 
 /// Configuration for bucket notifications.
 /// This struct now holds the parsed and validated rules in the new RulesMap format.
@@ -100,10 +99,6 @@ impl BucketNotificationConfig {
     // Expose the RulesMap for the notifier
     pub fn get_rules_map(&self) -> &RulesMap {
         &self.rules
-    }
-
-    pub fn to_rules_map(&self) -> RulesMap {
-        self.rules.clone()
     }
 
     /// Sets the region for the configuration

@@ -55,13 +55,12 @@ impl UserAgent {
 
     /// Obtain operating system platform information
     fn get_os_platform() -> String {
-        let sys = System::new_all();
         if cfg!(target_os = "windows") {
-            Self::get_windows_platform(&sys)
+            Self::get_windows_platform()
         } else if cfg!(target_os = "macos") {
-            Self::get_macos_platform(&sys)
+            Self::get_macos_platform()
         } else if cfg!(target_os = "linux") {
-            Self::get_linux_platform(&sys)
+            Self::get_linux_platform()
         } else {
             "Unknown".to_string()
         }
@@ -69,9 +68,9 @@ impl UserAgent {
 
     /// Get Windows platform information
     #[cfg(windows)]
-    fn get_windows_platform(sys: &System) -> String {
+    fn get_windows_platform() -> String {
         // Priority to using sysinfo to get versions
-        if let Some(version) = sys.os_version() {
+        if let Some(version) = System::os_version() {
             format!("Windows NT {}", version)
         } else {
             // Fallback to cmd /c ver
@@ -91,13 +90,13 @@ impl UserAgent {
     }
 
     #[cfg(not(windows))]
-    fn get_windows_platform(_sys: &System) -> String {
+    fn get_windows_platform() -> String {
         "N/A".to_string()
     }
 
     /// Get macOS platform information
     #[cfg(target_os = "macos")]
-    fn get_macos_platform(_sys: &System) -> String {
+    fn get_macos_platform() -> String {
         let binding = System::os_version().unwrap_or("14.5.0".to_string());
         let version = binding.split('.').collect::<Vec<&str>>();
         let major = version.first().unwrap_or(&"14").to_string();
@@ -112,20 +111,18 @@ impl UserAgent {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn get_macos_platform(_sys: &System) -> String {
+    fn get_macos_platform() -> String {
         "N/A".to_string()
     }
 
     /// Get Linux platform information
     #[cfg(target_os = "linux")]
-    fn get_linux_platform(sys: &System) -> String {
-        let name = sys.name().unwrap_or("Linux".to_string());
-        let version = sys.os_version().unwrap_or("Unknown".to_string());
-        format!("X11; {} {}", name, version)
+    fn get_linux_platform() -> String {
+        format!("X11; {}", System::long_os_version().unwrap_or("Linux Unknown".to_string()))
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn get_linux_platform(_sys: &System) -> String {
+    fn get_linux_platform() -> String {
         "N/A".to_string()
     }
 }

@@ -125,7 +125,7 @@ pub trait Store<T>: Send + Sync {
     fn open(&self) -> Result<(), Self::Error>;
 
     /// Stores a single item
-    fn put(&self, item: T) -> Result<Self::Key, Self::Error>;
+    fn put(&self, item: Arc<T>) -> Result<Self::Key, Self::Error>;
 
     /// Stores multiple items in a single batch
     fn put_multiple(&self, items: Vec<T>) -> Result<Self::Key, Self::Error>;
@@ -279,7 +279,7 @@ where
         Ok(())
     }
 
-    fn put(&self, item: T) -> Result<Self::Key, Self::Error> {
+    fn put(&self, item: Arc<T>) -> Result<Self::Key, Self::Error> {
         // Check storage limits
         {
             let entries = self

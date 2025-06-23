@@ -7,6 +7,7 @@ use rustfs_notify::factory::{
 use rustfs_notify::store::DEFAULT_LIMIT;
 use rustfs_notify::{BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, init_logger};
 use rustfs_notify::{initialize, notification_system};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
@@ -159,10 +160,8 @@ async fn main() -> Result<(), NotificationError> {
     system.load_bucket_notification_config("my-bucket", &bucket_config).await?;
 
     info!("\n---> Sending an event...");
-    let event = Event::new_test_event("my-bucket", "document.pdf", EventName::ObjectCreatedPut);
-    system
-        .send_event("my-bucket", "s3:ObjectCreated:Put", "document.pdf", event)
-        .await;
+    let event = Arc::new(Event::new_test_event("my-bucket", "document.pdf", EventName::ObjectCreatedPut));
+    system.send_event(event).await;
     info!("✅ Event sent. Only the Webhook target should receive it. Check logs for warnings about the missing MQTT target.");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
