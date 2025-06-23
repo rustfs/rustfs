@@ -12,7 +12,7 @@
 //! cargo bench --bench comparison_benchmark --features reed-solomon-simd
 //!
 //! # 测试强制 erasure-only 模式
-//! cargo bench --bench comparison_benchmark --features reed-solomon-erasure
+//! cargo bench --bench comparison_benchmark
 //!
 //! # 生成对比报告
 //! cargo bench --bench comparison_benchmark -- --save-baseline erasure

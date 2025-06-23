@@ -1,5 +1,5 @@
 use crate::arn::TargetID;
-use crate::{error::NotificationError, event::Event, rules::RulesMap, target::Target, EventName};
+use crate::{EventName, error::NotificationError, event::Event, rules::RulesMap, target::Target};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};

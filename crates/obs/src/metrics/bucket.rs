@@ -1,5 +1,5 @@
 /// bucket level s3 metric descriptor
-use crate::metrics::{new_counter_md, new_gauge_md, new_histogram_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, new_histogram_md, subsystems};
 
 lazy_static::lazy_static! {
     pub static ref BUCKET_API_TRAFFIC_SENT_BYTES_MD: MetricDescriptor =

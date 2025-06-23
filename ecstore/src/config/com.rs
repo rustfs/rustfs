@@ -1,4 +1,4 @@
-use super::{storageclass, Config, GLOBAL_StorageClass};
+use super::{Config, GLOBAL_StorageClass, storageclass};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};

@@ -41,7 +41,7 @@ impl TargetID {
         ARN {
             target_id: self.clone(),
             region: region.to_string(),
-            service: DEFAULT_ARN_SERVICE.to_string(), // Default Service
+            service: DEFAULT_ARN_SERVICE.to_string(),     // Default Service
             partition: DEFAULT_ARN_PARTITION.to_string(), // Default partition
         }
     }
@@ -112,7 +112,7 @@ impl ARN {
         ARN {
             target_id,
             region,
-            service: DEFAULT_ARN_SERVICE.to_string(), // Default is sqs
+            service: DEFAULT_ARN_SERVICE.to_string(),     // Default is sqs
             partition: DEFAULT_ARN_PARTITION.to_string(), // Default is rustfs partition
         }
     }
@@ -121,16 +121,10 @@ impl ARN {
     /// Returns the ARN string in the format "{ARN_PREFIX}:{region}:{target_id}"
     #[allow(clippy::inherent_to_string)]
     pub fn to_arn_string(&self) -> String {
-        if self.target_id.id.is_empty() && self.target_id.name.is_empty() && self.region.is_empty()
-        {
+        if self.target_id.id.is_empty() && self.target_id.name.is_empty() && self.region.is_empty() {
             return String::new();
         }
-        format!(
-            "{}:{}:{}",
-            ARN_PREFIX,
-            self.region,
-            self.target_id.to_id_string()
-        )
+        format!("{}:{}:{}", ARN_PREFIX, self.region, self.target_id.to_id_string())
     }
 
     /// Parsing ARN from string
@@ -162,8 +156,7 @@ impl ARN {
 
 impl fmt::Display for ARN {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.target_id.id.is_empty() && self.target_id.name.is_empty() && self.region.is_empty()
-        {
+        if self.target_id.id.is_empty() && self.target_id.name.is_empty() && self.region.is_empty() {
             // Returns an empty string if all parts are empty
             return Ok(());
         }

@@ -1,22 +1,22 @@
 use crate::store::{Key, STORE_EXTENSION};
 use crate::target::ChannelTargetType;
 use crate::{
-    arn::TargetID, error::TargetError,
+    StoreError, Target,
+    arn::TargetID,
+    error::TargetError,
     event::{Event, EventLog},
     store::Store,
-    StoreError,
-    Target,
 };
 use async_trait::async_trait;
-use rumqttc::{mqttbytes::Error as MqttBytesError, ConnectionError};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
+use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
 use std::sync::Arc;
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::sync::{mpsc, Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
 use urlencoding;
@@ -58,24 +58,19 @@ impl MQTTArgs {
         match self.broker.scheme() {
             "ws" | "wss" | "tcp" | "ssl" | "tls" | "tcps" | "mqtt" | "mqtts" => {}
             _ => {
-                return Err(TargetError::Configuration(
-                    "unknown protocol in broker address".to_string(),
-                ));
+                return Err(TargetError::Configuration("unknown protocol in broker address".to_string()));
             }
         }
 
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
-                return Err(TargetError::Configuration(
-                    "mqtt queueDir path should be absolute".to_string(),
-                ));
+                return Err(TargetError::Configuration("mqtt queueDir path should be absolute".to_string()));
             }
 
             if self.qos == QoS::AtMostOnce {
                 return Err(TargetError::Configuration(
-                    "QoS should be AtLeastOnce (1) or ExactlyOnce (2) if queueDir is set"
-                        .to_string(),
+                    "QoS should be AtLeastOnce (1) or ExactlyOnce (2) if queueDir is set".to_string(),
                 ));
             }
         }
@@ -107,21 +102,12 @@ impl MQTTTarget {
         let target_id = TargetID::new(id.clone(), ChannelTargetType::Mqtt.as_str().to_string());
         let queue_store = if !args.queue_dir.is_empty() {
             let base_path = PathBuf::from(&args.queue_dir);
-            let unique_dir_name = format!(
-                "rustfs-{}-{}-{}",
-                ChannelTargetType::Mqtt.as_str(),
-                target_id.name,
-                target_id.id
-            )
-            .replace(":", "_");
+            let unique_dir_name =
+                format!("rustfs-{}-{}-{}", ChannelTargetType::Mqtt.as_str(), target_id.name, target_id.id).replace(":", "_");
             // Ensure the directory name is valid for filesystem
             let specific_queue_path = base_path.join(unique_dir_name);
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
-            let store = crate::store::QueueStore::<Event>::new(
-                specific_queue_path,
-                args.queue_limit,
-                STORE_EXTENSION,
-            );
+            let store = crate::store::QueueStore::<Event>::new(specific_queue_path, args.queue_limit, STORE_EXTENSION);
             if let Err(e) = store.open() {
                 error!(
                     target_id = %target_id,
@@ -130,10 +116,7 @@ impl MQTTTarget {
                 );
                 return Err(TargetError::Storage(format!("{}", e)));
             }
-            Some(Box::new(store)
-                as Box<
-                    dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync,
-                >)
+            Some(Box::new(store) as Box<dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync>)
         } else {
             None
         };
@@ -175,18 +158,13 @@ impl MQTTTarget {
                 debug!(target_id = %target_id_clone, "Initializing MQTT background task.");
                 let host = args_clone.broker.host_str().unwrap_or("localhost");
                 let port = args_clone.broker.port().unwrap_or(1883);
-                let mut mqtt_options = MqttOptions::new(
-                    format!("rustfs_notify_{}", uuid::Uuid::new_v4()),
-                    host,
-                    port,
-                );
+                let mut mqtt_options = MqttOptions::new(format!("rustfs_notify_{}", uuid::Uuid::new_v4()), host, port);
                 mqtt_options
                     .set_keep_alive(args_clone.keep_alive)
                     .set_max_packet_size(100 * 1024 * 1024, 100 * 1024 * 1024); // 100MB
 
                 if !args_clone.username.is_empty() {
-                    mqtt_options
-                        .set_credentials(args_clone.username.clone(), args_clone.password.clone());
+                    mqtt_options.set_credentials(args_clone.username.clone(), args_clone.password.clone());
                 }
 
                 let (new_client, eventloop) = AsyncClient::new(mqtt_options, 10);
@@ -206,12 +184,8 @@ impl MQTTTarget {
                 *client_arc.lock().await = Some(new_client.clone());
 
                 info!(target_id = %target_id_clone, "Spawning MQTT event loop task.");
-                let task_handle = tokio::spawn(run_mqtt_event_loop(
-                    eventloop,
-                    connected_arc.clone(),
-                    target_id_clone.clone(),
-                    cancel_rx,
-                ));
+                let task_handle =
+                    tokio::spawn(run_mqtt_event_loop(eventloop, connected_arc.clone(), target_id_clone.clone(), cancel_rx));
                 Ok(task_handle)
             })
             .await
@@ -266,17 +240,13 @@ impl MQTTTarget {
             records: vec![event.clone()],
         };
 
-        let data = serde_json::to_vec(&log)
-            .map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {}", e)))?;
+        let data =
+            serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {}", e)))?;
 
         // Vec<u8> Convert to String, only for printing logs
-        let data_string = String::from_utf8(data.clone()).map_err(|e| {
-            TargetError::Encoding(format!("Failed to convert event data to UTF-8: {}", e))
-        })?;
-        debug!(
-            "Sending event to mqtt target: {}, event log: {}",
-            self.id, data_string
-        );
+        let data_string = String::from_utf8(data.clone())
+            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {}", e)))?;
+        debug!("Sending event to mqtt target: {}, event log: {}", self.id, data_string);
 
         client
             .publish(&self.args.topic, self.args.qos, false, data)
@@ -474,9 +444,7 @@ impl Target for MQTTTarget {
             if let Some(handle) = self.bg_task_manager.init_cell.get() {
                 if handle.is_finished() {
                     error!(target_id = %self.id, "MQTT background task has finished, possibly due to an error. Target is not active.");
-                    return Err(TargetError::Network(
-                        "MQTT background task terminated".to_string(),
-                    ));
+                    return Err(TargetError::Network("MQTT background task terminated".to_string()));
                 }
             }
             debug!(target_id = %self.id, "MQTT client not yet initialized or task not running/connected.");
@@ -507,10 +475,7 @@ impl Target for MQTTTarget {
                 }
                 Err(e) => {
                     error!(target_id = %self.id, error = %e, "Failed to save event to store");
-                    return Err(TargetError::Storage(format!(
-                        "Failed to save event to store: {}",
-                        e
-                    )));
+                    return Err(TargetError::Storage(format!("Failed to save event to store: {}", e)));
                 }
             }
         } else {
@@ -581,10 +546,7 @@ impl Target for MQTTTarget {
                     error = %e,
                     "Failed to get event from store"
                 );
-                return Err(TargetError::Storage(format!(
-                    "Failed to get event from store: {}",
-                    e
-                )));
+                return Err(TargetError::Storage(format!("Failed to get event from store: {}", e)));
             }
         };
 
@@ -608,10 +570,7 @@ impl Target for MQTTTarget {
             }
             Err(e) => {
                 error!(target_id = %self.id, error = %e, "Failed to delete event from store after send.");
-                return Err(TargetError::Storage(format!(
-                    "Failed to delete event from store: {}",
-                    e
-                )));
+                return Err(TargetError::Storage(format!("Failed to delete event from store: {}", e)));
             }
         }
 

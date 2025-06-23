@@ -1,27 +1,15 @@
-//! Erasure coding implementation supporting multiple Reed-Solomon backends.
+//! Erasure coding implementation using Reed-Solomon SIMD backend.
 //!
-//! This module provides erasure coding functionality with support for two different
-//! Reed-Solomon implementations:
+//! This module provides erasure coding functionality with high-performance SIMD
+//! Reed-Solomon implementation:
 //!
-//! ## Reed-Solomon Implementations
+//! ## Reed-Solomon Implementation
 //!
-//! ### Pure Erasure Mode (Default)
-//! - **Stability**: Pure erasure implementation, mature and well-tested
-//! - **Performance**: Good performance with consistent behavior
-//! - **Compatibility**: Works with any shard size
-//! - **Use case**: Default behavior, recommended for most production use cases
-//!
-//! ### SIMD Mode (`reed-solomon-simd` feature)
+//! ### SIMD Mode (Only)
 //! - **Performance**: Uses SIMD optimization for high-performance encoding/decoding
 //! - **Compatibility**: Works with any shard size through SIMD implementation
 //! - **Reliability**: High-performance SIMD implementation for large data processing
-//! - **Use case**: Use when maximum performance is needed for large data processing
-//!
-//! ## Feature Flags
-//!
-//! - Default: Use pure reed-solomon-erasure implementation (stable and reliable)
-//! - `reed-solomon-simd`: Use SIMD mode for optimal performance
-//! - `reed-solomon-erasure`: Explicitly enable pure erasure mode (same as default)
+//! - **Use case**: Optimized for maximum performance in large data processing scenarios
 //!
 //! ## Example
 //!
@@ -35,8 +23,6 @@
 //! ```
 
 use bytes::{Bytes, BytesMut};
-use reed_solomon_erasure::galois_8::ReedSolomon as ReedSolomonErasure;
-#[cfg(feature = "reed-solomon-simd")]
 use reed_solomon_simd;
 use smallvec::SmallVec;
 use std::io;
@@ -44,38 +30,23 @@ use tokio::io::AsyncRead;
 use tracing::warn;
 use uuid::Uuid;
 
-/// Reed-Solomon encoder variants supporting different implementations.
-#[allow(clippy::large_enum_variant)]
-pub enum ReedSolomonEncoder {
-    /// SIMD mode: High-performance SIMD implementation (when reed-solomon-simd feature is enabled)
-    #[cfg(feature = "reed-solomon-simd")]
-    SIMD {
-        data_shards: usize,
-        parity_shards: usize,
-        // 使用RwLock确保线程安全，实现Send + Sync
-        encoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
-        decoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
-    },
-    /// Pure erasure mode: default and when reed-solomon-erasure feature is specified
-    Erasure(Box<ReedSolomonErasure>),
+/// Reed-Solomon encoder using SIMD implementation.
+pub struct ReedSolomonEncoder {
+    data_shards: usize,
+    parity_shards: usize,
+    // 使用RwLock确保线程安全，实现Send + Sync
+    encoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
+    decoder_cache: std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
 }
 
 impl Clone for ReedSolomonEncoder {
     fn clone(&self) -> Self {
-        match self {
-            #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::SIMD {
-                data_shards,
-                parity_shards,
-                ..
-            } => ReedSolomonEncoder::SIMD {
-                data_shards: *data_shards,
-                parity_shards: *parity_shards,
-                // 为新实例创建空的缓存，不共享缓存
-                encoder_cache: std::sync::RwLock::new(None),
-                decoder_cache: std::sync::RwLock::new(None),
-            },
-            ReedSolomonEncoder::Erasure(encoder) => ReedSolomonEncoder::Erasure(encoder.clone()),
+        Self {
+            data_shards: self.data_shards,
+            parity_shards: self.parity_shards,
+            // 为新实例创建空的缓存，不共享缓存
+            encoder_cache: std::sync::RwLock::new(None),
+            decoder_cache: std::sync::RwLock::new(None),
         }
     }
 }
@@ -83,81 +54,50 @@ impl Clone for ReedSolomonEncoder {
 impl ReedSolomonEncoder {
     /// Create a new Reed-Solomon encoder with specified data and parity shards.
     pub fn new(data_shards: usize, parity_shards: usize) -> io::Result<Self> {
-        #[cfg(feature = "reed-solomon-simd")]
-        {
-            // SIMD mode when reed-solomon-simd feature is enabled
-            Ok(ReedSolomonEncoder::SIMD {
-                data_shards,
-                parity_shards,
-                encoder_cache: std::sync::RwLock::new(None),
-                decoder_cache: std::sync::RwLock::new(None),
-            })
-        }
-
-        #[cfg(not(feature = "reed-solomon-simd"))]
-        {
-            // Pure erasure mode when reed-solomon-simd feature is not enabled (default or reed-solomon-erasure)
-            let encoder = ReedSolomonErasure::new(data_shards, parity_shards)
-                .map_err(|e| io::Error::other(format!("Failed to create erasure encoder: {:?}", e)))?;
-            Ok(ReedSolomonEncoder::Erasure(Box::new(encoder)))
-        }
+        Ok(ReedSolomonEncoder {
+            data_shards,
+            parity_shards,
+            encoder_cache: std::sync::RwLock::new(None),
+            decoder_cache: std::sync::RwLock::new(None),
+        })
     }
 
     /// Encode data shards with parity.
     pub fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
-        match self {
-            #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::SIMD {
-                data_shards,
-                parity_shards,
-                encoder_cache,
-                ..
-            } => {
-                let mut shards_vec: Vec<&mut [u8]> = shards.into_vec();
-                if shards_vec.is_empty() {
-                    return Ok(());
-                }
+        let mut shards_vec: Vec<&mut [u8]> = shards.into_vec();
+        if shards_vec.is_empty() {
+            return Ok(());
+        }
 
-                // 使用 SIMD 进行编码
-                let simd_result = self.encode_with_simd(*data_shards, *parity_shards, encoder_cache, &mut shards_vec);
+        // 使用 SIMD 进行编码
+        let simd_result = self.encode_with_simd(&mut shards_vec);
 
-                match simd_result {
-                    Ok(()) => Ok(()),
-                    Err(simd_error) => {
-                        warn!("SIMD encoding failed: {}", simd_error);
-                        Err(simd_error)
-                    }
-                }
+        match simd_result {
+            Ok(()) => Ok(()),
+            Err(simd_error) => {
+                warn!("SIMD encoding failed: {}", simd_error);
+                Err(simd_error)
             }
-            ReedSolomonEncoder::Erasure(encoder) => encoder
-                .encode(shards)
-                .map_err(|e| io::Error::other(format!("Erasure encode error: {:?}", e))),
         }
     }
 
-    #[cfg(feature = "reed-solomon-simd")]
-    fn encode_with_simd(
-        &self,
-        data_shards: usize,
-        parity_shards: usize,
-        encoder_cache: &std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonEncoder>>,
-        shards_vec: &mut [&mut [u8]],
-    ) -> io::Result<()> {
+    fn encode_with_simd(&self, shards_vec: &mut [&mut [u8]]) -> io::Result<()> {
         let shard_len = shards_vec[0].len();
 
         // 获取或创建encoder
         let mut encoder = {
-            let mut cache_guard = encoder_cache
+            let mut cache_guard = self
+                .encoder_cache
                 .write()
                 .map_err(|_| io::Error::other("Failed to acquire encoder cache lock"))?;
 
             match cache_guard.take() {
                 Some(mut cached_encoder) => {
                     // 使用reset方法重置现有encoder以适应新的参数
-                    if let Err(e) = cached_encoder.reset(data_shards, parity_shards, shard_len) {
+                    if let Err(e) = cached_encoder.reset(self.data_shards, self.parity_shards, shard_len) {
                         warn!("Failed to reset SIMD encoder: {:?}, creating new one", e);
                         // 如果reset失败，创建新的encoder
-                        reed_solomon_simd::ReedSolomonEncoder::new(data_shards, parity_shards, shard_len)
+                        reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
                             .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {:?}", e)))?
                     } else {
                         cached_encoder
@@ -165,14 +105,14 @@ impl ReedSolomonEncoder {
                 }
                 None => {
                     // 第一次使用，创建新encoder
-                    reed_solomon_simd::ReedSolomonEncoder::new(data_shards, parity_shards, shard_len)
+                    reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
                         .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {:?}", e)))?
                 }
             }
         };
 
         // 添加原始shards
-        for (i, shard) in shards_vec.iter().enumerate().take(data_shards) {
+        for (i, shard) in shards_vec.iter().enumerate().take(self.data_shards) {
             encoder
                 .add_original_shard(shard)
                 .map_err(|e| io::Error::other(format!("Failed to add shard {}: {:?}", i, e)))?;
@@ -185,15 +125,16 @@ impl ReedSolomonEncoder {
 
         // 将恢复shards复制到输出缓冲区
         for (i, recovery_shard) in result.recovery_iter().enumerate() {
-            if i + data_shards < shards_vec.len() {
-                shards_vec[i + data_shards].copy_from_slice(recovery_shard);
+            if i + self.data_shards < shards_vec.len() {
+                shards_vec[i + self.data_shards].copy_from_slice(recovery_shard);
             }
         }
 
         // 将encoder放回缓存（在result被drop后encoder自动重置，可以重用）
         drop(result); // 显式drop result，确保encoder被重置
 
-        *encoder_cache
+        *self
+            .encoder_cache
             .write()
             .map_err(|_| io::Error::other("Failed to return encoder to cache"))? = Some(encoder);
 
@@ -202,39 +143,19 @@ impl ReedSolomonEncoder {
 
     /// Reconstruct missing shards.
     pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
-        match self {
-            #[cfg(feature = "reed-solomon-simd")]
-            ReedSolomonEncoder::SIMD {
-                data_shards,
-                parity_shards,
-                decoder_cache,
-                ..
-            } => {
-                // 使用 SIMD 进行重构
-                let simd_result = self.reconstruct_with_simd(*data_shards, *parity_shards, decoder_cache, shards);
+        // 使用 SIMD 进行重构
+        let simd_result = self.reconstruct_with_simd(shards);
 
-                match simd_result {
-                    Ok(()) => Ok(()),
-                    Err(simd_error) => {
-                        warn!("SIMD reconstruction failed: {}", simd_error);
-                        Err(simd_error)
-                    }
-                }
+        match simd_result {
+            Ok(()) => Ok(()),
+            Err(simd_error) => {
+                warn!("SIMD reconstruction failed: {}", simd_error);
+                Err(simd_error)
             }
-            ReedSolomonEncoder::Erasure(encoder) => encoder
-                .reconstruct(shards)
-                .map_err(|e| io::Error::other(format!("Erasure reconstruct error: {:?}", e))),
         }
     }
 
-    #[cfg(feature = "reed-solomon-simd")]
-    fn reconstruct_with_simd(
-        &self,
-        data_shards: usize,
-        parity_shards: usize,
-        decoder_cache: &std::sync::RwLock<Option<reed_solomon_simd::ReedSolomonDecoder>>,
-        shards: &mut [Option<Vec<u8>>],
-    ) -> io::Result<()> {
+    fn reconstruct_with_simd(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         // Find a valid shard to determine length
         let shard_len = shards
             .iter()
@@ -243,17 +164,18 @@ impl ReedSolomonEncoder {
 
         // 获取或创建decoder
         let mut decoder = {
-            let mut cache_guard = decoder_cache
+            let mut cache_guard = self
+                .decoder_cache
                 .write()
                 .map_err(|_| io::Error::other("Failed to acquire decoder cache lock"))?;
 
             match cache_guard.take() {
                 Some(mut cached_decoder) => {
                     // 使用reset方法重置现有decoder
-                    if let Err(e) = cached_decoder.reset(data_shards, parity_shards, shard_len) {
+                    if let Err(e) = cached_decoder.reset(self.data_shards, self.parity_shards, shard_len) {
                         warn!("Failed to reset SIMD decoder: {:?}, creating new one", e);
                         // 如果reset失败，创建新的decoder
-                        reed_solomon_simd::ReedSolomonDecoder::new(data_shards, parity_shards, shard_len)
+                        reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
                             .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {:?}", e)))?
                     } else {
                         cached_decoder
@@ -261,7 +183,7 @@ impl ReedSolomonEncoder {
                 }
                 None => {
                     // 第一次使用，创建新decoder
-                    reed_solomon_simd::ReedSolomonDecoder::new(data_shards, parity_shards, shard_len)
+                    reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
                         .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {:?}", e)))?
                 }
             }
@@ -270,12 +192,12 @@ impl ReedSolomonEncoder {
         // Add available shards (both data and parity)
         for (i, shard_opt) in shards.iter().enumerate() {
             if let Some(shard) = shard_opt {
-                if i < data_shards {
+                if i < self.data_shards {
                     decoder
                         .add_original_shard(i, shard)
                         .map_err(|e| io::Error::other(format!("Failed to add original shard for reconstruction: {:?}", e)))?;
                 } else {
-                    let recovery_idx = i - data_shards;
+                    let recovery_idx = i - self.data_shards;
                     decoder
                         .add_recovery_shard(recovery_idx, shard)
                         .map_err(|e| io::Error::other(format!("Failed to add recovery shard for reconstruction: {:?}", e)))?;
@@ -289,7 +211,7 @@ impl ReedSolomonEncoder {
 
         // Fill in missing data shards from reconstruction result
         for (i, shard_opt) in shards.iter_mut().enumerate() {
-            if shard_opt.is_none() && i < data_shards {
+            if shard_opt.is_none() && i < self.data_shards {
                 for (restored_index, restored_data) in result.restored_original_iter() {
                     if restored_index == i {
                         *shard_opt = Some(restored_data.to_vec());
@@ -302,7 +224,8 @@ impl ReedSolomonEncoder {
         // 将decoder放回缓存（在result被drop后decoder自动重置，可以重用）
         drop(result); // 显式drop result，确保decoder被重置
 
-        *decoder_cache
+        *self
+            .decoder_cache
             .write()
             .map_err(|_| io::Error::other("Failed to return decoder to cache"))? = Some(decoder);
 
@@ -592,19 +515,10 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let data_shards = 4;
         let parity_shards = 2;
-
-        // Use different block sizes based on feature
-        #[cfg(not(feature = "reed-solomon-simd"))]
-        let block_size = 8; // Pure erasure mode (default)
-        #[cfg(feature = "reed-solomon-simd")]
-        let block_size = 1024; // SIMD mode - SIMD with fallback
-
+        let block_size = 1024; // SIMD mode
         let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
-        // Use different test data based on feature
-        #[cfg(not(feature = "reed-solomon-simd"))]
-        let test_data = b"hello world".to_vec(); // Small data for erasure (default)
-        #[cfg(feature = "reed-solomon-simd")]
+        // Use sufficient test data for SIMD optimization
         let test_data = b"SIMD mode test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization.".repeat(20); // ~3KB for SIMD
 
         let data = &test_data;
@@ -632,13 +546,7 @@ mod tests {
     fn test_encode_decode_large_1m() {
         let data_shards = 4;
         let parity_shards = 2;
-
-        // Use different block sizes based on feature
-        #[cfg(feature = "reed-solomon-simd")]
         let block_size = 512 * 3; // SIMD mode
-        #[cfg(not(feature = "reed-solomon-simd"))]
-        let block_size = 8192; // Pure erasure mode (default)
-
         let erasure = Erasure::new(data_shards, parity_shards, block_size);
 
         // Generate 1MB test data
@@ -704,16 +612,10 @@ mod tests {
 
         let data_shards = 4;
         let parity_shards = 2;
-
-        // Use different block sizes based on feature
-        #[cfg(feature = "reed-solomon-simd")]
         let block_size = 1024; // SIMD mode
-        #[cfg(not(feature = "reed-solomon-simd"))]
-        let block_size = 8; // Pure erasure mode (default)
-
         let erasure = Arc::new(Erasure::new(data_shards, parity_shards, block_size));
 
-        // Use test data suitable for both modes
+        // Use test data suitable for SIMD mode
         let data =
             b"Async error test data with sufficient length to meet requirements for proper testing and validation.".repeat(20); // ~2KB
 
@@ -747,21 +649,13 @@ mod tests {
 
         let data_shards = 4;
         let parity_shards = 2;
-
-        // Use different block sizes based on feature
-        #[cfg(feature = "reed-solomon-simd")]
         let block_size = 1024; // SIMD mode
-        #[cfg(not(feature = "reed-solomon-simd"))]
-        let block_size = 8; // Pure erasure mode (default)
-
         let erasure = Arc::new(Erasure::new(data_shards, parity_shards, block_size));
 
         // Use test data that fits in exactly one block to avoid multi-block complexity
         let data =
             b"Channel async callback test data with sufficient length to ensure proper operation and validation requirements."
                 .repeat(8); // ~1KB
-
-        // let data = b"callback".to_vec(); // 8 bytes to fit exactly in one 8-byte block
 
         let data_clone = data.clone(); // Clone for later comparison
         let mut reader = Cursor::new(data);
@@ -801,8 +695,7 @@ mod tests {
         assert_eq!(&recovered, &data_clone);
     }
 
-    // Tests specifically for SIMD mode
-    #[cfg(feature = "reed-solomon-simd")]
+    // SIMD mode specific tests
     mod simd_tests {
         use super::*;
 
@@ -1169,49 +1062,6 @@ mod tests {
 
             recovered.truncate(data_clone.len());
             assert_eq!(&recovered, &data_clone);
-        }
-    }
-
-    // Comparative tests between different implementations
-    #[cfg(not(feature = "reed-solomon-simd"))]
-    mod comparative_tests {
-        use super::*;
-
-        #[test]
-        fn test_implementation_consistency() {
-            let data_shards = 4;
-            let parity_shards = 2;
-            let block_size = 2048; // Large enough for SIMD requirements
-
-            // Create test data that ensures each shard is >= 512 bytes (SIMD minimum)
-            let test_data = b"This is test data for comparing reed-solomon-simd and reed-solomon-erasure implementations to ensure they produce consistent results when given the same input parameters and data. This data needs to be sufficiently large to meet SIMD requirements.";
-            let data = test_data.repeat(50); // Create much larger data: ~13KB total, ~3.25KB per shard
-
-            // Test with erasure implementation (default)
-            let erasure_erasure = Erasure::new(data_shards, parity_shards, block_size);
-            let erasure_shards = erasure_erasure.encode_data(&data).unwrap();
-
-            // Test data integrity with erasure
-            let mut erasure_shards_opt: Vec<Option<Vec<u8>>> = erasure_shards.iter().map(|shard| Some(shard.to_vec())).collect();
-
-            // Lose some shards
-            erasure_shards_opt[1] = None; // Data shard
-            erasure_shards_opt[4] = None; // Parity shard
-
-            erasure_erasure.decode_data(&mut erasure_shards_opt).unwrap();
-
-            let mut erasure_recovered = Vec::new();
-            for shard in erasure_shards_opt.iter().take(data_shards) {
-                erasure_recovered.extend_from_slice(shard.as_ref().unwrap());
-            }
-            erasure_recovered.truncate(data.len());
-
-            // Verify erasure implementation works correctly
-            assert_eq!(&erasure_recovered, &data, "Erasure implementation failed to recover data correctly");
-
-            println!("✅ Both implementations are available and working correctly");
-            println!("✅ Default (reed-solomon-erasure): Data recovery successful");
-            println!("✅ SIMD tests are available as separate test suite");
         }
     }
 }

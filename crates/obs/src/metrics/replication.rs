@@ -1,5 +1,5 @@
 /// Copy the relevant metric descriptor
-use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 
 lazy_static::lazy_static! {
     pub static ref REPLICATION_AVERAGE_ACTIVE_WORKERS_MD: MetricDescriptor =

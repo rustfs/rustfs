@@ -1,5 +1,5 @@
 use crate::error::StoreError;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::sync::{Arc, RwLock};
 use std::{
@@ -195,11 +195,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
     /// Reads a file for the given key
     fn read_file(&self, key: &Key) -> Result<Vec<u8>, StoreError> {
         let path = self.file_path(key);
-        debug!(
-            "Reading file for key: {},path: {}",
-            key.to_string(),
-            path.display()
-        );
+        debug!("Reading file for key: {},path: {}", key.to_string(), path.display());
         let data = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound
@@ -240,13 +236,11 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
         };
 
         std::fs::write(&path, &data).map_err(StoreError::Io)?;
-        let modified = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-        let mut entries = self.entries.write().map_err(|_| {
-            StoreError::Internal("Failed to acquire write lock on entries".to_string())
-        })?;
+        let modified = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
         entries.insert(key.to_string(), modified);
         debug!("Wrote event to store: {}", key.to_string());
         Ok(())
@@ -265,18 +259,16 @@ where
 
         let entries = std::fs::read_dir(&self.directory).map_err(StoreError::Io)?;
         // Get the write lock to update the internal state
-        let mut entries_map = self.entries.write().map_err(|_| {
-            StoreError::Internal("Failed to acquire write lock on entries".to_string())
-        })?;
+        let mut entries_map = self
+            .entries
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
         for entry in entries {
             let entry = entry.map_err(StoreError::Io)?;
             let metadata = entry.metadata().map_err(StoreError::Io)?;
             if metadata.is_file() {
                 let modified = metadata.modified().map_err(StoreError::Io)?;
-                let unix_nano = modified
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as i64;
+                let unix_nano = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
 
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 entries_map.insert(file_name, unix_nano);
@@ -290,9 +282,10 @@ where
     fn put(&self, item: T) -> Result<Self::Key, Self::Error> {
         // Check storage limits
         {
-            let entries = self.entries.read().map_err(|_| {
-                StoreError::Internal("Failed to acquire read lock on entries".to_string())
-            })?;
+            let entries = self
+                .entries
+                .read()
+                .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
 
             if entries.len() as u64 >= self.entry_limit {
                 return Err(StoreError::LimitExceeded);
@@ -307,8 +300,7 @@ where
             compress: true,
         };
 
-        let data =
-            serde_json::to_vec(&item).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let data = serde_json::to_vec(&item).map_err(|e| StoreError::Serialization(e.to_string()))?;
         self.write_file(&key, &data)?;
 
         Ok(key)
@@ -317,9 +309,10 @@ where
     fn put_multiple(&self, items: Vec<T>) -> Result<Self::Key, Self::Error> {
         // Check storage limits
         {
-            let entries = self.entries.read().map_err(|_| {
-                StoreError::Internal("Failed to acquire read lock on entries".to_string())
-            })?;
+            let entries = self
+                .entries
+                .read()
+                .map_err(|_| StoreError::Internal("Failed to acquire read lock on entries".to_string()))?;
 
             if entries.len() as u64 >= self.entry_limit {
                 return Err(StoreError::LimitExceeded);
@@ -327,9 +320,7 @@ where
         }
         if items.is_empty() {
             // Or return an error, or a special key?
-            return Err(StoreError::Internal(
-                "Cannot put_multiple with empty items list".to_string(),
-            ));
+            return Err(StoreError::Internal("Cannot put_multiple with empty items list".to_string()));
         }
         let uuid = Uuid::new_v4();
         let key = Key {
@@ -348,8 +339,7 @@ where
         for item in items {
             // If items are Vec<Event>, and Event is large, this could be inefficient.
             // The current get_multiple deserializes one by one.
-            let item_data =
-                serde_json::to_vec(&item).map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let item_data = serde_json::to_vec(&item).map_err(|e| StoreError::Serialization(e.to_string()))?;
             buffer.extend_from_slice(&item_data);
             // If using JSON array: buffer = serde_json::to_vec(&items)?
         }
@@ -374,9 +364,7 @@ where
         debug!("Reading items from store for key: {}", key.to_string());
         let data = self.read_file(key)?;
         if data.is_empty() {
-            return Err(StoreError::Deserialization(
-                "Cannot deserialize empty data".to_string(),
-            ));
+            return Err(StoreError::Deserialization("Cannot deserialize empty data".to_string()));
         }
         let mut items = Vec::with_capacity(key.item_count);
 
@@ -395,10 +383,7 @@ where
             match deserializer.next() {
                 Some(Ok(item)) => items.push(item),
                 Some(Err(e)) => {
-                    return Err(StoreError::Deserialization(format!(
-                        "Failed to deserialize item in batch: {}",
-                        e
-                    )));
+                    return Err(StoreError::Deserialization(format!("Failed to deserialize item in batch: {}", e)));
                 }
                 None => {
                     // Reached end of stream sooner than item_count
@@ -435,7 +420,10 @@ where
         std::fs::remove_file(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 // If file not found, still try to remove from entries map in case of inconsistency
-                warn!("File not found for key {} during del, but proceeding to remove from entries map.", key.to_string());
+                warn!(
+                    "File not found for key {} during del, but proceeding to remove from entries map.",
+                    key.to_string()
+                );
                 StoreError::NotFound
             } else {
                 StoreError::Io(e)
@@ -443,17 +431,15 @@ where
         })?;
 
         // Get the write lock to update the internal state
-        let mut entries = self.entries.write().map_err(|_| {
-            StoreError::Internal("Failed to acquire write lock on entries".to_string())
-        })?;
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
 
         if entries.remove(&key.to_string()).is_none() {
             // Key was not in the map, could be an inconsistency or already deleted.
             // This is not necessarily an error if the file deletion succeeded or was NotFound.
-            debug!(
-                "Key {} not found in entries map during del, might have been already removed.",
-                key
-            );
+            debug!("Key {} not found in entries map during del, might have been already removed.", key);
         }
         debug!("Deleted event from store: {}", key.to_string());
         Ok(())
@@ -492,7 +478,6 @@ where
     }
 
     fn boxed_clone(&self) -> Box<dyn Store<T, Error = Self::Error, Key = Self::Key> + Send + Sync> {
-        Box::new(self.clone())
-            as Box<dyn Store<T, Error = Self::Error, Key = Self::Key> + Send + Sync>
+        Box::new(self.clone()) as Box<dyn Store<T, Error = Self::Error, Key = Self::Key> + Send + Sync>
     }
 }

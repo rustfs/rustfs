@@ -1,7 +1,7 @@
 //! Reed-Solomon erasure coding performance benchmarks.
 //!
 //! This benchmark compares the performance of different Reed-Solomon implementations:
-//! - Default (Pure erasure): Stable reed-solomon-erasure implementation
+//! - SIMD mode: High-performance reed-solomon-simd implementation
 //! - `reed-solomon-simd` feature: SIMD mode with optimized performance
 //!
 //! ## Running Benchmarks
@@ -235,7 +235,7 @@ fn bench_decode_performance(c: &mut Criterion) {
         group.finish();
 
         // 如果使用混合模式（默认），测试SIMD解码性能
-        #[cfg(not(feature = "reed-solomon-erasure"))]
+
         {
             let shard_size = calc_shard_size(config.data_size, config.data_shards);
             if shard_size >= 512 {

@@ -1,19 +1,19 @@
 use crate::store::STORE_EXTENSION;
 use crate::target::ChannelTargetType;
 use crate::{
-    arn::TargetID, error::TargetError,
+    StoreError, Target,
+    arn::TargetID,
+    error::TargetError,
     event::{Event, EventLog},
     store::{Key, Store},
-    StoreError,
-    Target,
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };

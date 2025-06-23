@@ -11,9 +11,7 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-default = ["reed-solomon-simd"]
-reed-solomon-simd = []
-reed-solomon-erasure = []
+default = []
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants"] }
@@ -40,7 +38,6 @@ http.workspace = true
 highway = { workspace = true }
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
-reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 reed-solomon-simd = { version = "3.0.0" }
 transform-stream = "0.3.1"
 lazy_static.workspace = true

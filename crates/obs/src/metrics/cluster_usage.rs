@@ -1,5 +1,5 @@
 /// Descriptors of metrics related to cluster object and bucket usage
-use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 
 /// Bucket labels
 pub const BUCKET_LABEL: &str = "bucket";
