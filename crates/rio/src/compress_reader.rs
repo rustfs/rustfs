@@ -474,7 +474,7 @@ mod tests {
     async fn test_compress_reader_large() {
         use rand::Rng;
         // Generate 1MB of random bytes
-        let mut data = vec![0u8; 1024 * 1024];
+        let mut data = vec![0u8; 1024 * 1024 * 32];
         rand::rng().fill(&mut data[..]);
         let reader = Cursor::new(data.clone());
         let mut compress_reader = CompressReader::new(WarpReader::new(reader), CompressionAlgorithm::Gzip);
