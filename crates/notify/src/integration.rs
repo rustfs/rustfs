@@ -224,7 +224,7 @@ impl NotificationSystem {
             let mut changed = false;
             if let Some(targets_of_type) = config.0.get_mut(target_type) {
                 if targets_of_type.remove(&target_id.name).is_some() {
-                    info!("Remove target from configuration {}", target_id);
+                    info!("Removed target {} from configuration", target_id);
                     changed = true;
                 }
                 if targets_of_type.is_empty() {
