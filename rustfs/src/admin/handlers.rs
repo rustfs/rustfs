@@ -63,6 +63,7 @@ pub mod pools;
 pub mod rebalance;
 pub mod service_account;
 pub mod sts;
+pub mod tier;
 pub mod trace;
 pub mod user;
 use urlencoding::decode;

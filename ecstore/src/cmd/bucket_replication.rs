@@ -56,6 +56,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
 // use bucket_targets::{self, GLOBAL_Bucket_Target_Sys};
+use crate::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct MRFReplicateEntry {
@@ -2013,6 +2014,7 @@ impl ReplicateObjectInfo {
             data_blocks: 0,
             version_id: Uuid::try_parse(&self.version_id).ok(),
             delete_marker: self.delete_marker,
+            transitioned_object: TransitionedObject::default(),
             user_tags: self.user_tags.clone(),
             parts: Vec::new(),
             is_latest: true,

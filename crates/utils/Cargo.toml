@@ -7,28 +7,27 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-base64-simd = { workspace = true, optional = true }
+base64-simd= { workspace = true , optional = true}
 blake3 = { workspace = true, optional = true }
 crc32fast.workspace = true
-hex-simd = { workspace = true, optional = true }
+hex-simd= { workspace = true , optional = true}
 highway = { workspace = true, optional = true }
-lazy_static = { workspace = true, optional = true }
+lazy_static= { workspace = true , optional = true}
 local-ip-address = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
-netif = { workspace = true, optional = true }
+netif= { workspace = true , optional = true}
 nix = { workspace = true, optional = true }
-regex = { workspace = true, optional = true }
+regex= { workspace = true, optional = true }
 rustfs-config = { workspace = true, features = ["constants"] }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 siphasher = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
 tracing = { workspace = true }
-url = { workspace = true, optional = true }
+url = { workspace = true , optional = true}
 flate2 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
@@ -39,6 +38,13 @@ futures = { workspace = true, optional = true }
 transform-stream = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 sysinfo = { workspace = true, optional = true }
+hyper.workspace = true
+hyper-util.workspace = true
+common.workspace = true
+sha1 = { workspace = true }
+sha2 = { workspace = true, optional = true }
+hmac.workspace = true
+s3s.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -59,7 +65,7 @@ io = ["dep:tokio"]
 path = []
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
 string = ["dep:regex", "dep:lazy_static", "dep:rand"]
-crypto = ["dep:base64-simd", "dep:hex-simd"]
+crypto = ["dep:base64-simd","dep:hex-simd"]
 hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake3", "dep:serde", "dep:siphasher"]
 os = ["dep:nix", "dep:tempfile", "winapi"]  # operating system utilities
 integration = []  # integration test features

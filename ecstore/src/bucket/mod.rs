@@ -1,4 +1,5 @@
 pub mod error;
+pub mod lifecycle;
 pub mod metadata;
 pub mod metadata_sys;
 pub mod object_lock;

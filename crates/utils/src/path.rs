@@ -253,6 +253,11 @@ pub fn dir(path: &str) -> String {
     let (a, _) = split(path);
     clean(a)
 }
+
+pub fn trim_etag(etag: &str) -> String {
+    etag.trim_matches('"').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

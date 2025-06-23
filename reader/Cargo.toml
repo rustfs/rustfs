@@ -1,0 +1,27 @@
+[package]
+name = "reader"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing.workspace = true
+s3s.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+pin-project-lite.workspace = true
+hex-simd = "0.8.0"
+base64-simd = "0.8.0"
+md-5.workspace = true
+sha2 = { version = "0.11.0-pre.4" }
+futures.workspace = true
+async-trait.workspace = true
+common.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

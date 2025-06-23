@@ -8,6 +8,7 @@ use crate::headers::{
 use byteorder::ByteOrder;
 use bytes::Bytes;
 use rmp::Marker;
+use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::convert::TryFrom;
@@ -37,6 +38,19 @@ const _XL_FLAG_INLINE_DATA: u8 = 1 << 2;
 
 const META_DATA_READ_DEFAULT: usize = 4 << 10;
 const MSGP_UINT32_SIZE: usize = 5;
+
+pub const TRANSITION_COMPLETE: &str = "complete";
+pub const TRANSITION_PENDING: &str = "pending";
+
+pub const FREE_VERSION: &str = "free-version";
+
+pub const TRANSITION_STATUS: &str = "transition-status";
+pub const TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
+pub const TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
+pub const TRANSITION_TIER: &str = "transition-tier";
+
+const X_AMZ_RESTORE_EXPIRY_DAYS: &str = "X-Amz-Restore-Expiry-Days";
+const X_AMZ_RESTORE_REQUEST_DATE: &str = "X-Amz-Restore-Request-Date";
 
 // type ScanHeaderVersionFn = Box<dyn Fn(usize, &[u8], &[u8]) -> Result<()>>;
 
@@ -468,6 +482,42 @@ impl FileMeta {
         Err(Error::other("add_version failed"))
     }
 
+    pub fn add_version_filemata(&mut self, ver: FileMetaVersion) -> Result<()> {
+        let mod_time = ver.get_mod_time().unwrap().nanosecond();
+        if !ver.valid() {
+            return Err(Error::other("attempted to add invalid version"));
+        }
+        let encoded = ver.marshal_msg()?;
+
+        if self.versions.len() + 1 > 100 {
+            return Err(Error::other(
+                "You've exceeded the limit on the number of versions you can create on this object",
+            ));
+        }
+
+        self.versions.push(FileMetaShallowVersion {
+            header: FileMetaVersionHeader {
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(-1)?),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let len = self.versions.len();
+        for (i, existing) in self.versions.iter().enumerate() {
+            if existing.header.mod_time.unwrap().nanosecond() <= mod_time {
+                let vers = self.versions[i..len - 1].to_vec();
+                self.versions[i + 1..].clone_from_slice(vers.as_slice());
+                self.versions[i] = FileMetaShallowVersion {
+                    header: ver.header(),
+                    meta: encoded,
+                };
+                return Ok(());
+            }
+        }
+        Err(Error::other("addVersion: Internal error, unable to add version"))
+    }
+
     // delete_version deletes version, returns data_dir
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
         let mut ventry = FileMetaVersion::default();
@@ -501,6 +551,42 @@ impl FileMeta {
                     return Ok(a);
                 }
             }
+        }
+
+        for (i, version) in self.versions.iter().enumerate() {
+            if version.header.version_type != VersionType::Object || version.header.version_id != fi.version_id {
+                continue;
+            }
+
+            let mut ver = self.get_idx(i)?;
+
+            if fi.expire_restored {
+                ver.object.as_mut().unwrap().remove_restore_hdrs();
+                let _ = self.set_idx(i, ver.clone());
+            } else if fi.transition_status == TRANSITION_COMPLETE {
+                ver.object.as_mut().unwrap().set_transition(fi);
+                ver.object.as_mut().unwrap().reset_inline_data();
+                self.set_idx(i, ver.clone())?;
+            } else {
+                let vers = self.versions[i + 1..].to_vec();
+                self.versions.extend(vers.iter().cloned());
+                let (free_version, to_free) = ver.object.as_ref().unwrap().init_free_version(fi);
+                if to_free {
+                    self.add_version_filemata(free_version)?;
+                }
+            }
+
+            if fi.deleted {
+                self.add_version_filemata(ventry)?;
+            }
+            if self.shared_data_dir_count(ver.object.as_ref().unwrap().version_id, ver.object.as_ref().unwrap().data_dir) > 0 {
+                return Ok(None);
+            }
+            return Ok(ver.object.as_ref().unwrap().data_dir);
+        }
+
+        if fi.deleted {
+            self.add_version_filemata(ventry)?;
         }
 
         Err(Error::FileVersionNotFound)
@@ -1850,10 +1936,29 @@ impl MetaObject {
         }
     }
 
-    /// Set transition metadata
-    pub fn set_transition(&mut self, _fi: &FileInfo) {
-        // Implementation for object lifecycle transitions
-        // This would handle storage class transitions
+    pub fn set_transition(&mut self, fi: &FileInfo) {
+        self.meta_sys.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITION_STATUS),
+            fi.transition_status.as_bytes().to_vec(),
+        );
+        self.meta_sys.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITIONED_OBJECTNAME),
+            fi.transitioned_objname.as_bytes().to_vec(),
+        );
+        self.meta_sys.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITIONED_VERSION_ID),
+            fi.transition_version_id.unwrap().as_bytes().to_vec(),
+        );
+        self.meta_sys.insert(
+            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITION_TIER),
+            fi.transition_tier.as_bytes().to_vec(),
+        );
+    }
+
+    pub fn remove_restore_hdrs(&mut self) {
+        self.meta_user.remove(X_AMZ_RESTORE.as_str());
+        self.meta_user.remove(X_AMZ_RESTORE_EXPIRY_DAYS);
+        self.meta_user.remove(X_AMZ_RESTORE_REQUEST_DATE);
     }
 
     pub fn uses_data_dir(&self) -> bool {
@@ -1888,6 +1993,66 @@ impl MetaObject {
         let hash = hasher.finish();
         let bytes = hash.to_le_bytes();
         [bytes[0], bytes[1], bytes[2], bytes[3]]
+    }
+
+    pub fn init_free_version(&self, fi: &FileInfo) -> (FileMetaVersion, bool) {
+        if fi.skip_tier_free_version() {
+            return (FileMetaVersion::default(), false);
+        }
+        if let Some(status) = self
+            .meta_sys
+            .get(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITION_STATUS))
+        {
+            if *status == TRANSITION_COMPLETE.as_bytes().to_vec() {
+                let vid = Uuid::parse_str(&fi.tier_free_version_id());
+                if let Err(err) = vid {
+                    panic!(
+                        "Invalid Tier Object delete marker versionId {} {}",
+                        fi.tier_free_version_id(),
+                        err.to_string()
+                    );
+                }
+                let vid = vid.unwrap();
+                let mut free_entry = FileMetaVersion {
+                    version_type: VersionType::Delete,
+                    write_version: 0,
+                    ..Default::default()
+                };
+                free_entry.delete_marker = Some(MetaDeleteMarker {
+                    version_id: Some(vid),
+                    mod_time: self.mod_time,
+                    meta_sys: Some(HashMap::<String, Vec<u8>>::new()),
+                });
+
+                free_entry
+                    .delete_marker
+                    .as_mut()
+                    .unwrap()
+                    .meta_sys
+                    .as_mut()
+                    .unwrap()
+                    .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, FREE_VERSION), vec![]);
+                let tier_key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITION_TIER);
+                let tier_obj_key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITIONED_OBJECTNAME);
+                let tier_obj_vid_key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITIONED_VERSION_ID);
+
+                let aa = [tier_key, tier_obj_key, tier_obj_vid_key];
+                for (k, v) in &self.meta_sys {
+                    if aa.contains(&k) {
+                        free_entry
+                            .delete_marker
+                            .as_mut()
+                            .unwrap()
+                            .meta_sys
+                            .as_mut()
+                            .unwrap()
+                            .insert(k.clone(), v.clone());
+                    }
+                }
+                return (free_entry, true);
+            }
+        }
+        (FileMetaVersion::default(), false)
     }
 }
 

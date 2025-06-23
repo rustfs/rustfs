@@ -1,0 +1,221 @@
+#![allow(clippy::map_entry)]
+use http::Request;
+use hyper::StatusCode;
+use hyper::body::Incoming;
+use std::{collections::HashMap, sync::Arc};
+use tracing::warn;
+use tracing::{debug, error, info};
+
+use crate::client::{
+    api_error_response::{http_resp_to_error_response, to_error_response},
+    transition_api::{Document, TransitionClient},
+};
+use crate::signer;
+use reader::hasher::{Hasher, Sha256};
+use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use s3s::Body;
+use s3s::S3ErrorCode;
+
+use super::constants::UNSIGNED_PAYLOAD;
+use super::credentials::SignatureType;
+
+pub struct BucketLocationCache {
+    items: HashMap<String, String>,
+}
+
+impl BucketLocationCache {
+    pub fn new() -> BucketLocationCache {
+        BucketLocationCache { items: HashMap::new() }
+    }
+
+    pub fn get(&self, bucket_name: &str) -> Option<String> {
+        self.items.get(bucket_name).map(|s| s.clone())
+    }
+
+    pub fn set(&mut self, bucket_name: &str, location: &str) {
+        self.items.insert(bucket_name.to_string(), location.to_string());
+    }
+
+    pub fn delete(&mut self, bucket_name: &str) {
+        self.items.remove(bucket_name);
+    }
+}
+
+impl TransitionClient {
+    pub async fn get_bucket_location(&self, bucket_name: &str) -> Result<String, std::io::Error> {
+        Ok(self.get_bucket_location_inner(bucket_name).await?)
+    }
+
+    async fn get_bucket_location_inner(&self, bucket_name: &str) -> Result<String, std::io::Error> {
+        if self.region != "" {
+            return Ok(self.region.clone());
+        }
+
+        let mut location;
+        {
+            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
+            let ret = bucket_loc_cache.get(bucket_name);
+            if let Some(location) = ret {
+                return Ok(location);
+            }
+            //location = ret?;
+        }
+
+        let req = self.get_bucket_location_request(bucket_name)?;
+
+        let mut resp = self.doit(req).await?;
+        location = process_bucket_location_response(resp, bucket_name).await?;
+        {
+            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
+            bucket_loc_cache.set(bucket_name, &location);
+        }
+        Ok(location)
+    }
+
+    fn get_bucket_location_request(&self, bucket_name: &str) -> Result<http::Request<Body>, std::io::Error> {
+        let mut url_values = HashMap::new();
+        url_values.insert("location".to_string(), "".to_string());
+
+        let mut target_url = self.endpoint_url.clone();
+        let scheme = self.endpoint_url.scheme();
+        let h = target_url.host().expect("host is none.");
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let p = target_url.port().unwrap_or(default_port);
+
+        let is_virtual_style = self.is_virtual_host_style_request(&target_url, bucket_name);
+
+        let mut url_str: String = "".to_string();
+
+        if is_virtual_style {
+            url_str = scheme.to_string();
+            url_str.push_str("://");
+            url_str.push_str(bucket_name);
+            url_str.push_str(".");
+            url_str.push_str(target_url.host_str().expect("err"));
+            url_str.push_str("/?location");
+        } else {
+            let mut path = bucket_name.to_string();
+            path.push_str("/");
+            target_url.set_path(&path);
+            {
+                let mut q = target_url.query_pairs_mut();
+                for (k, v) in url_values {
+                    q.append_pair(&k, &urlencoding::encode(&v));
+                }
+            }
+            url_str = target_url.to_string();
+        }
+
+        let mut req_builder = Request::builder().method(http::Method::GET).uri(url_str);
+
+        self.set_user_agent(&mut req_builder);
+
+        let value;
+        {
+            let mut creds_provider = self.creds_provider.lock().unwrap();
+            value = match creds_provider.get_with_context(Some(self.cred_context())) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Err(std::io::Error::other(err));
+                }
+            };
+        }
+
+        let mut signer_type = value.signer_type.clone();
+        let mut access_key_id = value.access_key_id;
+        let mut secret_access_key = value.secret_access_key;
+        let mut session_token = value.session_token;
+
+        if self.override_signer_type != SignatureType::SignatureDefault {
+            signer_type = self.override_signer_type.clone();
+        }
+
+        if value.signer_type == SignatureType::SignatureAnonymous {
+            signer_type = SignatureType::SignatureAnonymous
+        }
+
+        if signer_type == SignatureType::SignatureAnonymous {
+            let req = match req_builder.body(Body::empty()) {
+                Ok(req) => return Ok(req),
+                Err(err) => {
+                    return Err(std::io::Error::other(err));
+                }
+            };
+        }
+
+        if signer_type == SignatureType::SignatureV2 {
+            let req_builder = signer::sign_v2(req_builder, 0, &access_key_id, &secret_access_key, is_virtual_style);
+            let req = match req_builder.body(Body::empty()) {
+                Ok(req) => return Ok(req),
+                Err(err) => {
+                    return Err(std::io::Error::other(err));
+                }
+            };
+        }
+
+        let mut content_sha256 = EMPTY_STRING_SHA256_HASH.to_string();
+        if self.secure {
+            content_sha256 = UNSIGNED_PAYLOAD.to_string();
+        }
+
+        req_builder
+            .headers_mut()
+            .expect("err")
+            .insert("X-Amz-Content-Sha256", content_sha256.parse().unwrap());
+        let req_builder = signer::sign_v4(req_builder, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
+        let req = match req_builder.body(Body::empty()) {
+            Ok(req) => return Ok(req),
+            Err(err) => {
+                return Err(std::io::Error::other(err));
+            }
+        };
+    }
+}
+
+async fn process_bucket_location_response(mut resp: http::Response<Body>, bucket_name: &str) -> Result<String, std::io::Error> {
+    //if resp != nil {
+    if resp.status() != StatusCode::OK {
+        let err_resp = http_resp_to_error_response(resp, vec![], bucket_name, "");
+        match err_resp.code {
+                S3ErrorCode::NotImplemented => {
+                    match err_resp.server.as_str() {
+                        "AmazonSnowball" => {
+                            return Ok("snowball".to_string());
+                        }
+                        "cloudflare" => {
+                            return Ok("us-east-1".to_string());
+                        }
+                        _ => {
+                            return Err(std::io::Error::other(err_resp));
+                        }
+                    }
+                }
+                S3ErrorCode::AuthorizationHeaderMalformed |
+                //S3ErrorCode::InvalidRegion |
+                S3ErrorCode::AccessDenied => {
+                    if err_resp.region == "" {
+                      return Ok("us-east-1".to_string());
+                    }
+                    return Ok(err_resp.region);
+                }
+                _ => {
+                    return Err(std::io::Error::other(err_resp));
+                }
+            }
+    }
+    //}
+
+    let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
+    let Document(location_constraint) = serde_xml_rs::from_str::<Document>(&String::from_utf8(b).unwrap()).unwrap();
+
+    let mut location = location_constraint;
+    if location == "" {
+        location = "us-east-1".to_string();
+    }
+
+    if location == "EU" {
+        location = "eu-west-1".to_string();
+    }
+
+    Ok(location)
+}

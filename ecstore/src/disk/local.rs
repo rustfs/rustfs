@@ -2149,7 +2149,7 @@ impl DiskAPI for LocalDisk {
         // Check if the current bucket has a configured lifecycle policy
         if let Ok((lc, _)) = metadata_sys::get_lifecycle_config(&cache.info.name).await {
             if lc_has_active_rules(&lc, "") {
-                cache.info.life_cycle = Some(lc);
+                cache.info.lifecycle = Some(lc);
             }
         }
 
@@ -2258,9 +2258,9 @@ impl DiskAPI for LocalDisk {
                         }
                     }
 
-                    for frer_version in fivs.free_versions.iter() {
+                    for free_version in fivs.free_versions.iter() {
                         let _obj_info = ObjectInfo::from_file_info(
-                            frer_version,
+                            free_version,
                             &item.bucket,
                             &item.object_path().to_string_lossy(),
                             versioned,

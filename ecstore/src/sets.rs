@@ -29,6 +29,7 @@ use futures::future::join_all;
 use http::HeaderMap;
 use lock::{LockApi, namespace_lock::NsLockMap, new_lock_api};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use rustfs_filemeta::FileInfo;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -460,6 +461,11 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix && !opts.delete_prefix_object {
             self.delete_prefix(bucket, object).await?;
@@ -570,6 +576,24 @@ impl StorageAPI for Sets {
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object).transition_object(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
+        self.get_disks_by_key(object).add_partial(bucket, object, version_id).await;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object)
+            .restore_transitioned_object(bucket, object, opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]

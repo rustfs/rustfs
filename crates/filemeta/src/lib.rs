@@ -1,5 +1,5 @@
 mod error;
-mod fileinfo;
+pub mod fileinfo;
 mod filemeta;
 mod filemeta_inline;
 pub mod headers;

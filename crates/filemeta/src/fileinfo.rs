@@ -17,6 +17,10 @@ pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 pub const NULL_VERSION_ID: &str = "null";
 // pub const RUSTFS_ERASURE_UPGRADED: &str = "x-rustfs-internal-erasure-upgraded";
 
+pub const TIER_FV_ID: &str = "tier-free-versionID";
+pub const TIER_FV_MARKER: &str = "tier-free-marker";
+pub const TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
     pub etag: String,
@@ -152,11 +156,10 @@ pub struct FileInfo {
     pub version_id: Option<Uuid>,
     pub is_latest: bool,
     pub deleted: bool,
-    // Transition related fields
-    pub transition_status: Option<String>,
-    pub transitioned_obj_name: Option<String>,
-    pub transition_tier: Option<String>,
-    pub transition_version_id: Option<String>,
+    pub transition_status: String,
+    pub transitioned_objname: String,
+    pub transition_tier: String,
+    pub transition_version_id: Option<Uuid>,
     pub expire_restored: bool,
     pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
@@ -225,7 +228,11 @@ impl FileInfo {
     }
 
     pub fn get_etag(&self) -> Option<String> {
-        self.metadata.get("etag").cloned()
+        if let Some(meta) = self.metadata.get("etag") {
+            Some(meta.clone())
+        } else {
+            None
+        }
     }
 
     pub fn write_quorum(&self, quorum: usize) -> usize {
@@ -307,6 +314,35 @@ impl FileInfo {
         self.metadata.insert(RUSTFS_HEALING.to_string(), "true".to_string());
     }
 
+    pub fn set_tier_free_version_id(&mut self, version_id: &str) {
+        self.metadata
+            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_ID), version_id.to_string());
+    }
+
+    pub fn tier_free_version_id(&self) -> String {
+        self.metadata[&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_ID)].clone()
+    }
+
+    pub fn set_tier_free_version(&mut self) {
+        self.metadata
+            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_MARKER), "".to_string());
+    }
+
+    pub fn set_skip_tier_free_version(&mut self) {
+        self.metadata
+            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_SKIP_FV_ID), "".to_string());
+    }
+
+    pub fn skip_tier_free_version(&self) -> bool {
+        self.metadata
+            .contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_SKIP_FV_ID))
+    }
+
+    pub fn tier_free_version(&self) -> bool {
+        self.metadata
+            .contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_MARKER))
+    }
+
     pub fn set_inline_data(&mut self) {
         self.metadata
             .insert(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).to_owned(), "true".to_owned());
@@ -331,7 +367,7 @@ impl FileInfo {
 
     /// Check if the object is remote (transitioned to another tier)
     pub fn is_remote(&self) -> bool {
-        !self.transition_tier.as_ref().is_none_or(|s| s.is_empty())
+        !self.transition_tier.is_empty()
     }
 
     /// Get the data directory for this object
@@ -387,7 +423,7 @@ impl FileInfo {
     pub fn transition_info_equals(&self, other: &FileInfo) -> bool {
         self.transition_status == other.transition_status
             && self.transition_tier == other.transition_tier
-            && self.transitioned_obj_name == other.transitioned_obj_name
+            && self.transitioned_objname == other.transitioned_objname
             && self.transition_version_id == other.transition_version_id
     }
 
