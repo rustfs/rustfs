@@ -3816,7 +3816,7 @@ impl ObjectIO for SetDisks {
         //     _ns = Some(ns_lock);
         // }
 
-        let mut user_defined = opts.user_defined.clone().unwrap_or_default();
+        let mut user_defined = opts.user_defined.clone();
 
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_StorageClass.get() {
@@ -4152,19 +4152,17 @@ impl StorageAPI for SetDisks {
         };
 
         let inline_data = fi.inline_data();
-        fi.metadata = src_info.user_defined.as_ref().cloned().unwrap_or_default();
+        fi.metadata = src_info.user_defined.clone();
 
-        if let Some(ud) = src_info.user_defined.as_mut() {
-            if let Some(etag) = &src_info.etag {
-                ud.insert("etag".to_owned(), etag.clone());
-            }
+        if let Some(etag) = &src_info.etag {
+            fi.metadata.insert("etag".to_owned(), etag.clone());
         }
 
         let mod_time = OffsetDateTime::now_utc();
 
         for fi in metas.iter_mut() {
             if fi.is_valid() {
-                fi.metadata = src_info.user_defined.as_ref().cloned().unwrap_or_default();
+                fi.metadata = src_info.user_defined.clone();
                 fi.mod_time = Some(mod_time);
                 fi.version_id = version_id;
                 fi.versioned = src_opts.versioned || src_opts.version_suspended;
@@ -4439,10 +4437,8 @@ impl StorageAPI for SetDisks {
 
         let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
-        if let Some(ud) = obj_info.user_defined.as_ref() {
-            for (k, v) in ud {
-                fi.metadata.insert(k.clone(), v.clone());
-            }
+        for (k, v) in obj_info.user_defined {
+            fi.metadata.insert(k, v);
         }
 
         if let Some(mt) = &opts.eval_metadata {
@@ -4851,7 +4847,7 @@ impl StorageAPI for SetDisks {
 
         let disks = disks.clone();
 
-        let mut user_defined = opts.user_defined.clone().unwrap_or_default();
+        let mut user_defined = opts.user_defined.clone();
 
         if let Some(ref etag) = opts.preserve_etag {
             user_defined.insert("etag".to_owned(), etag.clone());
@@ -5111,7 +5107,7 @@ impl StorageAPI for SetDisks {
 
         // etag
         let etag = {
-            if let Some(Some(etag)) = opts.user_defined.as_ref().map(|v| v.get("etag")) {
+            if let Some(etag) = opts.user_defined.get("etag") {
                 etag.clone()
             } else {
                 get_complete_multipart_md5(&uploaded_parts)

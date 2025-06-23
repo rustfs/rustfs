@@ -480,7 +480,7 @@ impl Event {
             s3_metadata.object.content_type = args.object.content_type.clone();
             // Filter out internal reserved metadata
             let mut user_metadata = HashMap::new();
-            for (k, v) in &args.object.user_defined.unwrap_or_default() {
+            for (k, v) in args.object.user_defined.iter() {
                 if !k.to_lowercase().starts_with("x-amz-meta-internal-") {
                     user_metadata.insert(k.clone(), v.clone());
                 }

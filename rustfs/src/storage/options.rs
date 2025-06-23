@@ -14,7 +14,7 @@ pub async fn del_opts(
     object: &str,
     vid: Option<String>,
     headers: &HeaderMap<HeaderValue>,
-    metadata: Option<HashMap<String, String>>,
+    metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::suspended(bucket).await;
@@ -33,7 +33,7 @@ pub async fn del_opts(
         }
     }
 
-    let mut opts = put_opts_from_headers(headers, metadata)
+    let mut opts = put_opts_from_headers(headers, metadata.clone())
         .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
@@ -72,7 +72,7 @@ pub async fn get_opts(
         }
     }
 
-    let mut opts = get_default_opts(headers, None, false)
+    let mut opts = get_default_opts(headers, HashMap::new(), false)
         .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
@@ -97,7 +97,7 @@ pub async fn put_opts(
     object: &str,
     vid: Option<String>,
     headers: &HeaderMap<HeaderValue>,
-    metadata: Option<HashMap<String, String>>,
+    metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
@@ -136,30 +136,27 @@ pub async fn copy_dst_opts(
     object: &str,
     vid: Option<String>,
     headers: &HeaderMap<HeaderValue>,
-    metadata: Option<HashMap<String, String>>,
+    metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
     put_opts(bucket, object, vid, headers, metadata).await
 }
 
 pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderValue>) -> Result<ObjectOptions> {
-    get_default_opts(headers, None, false)
+    get_default_opts(headers, HashMap::new(), false)
 }
 
-pub fn put_opts_from_headers(
-    headers: &HeaderMap<HeaderValue>,
-    metadata: Option<HashMap<String, String>>,
-) -> Result<ObjectOptions> {
+pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
     get_default_opts(headers, metadata, false)
 }
 
 /// Creates default options for getting an object from a bucket.
 pub fn get_default_opts(
     _headers: &HeaderMap<HeaderValue>,
-    metadata: Option<HashMap<String, String>>,
+    metadata: HashMap<String, String>,
     _copy_source: bool,
 ) -> Result<ObjectOptions> {
     Ok(ObjectOptions {
-        user_defined: metadata.clone(),
+        user_defined: metadata,
         ..Default::default()
     })
 }
@@ -244,13 +241,13 @@ mod tests {
     #[tokio::test]
     async fn test_del_opts_basic() {
         let headers = create_test_headers();
-        let metadata = Some(create_test_metadata());
+        let metadata = create_test_metadata();
 
         let result = del_opts("test-bucket", "test-object", None, &headers, metadata).await;
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert!(opts.user_defined.is_some());
+        assert!(!opts.user_defined.is_empty());
         assert_eq!(opts.version_id, None);
     }
 
@@ -258,7 +255,7 @@ mod tests {
     async fn test_del_opts_with_directory_object() {
         let headers = create_test_headers();
 
-        let result = del_opts("test-bucket", "test-dir/", None, &headers, None).await;
+        let result = del_opts("test-bucket", "test-dir/", None, &headers, HashMap::new()).await;
 
         assert!(result.is_ok());
         let opts = result.unwrap();
@@ -270,7 +267,7 @@ mod tests {
         let headers = create_test_headers();
         let valid_uuid = Uuid::new_v4().to_string();
 
-        let result = del_opts("test-bucket", "test-object", Some(valid_uuid.clone()), &headers, None).await;
+        let result = del_opts("test-bucket", "test-object", Some(valid_uuid.clone()), &headers, HashMap::new()).await;
 
         // This test may fail if versioning is not enabled for the bucket
         // In a real test environment, you would mock BucketVersioningSys
@@ -289,7 +286,7 @@ mod tests {
         let headers = create_test_headers();
         let invalid_uuid = "invalid-uuid".to_string();
 
-        let result = del_opts("test-bucket", "test-object", Some(invalid_uuid), &headers, None).await;
+        let result = del_opts("test-bucket", "test-object", Some(invalid_uuid), &headers, HashMap::new()).await;
 
         assert!(result.is_err());
         if let Err(err) = result {
@@ -361,13 +358,13 @@ mod tests {
     #[tokio::test]
     async fn test_put_opts_basic() {
         let headers = create_test_headers();
-        let metadata = Some(create_test_metadata());
+        let metadata = create_test_metadata();
 
         let result = put_opts("test-bucket", "test-object", None, &headers, metadata).await;
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert!(opts.user_defined.is_some());
+        assert!(!opts.user_defined.is_empty());
         assert_eq!(opts.version_id, None);
     }
 
@@ -375,7 +372,7 @@ mod tests {
     async fn test_put_opts_with_directory_object() {
         let headers = create_test_headers();
 
-        let result = put_opts("test-bucket", "test-dir/", None, &headers, None).await;
+        let result = put_opts("test-bucket", "test-dir/", None, &headers, HashMap::new()).await;
 
         assert!(result.is_ok());
         let opts = result.unwrap();
@@ -387,7 +384,7 @@ mod tests {
         let headers = create_test_headers();
         let invalid_uuid = "invalid-uuid".to_string();
 
-        let result = put_opts("test-bucket", "test-object", Some(invalid_uuid), &headers, None).await;
+        let result = put_opts("test-bucket", "test-object", Some(invalid_uuid), &headers, HashMap::new()).await;
 
         assert!(result.is_err());
         if let Err(err) = result {
@@ -405,13 +402,13 @@ mod tests {
     #[tokio::test]
     async fn test_copy_dst_opts() {
         let headers = create_test_headers();
-        let metadata = Some(create_test_metadata());
+        let metadata = create_test_metadata();
 
         let result = copy_dst_opts("test-bucket", "test-object", None, &headers, metadata).await;
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert!(opts.user_defined.is_some());
+        assert!(!opts.user_defined.is_empty());
     }
 
     #[test]
@@ -422,20 +419,20 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert!(opts.user_defined.is_none());
+        assert!(opts.user_defined.is_empty());
     }
 
     #[test]
     fn test_put_opts_from_headers() {
         let headers = create_test_headers();
-        let metadata = Some(create_test_metadata());
+        let metadata = create_test_metadata();
 
         let result = put_opts_from_headers(&headers, metadata);
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert!(opts.user_defined.is_some());
-        let user_defined = opts.user_defined.unwrap();
+        assert!(!opts.user_defined.is_empty());
+        let user_defined = opts.user_defined;
         assert_eq!(user_defined.get("key1"), Some(&"value1".to_string()));
         assert_eq!(user_defined.get("key2"), Some(&"value2".to_string()));
     }
@@ -443,14 +440,14 @@ mod tests {
     #[test]
     fn test_get_default_opts_with_metadata() {
         let headers = create_test_headers();
-        let metadata = Some(create_test_metadata());
+        let metadata = create_test_metadata();
 
         let result = get_default_opts(&headers, metadata, false);
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert!(opts.user_defined.is_some());
-        let user_defined = opts.user_defined.unwrap();
+        assert!(!opts.user_defined.is_empty());
+        let user_defined = opts.user_defined;
         assert_eq!(user_defined.get("key1"), Some(&"value1".to_string()));
         assert_eq!(user_defined.get("key2"), Some(&"value2".to_string()));
     }
@@ -459,11 +456,11 @@ mod tests {
     fn test_get_default_opts_without_metadata() {
         let headers = create_test_headers();
 
-        let result = get_default_opts(&headers, None, false);
+        let result = get_default_opts(&headers, HashMap::new(), false);
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert!(opts.user_defined.is_none());
+        assert!(opts.user_defined.is_empty());
     }
 
     #[test]
