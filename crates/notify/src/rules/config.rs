@@ -97,8 +97,8 @@ impl BucketNotificationConfig {
     }
 
     // Expose the RulesMap for the notifier
-    pub fn get_rules_map(&self) -> RulesMap {
-        self.rules.clone()
+    pub fn get_rules_map(&self) -> &RulesMap {
+        &self.rules
     }
 
     /// Sets the region for the configuration
