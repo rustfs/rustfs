@@ -3048,33 +3048,33 @@ impl SetDisks {
 
         let task = if !skip_background_task {
             Some(tokio::spawn(async move {
-            let last_save = Some(SystemTime::now());
-            let mut need_loop = true;
-            while need_loop {
-                select! {
-                    _ = ticker.tick() => {
-                        if !cache.info.last_update.eq(&last_save) {
-                            let _ = cache.save(DATA_USAGE_CACHE_NAME).await;
-                            let _ = updates.send(cache.clone()).await;
-                        }
-                    }
-                    result = buckets_results_rx.recv() => {
-                        match result {
-                            Some(result) => {
-                                cache.replace(&result.name, &result.parent, result.entry);
-                                cache.info.last_update = Some(SystemTime::now());
-                            },
-                            None => {
-                                need_loop = false;
-                                cache.info.next_cycle = want_cycle;
-                                cache.info.last_update = Some(SystemTime::now());
+                let last_save = Some(SystemTime::now());
+                let mut need_loop = true;
+                while need_loop {
+                    select! {
+                        _ = ticker.tick() => {
+                            if !cache.info.last_update.eq(&last_save) {
                                 let _ = cache.save(DATA_USAGE_CACHE_NAME).await;
                                 let _ = updates.send(cache.clone()).await;
                             }
                         }
+                        result = buckets_results_rx.recv() => {
+                            match result {
+                                Some(result) => {
+                                    cache.replace(&result.name, &result.parent, result.entry);
+                                    cache.info.last_update = Some(SystemTime::now());
+                                },
+                                None => {
+                                    need_loop = false;
+                                    cache.info.next_cycle = want_cycle;
+                                    cache.info.last_update = Some(SystemTime::now());
+                                    let _ = cache.save(DATA_USAGE_CACHE_NAME).await;
+                                    let _ = updates.send(cache.clone()).await;
+                                }
+                            }
+                        }
                     }
                 }
-            }
             }))
         } else {
             None
@@ -3183,7 +3183,7 @@ impl SetDisks {
         info!("ns_scanner start");
         let _ = join_all(futures).await;
         if let Some(task) = task {
-        let _ = task.await;
+            let _ = task.await;
         }
         info!("ns_scanner completed");
         Ok(())
@@ -3721,9 +3721,7 @@ impl SetDisks {
         let mut oi = obj_info.clone();
         oi.metadata_only = true;
 
-        if let Some(user_defined) = &mut oi.user_defined {
-            user_defined.remove(X_AMZ_RESTORE.as_str());
-        }
+        oi.user_defined.remove(X_AMZ_RESTORE.as_str());
 
         let version_id = oi.version_id.clone().map(|v| v.to_string());
         let obj = self
@@ -4044,7 +4042,7 @@ impl ObjectIO for SetDisks {
 
             if opts.data_movement {
                 fi.set_data_moved();
-        }
+            }
         }
 
         let (online_disks, _, op_old_dir) = Self::rename_data(

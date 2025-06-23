@@ -36,7 +36,7 @@ pub fn enforce_retention_for_deletion(obj_info: &ObjectInfo) -> bool {
         return false;
     }
 
-    let lhold = objectlock::get_object_legalhold_meta(obj_info.user_defined.clone().expect("err"));
+    let lhold = objectlock::get_object_legalhold_meta(obj_info.user_defined.clone());
     match lhold.status {
         Some(st) if st.as_str() == ObjectLockLegalHoldStatus::ON => {
             return true;
@@ -44,7 +44,7 @@ pub fn enforce_retention_for_deletion(obj_info: &ObjectInfo) -> bool {
         _ => (),
     }
 
-    let ret = objectlock::get_object_retention_meta(obj_info.user_defined.clone().expect("err"));
+    let ret = objectlock::get_object_retention_meta(obj_info.user_defined.clone());
     match ret.mode {
         Some(r) if (r.as_str() == ObjectLockRetentionMode::COMPLIANCE || r.as_str() == ObjectLockRetentionMode::GOVERNANCE) => {
             let t = objectlock::utc_now_ntp();

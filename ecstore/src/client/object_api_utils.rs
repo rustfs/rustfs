@@ -55,8 +55,8 @@ fn part_number_to_rangespec(oi: ObjectInfo, part_number: usize) -> Option<HTTPRa
     }
 
     Some(HTTPRangeSpec {
-        start: start as usize,
-        end: Some(end as usize),
+        start: start,
+        end: end,
         is_suffix_length: false,
     })
 }

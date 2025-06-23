@@ -56,10 +56,6 @@ use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 // use ecstore::store_api::RESERVED_METADATA_PREFIX;
 use ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
-use ecstore::bucket::utils::serialize;
-use ecstore::cmd::bucket_replication::ReplicationStatusType;
-use ecstore::cmd::bucket_replication::ReplicationType;
-use ecstore::store_api::RESERVED_METADATA_PREFIX_LOWER;
 use futures::pin_mut;
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
@@ -2458,7 +2454,7 @@ impl S3 for FS {
         let retain_until_date = object_info
             .user_defined
             .get("x-amz-object-lock-retain-until-date")
-                .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
+            .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
             .map(Timestamp::from);
 
         Ok(S3Response::new(GetObjectRetentionOutput {

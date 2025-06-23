@@ -804,7 +804,7 @@ impl LifecycleOps for ObjectInfo {
             user_tags: self.user_tags.clone(),
             version_id: self.version_id.expect("err").to_string(),
             mod_time: self.mod_time,
-            size: self.size,
+            size: self.size as usize,
             is_latest: self.is_latest,
             num_versions: self.num_versions,
             delete_marker: self.delete_marker,

@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use bytes::Bytes;
 use s3s::StdError;
 use std::any::Any;
@@ -180,7 +182,7 @@ pub trait Reader {
     async fn seek(&mut self, offset: usize) -> Result<()>;
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize>;
     async fn read_all(&mut self) -> Result<Vec<u8>> {
-        let mut data = Vec::new();
+        let data = Vec::new();
 
         Ok(data)
     }
@@ -219,7 +221,7 @@ impl Reader for BufferReader {
     }
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let bytes_read = self.inner.read_exact(buf)?;
+        let _bytes_read = self.inner.read_exact(buf)?;
         self.pos += buf.len();
         //Ok(bytes_read)
         Ok(0)

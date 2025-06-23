@@ -1,7 +1,7 @@
 use std::str::from_utf8;
 
 use http::{HeaderMap, StatusCode};
-use iam::get_global_action_cred;
+//use iam::get_global_action_cred;
 use matchit::Params;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Deserialize;
@@ -277,8 +277,8 @@ impl Operation for RemoveTier {
         let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let sys_cred = get_global_action_cred()
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
+        //let sys_cred = get_global_action_cred()
+        //    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
 
         let mut force: bool = false;
         let force_str = query.force;
@@ -342,8 +342,8 @@ impl Operation for VerifyTier {
         let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let sys_cred = get_global_action_cred()
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
+        //let sys_cred = get_global_action_cred()
+        //    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         tier_config_mgr.verify(&query.tier.unwrap());
