@@ -78,7 +78,7 @@ mod tests {
         assert_eq!(new_pattern(Some(""), Some("b")), "*b");
         assert_eq!(new_pattern(None, None), "");
         assert_eq!(new_pattern(Some("prefix"), Some("suffix")), "prefix*suffix");
-        assert_eq!(new_pattern(Some("prefix/"), Some("/suffix")), "prefix/*suffix"); // prefix/* + */suffix -> prefix/**/suffix -> prefix/*/suffix
+        assert_eq!(new_pattern(Some("prefix/"), Some("/suffix")), "prefix/*/suffix"); // prefix/* + */suffix -> prefix/**/suffix -> prefix/*/suffix
     }
 
     #[test]
@@ -91,6 +91,7 @@ mod tests {
         assert!(match_simple("foo*bar", "foobazbar"));
         assert!(!match_simple("foo*bar", "foobar_baz"));
         assert!(match_simple("a*b*c", "axbyc"));
-        assert!(!match_simple("a*b*c", "axbc"));
+        assert!(match_simple("a*b*c", "abc"));
+        assert!(match_simple("a*b*c", "axbc"));
     }
 }
