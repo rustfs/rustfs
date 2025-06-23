@@ -59,8 +59,6 @@ rustfs-notify = { path = "crates/notify", version = "0.0.1" }
 rustfs-utils = { path = "crates/utils", version = "0.0.1" }
 rustfs-rio = { path = "crates/rio", version = "0.0.1" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.1" }
-rustfs-disk = { path = "crates/disk", version = "0.0.1" }
-rustfs-error = { path = "crates/error", version = "0.0.1" }
 workers = { path = "./common/workers", version = "0.0.1" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 arc-swap = "1.7.1"
