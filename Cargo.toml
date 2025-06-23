@@ -22,7 +22,6 @@ members = [
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
     "reader",
-
 ]
 resolver = "2"
 
@@ -91,7 +90,7 @@ derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
 flatbuffers = "25.2.10"
-flexi_logger = { version = "0.30.2", features = ["trc","dont_minimize_extra_stacks"] }  
+flexi_logger = { version = "0.30.2", features = ["trc", "dont_minimize_extra_stacks"] }
 form_urlencoded = "1.2.1"
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -202,7 +201,6 @@ serde-xml-rs = "0.8.1"
 serde_urlencoded = "0.7.1"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
-hmac = "0.12.1"
 std-next = "0.1.8"
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }

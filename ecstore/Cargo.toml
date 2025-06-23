@@ -61,7 +61,6 @@ base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
-
 hex-simd = { workspace = true }
 path-clean = { workspace = true }
 tempfile.workspace = true
@@ -77,7 +76,6 @@ tower.workspace = true
 async-channel.workspace = true
 num = "0.4.3"
 enumset = "1.1.5"
-hmac.workspace = true
 std-next.workspace = true
 num_cpus = { workspace = true }
 rand.workspace = true
@@ -93,10 +91,9 @@ urlencoding = { workspace = true }
 smallvec = { workspace = true }
 shadow-rs.workspace = true
 rustfs-filemeta.workspace = true
-rustfs-utils ={workspace = true, features=["full"]}
+rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 futures-util.workspace = true
-serde_urlencoded.workspace = true
 reader = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
