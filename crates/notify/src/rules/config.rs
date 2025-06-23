@@ -1,11 +1,11 @@
 use super::rules_map::RulesMap;
 // Keep for existing structure if any, or remove if not used
 use super::xml_config::ParseConfigError as BucketNotificationConfigError;
+use crate::EventName;
 use crate::arn::TargetID;
+use crate::rules::NotificationConfiguration;
 use crate::rules::pattern_rules;
 use crate::rules::target_id_set;
-use crate::rules::NotificationConfiguration;
-use crate::EventName;
 use std::collections::HashMap;
 use std::io::Read;
 

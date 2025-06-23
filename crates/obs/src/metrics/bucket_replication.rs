@@ -1,5 +1,5 @@
 /// Bucket copy metric descriptor
-use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 
 /// Bucket level replication metric descriptor
 pub const BUCKET_L: &str = "bucket";

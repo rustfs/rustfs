@@ -1,6 +1,6 @@
+use crate::arn::TargetID;
 use std::io;
 use thiserror::Error;
-use crate::arn::TargetID;
 
 /// Error types for the store
 #[derive(Debug, Error)]

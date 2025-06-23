@@ -1,5 +1,5 @@
 use crate::error::StoreError;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::sync::{Arc, RwLock};
 use std::{

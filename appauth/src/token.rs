@@ -1,8 +1,8 @@
 use rsa::Pkcs1v15Encrypt;
 use rsa::{
+    RsaPrivateKey, RsaPublicKey,
     pkcs8::{DecodePrivateKey, DecodePublicKey},
     rand_core::OsRng,
-    RsaPrivateKey, RsaPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Error, Result};
@@ -58,8 +58,8 @@ static TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhk
 mod tests {
     use super::*;
     use rsa::{
-        pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
         RsaPrivateKey,
+        pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
     };
     use std::time::{SystemTime, UNIX_EPOCH};
     #[test]

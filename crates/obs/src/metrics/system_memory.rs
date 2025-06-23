@@ -1,5 +1,5 @@
 /// Memory-related metric descriptors
-use crate::metrics::{new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 
 lazy_static::lazy_static! {
     pub static ref MEM_TOTAL_MD: MetricDescriptor =

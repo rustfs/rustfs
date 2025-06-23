@@ -1,5 +1,5 @@
 /// Notify the relevant metric descriptor
-use crate::metrics::{new_counter_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, subsystems};
 
 lazy_static::lazy_static! {
     pub static ref NOTIFICATION_CURRENT_SEND_IN_PROGRESS_MD: MetricDescriptor =

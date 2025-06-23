@@ -1,13 +1,13 @@
 use crate::{
-    error::TargetError, integration::NotificationMetrics,
+    Event, StoreError,
+    error::TargetError,
+    integration::NotificationMetrics,
     store::{Key, Store},
     target::Target,
-    Event,
-    StoreError,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 

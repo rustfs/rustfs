@@ -1,22 +1,22 @@
 use crate::store::{Key, STORE_EXTENSION};
 use crate::target::ChannelTargetType;
 use crate::{
-    arn::TargetID, error::TargetError,
+    StoreError, Target,
+    arn::TargetID,
+    error::TargetError,
     event::{Event, EventLog},
     store::Store,
-    StoreError,
-    Target,
 };
 use async_trait::async_trait;
-use rumqttc::{mqttbytes::Error as MqttBytesError, ConnectionError};
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
+use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
 use std::sync::Arc;
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::sync::{mpsc, Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
 use urlencoding;

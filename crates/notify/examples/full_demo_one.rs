@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KV, KVS};
+use std::sync::Arc;
 // Using Global Accessories
 use rustfs_notify::arn::TargetID;
 use rustfs_notify::factory::{
@@ -7,7 +7,7 @@ use rustfs_notify::factory::{
     NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
 use rustfs_notify::store::DEFAULT_LIMIT;
-use rustfs_notify::{init_logger, BucketNotificationConfig, Event, EventName, LogLevel, NotificationError};
+use rustfs_notify::{BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, init_logger};
 use rustfs_notify::{initialize, notification_system};
 use std::time::Duration;
 use tracing::info;

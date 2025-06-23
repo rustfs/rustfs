@@ -1,8 +1,8 @@
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
-use crate::disk::error_reduce::{reduce_read_quorum_errs, reduce_write_quorum_errs, OBJECT_OP_IGNORED_ERRS};
+use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
 use crate::disk::{
-    self, conv_part_err_to_int, has_part_err, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT,
-    CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS,
+    self, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS,
+    conv_part_err_to_int, has_part_err,
 };
 use crate::erasure_coding;
 use crate::erasure_coding::bitrot_verify;
@@ -12,24 +12,24 @@ use crate::heal::data_usage_cache::DataUsageCache;
 use crate::heal::heal_ops::{HealEntryFn, HealSequence};
 use crate::store_api::ObjectToDelete;
 use crate::{
-    cache_value::metacache_set::{list_path_raw, ListPathRawOptions},
-    config::{storageclass, GLOBAL_StorageClass},
+    cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
+    config::{GLOBAL_StorageClass, storageclass},
     disk::{
-        endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo,
-        DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp,
-        ReadOptions, UpdateMetadataOpts, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+        CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
+        RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+        UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
-    error::{to_object_err, StorageError},
+    error::{StorageError, to_object_err},
     global::{
-        get_global_deployment_id, is_dist_erasure, GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP,
-        GLOBAL_LOCAL_DISK_SET_DRIVES,
+        GLOBAL_BackgroundHealState, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id,
+        is_dist_erasure,
     },
     heal::{
         data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT},
         data_usage_cache::{DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo},
         heal_commands::{
-            HealOpts, HealScanMode, HealingTracker, DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE,
-            DRIVE_STATE_OK, HEAL_DEEP_SCAN, HEAL_ITEM_OBJECT, HEAL_NORMAL_SCAN,
+            DRIVE_STATE_CORRUPT, DRIVE_STATE_MISSING, DRIVE_STATE_OFFLINE, DRIVE_STATE_OK, HEAL_DEEP_SCAN, HEAL_ITEM_OBJECT,
+            HEAL_NORMAL_SCAN, HealOpts, HealScanMode, HealingTracker,
         },
         heal_ops::BG_HEALING_UUID,
     },
@@ -42,7 +42,7 @@ use crate::{
 };
 use crate::{disk::STORAGE_FORMAT_FILE, heal::mrf::PartialOperation};
 use crate::{
-    heal::data_scanner::{globalHealConfig, HEAL_DELETE_DANGLING},
+    heal::data_scanner::{HEAL_DELETE_DANGLING, globalHealConfig},
     store_api::ListObjectVersionsInfo,
 };
 use bytes::Bytes;
@@ -51,22 +51,22 @@ use chrono::Utc;
 use futures::future::join_all;
 use glob::Pattern;
 use http::HeaderMap;
-use lock::{namespace_lock::NsLockMap, LockApi};
+use lock::{LockApi, namespace_lock::NsLockMap};
 use madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use md5::{Digest as Md5Digest, Md5};
-use rand::{seq::SliceRandom, Rng};
+use rand::{Rng, seq::SliceRandom};
 use rustfs_filemeta::headers::RESERVED_METADATA_PREFIX_LOWER;
 use rustfs_filemeta::{
-    file_info_from_raw, headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS}, merge_file_meta_versions, FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries,
-    MetaCacheEntry, MetadataResolutionParams,
-    ObjectPartInfo,
-    RawFileInfo,
+    FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
+    RawFileInfo, file_info_from_raw,
+    headers::{AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
+    merge_file_meta_versions,
 };
 use rustfs_rio::{EtagResolvable, HashReader, TryGetIndex as _, WarpReader};
 use rustfs_utils::{
-    crypto::{base64_decode, base64_encode, hex},
-    path::{encode_dir_object, has_suffix, path_join_buf, SLASH_SEPARATOR},
     HashAlgorithm,
+    crypto::{base64_decode, base64_encode, hex},
+    path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use sha2::Sha256;
 use std::hash::Hash;
@@ -82,7 +82,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::{
     io::AsyncWrite,
-    sync::{broadcast, RwLock},
+    sync::{RwLock, broadcast},
 };
 use tokio::{
     select,
@@ -5837,9 +5837,9 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::error::DiskError;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
+    use crate::disk::error::DiskError;
     use crate::store_api::CompletePart;
     use rustfs_filemeta::ErasureInfo;
     use std::collections::HashMap;

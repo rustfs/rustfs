@@ -1,5 +1,5 @@
 /// ILM-related metric descriptors
-use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
+use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 
 lazy_static::lazy_static! {
     pub static ref ILM_EXPIRY_PENDING_TASKS_MD: MetricDescriptor =

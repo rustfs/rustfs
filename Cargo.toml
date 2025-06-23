@@ -84,7 +84,6 @@ cfg-if = "1.0.0"
 chacha20poly1305 = { version = "0.10.1" }
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
-config = "0.15.11"
 const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
 dashmap = "6.1.0"
@@ -92,7 +91,6 @@ datafusion = "46.0.1"
 derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }
 dirs = "6.0.0"
-dotenvy = "0.15.7"
 flatbuffers = "25.2.10"
 flexi_logger = { version = "0.30.2", features = ["trc", "dont_minimize_extra_stacks"] }
 form_urlencoded = "1.2.1"
@@ -168,7 +166,7 @@ flate2 = "1.1.1"
 zstd = "0.13.3"
 lz4 = "1.28.1"
 rdkafka = { version = "0.37.0", features = ["tokio"] }
-reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
+
 reed-solomon-simd = { version = "3.0.0" }
 regex = { version = "1.11.1" }
 reqwest = { version = "0.12.20", default-features = false, features = [
@@ -201,7 +199,6 @@ shadow-rs = { version = "1.1.1", default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 serde_urlencoded = "0.7.1"
-serde_with = "3.12.0"
 sha2 = "0.10.9"
 siphasher = "1.0.1"
 smallvec = { version = "1.15.1", features = ["serde"] }

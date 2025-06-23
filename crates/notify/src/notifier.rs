@@ -1,5 +1,5 @@
 use crate::arn::TargetID;
-use crate::{error::NotificationError, event::Event, rules::RulesMap, target::Target, EventName};
+use crate::{EventName, error::NotificationError, event::Event, rules::RulesMap, target::Target};
 use dashmap::DashMap;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;

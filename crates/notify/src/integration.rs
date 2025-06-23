@@ -1,15 +1,15 @@
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
 use crate::{
-    error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream, Event, EventName,
-    StoreError, Target,
+    Event, EventName, StoreError, Target, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry,
+    rules::BucketNotificationConfig, stream,
 };
 use ecstore::config::{Config, KVS};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
 /// Notify the system of monitoring indicators
