@@ -100,7 +100,7 @@ impl UserAgent {
     fn get_macos_platform(_sys: &System) -> String {
         let binding = System::os_version().unwrap_or("14.5.0".to_string());
         let version = binding.split('.').collect::<Vec<&str>>();
-        let major = version.get(0).unwrap_or(&"14").to_string();
+        let major = version.first().unwrap_or(&"14").to_string();
         let minor = version.get(1).unwrap_or(&"5").to_string();
         let patch = version.get(2).unwrap_or(&"0").to_string();
 

@@ -52,9 +52,7 @@ impl Notifier {
         }
 
         // Create an event and send it
-        let event = Event::new(args.clone());
-        notification_sys
-            .send_event(&args.bucket_name, &args.event_name.as_str(), &args.object.name.clone(), event)
-            .await;
+        let event = Arc::new(Event::new(args));
+        notification_sys.send_event(event).await;
     }
 }

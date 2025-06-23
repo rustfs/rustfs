@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
 use crate::{Event, StoreError, TargetError};
@@ -21,7 +22,7 @@ pub trait Target: Send + Sync + 'static {
     async fn is_active(&self) -> Result<bool, TargetError>;
 
     /// Saves an event (either sends it immediately or stores it for later)
-    async fn save(&self, event: Event) -> Result<(), TargetError>;
+    async fn save(&self, event: Arc<Event>) -> Result<(), TargetError>;
 
     /// Sends an event from the store
     async fn send_from_store(&self, key: Key) -> Result<(), TargetError>;

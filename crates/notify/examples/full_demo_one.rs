@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use ecstore::config::{Config, ENABLE_KEY, ENABLE_ON, KV, KVS};
 // Using Global Accessories
 use rustfs_notify::arn::TargetID;
@@ -153,10 +154,8 @@ async fn main() -> Result<(), NotificationError> {
 
     // --- Send events ---
     info!("\n---> Sending an event...");
-    let event = Event::new_test_event("my-bucket", "document.pdf", EventName::ObjectCreatedPut);
-    system
-        .send_event("my-bucket", "s3:ObjectCreated:Put", "document.pdf", event)
-        .await;
+    let event = Arc::new(Event::new_test_event("my-bucket", "document.pdf", EventName::ObjectCreatedPut));
+    system.send_event(event).await;
     info!("✅ Event sent. Both Webhook and MQTT targets should receive it.");
 
     tokio::time::sleep(Duration::from_secs(2)).await;

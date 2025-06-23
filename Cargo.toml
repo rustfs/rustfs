@@ -87,6 +87,7 @@ clap = { version = "4.5.40", features = ["derive", "env"] }
 config = "0.15.11"
 const-str = { version = "0.6.2", features = ["std", "proc"] }
 crc32fast = "1.4.2"
+dashmap = "6.1.0"
 datafusion = "46.0.1"
 derive_builder = "0.20.2"
 dioxus = { version = "0.6.3", features = ["router"] }

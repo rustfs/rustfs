@@ -1,5 +1,6 @@
 use crate::arn::TargetID;
 use crate::{error::NotificationError, event::Event, rules::RulesMap, target::Target, EventName};
+use dashmap::DashMap;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, instrument, warn};
@@ -7,7 +8,7 @@ use tracing::{debug, error, info, instrument, warn};
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
     target_list: Arc<RwLock<TargetList>>,
-    bucket_rules_map: Arc<RwLock<HashMap<String, RulesMap>>>,
+    bucket_rules_map: Arc<DashMap<String, RulesMap>>,
 }
 
 impl Default for EventNotifier {
@@ -21,7 +22,7 @@ impl EventNotifier {
     pub fn new() -> Self {
         EventNotifier {
             target_list: Arc::new(RwLock::new(TargetList::new())),
-            bucket_rules_map: Arc::new(RwLock::new(HashMap::new())),
+            bucket_rules_map: Arc::new(DashMap::new()),
         }
     }
 
@@ -40,8 +41,7 @@ impl EventNotifier {
     /// This method removes all rules associated with the specified bucket name.
     /// It will log a message indicating the removal of rules.
     pub async fn remove_rules_map(&self, bucket_name: &str) {
-        let mut rules_map = self.bucket_rules_map.write().await;
-        if rules_map.remove(bucket_name).is_some() {
+        if self.bucket_rules_map.remove(bucket_name).is_some() {
             info!("Removed all notification rules for bucket: {}", bucket_name);
         }
     }
@@ -58,19 +58,17 @@ impl EventNotifier {
 
     /// Adds a rules map for a bucket
     pub async fn add_rules_map(&self, bucket_name: &str, rules_map: RulesMap) {
-        let mut bucket_rules_guard = self.bucket_rules_map.write().await;
         if rules_map.is_empty() {
-            bucket_rules_guard.remove(bucket_name);
+            self.bucket_rules_map.remove(bucket_name);
         } else {
-            bucket_rules_guard.insert(bucket_name.to_string(), rules_map);
+            self.bucket_rules_map.insert(bucket_name.to_string(), rules_map);
         }
         info!("Added rules for bucket: {}", bucket_name);
     }
 
     /// Removes notification rules for a bucket
     pub async fn remove_notification(&self, bucket_name: &str) {
-        let mut bucket_rules_guard = self.bucket_rules_map.write().await;
-        bucket_rules_guard.remove(bucket_name);
+        self.bucket_rules_map.remove(bucket_name);
         info!("Removed notification rules for bucket: {}", bucket_name);
     }
 
@@ -83,12 +81,34 @@ impl EventNotifier {
         info!("Removed all targets and their streams");
     }
 
+    /// Checks if there are active subscribers for the given bucket and event name.
+    ///
+    /// # Parameters
+    /// * `bucket_name` - bucket name.
+    /// * `event_name` - Event name.
+    ///
+    /// # Return value
+    /// Return `true` if at least one matching notification rule exists.
+    pub async fn has_subscriber(&self, bucket_name: &str, event_name: &EventName) -> bool {
+        // Rules to check if the bucket exists
+        if let Some(rules_map) = self.bucket_rules_map.get(bucket_name) {
+            // A composite event (such as ObjectCreatedAll) is expanded to multiple single events.
+            // We need to check whether any of these single events have the rules configured.
+            rules_map.has_subscriber(event_name)
+        } else {
+            // If no bucket is found, no subscribers
+            false
+        }
+    }
+
     /// Sends an event to the appropriate targets based on the bucket rules
     #[instrument(skip(self, event))]
-    pub async fn send(&self, bucket_name: &str, event_name: &str, object_key: &str, event: Event) {
-        let bucket_rules_guard = self.bucket_rules_map.read().await;
-        if let Some(rules) = bucket_rules_guard.get(bucket_name) {
-            let target_ids = rules.match_rules(EventName::from(event_name), object_key);
+    pub async fn send(&self, event: Arc<Event>) {
+        let bucket_name = &event.s3.bucket.name;
+        let object_key = &event.s3.object.key;
+        let event_name = event.event_name;
+        if let Some(rules) = self.bucket_rules_map.get(bucket_name) {
+            let target_ids = rules.match_rules(event_name, object_key);
             if target_ids.is_empty() {
                 debug!("No matching targets for event in bucket: {}", bucket_name);
                 return;

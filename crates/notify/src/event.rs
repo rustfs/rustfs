@@ -445,29 +445,20 @@ impl Event {
         };
 
         let mut resp_elements = args.resp_elements.clone();
-        resp_elements
-            .entry("x-amz-request-id".to_string())
-            .or_insert_with(|| "".to_string());
-        resp_elements
-            .entry("x-amz-id-2".to_string())
-            .or_insert_with(|| "".to_string());
-        // ... Filling of other response elements
+        initialize_response_elements(&mut resp_elements, &["x-amz-request-id", "x-amz-id-2"]);
 
         // URL encoding of object keys
         let key_name = form_urlencoded::byte_serialize(args.object.name.as_bytes()).collect::<String>();
-
-        let principal_id = args.req_params.get("principalId").cloned().unwrap_or_default();
-        let owner_identity = Identity {
-            principal_id: principal_id.clone(),
-        };
-        let user_identity = Identity { principal_id };
+        let principal_id = args.req_params.get("principalId").unwrap_or(&String::new()).to_string();
 
         let mut s3_metadata = Metadata {
             schema_version: "1.0".to_string(),
             configuration_id: "Config".to_string(), // or from args
             bucket: Bucket {
                 name: args.bucket_name.clone(),
-                owner_identity,
+                owner_identity: Identity {
+                    principal_id: principal_id.clone(),
+                },
                 arn: format!("arn:aws:s3:::{}", args.bucket_name),
             },
             object: Object {
@@ -503,7 +494,7 @@ impl Event {
             aws_region: args.req_params.get("region").cloned().unwrap_or_default(),
             event_time: event_time.and_utc(),
             event_name: args.event_name,
-            user_identity,
+            user_identity: Identity { principal_id },
             request_parameters: args.req_params,
             response_elements: resp_elements,
             s3: s3_metadata,
@@ -513,6 +504,12 @@ impl Event {
                 user_agent: args.user_agent,
             },
         }
+    }
+}
+
+fn initialize_response_elements(elements: &mut HashMap<String, String>, keys: &[&str]) {
+    for key in keys {
+        elements.entry(key.to_string()).or_default();
     }
 }
 

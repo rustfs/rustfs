@@ -9,32 +9,43 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Default)]
 pub struct RulesMap {
     map: HashMap<EventName, PatternRules>,
+    /// A bitmask that represents the union of all event types in this map.
+    /// Used for quick checks in `has_subscriber`.
+    total_events_mask: u64,
 }
 
 impl RulesMap {
+    /// Create a new, empty RulesMap.
     pub fn new() -> Self {
         Default::default()
     }
 
-    /// Add rule configuration.
-    /// event_names: A set of event names。
-    /// pattern: Object key pattern.
-    /// target_id: Notify the target.
+    /// Add a rule configuration to the map.
     ///
-    /// This method expands the composite event name.
+    /// This method handles composite event names (such as `s3:ObjectCreated:*`), expanding them as
+    /// Multiple specific event types and add rules for each event type.
+    ///
+    /// # Parameters
+    /// * `event_names` - List of event names associated with this rule.
+    /// * `pattern` - Matching pattern for object keys. If empty, the default is `*` (match all).
+    /// * `target_id` - The target ID of the notification.
     pub fn add_rule_config(&mut self, event_names: &[EventName], pattern: String, target_id: TargetID) {
-        let mut effective_pattern = pattern;
-        if effective_pattern.is_empty() {
-            effective_pattern = "*".to_string(); // Match all by default
-        }
+        let effective_pattern = if pattern.is_empty() {
+            "*".to_string() // Match all by default
+        } else {
+            pattern
+        };
 
         for event_name_spec in event_names {
+            // Expand compound event types, for example ObjectCreatedAll -> [ObjectCreatedPut, ObjectCreatedPost, ...]
             for expanded_event_name in event_name_spec.expand() {
                 // Make sure EventName::expand() returns Vec<EventName>
                 self.map
                     .entry(expanded_event_name)
                     .or_default()
                     .add(effective_pattern.clone(), target_id.clone());
+                // Update the total_events_mask to include this event type
+                self.total_events_mask |= expanded_event_name.mask();
             }
         }
     }
@@ -44,13 +55,17 @@ impl RulesMap {
     pub fn add_map(&mut self, other_map: &Self) {
         for (event_name, other_pattern_rules) in &other_map.map {
             let self_pattern_rules = self.map.entry(*event_name).or_default();
-            // PatternRules::union 返回新的 PatternRules，我们需要修改现有的
+            // PatternRules::union Returns the new PatternRules, we need to modify the existing ones
             let merged_rules = self_pattern_rules.union(other_pattern_rules);
             *self_pattern_rules = merged_rules;
         }
+        // Directly merge two masks.
+        self.total_events_mask |= other_map.total_events_mask;
     }
 
     /// Remove another rule defined in the RulesMap from the current RulesMap.
+    ///
+    /// After the rule is removed, `total_events_mask` is recalculated to ensure its accuracy.
     pub fn remove_map(&mut self, other_map: &Self) {
         let mut events_to_remove = Vec::new();
         for (event_name, self_pattern_rules) in &mut self.map {
@@ -64,10 +79,30 @@ impl RulesMap {
         for event_name in events_to_remove {
             self.map.remove(&event_name);
         }
+        // After removing the rule, recalculate total_events_mask.
+        self.recalculate_mask();
     }
 
-    ///Rules matching the given event name and object key, returning all matching TargetIDs.
+    /// Checks whether any configured rules exist for a given event type.
+    ///
+    /// This method uses a bitmask for a quick check of O(1) complexity.
+    /// `event_name` can be a compound type, such as `ObjectCreatedAll`.
+    pub fn has_subscriber(&self, event_name: &EventName) -> bool {
+        // event_name.mask() will handle compound events correctly
+        (self.total_events_mask & event_name.mask()) != 0
+    }
+
+    /// Rules matching the given event and object keys and return all matching target IDs.
+    ///
+    /// # Notice
+    /// The `event_name` parameter should be a specific, non-compound event type.
+    /// Because this is taken from the `Event` object that actually occurs.
     pub fn match_rules(&self, event_name: EventName, object_key: &str) -> TargetIdSet {
+        // Use bitmask to quickly determine whether there is a matching rule
+        if (self.total_events_mask & event_name.mask()) == 0 {
+            return TargetIdSet::new(); // No matching rules
+        }
+
         // First try to directly match the event name
         if let Some(pattern_rules) = self.map.get(&event_name) {
             let targets = pattern_rules.match_targets(object_key);
@@ -89,6 +124,7 @@ impl RulesMap {
             .map_or_else(TargetIdSet::new, |pr| pr.match_targets(object_key))
     }
 
+    /// Check if RulesMap is empty.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -96,5 +132,43 @@ impl RulesMap {
     /// Returns a clone of internal rules for use in scenarios such as BucketNotificationConfig::validate.
     pub fn inner(&self) -> &HashMap<EventName, PatternRules> {
         &self.map
+    }
+
+    /// A private helper function that recalculates `total_events_mask` based on the content of the current `map`.
+    /// Called after the removal operation to ensure the accuracy of the mask.
+    fn recalculate_mask(&mut self) {
+        let mut new_mask = 0u64;
+        for event_name in self.map.keys() {
+            new_mask |= event_name.mask();
+        }
+        self.total_events_mask = new_mask;
+    }
+
+    /// Remove rules and optimize performance
+    #[allow(dead_code)]
+    pub fn remove_rule(&mut self, event_name: &EventName, pattern: &str) {
+        if let Some(pattern_rules) = self.map.get_mut(event_name) {
+            pattern_rules.rules.remove(pattern);
+            if pattern_rules.is_empty() {
+                self.map.remove(event_name);
+            }
+        }
+        self.recalculate_mask(); // Delay calculation mask
+    }
+
+    /// Batch Delete Rules
+    #[allow(dead_code)]
+    pub fn remove_rules(&mut self, event_names: &[EventName]) {
+        for event_name in event_names {
+            self.map.remove(event_name);
+        }
+        self.recalculate_mask(); // Unified calculation of mask after batch processing
+    }
+
+    /// Update rules and optimize performance
+    #[allow(dead_code)]
+    pub fn update_rule(&mut self, event_name: EventName, pattern: String, target_id: TargetID) {
+        self.map.entry(event_name).or_default().add(pattern, target_id);
+        self.total_events_mask |= event_name.mask(); // Update only the relevant bitmask
     }
 }

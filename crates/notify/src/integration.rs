@@ -1,7 +1,7 @@
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
 use crate::{
-    error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream, Event,
+    error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream, Event, EventName,
     StoreError, Target,
 };
 use ecstore::config::{Config, KVS};
@@ -173,6 +173,38 @@ impl NotificationSystem {
         self.notifier.target_list().read().await.keys()
     }
 
+    /// Checks if there are active subscribers for the given bucket and event name.
+    pub async fn has_subscriber(&self, bucket: &str, event_name: &EventName) -> bool {
+        self.notifier.has_subscriber(bucket, event_name).await
+    }
+
+    async fn update_config_and_reload<F>(&self, mut modifier: F) -> Result<(), NotificationError>
+    where
+        F: FnMut(&mut Config) -> bool, // The closure returns a boolean value indicating whether the configuration has been changed
+    {
+        let Some(store) = ecstore::global::new_object_layer_fn() else {
+            return Err(NotificationError::ServerNotInitialized);
+        };
+
+        let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
+            .await
+            .map_err(|e| NotificationError::ReadConfig(e.to_string()))?;
+
+        if !modifier(&mut new_config) {
+            // If the closure indication has not changed, return in advance
+            info!("Configuration not changed, skipping save and reload.");
+            return Ok(());
+        }
+
+        if let Err(e) = ecstore::config::com::save_server_config(store, &new_config).await {
+            error!("Failed to save config: {}", e);
+            return Err(NotificationError::SaveConfig(e.to_string()));
+        }
+
+        info!("Configuration updated. Reloading system...");
+        self.reload_config(new_config).await
+    }
+
     /// Accurately remove a Target and its related resources through TargetID.
     ///
     /// This process includes:
@@ -188,43 +220,23 @@ impl NotificationSystem {
     pub async fn remove_target(&self, target_id: &TargetID, target_type: &str) -> Result<(), NotificationError> {
         info!("Attempting to remove target: {}", target_id);
 
-        let Some(store) = ecstore::global::new_object_layer_fn() else {
-            return Err(NotificationError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "errServerNotInitialized",
-            )));
-        };
-
-        let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
-            .await
-            .map_err(|e| NotificationError::Configuration(format!("Failed to read notification config: {}", e)))?;
-
-        let mut changed = false;
-        if let Some(targets_of_type) = new_config.0.get_mut(target_type) {
-            if targets_of_type.remove(&target_id.name).is_some() {
-                info!("Removed target {} from the configuration.", target_id);
-                changed = true;
+        self.update_config_and_reload(|config| {
+            let mut changed = false;
+            if let Some(targets_of_type) = config.0.get_mut(target_type) {
+                if targets_of_type.remove(&target_id.name).is_some() {
+                    info!("Remove target from configuration {}", target_id);
+                    changed = true;
+                }
+                if targets_of_type.is_empty() {
+                    config.0.remove(target_type);
+                }
             }
-            if targets_of_type.is_empty() {
-                new_config.0.remove(target_type);
+            if !changed {
+                warn!("Target {} not found in configuration", target_id);
             }
-        }
-
-        if !changed {
-            warn!("Target {} was not found in the configuration.", target_id);
-            return Ok(());
-        }
-
-        if let Err(e) = ecstore::config::com::save_server_config(store, &new_config).await {
-            error!("Failed to save config for target removal: {}", e);
-            return Err(NotificationError::Configuration(format!("Failed to save config: {}", e)));
-        }
-
-        info!(
-            "Configuration updated and persisted for target {} removal. Reloading system...",
-            target_id
-        );
-        self.reload_config(new_config).await
+            changed
+        })
+        .await
     }
 
     /// Set or update a Target configuration.
@@ -241,49 +253,15 @@ impl NotificationSystem {
     /// If the target configuration is invalid, it returns Err(NotificationError::Configuration).
     pub async fn set_target_config(&self, target_type: &str, target_name: &str, kvs: KVS) -> Result<(), NotificationError> {
         info!("Setting config for target {} of type {}", target_name, target_type);
-        // 1. Get the storage handle
-        let Some(store) = ecstore::global::new_object_layer_fn() else {
-            return Err(NotificationError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "errServerNotInitialized",
-            )));
-        };
-
-        // 2. Read the latest configuration from storage
-        let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
-            .await
-            .map_err(|e| NotificationError::Configuration(format!("Failed to read notification config: {}", e)))?;
-
-        // 3. Modify the configuration copy
-        new_config
-            .0
-            .entry(target_type.to_string())
-            .or_default()
-            .insert(target_name.to_string(), kvs);
-
-        // 4. Persist the new configuration
-        if let Err(e) = ecstore::config::com::save_server_config(store, &new_config).await {
-            error!("Failed to save notification config: {}", e);
-            return Err(NotificationError::Configuration(format!("Failed to save notification config: {}", e)));
-        }
-
-        // 5. After the persistence is successful, the system will be reloaded to apply changes.
-        match self.reload_config(new_config).await {
-            Ok(_) => {
-                info!(
-                    "Target {} of type {} configuration updated and reloaded successfully",
-                    target_name, target_type
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to reload config for target {} of type {}: {}", target_name, target_type, e);
-                Err(NotificationError::Configuration(format!(
-                    "Configuration saved, but failed to reload: {}",
-                    e
-                )))
-            }
-        }
+        self.update_config_and_reload(|config| {
+            config
+                .0
+                .entry(target_type.to_string())
+                .or_default()
+                .insert(target_name.to_string(), kvs.clone());
+            true // The configuration is always modified
+        })
+        .await
     }
 
     /// Removes all notification configurations for a bucket.
@@ -305,42 +283,22 @@ impl NotificationSystem {
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
         info!("Removing config for target {} of type {}", target_name, target_type);
-        let Some(store) = ecstore::global::new_object_layer_fn() else {
-            return Err(NotificationError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "errServerNotInitialized",
-            )));
-        };
-
-        let mut new_config = ecstore::config::com::read_config_without_migrate(store.clone())
-            .await
-            .map_err(|e| NotificationError::Configuration(format!("Failed to read notification config: {}", e)))?;
-
-        let mut changed = false;
-        if let Some(targets) = new_config.0.get_mut(target_type) {
-            if targets.remove(target_name).is_some() {
-                changed = true;
+        self.update_config_and_reload(|config| {
+            let mut changed = false;
+            if let Some(targets) = config.0.get_mut(target_type) {
+                if targets.remove(target_name).is_some() {
+                    changed = true;
+                }
+                if targets.is_empty() {
+                    config.0.remove(target_type);
+                }
             }
-            if targets.is_empty() {
-                new_config.0.remove(target_type);
+            if !changed {
+                info!("Target {} of type {} not found, no changes made.", target_name, target_type);
             }
-        }
-
-        if !changed {
-            info!("Target {} of type {} not found, no changes made.", target_name, target_type);
-            return Ok(());
-        }
-
-        if let Err(e) = ecstore::config::com::save_server_config(store, &new_config).await {
-            error!("Failed to save config for target removal: {}", e);
-            return Err(NotificationError::Configuration(format!("Failed to save config: {}", e)));
-        }
-
-        info!(
-            "Configuration updated and persisted for target {} removal. Reloading system...",
-            target_name
-        );
-        self.reload_config(new_config).await
+            changed
+        })
+        .await
     }
 
     /// Enhanced event stream startup function, including monitoring and concurrency control
@@ -355,6 +313,12 @@ impl NotificationSystem {
         stream::start_event_stream_with_batching(store, target, metrics, semaphore)
     }
 
+    /// Update configuration
+    async fn update_config(&self, new_config: Config) {
+        let mut config = self.config.write().await;
+        *config = new_config;
+    }
+
     /// Reloads the configuration
     pub async fn reload_config(&self, new_config: Config) -> Result<(), NotificationError> {
         info!("Reload notification configuration starts");
@@ -367,10 +331,7 @@ impl NotificationSystem {
         }
 
         // Update the config
-        {
-            let mut config = self.config.write().await;
-            *config = new_config.clone();
-        }
+        self.update_config(new_config.clone()).await;
 
         // Create a new target from configuration
         let targets: Vec<Box<dyn Target + Send + Sync>> = self
@@ -459,8 +420,8 @@ impl NotificationSystem {
     }
 
     /// Sends an event
-    pub async fn send_event(&self, bucket_name: &str, event_name: &str, object_key: &str, event: Event) {
-        self.notifier.send(bucket_name, event_name, object_key, event).await;
+    pub async fn send_event(&self, event: Arc<Event>) {
+        self.notifier.send(event).await;
     }
 
     /// Obtain system status information

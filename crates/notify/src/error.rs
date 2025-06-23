@@ -1,5 +1,6 @@
 use std::io;
 use thiserror::Error;
+use crate::arn::TargetID;
 
 /// Error types for the store
 #[derive(Debug, Error)]
@@ -96,8 +97,20 @@ pub enum NotificationError {
     #[error("Notification system has already been initialized")]
     AlreadyInitialized,
 
-    #[error("Io error: {0}")]
+    #[error("I/O error: {0}")]
     Io(std::io::Error),
+
+    #[error("Failed to read configuration: {0}")]
+    ReadConfig(String),
+
+    #[error("Failed to save configuration: {0}")]
+    SaveConfig(String),
+
+    #[error("Target '{0}' not found")]
+    TargetNotFound(TargetID),
+
+    #[error("Server not initialized")]
+    ServerNotInitialized,
 }
 
 impl From<url::ParseError> for TargetError {
