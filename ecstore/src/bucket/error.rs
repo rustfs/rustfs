@@ -32,19 +32,9 @@ impl BucketMetadataError {
     }
 }
 
-impl From<BucketMetadataError> for Error {
-    fn from(e: BucketMetadataError) -> Self {
-        match e {
-            BucketMetadataError::BucketPolicyNotFound => Error::BucketPolicyNotFound,
-            _ => Error::other(e),
-        }
-    }
-}
-
 impl From<Error> for BucketMetadataError {
     fn from(e: Error) -> Self {
         match e {
-            Error::BucketPolicyNotFound => BucketMetadataError::BucketPolicyNotFound,
             Error::Io(e) => e.into(),
             _ => BucketMetadataError::other(e),
         }

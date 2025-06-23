@@ -1613,7 +1613,7 @@ impl S3 for FS {
         let cfg = match PolicySys::get(&bucket).await {
             Ok(res) => res,
             Err(err) => {
-                if StorageError::BucketPolicyNotFound == err {
+                if StorageError::ConfigNotFound == err {
                     return Err(s3_error!(NoSuchBucketPolicy));
                 }
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, err.to_string()));

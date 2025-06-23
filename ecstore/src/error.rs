@@ -2,6 +2,7 @@ use s3s::{S3Error, S3ErrorCode};
 
 use rustfs_utils::path::decode_dir_object;
 
+use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
 
 pub type Error = StorageError;
@@ -166,9 +167,6 @@ pub enum StorageError {
     #[error("first disk wait")]
     FirstDiskWait,
 
-    #[error("Bucket policy not found")]
-    BucketPolicyNotFound,
-
     #[error("Io error: {0}")]
     Io(std::io::Error),
 }
@@ -253,6 +251,22 @@ impl From<StorageError> for DiskError {
             StorageError::VolumeExists => DiskError::VolumeExists,
             StorageError::FileNameTooLong => DiskError::FileNameTooLong,
             _ => DiskError::other(val),
+        }
+    }
+}
+
+impl From<BucketMetadataError> for Error {
+    fn from(e: BucketMetadataError) -> Self {
+        match e {
+            BucketMetadataError::TaggingNotFound => Error::ConfigNotFound,
+            BucketMetadataError::BucketPolicyNotFound => Error::ConfigNotFound,
+            BucketMetadataError::BucketObjectLockConfigNotFound => Error::ConfigNotFound,
+            BucketMetadataError::BucketLifecycleNotFound => Error::ConfigNotFound,
+            BucketMetadataError::BucketSSEConfigNotFound => Error::ConfigNotFound,
+            BucketMetadataError::BucketQuotaConfigNotFound => Error::ConfigNotFound,
+            BucketMetadataError::BucketReplicationConfigNotFound => Error::ConfigNotFound,
+            BucketMetadataError::BucketRemoteTargetNotFound => Error::ConfigNotFound,
+            _ => Error::other(e),
         }
     }
 }
@@ -381,7 +395,6 @@ impl Clone for StorageError {
             StorageError::FirstDiskWait => StorageError::FirstDiskWait,
             StorageError::TooManyOpenFiles => StorageError::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageError::NoHealRequired,
-            StorageError::BucketPolicyNotFound => StorageError::BucketPolicyNotFound,
         }
     }
 }
@@ -444,7 +457,6 @@ impl StorageError {
             StorageError::ConfigNotFound => 0x35,
             StorageError::TooManyOpenFiles => 0x36,
             StorageError::NoHealRequired => 0x37,
-            StorageError::BucketPolicyNotFound => 0x38,
         }
     }
 
@@ -509,7 +521,6 @@ impl StorageError {
             0x35 => Some(StorageError::ConfigNotFound),
             0x36 => Some(StorageError::TooManyOpenFiles),
             0x37 => Some(StorageError::NoHealRequired),
-            0x38 => Some(StorageError::BucketPolicyNotFound),
             _ => None,
         }
     }
