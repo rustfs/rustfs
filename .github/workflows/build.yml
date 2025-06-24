@@ -370,7 +370,7 @@ jobs:
 
           # Set the OSS configuration
           ossutil config set Region oss-cn-beijing
-          ossutil config set endpoint oss-accelerate.aliyuncs.com
+          ossutil config set endpoint oss-cn-beijing.aliyuncs.com
           ossutil config set accessKeyID ${{ secrets.ALICLOUDOSS_KEY_ID }}
           ossutil config set accessKeySecret ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
 
@@ -380,7 +380,8 @@ jobs:
         env:
           OSSUTIL_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSSUTIL_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-          OSSUTIL_ENDPOINT: https://oss-accelerate.aliyuncs.com
+          OSS_REGION: cn-beijing
+          OSSUTIL_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         run: |
           echo "::group::Uploading files to OSS"
           # Upload the artifact file to two different paths
@@ -508,7 +509,8 @@ jobs:
         env:
           OSSUTIL_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSSUTIL_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-          OSSUTIL_ENDPOINT: https://oss-accelerate.aliyuncs.com
+          OSS_REGION: cn-beijing
+          OSSUTIL_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         run: |
           echo "::group::Uploading GUI files to OSS"
           # Upload the GUI artifact file to two different paths
