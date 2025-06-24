@@ -461,13 +461,7 @@ pub struct FileInfoVersions {
 }
 
 impl FileInfoVersions {
-    pub fn find_version_index(&self, v: &str) -> Option<usize> {
-        if v.is_empty() {
-            return None;
-        }
-
-        let vid = Uuid::parse_str(v).unwrap_or_default();
-
+    pub fn find_version_index(&self, vid: Uuid) -> Option<usize> {
         self.versions.iter().position(|v| v.version_id == Some(vid))
     }
 

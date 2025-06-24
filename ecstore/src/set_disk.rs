@@ -4690,8 +4690,7 @@ impl StorageAPI for SetDisks {
                     continue;
                 }
             }
-            let _ = self.add_partial(bucket, object, opts.version_id.as_ref().expect("err"))
-                .await;
+            let _ = self.add_partial(bucket, object, opts.version_id.as_ref().expect("err")).await;
             break;
         }
 

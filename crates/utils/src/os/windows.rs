@@ -40,14 +40,12 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let free = unsafe { *lp_total_number_of_free_bytes.QuadPart() };
 
     if free > total {
-        return Err(Error::other(
-            format!(
-                "detected free space ({}) > total drive space ({}), fs corruption at ({}). please run 'fsck'",
-                free,
-                total,
-                p.as_ref().display()
-            ),
-        ));
+        return Err(Error::other(format!(
+            "detected free space ({}) > total drive space ({}), fs corruption at ({}). please run 'fsck'",
+            free,
+            total,
+            p.as_ref().display()
+        )));
     }
 
     let mut lp_sectors_per_cluster: DWORD = 0;
