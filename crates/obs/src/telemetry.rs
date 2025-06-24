@@ -1,19 +1,19 @@
 use crate::OtelConfig;
-use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode, style};
+use flexi_logger::{style, Age, Cleanup, Criterion, DeferredNow, FileSpec, LogSpecification, Naming, Record, WriteMode};
 use nu_ansi_term::Color;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry::{KeyValue, global};
+use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::{
-    Resource,
     metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
+    Resource,
 };
 use opentelemetry_semantic_conventions::{
-    SCHEMA_URL,
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
+    SCHEMA_URL,
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_DIR, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
@@ -28,7 +28,7 @@ use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::LocalTime;
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 /// A guard object that manages the lifecycle of OpenTelemetry components.
 ///
@@ -356,19 +356,19 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             // Save the logger handle to keep the logging
             flexi_logger_handle = Some(logger);
 
-            info!("Flexi logger initialized with file logging to {}/{}.log", log_directory, log_filename);
+            eprintln!("Flexi logger initialized with file logging to {}/{}.log", log_directory, log_filename);
 
             // Log logging of log cutting conditions
             match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
-                (Some(time), Some(size)) => info!(
+                (Some(time), Some(size)) => eprintln!(
                     "Log rotation configured for: every {} or when size exceeds {}MB, keeping {} files",
                     time, size, keep_files
                 ),
-                (Some(time), None) => info!("Log rotation configured for: every {}, keeping {} files", time, keep_files),
+                (Some(time), None) => eprintln!("Log rotation configured for: every {}, keeping {} files", time, keep_files),
                 (None, Some(size)) => {
-                    info!("Log rotation configured for: when size exceeds {}MB, keeping {} files", size, keep_files)
+                    eprintln!("Log rotation configured for: when size exceeds {}MB, keeping {} files", size, keep_files)
                 }
-                _ => info!("Log rotation configured for: daily, keeping {} files", keep_files),
+                _ => eprintln!("Log rotation configured for: daily, keeping {} files", keep_files),
             }
         } else {
             eprintln!("Failed to initialize flexi_logger: {:?}", flexi_logger_result.err());
@@ -397,6 +397,7 @@ fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilte
 }
 
 /// Custom Log Formatter Function - Terminal Output (with Color)
+#[inline(never)]
 fn format_with_color(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &Record) -> Result<(), std::io::Error> {
     let level = record.level();
     let level_style = style(level);
@@ -421,6 +422,7 @@ fn format_with_color(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: 
 }
 
 /// Custom Log Formatter - File Output (No Color)
+#[inline(never)]
 fn format_for_file(w: &mut dyn std::io::Write, now: &mut DeferredNow, record: &Record) -> Result<(), std::io::Error> {
     let level = record.level();
 
