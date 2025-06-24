@@ -428,6 +428,10 @@ async fn run(opt: config::Opt) -> Result<()> {
                 let tls_socket = match tls_acceptor
                     .as_ref()
                     .ok_or_else(|| rustfs_utils::certs_error("TLS not configured".to_string()))
+                    .map_err(|e| {
+                        error!("TLS panic error: {}", e);
+                        e
+                    })
                     .unwrap()
                     .accept(socket)
                     .await
