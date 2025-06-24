@@ -509,6 +509,7 @@ jobs:
         env:
           OSSUTIL_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSSUTIL_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
           OSSUTIL_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
         run: |
           echo "::group::Uploading GUI files to OSS"
