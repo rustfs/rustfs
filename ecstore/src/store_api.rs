@@ -567,7 +567,92 @@ impl ObjectInfo {
         }
     }
 
-    pub async fn from_meta_cache_entries_sorted(
+    pub async fn from_meta_cache_entries_sorted_versions(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_id: Option<Uuid>,
+    ) -> Vec<ObjectInfo> {
+        let vcfg = get_versioning_config(bucket).await.ok();
+        let mut objects = Vec::with_capacity(entries.entries().len());
+        let mut prev_prefix = "";
+        for entry in entries.entries() {
+            if entry.is_object() {
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
+
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
+                        }
+                        continue;
+                    }
+                }
+
+                let file_infos = match entry.file_info_versions(bucket) {
+                    Ok(res) => res,
+                    Err(err) => {
+                        warn!("file_info_versions err {:?}", err);
+                        continue;
+                    }
+                };
+
+                let versions = if let Some(vid) = after_version_id {
+                    if let Some(idx) = file_infos.find_version_index(vid) {
+                        &file_infos.versions[idx + 1..]
+                    } else {
+                        &file_infos.versions
+                    }
+                } else {
+                    &file_infos.versions
+                };
+
+                for fi in versions.iter() {
+                    // TODO:VersionPurgeStatus
+                    let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
+                    objects.push(ObjectInfo::from_file_info(fi, bucket, &entry.name, versioned));
+                }
+                continue;
+            }
+
+            if entry.is_dir() {
+                if let Some(delimiter) = &delimiter {
+                    if let Some(idx) = entry.name.trim_start_matches(prefix).find(delimiter) {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        if let Some(curr_prefix) = entry.name.get(0..idx) {
+                            if curr_prefix == prev_prefix {
+                                continue;
+                            }
+
+                            prev_prefix = curr_prefix;
+
+                            objects.push(ObjectInfo {
+                                is_dir: true,
+                                bucket: bucket.to_owned(),
+                                name: curr_prefix.to_owned(),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        objects
+    }
+
+    pub async fn from_meta_cache_entries_sorted_infos(
         entries: &MetaCacheEntriesSorted,
         bucket: &str,
         prefix: &str,
@@ -599,11 +684,18 @@ impl ObjectInfo {
                     }
                 }
 
-                if let Ok(fi) = entry.to_fileinfo(bucket) {
-                    // TODO:VersionPurgeStatus
-                    let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
-                    objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
-                }
+                let fi = match entry.to_fileinfo(bucket) {
+                    Ok(res) => res,
+                    Err(err) => {
+                        warn!("file_info_versions err {:?}", err);
+                        continue;
+                    }
+                };
+
+                // TODO:VersionPurgeStatus
+                let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
+                objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
+
                 continue;
             }
 

@@ -198,7 +198,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
             }
 
             let rule_prefix = rule.prefix.as_ref().expect("err!");
-            if prefix.len() > 0 && rule_prefix.len() > 0 && !prefix.starts_with(rule_prefix) && !rule_prefix.starts_with(&prefix) {
+            if prefix.len() > 0 && rule_prefix.len() > 0 && !prefix.starts_with(rule_prefix) && !rule_prefix.starts_with(&prefix)
+            {
                 continue;
             }
 
@@ -425,7 +426,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 if !obj.is_latest {
                     if let Some(ref noncurrent_version_transitions) = rule.noncurrent_version_transitions {
                         if let Some(ref storage_class) = noncurrent_version_transitions[0].storage_class {
-                            if storage_class.as_str() != "" && !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE {
+                            if storage_class.as_str() != "" && !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE
+                            {
                                 let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
                                 if due.is_some()
                                     && (now.unix_timestamp() == 0 || now.unix_timestamp() > due.unwrap().unix_timestamp())
@@ -452,7 +454,9 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     if let Some(ref expiration) = rule.expiration {
                         if let Some(ref date) = expiration.date {
                             let date0 = OffsetDateTime::from(date.clone());
-                            if date0.unix_timestamp() != 0 && (now.unix_timestamp() == 0 || now.unix_timestamp() > date0.unix_timestamp()) {
+                            if date0.unix_timestamp() != 0
+                                && (now.unix_timestamp() == 0 || now.unix_timestamp() > date0.unix_timestamp())
+                            {
                                 events.push(Event {
                                     action: IlmAction::DeleteAction,
                                     rule_id: rule.id.clone().expect("err!"),

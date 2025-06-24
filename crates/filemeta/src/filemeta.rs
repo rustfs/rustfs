@@ -2006,11 +2006,7 @@ impl MetaObject {
             if *status == TRANSITION_COMPLETE.as_bytes().to_vec() {
                 let vid = Uuid::parse_str(&fi.tier_free_version_id());
                 if let Err(err) = vid {
-                    panic!(
-                        "Invalid Tier Object delete marker versionId {} {}",
-                        fi.tier_free_version_id(),
-                        err
-                    );
+                    panic!("Invalid Tier Object delete marker versionId {} {}", fi.tier_free_version_id(), err);
                 }
                 let vid = vid.unwrap();
                 let mut free_entry = FileMetaVersion {

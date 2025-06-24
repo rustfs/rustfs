@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{error, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -246,8 +246,6 @@ impl ECStore {
             ..Default::default()
         };
 
-        // warn!("list_objects_generic opts {:?}", &opts);
-
         // use get
         if !opts.prefix.is_empty() && opts.limit == 1 && opts.marker.is_none() {
             match self
@@ -295,7 +293,7 @@ impl ECStore {
 
         // contextCanceled
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted(
+        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -364,9 +362,14 @@ impl ECStore {
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
         if marker.is_none() && version_marker.is_some() {
-            warn!("inner_list_object_versions: marker is none and version_marker is some");
             return Err(StorageError::NotImplemented);
         }
+
+        let version_marker = if let Some(marker) = version_marker {
+            Some(Uuid::parse_str(&marker)?)
+        } else {
+            None
+        };
 
         // if marker set, limit +1
         let opts = ListPathOptions {
@@ -399,11 +402,12 @@ impl ECStore {
             result.forward_past(opts.marker);
         }
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted(
+        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
             delimiter.clone(),
+            version_marker,
         )
         .await;
 
@@ -1068,7 +1072,7 @@ async fn merge_entry_channels(
                     }
                 },
                 _ = rx.recv()=>{
-                    warn!("merge_entry_channels rx.recv() cancel");
+                    info!("merge_entry_channels rx.recv() cancel");
                     return Ok(())
                 },
             }
