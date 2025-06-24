@@ -36,7 +36,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # 可观测性 相关配置信息
-#export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的地址
+export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的地址
 #export RUSTFS_OBS_USE_STDOUT=false # 是否使用标准输出
 #export RUSTFS_OBS_SAMPLE_RATIO=2.0 # 采样率，0.0-1.0之间，0.0表示不采样，1.0表示全部采样
 #export RUSTFS_OBS_METER_INTERVAL=1 # 采样间隔，单位为秒
@@ -50,10 +50,10 @@ export RUSTFS_OBS_LOG_ROTATION_TIME="minute" # Log rotation time unit, can be "s
 export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
 
 #
-#export RUSTFS_SINKS_FILE_PATH=./deploy/logs/rustfs.log
-#export RUSTFS_SINKS_FILE_BUFFER_SIZE=12
-#export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000
-#export RUSTFS_SINKS_FILE_FLUSH_THRESHOLD=100
+export RUSTFS_SINKS_FILE_PATH=./deploy/logs/rustfs.log
+export RUSTFS_SINKS_FILE_BUFFER_SIZE=12
+export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000
+export RUSTFS_SINKS_FILE_FLUSH_THRESHOLD=100
 #
 # Kafka sink 配置
 #export RUSTFS_SINKS_KAFKA_BROKERS=localhost:9092

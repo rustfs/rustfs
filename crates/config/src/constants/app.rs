@@ -101,7 +101,7 @@ pub const DEFAULT_LOG_FILENAME: &str = "rustfs.log";
 /// It is used to store the logs of the application.
 /// Default value: logs
 /// Environment variable: RUSTFS_OBSERVABILITY_LOG_DIRECTORY
-pub const DEFAULT_LOG_DIR: &str = "logs";
+pub const DEFAULT_LOG_DIR: &str = "deploy/logs";
 
 /// Default log rotation size mb for rustfs
 /// This is the default log rotation size for rustfs.

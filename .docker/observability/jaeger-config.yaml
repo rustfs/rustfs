@@ -50,10 +50,10 @@ extensions:
     backends:
       some_store:
         memory:
-          max_traces: 100000
+          max_traces: 1000000
       another_store:
         memory:
-          max_traces: 100000
+          max_traces: 1000000
     metric_backends:
       some_metrics_storage:
         prometheus:

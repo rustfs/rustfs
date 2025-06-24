@@ -16,7 +16,7 @@ services:
     networks:
       - otel-network
   jaeger:
-    image: jaegertracing/jaeger:2.6.0
+    image: jaegertracing/jaeger:2.7.0
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -47,7 +47,7 @@ services:
     networks:
       - otel-network
   grafana:
-    image: grafana/grafana:12.0.1
+    image: grafana/grafana:12.0.2
     ports:
       - "3000:3000"  # Web UI
     environment:
