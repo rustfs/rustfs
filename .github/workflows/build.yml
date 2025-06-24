@@ -370,7 +370,7 @@ jobs:
 
           # Set the OSS configuration
           ossutil config set Region oss-cn-beijing
-          ossutil config set endpoint oss-cn-beijing.aliyuncs.com
+          ossutil config set endpoint oss-accelerate.aliyuncs.com
           ossutil config set accessKeyID ${{ secrets.ALICLOUDOSS_KEY_ID }}
           ossutil config set accessKeySecret ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
 
