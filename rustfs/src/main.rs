@@ -425,20 +425,44 @@ async fn run(opt: config::Opt) -> Result<()> {
 
             if has_tls_certs {
                 debug!("TLS certificates found, starting with SIGINT");
-                let tls_socket = match tls_acceptor
-                    .as_ref()
-                    .ok_or_else(|| rustfs_utils::certs_error("TLS not configured".to_string()))
-                    .map_err(|e| {
-                        error!("TLS panic error: {}", e);
-                        e
-                    })
-                    .unwrap()
-                    .accept(socket)
-                    .await
-                {
-                    Ok(tls_socket) => tls_socket,
-                    Err(err) => {
-                        error!("TLS handshake failed {}", err);
+                // let tls_socket = match tls_acceptor
+                //     .as_ref()
+                //     .ok_or_else(|| rustfs_utils::certs_error("TLS not configured".to_string()))
+                //     .map_err(|e| {
+                //         error!("TLS panic error: {}", e);
+                //         e
+                //     })
+                //     .unwrap()
+                //     .accept(socket)
+                //     .await
+                // {
+                //     Ok(tls_socket) => tls_socket,
+                //     Err(err) => {
+                //         error!("TLS handshake failed {}", err);
+                //         continue;
+                //     }
+                // };
+
+                let peer_addr_str = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|e| {
+                    warn!("Could not get peer address: {}", e);
+                    "unknown".to_string()
+                });
+                let tls_socket = match tls_acceptor.as_ref() {
+                    Some(acceptor) => match acceptor.accept(socket).await {
+                        Ok(tls_socket) => {
+                            info!("TLS handshake successful with peer: {}", peer_addr_str);
+                            tls_socket
+                        }
+                        Err(err) => {
+                            error!("TLS handshake with peer {} failed: {}", peer_addr_str, err);
+                            continue;
+                        }
+                    },
+                    None => {
+                        error!(
+                            "TLS acceptor is not available, but TLS is enabled. This is a bug. Dropping connection from {}",
+                            peer_addr_str
+                        );
                         continue;
                     }
                 };
