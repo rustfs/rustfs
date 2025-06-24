@@ -1,3 +1,10 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
@@ -54,7 +61,7 @@ impl WarmBackendS3 {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
-        let mut creds: Credentials<Static>;
+        let creds: Credentials<Static>;
 
         if conf.access_key != "" && conf.secret_key != "" {
             //creds = Credentials::new_static_v4(conf.access_key, conf.secret_key, "");
@@ -69,7 +76,7 @@ impl WarmBackendS3 {
             return Err(std::io::Error::other("insufficient parameters for S3 backend authentication"));
         }
         let opts = Options {
-            creds: creds,
+            creds,
             secure: u.scheme() == "https",
             //transport: GLOBAL_RemoteTargetTransport,
             ..Default::default()

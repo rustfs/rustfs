@@ -1,20 +1,27 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use s3s::Body;
 use sha2::{Digest, Sha256};
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::collections::HashMap;
 use std::env;
-use std::io::{Cursor, Write};
+use std::io::Write;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -48,7 +55,7 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 
 static XXHASH_SEED: u64 = 0;
 
-const DISABLED: &str = "Disabled";
+const _DISABLED: &str = "Disabled";
 
 //pub const ERR_INVALID_STORAGECLASS: &str = "invalid storage class.";
 pub const ERR_INVALID_STORAGECLASS: &str = "invalid tier.";
@@ -70,7 +77,7 @@ impl LifecycleSys {
         Some(lc)
     }
 
-    pub fn trace(oi: &ObjectInfo) -> TraceFn {
+    pub fn trace(_oi: &ObjectInfo) -> TraceFn {
         todo!();
     }
 }
@@ -264,7 +271,7 @@ impl ExpiryState {
 
         let task = NewerNoncurrentTask {
             bucket: String::from(bucket),
-            versions: versions,
+            versions,
             event: lc_event,
         };
         let wrkr = self.get_worker_ch(task.op_hash());
@@ -297,7 +304,7 @@ impl ExpiryState {
         let mut state = GLOBAL_ExpiryState.write().await;
 
         while state.tasks_tx.len() < n {
-            let (tx, mut rx) = mpsc::channel(10000);
+            let (tx, rx) = mpsc::channel(10000);
             let api = api.clone();
             let rx = Arc::new(tokio::sync::Mutex::new(rx));
             state.tasks_tx.push(tx);
@@ -349,7 +356,7 @@ impl ExpiryState {
                         }
                     }
                     else if v.as_any().is::<NewerNoncurrentTask>() {
-                        let v = v.as_any().downcast_ref::<NewerNoncurrentTask>().expect("err!");
+                        let _v = v.as_any().downcast_ref::<NewerNoncurrentTask>().expect("err!");
                         //delete_object_versions(api, &v.bucket, &v.versions, v.event).await;
                     }
                     else if v.as_any().is::<Jentry>() {
@@ -357,7 +364,7 @@ impl ExpiryState {
                     }
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("err!");
-                        let oi = v.0.clone();
+                        let _oi = v.0.clone();
 
                     }
                     else {
@@ -490,11 +497,9 @@ impl TransitionState {
 
                         GLOBAL_TransitionState.active_tasks.fetch_add(1, Ordering::SeqCst);
                         if let Err(err) = transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone())).await {
-                            if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) {
-                                if !err.to_string().contains("use of closed network connection") {
-                                    error!("Transition to {} failed for {}/{} version:{} with {}",
-                                        task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.expect("err"), err.to_string());
-                                }
+                            if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
+                                error!("Transition to {} failed for {}/{} version:{} with {}",
+                                    task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.expect("err"), err.to_string());
                             }
                         } else {
                             let mut ts = TierStats {
@@ -655,7 +660,7 @@ pub async fn expire_transitioned_object(
     api: Arc<ECStore>,
     oi: &ObjectInfo,
     lc_event: &lifecycle::Event,
-    src: &LcEventSrc,
+    _src: &LcEventSrc,
 ) -> Result<ObjectInfo, std::io::Error> {
     //let traceFn = GLOBAL_LifecycleSys.trace(oi);
     let mut opts = ObjectOptions {
@@ -747,7 +752,7 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
     api.transition_object(&oi.bucket, &oi.name, &opts).await
 }
 
-pub fn audit_tier_actions(api: ECStore, tier: &str, bytes: i64) -> TimeFn {
+pub fn audit_tier_actions(_api: ECStore, _tier: &str, _bytes: i64) -> TimeFn {
     todo!();
 }
 
@@ -785,11 +790,11 @@ pub async fn get_transitioned_object_reader(
     Ok(get_fn(reader, h))
 }
 
-pub fn post_restore_opts(r: http::Request<Body>, bucket: &str, object: &str) -> Result<ObjectOptions, std::io::Error> {
+pub fn post_restore_opts(_r: http::Request<Body>, _bucket: &str, _object: &str) -> Result<ObjectOptions, std::io::Error> {
     todo!();
 }
 
-pub fn put_restore_opts(bucket: &str, object: &str, rreq: &RestoreObjectRequest, oi: &ObjectInfo) -> ObjectOptions {
+pub fn put_restore_opts(_bucket: &str, _object: &str, _rreq: &RestoreObjectRequest, _oi: &ObjectInfo) -> ObjectOptions {
     todo!();
 }
 

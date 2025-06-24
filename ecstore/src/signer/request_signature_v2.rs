@@ -1,3 +1,10 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use bytes::{Bytes, BytesMut};
 use http::request;
 use hyper::Uri;
@@ -117,14 +124,14 @@ fn pre_string_to_sign_v2(req: &request::Builder, virtual_host: bool) -> String {
 }
 
 fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Builder) {
-    buf.write_str(req.method_ref().unwrap().as_str());
-    buf.write_char('\n');
-    buf.write_str(req.headers_ref().unwrap().get("Content-Md5").unwrap().to_str().unwrap());
-    buf.write_char('\n');
-    buf.write_str(req.headers_ref().unwrap().get("Content-Type").unwrap().to_str().unwrap());
-    buf.write_char('\n');
-    buf.write_str(req.headers_ref().unwrap().get("Expires").unwrap().to_str().unwrap());
-    buf.write_char('\n');
+    let _ = buf.write_str(req.method_ref().unwrap().as_str());
+    let _ = buf.write_char('\n');
+    let _ = buf.write_str(req.headers_ref().unwrap().get("Content-Md5").unwrap().to_str().unwrap());
+    let _ = buf.write_char('\n');
+    let _ = buf.write_str(req.headers_ref().unwrap().get("Content-Type").unwrap().to_str().unwrap());
+    let _ = buf.write_char('\n');
+    let _ = buf.write_str(req.headers_ref().unwrap().get("Expires").unwrap().to_str().unwrap());
+    let _ = buf.write_char('\n');
 }
 
 fn string_to_sign_v2(req: &request::Builder, virtual_host: bool) -> String {
@@ -136,14 +143,14 @@ fn string_to_sign_v2(req: &request::Builder, virtual_host: bool) -> String {
 }
 
 fn write_sign_v2_headers(buf: &mut BytesMut, req: &request::Builder) {
-    buf.write_str(req.method_ref().unwrap().as_str());
-    buf.write_char('\n');
-    buf.write_str(req.headers_ref().unwrap().get("Content-Md5").unwrap().to_str().unwrap());
-    buf.write_char('\n');
-    buf.write_str(req.headers_ref().unwrap().get("Content-Type").unwrap().to_str().unwrap());
-    buf.write_char('\n');
-    buf.write_str(req.headers_ref().unwrap().get("Date").unwrap().to_str().unwrap());
-    buf.write_char('\n');
+    let _ = buf.write_str(req.method_ref().unwrap().as_str());
+    let _ = buf.write_char('\n');
+    let _ = buf.write_str(req.headers_ref().unwrap().get("Content-Md5").unwrap().to_str().unwrap());
+    let _ = buf.write_char('\n');
+    let _ = buf.write_str(req.headers_ref().unwrap().get("Content-Type").unwrap().to_str().unwrap());
+    let _ = buf.write_char('\n');
+    let _ = buf.write_str(req.headers_ref().unwrap().get("Date").unwrap().to_str().unwrap());
+    let _ = buf.write_char('\n');
 }
 
 fn write_canonicalized_headers(buf: &mut BytesMut, req: &request::Builder) {
@@ -165,15 +172,15 @@ fn write_canonicalized_headers(buf: &mut BytesMut, req: &request::Builder) {
     }
     proto_headers.sort();
     for k in proto_headers {
-        buf.write_str(&k);
-        buf.write_char(':');
+        let _ = buf.write_str(&k);
+        let _ = buf.write_char(':');
         for (idx, v) in vals[&k].iter().enumerate() {
             if idx > 0 {
-                buf.write_char(',');
+                let _ = buf.write_char(',');
             }
-            buf.write_str(v);
+            let _ = buf.write_str(v);
         }
-        buf.write_char('\n');
+        let _ = buf.write_char('\n');
     }
 }
 
@@ -203,7 +210,7 @@ const INCLUDED_QUERY: &[&str] = &[
 
 fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Builder, virtual_host: bool) {
     let request_url = req.uri_ref().unwrap();
-    buf.write_str(&encode_url2path(req, virtual_host));
+    let _ = buf.write_str(&encode_url2path(req, virtual_host));
     if request_url.query().unwrap() != "" {
         let mut n: i64 = 0;
         let result = serde_urlencoded::from_str::<HashMap<String, Vec<String>>>(req.uri_ref().unwrap().query().unwrap());
@@ -214,14 +221,14 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Builder, virt
                 n += 1;
                 match n {
                     1 => {
-                        buf.write_char('?');
+                        let _ = buf.write_char('?');
                     }
                     _ => {
-                        buf.write_char('&');
-                        buf.write_str(resource);
+                        let _ = buf.write_char('&');
+                        let _ = buf.write_str(resource);
                         if vv[0].len() > 0 {
-                            buf.write_char('=');
-                            buf.write_str(&vv[0]);
+                            let _ = buf.write_char('=');
+                            let _ = buf.write_str(&vv[0]);
                         }
                     }
                 }

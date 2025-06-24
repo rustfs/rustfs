@@ -1,7 +1,5 @@
-use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use time::{OffsetDateTime, format_description};
-use tracing::{error, warn};
 
 use s3s::dto::{Date, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode};
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
@@ -72,7 +70,7 @@ pub fn get_object_legalhold_meta(meta: HashMap<String, String>) -> ObjectLockLeg
 }
 
 pub fn parse_ret_mode(mode_str: &str) -> ObjectLockRetentionMode {
-    let mut mode;
+    let mode;
     match mode_str.to_uppercase().as_str() {
         "GOVERNANCE" => {
             mode = ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE);
@@ -86,7 +84,7 @@ pub fn parse_ret_mode(mode_str: &str) -> ObjectLockRetentionMode {
 }
 
 pub fn parse_legalhold_status(hold_str: &str) -> ObjectLockLegalHoldStatus {
-    let mut st;
+    let st;
     match hold_str {
         "ON" => {
             st = ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON);

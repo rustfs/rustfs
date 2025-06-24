@@ -1,7 +1,7 @@
 #![allow(unsafe_code)] // TODO: audit unsafe code
 
 use super::{DiskInfo, IOStats};
-use std::io::{Error, ErrorKind};
+use std::io::Error;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -40,8 +40,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let free = unsafe { *lp_total_number_of_free_bytes.QuadPart() };
 
     if free > total {
-        return Err(Error::new(
-            ErrorKind::Other,
+        return Err(Error::other(
             format!(
                 "detected free space ({}) > total drive space ({}), fs corruption at ({}). please run 'fsck'",
                 free,

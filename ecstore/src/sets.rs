@@ -461,7 +461,7 @@ impl StorageAPI for Sets {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, _force_del_marker: bool) -> Result<()> {
         unimplemented!()
     }
 
@@ -585,8 +585,7 @@ impl StorageAPI for Sets {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        self.get_disks_by_key(object).add_partial(bucket, object, version_id).await;
-        Ok(())
+        self.get_disks_by_key(object).add_partial(bucket, object, version_id).await
     }
 
     #[tracing::instrument(skip(self))]

@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use crate::client::{
     api_error_response::{err_entity_too_large, err_invalid_argument},
     api_put_object::PutObjectOptions,
@@ -47,12 +54,10 @@ pub fn optimal_part_info(object_size: i64, configured_part_size: u64) -> Result<
             )));
         }
 
-        if !unknown_size {
-            if object_size > (configured_part_size as i64 * MAX_PARTS_COUNT) {
-                return Err(std::io::Error::other(err_invalid_argument(
-                    "Part size * max_parts(10000) is lesser than input objectSize.",
-                )));
-            }
+        if !unknown_size && object_size > (configured_part_size as i64 * MAX_PARTS_COUNT) {
+            return Err(std::io::Error::other(err_invalid_argument(
+                "Part size * max_parts(10000) is lesser than input objectSize.",
+            )));
         }
 
         if (configured_part_size as i64) < ABS_MIN_PART_SIZE {

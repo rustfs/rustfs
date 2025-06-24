@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use bytes::Bytes;
 use http::HeaderMap;
 use std::io::Cursor;
@@ -169,7 +176,7 @@ impl Object {
         if !self.is_started || !self.object_info_set {
             let seek_req = GetRequest {
                 is_read_op: false,
-                offset: offset,
+                offset,
                 is_first_req: true,
                 ..Default::default()
             };

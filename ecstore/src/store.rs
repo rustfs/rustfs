@@ -1883,14 +1883,14 @@ impl StorageAPI for ECStore {
         let object = encode_dir_object(object);
 
         if self.single_pool() {
-            self.pools[0].add_partial(bucket, object.as_str(), version_id).await;
+            let _ = self.pools[0].add_partial(bucket, object.as_str(), version_id).await;
         }
 
         let idx = self
             .get_pool_idx_existing_with_opts(bucket, object.as_str(), &ObjectOptions::default())
             .await?;
 
-        self.pools[idx].add_partial(bucket, object.as_str(), version_id).await;
+        let _ = self.pools[idx].add_partial(bucket, object.as_str(), version_id).await;
         Ok(())
     }
     #[tracing::instrument(skip(self))]

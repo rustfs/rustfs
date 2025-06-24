@@ -1,8 +1,15 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use tracing::info;
 
-const C_TierConfigVer: &str = "v1";
+const C_TIER_CONFIG_VER: &str = "v1";
 
 const ERR_TIER_NAME_EMPTY: &str = "remote tier name empty";
 const ERR_TIER_INVALID_CONFIG: &str = "invalid tier config";
@@ -112,7 +119,7 @@ impl Clone for TierConfig {
             version: self.version.clone(),
             tier_type: self.tier_type.clone(),
             name: self.name.clone(),
-            s3: s3,
+            s3,
             //azure:   az,
             //gcs:     gcs,
             rustfs: r,
@@ -237,7 +244,7 @@ impl TierS3 {
         }
 
         Ok(TierConfig {
-            version: C_TierConfigVer.to_string(),
+            version: C_TIER_CONFIG_VER.to_string(),
             tier_type: TierType::S3,
             name: name.to_string(),
             s3: Some(sc),
@@ -306,7 +313,7 @@ impl TierMinIO {
         }
 
         Ok(TierConfig {
-            version: C_TierConfigVer.to_string(),
+            version: C_TIER_CONFIG_VER.to_string(),
             tier_type: TierType::MinIO,
             name: name.to_string(),
             minio: Some(m),

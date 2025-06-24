@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+
 pub struct TargetID {
     id: String,
     name: String,

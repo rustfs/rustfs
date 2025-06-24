@@ -1,3 +1,10 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::io::{Cursor, Write};

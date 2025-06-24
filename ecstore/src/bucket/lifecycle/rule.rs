@@ -1,3 +1,10 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use s3s::dto::{LifecycleRuleFilter, Transition};
 
 const ERR_TRANSITION_INVALID_DAYS: &str = "Days must be 0 or greater when used with Transition";

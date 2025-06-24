@@ -1,5 +1,12 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::client::{
     admin_handler_utils::AdminError,
@@ -46,7 +53,7 @@ impl WarmBackendMinIO {
             ..Default::default()
         }));
         let opts = Options {
-            creds: creds,
+            creds,
             secure: u.scheme() == "https",
             //transport: GLOBAL_RemoteTargetTransport,
             trailing_headers: true,

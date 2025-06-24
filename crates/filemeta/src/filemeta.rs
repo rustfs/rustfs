@@ -2009,7 +2009,7 @@ impl MetaObject {
                     panic!(
                         "Invalid Tier Object delete marker versionId {} {}",
                         fi.tier_free_version_id(),
-                        err.to_string()
+                        err
                     );
                 }
                 let vid = vid.unwrap();
@@ -2038,7 +2038,7 @@ impl MetaObject {
 
                 let aa = [tier_key, tier_obj_key, tier_obj_vid_key];
                 for (k, v) in &self.meta_sys {
-                    if aa.contains(&k) {
+                    if aa.contains(k) {
                         free_entry
                             .delete_marker
                             .as_mut()

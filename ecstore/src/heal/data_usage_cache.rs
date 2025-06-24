@@ -173,9 +173,9 @@ impl AllTierStats {
             stats.insert(
                 tier.clone(),
                 TierStats {
-                    total_size: st.total_size.clone(),
-                    num_versions: st.num_versions.clone(),
-                    num_objects: st.num_objects.clone(),
+                    total_size: st.total_size,
+                    num_versions: st.num_versions,
+                    num_objects: st.num_objects,
                 },
             );
         }

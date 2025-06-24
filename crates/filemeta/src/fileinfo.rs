@@ -228,11 +228,7 @@ impl FileInfo {
     }
 
     pub fn get_etag(&self) -> Option<String> {
-        if let Some(meta) = self.metadata.get("etag") {
-            Some(meta.clone())
-        } else {
-            None
-        }
+        self.metadata.get("etag").cloned()
     }
 
     pub fn write_quorum(&self, quorum: usize) -> usize {

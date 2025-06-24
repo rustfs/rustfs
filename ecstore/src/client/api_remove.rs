@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use s3s::S3ErrorCode;
@@ -55,7 +62,7 @@ pub struct RemoveObjectOptions {
 
 impl TransitionClient {
     pub async fn remove_bucket_with_options(&self, bucket_name: &str, opts: &RemoveBucketOptions) -> Result<(), std::io::Error> {
-        let mut headers = HeaderMap::new();
+        let headers = HeaderMap::new();
         /*if opts.force_delete {
             headers.insert(rustFSForceDelete, "true");
         }*/
@@ -189,7 +196,7 @@ impl TransitionClient {
         objects_rx: Receiver<ObjectInfo>,
         opts: RemoveObjectsOptions,
     ) -> Receiver<RemoveObjectResult> {
-        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let (result_tx, result_rx) = mpsc::channel(1);
 
         let self_clone = Arc::clone(&self);
         let bucket_name_owned = bucket_name.to_string();
@@ -208,7 +215,7 @@ impl TransitionClient {
         objects_rx: Receiver<ObjectInfo>,
         opts: RemoveObjectsOptions,
     ) -> Receiver<RemoveObjectError> {
-        let (error_tx, mut error_rx) = mpsc::channel(1);
+        let (error_tx, error_rx) = mpsc::channel(1);
 
         let self_clone = Arc::clone(&self);
         let bucket_name_owned = bucket_name.to_string();

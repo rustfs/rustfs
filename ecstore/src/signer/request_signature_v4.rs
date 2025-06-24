@@ -1,3 +1,10 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
 use http::Uri;
@@ -105,22 +112,22 @@ fn get_canonical_headers(req: &request::Builder, ignored_headers: &HashMap<Strin
 
     let mut buf = BytesMut::new();
     for k in headers {
-        buf.write_str(&k);
-        buf.write_char(':');
+        let _ = buf.write_str(&k);
+        let _ = buf.write_char(':');
         let k: &str = &k;
         match k {
             "host" => {
-                buf.write_str(&get_host_addr(&req));
-                buf.write_char('\n');
+                let _ = buf.write_str(&get_host_addr(&req));
+                let _ = buf.write_char('\n');
             }
             _ => {
                 for (idx, v) in vals[k].iter().enumerate() {
                     if idx > 0 {
-                        buf.write_char(',');
+                        let _ = buf.write_char(',');
                     }
-                    buf.write_str(&sign_v4_trim_all(v));
+                    let _ = buf.write_str(&sign_v4_trim_all(v));
                 }
-                buf.write_char('\n');
+                let _ = buf.write_char('\n');
             }
         }
     }
@@ -174,12 +181,12 @@ fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<Strin
 
 fn get_string_to_sign_v4(t: OffsetDateTime, location: &str, canonical_request: &str, service_type: &str) -> String {
     let mut string_to_sign = SIGN_V4_ALGORITHM.to_string();
-    string_to_sign.push_str("\n");
+    string_to_sign.push('\n');
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
     string_to_sign.push_str(&t.format(&format).unwrap());
-    string_to_sign.push_str("\n");
+    string_to_sign.push('\n');
     string_to_sign.push_str(&get_scope(location, t, service_type));
-    string_to_sign.push_str("\n");
+    string_to_sign.push('\n');
     string_to_sign.push_str(&hex_sha256(canonical_request.as_bytes(), |s| s.to_string()));
     string_to_sign
 }
@@ -639,18 +646,18 @@ mod tests {
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
 
-        req = pre_sign_v4(req, &access_key_id, &secret_access_key, "", &region, 86400, t);
+        req = pre_sign_v4(req, access_key_id, secret_access_key, "", region, 86400, t);
 
         let mut canonical_request = req.method_ref().unwrap().as_str().to_string();
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(req.uri_ref().unwrap().path());
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(req.uri_ref().unwrap().query().unwrap());
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(&get_canonical_headers(&req, &v4_ignored_headers));
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(&get_signed_headers(&req, &v4_ignored_headers));
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(&get_hashed_payload(&req));
         //println!("canonical_request: \n{}\n", canonical_request);
         assert_eq!(
@@ -686,18 +693,18 @@ mod tests {
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "192.168.1.11:9020".parse().unwrap());
 
-        req = pre_sign_v4(req, &access_key_id, &secret_access_key, "", &region, 86400, t);
+        req = pre_sign_v4(req, access_key_id, secret_access_key, "", region, 86400, t);
 
         let mut canonical_request = req.method_ref().unwrap().as_str().to_string();
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(req.uri_ref().unwrap().path());
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(req.uri_ref().unwrap().query().unwrap());
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(&get_canonical_headers(&req, &v4_ignored_headers));
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(&get_signed_headers(&req, &v4_ignored_headers));
-        canonical_request.push_str("\n");
+        canonical_request.push('\n');
         canonical_request.push_str(&get_hashed_payload(&req));
         //println!("canonical_request: \n{}\n", canonical_request);
         assert_eq!(

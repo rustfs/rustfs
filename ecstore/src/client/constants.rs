@@ -1,4 +1,10 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+
 use lazy_static::lazy_static;
 use std::{collections::HashMap, sync::Arc};
 use time::{format_description::FormatItem, macros::format_description};
@@ -20,6 +26,6 @@ pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const ISO8601_DATEFORMAT: &[FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
 
-const GetObjectAttributesTags: &str = "ETag,Checksum,StorageClass,ObjectSize,ObjectParts";
-const GetObjectAttributesMaxParts: i64 = 1000;
+pub const GET_OBJECT_ATTRIBUTES_TAGS: &str = "ETag,Checksum,StorageClass,ObjectSize,ObjectParts";
+pub const GET_OBJECT_ATTRIBUTES_MAX_PARTS: i64 = 1000;
 const RUSTFS_BUCKET_SOURCE_MTIME: &str = "X-RustFs-Source-Mtime";

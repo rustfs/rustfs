@@ -1,3 +1,6 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::client::{object_api_utils::extract_etag, transition_api::ReaderImpl};
@@ -3723,7 +3726,7 @@ impl SetDisks {
 
         oi.user_defined.remove(X_AMZ_RESTORE.as_str());
 
-        let version_id = oi.version_id.clone().map(|v| v.to_string());
+        let version_id = oi.version_id.map(|v| v.to_string());
         let obj = self
             .copy_object(
                 bucket,
@@ -3736,7 +3739,7 @@ impl SetDisks {
                     ..Default::default()
                 },
                 &ObjectOptions {
-                    version_id: version_id,
+                    version_id,
                     ..Default::default()
                 },
             )
@@ -4245,7 +4248,7 @@ impl StorageAPI for SetDisks {
             futures.push(async move {
                 if let Some(disk) = disk {
                     match disk
-                        .delete_version(&bucket, &object, fi.clone(), force_del_marker, DeleteOptions::default())
+                        .delete_version(bucket, object, fi.clone(), force_del_marker, DeleteOptions::default())
                         .await
                     {
                         Ok(r) => Ok(r),
@@ -4585,7 +4588,7 @@ impl StorageAPI for SetDisks {
             //defer lk.Unlock(lkctx)
         }*/
 
-        let (mut fi, mut meta_arr, mut online_disks) = self.get_object_fileinfo(&bucket, &object, &opts, true).await?;
+        let (mut fi, meta_arr, online_disks) = self.get_object_fileinfo(bucket, object, opts, true).await?;
         /*if err != nil {
             return Err(to_object_err(err, vec![bucket, object]));
         }*/
@@ -4596,7 +4599,7 @@ impl StorageAPI for SetDisks {
             return Err(to_object_err(ERR_METHOD_NOT_ALLOWED, vec![bucket, object]));
         }*/
         if !opts.mod_time.expect("err").unix_timestamp() == fi.mod_time.as_ref().expect("err").unix_timestamp()
-            || !(opts.transition.etag == extract_etag(&fi.metadata))
+            || opts.transition.etag != extract_etag(&fi.metadata)
         {
             return Err(to_object_err(Error::from(DiskError::FileNotFound), vec![bucket, object]));
         }
@@ -4622,7 +4625,7 @@ impl StorageAPI for SetDisks {
         }
         let dest_obj = dest_obj.unwrap();
 
-        let oi = ObjectInfo::from_file_info(&fi, &bucket, &object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
         let (pr, mut pw) = tokio::io::duplex(fi.erasure.block_size);
         //let h = HeaderMap::new();
@@ -4657,7 +4660,7 @@ impl StorageAPI for SetDisks {
         });
 
         let rv = tgt_client
-            .put_with_meta(&dest_obj, reader, fi.size as i64, {
+            .put_with_meta(&dest_obj, reader, fi.size, {
                 let mut m = HashMap::<String, String>::new();
                 m.insert("name".to_string(), object.to_string());
                 m
@@ -4672,7 +4675,7 @@ impl StorageAPI for SetDisks {
         fi.transition_status = TRANSITION_COMPLETE.to_string();
         fi.transitioned_objname = dest_obj;
         fi.transition_tier = opts.transition.tier.clone();
-        fi.transition_version_id = if rv == "" { None } else { Some(Uuid::parse_str(&rv)?) };
+        fi.transition_version_id = if rv.is_empty() { None } else { Some(Uuid::parse_str(&rv)?) };
         let mut event_name = EventName::ObjectTransitionComplete.as_ref();
 
         let disks = self.get_disks(0, 0).await?;
@@ -4687,7 +4690,7 @@ impl StorageAPI for SetDisks {
                     continue;
                 }
             }
-            self.add_partial(bucket, object, &opts.version_id.as_ref().expect("err"))
+            let _ = self.add_partial(bucket, object, opts.version_id.as_ref().expect("err"))
                 .await;
             break;
         }
@@ -4716,11 +4719,11 @@ impl StorageAPI for SetDisks {
             Err(rerr.unwrap())
         };
         let mut oi = ObjectInfo::default();
-        let fi = self.get_object_fileinfo(&bucket, &object, &opts, true).await;
+        let fi = self.get_object_fileinfo(bucket, object, opts, true).await;
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
-        let (mut actual_fi, _, _) = fi.unwrap();
+        let (actual_fi, _, _) = fi.unwrap();
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi);

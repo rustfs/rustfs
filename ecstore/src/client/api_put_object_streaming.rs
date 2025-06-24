@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use bytes::Bytes;
 use futures::future::join_all;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -41,7 +48,7 @@ impl TransitionClient {
         self: Arc<Self>,
         bucket_name: &str,
         object_name: &str,
-        mut reader: ReaderImpl,
+        reader: ReaderImpl,
         size: i64,
         opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
@@ -67,7 +74,7 @@ impl TransitionClient {
         &self,
         bucket_name: &str,
         object_name: &str,
-        mut reader: ReaderImpl,
+        reader: ReaderImpl,
         size: i64,
         opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
@@ -132,7 +139,7 @@ impl TransitionClient {
 
             if opts.send_content_md5 {
                 let mut md5_hasher = self.md5_hasher.lock().unwrap();
-                let mut md5_hash = md5_hasher.as_mut().expect("err");
+                let md5_hash = md5_hasher.as_mut().expect("err");
                 md5_hash.reset();
                 md5_hash.write(&buf[..length]);
                 md5_base64 = base64_encode(md5_hash.sum().as_bytes());
@@ -173,15 +180,13 @@ impl TransitionClient {
             total_uploaded_size += part_size as i64;
         }
 
-        if size > 0 {
-            if total_uploaded_size != size {
-                return Err(std::io::Error::other(err_unexpected_eof(
-                    total_uploaded_size,
-                    size,
-                    bucket_name,
-                    object_name,
-                )));
-            }
+        if size > 0 && total_uploaded_size != size {
+            return Err(std::io::Error::other(err_unexpected_eof(
+                total_uploaded_size,
+                size,
+                bucket_name,
+                object_name,
+            )));
         }
 
         let mut compl_multipart_upload = CompleteMultipartUpload::default();
@@ -242,7 +247,7 @@ impl TransitionClient {
         opts.user_metadata.remove("X-Amz-Checksum-Algorithm");
 
         let mut total_uploaded_size: i64 = 0;
-        let mut parts_info = Arc::new(RwLock::new(HashMap::<i64, ObjectPart>::new()));
+        let parts_info = Arc::new(RwLock::new(HashMap::<i64, ObjectPart>::new()));
 
         let n_buffers = opts.num_threads;
         let (bufs_tx, mut bufs_rx) = mpsc::channel(n_buffers as usize);
@@ -315,7 +320,7 @@ impl TransitionClient {
 
                 if opts.send_content_md5 {
                     let mut md5_hasher = clone_self.md5_hasher.lock().unwrap();
-                    let mut md5_hash = md5_hasher.as_mut().expect("err");
+                    let md5_hash = md5_hasher.as_mut().expect("err");
                     md5_hash.write(&buf[..length]);
                     md5_base64 = base64_encode(md5_hash.sum().as_bytes());
                 }
@@ -357,7 +362,7 @@ impl TransitionClient {
 
         let mut compl_multipart_upload = CompleteMultipartUpload::default();
 
-        let mut part_number: i64 = total_parts_count;
+        let part_number: i64 = total_parts_count;
         let mut all_parts = Vec::<ObjectPart>::with_capacity(parts_info.read().unwrap().len());
         for i in 1..part_number {
             let part = parts_info.read().unwrap()[&i].clone();
@@ -396,7 +401,7 @@ impl TransitionClient {
         &self,
         bucket_name: &str,
         object_name: &str,
-        mut reader: ReaderImpl,
+        reader: ReaderImpl,
         size: i64,
         opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
@@ -405,7 +410,7 @@ impl TransitionClient {
             opts.send_content_md5 = false;
         }
 
-        let mut md5_base64: String = "".to_string();
+        let md5_base64: String = "".to_string();
         let progress_reader = reader; //newHook(reader, opts.progress);
 
         self.put_object_do(bucket_name, object_name, progress_reader, &md5_base64, "", size, &opts)
@@ -492,7 +497,7 @@ impl TransitionClient {
             } else {
                 "".to_string()
             },
-            size: size,
+            size,
             expiration: exp_time,
             expiration_rule_id: rule_id,
             checksum_crc32: if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) {

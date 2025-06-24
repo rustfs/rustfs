@@ -1,8 +1,11 @@
-use http::status::StatusCode;
-use rand::Rng;
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::warn;
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]

@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde::{de::Deserializer, ser::Serializer};
@@ -7,7 +14,7 @@ use std::fmt::Display;
 use s3s::Body;
 use s3s::S3ErrorCode;
 
-const REPORT_ISSUE: &str = "Please report this issue at https://github.com/rustfs/rustfs/issues.";
+const _REPORT_ISSUE: &str = "Please report this issue at https://github.com/rustfs/rustfs/issues.";
 
 #[derive(Serialize, Deserialize, Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[serde(default, rename_all = "PascalCase")]
@@ -26,7 +33,7 @@ pub struct ErrorResponse {
     pub status_code: StatusCode,
 }
 
-fn serialize_code<S>(data: &S3ErrorCode, s: S) -> Result<S::Ok, S::Error>
+fn serialize_code<S>(_data: &S3ErrorCode, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {

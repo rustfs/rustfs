@@ -115,7 +115,7 @@ pub fn must_get_local_ips() -> std::io::Result<Vec<IpAddr>> {
     }
 }
 
-pub fn get_default_location(u: Url, region_override: &str) -> String {
+pub fn get_default_location(_u: Url, _region_override: &str) -> String {
     todo!();
 }
 
@@ -136,7 +136,7 @@ pub fn get_endpoint_url(endpoint: &str, secure: bool) -> Result<Url, std::io::Er
 
 pub const DEFAULT_DIAL_TIMEOUT: i64 = 5;
 
-pub fn new_remotetarget_http_transport(insecure: bool) -> Builder<TokioExecutor> {
+pub fn new_remotetarget_http_transport(_insecure: bool) -> Builder<TokioExecutor> {
     todo!();
 }
 
@@ -255,11 +255,8 @@ impl TryFrom<String> for XHost {
     }
 }
 
-/// parses the address string, process the ":port" format for double-stack binding,
-/// and resolve the host name or IP address. If the port is 0, an available port is assigned.
 pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> {
     let resolved_addr: SocketAddr = if let Some(port) = addr_str.strip_prefix(":") {
-        // Process the ":port" format for double stack binding
         let port_str = port;
         let port: u16 = port_str
             .parse()
@@ -269,10 +266,8 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
         } else {
             port
         };
-        // Using IPv6 without address specified [::], it should handle both IPv4 and IPv6
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), final_port)
     } else {
-        // Use existing logic to handle regular address formats
         let mut addr = check_local_server_addr(addr_str)?; // assume check_local_server_addr is available here
         if addr.port() == 0 {
             addr.set_port(get_available_port());

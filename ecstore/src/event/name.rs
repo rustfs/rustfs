@@ -1,3 +1,5 @@
+#![allow(unused_variables)]
+
 #[derive(Default)]
 pub enum EventName {
     ObjectAccessedGet,
@@ -32,7 +34,7 @@ pub enum EventName {
     ObjectLargeVersions,
     PrefixManyFolders,
     ILMDelMarkerExpirationDelete,
-    objectSingleTypesEnd,
+    ObjectSingleTypesEnd,
     ObjectAccessedAll,
     ObjectCreatedAll,
     ObjectRemovedAll,

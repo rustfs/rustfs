@@ -12,7 +12,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::sync::{Mutex, RwLock};
-use tracing::debug;
 
 use super::data_scanner::CurrentScannerCycle;
 use crate::bucket::lifecycle::lifecycle;

@@ -1,22 +1,16 @@
-use bytes::{Bytes, BytesMut};
-use futures::prelude::*;
-use futures::task;
-use http::HeaderMap;
-use http::Uri;
-use http::header::TRAILER;
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use http::request::{self, Request};
-use hyper::Method;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
-use std::fmt::Write;
-use std::pin::Pin;
-use std::sync::Mutex;
-use stdx::str::StrExt;
-use time::{OffsetDateTime, format_description, macros::datetime, macros::format_description};
-use tracing::{debug, error, info, warn};
+use time::{OffsetDateTime, macros::format_description};
 
 use super::request_signature_v4::{SERVICE_TYPE_S3, get_scope, get_signature, get_signing_key};
-use crate::client::constants::UNSIGNED_PAYLOAD;
 use rustfs_utils::{
     crypto::{hex, hex_sha256, hex_sha256_chunk, hmac_sha256},
     hash::EMPTY_STRING_SHA256_HASH,

@@ -23,7 +23,7 @@ use protos::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 use time::OffsetDateTime;
 use tonic::Request;

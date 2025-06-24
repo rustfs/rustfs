@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use s3s::S3ErrorCode;
@@ -104,8 +111,8 @@ impl TransitionClient {
             //let rd = newHook(bytes.NewReader(buf[..length]), opts.progress);
             let rd = Bytes::from(buf.clone());
 
-            let mut md5_base64: String;
-            let mut sha256_hex: String;
+            let md5_base64: String;
+            let sha256_hex: String;
 
             //if hash_sums["md5"] != nil {
             md5_base64 = base64_encode(&hash_sums["md5"]);
@@ -166,7 +173,7 @@ impl TransitionClient {
         }
 
         compl_multipart_upload.parts.sort();
-        let mut opts = PutObjectOptions {
+        let opts = PutObjectOptions {
             //server_side_encryption: opts.server_side_encryption,
             auto_checksum: opts.auto_checksum,
             ..Default::default()
@@ -199,7 +206,7 @@ impl TransitionClient {
             url_values.insert("versionId".to_string(), opts.internal.source_version_id.clone());
         }
 
-        let mut custom_header = opts.header();
+        let custom_header = opts.header();
 
         let mut req_metadata = RequestMetadata {
             bucket_name: bucket_name.to_string(),
@@ -339,7 +346,7 @@ impl TransitionClient {
         url_values.insert("uploadId".to_string(), upload_id.to_string());
         let complete_multipart_upload_bytes = complete.marshal_msg()?.as_bytes().to_vec();
 
-        let mut headers = opts.header();
+        let headers = opts.header();
 
         let complete_multipart_upload_buffer = Bytes::from(complete_multipart_upload_bytes);
         let mut req_metadata = RequestMetadata {

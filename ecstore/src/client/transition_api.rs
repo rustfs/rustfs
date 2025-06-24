@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use bytes::Bytes;
 use futures::Future;
 use http::{HeaderMap, HeaderName};
@@ -300,7 +307,7 @@ impl TransitionClient {
             return Err(std::io::Error::other(s));
         }
 
-        let mut retryable: bool;
+        let retryable: bool;
         //let mut body_seeker: BufferReader;
         let mut req_retry = self.max_retries;
         let mut resp: http::Response<Body>;
@@ -348,11 +355,9 @@ impl TransitionClient {
                                 bucket_loc_cache.set(&metadata.bucket_name, &err_response.region);
                                 //continue;
                             }
-                        } else {
-                            if err_response.region != metadata.bucket_location {
-                                metadata.bucket_location = err_response.region.clone();
-                                //continue;
-                            }
+                        } else if err_response.region != metadata.bucket_location {
+                            metadata.bucket_location = err_response.region.clone();
+                            //continue;
                         }
                         return Err(std::io::Error::other(err_response));
                     }
@@ -374,10 +379,8 @@ impl TransitionClient {
         metadata: &mut RequestMetadata,
     ) -> Result<http::Request<Body>, std::io::Error> {
         let location = metadata.bucket_location.clone();
-        if location == "" {
-            if metadata.bucket_name != "" {
-                let location = self.get_bucket_location(&metadata.bucket_name).await?;
-            }
+        if location == "" && metadata.bucket_name != "" {
+            let location = self.get_bucket_location(&metadata.bucket_name).await?;
         }
 
         let is_makebucket = metadata.object_name == "" && method == http::Method::PUT && metadata.query_values.len() == 0;
@@ -538,7 +541,7 @@ impl TransitionClient {
     }
 
     pub fn set_user_agent(&self, req: &mut Builder) {
-        let mut headers = req.headers_mut().expect("err");
+        let headers = req.headers_mut().expect("err");
         headers.insert("User-Agent", C_USER_AGENT.parse().expect("err"));
         /*if self.app_info.app_name != "" && self.app_info.app_version != "" {
             headers.insert("User-Agent", C_USER_AGENT+" "+self.app_info.app_name+"/"+self.app_info.app_version);
@@ -771,7 +774,7 @@ impl TransitionCore {
             part_number: part_id,
             md5_base64: opts.md5_base64,
             sha256_hex: opts.sha256_hex,
-            size: size,
+            size,
             //sse:           opts.sse,
             stream_sha256: !opts.disable_content_sha256,
             custom_header: opts.custom_header,

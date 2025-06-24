@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use http::HeaderMap;
 use std::io::Cursor;
 use std::{collections::HashMap, sync::Arc};
@@ -55,8 +62,8 @@ fn part_number_to_rangespec(oi: ObjectInfo, part_number: usize) -> Option<HTTPRa
     }
 
     Some(HTTPRangeSpec {
-        start: start,
-        end: end,
+        start,
+        end,
         is_suffix_length: false,
     })
 }

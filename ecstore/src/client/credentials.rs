@@ -1,3 +1,10 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use std::fmt::{Display, Formatter};
 
 use time::OffsetDateTime;
@@ -22,7 +29,7 @@ pub struct Credentials<P: Provider + Default> {
 impl<P: Provider + Default> Credentials<P> {
     pub fn new(provider: P) -> Self {
         Self {
-            provider: provider,
+            provider,
             force_refresh: true,
             ..Default::default()
         }

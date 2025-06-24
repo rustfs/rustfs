@@ -1,6 +1,5 @@
 use crate::client::admin_handler_utils::AdminError;
 use http::status::StatusCode;
-use tracing::warn;
 
 pub const ERR_TIER_ALREADY_EXISTS: AdminError = AdminError {
     code: "XRustFSAdminTierAlreadyExists",

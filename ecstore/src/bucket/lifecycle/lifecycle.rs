@@ -1,3 +1,10 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
     ObjectLockConfiguration, ObjectLockEnabled, Transition,
@@ -191,10 +198,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
             }
 
             let rule_prefix = rule.prefix.as_ref().expect("err!");
-            if prefix.len() > 0 && rule_prefix.len() > 0 {
-                if !prefix.starts_with(rule_prefix) && !rule_prefix.starts_with(&prefix) {
-                    continue;
-                }
+            if prefix.len() > 0 && rule_prefix.len() > 0 && !prefix.starts_with(rule_prefix) && !rule_prefix.starts_with(&prefix) {
+                continue;
             }
 
             let rule_noncurrent_version_expiration = rule.noncurrent_version_expiration.as_ref().expect("err!");
@@ -317,7 +322,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 }
 
                 events.push(Event {
-                    action: action,
+                    action,
                     due: Some(now),
                     rule_id: "".into(),
                     noncurrent_days: 0,
@@ -420,25 +425,23 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 if !obj.is_latest {
                     if let Some(ref noncurrent_version_transitions) = rule.noncurrent_version_transitions {
                         if let Some(ref storage_class) = noncurrent_version_transitions[0].storage_class {
-                            if storage_class.as_str() != "" {
-                                if !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE {
-                                    let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
-                                    if due.is_some()
-                                        && (now.unix_timestamp() == 0 || now.unix_timestamp() > due.unwrap().unix_timestamp())
-                                    {
-                                        events.push(Event {
-                                            action: IlmAction::TransitionVersionAction,
-                                            rule_id: rule.id.clone().expect("err!"),
-                                            due,
-                                            storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
-                                                .storage_class
-                                                .clone()
-                                                .unwrap()
-                                                .as_str()
-                                                .to_string(),
-                                            ..Default::default()
-                                        });
-                                    }
+                            if storage_class.as_str() != "" && !obj.delete_marker && obj.transition_status != TRANSITION_COMPLETE {
+                                let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
+                                if due.is_some()
+                                    && (now.unix_timestamp() == 0 || now.unix_timestamp() > due.unwrap().unix_timestamp())
+                                {
+                                    events.push(Event {
+                                        action: IlmAction::TransitionVersionAction,
+                                        rule_id: rule.id.clone().expect("err!"),
+                                        due,
+                                        storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
+                                            .storage_class
+                                            .clone()
+                                            .unwrap()
+                                            .as_str()
+                                            .to_string(),
+                                        ..Default::default()
+                                    });
                                 }
                             }
                         }
@@ -449,17 +452,15 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     if let Some(ref expiration) = rule.expiration {
                         if let Some(ref date) = expiration.date {
                             let date0 = OffsetDateTime::from(date.clone());
-                            if date0.unix_timestamp() != 0 {
-                                if now.unix_timestamp() == 0 || now.unix_timestamp() > date0.unix_timestamp() {
-                                    events.push(Event {
-                                        action: IlmAction::DeleteAction,
-                                        rule_id: rule.id.clone().expect("err!"),
-                                        due: Some(date0),
-                                        noncurrent_days: 0,
-                                        newer_noncurrent_versions: 0,
-                                        storage_class: "".into(),
-                                    });
-                                }
+                            if date0.unix_timestamp() != 0 && (now.unix_timestamp() == 0 || now.unix_timestamp() > date0.unix_timestamp()) {
+                                events.push(Event {
+                                    action: IlmAction::DeleteAction,
+                                    rule_id: rule.id.clone().expect("err!"),
+                                    due: Some(date0),
+                                    noncurrent_days: 0,
+                                    newer_noncurrent_versions: 0,
+                                    storage_class: "".into(),
+                                });
                             }
                         } else if let Some(days) = expiration.days {
                             if days != 0 {

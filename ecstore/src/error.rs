@@ -737,7 +737,7 @@ pub fn to_object_err(err: Error, params: Vec<&str>) -> Error {
     }
 }
 
-pub fn is_network_or_host_down(err: &str, expect_timeouts: bool) -> bool {
+pub fn is_network_or_host_down(err: &str, _expect_timeouts: bool) -> bool {
     err.contains("Connection closed by foreign host")
         || err.contains("TLS handshake timeout")
         || err.contains("i/o timeout")
@@ -809,7 +809,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         return std::io::Error::other(ObjectApiError::BackendDown(format!("{}", err)));
     }
 
-    let mut err_ = std::io::Error::other(err.to_string());
+    let err_ = std::io::Error::other(err.to_string());
     let r_err = err;
     let mut err = err_;
     let bucket = bucket.to_string();
@@ -908,8 +908,8 @@ pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
         StorageError::MethodNotAllowed => S3Error::with_message(
             S3ErrorCode::MethodNotAllowed,
             ObjectApiError::MethodNotAllowed(GenericError {
-                bucket: bucket,
-                object: object,
+                bucket,
+                object,
                 ..Default::default()
             })
             .to_string(),

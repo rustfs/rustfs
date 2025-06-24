@@ -1,4 +1,11 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::{collections::HashMap, sync::Arc};
@@ -206,10 +213,8 @@ impl PutObjectOptions {
                 if let Ok(header_name) = HeaderName::from_bytes(k.as_bytes()) {
                     header.insert(header_name, HeaderValue::from_str(&v).unwrap());
                 }
-            } else {
-                if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{}", k).as_bytes()) {
-                    header.insert(header_name, HeaderValue::from_str(&v).unwrap());
-                }
+            } else if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{}", k).as_bytes()) {
+                header.insert(header_name, HeaderValue::from_str(&v).unwrap());
             }
         }
 
@@ -239,7 +244,7 @@ impl TransitionClient {
         self: Arc<Self>,
         bucket_name: &str,
         object_name: &str,
-        mut reader: ReaderImpl,
+        reader: ReaderImpl,
         object_size: i64,
         opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
@@ -255,7 +260,7 @@ impl TransitionClient {
         self: Arc<Self>,
         bucket_name: &str,
         object_name: &str,
-        mut reader: ReaderImpl,
+        reader: ReaderImpl,
         size: i64,
         opts: &PutObjectOptions,
     ) -> Result<UploadInfo, std::io::Error> {
@@ -346,7 +351,7 @@ impl TransitionClient {
             let mut md5_base64: String = "".to_string();
             if opts.send_content_md5 {
                 let mut md5_hasher = self.md5_hasher.lock().unwrap();
-                let mut hash = md5_hasher.as_mut().expect("err");
+                let hash = md5_hasher.as_mut().expect("err");
                 hash.write(&buf[..length]);
                 md5_base64 = base64_encode(hash.sum().as_bytes());
             } else {
@@ -406,7 +411,7 @@ impl TransitionClient {
 
         compl_multipart_upload.parts.sort();
 
-        let mut opts = PutObjectOptions {
+        let opts = PutObjectOptions {
             //server_side_encryption: opts.server_side_encryption,
             auto_checksum: opts.auto_checksum,
             ..Default::default()

@@ -1,7 +1,13 @@
 #![allow(clippy::map_entry)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
 use lazy_static::lazy_static;
-use std::ops::{BitAnd, BitOr};
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use crate::client::{api_put_object::PutObjectOptions, api_s3_datatypes::ObjectPart};
 use crate::{disk::DiskAPI, store_api::GetObjectReader};
@@ -206,7 +212,7 @@ impl ChecksumMode {
             }
         });
         let c = self.base();
-        let mut crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len() as usize);
+        let crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len() as usize);
         let mut h = self.hasher()?;
         h.write(&crc_bytes);
         Ok(Checksum {
