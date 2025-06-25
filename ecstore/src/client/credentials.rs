@@ -84,7 +84,7 @@ pub struct CredContext {
     pub endpoint: String,
 }
 
-trait Provider {
+pub trait Provider {
     fn retrieve(&self) -> Value;
     fn retrieve_with_cred_context(&self, _: CredContext) -> Value;
     fn is_expired(&self) -> bool;

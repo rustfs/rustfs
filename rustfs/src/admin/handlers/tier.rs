@@ -1,20 +1,18 @@
-use std::str::from_utf8;
+#![allow(unused_variables, unused_mut, unused_must_use)]
 
 use http::{HeaderMap, StatusCode};
 //use iam::get_global_action_cred;
 use matchit::Params;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
-use serde::Deserialize;
 use serde_urlencoded::from_bytes;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::{
-    admin::{router::Operation, utils::has_space_be},
+    admin::router::Operation,
     auth::{check_key_valid, get_session_token},
 };
-use crypto::{decrypt_data, encrypt_data};
+
 use ecstore::{
-    client::admin_handler_utils::AdminError,
     config::storageclass,
     global::GLOBAL_TierConfigMgr,
     tier::{
@@ -28,13 +26,30 @@ use ecstore::{
     },
 };
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {
     #[serde(rename = "accessKey")]
+    #[allow(dead_code)]
     pub access_key: Option<String>,
+    #[allow(dead_code)]
     pub status: Option<String>,
+    #[serde(rename = "secretKey")]
+    #[allow(dead_code)]
+    pub secret_key: Option<String>,
+    #[serde(rename = "serviceName")]
+    #[allow(dead_code)]
+    pub service_name: Option<String>,
+    #[serde(rename = "sessionToken")]
+    #[allow(dead_code)]
+    pub session_token: Option<String>,
     pub tier: Option<String>,
-    pub force: String,
+    #[serde(rename = "tierName")]
+    #[allow(dead_code)]
+    pub tier_name: Option<String>,
+    #[serde(rename = "tierType")]
+    #[allow(dead_code)]
+    pub tier_type: Option<String>,
+    pub force: Option<String>,
 }
 
 pub struct AddTier {}
@@ -86,9 +101,12 @@ impl Operation for AddTier {
         debug!("add tier args {:?}", args);
 
         let mut force: bool = false;
-        let force_str = query.force;
-        if force_str != "" {
-            force = force_str.parse().unwrap();
+        let force_str = query.force.clone().unwrap_or_default();
+        if !force_str.is_empty() {
+            force = force_str.parse().map_err(|e| {
+                warn!("parse force failed, e: {:?}", e);
+                s3_error!(InvalidRequest, "parse force failed")
+            })?;
         }
         match args.name.as_str() {
             storageclass::STANDARD | storageclass::RRS => {
@@ -221,9 +239,10 @@ impl Operation for EditTier {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct BucketQuery {
     #[serde(rename = "bucket")]
+    #[allow(dead_code)]
     pub bucket: String,
 }
 pub struct ListTiers {}
@@ -281,9 +300,12 @@ impl Operation for RemoveTier {
         //    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
 
         let mut force: bool = false;
-        let force_str = query.force;
-        if force_str != "" {
-            force = force_str.parse().unwrap();
+        let force_str = query.force.clone().unwrap_or_default();
+        if !force_str.is_empty() {
+            force = force_str.parse().map_err(|e| {
+                warn!("parse force failed, e: {:?}", e);
+                s3_error!(InvalidRequest, "parse force failed")
+            })?;
         }
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
@@ -346,7 +368,7 @@ impl Operation for VerifyTier {
         //    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "get_global_action_cred failed"))?;
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
-        tier_config_mgr.verify(&query.tier.unwrap());
+        tier_config_mgr.verify(&query.tier.unwrap()).await;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());

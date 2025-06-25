@@ -27,7 +27,7 @@ use crate::{
 use reader::hasher::{sum_md5_base64, sum_sha256_hex};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
-struct RemoveBucketOptions {
+pub struct RemoveBucketOptions {
     forced_elete: bool,
 }
 
@@ -426,7 +426,7 @@ impl TransitionClient {
 }
 
 #[derive(Debug, Default)]
-struct RemoveObjectError {
+pub struct RemoveObjectError {
     object_name: String,
     version_id: String,
     err: Option<std::io::Error>,

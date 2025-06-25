@@ -163,9 +163,26 @@ fn get_signed_headers(req: &request::Builder, ignored_headers: &HashMap<String, 
 fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<String, bool>, hashed_payload: &str) -> String {
     let mut canonical_query_string = "".to_string();
     if let Some(q) = req.uri_ref().unwrap().query() {
-        let mut query = q.split('&').map(|h| h.to_string()).collect::<Vec<String>>();
-        query.sort();
-        canonical_query_string = query.join("&");
+        // Parse query string into key-value pairs
+        let mut query_params: Vec<(String, String)> = Vec::new();
+        for param in q.split('&') {
+            if let Some((key, value)) = param.split_once('=') {
+                query_params.push((key.to_string(), value.to_string()));
+            } else {
+                query_params.push((param.to_string(), "".to_string()));
+            }
+        }
+
+        // Sort by key name
+        query_params.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Build canonical query string
+        let sorted_params: Vec<String> = query_params
+            .iter()
+            .map(|(k, v)| if v.is_empty() { k.clone() } else { format!("{}={}", k, v) })
+            .collect();
+
+        canonical_query_string = sorted_params.join("&");
         canonical_query_string = canonical_query_string.replace("+", "%20");
     }
 
@@ -665,7 +682,7 @@ mod tests {
             concat!(
                 "GET\n",
                 "/test.txt\n",
-                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z&X-Amz-Expires=0000086400&X-Amz-SignedHeaders=host&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404\n",
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z&X-Amz-Expires=0000086400&X-Amz-SignedHeaders=host&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=98f1c9f47b39a4c40662680a9b029b046b7da5542c2e35d67edb8ff18d2ccf5c\n",
                 "host:examplebucket.s3.amazonaws.com\n",
                 "\n",
                 "host\n",
@@ -712,7 +729,7 @@ mod tests {
             concat!(
                 "GET\n",
                 "/mblock2/test.txt\n",
-                "delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z&X-Amz-Expires=0000086400&X-Amz-SignedHeaders=host&X-Amz-Credential=rustfsadmin%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=e4af975e4a7e2c0449451740c7e9a425123681d2a8830bfb188789ea19618b20\n",
+                "delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20130524T000000Z&X-Amz-Expires=0000086400&X-Amz-SignedHeaders=host&X-Amz-Credential=rustfsadmin%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=30e6b8c920512f0d12cba77a7c39612bff7f5f8148f4dc35cdd18f4b15a12477\n",
                 "host:192.168.1.11:9020\n",
                 "\n",
                 "host\n",

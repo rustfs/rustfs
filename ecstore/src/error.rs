@@ -386,9 +386,9 @@ impl Clone for StorageError {
             // StorageError::InsufficientReadQuorum => StorageError::InsufficientReadQuorum,
             // StorageError::InsufficientWriteQuorum => StorageError::InsufficientWriteQuorum,
             StorageError::DecommissionNotStarted => StorageError::DecommissionNotStarted,
-            StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
-            StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(*a, b.clone(), c.clone()),
+            StorageError::DoneForNow => StorageError::DoneForNow,
+            StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageError::NotFirstDisk,
@@ -795,7 +795,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
     let mut bucket = "";
     let mut object = "";
     let mut version_id = "";
-    if params.len() >= 1 {
+    if !params.is_empty() {
         bucket = params[0];
     }
     if params.len() >= 2 {
@@ -809,9 +809,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         return std::io::Error::other(ObjectApiError::BackendDown(format!("{}", err)));
     }
 
-    let err_ = std::io::Error::other(err.to_string());
     let r_err = err;
-    let mut err = err_;
     let bucket = bucket.to_string();
     let object = object.to_string();
     let version_id = version_id.to_string();
@@ -832,75 +830,61 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         /*S3ErrorCode::BucketAlreadyOwnedByYou => {
             err = Error::from(StorageError::BucketAlreadyOwnedByYou);
         }*/
-        S3ErrorCode::BucketNotEmpty => {
-            err = std::io::Error::other(StorageError::BucketNotEmpty("".to_string()).to_string());
-        }
+        S3ErrorCode::BucketNotEmpty => std::io::Error::other(StorageError::BucketNotEmpty("".to_string()).to_string()),
         /*S3ErrorCode::NoSuchBucketPolicy => {
             err = Error::from(StorageError::BucketPolicyNotFound);
         }*/
         /*S3ErrorCode::NoSuchLifecycleConfiguration => {
             err = Error::from(StorageError::BucketLifecycleNotFound);
         }*/
-        S3ErrorCode::InvalidBucketName => {
-            err = std::io::Error::other(StorageError::BucketNameInvalid(bucket));
-        }
+        S3ErrorCode::InvalidBucketName => std::io::Error::other(StorageError::BucketNameInvalid(bucket)),
         S3ErrorCode::InvalidPart => {
-            err = std::io::Error::other(StorageError::InvalidPart(0, bucket, object /* , version_id */));
+            std::io::Error::other(StorageError::InvalidPart(0, bucket, object /* , version_id */))
         }
-        S3ErrorCode::NoSuchBucket => {
-            err = std::io::Error::other(StorageError::BucketNotFound(bucket));
-        }
+        S3ErrorCode::NoSuchBucket => std::io::Error::other(StorageError::BucketNotFound(bucket)),
         S3ErrorCode::NoSuchKey => {
-            if object != "" {
-                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object));
+            if !object.is_empty() {
+                std::io::Error::other(StorageError::ObjectNotFound(bucket, object))
             } else {
-                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
+                std::io::Error::other(StorageError::BucketNotFound(bucket))
             }
         }
         S3ErrorCode::NoSuchVersion => {
-            if object != "" {
-                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object)); //, version_id);
+            if !object.is_empty() {
+                std::io::Error::other(StorageError::ObjectNotFound(bucket, object)) //, version_id);
             } else {
-                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
+                std::io::Error::other(StorageError::BucketNotFound(bucket))
             }
         }
         /*S3ErrorCode::XRustFsInvalidObjectName => {
             err = Error::from(StorageError::ObjectNameInvalid(bucket, object));
         }*/
-        S3ErrorCode::AccessDenied => {
-            err = std::io::Error::other(StorageError::PrefixAccessDenied(bucket, object));
-        }
+        S3ErrorCode::AccessDenied => std::io::Error::other(StorageError::PrefixAccessDenied(bucket, object)),
         /*S3ErrorCode::XAmzContentSHA256Mismatch => {
             err = hash.SHA256Mismatch{};
         }*/
-        S3ErrorCode::NoSuchUpload => {
-            err = std::io::Error::other(StorageError::InvalidUploadID(bucket, object, version_id));
-        }
+        S3ErrorCode::NoSuchUpload => std::io::Error::other(StorageError::InvalidUploadID(bucket, object, version_id)),
         /*S3ErrorCode::EntityTooSmall => {
             err = std::io::Error::other(StorageError::PartTooSmall);
         }*/
         /*S3ErrorCode::ReplicationPermissionCheck => {
             err = std::io::Error::other(StorageError::ReplicationPermissionCheck);
         }*/
-        _ => {
-            err = std::io::Error::other("err");
-        }
+        _ => std::io::Error::other("err"),
     }
-
-    err
 }
 
 pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
     let storage_err = &err;
     let mut bucket: String = "".to_string();
     let mut object: String = "".to_string();
-    if params.len() >= 1 {
+    if !params.is_empty() {
         bucket = params[0].to_string();
     }
     if params.len() >= 2 {
         object = decode_dir_object(params[1]);
     }
-    return match storage_err {
+    match storage_err {
         /*StorageError::NotImplemented => s3_error!(NotImplemented),
         StorageError::InvalidArgument(bucket, object, version_id) => {
             s3_error!(InvalidArgument, "Invalid arguments provided for {}/{}-{}", bucket, object, version_id)
@@ -982,7 +966,7 @@ pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
         }
         StorageError::DoneForNow => s3_error!(InternalError, "DoneForNow"),*/
         _ => s3s::S3Error::with_message(S3ErrorCode::Custom("err".into()), err.to_string()),
-    };
+    }
 }
 
 #[cfg(test)]

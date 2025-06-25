@@ -3786,10 +3786,7 @@ impl SetDisks {
                 },
             )
             .await;
-        if let Err(err) = obj {
-            //storagelogif(ctx, fmt.Errorf("Unable to update transition restore metadata for %s/%s(%s): %s", bucket, object, oi.VersionID, err))
-            return Err(err);
-        }
+        obj?;
         Ok(())
     }
 }

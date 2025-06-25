@@ -18,7 +18,7 @@ use chrono::Utc;
 use datafusion::arrow::csv::WriterBuilder as CsvWriterBuilder;
 use datafusion::arrow::json::WriterBuilder as JsonWriterBuilder;
 use datafusion::arrow::json::writer::JsonArray;
-use ecstore::bucket::error::BucketMetadataError;
+
 use ecstore::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 use ecstore::bucket::metadata::BUCKET_NOTIFICATION_CONFIG;
 use ecstore::bucket::metadata::BUCKET_POLICY_CONFIG;
@@ -56,8 +56,7 @@ use ecstore::store_api::PutObjReader;
 use ecstore::store_api::StorageAPI;
 // use ecstore::store_api::RESERVED_METADATA_PREFIX;
 use ecstore::bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier;
-use futures::pin_mut;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use policy::auth;
@@ -102,10 +101,7 @@ use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
-use ecstore::bucket::{
-    lifecycle::{bucket_lifecycle_ops::ERR_INVALID_STORAGECLASS, lifecycle::Lifecycle},
-    object_lock::objectlock_sys::BucketObjectLockSys,
-};
+use ecstore::bucket::lifecycle::lifecycle::Lifecycle;
 
 macro_rules! try_ {
     ($result:expr) => {
@@ -1733,18 +1729,12 @@ impl S3 for FS {
 
         if let Err(err) = input_cfg.validate(&rcfg).await {
             //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), "bucket lock validate failed."));
-            return Err(S3Error::with_message(
-                S3ErrorCode::Custom("ValidateFailed".into()),
-                format!("{}", err.to_string()),
-            ));
+            return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
         }
 
         if let Err(err) = validate_transition_tier(&input_cfg).await {
             //warn!("lifecycle_configuration add failed, err: {:?}", err);
-            return Err(S3Error::with_message(
-                S3ErrorCode::Custom("CustomError".into()),
-                format!("{}", err.to_string()),
-            ));
+            return Err(S3Error::with_message(S3ErrorCode::Custom("CustomError".into()), err.to_string()));
         }
 
         let data = try_!(serialize(&input_cfg));

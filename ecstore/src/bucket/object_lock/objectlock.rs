@@ -9,36 +9,36 @@ use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OB
 //const AMZ_OBJECTLOCK_MODE: &str                  = "X-Amz-Object-Lock-Mode";
 //const AMZ_OBJECTLOCK_LEGALHOLD: &str             = "X-Amz-Object-Lock-Legal-Hold";
 
-const ERR_MALFORMED_BUCKET_OBJECT_CONFIG: &str = "invalid bucket object lock config";
-const ERR_INVALID_RETENTION_DATE: &str = "date must be provided in ISO 8601 format";
-const ERR_PAST_OBJECTLOCK_RETAIN_DATE: &str = "the retain until date must be in the future";
-const ERR_UNKNOWN_WORMMODE_DIRECTIVE: &str = "unknown WORM mode directive";
-const ERR_OBJECTLOCK_MISSING_CONTENT_MD5: &str =
-    "content-MD5 HTTP header is required for Put Object requests with Object Lock parameters";
-const ERR_OBJECTLOCK_INVALID_HEADERS: &str =
-    "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
-const ERR_MALFORMED_XML: &str = "the XML you provided was not well-formed or did not validate against our published schema";
+// Commented out unused constants to avoid dead code warnings
+// const ERR_MALFORMED_BUCKET_OBJECT_CONFIG: &str = "invalid bucket object lock config";
+// const ERR_INVALID_RETENTION_DATE: &str = "date must be provided in ISO 8601 format";
+// const ERR_PAST_OBJECTLOCK_RETAIN_DATE: &str = "the retain until date must be in the future";
+// const ERR_UNKNOWN_WORMMODE_DIRECTIVE: &str = "unknown WORM mode directive";
+// const ERR_OBJECTLOCK_MISSING_CONTENT_MD5: &str =
+//     "content-MD5 HTTP header is required for Put Object requests with Object Lock parameters";
+// const ERR_OBJECTLOCK_INVALID_HEADERS: &str =
+//     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
+// const ERR_MALFORMED_XML: &str = "the XML you provided was not well-formed or did not validate against our published schema";
 
 pub fn utc_now_ntp() -> OffsetDateTime {
-    return OffsetDateTime::now_utc();
+    OffsetDateTime::now_utc()
 }
 
 pub fn get_object_retention_meta(meta: HashMap<String, String>) -> ObjectLockRetention {
-    let mode: ObjectLockRetentionMode;
     let mut retain_until_date: Date = Date::from(OffsetDateTime::UNIX_EPOCH);
 
     let mut mode_str = meta.get(X_AMZ_OBJECT_LOCK_MODE.as_str().to_lowercase().as_str());
     if mode_str.is_none() {
         mode_str = Some(&meta[X_AMZ_OBJECT_LOCK_MODE.as_str()]);
     }
-    if let Some(mode_str) = mode_str {
-        mode = parse_ret_mode(mode_str.as_str());
+    let mode = if let Some(mode_str) = mode_str {
+        parse_ret_mode(mode_str.as_str())
     } else {
         return ObjectLockRetention {
             mode: None,
             retain_until_date: None,
         };
-    }
+    };
 
     let mut till_str = meta.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_lowercase().as_str());
     if till_str.is_none() {
@@ -70,29 +70,17 @@ pub fn get_object_legalhold_meta(meta: HashMap<String, String>) -> ObjectLockLeg
 }
 
 pub fn parse_ret_mode(mode_str: &str) -> ObjectLockRetentionMode {
-    let mode;
     match mode_str.to_uppercase().as_str() {
-        "GOVERNANCE" => {
-            mode = ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE);
-        }
-        "COMPLIANCE" => {
-            mode = ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE);
-        }
+        "GOVERNANCE" => ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE),
+        "COMPLIANCE" => ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE),
         _ => unreachable!(),
     }
-    mode
 }
 
 pub fn parse_legalhold_status(hold_str: &str) -> ObjectLockLegalHoldStatus {
-    let st;
     match hold_str {
-        "ON" => {
-            st = ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON);
-        }
-        "OFF" => {
-            st = ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF);
-        }
+        "ON" => ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON),
+        "OFF" => ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF),
         _ => unreachable!(),
     }
-    st
 }

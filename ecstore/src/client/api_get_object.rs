@@ -61,7 +61,7 @@ impl TransitionClient {
 }
 
 #[derive(Default)]
-struct GetRequest {
+pub struct GetRequest {
     pub buffer: Vec<u8>,
     pub offset: i64,
     pub did_offset_change: bool,
@@ -72,7 +72,7 @@ struct GetRequest {
     pub setting_object_info: bool,
 }
 
-struct GetResponse {
+pub struct GetResponse {
     pub size: i64,
     //pub error:       error,
     pub did_read: bool,
@@ -80,7 +80,7 @@ struct GetResponse {
 }
 
 #[derive(Default)]
-struct Object {
+pub struct Object {
     //pub reqch:      chan<- getRequest,
     //pub resch:      <-chan getResponse,
     //pub cancel:     context.CancelFunc,

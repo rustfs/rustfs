@@ -218,6 +218,7 @@ impl ChecksumMode {
         Ok(Checksum {
             checksum_type: self.clone(),
             r: h.sum().as_bytes().to_vec(),
+            computed: false,
         })
     }
 
@@ -227,9 +228,10 @@ impl ChecksumMode {
 }
 
 #[derive(Default)]
-struct Checksum {
+pub struct Checksum {
     checksum_type: ChecksumMode,
     r: Vec<u8>,
+    computed: bool,
 }
 
 impl Checksum {
@@ -238,18 +240,24 @@ impl Checksum {
             return Checksum {
                 checksum_type: t,
                 r: b.to_vec(),
+                computed: false,
             };
         }
         Checksum::default()
     }
 
+    #[allow(dead_code)]
     fn new_checksum_string(t: ChecksumMode, s: &str) -> Result<Checksum, std::io::Error> {
         let b = match base64_decode(s.as_bytes()) {
             Ok(b) => b,
             Err(err) => return Err(std::io::Error::other(err.to_string())),
         };
         if t.is_set() && b.len() == t.raw_byte_len() {
-            return Ok(Checksum { checksum_type: t, r: b });
+            return Ok(Checksum {
+                checksum_type: t,
+                r: b,
+                computed: false,
+            });
         }
         Ok(Checksum::default())
     }
@@ -265,6 +273,7 @@ impl Checksum {
         base64_encode(&self.r)
     }
 
+    #[allow(dead_code)]
     fn raw(&self) -> Option<Vec<u8>> {
         if !self.is_set() {
             return None;

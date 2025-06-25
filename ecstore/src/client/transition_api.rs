@@ -116,7 +116,7 @@ pub struct Options {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-enum BucketLookupType {
+pub enum BucketLookupType {
     #[default]
     BucketLookupAuto,
     BucketLookupDNS,

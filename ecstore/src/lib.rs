@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 extern crate core;
 
 pub mod admin_server_info;

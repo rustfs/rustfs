@@ -15,7 +15,7 @@ use crate::{
 use futures::future::join_all;
 use std::collections::{HashMap, hash_map::Entry};
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
