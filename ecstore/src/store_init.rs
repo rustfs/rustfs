@@ -15,7 +15,7 @@ use crate::{
 use futures::future::join_all;
 use std::collections::{HashMap, hash_map::Entry};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
@@ -52,10 +52,9 @@ pub async fn connect_load_init_formats(
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
 ) -> Result<FormatV3> {
-    warn!("connect_load_init_formats first_disk: {}", first_disk);
     let (formats, errs) = load_format_erasure_all(disks, false).await;
 
-    debug!("load_format_erasure_all errs {:?}", &errs);
+    // debug!("load_format_erasure_all errs {:?}", &errs);
 
     check_disk_fatal_errs(&errs)?;
 
@@ -63,14 +62,14 @@ pub async fn connect_load_init_formats(
 
     if first_disk && should_init_erasure_disks(&errs) {
         //  UnformattedDisk, not format file create
-        warn!("first_disk && should_init_erasure_disks");
+        info!("first_disk && should_init_erasure_disks");
         // new format and save
         let fm = init_format_erasure(disks, set_count, set_drive_count, deployment_id).await?;
 
         return Ok(fm);
     }
 
-    warn!(
+    info!(
         "first_disk: {}, should_init_erasure_disks: {}",
         first_disk,
         should_init_erasure_disks(&errs)

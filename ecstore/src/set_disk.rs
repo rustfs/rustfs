@@ -81,7 +81,7 @@ use rustfs_utils::{
 use s3s::header::X_AMZ_RESTORE;
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
-use std::mem;
+use std::mem::{self};
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, HashSet},
@@ -107,12 +107,12 @@ use workers::workers::Workers;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SetDisks {
     pub lockers: Vec<LockApi>,
     pub locker_owner: String,
     pub ns_mutex: Arc<RwLock<NsLockMap>>,
-    pub disks: RwLock<Vec<Option<DiskStore>>>,
+    pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
     pub set_endpoints: Vec<Endpoint>,
     pub set_drive_count: usize,
     pub default_parity_count: usize,
@@ -122,10 +122,52 @@ pub struct SetDisks {
 }
 
 impl SetDisks {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
+        lockers: Vec<LockApi>,
+        locker_owner: String,
+        ns_mutex: Arc<RwLock<NsLockMap>>,
+        disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
+        set_drive_count: usize,
+        default_parity_count: usize,
+        set_index: usize,
+        pool_index: usize,
+        set_endpoints: Vec<Endpoint>,
+        format: FormatV3,
+    ) -> Arc<Self> {
+        Arc::new(SetDisks {
+            lockers,
+            locker_owner,
+            ns_mutex,
+            disks,
+            set_drive_count,
+            default_parity_count,
+            set_index,
+            pool_index,
+            format,
+            set_endpoints,
+        })
+    }
     async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
         let rl = self.disks.read().await;
 
         rl.clone()
+    }
+
+    pub async fn get_local_disks(&self) -> Vec<Option<DiskStore>> {
+        let rl = self.disks.read().await;
+
+        let mut disks: Vec<Option<DiskStore>> = rl
+            .clone()
+            .into_iter()
+            .filter(|v| v.as_ref().is_some_and(|d| d.is_local()))
+            .collect();
+
+        let mut rng = rand::rng();
+
+        disks.shuffle(&mut rng);
+
+        disks
     }
 
     async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {

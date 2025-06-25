@@ -21,7 +21,7 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::broadcast::{self, Receiver as B_Receiver};
 use tokio::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 const REBAL_META_FMT: u16 = 1; // Replace with actual format value
@@ -162,7 +162,7 @@ impl RebalanceMeta {
     pub async fn load_with_opts<S: StorageAPI>(&mut self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
         let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
         if data.is_empty() {
-            warn!("rebalanceMeta load_with_opts: no data");
+            info!("rebalanceMeta load_with_opts: no data");
             return Ok(());
         }
         if data.len() <= 4 {
@@ -184,7 +184,7 @@ impl RebalanceMeta {
 
         self.last_refreshed_at = Some(OffsetDateTime::now_utc());
 
-        warn!("rebalanceMeta load_with_opts: loaded meta done");
+        info!("rebalanceMeta load_with_opts: loaded meta done");
         Ok(())
     }
 
@@ -194,7 +194,7 @@ impl RebalanceMeta {
 
     pub async fn save_with_opts<S: StorageAPI>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()> {
         if self.pool_stats.is_empty() {
-            warn!("rebalanceMeta save_with_opts: no pool stats");
+            info!("rebalanceMeta save_with_opts: no pool stats");
             return Ok(());
         }
 
@@ -217,10 +217,10 @@ impl ECStore {
     #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
         let mut meta = RebalanceMeta::new();
-        warn!("rebalanceMeta: store load rebalance meta");
+        info!("rebalanceMeta: store load rebalance meta");
         match meta.load(self.pools[0].clone()).await {
             Ok(_) => {
-                warn!("rebalanceMeta: rebalance meta loaded0");
+                info!("rebalanceMeta: rebalance meta loaded0");
                 {
                     let mut rebalance_meta = self.rebalance_meta.write().await;
 
@@ -229,12 +229,12 @@ impl ECStore {
                     drop(rebalance_meta);
                 }
 
-                warn!("rebalanceMeta: rebalance meta loaded1");
+                info!("rebalanceMeta: rebalance meta loaded1");
 
                 if let Err(err) = self.update_rebalance_stats().await {
                     error!("Failed to update rebalance stats: {}", err);
                 } else {
-                    warn!("rebalanceMeta: rebalance meta loaded2");
+                    info!("rebalanceMeta: rebalance meta loaded2");
                 }
             }
             Err(err) => {
@@ -243,7 +243,7 @@ impl ECStore {
                     return Err(err);
                 }
 
-                warn!("rebalanceMeta: not found, rebalance not started");
+                info!("rebalanceMeta: not found, rebalance not started");
             }
         }
 
@@ -259,13 +259,13 @@ impl ECStore {
             rebalance_meta.as_ref().map(|v| v.pool_stats.clone()).unwrap_or_default()
         };
 
-        warn!("update_rebalance_stats: pool_stats: {:?}", &pool_stats);
+        info!("update_rebalance_stats: pool_stats: {:?}", &pool_stats);
 
         for i in 0..self.pools.len() {
             if pool_stats.get(i).is_none() {
-                warn!("update_rebalance_stats: pool {} not found", i);
+                info!("update_rebalance_stats: pool {} not found", i);
                 let mut rebalance_meta = self.rebalance_meta.write().await;
-                warn!("update_rebalance_stats: pool {} not found, add", i);
+                info!("update_rebalance_stats: pool {} not found, add", i);
                 if let Some(meta) = rebalance_meta.as_mut() {
                     meta.pool_stats.push(RebalanceStats::default());
                 }
@@ -275,7 +275,7 @@ impl ECStore {
         }
 
         if ok {
-            warn!("update_rebalance_stats: save rebalance meta");
+            info!("update_rebalance_stats: save rebalance meta");
 
             let rebalance_meta = self.rebalance_meta.read().await;
             if let Some(meta) = rebalance_meta.as_ref() {
@@ -296,7 +296,7 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn init_rebalance_meta(&self, bucktes: Vec<String>) -> Result<String> {
-        warn!("init_rebalance_meta: start rebalance");
+        info!("init_rebalance_meta: start rebalance");
         let si = self.storage_info().await;
 
         let mut disk_stats = vec![DiskStat::default(); self.pools.len()];
@@ -351,7 +351,7 @@ impl ECStore {
 
         meta.save(self.pools[0].clone()).await?;
 
-        warn!("init_rebalance_meta: rebalance meta saved");
+        info!("init_rebalance_meta: rebalance meta saved");
 
         let id = meta.id.clone();
 
@@ -378,26 +378,26 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn next_rebal_bucket(&self, pool_index: usize) -> Result<Option<String>> {
-        warn!("next_rebal_bucket: pool_index: {}", pool_index);
+        info!("next_rebal_bucket: pool_index: {}", pool_index);
         let rebalance_meta = self.rebalance_meta.read().await;
-        warn!("next_rebal_bucket: rebalance_meta: {:?}", rebalance_meta);
+        info!("next_rebal_bucket: rebalance_meta: {:?}", rebalance_meta);
         if let Some(meta) = rebalance_meta.as_ref() {
             if let Some(pool_stat) = meta.pool_stats.get(pool_index) {
                 if pool_stat.info.status == RebalStatus::Completed || !pool_stat.participating {
-                    warn!("next_rebal_bucket: pool_index: {} completed or not participating", pool_index);
+                    info!("next_rebal_bucket: pool_index: {} completed or not participating", pool_index);
                     return Ok(None);
                 }
 
                 if pool_stat.buckets.is_empty() {
-                    warn!("next_rebal_bucket: pool_index: {} buckets is empty", pool_index);
+                    info!("next_rebal_bucket: pool_index: {} buckets is empty", pool_index);
                     return Ok(None);
                 }
-                warn!("next_rebal_bucket: pool_index: {} bucket: {}", pool_index, pool_stat.buckets[0]);
+                info!("next_rebal_bucket: pool_index: {} bucket: {}", pool_index, pool_stat.buckets[0]);
                 return Ok(Some(pool_stat.buckets[0].clone()));
             }
         }
 
-        warn!("next_rebal_bucket: pool_index: {} None", pool_index);
+        info!("next_rebal_bucket: pool_index: {} None", pool_index);
         Ok(None)
     }
 
@@ -406,7 +406,7 @@ impl ECStore {
         let mut rebalance_meta = self.rebalance_meta.write().await;
         if let Some(meta) = rebalance_meta.as_mut() {
             if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
-                warn!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
+                info!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
 
                 // 使用 retain 来过滤掉要删除的 bucket
                 let mut found = false;
@@ -421,14 +421,14 @@ impl ECStore {
                 });
 
                 if found {
-                    warn!("bucket_rebalance_done: bucket {} rebalanced", &bucket);
+                    info!("bucket_rebalance_done: bucket {} rebalanced", &bucket);
                     return Ok(());
                 } else {
-                    warn!("bucket_rebalance_done: bucket {} not found", bucket);
+                    info!("bucket_rebalance_done: bucket {} not found", bucket);
                 }
             }
         }
-        warn!("bucket_rebalance_done: bucket {} not found", bucket);
+        info!("bucket_rebalance_done: bucket {} not found", bucket);
         Ok(())
     }
 
@@ -436,12 +436,12 @@ impl ECStore {
         let rebalance_meta = self.rebalance_meta.read().await;
         if let Some(ref meta) = *rebalance_meta {
             if meta.stopped_at.is_some() {
-                warn!("is_rebalance_started: rebalance stopped");
+                info!("is_rebalance_started: rebalance stopped");
                 return false;
             }
 
             meta.pool_stats.iter().enumerate().for_each(|(i, v)| {
-                warn!(
+                info!(
                     "is_rebalance_started: pool_index: {}, participating: {:?}, status: {:?}",
                     i, v.participating, v.info.status
                 );
@@ -452,12 +452,12 @@ impl ECStore {
                 .iter()
                 .any(|v| v.participating && v.info.status != RebalStatus::Completed)
             {
-                warn!("is_rebalance_started: rebalance started");
+                info!("is_rebalance_started: rebalance started");
                 return true;
             }
         }
 
-        warn!("is_rebalance_started: rebalance not started");
+        info!("is_rebalance_started: rebalance not started");
         false
     }
 
@@ -490,7 +490,7 @@ impl ECStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) {
-        warn!("start_rebalance: start rebalance");
+        info!("start_rebalance: start rebalance");
         // let rebalance_meta = self.rebalance_meta.read().await;
 
         let (tx, rx) = broadcast::channel::<bool>(1);
@@ -501,7 +501,7 @@ impl ECStore {
             if let Some(meta) = rebalance_meta.as_mut() {
                 meta.cancel = Some(tx)
             } else {
-                warn!("start_rebalance: rebalance_meta is None exit");
+                info!("start_rebalance: rebalance_meta is None exit");
                 return;
             }
 
@@ -517,36 +517,36 @@ impl ECStore {
 
                 let mut participants = vec![false; meta.pool_stats.len()];
                 for (i, pool_stat) in meta.pool_stats.iter().enumerate() {
-                    warn!("start_rebalance: pool {} status: {:?}", i, pool_stat.info.status);
+                    info!("start_rebalance: pool {} status: {:?}", i, pool_stat.info.status);
                     if pool_stat.info.status != RebalStatus::Started {
-                        warn!("start_rebalance: pool {} not started, skipping", i);
+                        info!("start_rebalance: pool {} not started, skipping", i);
                         continue;
                     }
 
-                    warn!("start_rebalance: pool {} participating: {:?}", i, pool_stat.participating);
+                    info!("start_rebalance: pool {} participating: {:?}", i, pool_stat.participating);
                     participants[i] = pool_stat.participating;
                 }
                 participants
             } else {
-                warn!("start_rebalance:2  rebalance_meta is None exit");
+                info!("start_rebalance:2  rebalance_meta is None exit");
                 Vec::new()
             }
         };
 
         for (idx, participating) in participants.iter().enumerate() {
             if !*participating {
-                warn!("start_rebalance: pool {} is not participating, skipping", idx);
+                info!("start_rebalance: pool {} is not participating, skipping", idx);
                 continue;
             }
 
             if !get_global_endpoints().as_ref().get(idx).is_some_and(|v| {
-                warn!("start_rebalance: pool {} endpoints: {:?}", idx, v.endpoints);
+                info!("start_rebalance: pool {} endpoints: {:?}", idx, v.endpoints);
                 v.endpoints.as_ref().first().is_some_and(|e| {
-                    warn!("start_rebalance: pool {} endpoint: {:?}, is_local: {}", idx, e, e.is_local);
+                    info!("start_rebalance: pool {} endpoint: {:?}, is_local: {}", idx, e, e.is_local);
                     e.is_local
                 })
             }) {
-                warn!("start_rebalance: pool {} is not local, skipping", idx);
+                info!("start_rebalance: pool {} is not local, skipping", idx);
                 continue;
             }
 
@@ -562,7 +562,7 @@ impl ECStore {
             });
         }
 
-        warn!("start_rebalance: rebalance started done");
+        info!("start_rebalance: rebalance started done");
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -585,11 +585,11 @@ impl ECStore {
 
                         let state = match result {
                             Ok(_) => {
-                                warn!("rebalance_buckets: completed");
+                                info!("rebalance_buckets: completed");
                                 msg = format!("Rebalance completed at {:?}", now);
                                 RebalStatus::Completed},
                             Err(err) => {
-                                warn!("rebalance_buckets: error: {:?}", err);
+                                info!("rebalance_buckets: error: {:?}", err);
                                 // TODO: check stop
                                 if err.to_string().contains("canceled") {
                                     msg = format!("Rebalance stopped at {:?}", now);
@@ -602,11 +602,11 @@ impl ECStore {
                         };
 
                         {
-                            warn!("rebalance_buckets: save rebalance meta, pool_index: {}, state: {:?}", pool_index, state);
+                            info!("rebalance_buckets: save rebalance meta, pool_index: {}, state: {:?}", pool_index, state);
                             let mut rebalance_meta = store.rebalance_meta.write().await;
 
                             if let Some(rbm) = rebalance_meta.as_mut() {
-                                warn!("rebalance_buckets: save rebalance meta2, pool_index: {}, state: {:?}", pool_index, state);
+                                info!("rebalance_buckets: save rebalance meta2, pool_index: {}, state: {:?}", pool_index, state);
                                 rbm.pool_stats[pool_index].info.status = state;
                                 rbm.pool_stats[pool_index].info.end_time = Some(now);
                             }
@@ -623,11 +623,11 @@ impl ECStore {
                 if let Err(err) = store.save_rebalance_stats(pool_index, RebalSaveOpt::Stats).await {
                     error!("{} err: {:?}", msg, err);
                 } else {
-                    warn!(msg);
+                    info!(msg);
                 }
 
                 if quit {
-                    warn!("{}: exiting save_task", msg);
+                    info!("{}: exiting save_task", msg);
                     return;
                 }
 
@@ -635,21 +635,21 @@ impl ECStore {
             }
         });
 
-        warn!("Pool {} rebalancing is started", pool_index);
+        info!("Pool {} rebalancing is started", pool_index);
 
         loop {
             if let Ok(true) = rx.try_recv() {
-                warn!("Pool {} rebalancing is stopped", pool_index);
+                info!("Pool {} rebalancing is stopped", pool_index);
                 done_tx.send(Err(Error::other("rebalance stopped canceled"))).await.ok();
                 break;
             }
 
             if let Some(bucket) = self.next_rebal_bucket(pool_index).await? {
-                warn!("Rebalancing bucket: start {}", bucket);
+                info!("Rebalancing bucket: start {}", bucket);
 
                 if let Err(err) = self.rebalance_bucket(rx.resubscribe(), bucket.clone(), pool_index).await {
                     if err.to_string().contains("not initialized") {
-                        warn!("rebalance_bucket: rebalance not initialized, continue");
+                        info!("rebalance_bucket: rebalance not initialized, continue");
                         continue;
                     }
                     error!("Error rebalancing bucket {}: {:?}", bucket, err);
@@ -657,19 +657,19 @@ impl ECStore {
                     break;
                 }
 
-                warn!("Rebalance bucket: done {} ", bucket);
+                info!("Rebalance bucket: done {} ", bucket);
                 self.bucket_rebalance_done(pool_index, bucket).await?;
             } else {
-                warn!("Rebalance bucket: no bucket to rebalance");
+                info!("Rebalance bucket: no bucket to rebalance");
                 break;
             }
         }
 
-        warn!("Pool {} rebalancing is done", pool_index);
+        info!("Pool {} rebalancing is done", pool_index);
 
         done_tx.send(Ok(())).await.ok();
         save_task.await.ok();
-        warn!("Pool {} rebalancing is done2", pool_index);
+        info!("Pool {} rebalancing is done2", pool_index);
         Ok(())
     }
 
@@ -680,7 +680,7 @@ impl ECStore {
             if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
                 // Check if the pool's rebalance status is already completed
                 if pool_stat.info.status == RebalStatus::Completed {
-                    warn!("check_if_rebalance_done: pool {} is already completed", pool_index);
+                    info!("check_if_rebalance_done: pool {} is already completed", pool_index);
                     return true;
                 }
 
@@ -691,7 +691,7 @@ impl ECStore {
                 if (pfi - meta.percent_free_goal).abs() <= 0.05 {
                     pool_stat.info.status = RebalStatus::Completed;
                     pool_stat.info.end_time = Some(OffsetDateTime::now_utc());
-                    warn!("check_if_rebalance_done: pool {} is completed, pfi: {}", pool_index, pfi);
+                    info!("check_if_rebalance_done: pool {} is completed, pfi: {}", pool_index, pfi);
                     return true;
                 }
             }
@@ -710,7 +710,7 @@ impl ECStore {
         set: Arc<SetDisks>,
         // wk: Arc<Workers>,
     ) {
-        warn!("rebalance_entry: start rebalance_entry");
+        info!("rebalance_entry: start rebalance_entry");
 
         // defer!(|| async {
         //     warn!("rebalance_entry: defer give worker start");
@@ -719,12 +719,12 @@ impl ECStore {
         // });
 
         if entry.is_dir() {
-            warn!("rebalance_entry: entry is dir, skipping");
+            info!("rebalance_entry: entry is dir, skipping");
             return;
         }
 
         if self.check_if_rebalance_done(pool_index).await {
-            warn!("rebalance_entry: rebalance done, skipping pool {}", pool_index);
+            info!("rebalance_entry: rebalance done, skipping pool {}", pool_index);
             return;
         }
 
@@ -732,7 +732,7 @@ impl ECStore {
             Ok(fivs) => fivs,
             Err(err) => {
                 error!("rebalance_entry Error getting file info versions: {}", err);
-                warn!("rebalance_entry: Error getting file info versions, skipping");
+                info!("rebalance_entry: Error getting file info versions, skipping");
                 return;
             }
         };
@@ -743,7 +743,7 @@ impl ECStore {
         let expired: usize = 0;
         for version in fivs.versions.iter() {
             if version.is_remote() {
-                warn!("rebalance_entry Entry {} is remote, skipping", version.name);
+                info!("rebalance_entry Entry {} is remote, skipping", version.name);
                 continue;
             }
             // TODO: filterLifecycle
@@ -751,7 +751,7 @@ impl ECStore {
             let remaining_versions = fivs.versions.len() - expired;
             if version.deleted && remaining_versions == 1 {
                 rebalanced += 1;
-                warn!("rebalance_entry Entry {} is deleted and last version, skipping", version.name);
+                info!("rebalance_entry Entry {} is deleted and last version, skipping", version.name);
                 continue;
             }
             let version_id = version.version_id.map(|v| v.to_string());
@@ -802,7 +802,7 @@ impl ECStore {
             }
 
             for _i in 0..3 {
-                warn!("rebalance_entry: get_object_reader, bucket: {}, version: {}", &bucket, &version.name);
+                info!("rebalance_entry: get_object_reader, bucket: {}, version: {}", &bucket, &version.name);
                 let rd = match set
                     .get_object_reader(
                         bucket.as_str(),
@@ -821,7 +821,7 @@ impl ECStore {
                     Err(err) => {
                         if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                             ignore = true;
-                            warn!(
+                            info!(
                                 "rebalance_entry: get_object_reader, bucket: {}, version: {}, ignore",
                                 &bucket, &version.name
                             );
@@ -837,7 +837,7 @@ impl ECStore {
                 if let Err(err) = self.clone().rebalance_object(pool_index, bucket.clone(), rd).await {
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
                         ignore = true;
-                        warn!("rebalance_entry {} Entry {} is already deleted, skipping", &bucket, version.name);
+                        info!("rebalance_entry {} Entry {} is already deleted, skipping", &bucket, version.name);
                         break;
                     }
 
@@ -852,7 +852,7 @@ impl ECStore {
             }
 
             if ignore {
-                warn!("rebalance_entry {} Entry {} is already deleted, skipping", &bucket, version.name);
+                info!("rebalance_entry {} Entry {} is already deleted, skipping", &bucket, version.name);
                 continue;
             }
 
@@ -884,7 +884,7 @@ impl ECStore {
             {
                 error!("rebalance_entry: delete_object err {:?}", &err);
             } else {
-                warn!("rebalance_entry {} Entry {} deleted successfully", &bucket, &entry.name);
+                info!("rebalance_entry {} Entry {} deleted successfully", &bucket, &entry.name);
             }
         }
     }
@@ -1022,7 +1022,7 @@ impl ECStore {
     #[tracing::instrument(skip(self, rx))]
     async fn rebalance_bucket(self: &Arc<Self>, rx: B_Receiver<bool>, bucket: String, pool_index: usize) -> Result<()> {
         // Placeholder for actual bucket rebalance logic
-        warn!("Rebalancing bucket {} in pool {}", bucket, pool_index);
+        info!("Rebalancing bucket {} in pool {}", bucket, pool_index);
 
         // TODO: other config
         // if bucket != RUSTFS_META_BUCKET{
@@ -1047,12 +1047,12 @@ impl ECStore {
                     // let wk = wk.clone();
                     let set = set.clone();
                     Box::pin(async move {
-                        warn!("rebalance_entry: rebalance_entry spawn start");
+                        info!("rebalance_entry: rebalance_entry spawn start");
                         // wk.take().await;
                         // tokio::spawn(async move {
-                        warn!("rebalance_entry: rebalance_entry spawn start2");
+                        info!("rebalance_entry: rebalance_entry spawn start2");
                         this.rebalance_entry(bucket, pool_index, entry, set).await;
-                        warn!("rebalance_entry: rebalance_entry spawn done");
+                        info!("rebalance_entry: rebalance_entry spawn done");
                         // });
                     })
                 }
@@ -1079,7 +1079,7 @@ impl ECStore {
         for job in jobs {
             job.await.unwrap();
         }
-        warn!("rebalance_bucket: rebalance_bucket done");
+        info!("rebalance_bucket: rebalance_bucket done");
         Ok(())
     }
 
@@ -1089,7 +1089,7 @@ impl ECStore {
         let mut meta = RebalanceMeta::new();
         if let Err(err) = meta.load(self.pools[0].clone()).await {
             if err != Error::ConfigNotFound {
-                warn!("save_rebalance_stats: load err: {:?}", err);
+                info!("save_rebalance_stats: load err: {:?}", err);
                 return Err(err);
             }
         }
@@ -1117,7 +1117,7 @@ impl ECStore {
             *rebalance_meta = Some(meta.clone());
         }
 
-        warn!(
+        info!(
             "save_rebalance_stats: save rebalance meta, pool_idx: {}, opt: {:?}, meta: {:?}",
             pool_idx, opt, meta
         );
@@ -1135,15 +1135,15 @@ impl SetDisks {
         bucket: String,
         cb: ListCallback,
     ) -> Result<()> {
-        warn!("list_objects_to_rebalance: start list_objects_to_rebalance");
+        info!("list_objects_to_rebalance: start list_objects_to_rebalance");
         // Placeholder for actual object listing logic
         let (disks, _) = self.get_online_disks_with_healing(false).await;
         if disks.is_empty() {
-            warn!("list_objects_to_rebalance: no disk available");
+            info!("list_objects_to_rebalance: no disk available");
             return Err(Error::other("errNoDiskAvailable"));
         }
 
-        warn!("list_objects_to_rebalance: get online disks with healing");
+        info!("list_objects_to_rebalance: get online disks with healing");
         let listing_quorum = self.set_drive_count.div_ceil(2);
 
         let resolver = MetadataResolutionParams {
@@ -1162,7 +1162,7 @@ impl SetDisks {
                 recursice: true,
                 min_disks: listing_quorum,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-                    warn!("list_objects_to_rebalance: agreed: {:?}", &entry.name);
+                    info!("list_objects_to_rebalance: agreed: {:?}", &entry.name);
                     Box::pin(cb1(entry))
                 })),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
@@ -1172,11 +1172,11 @@ impl SetDisks {
 
                     match entries.resolve(resolver) {
                         Some(entry) => {
-                            warn!("list_objects_to_rebalance: list_objects_to_decommission get {}", &entry.name);
+                            info!("list_objects_to_rebalance: list_objects_to_decommission get {}", &entry.name);
                             Box::pin(async move { cb(entry).await })
                         }
                         None => {
-                            warn!("list_objects_to_rebalance: list_objects_to_decommission get none");
+                            info!("list_objects_to_rebalance: list_objects_to_decommission get none");
                             Box::pin(async {})
                         }
                     }
@@ -1186,7 +1186,7 @@ impl SetDisks {
         )
         .await?;
 
-        warn!("list_objects_to_rebalance: list_objects_to_rebalance done");
+        info!("list_objects_to_rebalance: list_objects_to_rebalance done");
         Ok(())
     }
 }

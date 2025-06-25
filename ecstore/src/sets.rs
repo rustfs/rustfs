@@ -35,8 +35,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::heal::heal_ops::HealSequence;
+use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
 
@@ -55,7 +55,15 @@ pub struct Sets {
     pub set_drive_count: usize,
     pub default_parity_count: usize,
     pub distribution_algo: DistributionAlgoVersion,
-    ctx: CancellationToken,
+    exit_signal: Option<Sender<()>>,
+}
+
+impl Drop for Sets {
+    fn drop(&mut self) {
+        if let Some(exit_signal) = self.exit_signal.take() {
+            let _ = exit_signal.send(());
+        }
+    }
 }
 
 impl Sets {
@@ -144,21 +152,24 @@ impl Sets {
 
             // warn!("sets new set_drive {:?}", &set_drive);
 
-            let set_disks = SetDisks {
-                lockers: locker.clone(),
-                locker_owner: GLOBAL_Local_Node_Name.read().await.to_string(),
-                ns_mutex: Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
-                disks: RwLock::new(set_drive),
+            let set_disks = SetDisks::new(
+                locker.clone(),
+                GLOBAL_Local_Node_Name.read().await.to_string(),
+                Arc::new(RwLock::new(NsLockMap::new(is_dist_erasure().await))),
+                Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
-                default_parity_count: partiy_count,
-                set_index: i,
-                pool_index: pool_idx,
+                partiy_count,
+                i,
+                pool_idx,
                 set_endpoints,
-                format: fm.clone(),
-            };
+                fm.clone(),
+            )
+            .await;
 
-            disk_set.push(Arc::new(set_disks));
+            disk_set.push(set_disks);
         }
+
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
 
         let sets = Arc::new(Self {
             id: fm.id,
@@ -173,12 +184,17 @@ impl Sets {
             set_drive_count,
             default_parity_count: partiy_count,
             distribution_algo: fm.erasure.distribution_algo.clone(),
-            ctx: CancellationToken::new(),
+            exit_signal: Some(tx),
         });
 
         let asets = sets.clone();
 
-        tokio::spawn(async move { asets.monitor_and_connect_endpoints().await });
+        let rx1 = rx.resubscribe();
+        tokio::spawn(async move { asets.monitor_and_connect_endpoints(rx1).await });
+
+        // let sets2 = sets.clone();
+        // let rx2 = rx.resubscribe();
+        // tokio::spawn(async move { sets2.cleanup_deleted_objects_loop(rx2).await });
 
         Ok(sets)
     }
@@ -186,7 +202,38 @@ impl Sets {
     pub fn set_drive_count(&self) -> usize {
         self.set_drive_count
     }
-    pub async fn monitor_and_connect_endpoints(&self) {
+
+    // pub async fn cleanup_deleted_objects_loop(self: Arc<Self>, mut rx: Receiver<()>) {
+    //     tokio::time::sleep(Duration::from_secs(5)).await;
+
+    //     info!("start cleanup_deleted_objects_loop");
+
+    //     // TODO: config interval
+    //     let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
+    //     loop {
+    //         tokio::select! {
+    //            _= interval.tick()=>{
+
+    //             info!("cleanup_deleted_objects_loop tick");
+
+    //             for set in self.disk_set.iter() {
+    //                 set.clone().cleanup_deleted_objects().await;
+    //             }
+
+    //             interval.reset();
+    //            },
+
+    //            _ = rx.recv() => {
+    //             warn!("cleanup_deleted_objects_loop ctx cancelled");
+    //             break;
+    //            }
+    //         }
+    //     }
+
+    //     warn!("cleanup_deleted_objects_loop exit");
+    // }
+
+    pub async fn monitor_and_connect_endpoints(&self, mut rx: Receiver<()>) {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         info!("start monitor_and_connect_endpoints");
@@ -195,7 +242,6 @@ impl Sets {
 
         // TODO: config interval
         let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
-        let cloned_token = self.ctx.clone();
         loop {
             tokio::select! {
                _= interval.tick()=>{
@@ -205,7 +251,7 @@ impl Sets {
                 interval.reset();
                },
 
-               _ = cloned_token.cancelled() => {
+               _ = rx.recv() => {
                 warn!("monitor_and_connect_endpoints ctx cancelled");
                 break;
                }
