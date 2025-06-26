@@ -14,6 +14,18 @@ pub fn extract_req_params<T>(req: &S3Request<T>) -> HashMap<String, String> {
     params
 }
 
+/// Extract request parameters from hyper::HeaderMap, mainly header information.
+/// This function is useful when you have a raw HTTP request and need to extract parameters.
+pub fn extract_req_params_header(head: &HeaderMap) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    for (key, value) in head.iter() {
+        if let Ok(val_str) = value.to_str() {
+            params.insert(key.as_str().to_string(), val_str.to_string());
+        }
+    }
+    params
+}
+
 /// Extract response elements from S3Response, mainly header information.
 #[allow(dead_code)]
 pub fn extract_resp_elements<T>(resp: &S3Response<T>) -> HashMap<String, String> {

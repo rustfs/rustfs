@@ -51,5 +51,10 @@ pub use crypto::*;
 #[cfg(feature = "compress")]
 pub use compress::*;
 
+#[cfg(feature = "notify")]
+mod notify;
 #[cfg(feature = "sys")]
 pub mod sys;
+
+#[cfg(feature = "notify")]
+pub use notify::*;

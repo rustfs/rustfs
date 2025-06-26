@@ -18,6 +18,6 @@ workspace = true
 [features]
 default = []
 constants = ["dep:const-str"]
-notify = []
+notify = ["dep:const-str"]
 observability = []
 
