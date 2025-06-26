@@ -1,4 +1,3 @@
-use crate::store::DEFAULT_LIMIT;
 use crate::{
     error::TargetError,
     target::{Target, mqtt::MQTTArgs, webhook::WebhookArgs},
@@ -6,85 +5,30 @@ use crate::{
 use async_trait::async_trait;
 use ecstore::config::{ENABLE_KEY, ENABLE_ON, KVS};
 use rumqttc::QoS;
+use rustfs_config::notify::{
+    DEFAULT_DIR, DEFAULT_LIMIT, ENV_MQTT_BROKER, ENV_MQTT_ENABLE, ENV_MQTT_KEEP_ALIVE_INTERVAL, ENV_MQTT_PASSWORD, ENV_MQTT_QOS,
+    ENV_MQTT_QUEUE_DIR, ENV_MQTT_QUEUE_LIMIT, ENV_MQTT_RECONNECT_INTERVAL, ENV_MQTT_TOPIC, ENV_MQTT_USERNAME,
+    ENV_WEBHOOK_AUTH_TOKEN, ENV_WEBHOOK_CLIENT_CERT, ENV_WEBHOOK_CLIENT_KEY, ENV_WEBHOOK_ENABLE, ENV_WEBHOOK_ENDPOINT,
+    ENV_WEBHOOK_QUEUE_DIR, ENV_WEBHOOK_QUEUE_LIMIT, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS,
+    MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, WEBHOOK_AUTH_TOKEN,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+};
+use rustfs_config::{DEFAULT_DELIMITER, ENV_WORD_DELIMITER_DASH};
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
-
-// --- Configuration Constants ---
-
-// General
-
-pub const DEFAULT_TARGET: &str = "1";
-
-#[allow(dead_code)]
-pub const NOTIFY_KAFKA_SUB_SYS: &str = "notify_kafka";
-#[allow(dead_code)]
-pub const NOTIFY_MQTT_SUB_SYS: &str = "notify_mqtt";
-#[allow(dead_code)]
-pub const NOTIFY_MY_SQL_SUB_SYS: &str = "notify_mysql";
-#[allow(dead_code)]
-pub const NOTIFY_NATS_SUB_SYS: &str = "notify_nats";
-#[allow(dead_code)]
-pub const NOTIFY_NSQ_SUB_SYS: &str = "notify_nsq";
-#[allow(dead_code)]
-pub const NOTIFY_ES_SUB_SYS: &str = "notify_elasticsearch";
-#[allow(dead_code)]
-pub const NOTIFY_AMQP_SUB_SYS: &str = "notify_amqp";
-#[allow(dead_code)]
-pub const NOTIFY_POSTGRES_SUB_SYS: &str = "notify_postgres";
-#[allow(dead_code)]
-pub const NOTIFY_REDIS_SUB_SYS: &str = "notify_redis";
-pub const NOTIFY_WEBHOOK_SUB_SYS: &str = "notify_webhook";
-
-#[allow(dead_code)]
-pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS];
-
-// Webhook Keys
-pub const WEBHOOK_ENDPOINT: &str = "endpoint";
-pub const WEBHOOK_AUTH_TOKEN: &str = "auth_token";
-pub const WEBHOOK_QUEUE_LIMIT: &str = "queue_limit";
-pub const WEBHOOK_QUEUE_DIR: &str = "queue_dir";
-pub const WEBHOOK_CLIENT_CERT: &str = "client_cert";
-pub const WEBHOOK_CLIENT_KEY: &str = "client_key";
-
-// Webhook Environment Variables
-const ENV_WEBHOOK_ENABLE: &str = "RUSTFS_NOTIFY_WEBHOOK_ENABLE";
-const ENV_WEBHOOK_ENDPOINT: &str = "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT";
-const ENV_WEBHOOK_AUTH_TOKEN: &str = "RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN";
-const ENV_WEBHOOK_QUEUE_LIMIT: &str = "RUSTFS_NOTIFY_WEBHOOK_QUEUE_LIMIT";
-const ENV_WEBHOOK_QUEUE_DIR: &str = "RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR";
-const ENV_WEBHOOK_CLIENT_CERT: &str = "RUSTFS_NOTIFY_WEBHOOK_CLIENT_CERT";
-const ENV_WEBHOOK_CLIENT_KEY: &str = "RUSTFS_NOTIFY_WEBHOOK_CLIENT_KEY";
-
-// MQTT Keys
-pub const MQTT_BROKER: &str = "broker";
-pub const MQTT_TOPIC: &str = "topic";
-pub const MQTT_QOS: &str = "qos";
-pub const MQTT_USERNAME: &str = "username";
-pub const MQTT_PASSWORD: &str = "password";
-pub const MQTT_RECONNECT_INTERVAL: &str = "reconnect_interval";
-pub const MQTT_KEEP_ALIVE_INTERVAL: &str = "keep_alive_interval";
-pub const MQTT_QUEUE_DIR: &str = "queue_dir";
-pub const MQTT_QUEUE_LIMIT: &str = "queue_limit";
-
-// MQTT Environment Variables
-const ENV_MQTT_ENABLE: &str = "RUSTFS_NOTIFY_MQTT_ENABLE";
-const ENV_MQTT_BROKER: &str = "RUSTFS_NOTIFY_MQTT_BROKER";
-const ENV_MQTT_TOPIC: &str = "RUSTFS_NOTIFY_MQTT_TOPIC";
-const ENV_MQTT_QOS: &str = "RUSTFS_NOTIFY_MQTT_QOS";
-const ENV_MQTT_USERNAME: &str = "RUSTFS_NOTIFY_MQTT_USERNAME";
-const ENV_MQTT_PASSWORD: &str = "RUSTFS_NOTIFY_MQTT_PASSWORD";
-const ENV_MQTT_RECONNECT_INTERVAL: &str = "RUSTFS_NOTIFY_MQTT_RECONNECT_INTERVAL";
-const ENV_MQTT_KEEP_ALIVE_INTERVAL: &str = "RUSTFS_NOTIFY_MQTT_KEEP_ALIVE_INTERVAL";
-const ENV_MQTT_QUEUE_DIR: &str = "RUSTFS_NOTIFY_MQTT_QUEUE_DIR";
-const ENV_MQTT_QUEUE_LIMIT: &str = "RUSTFS_NOTIFY_MQTT_QUEUE_LIMIT";
 
 /// Helper function to get values from environment variables or KVS configurations.
 ///
 /// It will give priority to reading from environment variables such as `BASE_ENV_KEY_ID` and fall back to the KVS configuration if it fails.
 fn get_config_value(id: &str, base_env_key: &str, config_key: &str, config: &KVS) -> Option<String> {
-    let env_key = if id != DEFAULT_TARGET {
-        format!("{}_{}", base_env_key, id.to_uppercase().replace('-', "_"))
+    let env_key = if id != DEFAULT_DELIMITER {
+        format!(
+            "{}{}{}",
+            base_env_key,
+            DEFAULT_DELIMITER,
+            id.to_uppercase().replace(ENV_WORD_DELIMITER_DASH, DEFAULT_DELIMITER)
+        )
     } else {
         base_env_key.to_string()
     };
@@ -123,11 +67,12 @@ impl TargetFactory for WebhookTargetFactory {
 
         let endpoint = get(ENV_WEBHOOK_ENDPOINT, WEBHOOK_ENDPOINT)
             .ok_or_else(|| TargetError::Configuration("Missing webhook endpoint".to_string()))?;
-        let endpoint_url =
-            Url::parse(&endpoint).map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {}", e)))?;
+        let endpoint_url = Url::parse(&endpoint)
+            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {} (value: '{}')", e, endpoint)))?;
 
         let auth_token = get(ENV_WEBHOOK_AUTH_TOKEN, WEBHOOK_AUTH_TOKEN).unwrap_or_default();
-        let queue_dir = get(ENV_WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_DIR).unwrap_or_default();
+        let queue_dir = get(ENV_WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_DIR)
+            .unwrap_or(DEFAULT_DIR.to_string());
 
         let queue_limit = get(ENV_WEBHOOK_QUEUE_LIMIT, WEBHOOK_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
@@ -163,7 +108,10 @@ impl TargetFactory for WebhookTargetFactory {
 
         let endpoint = get(ENV_WEBHOOK_ENDPOINT, WEBHOOK_ENDPOINT)
             .ok_or_else(|| TargetError::Configuration("Missing webhook endpoint".to_string()))?;
-        Url::parse(&endpoint).map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {}", e)))?;
+        debug!("endpoint: {}", endpoint);
+        let parsed_endpoint = endpoint.trim();
+        Url::parse(parsed_endpoint)
+            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {} (value: '{}')", e, parsed_endpoint)))?;
 
         let client_cert = get(ENV_WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_CERT).unwrap_or_default();
         let client_key = get(ENV_WEBHOOK_CLIENT_KEY, WEBHOOK_CLIENT_KEY).unwrap_or_default();
@@ -174,7 +122,9 @@ impl TargetFactory for WebhookTargetFactory {
             ));
         }
 
-        let queue_dir = get(ENV_WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_DIR).unwrap_or_default();
+        let queue_dir = get(ENV_WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_DIR)
+            .and_then(|v| v.parse::<String>().ok())
+            .unwrap_or(DEFAULT_DIR.to_string());
         if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
             return Err(TargetError::Configuration("Webhook queue directory must be an absolute path".to_string()));
         }
@@ -201,7 +151,8 @@ impl TargetFactory for MQTTTargetFactory {
 
         let broker =
             get(ENV_MQTT_BROKER, MQTT_BROKER).ok_or_else(|| TargetError::Configuration("Missing MQTT broker".to_string()))?;
-        let broker_url = Url::parse(&broker).map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {}", e)))?;
+        let broker_url = Url::parse(&broker)
+            .map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {} (value: '{}')", e, broker)))?;
 
         let topic =
             get(ENV_MQTT_TOPIC, MQTT_TOPIC).ok_or_else(|| TargetError::Configuration("Missing MQTT topic".to_string()))?;
@@ -229,7 +180,9 @@ impl TargetFactory for MQTTTargetFactory {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(30));
 
-        let queue_dir = get(ENV_MQTT_QUEUE_DIR, MQTT_QUEUE_DIR).unwrap_or_default();
+        let queue_dir = get(ENV_MQTT_QUEUE_DIR, MQTT_QUEUE_DIR)
+            .and_then(|v| v.parse::<String>().ok())
+            .unwrap_or(DEFAULT_DIR.to_string());
         let queue_limit = get(ENV_MQTT_QUEUE_LIMIT, MQTT_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_LIMIT);
@@ -264,7 +217,8 @@ impl TargetFactory for MQTTTargetFactory {
 
         let broker =
             get(ENV_MQTT_BROKER, MQTT_BROKER).ok_or_else(|| TargetError::Configuration("Missing MQTT broker".to_string()))?;
-        let url = Url::parse(&broker).map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {}", e)))?;
+        let url = Url::parse(&broker)
+            .map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {} (value: '{}')", e, broker)))?;
 
         match url.scheme() {
             "tcp" | "ssl" | "ws" | "wss" | "mqtt" | "mqtts" => {}
@@ -286,7 +240,9 @@ impl TargetFactory for MQTTTargetFactory {
             }
         }
 
-        let queue_dir = get(ENV_MQTT_QUEUE_DIR, MQTT_QUEUE_DIR).unwrap_or_default();
+        let queue_dir = get(ENV_MQTT_QUEUE_DIR, MQTT_QUEUE_DIR)
+            .and_then(|v| v.parse::<String>().ok())
+            .unwrap_or(DEFAULT_DIR.to_string());
         if !queue_dir.is_empty() {
             if !std::path::Path::new(&queue_dir).is_absolute() {
                 return Err(TargetError::Configuration("MQTT queue directory must be an absolute path".to_string()));

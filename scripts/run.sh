@@ -12,6 +12,7 @@ if [ -z "$SKIP_BUILD" ]; then
 fi
 
 current_dir=$(pwd)
+echo "Current directory: $current_dir"
 
 # mkdir -p ./target/volume/test
 mkdir -p ./target/volume/test{0..4}
@@ -19,7 +20,7 @@ mkdir -p ./target/volume/test{0..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="rustfs=info,ecstore=info,s3s=debug,iam=info"
+    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -45,12 +46,12 @@ export RUSTFS_OBS_ENDPOINT=http://localhost:4317 # OpenTelemetry Collector 的�
 #export RUSTFS_OBS_ENVIRONMENT=develop # 环境名称
 export RUSTFS_OBS_LOGGER_LEVEL=debug # 日志级别，支持 trace, debug, info, warn, error
 export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # 是否启用本地日志记录
-export RUSTFS_OBS_LOG_DIRECTORY="./deploy/logs" # Log directory
+export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="minute" # Log rotation time unit, can be "second", "minute", "hour", "day"
 export RUSTFS_OBS_LOG_ROTATION_SIZE_MB=1 # Log rotation size in MB
 
 #
-export RUSTFS_SINKS_FILE_PATH=./deploy/logs/rustfs.log
+export RUSTFS_SINKS_FILE_PATH="$current_dir/deploy/logs/rustfs.log"
 export RUSTFS_SINKS_FILE_BUFFER_SIZE=12
 export RUSTFS_SINKS_FILE_FLUSH_INTERVAL_MS=1000
 export RUSTFS_SINKS_FILE_FLUSH_THRESHOLD=100
@@ -74,6 +75,12 @@ export OTEL_INSTRUMENTATION_VERSION="0.1.1"
 export OTEL_INSTRUMENTATION_SCHEMA_URL="https://opentelemetry.io/schemas/1.31.0"
 export OTEL_INSTRUMENTATION_ATTRIBUTES="env=production"
 
+# notify
+export RUSTFS_NOTIFY_WEBHOOK_ENABLE="true" # 是否启用 webhook 通知
+export RUSTFS_NOTIFY_WEBHOOK_ENDPOINT="http://[::]:3020/webhook" # webhook 通知地址
+export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR="$current_dir/deploy/logs/notify"
+
+
 export RUSTFS_NS_SCANNER_INTERVAL=60  # 对象扫描间隔时间，单位为秒
 # exportRUSTFS_SKIP_BACKGROUND_TASK=true
 
@@ -87,6 +94,6 @@ if [ -n "$1" ]; then
 fi
 
 # 启动 webhook 服务器
-#cargo run --example webhook -p rustfs-event &
+#cargo run --example webhook -p rustfs-notify &
 # 启动主服务
 cargo run --bin rustfs

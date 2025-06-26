@@ -634,7 +634,7 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
         } else {
             error!("Unknown hyper error:{:?}", hyper_err);
         }
-    } else if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+    } else if let Some(io_err) = err.downcast_ref::<Error>() {
         error!("Unknown connection IO error:{}", io_err);
     } else {
         error!("Unknown connection error type:{:?}", err);

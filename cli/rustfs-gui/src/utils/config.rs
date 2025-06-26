@@ -201,7 +201,7 @@ impl RustFSConfig {
     /// Clear the stored configuration from the system keyring
     ///
     /// # Returns
-    /// Returns `Ok(())` if the configuration was successfully cleared, or an error if the operation failed.
+    /// `Ok(())` if the configuration was successfully cleared, or an error if the operation failed.
     ///
     /// # Example
     /// ```
@@ -525,14 +525,14 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: "9000".to_string(),
             access_key: "用户名".to_string(),
-            secret_key: "密码123".to_string(),
+            secret_key: "密码 123".to_string(),
             domain_name: "测试.com".to_string(),
             volume_name: "/数据/存储".to_string(),
             console_address: "127.0.0.1:9001".to_string(),
         };
 
         assert_eq!(config.access_key, "用户名");
-        assert_eq!(config.secret_key, "密码123");
+        assert_eq!(config.secret_key, "密码 123");
         assert_eq!(config.domain_name, "测试.com");
         assert_eq!(config.volume_name, "/数据/存储");
     }

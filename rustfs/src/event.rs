@@ -1,4 +1,5 @@
 use ecstore::config::GLOBAL_ServerConfig;
+use rustfs_config::DEFAULT_DELIMITER;
 use tracing::{error, info, instrument};
 
 #[instrument]
@@ -14,8 +15,15 @@ pub(crate) async fn init_event_notifier() {
         }
     };
 
+    info!("Global server configuration loaded successfully. config: {:?}", server_config);
     // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
-    if server_config.get_value("notify", "_").is_none() {
+    if server_config
+        .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
+        .is_none()
+        || server_config
+            .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
+            .is_none()
+    {
         info!("'notify' subsystem not configured, skipping event notifier initialization.");
         return;
     }

@@ -1,4 +1,3 @@
-use crate::store::STORE_EXTENSION;
 use crate::target::ChannelTargetType;
 use crate::{
     StoreError, Target,
@@ -9,6 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
+use rustfs_config::notify::STORE_EXTENSION;
 use std::{
     path::PathBuf,
     sync::{
@@ -41,8 +41,8 @@ pub struct WebhookArgs {
     pub client_key: String,
 }
 
-// WebhookArgs 的验证方法
 impl WebhookArgs {
+    /// WebhookArgs verification method
     pub fn validate(&self) -> Result<(), TargetError> {
         if !self.enable {
             return Ok(());
@@ -134,7 +134,7 @@ impl WebhookTarget {
                 target_id.name,
                 target_id.id
             ));
-            let store = super::super::store::QueueStore::<Event>::new(queue_dir, args.queue_limit, STORE_EXTENSION);
+            let store = crate::store::QueueStore::<Event>::new(queue_dir, args.queue_limit, STORE_EXTENSION);
 
             if let Err(e) = store.open() {
                 error!("Failed to open store for Webhook target {}: {}", target_id.id, e);
@@ -172,9 +172,9 @@ impl WebhookTarget {
     }
 
     async fn init(&self) -> Result<(), TargetError> {
-        // 使用 CAS 操作确保线程安全初始化
+        // Use CAS operations to ensure thread-safe initialization
         if !self.initialized.load(Ordering::SeqCst) {
-            // 检查连接
+            // Check the connection
             match self.is_active().await {
                 Ok(true) => {
                     info!("Webhook target {} is active", self.id);
@@ -209,12 +209,12 @@ impl WebhookTarget {
         let data =
             serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {}", e)))?;
 
-        // Vec<u8> 转换为 String
+        // Vec<u8> Convert to String
         let data_string = String::from_utf8(data.clone())
             .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {}", e)))?;
         debug!("Sending event to webhook target: {}, event log: {}", self.id, data_string);
 
-        // 构建请求
+        // build request
         let mut req_builder = self
             .http_client
             .post(self.args.endpoint.as_str())

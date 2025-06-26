@@ -1,17 +1,9 @@
 use crate::TargetError;
-use const_str::concat;
+use rustfs_config::notify::{ARN_PREFIX, DEFAULT_ARN_PARTITION, DEFAULT_ARN_SERVICE};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
-
-pub(crate) const DEFAULT_ARN_PARTITION: &str = "rustfs";
-
-pub(crate) const DEFAULT_ARN_SERVICE: &str = "sqs";
-
-/// Default ARN prefix for SQS
-/// "arn:rustfs:sqs:"
-const ARN_PREFIX: &str = concat!("arn:", DEFAULT_ARN_PARTITION, ":", DEFAULT_ARN_SERVICE, ":");
 
 #[derive(Debug, Error)]
 pub enum TargetIDError {

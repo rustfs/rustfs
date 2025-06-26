@@ -8341,6 +8341,7 @@ dependencies = [
  "quick-xml",
  "reqwest",
  "rumqttc",
+ "rustfs-config",
  "rustfs-utils",
  "serde",
  "serde_json",

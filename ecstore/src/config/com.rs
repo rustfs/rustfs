@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use lazy_static::lazy_static;
+use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -13,7 +14,6 @@ pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
-pub const DEFAULT_KV_KEY: &str = "_";
 
 lazy_static! {
     static ref CONFIG_BUCKET: String = format!("{}{}{}", RUSTFS_META_BUCKET, SLASH_SEPARATOR, CONFIG_PREFIX);
@@ -193,7 +193,7 @@ async fn apply_dynamic_config<S: StorageAPI>(cfg: &mut Config, api: Arc<S>) -> R
 async fn apply_dynamic_config_for_sub_sys<S: StorageAPI>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()> {
     let set_drive_counts = api.set_drive_counts();
     if subsys == STORAGE_CLASS_SUB_SYS {
-        let kvs = cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_KV_KEY).unwrap_or_default();
+        let kvs = cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
 
         for (i, count) in set_drive_counts.iter().enumerate() {
             match storageclass::lookup_config(&kvs, *count) {

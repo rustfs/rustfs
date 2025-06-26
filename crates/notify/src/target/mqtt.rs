@@ -1,4 +1,4 @@
-use crate::store::{Key, STORE_EXTENSION};
+use crate::store::Key;
 use crate::target::ChannelTargetType;
 use crate::{
     StoreError, Target,
@@ -10,6 +10,7 @@ use crate::{
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
 use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
+use rustfs_config::notify::STORE_EXTENSION;
 use std::sync::Arc;
 use std::{
     path::PathBuf,

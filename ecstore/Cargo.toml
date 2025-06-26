@@ -14,7 +14,7 @@ workspace = true
 default = []
 
 [dependencies]
-rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-config = { workspace = true, features = ["constants", "notify"] }
 async-trait.workspace = true
 backon.workspace = true
 blake2 = { workspace = true }
@@ -92,7 +92,7 @@ urlencoding = { workspace = true }
 smallvec = { workspace = true }
 shadow-rs.workspace = true
 rustfs-filemeta.workspace = true
-rustfs-utils ={workspace = true, features=["full"]}
+rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 futures-util.workspace = true
 reader = { workspace = true }

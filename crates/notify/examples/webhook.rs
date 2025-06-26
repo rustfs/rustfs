@@ -6,6 +6,7 @@ use axum::{
     routing::post,
 };
 use serde_json::Value;
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::Query;
@@ -17,7 +18,9 @@ struct ResetParams {
 }
 
 // Define a global variable and count the number of data received
+use rustfs_utils::parse_and_resolve_address;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::net::TcpListener;
 
 static WEBHOOK_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -30,16 +33,23 @@ async fn main() {
         .route("/webhook/reset", get(reset_webhook_count))
         .route("/webhook", get(receive_webhook));
     // Start the server
-    let addr = "0.0.0.0:3020";
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    println!("Server running on {}", addr);
+    // let addr = "[0.0.0.0.0.0.0.0]:3020";
+    let server_addr = match parse_and_resolve_address(":3020") {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("Failed to parse address: {}", e);
+            return;
+        }
+    };
+    let listener = TcpListener::bind(server_addr).await.unwrap();
+    println!("Server running on {}", server_addr);
 
     // Self-checking after the service is started
     tokio::spawn(async move {
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        match is_service_active(addr).await {
+        match is_service_active(server_addr).await {
             Ok(true) => println!("Service health check: Successful - Service is running normally"),
             Ok(false) => eprintln!("Service Health Check: Failed - Service Not Responded"),
             Err(e) => eprintln!("Service health check errors:{}", e),
@@ -106,7 +116,7 @@ async fn reset_webhook_count(Query(params): Query<ResetParams>, headers: HeaderM
         .unwrap()
 }
 
-async fn is_service_active(addr: &str) -> Result<bool, String> {
+async fn is_service_active(addr: SocketAddr) -> Result<bool, String> {
     let socket_addr = tokio::net::lookup_host(addr)
         .await
         .map_err(|e| format!("Unable to resolve host:{}", e))?

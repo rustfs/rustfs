@@ -1,4 +1,5 @@
 use crate::error::StoreError;
+use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT, DEFAULT_LIMIT};
 use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::sync::{Arc, RwLock};
@@ -10,13 +11,6 @@ use std::{
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
-
-pub const DEFAULT_LIMIT: u64 = 100000; // Default store limit
-pub const DEFAULT_EXT: &str = ".unknown"; // Default file extension
-pub const COMPRESS_EXT: &str = ".snappy"; // Extension for compressed files
-
-/// STORE_EXTENSION - file extension of an event file in store
-pub const STORE_EXTENSION: &str = ".event";
 
 /// Represents a key for an entry in the store
 #[derive(Debug, Clone)]

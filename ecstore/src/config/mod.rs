@@ -1,12 +1,14 @@
 pub mod com;
 #[allow(dead_code)]
 pub mod heal;
+mod notify;
 pub mod storageclass;
 
 use crate::error::Result;
 use crate::store::ECStore;
 use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
 use lazy_static::lazy_static;
+use rustfs_config::DEFAULT_DELIMITER;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -120,11 +122,11 @@ impl Config {
             for (k, v) in defaults.iter() {
                 if !self.0.contains_key(k) {
                     let mut default = HashMap::new();
-                    default.insert("_".to_owned(), v.clone());
+                    default.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
                     self.0.insert(k.clone(), default);
-                } else if !self.0[k].contains_key("_") {
+                } else if !self.0[k].contains_key(DEFAULT_DELIMITER) {
                     if let Some(m) = self.0.get_mut(k) {
-                        m.insert("_".to_owned(), v.clone());
+                        m.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
                     }
                 }
             }
@@ -160,7 +162,16 @@ pub fn register_default_kvs(kvs: HashMap<String, KVS>) {
 
 pub fn init() {
     let mut kvs = HashMap::new();
+    // Load storageclass default configuration
     kvs.insert(STORAGE_CLASS_SUB_SYS.to_owned(), storageclass::DefaultKVS.clone());
-    // TODO: other default
+    // New: Loading default configurations for notify_webhook and notify_mqtt
+    // Referring subsystem names through constants to improve the readability and maintainability of the code
+    kvs.insert(
+        rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS.to_owned(),
+        notify::DefaultWebhookKVS.clone(),
+    );
+    kvs.insert(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS.to_owned(), notify::DefaultMqttKVS.clone());
+
+    // Register all default configurations
     register_default_kvs(kvs)
 }

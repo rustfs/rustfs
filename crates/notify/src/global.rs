@@ -2,10 +2,11 @@ use crate::{Event, EventArgs, NotificationError, NotificationSystem};
 use ecstore::config::Config;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, OnceLock};
+use tracing::instrument;
 
 static NOTIFICATION_SYSTEM: OnceLock<Arc<NotificationSystem>> = OnceLock::new();
 // Create a globally unique Notifier instance
-pub static GLOBAL_NOTIFIER: Lazy<Notifier> = Lazy::new(|| Notifier {});
+static GLOBAL_NOTIFIER: Lazy<Notifier> = Lazy::new(|| Notifier {});
 
 /// Initialize the global notification system with the given configuration.
 /// This function should only be called once throughout the application life cycle.
@@ -27,14 +28,22 @@ pub fn notification_system() -> Option<Arc<NotificationSystem>> {
     NOTIFICATION_SYSTEM.get().cloned()
 }
 
-pub struct Notifier {
-    // Notifier can hold state, but in this design we make it stateless,
-    // Rely on getting an instance of NotificationSystem from the outside.
+/// Check if the notification system has been initialized.
+pub fn is_notification_system_initialized() -> bool {
+    NOTIFICATION_SYSTEM.get().is_some()
 }
+
+/// Returns a reference to the global Notifier instance.
+pub fn notifier_instance() -> &'static Notifier {
+    &GLOBAL_NOTIFIER
+}
+
+pub struct Notifier {}
 
 impl Notifier {
     /// Notify an event asynchronously.
     /// This is the only entry point for all event notifications in the system.
+    #[instrument(skip(self, args))]
     pub async fn notify(&self, args: EventArgs) {
         // Dependency injection or service positioning mode obtain NotificationSystem instance
         let notification_sys = match notification_system() {
@@ -48,6 +57,11 @@ impl Notifier {
 
         // Avoid generating notifications for replica creation events
         if args.is_replication_request() {
+            return;
+        }
+
+        // Check if any subscribers are interested in the event
+        if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await {
             return;
         }
 

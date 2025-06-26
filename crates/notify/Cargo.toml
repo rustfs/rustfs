@@ -7,6 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+rustfs-config = { workspace = true, features = ["notify"] }
 rustfs-utils = { workspace = true, features = ["path", "sys"] }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
