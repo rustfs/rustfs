@@ -221,7 +221,7 @@ impl FS {
                     .await
                     .map_err(ApiError::from)?;
 
-                // let e_tag = obj_info.etag;
+                let e_tag = _obj_info.clone().etag;
 
                 // // store.put_object(bucket, object, data, opts);
 
@@ -235,9 +235,9 @@ impl FS {
                     bucket_name: bucket.clone(),
                     object: _obj_info.clone(), // clone() 或传递所需字段
                     req_params: rustfs_utils::extract_req_params_header(&req.headers), // 假设有一个辅助函数来提取请求参数
-                    resp_elements: rustfs_utils::extract_resp_elements(&output), // 假设有一个辅助函数来提取响应元素
-                    host: rustfs_utils::get_request_host(&req.headers), // 假设的辅助函数
-                    user_agent: rustfs_utils::get_request_user_agent(&req.headers), // 假设的辅助函数
+                    resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())), // 假设有一个辅助函数来提取响应元素
+                    host: rustfs_utils::get_request_host(&req.headers),                                   // 假设的辅助函数
+                    user_agent: rustfs_utils::get_request_user_agent(&req.headers),                       // 假设的辅助函数
                 };
 
                 // 异步调用，不会阻塞当前请求的响应
