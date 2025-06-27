@@ -270,8 +270,8 @@ mod test {
         println!("len: {}", "╦".len());
         let result = replace_symbol(delimiter, slice);
         match String::from_utf8(result) {
-            Ok(s) => println!("slice: {}", s),
-            Err(e) => eprintln!("Error converting to string: {}", e),
+            Ok(s) => println!("slice: {s}"),
+            Err(e) => eprintln!("Error converting to string: {e}"),
         }
     }
 }

@@ -660,7 +660,7 @@ mod tests {
         let json = index.to_json().unwrap();
         let json_str = String::from_utf8(json).unwrap();
 
-        println!("json_str: {}", json_str);
+        println!("json_str: {json_str}");
         // 验证 JSON 内容
 
         assert!(json_str.contains("\"compressed\": 100"));

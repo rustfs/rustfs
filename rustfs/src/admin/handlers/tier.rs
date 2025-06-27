@@ -84,7 +84,7 @@ impl Operation for AddTier {
         };
 
         let mut args: TierConfig = serde_json::from_slice(&body)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {e}")))?;
 
         match args.tier_type {
             TierType::S3 => {
@@ -202,7 +202,7 @@ impl Operation for EditTier {
         };
 
         let creds: TierCreds = serde_json::from_slice(&body)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {e}")))?;
 
         debug!("edit tier args {:?}", creds);
 
@@ -264,7 +264,7 @@ impl Operation for ListTiers {
         let tiers = tier_config_mgr.list_tiers();
 
         let data = serde_json::to_vec(&tiers)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tiers err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tiers err {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -397,7 +397,7 @@ impl Operation for GetTierInfo {
         let info = tier_config_mgr.get(&query.tier.unwrap());
 
         let data = serde_json::to_vec(&info)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());

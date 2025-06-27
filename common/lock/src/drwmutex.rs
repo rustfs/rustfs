@@ -612,7 +612,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             retry_interval: Duration::from_millis(100),
         };
-        let debug_str = format!("{:?}", opts);
+        let debug_str = format!("{opts:?}");
         assert!(debug_str.contains("timeout"));
         assert!(debug_str.contains("retry_interval"));
     }
@@ -850,7 +850,7 @@ mod tests {
         let lockers = create_mock_lockers(1);
         let mutex = DRWMutex::new("owner1".to_string(), names, lockers);
 
-        let debug_str = format!("{:?}", mutex);
+        let debug_str = format!("{mutex:?}");
         assert!(debug_str.contains("DRWMutex"));
         assert!(debug_str.contains("owner"));
         assert!(debug_str.contains("names"));

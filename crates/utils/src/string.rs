@@ -7,7 +7,7 @@ pub fn parse_bool(str: &str) -> Result<bool> {
     match str {
         "1" | "t" | "T" | "true" | "TRUE" | "True" | "on" | "ON" | "On" | "enabled" => Ok(true),
         "0" | "f" | "F" | "false" | "FALSE" | "False" | "off" | "OFF" | "Off" | "disabled" => Ok(false),
-        _ => Err(Error::other(format!("ParseBool: parsing {}", str))),
+        _ => Err(Error::other(format!("ParseBool: parsing {str}"))),
     }
 }
 
@@ -208,8 +208,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
         Some(caps) => caps,
         None => {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4",
-                arg
+                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4"
             )));
         }
     };
@@ -248,8 +247,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
             || p.suffix.contains(CLOSE_BRACES)
         {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4",
-                arg
+                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4"
             )));
         }
     }
@@ -300,7 +298,7 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
         if ellipses_range[0].starts_with('0') && ellipses_range[0].len() > 1 {
             ret.push(format!("{:0width$}", i, width = ellipses_range[1].len()));
         } else {
-            ret.push(format!("{}", i));
+            ret.push(format!("{i}"));
         }
     }
 
@@ -381,7 +379,7 @@ mod tests {
 
         for (i, args, expected) in test_cases {
             let ret = has_ellipses(&args);
-            assert_eq!(ret, expected, "Test{}: Expected {}, got {}", i, expected, ret);
+            assert_eq!(ret, expected, "Test{i}: Expected {expected}, got {ret}");
         }
     }
 

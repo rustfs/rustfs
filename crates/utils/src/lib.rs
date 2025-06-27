@@ -4,6 +4,7 @@ pub mod certs;
 pub mod ip;
 #[cfg(feature = "net")]
 pub mod net;
+
 #[cfg(feature = "net")]
 pub use net::*;
 
@@ -53,6 +54,7 @@ pub use compress::*;
 
 #[cfg(feature = "notify")]
 mod notify;
+
 #[cfg(feature = "sys")]
 pub mod sys;
 

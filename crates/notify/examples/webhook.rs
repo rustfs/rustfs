@@ -37,12 +37,12 @@ async fn main() {
     let server_addr = match parse_and_resolve_address(":3020") {
         Ok(addr) => addr,
         Err(e) => {
-            eprintln!("Failed to parse address: {}", e);
+            eprintln!("Failed to parse address: {e}");
             return;
         }
     };
     let listener = TcpListener::bind(server_addr).await.unwrap();
-    println!("Server running on {}", server_addr);
+    println!("Server running on {server_addr}");
 
     // Self-checking after the service is started
     tokio::spawn(async move {
@@ -52,7 +52,7 @@ async fn main() {
         match is_service_active(server_addr).await {
             Ok(true) => println!("Service health check: Successful - Service is running normally"),
             Ok(false) => eprintln!("Service Health Check: Failed - Service Not Responded"),
-            Err(e) => eprintln!("Service health check errors:{}", e),
+            Err(e) => eprintln!("Service health check errors:{e}"),
         }
     });
 
@@ -60,7 +60,7 @@ async fn main() {
     tokio::select! {
         result = axum::serve(listener, app) => {
             if let Err(e) = result {
-                eprintln!("Server error: {}", e);
+                eprintln!("Server error: {e}");
             }
         }
         _ = tokio::signal::ctrl_c() => {
@@ -73,9 +73,9 @@ async fn main() {
 async fn reset_webhook_count_with_path(axum::extract::Path(reason): axum::extract::Path<String>) -> Response<String> {
     // Output the value of the current counter
     let current_count = WEBHOOK_COUNT.load(Ordering::SeqCst);
-    println!("Current webhook count: {}", current_count);
+    println!("Current webhook count: {current_count}");
 
-    println!("Reset webhook count, reason: {}", reason);
+    println!("Reset webhook count, reason: {reason}");
     // Reset the counter to 0
     WEBHOOK_COUNT.store(0, Ordering::SeqCst);
     println!("Webhook count has been reset to 0.");
@@ -84,8 +84,7 @@ async fn reset_webhook_count_with_path(axum::extract::Path(reason): axum::extrac
         .header("Foo", "Bar")
         .status(StatusCode::OK)
         .body(format!(
-            "Webhook count reset successfully. Previous count: {}. Reason: {}",
-            current_count, reason
+            "Webhook count reset successfully. Previous count: {current_count}. Reason: {reason}"
         ))
         .unwrap()
 }
@@ -95,14 +94,14 @@ async fn reset_webhook_count_with_path(axum::extract::Path(reason): axum::extrac
 async fn reset_webhook_count(Query(params): Query<ResetParams>, headers: HeaderMap) -> Response<String> {
     // Output the value of the current counter
     let current_count = WEBHOOK_COUNT.load(Ordering::SeqCst);
-    println!("Current webhook count: {}", current_count);
+    println!("Current webhook count: {current_count}");
 
     let reason = params.reason.unwrap_or_else(|| "Reason not provided".to_string());
-    println!("Reset webhook count, reason: {}", reason);
+    println!("Reset webhook count, reason: {reason}");
 
     for header in headers {
         let (key, value) = header;
-        println!("Header: {:?}: {:?}", key, value);
+        println!("Header: {key:?}: {value:?}");
     }
 
     println!("Reset webhook count printed headers");
@@ -112,18 +111,18 @@ async fn reset_webhook_count(Query(params): Query<ResetParams>, headers: HeaderM
     Response::builder()
         .header("Foo", "Bar")
         .status(StatusCode::OK)
-        .body(format!("Webhook count reset successfully current_count:{}", current_count))
+        .body(format!("Webhook count reset successfully current_count:{current_count}"))
         .unwrap()
 }
 
 async fn is_service_active(addr: SocketAddr) -> Result<bool, String> {
     let socket_addr = tokio::net::lookup_host(addr)
         .await
-        .map_err(|e| format!("Unable to resolve host:{}", e))?
+        .map_err(|e| format!("Unable to resolve host:{e}"))?
         .next()
         .ok_or_else(|| "Address not found".to_string())?;
 
-    println!("Checking service status:{}", socket_addr);
+    println!("Checking service status:{socket_addr}");
 
     match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::TcpStream::connect(socket_addr)).await {
         Ok(Ok(_)) => Ok(true),
@@ -131,7 +130,7 @@ async fn is_service_active(addr: SocketAddr) -> Result<bool, String> {
             if e.kind() == std::io::ErrorKind::ConnectionRefused {
                 Ok(false)
             } else {
-                Err(format!("Connection failed:{}", e))
+                Err(format!("Connection failed:{e}"))
             }
         }
         Err(_) => Err("Connection timeout".to_string()),
@@ -149,7 +148,7 @@ async fn receive_webhook(Json(payload): Json<Value>) -> StatusCode {
     let (year, month, day, hour, minute, second) = convert_seconds_to_date(seconds);
 
     // output result
-    println!("current time:{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, minute, second);
+    println!("current time:{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}");
     println!(
         "received a webhook request time:{} content:\n {}",
         seconds,

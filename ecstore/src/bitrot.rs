@@ -168,7 +168,7 @@ mod tests {
 
         assert!(wrapper.is_err());
         let error = wrapper.unwrap_err();
-        println!("error: {:?}", error);
+        println!("error: {error:?}");
         assert_eq!(error, DiskError::DiskNotFound);
     }
 }

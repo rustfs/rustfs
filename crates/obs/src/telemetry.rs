@@ -65,18 +65,18 @@ impl Drop for OtelGuard {
     fn drop(&mut self) {
         if let Some(provider) = self.tracer_provider.take() {
             if let Err(err) = provider.shutdown() {
-                eprintln!("Tracer shutdown error: {:?}", err);
+                eprintln!("Tracer shutdown error: {err:?}");
             }
         }
 
         if let Some(provider) = self.meter_provider.take() {
             if let Err(err) = provider.shutdown() {
-                eprintln!("Meter shutdown error: {:?}", err);
+                eprintln!("Meter shutdown error: {err:?}");
             }
         }
         if let Some(provider) = self.logger_provider.take() {
             if let Err(err) = provider.shutdown() {
-                eprintln!("Logger shutdown error: {:?}", err);
+                eprintln!("Logger shutdown error: {err:?}");
             }
         }
     }
@@ -333,10 +333,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         // Configure the flexi_logger
         let flexi_logger_result = flexi_logger::Logger::try_with_env_or_str(logger_level)
             .unwrap_or_else(|e| {
-                eprintln!(
-                    "Invalid logger level: {}, using default: {}, failed error: {:?}",
-                    logger_level, DEFAULT_LOG_LEVEL, e
-                );
+                eprintln!("Invalid logger level: {logger_level}, using default: {DEFAULT_LOG_LEVEL}, failed error: {e:?}");
                 flexi_logger::Logger::with(log_spec.clone())
             })
             .log_to_file(
@@ -356,19 +353,18 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             // Save the logger handle to keep the logging
             flexi_logger_handle = Some(logger);
 
-            eprintln!("Flexi logger initialized with file logging to {}/{}.log", log_directory, log_filename);
+            eprintln!("Flexi logger initialized with file logging to {log_directory}/{log_filename}.log");
 
             // Log logging of log cutting conditions
             match (config.log_rotation_time.as_deref(), config.log_rotation_size_mb) {
                 (Some(time), Some(size)) => eprintln!(
-                    "Log rotation configured for: every {} or when size exceeds {}MB, keeping {} files",
-                    time, size, keep_files
+                    "Log rotation configured for: every {time} or when size exceeds {size}MB, keeping {keep_files} files"
                 ),
-                (Some(time), None) => eprintln!("Log rotation configured for: every {}, keeping {} files", time, keep_files),
+                (Some(time), None) => eprintln!("Log rotation configured for: every {time}, keeping {keep_files} files"),
                 (None, Some(size)) => {
-                    eprintln!("Log rotation configured for: when size exceeds {}MB, keeping {} files", size, keep_files)
+                    eprintln!("Log rotation configured for: when size exceeds {size}MB, keeping {keep_files} files")
                 }
-                _ => eprintln!("Log rotation configured for: daily, keeping {} files", keep_files),
+                _ => eprintln!("Log rotation configured for: daily, keeping {keep_files} files"),
             }
         } else {
             eprintln!("Failed to initialize flexi_logger: {:?}", flexi_logger_result.err());
@@ -389,7 +385,7 @@ fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilte
     if !matches!(logger_level, "trace" | "debug") {
         let directives: SmallVec<[&str; 5]> = smallvec::smallvec!["hyper", "tonic", "h2", "reqwest", "tower"];
         for directive in directives {
-            filter = filter.add_directive(format!("{}=off", directive).parse().unwrap());
+            filter = filter.add_directive(format!("{directive}=off").parse().unwrap());
         }
     }
 

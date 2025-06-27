@@ -147,7 +147,7 @@ pub struct BucketRemoteTargetNotFound {
 }
 
 pub async fn init_bucket_targets(bucket: &str, meta: Arc<bucket::metadata::BucketMetadata>) {
-    println!("140 {}", bucket);
+    println!("140 {bucket}");
     if let Some(sys) = GLOBAL_Bucket_Target_Sys.get() {
         if let Some(tgts) = meta.bucket_target_config.clone() {
             for tgt in tgts.targets {
@@ -282,7 +282,7 @@ impl BucketTargetSys {
                 let _ = metadata_sys::update(bucket, "bucket-targets.json", json).await;
             }
             Err(e) => {
-                println!("序列化失败{}", e);
+                println!("序列化失败{e}");
             }
         }
 
@@ -379,11 +379,11 @@ impl BucketTargetSys {
         // .get_bucket_info(bucket, &ecstore::store_api::BucketOptions::default()).await;
         match store.get_bucket_info(_bucket, &store_api::BucketOptions::default()).await {
             Ok(info) => {
-                println!("Bucket Info: {:?}", info);
+                println!("Bucket Info: {info:?}");
                 info.versionning
             }
             Err(err) => {
-                eprintln!("Error: {:?}", err);
+                eprintln!("Error: {err:?}");
                 false
             }
         }
@@ -433,7 +433,7 @@ impl BucketTargetSys {
 
         let url_str = format!("http://{}", tgt.endpoint.clone());
 
-        println!("url str is {}", url_str);
+        println!("url str is {url_str}");
         // 转换为 Url 类型
         let parsed_url = url::Url::parse(&url_str).unwrap();
 
@@ -451,7 +451,7 @@ impl BucketTargetSys {
             .await
         {
             Ok(info) => {
-                println!("Bucket Info: {:?}", info);
+                println!("Bucket Info: {info:?}");
                 if !info.versionning {
                     println!("2222222222 {}", info.versionning);
                     return Err(SetTargetError::TargetNotVersioned(tgt.target_bucket.to_string()));
@@ -459,7 +459,7 @@ impl BucketTargetSys {
             }
             Err(err) => {
                 println!("remote bucket 369 is:{}", tgt.target_bucket);
-                eprintln!("Error: {:?}", err);
+                eprintln!("Error: {err:?}");
                 return Err(SetTargetError::SourceNotVersioned(tgt.target_bucket.to_string()));
             }
         }
@@ -629,12 +629,12 @@ impl ARN {
     pub fn parse(s: &str) -> Result<Self, String> {
         // ARN 必须是格式 arn:rustfs:<Type>:<REGION>:<ID>:<remote-bucket>
         if !s.starts_with("arn:rustfs:") {
-            return Err(format!("Invalid ARN {}", s));
+            return Err(format!("Invalid ARN {s}"));
         }
 
         let tokens: Vec<&str> = s.split(':').collect();
         if tokens.len() != 6 || tokens[4].is_empty() || tokens[5].is_empty() {
-            return Err(format!("Invalid ARN {}", s));
+            return Err(format!("Invalid ARN {s}"));
         }
 
         Ok(ARN {

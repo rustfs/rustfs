@@ -50,7 +50,7 @@ impl TargetRegistry {
         let factory = self
             .factories
             .get(target_type)
-            .ok_or_else(|| TargetError::Configuration(format!("Unknown target type: {}", target_type)))?;
+            .ok_or_else(|| TargetError::Configuration(format!("Unknown target type: {target_type}")))?;
 
         // Validate configuration before creating target
         factory.validate_config(&id, config)?;

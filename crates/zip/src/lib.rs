@@ -347,11 +347,11 @@ mod tests {
     fn test_compression_format_debug() {
         // Test Debug trait implementation
         let format = CompressionFormat::Gzip;
-        let debug_str = format!("{:?}", format);
+        let debug_str = format!("{format:?}");
         assert_eq!(debug_str, "Gzip");
 
         let unknown_format = CompressionFormat::Unknown;
-        let unknown_debug_str = format!("{:?}", unknown_format);
+        let unknown_debug_str = format!("{unknown_format:?}");
         assert_eq!(unknown_debug_str, "Unknown");
     }
 
@@ -419,7 +419,7 @@ mod tests {
         for format in supported_formats {
             let cursor = Cursor::new(sample_content);
             let decoder_result = format.get_decoder(cursor);
-            assert!(decoder_result.is_ok(), "Format {:?} should create decoder successfully", format);
+            assert!(decoder_result.is_ok(), "Format {format:?} should create decoder successfully");
         }
     }
 
@@ -453,7 +453,7 @@ mod tests {
 
         for format in all_formats {
             // Verify each format has corresponding Debug implementation
-            let _debug_str = format!("{:?}", format);
+            let _debug_str = format!("{format:?}");
 
             // Verify each format has corresponding PartialEq implementation
             assert_eq!(format, format);
@@ -480,9 +480,7 @@ mod tests {
             assert_eq!(
                 CompressionFormat::from_extension(ext),
                 expected_format,
-                "Extension '{}' should map to {:?}",
-                ext,
-                expected_format
+                "Extension '{ext}' should map to {expected_format:?}"
             );
         }
     }
@@ -502,7 +500,7 @@ mod tests {
 
         for (format, expected_str) in format_strings {
             assert_eq!(
-                format!("{:?}", format),
+                format!("{format:?}"),
                 expected_str,
                 "Format {:?} should have string representation '{}'",
                 format,
@@ -531,14 +529,13 @@ mod tests {
 
         // Verify enum size is reasonable
         let size = mem::size_of::<CompressionFormat>();
-        assert!(size <= 8, "CompressionFormat should be memory efficient, got {} bytes", size);
+        assert!(size <= 8, "CompressionFormat should be memory efficient, got {size} bytes");
 
         // Verify Option<CompressionFormat> size
         let option_size = mem::size_of::<Option<CompressionFormat>>();
         assert!(
             option_size <= 16,
-            "Option<CompressionFormat> should be efficient, got {} bytes",
-            option_size
+            "Option<CompressionFormat> should be efficient, got {option_size} bytes"
         );
     }
 
@@ -567,8 +564,7 @@ mod tests {
             let is_known = format != CompressionFormat::Unknown;
             assert_eq!(
                 is_known, should_be_known,
-                "Extension '{}' recognition mismatch: expected {}, got {}",
-                ext, should_be_known, is_known
+                "Extension '{ext}' recognition mismatch: expected {should_be_known}, got {is_known}"
             );
         }
     }
@@ -601,7 +597,7 @@ mod tests {
 
         for (format, ext) in consistency_tests {
             let parsed_format = CompressionFormat::from_extension(ext);
-            assert_eq!(parsed_format, format, "Extension '{}' should consistently map to {:?}", ext, format);
+            assert_eq!(parsed_format, format, "Extension '{ext}' should consistently map to {format:?}");
         }
     }
 
@@ -770,7 +766,7 @@ mod tests {
 
         for ext in unknown_extensions {
             let format = CompressionFormat::from_extension(ext);
-            assert_eq!(format, CompressionFormat::Unknown, "Extension '{}' should default to Unknown", ext);
+            assert_eq!(format, CompressionFormat::Unknown, "Extension '{ext}' should default to Unknown");
         }
     }
 
@@ -929,7 +925,7 @@ mod tests {
 
         for level in levels {
             // 验证每个级别都有对应的 Debug 实现
-            let _debug_str = format!("{:?}", level);
+            let _debug_str = format!("{level:?}");
         }
     }
 
@@ -955,7 +951,7 @@ mod tests {
             let _supported = format.is_supported();
 
             // 验证 Debug 实现
-            let _debug = format!("{:?}", format);
+            let _debug = format!("{format:?}");
         }
     }
 }

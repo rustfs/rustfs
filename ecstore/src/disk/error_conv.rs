@@ -410,9 +410,7 @@ mod tests {
             let result = to_file_error(create_io_error(kind));
             assert!(
                 contains_disk_error(result, expected_disk_error.clone()),
-                "Failed for ErrorKind::{:?} -> DiskError::{:?}",
-                kind,
-                expected_disk_error
+                "Failed for ErrorKind::{kind:?} -> DiskError::{expected_disk_error:?}"
             );
         }
     }
@@ -430,9 +428,7 @@ mod tests {
             let result = to_volume_error(create_io_error(kind));
             assert!(
                 contains_disk_error(result, expected_disk_error.clone()),
-                "Failed for ErrorKind::{:?} -> DiskError::{:?}",
-                kind,
-                expected_disk_error
+                "Failed for ErrorKind::{kind:?} -> DiskError::{expected_disk_error:?}"
             );
         }
     }

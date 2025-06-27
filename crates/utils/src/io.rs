@@ -29,7 +29,7 @@ pub async fn read_full<R: AsyncRead + Send + Sync + Unpin>(mut reader: R, mut bu
                 }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    format!("read {} bytes, error: {}", total, e),
+                    format!("read {total} bytes, error: {e}"),
                 ));
             }
         };
@@ -116,7 +116,7 @@ mod tests {
             rev[total - n..total].copy_from_slice(&buf[..n]);
 
             count += 1;
-            println!("count: {}, total: {}, n: {}", count, total, n);
+            println!("count: {count}, total: {total}, n: {n}");
         }
         assert_eq!(total, size);
 
@@ -167,8 +167,8 @@ mod tests {
         for &v in &[1u64, 127, 128, 255, 300, 16384, u32::MAX as u64] {
             let n = put_uvarint(&mut buf, v);
             let (decoded, m) = uvarint(&buf[..n]);
-            assert_eq!(decoded, v, "decode mismatch for {}", v);
-            assert_eq!(m as usize, n, "length mismatch for {}", v);
+            assert_eq!(decoded, v, "decode mismatch for {v}");
+            assert_eq!(m as usize, n, "length mismatch for {v}");
         }
     }
 

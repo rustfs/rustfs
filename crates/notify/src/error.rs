@@ -115,6 +115,6 @@ pub enum NotificationError {
 
 impl From<url::ParseError> for TargetError {
     fn from(err: url::ParseError) -> Self {
-        TargetError::Configuration(format!("URL parse error: {}", err))
+        TargetError::Configuration(format!("URL parse error: {err}"))
     }
 }

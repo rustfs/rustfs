@@ -34,13 +34,13 @@ async fn test_lock_unlock_rpc() -> Result<(), Box<dyn Error>> {
     let response = client.lock(request).await?.into_inner();
     println!("request ended");
     if let Some(error_info) = response.error_info {
-        panic!("can not get lock: {}", error_info);
+        panic!("can not get lock: {error_info}");
     }
 
     let request = Request::new(GenerallyLockRequest { args });
     let response = client.un_lock(request).await?.into_inner();
     if let Some(error_info) = response.error_info {
-        panic!("can not get un_lock: {}", error_info);
+        panic!("can not get un_lock: {error_info}");
     }
 
     Ok(())

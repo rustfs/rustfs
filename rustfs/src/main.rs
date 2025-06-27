@@ -12,10 +12,10 @@ mod service;
 mod storage;
 
 use crate::auth::IAMAuth;
-use crate::console::{init_console_cfg, CONSOLE_CONFIG};
+use crate::console::{CONSOLE_CONFIG, init_console_cfg};
 // Ensure the correct path for parse_license is imported
 use crate::event::shutdown_event_notifier;
-use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
+use crate::server::{SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, wait_for_shutdown};
 use bytes::Bytes;
 use chrono::Datelike;
 use clap::Parser;
@@ -23,6 +23,7 @@ use common::{
     // error::{Error, Result},
     globals::set_global_addr,
 };
+use ecstore::StorageAPI;
 use ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
 use ecstore::cmd::bucket_replication::init_bucket_replication_pool;
 use ecstore::config as ecconfig;
@@ -30,12 +31,11 @@ use ecstore::config::GLOBAL_ConfigSys;
 use ecstore::heal::background_heal_ops::init_auto_heal;
 use ecstore::rpc::make_server;
 use ecstore::store_api::BucketOptions;
-use ecstore::StorageAPI;
 use ecstore::{
     endpoints::EndpointServerPools,
     heal::data_scanner::init_data_scanner,
     set_global_endpoints,
-    store::{init_local_disks, ECStore},
+    store::{ECStore, init_local_disks},
     update_erasure_type,
 };
 use ecstore::{global::set_global_rustfs_port, notification_sys::new_global_notification_sys};
@@ -50,7 +50,7 @@ use iam::init_iam_sys;
 use license::init_license;
 use protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustfs_obs::{init_obs, set_global_guard, SystemObserver};
+use rustfs_obs::{SystemObserver, init_obs, set_global_guard};
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3ServiceBuilder};
@@ -62,12 +62,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 #[cfg(unix)]
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_rustls::TlsAcceptor;
-use tonic::{metadata::MetadataValue, Request, Status};
+use tonic::{Request, Status, metadata::MetadataValue};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, instrument, warn, Span};
+use tracing::{Span, debug, error, info, instrument, warn};
 
 const MI_B: usize = 1024 * 1024;
 
@@ -158,8 +158,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     }
 
     // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("http://{}:{}", local_ip, server_port);
-    let localhost_endpoint = format!("http://127.0.0.1:{}", server_port);
+    let api_endpoints = format!("http://{local_ip}:{server_port}");
+    let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
     info!("   API: {}  {}", api_endpoints, localhost_endpoint);
     info!("   RootUser: {}", opt.access_key.clone());
     info!("   RootPass: {}", opt.secret_key.clone());
@@ -264,8 +264,8 @@ async fn run(opt: config::Opt) -> Result<()> {
             }
             _ => {
                 // 2. If the synthesis fails, fall back to the traditional document certificate mode (backward compatible)
-                let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
-                let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+                let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
+                let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
                 let has_single_cert =
                     tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
 
@@ -322,14 +322,6 @@ async fn run(opt: config::Opt) -> Result<()> {
                 }
             };
             (sigterm_inner, sigint_inner)
-        };
-
-        #[cfg(not(unix))]
-        let (mut sigterm_inner, mut sigint_inner) = {
-            // Windows platform uses Ctrl+C as the only signal source
-            // Create two never-finished futures as placeholders
-            info!("Running on Windows, only Ctrl+C signal will be handled");
-            (std::pin::pin!(std::future::pending::<()>()), std::pin::pin!(std::future::pending::<()>()))
         };
 
         let hybrid_service = TowerToHyperService::new(
@@ -392,38 +384,68 @@ async fn run(opt: config::Opt) -> Result<()> {
         loop {
             debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
             // Wait for a connection
-            let (socket, _) = tokio::select! {
-                res = listener.accept() => {
-                    match res {
-                        Ok(conn) => conn,
-                        Err(err) => {
-                            error!("error accepting connection: {err}");
-                            continue;
+            let (socket, _) = {
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        res = listener.accept() => {
+                            match res {
+                                Ok(conn) => conn,
+                                Err(err) => {
+                                    error!("error accepting connection: {err}");
+                                    continue;
+                                }
+                            }
+                        }
+
+                        _ = ctrl_c.as_mut() => {
+                            info!("Ctrl-C received in worker thread");
+                            let _ = shutdown_tx_clone.send(());
+                            break;
+                        }
+
+                       Some(_) = sigint_inner.recv() => {
+                           info!("SIGINT received in worker thread");
+                           let _ = shutdown_tx_clone.send(());
+                           break;
+                       }
+
+                       Some(_) = sigterm_inner.recv() => {
+                           info!("SIGTERM received in worker thread");
+                           let _ = shutdown_tx_clone.send(());
+                           break;
+                       }
+
+                        _ = shutdown_rx.recv() => {
+                            info!("Shutdown signal received in worker thread");
+                            break;
                         }
                     }
                 }
+                #[cfg(not(unix))]
+                {
+                    tokio::select! {
+                        res = listener.accept() => {
+                            match res {
+                                Ok(conn) => conn,
+                                Err(err) => {
+                                    error!("error accepting connection: {err}");
+                                    continue;
+                                }
+                            }
+                        }
 
-                _ = ctrl_c.as_mut() => {
-                    info!("Ctrl-C received in worker thread");
-                    let _ = shutdown_tx_clone.send(());
-                    break;
-                }
+                        _ = ctrl_c.as_mut() => {
+                            info!("Ctrl-C received in worker thread");
+                            let _ = shutdown_tx_clone.send(());
+                            break;
+                        }
 
-               Some(_) = sigint_inner.recv() => {
-                   info!("SIGINT received in worker thread");
-                   let _ = shutdown_tx_clone.send(());
-                   break;
-               }
-
-               Some(_) = sigterm_inner.recv() => {
-                   info!("SIGTERM received in worker thread");
-                   let _ = shutdown_tx_clone.send(());
-                   break;
-               }
-
-                _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received in worker thread");
-                    break;
+                        _ = shutdown_rx.recv() => {
+                            info!("Shutdown signal received in worker thread");
+                            break;
+                        }
+                    }
                 }
             };
 
@@ -588,21 +610,13 @@ async fn run(opt: config::Opt) -> Result<()> {
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
     match wait_for_shutdown().await {
+        #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            info!("Shutdown signal received in main thread");
-            // update the status to stopping first
-            state_manager.update(ServiceState::Stopping);
-
-            // Stop the notification system
-            shutdown_event_notifier().await;
-
-            info!("Server is stopping...");
-            let _ = shutdown_tx.send(());
-            // Wait for the worker thread to complete the cleaning work
-            tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
-            // the last updated status is stopped
-            state_manager.update(ServiceState::Stopped);
-            info!("Server stopped current ");
+            handle_shutdown(&state_manager, &shutdown_tx).await;
+        }
+        #[cfg(not(unix))]
+        ShutdownSignal::CtrlC => {
+            handle_shutdown(&state_manager, &shutdown_tx).await;
         }
     }
 
@@ -610,6 +624,27 @@ async fn run(opt: config::Opt) -> Result<()> {
     Ok(())
 }
 
+/// Handles the shutdown process of the server
+async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
+    info!("Shutdown signal received in main thread");
+    // update the status to stopping first
+    state_manager.update(ServiceState::Stopping);
+
+    // Stop the notification system
+    shutdown_event_notifier().await;
+
+    info!("Server is stopping...");
+    let _ = shutdown_tx.send(());
+
+    // Wait for the worker thread to complete the cleaning work
+    tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+
+    // the last updated status is stopped
+    state_manager.update(ServiceState::Stopped);
+    info!("Server stopped current ");
+}
+
+/// Handles connection errors by logging them with appropriate severity
 fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
         if hyper_err.is_incomplete_message() {

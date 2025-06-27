@@ -62,7 +62,7 @@ impl std::fmt::Display for Key {
         if self.compress {
             file_name.push_str(COMPRESS_EXT);
         }
-        write!(f, "{}", file_name)
+        write!(f, "{file_name}")
     }
 }
 
@@ -377,7 +377,7 @@ where
             match deserializer.next() {
                 Some(Ok(item)) => items.push(item),
                 Some(Err(e)) => {
-                    return Err(StoreError::Deserialization(format!("Failed to deserialize item in batch: {}", e)));
+                    return Err(StoreError::Deserialization(format!("Failed to deserialize item in batch: {e}")));
                 }
                 None => {
                     // Reached end of stream sooner than item_count
@@ -393,8 +393,7 @@ where
                     } else if items.is_empty() {
                         // No items at all, but file existed
                         return Err(StoreError::Deserialization(format!(
-                            "No items deserialized for key {} though file existed.",
-                            key
+                            "No items deserialized for key {key} though file existed."
                         )));
                     }
                     break;

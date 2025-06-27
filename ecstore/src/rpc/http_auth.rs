@@ -34,7 +34,7 @@ fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) 
 
     let url = path_and_query.to_string();
 
-    let data = format!("{}|{}|{}", url, method, timestamp);
+    let data = format!("{url}|{method}|{timestamp}");
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
@@ -369,7 +369,7 @@ mod tests {
 
             // Verify the signature should succeed
             let result = verify_rpc_signature(url, &method, &headers);
-            assert!(result.is_ok(), "Round-trip test failed for {} {}", method, url);
+            assert!(result.is_ok(), "Round-trip test failed for {method} {url}");
         }
     }
 }

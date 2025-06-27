@@ -64,15 +64,12 @@ fn get_policy_doc_path(name: &str) -> String {
 
 fn get_mapped_policy_path(name: &str, user_type: UserType, is_group: bool) -> String {
     if is_group {
-        return path_join_buf(&[&IAM_CONFIG_POLICY_DB_GROUPS_PREFIX, format!("{}.json", name).as_str()]);
+        return path_join_buf(&[&IAM_CONFIG_POLICY_DB_GROUPS_PREFIX, format!("{name}.json").as_str()]);
     }
     match user_type {
-        UserType::Svc => path_join_buf(&[
-            &IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX,
-            format!("{}.json", name).as_str(),
-        ]),
-        UserType::Sts => path_join_buf(&[&IAM_CONFIG_POLICY_DB_STS_USERS_PREFIX, format!("{}.json", name).as_str()]),
-        _ => path_join_buf(&[&IAM_CONFIG_POLICY_DB_USERS_PREFIX, format!("{}.json", name).as_str()]),
+        UserType::Svc => path_join_buf(&[&IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX, format!("{name}.json").as_str()]),
+        UserType::Sts => path_join_buf(&[&IAM_CONFIG_POLICY_DB_STS_USERS_PREFIX, format!("{name}.json").as_str()]),
+        _ => path_join_buf(&[&IAM_CONFIG_POLICY_DB_USERS_PREFIX, format!("{name}.json").as_str()]),
     }
 }
 
@@ -212,7 +209,7 @@ impl ObjectStore {
                     Ok(p) => Ok(p),
                     Err(err) => {
                         if !is_err_no_such_policy(&err) {
-                            Err(Error::other(format!("load policy doc failed: {}", err)))
+                            Err(Error::other(format!("load policy doc failed: {err}")))
                         } else {
                             Ok(PolicyDoc::default())
                         }
@@ -244,7 +241,7 @@ impl ObjectStore {
                     Ok(res) => Ok(res),
                     Err(err) => {
                         if !is_err_no_such_user(&err) {
-                            Err(Error::other(format!("load user failed: {}", err)))
+                            Err(Error::other(format!("load user failed: {err}")))
                         } else {
                             Ok(UserIdentity::default())
                         }
@@ -295,7 +292,7 @@ impl ObjectStore {
                     Ok(p) => Ok(p),
                     Err(err) => {
                         if !is_err_no_such_policy(&err) {
-                            Err(Error::other(format!("load mapped policy failed: {}", err)))
+                            Err(Error::other(format!("load mapped policy failed: {err}")))
                         } else {
                             Ok(MappedPolicy::default())
                         }
@@ -767,7 +764,7 @@ impl Store for ObjectStore {
                 let name = rustfs_utils::path::dir(item);
                 info!("load group: {}", name);
                 if let Err(err) = self.load_group(&name, &mut items_cache).await {
-                    return Err(Error::other(format!("load group failed: {}", err)));
+                    return Err(Error::other(format!("load group failed: {err}")));
                 };
             }
 
@@ -828,7 +825,7 @@ impl Store for ObjectStore {
                 info!("load group policy: {}", name);
                 if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await {
                     if !is_err_no_such_policy(&err) {
-                        return Err(Error::other(format!("load group policy failed: {}", err)));
+                        return Err(Error::other(format!("load group policy failed: {err}")));
                     }
                 };
             }
@@ -847,7 +844,7 @@ impl Store for ObjectStore {
                 info!("load svc user: {}", name);
                 if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await {
                     if !is_err_no_such_user(&err) {
-                        return Err(Error::other(format!("load svc user failed: {}", err)));
+                        return Err(Error::other(format!("load svc user failed: {err}")));
                     }
                 };
             }
@@ -861,7 +858,7 @@ impl Store for ObjectStore {
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
-                            return Err(Error::other(format!("load_mapped_policy failed: {}", err)));
+                            return Err(Error::other(format!("load_mapped_policy failed: {err}")));
                         }
                     }
                 }

@@ -32,7 +32,7 @@ impl VersioningApi for VersioningConfiguration {
         if let Some(ref excluded_prefixes) = self.excluded_prefixes {
             for p in excluded_prefixes.iter() {
                 if let Some(ref sprefix) = p.prefix {
-                    let pattern = format!("{}*", sprefix);
+                    let pattern = format!("{sprefix}*");
                     if match_simple(&pattern, prefix) {
                         return false;
                     }
@@ -62,7 +62,7 @@ impl VersioningApi for VersioningConfiguration {
             if let Some(ref excluded_prefixes) = self.excluded_prefixes {
                 for p in excluded_prefixes.iter() {
                     if let Some(ref sprefix) = p.prefix {
-                        let pattern = format!("{}*", sprefix);
+                        let pattern = format!("{sprefix}*");
                         if match_simple(&pattern, prefix) {
                             return true;
                         }

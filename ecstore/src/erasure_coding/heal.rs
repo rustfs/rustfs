@@ -39,7 +39,7 @@ impl super::Erasure {
             let (mut shards, errs) = reader.read().await;
 
             if errs.iter().filter(|e| e.is_none()).count() < self.data_shards {
-                return Err(Error::other(format!("can not reconstruct data: not enough data shards {:?}", errs)));
+                return Err(Error::other(format!("can not reconstruct data: not enough data shards {errs:?}")));
             }
 
             if self.parity_shards > 0 {

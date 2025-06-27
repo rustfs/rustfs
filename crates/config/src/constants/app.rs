@@ -231,10 +231,10 @@ mod tests {
     #[test]
     fn test_const_str_concat_functionality() {
         // Test const_str::concat macro functionality
-        let expected_address = format!(":{}", DEFAULT_PORT);
+        let expected_address = format!(":{DEFAULT_PORT}");
         assert_eq!(DEFAULT_ADDRESS, expected_address);
 
-        let expected_console_address = format!(":{}", DEFAULT_CONSOLE_PORT);
+        let expected_console_address = format!(":{DEFAULT_CONSOLE_PORT}");
         assert_eq!(DEFAULT_CONSOLE_ADDRESS, expected_console_address);
     }
 
@@ -256,9 +256,9 @@ mod tests {
         ];
 
         for constant in &string_constants {
-            assert!(!constant.is_empty(), "String constant should not be empty: {}", constant);
-            assert!(!constant.starts_with(' '), "String constant should not start with space: {}", constant);
-            assert!(!constant.ends_with(' '), "String constant should not end with space: {}", constant);
+            assert!(!constant.is_empty(), "String constant should not be empty: {constant}");
+            assert!(!constant.starts_with(' '), "String constant should not start with space: {constant}");
+            assert!(!constant.ends_with(' '), "String constant should not end with space: {constant}");
         }
     }
 
@@ -284,8 +284,8 @@ mod tests {
 
         // These are default values, should be changed in production environments
         println!("Security Warning: Default credentials detected!");
-        println!("Access Key: {}", DEFAULT_ACCESS_KEY);
-        println!("Secret Key: {}", DEFAULT_SECRET_KEY);
+        println!("Access Key: {DEFAULT_ACCESS_KEY}");
+        println!("Secret Key: {DEFAULT_SECRET_KEY}");
         println!("These should be changed in production environments!");
 
         // Verify that key lengths meet minimum security requirements
@@ -312,11 +312,11 @@ mod tests {
         let ports = [DEFAULT_PORT, DEFAULT_CONSOLE_PORT];
         let mut unique_ports = std::collections::HashSet::new();
         for port in &ports {
-            assert!(unique_ports.insert(port), "Port {} is duplicated", port);
+            assert!(unique_ports.insert(port), "Port {port} is duplicated");
         }
 
         // Address format consistency
-        assert_eq!(DEFAULT_ADDRESS, format!(":{}", DEFAULT_PORT));
-        assert_eq!(DEFAULT_CONSOLE_ADDRESS, format!(":{}", DEFAULT_CONSOLE_PORT));
+        assert_eq!(DEFAULT_ADDRESS, format!(":{DEFAULT_PORT}"));
+        assert_eq!(DEFAULT_CONSOLE_ADDRESS, format!(":{DEFAULT_CONSOLE_PORT}"));
     }
 }

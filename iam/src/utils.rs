@@ -287,7 +287,7 @@ mod tests {
 
         for invalid_token in &invalid_tokens {
             let result = extract_claims::<Claims>(invalid_token, "secret");
-            assert!(result.is_err(), "Should fail with invalid token: {}", invalid_token);
+            assert!(result.is_err(), "Should fail with invalid token: {invalid_token}");
         }
     }
 

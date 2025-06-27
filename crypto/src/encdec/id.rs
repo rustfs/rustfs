@@ -80,9 +80,9 @@ mod tests {
         let argon2_chacha = ID::Argon2idChaCHa20Poly1305;
         let pbkdf2 = ID::Pbkdf2AESGCM;
 
-        assert_eq!(format!("{:?}", argon2_aes), "Argon2idAESGCM");
-        assert_eq!(format!("{:?}", argon2_chacha), "Argon2idChaCHa20Poly1305");
-        assert_eq!(format!("{:?}", pbkdf2), "Pbkdf2AESGCM");
+        assert_eq!(format!("{argon2_aes:?}"), "Argon2idAESGCM");
+        assert_eq!(format!("{argon2_chacha:?}"), "Argon2idChaCHa20Poly1305");
+        assert_eq!(format!("{pbkdf2:?}"), "Pbkdf2AESGCM");
     }
 
     #[test]
@@ -205,13 +205,13 @@ mod tests {
 
         for algorithm in &algorithms {
             let result = algorithm.get_key(password, salt);
-            assert!(result.is_ok(), "Algorithm {:?} should generate valid key", algorithm);
+            assert!(result.is_ok(), "Algorithm {algorithm:?} should generate valid key");
 
             let key = result.expect("Key generation should succeed for all algorithms");
-            assert_eq!(key.len(), 32, "Key length should be 32 bytes for {:?}", algorithm);
+            assert_eq!(key.len(), 32, "Key length should be 32 bytes for {algorithm:?}");
 
             // Verify key is not all zeros (very unlikely with proper implementation)
-            assert_ne!(key, [0u8; 32], "Key should not be all zeros for {:?}", algorithm);
+            assert_ne!(key, [0u8; 32], "Key should not be all zeros for {algorithm:?}");
         }
     }
 

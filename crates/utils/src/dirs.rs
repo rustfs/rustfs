@@ -54,7 +54,7 @@ mod tests {
                 assert!(path.exists(), "The project root directory does not exist:{}", path.display());
                 println!("The test is passed, the project root directory:{}", path.display());
             }
-            Err(e) => panic!("Failed to get the project root directory:{}", e),
+            Err(e) => panic!("Failed to get the project root directory:{e}"),
         }
     }
 }

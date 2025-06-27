@@ -318,7 +318,7 @@ impl HealSequence {
         self.count_scanned(heal_type.clone()).await;
 
         if source.no_wait {
-            let task_str = format!("{:?}", task);
+            let task_str = format!("{task:?}");
             if GLOBAL_BackgroundHealRoutine.tasks_tx.try_send(task).is_ok() {
                 info!("Task in the queue: {:?}", task_str);
             }
@@ -328,7 +328,7 @@ impl HealSequence {
         let (resp_tx, mut resp_rx) = mpsc::channel(1);
         task.resp_tx = Some(resp_tx);
 
-        let task_str = format!("{:?}", task);
+        let task_str = format!("{task:?}");
         if GLOBAL_BackgroundHealRoutine.tasks_tx.try_send(task).is_ok() {
             info!("Task in the queue: {:?}", task_str);
         } else {
@@ -793,8 +793,7 @@ impl AllHealState {
         for (k, v) in self.heal_seq_map.read().await.iter() {
             if (has_prefix(k, path_s) || has_prefix(path_s, k)) && !v.has_ended().await {
                 return Err(Error::other(format!(
-                    "The provided heal sequence path overlaps with an existing heal path: {}",
-                    k
+                    "The provided heal sequence path overlaps with an existing heal path: {k}"
                 )));
             }
         }

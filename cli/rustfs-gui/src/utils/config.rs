@@ -288,7 +288,7 @@ mod tests {
 
         for (input, expected) in test_cases {
             let result = RustFSConfig::extract_host_port(input);
-            assert_eq!(result, expected, "Failed for input: {}", input);
+            assert_eq!(result, expected, "Failed for input: {input}");
         }
     }
 
@@ -306,7 +306,7 @@ mod tests {
 
         for input in invalid_cases {
             let result = RustFSConfig::extract_host_port(input);
-            assert_eq!(result, None, "Should be None for input: {}", input);
+            assert_eq!(result, None, "Should be None for input: {input}");
         }
 
         // Special case: empty host but valid port should still work
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn test_debug_format() {
         let config = RustFSConfig::default_config();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         assert!(debug_str.contains("RustFSConfig"));
         assert!(debug_str.contains("address"));
@@ -484,14 +484,14 @@ mod tests {
     fn test_very_long_strings() {
         let long_string = "a".repeat(1000);
         let config = RustFSConfig {
-            address: format!("{}:9000", long_string),
+            address: format!("{long_string}:9000"),
             host: long_string.clone(),
             port: "9000".to_string(),
             access_key: long_string.clone(),
             secret_key: long_string.clone(),
-            domain_name: format!("{}.com", long_string),
-            volume_name: format!("/data/{}", long_string),
-            console_address: format!("{}:9001", long_string),
+            domain_name: format!("{long_string}.com"),
+            volume_name: format!("/data/{long_string}"),
+            console_address: format!("{long_string}:9001"),
         };
 
         assert_eq!(config.host.len(), 1000);

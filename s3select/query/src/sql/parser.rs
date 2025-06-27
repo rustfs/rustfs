@@ -360,7 +360,7 @@ mod tests {
 
         for sql in invalid_sqls {
             let result = ExtParser::parse_sql(sql);
-            assert!(result.is_err(), "Invalid SQL '{}' should return error", sql);
+            assert!(result.is_err(), "Invalid SQL '{sql}' should return error");
         }
     }
 
@@ -385,14 +385,14 @@ mod tests {
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("col{}", i));
+            sql.push_str(&format!("col{i}"));
         }
         sql.push_str(" FROM S3Object WHERE ");
         for i in 0..50 {
             if i > 0 {
                 sql.push_str(" AND ");
             }
-            sql.push_str(&format!("col{} > {}", i, i));
+            sql.push_str(&format!("col{i} > {i}"));
         }
 
         let result = ExtParser::parse_sql(&sql);

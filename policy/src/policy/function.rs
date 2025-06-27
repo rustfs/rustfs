@@ -103,7 +103,7 @@ impl<'de> Deserialize<'de> for Functions {
                 let mut inner_data = Functions::default();
                 while let Some(key) = map.next_key::<&str>()? {
                     if hash.contains(&key) {
-                        return Err(Error::custom(format!("duplicate condition operator `{}`", key)));
+                        return Err(Error::custom(format!("duplicate condition operator `{key}`")));
                     }
 
                     hash.insert(key);

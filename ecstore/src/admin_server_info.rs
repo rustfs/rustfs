@@ -102,9 +102,9 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
     // 打印响应
     let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
     if let Err(e) = ping_response_body {
-        eprintln!("{}", e);
+        eprintln!("{e}");
     } else {
-        println!("ping_resp:body(flatbuffer): {:?}", ping_response_body);
+        println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
     }
 
     Ok(())

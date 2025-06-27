@@ -136,7 +136,7 @@ impl Operation for UpdateGroupMembers {
         };
 
         let args: GroupAddRemove = serde_json::from_slice(&body)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {e}")))?;
 
         warn!("UpdateGroupMembers args {:?}", args);
 
@@ -148,7 +148,7 @@ impl Operation for UpdateGroupMembers {
                     if is_temp {
                         return Err(S3Error::with_message(
                             S3ErrorCode::MethodNotAllowed,
-                            format!("can't add temp user {}", member),
+                            format!("can't add temp user {member}"),
                         ));
                     }
 
@@ -157,7 +157,7 @@ impl Operation for UpdateGroupMembers {
                             if cred.access_key == *member {
                                 return Err(S3Error::with_message(
                                     S3ErrorCode::MethodNotAllowed,
-                                    format!("can't add root {}", member),
+                                    format!("can't add root {member}"),
                                 ));
                             }
                             Ok(())

@@ -1066,15 +1066,15 @@ mod tests {
         let server_props = ServerProperties::default();
 
         // Test that all structures can be formatted with Debug
-        assert!(!format!("{:?}", item_state).is_empty());
-        assert!(!format!("{:?}", disk_metrics).is_empty());
-        assert!(!format!("{:?}", disk).is_empty());
-        assert!(!format!("{:?}", healing_disk).is_empty());
-        assert!(!format!("{:?}", backend_byte).is_empty());
-        assert!(!format!("{:?}", storage_info).is_empty());
-        assert!(!format!("{:?}", backend_info).is_empty());
-        assert!(!format!("{:?}", mem_stats).is_empty());
-        assert!(!format!("{:?}", server_props).is_empty());
+        assert!(!format!("{item_state:?}").is_empty());
+        assert!(!format!("{disk_metrics:?}").is_empty());
+        assert!(!format!("{disk:?}").is_empty());
+        assert!(!format!("{healing_disk:?}").is_empty());
+        assert!(!format!("{backend_byte:?}").is_empty());
+        assert!(!format!("{storage_info:?}").is_empty());
+        assert!(!format!("{backend_info:?}").is_empty());
+        assert!(!format!("{mem_stats:?}").is_empty());
+        assert!(!format!("{server_props:?}").is_empty());
     }
 
     #[test]

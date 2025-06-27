@@ -394,7 +394,7 @@ pub async fn check_replicate_delete(
 // use crate::global::*;
 
 fn target_reset_header(arn: &str) -> String {
-    format!("{}{}-{}", RESERVED_METADATA_PREFIX_LOWER, REPLICATION_RESET, arn)
+    format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_RESET}-{arn}")
 }
 
 pub async fn get_heal_replicate_object_info(
@@ -491,7 +491,7 @@ pub async fn get_heal_replicate_object_info(
 
     let asz = oi.get_actual_size().unwrap_or(0);
 
-    let key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, REPLICATION_TIMESTAMP);
+    let key = format!("{RESERVED_METADATA_PREFIX_LOWER}{REPLICATION_TIMESTAMP}");
     let tm: Option<DateTime<Utc>> = user_defined
         .get(&key)
         .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
@@ -819,7 +819,7 @@ impl ReplicationPool {
     // }
 
     fn get_worker_ch(&self, bucket: &str, object: &str, _sz: i64) -> Option<&Sender<Box<dyn ReplicationWorkerOperation>>> {
-        let h = xxh3_64(format!("{}{}", bucket, object).as_bytes()); // 计算哈希值
+        let h = xxh3_64(format!("{bucket}{object}").as_bytes()); // 计算哈希值
 
         // need lock;
         let workers = &self.workers_sender; // 读锁
@@ -1067,7 +1067,7 @@ impl fmt::Display for VersionPurgeStatusType {
             VersionPurgeStatusType::Empty => "",
             VersionPurgeStatusType::Unknown => "UNKNOWN",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -1307,7 +1307,7 @@ impl fmt::Display for ReplicateDecision {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut entries = Vec::new();
         for (key, value) in &self.targets_map {
-            entries.push(format!("{}={}", key, value));
+            entries.push(format!("{key}={value}"));
         }
         write!(f, "{}", entries.join(","))
     }
@@ -2123,7 +2123,7 @@ async fn replicate_object_with_multipart(
         .provider(provider)
         .secure(false)
         .build()
-        .map_err(|e| Error::other(format!("build minio client failed: {}", e)))?;
+        .map_err(|e| Error::other(format!("build minio client failed: {e}")))?;
 
     let ret = minio_cli
         .create_multipart_upload_with_versionid(tgt_cli.bucket.clone(), local_obj_info.name.clone(), rep_obj.version_id.clone())
@@ -2168,7 +2168,7 @@ async fn replicate_object_with_multipart(
                                     }
                                     Err(err) => {
                                         error!("upload part {} failed: {}", index + 1, err);
-                                        Err(Error::other(format!("upload error: {}", err)))
+                                        Err(Error::other(format!("upload error: {err}")))
                                     }
                                 }
                             }
@@ -2179,7 +2179,7 @@ async fn replicate_object_with_multipart(
                         },
                         Err(err) => {
                             error!("reader error for part {}: {}", index + 1, err);
-                            Err(Error::other(format!("reader error: {}", err)))
+                            Err(Error::other(format!("reader error: {err}")))
                         }
                     }
                 }));
@@ -2196,7 +2196,7 @@ async fn replicate_object_with_multipart(
                     }
                     Err(join_err) => {
                         error!("tokio join error: {}", join_err);
-                        return Err(Error::other(format!("join error: {}", join_err)));
+                        return Err(Error::other(format!("join error: {join_err}")));
                     }
                 }
             }
@@ -2210,12 +2210,12 @@ async fn replicate_object_with_multipart(
                 }
                 Err(err) => {
                     error!("finish upload failed:{}", err);
-                    return Err(Error::other(format!("finish upload failed:{}", err)));
+                    return Err(Error::other(format!("finish upload failed:{err}")));
                 }
             }
         }
         Err(err) => {
-            return Err(Error::other(format!("finish upload failed:{}", err)));
+            return Err(Error::other(format!("finish upload failed:{err}")));
         }
     }
     Ok(())
@@ -2729,7 +2729,7 @@ pub async fn replicate_object(ri: ReplicateObjectInfo, object_api: Arc<store::EC
             // }
         }
         Err(err) => {
-            println!("Failed to get replication config: {:?}", err);
+            println!("Failed to get replication config: {err:?}");
         }
     }
 }

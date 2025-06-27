@@ -47,10 +47,7 @@ fn parse_bitrot_config(s: &str) -> Result<Duration> {
             match s.trim_end_matches('m').parse::<u64>() {
                 Ok(months) => {
                     if months < RUSTFS_BITROT_CYCLE_IN_MONTHS {
-                        return Err(Error::other(format!(
-                            "minimum bitrot cycle is {} month(s)",
-                            RUSTFS_BITROT_CYCLE_IN_MONTHS
-                        )));
+                        return Err(Error::other(format!("minimum bitrot cycle is {RUSTFS_BITROT_CYCLE_IN_MONTHS} month(s)")));
                     }
 
                     Ok(Duration::from_secs(months * 30 * 24 * 60))

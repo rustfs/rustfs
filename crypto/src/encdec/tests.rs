@@ -103,7 +103,7 @@ fn test_encrypt_decrypt_unicode_data() -> Result<(), crate::Error> {
         let data = text.as_bytes();
         let encrypted = encrypt_data(PASSWORD, data)?;
         let decrypted = decrypt_data(PASSWORD, &encrypted)?;
-        assert_eq!(data, decrypted.as_slice(), "Unicode data mismatch for: {}", text);
+        assert_eq!(data, decrypted.as_slice(), "Unicode data mismatch for: {text}");
     }
     Ok(())
 }
@@ -125,7 +125,7 @@ fn test_decrypt_with_corrupted_data() {
         corrupted[*corrupt_index] ^= 0xFF; // Flip all bits
 
         let result = decrypt_data(PASSWORD, &corrupted);
-        assert!(result.is_err(), "{} should cause decryption to fail", description);
+        assert!(result.is_err(), "{description} should cause decryption to fail");
     }
 }
 
@@ -146,7 +146,7 @@ fn test_decrypt_with_truncated_data() {
     for &length in &truncation_lengths {
         let truncated = &encrypted[..length.min(encrypted.len())];
         let result = decrypt_data(PASSWORD, truncated);
-        assert!(result.is_err(), "Truncated data (length {}) should cause decryption to fail", length);
+        assert!(result.is_err(), "Truncated data (length {length}) should cause decryption to fail");
     }
 }
 
@@ -219,7 +219,7 @@ fn test_password_variations() -> Result<(), crate::Error> {
     for password in &password_variations {
         let encrypted = encrypt_data(password, data)?;
         let decrypted = decrypt_data(password, &encrypted)?;
-        assert_eq!(data, decrypted.as_slice(), "Failed with password: {:?}", password);
+        assert_eq!(data, decrypted.as_slice(), "Failed with password: {password:?}");
     }
 
     Ok(())
@@ -292,7 +292,7 @@ fn test_concurrent_encryption_safety() -> Result<(), crate::Error> {
             thread::spawn(move || {
                 let encrypted = encrypt_data(&password, &data).expect("Encryption should succeed");
                 let decrypted = decrypt_data(&password, &encrypted).expect("Decryption should succeed");
-                assert_eq!(**data, decrypted, "Thread {} failed", i);
+                assert_eq!(**data, decrypted, "Thread {i} failed");
             })
         })
         .collect();

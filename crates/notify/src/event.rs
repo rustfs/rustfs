@@ -413,7 +413,7 @@ impl Event {
                     owner_identity: Identity {
                         principal_id: "rustfs".to_string(),
                     },
-                    arn: format!("arn:rustfs:s3:::{}", bucket),
+                    arn: format!("arn:rustfs:s3:::{bucket}"),
                 },
                 object: Object {
                     key: key.to_string(),

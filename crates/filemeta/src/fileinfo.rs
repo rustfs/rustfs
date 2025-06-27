@@ -72,7 +72,7 @@ impl std::fmt::Display for ErasureAlgo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ErasureAlgo::Invalid => write!(f, "Invalid"),
-            ErasureAlgo::ReedSolomon => write!(f, "{}", ERASURE_ALGORITHM),
+            ErasureAlgo::ReedSolomon => write!(f, "{ERASURE_ALGORITHM}"),
         }
     }
 }
@@ -312,53 +312,53 @@ impl FileInfo {
 
     pub fn set_tier_free_version_id(&mut self, version_id: &str) {
         self.metadata
-            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_ID), version_id.to_string());
+            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_ID}"), version_id.to_string());
     }
 
     pub fn tier_free_version_id(&self) -> String {
-        self.metadata[&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_ID)].clone()
+        self.metadata[&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_ID}")].clone()
     }
 
     pub fn set_tier_free_version(&mut self) {
         self.metadata
-            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_MARKER), "".to_string());
+            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_MARKER}"), "".to_string());
     }
 
     pub fn set_skip_tier_free_version(&mut self) {
         self.metadata
-            .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_SKIP_FV_ID), "".to_string());
+            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_SKIP_FV_ID}"), "".to_string());
     }
 
     pub fn skip_tier_free_version(&self) -> bool {
         self.metadata
-            .contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_SKIP_FV_ID))
+            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_SKIP_FV_ID}"))
     }
 
     pub fn tier_free_version(&self) -> bool {
         self.metadata
-            .contains_key(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TIER_FV_MARKER))
+            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_MARKER}"))
     }
 
     pub fn set_inline_data(&mut self) {
         self.metadata
-            .insert(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).to_owned(), "true".to_owned());
+            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").to_owned(), "true".to_owned());
     }
 
     pub fn set_data_moved(&mut self) {
         self.metadata
-            .insert(format!("{}data-moved", RESERVED_METADATA_PREFIX_LOWER).to_owned(), "true".to_owned());
+            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}data-moved").to_owned(), "true".to_owned());
     }
 
     pub fn inline_data(&self) -> bool {
         self.metadata
-            .contains_key(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).as_str())
+            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str())
             && !self.is_remote()
     }
 
     /// Check if the object is compressed
     pub fn is_compressed(&self) -> bool {
         self.metadata
-            .contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER))
+            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
     }
 
     /// Check if the object is remote (transitioned to another tier)

@@ -467,7 +467,7 @@ impl SetDisks {
         data_dir: &str,
         write_quorum: usize,
     ) -> disk::error::Result<()> {
-        let file_path = Arc::new(format!("{}/{}", object, data_dir));
+        let file_path = Arc::new(format!("{object}/{data_dir}"));
         let bucket = Arc::new(bucket.to_string());
         let futures = disks.iter().map(|disk| {
             let file_path = file_path.clone();
@@ -585,7 +585,7 @@ impl SetDisks {
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
             warn!("rename_part errs {:?}", &errs);
-            Self::cleanup_multipart_path(disks, &[dst_object.to_string(), format!("{}.meta", dst_object)]).await;
+            Self::cleanup_multipart_path(disks, &[dst_object.to_string(), format!("{dst_object}.meta")]).await;
             return Err(err);
         }
 
@@ -723,7 +723,7 @@ impl SetDisks {
     }
 
     fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
-        let path = format!("{}/{}", bucket, object);
+        let path = format!("{bucket}/{object}");
         let mut hasher = Sha256::new();
         hasher.update(path);
         hex(hasher.finalize())
@@ -1966,7 +1966,7 @@ impl SetDisks {
                     return Err(to_object_err(read_err.into(), vec![bucket, object]));
                 }
                 error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
-                return Err(Error::other(format!("not enough disks to read: {:?}", errors)));
+                return Err(Error::other(format!("not enough disks to read: {errors:?}")));
             }
 
             // debug!(
@@ -2161,7 +2161,7 @@ impl SetDisks {
 
         _ = list_path_raw(rx, lopts)
             .await
-            .map_err(|err| Error::other(format!("listPathRaw returned {}: bucket: {}, path: {}", err, bucket, path)));
+            .map_err(|err| Error::other(format!("listPathRaw returned {err}: bucket: {bucket}, path: {path}")));
         Ok(())
     }
 
@@ -2677,8 +2677,7 @@ impl SetDisks {
                                     return Ok((
                                         result,
                                         Some(DiskError::other(format!(
-                                            "all drives had write errors, unable to heal {}/{}",
-                                            bucket, object
+                                            "all drives had write errors, unable to heal {bucket}/{object}"
                                         ))),
                                     ));
                                 }
@@ -2955,7 +2954,7 @@ impl SetDisks {
             tags.insert("set", self.set_index.to_string());
             tags.insert("pool", self.pool_index.to_string());
             tags.insert("merrs", join_errs(errs));
-            tags.insert("derrs", format!("{:?}", data_errs_by_part));
+            tags.insert("derrs", format!("{data_errs_by_part:?}"));
             if m.is_valid() {
                 tags.insert("sz", m.size.to_string());
                 tags.insert(
@@ -3268,7 +3267,7 @@ impl SetDisks {
             Ok(info) => info,
             Err(err) => {
                 defer.await;
-                return Err(Error::other(format!("unable to get disk information before healing it: {}", err)));
+                return Err(Error::other(format!("unable to get disk information before healing it: {err}")));
             }
         };
         let num_cores = num_cpus::get(); // 使用 num_cpus crate 获取核心数
@@ -4010,7 +4009,7 @@ impl ObjectIO for SetDisks {
                 return Err(to_object_err(write_err.into(), vec![bucket, object]));
             }
 
-            return Err(Error::other(format!("not enough disks to write: {:?}", errors)));
+            return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
         let stream = mem::replace(
@@ -4035,8 +4034,8 @@ impl ObjectIO for SetDisks {
             return Err(Error::other("put_object write size < data.size()"));
         }
 
-        if user_defined.contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER)) {
-            user_defined.insert(format!("{}compression-size", RESERVED_METADATA_PREFIX_LOWER), w_size.to_string());
+        if user_defined.contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression")) {
+            user_defined.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"), w_size.to_string());
         }
 
         let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
@@ -4879,9 +4878,9 @@ impl StorageAPI for SetDisks {
         let disks = disks.clone();
         let shuffle_disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
-        let part_suffix = format!("part.{}", part_id);
+        let part_suffix = format!("part.{part_id}");
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
-        let tmp_part_path = Arc::new(format!("{}/{}", tmp_part, part_suffix));
+        let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
         // let mut writers = Vec::with_capacity(disks.len());
         // let erasure = Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
@@ -4979,7 +4978,7 @@ impl StorageAPI for SetDisks {
                 return Err(to_object_err(write_err.into(), vec![bucket, object]));
             }
 
-            return Err(Error::other(format!("not enough disks to write: {:?}", errors)));
+            return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
         let stream = mem::replace(
@@ -5473,11 +5472,11 @@ impl StorageAPI for SetDisks {
         fi.metadata.insert("etag".to_owned(), etag);
 
         fi.metadata
-            .insert(format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER), object_actual_size.to_string());
+            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"), object_actual_size.to_string());
 
         if fi.is_compressed() {
             fi.metadata
-                .insert(format!("{}compression-size", RESERVED_METADATA_PREFIX_LOWER), object_size.to_string());
+                .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"), object_size.to_string());
         }
 
         if opts.data_movement {

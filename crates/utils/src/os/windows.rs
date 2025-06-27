@@ -12,6 +12,7 @@ use winapi::um::winnt::{LPCWSTR, WCHAR};
 
 /// Returns total and free bytes available in a directory, e.g. `C:\`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
+    let path_display = p.as_ref().display();
     let path_wide: Vec<WCHAR> = p
         .as_ref()
         .canonicalize()?
@@ -41,10 +42,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
 
     if free > total {
         return Err(Error::other(format!(
-            "detected free space ({}) > total drive space ({}), fs corruption at ({}). please run 'fsck'",
-            free,
-            total,
-            p.as_ref().display()
+            "detected free space ({free}) > total drive space ({total}), fs corruption at ({path_display}). please run 'fsck'"
         )));
     }
 

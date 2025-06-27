@@ -131,7 +131,7 @@ impl GetObjectReader {
             let actual_size = if actual_size > 0 {
                 actual_size as usize
             } else {
-                return Err(Error::other(format!("invalid decompressed size {}", actual_size)));
+                return Err(Error::other(format!("invalid decompressed size {actual_size}")));
             };
 
             let dec_reader = LimitReader::new(dec_reader, actual_size);
@@ -428,13 +428,13 @@ impl Clone for ObjectInfo {
 impl ObjectInfo {
     pub fn is_compressed(&self) -> bool {
         self.user_defined
-            .contains_key(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER))
+            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
     }
 
     pub fn is_compressed_ok(&self) -> Result<(CompressionAlgorithm, bool)> {
         let scheme = self
             .user_defined
-            .get(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER))
+            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
             .cloned();
 
         if let Some(scheme) = scheme {
@@ -455,10 +455,7 @@ impl ObjectInfo {
         }
 
         if self.is_compressed() {
-            if let Some(size_str) = self
-                .user_defined
-                .get(&format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER))
-            {
+            if let Some(size_str) = self.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size")) {
                 if !size_str.is_empty() {
                     // Todo: deal with error
                     let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;

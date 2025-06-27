@@ -68,7 +68,7 @@ impl TargetFactory for WebhookTargetFactory {
         let endpoint = get(ENV_WEBHOOK_ENDPOINT, WEBHOOK_ENDPOINT)
             .ok_or_else(|| TargetError::Configuration("Missing webhook endpoint".to_string()))?;
         let endpoint_url = Url::parse(&endpoint)
-            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {} (value: '{}')", e, endpoint)))?;
+            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {e} (value: '{endpoint}')")))?;
 
         let auth_token = get(ENV_WEBHOOK_AUTH_TOKEN, WEBHOOK_AUTH_TOKEN).unwrap_or_default();
         let queue_dir = get(ENV_WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_DIR).unwrap_or(DEFAULT_DIR.to_string());
@@ -110,7 +110,7 @@ impl TargetFactory for WebhookTargetFactory {
         debug!("endpoint: {}", endpoint);
         let parsed_endpoint = endpoint.trim();
         Url::parse(parsed_endpoint)
-            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {} (value: '{}')", e, parsed_endpoint)))?;
+            .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {e} (value: '{parsed_endpoint}')")))?;
 
         let client_cert = get(ENV_WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_CERT).unwrap_or_default();
         let client_key = get(ENV_WEBHOOK_CLIENT_KEY, WEBHOOK_CLIENT_KEY).unwrap_or_default();
@@ -151,7 +151,7 @@ impl TargetFactory for MQTTTargetFactory {
         let broker =
             get(ENV_MQTT_BROKER, MQTT_BROKER).ok_or_else(|| TargetError::Configuration("Missing MQTT broker".to_string()))?;
         let broker_url = Url::parse(&broker)
-            .map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {} (value: '{}')", e, broker)))?;
+            .map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {e} (value: '{broker}')")))?;
 
         let topic =
             get(ENV_MQTT_TOPIC, MQTT_TOPIC).ok_or_else(|| TargetError::Configuration("Missing MQTT topic".to_string()))?;
@@ -217,7 +217,7 @@ impl TargetFactory for MQTTTargetFactory {
         let broker =
             get(ENV_MQTT_BROKER, MQTT_BROKER).ok_or_else(|| TargetError::Configuration("Missing MQTT broker".to_string()))?;
         let url = Url::parse(&broker)
-            .map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {} (value: '{}')", e, broker)))?;
+            .map_err(|e| TargetError::Configuration(format!("Invalid broker URL: {e} (value: '{broker}')")))?;
 
         match url.scheme() {
             "tcp" | "ssl" | "ws" | "wss" | "mqtt" | "mqtts" => {}

@@ -189,7 +189,7 @@ fn get_all_sets<T: AsRef<str>>(set_drive_count: usize, is_ellipses: bool, args: 
     for args in set_args.iter() {
         for arg in args {
             if unique_args.contains(arg) {
-                return Err(Error::other(format!("Input args {} has duplicate ellipses", arg)));
+                return Err(Error::other(format!("Input args {arg} has duplicate ellipses")));
             }
             unique_args.insert(arg);
         }
@@ -383,7 +383,7 @@ fn get_set_indexes<T: AsRef<str>>(
     for &size in total_sizes {
         // Check if total_sizes has minimum range upto set_size
         if size < SET_SIZES[0] || size < set_drive_count {
-            return Err(Error::other(format!("Incorrect number of endpoints provided, size {}", size)));
+            return Err(Error::other(format!("Incorrect number of endpoints provided, size {size}")));
         }
     }
 
@@ -655,9 +655,9 @@ mod test {
         let mut seq = Vec::new();
         for i in start..=number {
             if padding_len == 0 {
-                seq.push(format!("{}", i));
+                seq.push(format!("{i}"));
             } else {
-                seq.push(format!("{:0width$}", i, width = padding_len));
+                seq.push(format!("{i:0padding_len$}"));
             }
         }
         seq

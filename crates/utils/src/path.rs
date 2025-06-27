@@ -44,7 +44,7 @@ pub fn retain_slash(s: &str) -> String {
     if s.ends_with(SLASH_SEPARATOR) {
         s.to_string()
     } else {
-        format!("{}{}", s, SLASH_SEPARATOR)
+        format!("{s}{SLASH_SEPARATOR}")
     }
 }
 
@@ -91,7 +91,7 @@ pub fn path_join_buf(elements: &[&str]) -> String {
     let clean_path = cpath.to_string_lossy();
 
     if trailing_slash {
-        return format!("{}{}", clean_path, SLASH_SEPARATOR);
+        return format!("{clean_path}{SLASH_SEPARATOR}");
     }
     clean_path.to_string()
 }
@@ -265,9 +265,9 @@ mod tests {
     #[test]
     fn test_base_dir_from_prefix() {
         let a = "da/";
-        println!("---- in {}", a);
+        println!("---- in {a}");
         let a = base_dir_from_prefix(a);
-        println!("---- out {}", a);
+        println!("---- out {a}");
     }
 
     #[test]

@@ -112,7 +112,7 @@ mod tests {
         // 读取超限，应该返回错误
         let err = match read_full(&mut r, &mut buf).await {
             Ok(n) => {
-                println!("Read {} bytes", n);
+                println!("Read {n} bytes");
                 assert_eq!(n, 3);
                 assert_eq!(&buf[..n], b"abc");
                 None

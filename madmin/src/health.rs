@@ -667,12 +667,12 @@ mod tests {
         let mem_info = MemInfo::default();
 
         // Test that all structures can be formatted with Debug
-        assert!(!format!("{:?}", node).is_empty());
-        assert!(!format!("{:?}", cpu).is_empty());
-        assert!(!format!("{:?}", partition).is_empty());
-        assert!(!format!("{:?}", proc_info).is_empty());
-        assert!(!format!("{:?}", service).is_empty());
-        assert!(!format!("{:?}", mem_info).is_empty());
+        assert!(!format!("{node:?}").is_empty());
+        assert!(!format!("{cpu:?}").is_empty());
+        assert!(!format!("{partition:?}").is_empty());
+        assert!(!format!("{proc_info:?}").is_empty());
+        assert!(!format!("{service:?}").is_empty());
+        assert!(!format!("{mem_info:?}").is_empty());
     }
 
     #[test]

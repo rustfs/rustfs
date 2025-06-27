@@ -180,7 +180,7 @@ impl FormatV3 {
             }
         }
 
-        Err(Error::other(format!("disk id not found {}", disk_id)))
+        Err(Error::other(format!("disk id not found {disk_id}")))
     }
 
     pub fn check_other(&self, other: &FormatV3) -> Result<()> {
@@ -242,7 +242,7 @@ mod test {
         let format = FormatV3::new(1, 4);
 
         let str = serde_json::to_string(&format);
-        println!("{:?}", str);
+        println!("{str:?}");
 
         let data = r#"
         {
@@ -266,7 +266,7 @@ mod test {
 
         let p = FormatV3::try_from(data);
 
-        println!("{:?}", p);
+        println!("{p:?}");
     }
 
     #[test]

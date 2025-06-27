@@ -29,7 +29,7 @@ impl TryFrom<&str> for AccountStatus {
         match s {
             "enabled" => Ok(AccountStatus::Enabled),
             "disabled" => Ok(AccountStatus::Disabled),
-            _ => Err(format!("invalid account status: {}", s)),
+            _ => Err(format!("invalid account status: {s}")),
         }
     }
 }
@@ -737,10 +737,10 @@ mod tests {
         };
 
         // Test that all structures can be formatted with Debug
-        assert!(!format!("{:?}", account_status).is_empty());
-        assert!(!format!("{:?}", user_auth_type).is_empty());
-        assert!(!format!("{:?}", user_info).is_empty());
-        assert!(!format!("{:?}", service_account).is_empty());
+        assert!(!format!("{account_status:?}").is_empty());
+        assert!(!format!("{user_auth_type:?}").is_empty());
+        assert!(!format!("{user_info:?}").is_empty());
+        assert!(!format!("{service_account:?}").is_empty());
     }
 
     #[test]

@@ -217,7 +217,7 @@ impl Operation for AccountInfoHandler {
             let policies = iam_store
                 .policy_db_get(&account_name, &cred.groups)
                 .await
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get policy failed: {}", e)))?;
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get policy failed: {e}")))?;
 
             effective_policy = iam_store.get_combined_policy(&policies).await;
         };
@@ -1036,6 +1036,6 @@ mod test {
     fn test_decode() {
         let b = b"{\"recursive\":false,\"dryRun\":false,\"remove\":false,\"recreate\":false,\"scanMode\":1,\"updateParity\":false,\"nolock\":false}";
         let s: HealOpts = serde_urlencoded::from_bytes(b).unwrap();
-        println!("{:?}", s);
+        println!("{s:?}");
     }
 }

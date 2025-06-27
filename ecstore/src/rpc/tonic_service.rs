@@ -121,7 +121,7 @@ impl Node for NodeService {
             Err(err) => {
                 return Ok(tonic::Response::new(HealBucketResponse {
                     success: false,
-                    error: Some(DiskError::other(format!("decode HealOpts failed: {}", err)).into()),
+                    error: Some(DiskError::other(format!("decode HealOpts failed: {err}")).into()),
                 }));
             }
         };
@@ -149,7 +149,7 @@ impl Node for NodeService {
                 return Ok(tonic::Response::new(ListBucketResponse {
                     success: false,
                     bucket_infos: Vec::new(),
-                    error: Some(DiskError::other(format!("decode BucketOptions failed: {}", err)).into()),
+                    error: Some(DiskError::other(format!("decode BucketOptions failed: {err}")).into()),
                 }));
             }
         };
@@ -183,7 +183,7 @@ impl Node for NodeService {
             Err(err) => {
                 return Ok(tonic::Response::new(MakeBucketResponse {
                     success: false,
-                    error: Some(DiskError::other(format!("decode MakeBucketOptions failed: {}", err)).into()),
+                    error: Some(DiskError::other(format!("decode MakeBucketOptions failed: {err}")).into()),
                 }));
             }
         };
@@ -209,7 +209,7 @@ impl Node for NodeService {
                 return Ok(tonic::Response::new(GetBucketInfoResponse {
                     success: false,
                     bucket_info: String::new(),
-                    error: Some(DiskError::other(format!("decode BucketOptions failed: {}", err)).into()),
+                    error: Some(DiskError::other(format!("decode BucketOptions failed: {err}")).into()),
                 }));
             }
         };
@@ -221,7 +221,7 @@ impl Node for NodeService {
                         return Ok(tonic::Response::new(GetBucketInfoResponse {
                             success: false,
                             bucket_info: String::new(),
-                            error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                         }));
                     }
                 };
@@ -323,7 +323,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(DeleteResponse {
                         success: false,
-                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
                     }));
                 }
             };
@@ -354,7 +354,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(VerifyFileResponse {
                         success: false,
                         check_parts_resp: "".to_string(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
                     }));
                 }
             };
@@ -366,7 +366,7 @@ impl Node for NodeService {
                             return Ok(tonic::Response::new(VerifyFileResponse {
                                 success: false,
                                 check_parts_resp: String::new(),
-                                error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                             }));
                         }
                     };
@@ -400,7 +400,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(CheckPartsResponse {
                         success: false,
                         check_parts_resp: "".to_string(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
                     }));
                 }
             };
@@ -412,7 +412,7 @@ impl Node for NodeService {
                             return Ok(tonic::Response::new(CheckPartsResponse {
                                 success: false,
                                 check_parts_resp: String::new(),
-                                error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                             }));
                         }
                     };
@@ -773,7 +773,7 @@ impl Node for NodeService {
                 let (rd, mut wr) = tokio::io::duplex(64);
                 let job1 = spawn(async move {
                     if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-                        println!("walk_dir err {:?}", err);
+                        println!("walk_dir err {err:?}");
                     }
                 });
                 let job2 = spawn(async move {
@@ -829,7 +829,7 @@ impl Node for NodeService {
                                     break;
                                 }
 
-                                println!("get err {:?}", err);
+                                println!("get err {err:?}");
 
                                 let _ = tx
                                     .send(Ok(WalkDirResponse {
@@ -862,7 +862,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(RenameDataResponse {
                         success: false,
                         rename_data_resp: String::new(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
                     }));
                 }
             };
@@ -877,7 +877,7 @@ impl Node for NodeService {
                             return Ok(tonic::Response::new(RenameDataResponse {
                                 success: false,
                                 rename_data_resp: String::new(),
-                                error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                             }));
                         }
                     };
@@ -987,7 +987,7 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(StatVolumeResponse {
                         success: false,
                         volume_info: String::new(),
-                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(StatVolumeResponse {
@@ -1034,7 +1034,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(UpdateMetadataResponse {
                         success: false,
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
                     }));
                 }
             };
@@ -1043,7 +1043,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(UpdateMetadataResponse {
                         success: false,
-                        error: Some(DiskError::other(format!("decode UpdateMetadataOpts failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode UpdateMetadataOpts failed: {err}")).into()),
                     }));
                 }
             };
@@ -1074,7 +1074,7 @@ impl Node for NodeService {
                 Err(err) => {
                     return Ok(tonic::Response::new(WriteMetadataResponse {
                         success: false,
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
                     }));
                 }
             };
@@ -1105,7 +1105,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
-                        error: Some(DiskError::other(format!("decode ReadOptions failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode ReadOptions failed: {err}")).into()),
                     }));
                 }
             };
@@ -1122,7 +1122,7 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
-                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(ReadVersionResponse {
@@ -1153,7 +1153,7 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(ReadXlResponse {
                         success: false,
                         raw_file_info: String::new(),
-                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(ReadXlResponse {
@@ -1180,7 +1180,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(DeleteVersionResponse {
                         success: false,
                         raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
                     }));
                 }
             };
@@ -1190,7 +1190,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(DeleteVersionResponse {
                         success: false,
                         raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
                     }));
                 }
             };
@@ -1207,7 +1207,7 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(DeleteVersionResponse {
                         success: false,
                         raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(DeleteVersionResponse {
@@ -1236,7 +1236,7 @@ impl Node for NodeService {
                         return Ok(tonic::Response::new(DeleteVersionsResponse {
                             success: false,
                             errors: Vec::new(),
-                            error: Some(DiskError::other(format!("decode FileInfoVersions failed: {}", err)).into()),
+                            error: Some(DiskError::other(format!("decode FileInfoVersions failed: {err}")).into()),
                         }));
                     }
                 };
@@ -1247,7 +1247,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(DeleteVersionsResponse {
                         success: false,
                         errors: Vec::new(),
-                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
                     }));
                 }
             };
@@ -1291,7 +1291,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(ReadMultipleResponse {
                         success: false,
                         read_multiple_resps: Vec::new(),
-                        error: Some(DiskError::other(format!("decode ReadMultipleReq failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode ReadMultipleReq failed: {err}")).into()),
                     }));
                 }
             };
@@ -1353,7 +1353,7 @@ impl Node for NodeService {
                     return Ok(tonic::Response::new(DiskInfoResponse {
                         success: false,
                         disk_info: "".to_string(),
-                        error: Some(DiskError::other(format!("decode DiskInfoOptions failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("decode DiskInfoOptions failed: {err}")).into()),
                     }));
                 }
             };
@@ -1367,7 +1367,7 @@ impl Node for NodeService {
                     Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
                         success: false,
                         disk_info: "".to_string(),
-                        error: Some(DiskError::other(format!("encode data failed: {}", err)).into()),
+                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                     })),
                 },
                 Err(err) => Ok(tonic::Response::new(DiskInfoResponse {
@@ -1403,7 +1403,7 @@ impl Node for NodeService {
                                     success: false,
                                     update: "".to_string(),
                                     data_usage_cache: "".to_string(),
-                                    error: Some(DiskError::other(format!("decode DataUsageCache failed: {}", err)).into()),
+                                    error: Some(DiskError::other(format!("decode DataUsageCache failed: {err}")).into()),
                                 }))
                                 .await
                                 .expect("working rx");
@@ -1485,12 +1485,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not lock, args: {}, err: {}", args, err)),
+                    error_info: Some(format!("can not lock, args: {args}, err: {err}")),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err)),
+                error_info: Some(format!("can not decode args, err: {err}")),
             })),
         }
     }
@@ -1505,12 +1505,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not unlock, args: {}, err: {}", args, err)),
+                    error_info: Some(format!("can not unlock, args: {args}, err: {err}")),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err)),
+                error_info: Some(format!("can not decode args, err: {err}")),
             })),
         }
     }
@@ -1525,12 +1525,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not rlock, args: {}, err: {}", args, err)),
+                    error_info: Some(format!("can not rlock, args: {args}, err: {err}")),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err)),
+                error_info: Some(format!("can not decode args, err: {err}")),
             })),
         }
     }
@@ -1545,12 +1545,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not runlock, args: {}, err: {}", args, err)),
+                    error_info: Some(format!("can not runlock, args: {args}, err: {err}")),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err)),
+                error_info: Some(format!("can not decode args, err: {err}")),
             })),
         }
     }
@@ -1565,12 +1565,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not force_unlock, args: {}, err: {}", args, err)),
+                    error_info: Some(format!("can not force_unlock, args: {args}, err: {err}")),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err)),
+                error_info: Some(format!("can not decode args, err: {err}")),
             })),
         }
     }
@@ -1585,12 +1585,12 @@ impl Node for NodeService {
                 })),
                 Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                     success: false,
-                    error_info: Some(format!("can not refresh, args: {}, err: {}", args, err)),
+                    error_info: Some(format!("can not refresh, args: {args}, err: {err}")),
                 })),
             },
             Err(err) => Ok(tonic::Response::new(GenerallyLockResponse {
                 success: false,
-                error_info: Some(format!("can not decode args, err: {}", err)),
+                error_info: Some(format!("can not decode args, err: {err}")),
             })),
         }
     }
@@ -3595,7 +3595,7 @@ mod tests {
     #[test]
     fn test_node_service_debug() {
         let service = create_test_node_service();
-        let debug_str = format!("{:?}", service);
+        let debug_str = format!("{service:?}");
         assert!(debug_str.contains("NodeService"));
     }
 
@@ -3605,8 +3605,8 @@ mod tests {
         let service2 = make_server();
 
         // Both services should be created successfully
-        assert!(format!("{:?}", service1).contains("NodeService"));
-        assert!(format!("{:?}", service2).contains("NodeService"));
+        assert!(format!("{service1:?}").contains("NodeService"));
+        assert!(format!("{service2:?}").contains("NodeService"));
     }
 
     #[tokio::test]

@@ -98,7 +98,7 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
         let mut metadata = HashMap::new();
         metadata.insert("Content-Type".to_string(), "application/octet-stream".to_string());
         metadata.insert("X-Amz-Meta-Version".to_string(), i.to_string());
-        metadata.insert("X-Amz-Meta-Test".to_string(), format!("test-value-{}", i));
+        metadata.insert("X-Amz-Meta-Test".to_string(), format!("test-value-{i}"));
 
         let object_version = MetaObject {
             version_id: Some(version_id),

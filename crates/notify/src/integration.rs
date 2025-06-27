@@ -412,7 +412,6 @@ impl NotificationSystem {
             }
         }
 
-        // let rules_map = config.to_rules_map();
         let rules_map = config.get_rules_map();
         self.notifier.add_rules_map(bucket_name, rules_map.clone()).await;
         info!("Loaded notification config for bucket: {}", bucket_name);
@@ -473,9 +472,9 @@ impl Drop for NotificationSystem {
 pub async fn load_config_from_file(path: &str, system: &NotificationSystem) -> Result<(), NotificationError> {
     let config_data = tokio::fs::read(path)
         .await
-        .map_err(|e| NotificationError::Configuration(format!("Failed to read config file: {}", e)))?;
+        .map_err(|e| NotificationError::Configuration(format!("Failed to read config file: {e}")))?;
 
     let config = Config::unmarshal(config_data.as_slice())
-        .map_err(|e| NotificationError::Configuration(format!("Failed to parse config: {}", e)))?;
+        .map_err(|e| NotificationError::Configuration(format!("Failed to parse config: {e}")))?;
     system.reload_config(config).await
 }
