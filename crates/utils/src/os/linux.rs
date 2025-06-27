@@ -1,5 +1,5 @@
 use nix::sys::stat::{self, stat};
-use nix::sys::statfs::{self, FsType, statfs};
+use nix::sys::statfs::{self, statfs, FsType};
 use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind};
 use std::path::Path;
@@ -19,10 +19,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         Some(reserved) => reserved,
         None => {
             return Err(Error::other(format!(
-                "detected f_bavail space ({}) > f_bfree space ({}), fs corruption at ({}). please run 'fsck'",
-                bavail,
-                bfree,
-                p.as_ref().display()
+                "detected f_bavail space ({bavail}) > f_bfree space ({bfree}), fs corruption at ({p.as_ref().display()}). please run 'fsck'"
             )));
         }
     };
@@ -31,10 +28,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         Some(total) => total * bsize,
         None => {
             return Err(Error::other(format!(
-                "detected reserved space ({}) > blocks space ({}), fs corruption at ({}). please run 'fsck'",
-                reserved,
-                blocks,
-                p.as_ref().display()
+                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({p.as_ref().display()}). please run 'fsck'"
             )));
         }
     };
@@ -44,10 +38,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         Some(used) => used,
         None => {
             return Err(Error::other(format!(
-                "detected free space ({}) > total drive space ({}), fs corruption at ({}). please run 'fsck'",
-                free,
-                total,
-                p.as_ref().display()
+                "detected free space ({free}) > total drive space ({total}), fs corruption at ({p.as_ref().display()}). please run 'fsck'"
             )));
         }
     };
@@ -101,7 +92,7 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
 }
 
 pub fn get_drive_stats(major: u32, minor: u32) -> std::io::Result<IOStats> {
-    read_drive_stats(&format!("/sys/dev/block/{}:{}/stat", major, minor))
+    read_drive_stats(&format!("/sys/dev/block/{major}:{minor}/stat"))
 }
 
 fn read_drive_stats(stats_file: &str) -> std::io::Result<IOStats> {
@@ -109,7 +100,7 @@ fn read_drive_stats(stats_file: &str) -> std::io::Result<IOStats> {
     if stats.len() < 11 {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("found invalid format while reading {}", stats_file),
+            format!("found invalid format while reading {stats_file}"),
         ));
     }
     let mut io_stats = IOStats {
@@ -153,7 +144,7 @@ fn read_stat(file_name: &str) -> std::io::Result<Vec<u64>> {
         for token in line.split_whitespace() {
             let ui64: u64 = token
                 .parse()
-                .map_err(|e| Error::new(ErrorKind::InvalidData, format!("failed to parse '{}' as u64: {}", token, e)))?;
+                .map_err(|e| Error::new(ErrorKind::InvalidData, format!("failed to parse '{token}' as u64: {e}")))?;
             stats.push(ui64);
         }
     }
