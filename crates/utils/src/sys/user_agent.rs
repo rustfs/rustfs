@@ -70,23 +70,11 @@ impl UserAgent {
     #[cfg(windows)]
     fn get_windows_platform() -> String {
         // Priority to using sysinfo to get versions
-        if let Some(version) = System::os_version() {
-            format!("Windows NT {}", version)
-        } else {
-            // Fallback to cmd /c ver
-            let output = std::process::Command::new("cmd")
-                .args(&["/C", "ver"])
-                .output()
-                .unwrap_or_default();
-            let version = String::from_utf8_lossy(&output.stdout);
-            let version = version
-                .lines()
-                .next()
-                .unwrap_or("Windows NT 10.0")
-                .replace("Microsoft Windows [Version ", "")
-                .replace("]", "");
-            format!("Windows NT {}", version.trim())
-        }
+        let version = match System::os_version() {
+            Some(version) => version,
+            None => "Windows NT Unknown".to_string(),
+        };
+        format!("Windows NT {}", version)
     }
 
     #[cfg(not(windows))]
@@ -131,11 +119,11 @@ impl UserAgent {
 impl fmt::Display for UserAgent {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.service == ServiceType::Basis {
-            return write!(f, "Mozilla/5.0 ({}; {}) Rustfs/{}", self.os_platform, self.arch, self.version);
+            return write!(f, "Mozilla/5.0 ({}; {}) RustFS/{}", self.os_platform, self.arch, self.version);
         }
         write!(
             f,
-            "Mozilla/5.0 ({}; {}) Rustfs/{} ({})",
+            "Mozilla/5.0 ({}; {}) RustFS/{} ({})",
             self.os_platform,
             self.arch,
             self.version,
@@ -157,7 +145,7 @@ mod tests {
     fn test_user_agent_format_basis() {
         let ua = get_user_agent(ServiceType::Basis);
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("Rustfs/1.0.0"));
+        assert!(ua.contains("RustFS/1.0.0"));
         println!("User-Agent: {}", ua);
     }
 
@@ -165,7 +153,7 @@ mod tests {
     fn test_user_agent_format_core() {
         let ua = get_user_agent(ServiceType::Core);
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("Rustfs/1.0.0 (core)"));
+        assert!(ua.contains("RustFS/1.0.0 (core)"));
         println!("User-Agent: {}", ua);
     }
 
@@ -173,7 +161,7 @@ mod tests {
     fn test_user_agent_format_event() {
         let ua = get_user_agent(ServiceType::Event);
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("Rustfs/1.0.0 (event)"));
+        assert!(ua.contains("RustFS/1.0.0 (event)"));
         println!("User-Agent: {}", ua);
     }
 
@@ -181,7 +169,7 @@ mod tests {
     fn test_user_agent_format_logger() {
         let ua = get_user_agent(ServiceType::Logger);
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("Rustfs/1.0.0 (logger)"));
+        assert!(ua.contains("RustFS/1.0.0 (logger)"));
         println!("User-Agent: {}", ua);
     }
 
@@ -189,7 +177,7 @@ mod tests {
     fn test_user_agent_format_custom() {
         let ua = get_user_agent(ServiceType::Custom("monitor".to_string()));
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("Rustfs/1.0.0 (monitor)"));
+        assert!(ua.contains("RustFS/1.0.0 (monitor)"));
         println!("User-Agent: {}", ua);
     }
 

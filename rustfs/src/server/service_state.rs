@@ -2,6 +2,7 @@ use atomic_enum::atomic_enum;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 
