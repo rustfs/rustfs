@@ -412,7 +412,6 @@ impl NotificationSystem {
             }
         }
 
-        // let rules_map = config.to_rules_map();
         let rules_map = config.get_rules_map();
         self.notifier.add_rules_map(bucket_name, rules_map.clone()).await;
         info!("Loaded notification config for bucket: {}", bucket_name);
