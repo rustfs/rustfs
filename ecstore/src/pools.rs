@@ -121,11 +121,11 @@ impl PoolMeta {
         };
         let format = LittleEndian::read_u16(&data[0..2]);
         if format != POOL_META_FORMAT {
-            return Err(Error::other(format!("PoolMeta: unknown format: {}", format)));
+            return Err(Error::other(format!("PoolMeta: unknown format: {format}")));
         }
         let version = LittleEndian::read_u16(&data[2..4]);
         if version != POOL_META_VERSION {
-            return Err(Error::other(format!("PoolMeta: unknown version: {}", version)));
+            return Err(Error::other(format!("PoolMeta: unknown version: {version}")));
         }
 
         let mut buf = Deserializer::new(Cursor::new(&data[4..]));

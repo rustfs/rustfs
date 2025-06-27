@@ -48,8 +48,7 @@ fn parse_bitrot_config(s: &str) -> Result<Duration> {
                 Ok(months) => {
                     if months < RUSTFS_BITROT_CYCLE_IN_MONTHS {
                         return Err(Error::other(format!(
-                            "minimum bitrot cycle is {} month(s)",
-                            RUSTFS_BITROT_CYCLE_IN_MONTHS
+                            "minimum bitrot cycle is {RUSTFS_BITROT_CYCLE_IN_MONTHS} month(s)"
                         )));
                     }
 

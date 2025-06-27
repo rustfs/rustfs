@@ -30,7 +30,7 @@ pub fn Home() -> Element {
     #[allow(clippy::redundant_closure)]
     let service = use_signal(|| ServiceManager::new());
     let conf = RustFSConfig::load().unwrap_or_else(|e| {
-        ServiceManager::show_error(&format!("加载配置失败：{}", e));
+        ServiceManager::show_error(&format!("加载配置失败：{e}"));
         RustFSConfig::default()
     });
 
@@ -78,7 +78,7 @@ pub fn Home() -> Element {
                     }
                 }
                 Err(e) => {
-                    ServiceManager::show_error(&format!("服务启动失败：{}", e));
+                    ServiceManager::show_error(&format!("服务启动失败：{e}"));
                 }
             }
             // Only set loading to false when it's actually done
@@ -104,7 +104,7 @@ pub fn Home() -> Element {
                     }
                 }
                 Err(e) => {
-                    ServiceManager::show_error(&format!("服务停止失败：{}", e));
+                    ServiceManager::show_error(&format!("服务停止失败：{e}"));
                 }
             }
             debug!("service_state: {:?}", service_state.read());

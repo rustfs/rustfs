@@ -81,7 +81,7 @@ fn bench_encode_analysis(c: &mut Criterion) {
                     );
                 }
                 Err(e) => {
-                    println!("⚠️  Skipping test {} - configuration not supported: {}", test_name, e);
+                    println!("⚠️  Skipping test {test_name} - configuration not supported: {e}");
                 }
             }
             group.finish();
@@ -130,7 +130,7 @@ fn bench_decode_analysis(c: &mut Criterion) {
                     group.finish();
                 }
                 Err(e) => {
-                    println!("⚠️  Skipping decode test {} - configuration not supported: {}", test_name, e);
+                    println!("⚠️  Skipping decode test {test_name} - configuration not supported: {e}");
                 }
             }
         }
@@ -152,7 +152,7 @@ fn bench_shard_size_analysis(c: &mut Criterion) {
     for shard_size in shard_sizes {
         let total_size = shard_size * data_shards;
         let data = (0..total_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
-        let test_name = format!("{}B_shard_simd", shard_size);
+        let test_name = format!("{shard_size}B_shard_simd");
 
         group.throughput(Throughput::Bytes(total_size as u64));
 
@@ -169,7 +169,7 @@ fn bench_shard_size_analysis(c: &mut Criterion) {
                 });
             }
             Err(e) => {
-                println!("⚠️  Skipping shard size test {} - not supported: {}", test_name, e);
+                println!("⚠️  Skipping shard size test {test_name} - not supported: {e}");
             }
         }
     }
@@ -238,7 +238,7 @@ fn bench_error_recovery_analysis(c: &mut Criterion) {
 
         match erasure.encode_data(&data) {
             Ok(encoded_shards) => {
-                let test_name = format!("{}+{}_{}", data_shards, parity_shards, scenario_name);
+                let test_name = format!("{data_shards}+{parity_shards}_{scenario_name}");
 
                 group.bench_with_input(
                     BenchmarkId::new("recovery", &test_name),
@@ -261,7 +261,7 @@ fn bench_error_recovery_analysis(c: &mut Criterion) {
                 );
             }
             Err(e) => {
-                println!("⚠️  Skipping recovery test {}: {}", scenario_name, e);
+                println!("⚠️  Skipping recovery test {scenario_name}: {e}");
             }
         }
     }

@@ -117,8 +117,7 @@ impl Locker for LocalLocker {
     async fn lock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() > MAX_DELETE_LIST {
             return Err(Error::other(format!(
-                "internal error: LocalLocker.lock called with more than {} resources",
-                MAX_DELETE_LIST
+                "internal error: LocalLocker.lock called with more than {MAX_DELETE_LIST} resources"
             )));
         }
 
@@ -153,8 +152,7 @@ impl Locker for LocalLocker {
     async fn unlock(&mut self, args: &LockArgs) -> Result<bool> {
         if args.resources.len() > MAX_DELETE_LIST {
             return Err(Error::other(format!(
-                "internal error: LocalLocker.unlock called with more than {} resources",
-                MAX_DELETE_LIST
+                "internal error: LocalLocker.unlock called with more than {MAX_DELETE_LIST} resources"
             )));
         }
 
@@ -165,9 +163,9 @@ impl Locker for LocalLocker {
                 Some(lris) => {
                     if !is_write_lock(lris) {
                         if err_info.is_empty() {
-                            err_info = format!("unlock attempted on a read locked entity: {}", resource);
+                            err_info = format!("unlock attempted on a read locked entity: {resource}");
                         } else {
-                            err_info.push_str(&format!(", {}", resource));
+                            err_info.push_str(&format!(", {resource}"));
                         }
                     } else {
                         lris.retain(|lri| {
@@ -249,7 +247,7 @@ impl Locker for LocalLocker {
         match self.lock_map.get_mut(resource) {
             Some(lris) => {
                 if is_write_lock(lris) {
-                    return Err(Error::other(format!("runlock attempted on a write locked entity: {}", resource)));
+                    return Err(Error::other(format!("runlock attempted on a write locked entity: {resource}")));
                 } else {
                     lris.retain(|lri| {
                         if lri.uid == args.uid && (args.owner.is_empty() || lri.owner == args.owner) {
@@ -405,10 +403,10 @@ mod test {
         };
         local_locker.lock(&args).await?;
 
-        println!("lock local_locker: {:?} \n", local_locker);
+        println!("lock local_locker: {local_locker:?} \n");
 
         local_locker.unlock(&args).await?;
-        println!("unlock local_locker: {:?}", local_locker);
+        println!("unlock local_locker: {local_locker:?}");
 
         Ok(())
     }

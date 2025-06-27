@@ -128,7 +128,7 @@ impl Erasure {
                         total += n;
                         let res = self.encode_data(&buf[..n])?;
                         if let Err(err) = tx.send(res).await {
-                            return Err(std::io::Error::other(format!("Failed to send encoded data : {}", err)));
+                            return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                         }
                     }
                     Ok(_) => break,

@@ -184,7 +184,7 @@ impl ServiceManager {
             let cached_hash = fs::read_to_string(&hash_path).await?;
             let expected_hash = RUSTFS_HASH.lock().await;
             if cached_hash == *expected_hash {
-                println!("Use cached rustfs: {:?}", executable_path);
+                println!("Use cached rustfs: {executable_path:?}");
                 return Ok(executable_path);
             }
         }
@@ -235,23 +235,23 @@ impl ServiceManager {
                 match cmd {
                     ServiceCommand::Start(config) => {
                         if let Err(e) = Self::start_service(&config).await {
-                            Self::show_error(&format!("启动服务失败：{}", e));
+                            Self::show_error(&format!("启动服务失败：{e}"));
                         }
                     }
                     ServiceCommand::Stop => {
                         if let Err(e) = Self::stop_service().await {
-                            Self::show_error(&format!("停止服务失败：{}", e));
+                            Self::show_error(&format!("停止服务失败：{e}"));
                         }
                     }
                     ServiceCommand::Restart(config) => {
                         if Self::check_service_status().await.is_some() {
                             if let Err(e) = Self::stop_service().await {
-                                Self::show_error(&format!("重启服务失败：{}", e));
+                                Self::show_error(&format!("重启服务失败：{e}"));
                                 continue;
                             }
                         }
                         if let Err(e) = Self::start_service(&config).await {
-                            Self::show_error(&format!("重启服务失败：{}", e));
+                            Self::show_error(&format!("重启服务失败：{e}"));
                         }
                     }
                 }
@@ -283,7 +283,7 @@ impl ServiceManager {
     async fn start_service(config: &RustFSConfig) -> Result<(), Box<dyn Error>> {
         // Check if the service is already running
         if let Some(existing_pid) = Self::check_service_status().await {
-            return Err(format!("服务已经在运行，PID: {}", existing_pid).into());
+            return Err(format!("服务已经在运行，PID: {existing_pid}").into());
         }
 
         // Prepare the service program
@@ -304,7 +304,7 @@ impl ServiceManager {
         let ports = vec![main_port, console_port];
         for port in ports {
             if Self::is_port_in_use(host, port).await {
-                return Err(format!("端口 {} 已被占用", port).into());
+                return Err(format!("端口 {port} 已被占用").into());
             }
         }
 
@@ -327,7 +327,7 @@ impl ServiceManager {
 
         // Check if the service started successfully
         if Self::is_port_in_use(host, main_port).await {
-            Self::show_info(&format!("服务启动成功！进程 ID: {}", process_pid));
+            Self::show_info(&format!("服务启动成功！进程 ID: {process_pid}"));
 
             Ok(())
         } else {
@@ -387,7 +387,7 @@ impl ServiceManager {
     /// println!("{:?}", result);
     /// ```
     async fn is_port_in_use(host: &str, port: u16) -> bool {
-        TcpStream::connect(format!("{}:{}", host, port)).await.is_ok()
+        TcpStream::connect(format!("{host}:{port}")).await.is_ok()
     }
 
     /// Show an error message
@@ -674,7 +674,7 @@ mod tests {
             message: "Test message".to_string(),
         };
 
-        let debug_str = format!("{:?}", result);
+        let debug_str = format!("{result:?}");
         assert!(debug_str.contains("ServiceOperationResult"));
         assert!(debug_str.contains("success: true"));
         assert!(debug_str.contains("Test message"));
@@ -691,8 +691,8 @@ mod tests {
             let cloned_manager = service_manager.clone();
 
             // Both should be valid (we can't test much more without async runtime)
-            assert!(format!("{:?}", service_manager).contains("ServiceManager"));
-            assert!(format!("{:?}", cloned_manager).contains("ServiceManager"));
+            assert!(format!("{service_manager:?}").contains("ServiceManager"));
+            assert!(format!("{cloned_manager:?}").contains("ServiceManager"));
         });
     }
 
@@ -710,7 +710,7 @@ mod tests {
 
         for (input, expected) in test_cases {
             let result = ServiceManager::extract_port(input);
-            assert_eq!(result, expected, "Failed for input: {}", input);
+            assert_eq!(result, expected, "Failed for input: {input}");
         }
     }
 
@@ -729,7 +729,7 @@ mod tests {
 
         for input in invalid_cases {
             let result = ServiceManager::extract_port(input);
-            assert_eq!(result, None, "Should be None for input: {}", input);
+            assert_eq!(result, None, "Should be None for input: {input}");
         }
 
         // Special case: empty host but valid port should still work

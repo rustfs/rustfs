@@ -78,10 +78,10 @@ impl Config {
         Config {
             port,
             api: Api {
-                base_url: format!("http://{}:{}/{}", local_ip, port, RUSTFS_ADMIN_PREFIX),
+                base_url: format!("http://{local_ip}:{port}/{RUSTFS_ADMIN_PREFIX}"),
             },
             s3: S3 {
-                endpoint: format!("http://{}:{}", local_ip, port),
+                endpoint: format!("http://{local_ip}:{port}"),
                 region: "cn-east-1".to_owned(),
             },
             release: Release {
@@ -209,7 +209,7 @@ async fn config_handler(uri: Uri, Host(host): Host) -> impl IntoResponse {
     let mut cfg = CONSOLE_CONFIG.get().unwrap().clone();
 
     let url = format!("{}://{}:{}", scheme, host, cfg.port);
-    cfg.api.base_url = format!("{}{}", url, RUSTFS_ADMIN_PREFIX);
+    cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");
     cfg.s3.endpoint = url;
 
     Response::builder()
@@ -259,8 +259,8 @@ pub async fn start_static_file_server(
 }
 async fn start_server(server_addr: SocketAddr, tls_path: Option<String>, app: Router) -> io::Result<()> {
     let tls_path = tls_path.unwrap_or_default();
-    let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
-    let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+    let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
+    let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
     let handle = axum_server::Handle::new();
     // create a signal off listening task
     let handle_clone = handle.clone();
@@ -310,7 +310,7 @@ fn redirect_to_https(https_port: u16) -> Router {
                     .get("host")
                     .map_or("localhost", |h| h.to_str().unwrap_or("localhost"));
                 let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("");
-                let https_url = format!("https://{}:{}{}", host, https_port, path);
+                let https_url = format!("https://{host}:{https_port}{path}");
                 Redirect::permanent(&https_url)
             }
         }),

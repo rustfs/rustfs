@@ -228,7 +228,7 @@ impl PoolEndpointList {
 
                 let host = ep.url.host().unwrap();
                 let host_ip_set = host_ip_cache.entry(host.clone()).or_insert({
-                    get_host_ip(host.clone()).map_err(|e| Error::other(format!("host '{}' cannot resolve: {}", host, e)))?
+                    get_host_ip(host.clone()).map_err(|e| Error::other(format!("host '{host}' cannot resolve: {e}")))?
                 });
 
                 let path = ep.get_file_path();
@@ -236,8 +236,7 @@ impl PoolEndpointList {
                     Entry::Occupied(mut e) => {
                         if e.get().intersection(host_ip_set).count() > 0 {
                             return Err(Error::other(format!(
-                                "same path '{}' can not be served by different port on same address",
-                                path
+                                "same path '{path}' can not be served by different port on same address"
                             )));
                         }
                         e.get_mut().extend(host_ip_set.iter());
@@ -258,8 +257,7 @@ impl PoolEndpointList {
                 let path = ep.get_file_path();
                 if local_path_set.contains(path) {
                     return Err(Error::other(format!(
-                        "path '{}' cannot be served by different address on same server",
-                        path
+                        "path '{path}' cannot be served by different address on same server"
                     )));
                 }
                 local_path_set.insert(path);
@@ -751,67 +749,67 @@ mod test {
         }
         let non_loop_back_ip = non_loop_back_i_ps[0];
 
-        let case1_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
-        let case1_endpoint2 = format!("http://{}/d2", non_loop_back_ip);
+        let case1_endpoint1 = format!("http://{non_loop_back_ip}/d1");
+        let case1_endpoint2 = format!("http://{non_loop_back_ip}/d2");
         let args = vec![
             format!("http://{}:10000/d1", non_loop_back_ip),
             format!("http://{}:10000/d2", non_loop_back_ip),
             "http://example.org:10000/d3".to_string(),
             "http://example.com:10000/d4".to_string(),
         ];
-        let (case1_ur_ls, case1_local_flags) = get_expected_endpoints(args, format!("http://{}:10000/", non_loop_back_ip));
+        let (case1_ur_ls, case1_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:10000/"));
 
-        let case2_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
-        let case2_endpoint2 = format!("http://{}:9000/d2", non_loop_back_ip);
+        let case2_endpoint1 = format!("http://{non_loop_back_ip}/d1");
+        let case2_endpoint2 = format!("http://{non_loop_back_ip}:9000/d2");
         let args = vec![
             format!("http://{}:10000/d1", non_loop_back_ip),
             format!("http://{}:9000/d2", non_loop_back_ip),
             "http://example.org:10000/d3".to_string(),
             "http://example.com:10000/d4".to_string(),
         ];
-        let (case2_ur_ls, case2_local_flags) = get_expected_endpoints(args, format!("http://{}:10000/", non_loop_back_ip));
+        let (case2_ur_ls, case2_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:10000/"));
 
-        let case3_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let case3_endpoint1 = format!("http://{non_loop_back_ip}/d1");
         let args = vec![
             format!("http://{}:80/d1", non_loop_back_ip),
             "http://example.org:9000/d2".to_string(),
             "http://example.com:80/d3".to_string(),
             "http://example.net:80/d4".to_string(),
         ];
-        let (case3_ur_ls, case3_local_flags) = get_expected_endpoints(args, format!("http://{}:80/", non_loop_back_ip));
+        let (case3_ur_ls, case3_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:80/"));
 
-        let case4_endpoint1 = format!("http://{}/d1", non_loop_back_ip);
+        let case4_endpoint1 = format!("http://{non_loop_back_ip}/d1");
         let args = vec![
             format!("http://{}:9000/d1", non_loop_back_ip),
             "http://example.org:9000/d2".to_string(),
             "http://example.com:9000/d3".to_string(),
             "http://example.net:9000/d4".to_string(),
         ];
-        let (case4_ur_ls, case4_local_flags) = get_expected_endpoints(args, format!("http://{}:9000/", non_loop_back_ip));
+        let (case4_ur_ls, case4_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:9000/"));
 
-        let case5_endpoint1 = format!("http://{}:9000/d1", non_loop_back_ip);
-        let case5_endpoint2 = format!("http://{}:9001/d2", non_loop_back_ip);
-        let case5_endpoint3 = format!("http://{}:9002/d3", non_loop_back_ip);
-        let case5_endpoint4 = format!("http://{}:9003/d4", non_loop_back_ip);
+        let case5_endpoint1 = format!("http://{non_loop_back_ip}:9000/d1");
+        let case5_endpoint2 = format!("http://{non_loop_back_ip}:9001/d2");
+        let case5_endpoint3 = format!("http://{non_loop_back_ip}:9002/d3");
+        let case5_endpoint4 = format!("http://{non_loop_back_ip}:9003/d4");
         let args = vec![
             case5_endpoint1.clone(),
             case5_endpoint2.clone(),
             case5_endpoint3.clone(),
             case5_endpoint4.clone(),
         ];
-        let (case5_ur_ls, case5_local_flags) = get_expected_endpoints(args, format!("http://{}:9000/", non_loop_back_ip));
+        let (case5_ur_ls, case5_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:9000/"));
 
-        let case6_endpoint1 = format!("http://{}:9003/d4", non_loop_back_ip);
+        let case6_endpoint1 = format!("http://{non_loop_back_ip}:9003/d4");
         let args = vec![
             "http://localhost:9000/d1".to_string(),
             "http://localhost:9001/d2".to_string(),
             "http://127.0.0.1:9002/d3".to_string(),
             case6_endpoint1.clone(),
         ];
-        let (case6_ur_ls, case6_local_flags) = get_expected_endpoints(args, format!("http://{}:9003/", non_loop_back_ip));
+        let (case6_ur_ls, case6_local_flags) = get_expected_endpoints(args, format!("http://{non_loop_back_ip}:9003/"));
 
-        let case7_endpoint1 = format!("http://{}:9001/export", non_loop_back_ip);
-        let case7_endpoint2 = format!("http://{}:9000/export", non_loop_back_ip);
+        let case7_endpoint1 = format!("http://{non_loop_back_ip}:9001/export");
+        let case7_endpoint2 = format!("http://{non_loop_back_ip}:9000/export");
 
         let test_cases = [
             TestCase {

@@ -14,17 +14,16 @@ use tracing::{debug, warn};
 /// This function loads a public certificate from the specified file.
 pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     // Open certificate file.
-    let cert_file = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {}: {}", filename, e)))?;
+    let cert_file = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {filename}: {e}")))?;
     let mut reader = io::BufReader::new(cert_file);
 
     // Load and return certificate.
     let certs = certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| certs_error(format!("certificate file {} format error:{:?}", filename, e)))?;
+        .map_err(|e| certs_error(format!("certificate file {filename} format error:{e:?}")))?;
     if certs.is_empty() {
         return Err(certs_error(format!(
-            "No valid certificate was found in the certificate file {}",
-            filename
+            "No valid certificate was found in the certificate file {filename}"
         )));
     }
     Ok(certs)
@@ -34,11 +33,11 @@ pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
 /// This function loads a private key from the specified file.
 pub fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
     // Open keyfile.
-    let keyfile = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {}: {}", filename, e)))?;
+    let keyfile = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {filename}: {e}")))?;
     let mut reader = io::BufReader::new(keyfile);
 
     // Load and return a single private key.
-    private_key(&mut reader)?.ok_or_else(|| certs_error(format!("no private key found in {}", filename)))
+    private_key(&mut reader)?.ok_or_else(|| certs_error(format!("no private key found in {filename}")))
 }
 
 /// error function
@@ -58,8 +57,7 @@ pub fn load_all_certs_from_directory(
 
     if !dir.exists() || !dir.is_dir() {
         return Err(certs_error(format!(
-            "The certificate directory does not exist or is not a directory: {}",
-            dir_path
+            "The certificate directory does not exist or is not a directory: {dir_path}"
         )));
     }
 
@@ -71,10 +69,10 @@ pub fn load_all_certs_from_directory(
         debug!("find the root directory certificate: {:?}", root_cert_path);
         let root_cert_str = root_cert_path
             .to_str()
-            .ok_or_else(|| certs_error(format!("Invalid UTF-8 in root certificate path: {:?}", root_cert_path)))?;
+            .ok_or_else(|| certs_error(format!("Invalid UTF-8 in root certificate path: {root_cert_path:?}")))?;
         let root_key_str = root_key_path
             .to_str()
-            .ok_or_else(|| certs_error(format!("Invalid UTF-8 in root key path: {:?}", root_key_path)))?;
+            .ok_or_else(|| certs_error(format!("Invalid UTF-8 in root key path: {root_key_path:?}")))?;
         match load_cert_key_pair(root_cert_str, root_key_str) {
             Ok((certs, key)) => {
                 // The root directory certificate is used as the default certificate and is stored using special keys.
@@ -95,7 +93,7 @@ pub fn load_all_certs_from_directory(
             let domain_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .ok_or_else(|| certs_error(format!("invalid domain name directory:{:?}", path)))?;
+                .ok_or_else(|| certs_error(format!("invalid domain name directory:{path:?}")))?;
 
             // find certificate and private key files
             let cert_path = path.join(RUSTFS_TLS_CERT); // e.g., rustfs_cert.pem
@@ -117,8 +115,7 @@ pub fn load_all_certs_from_directory(
 
     if cert_key_pairs.is_empty() {
         return Err(certs_error(format!(
-            "No valid certificate/private key pair found in directory {}",
-            dir_path
+            "No valid certificate/private key pair found in directory {dir_path}"
         )));
     }
 
@@ -165,7 +162,7 @@ pub fn create_multi_cert_resolver(
     for (domain, (certs, key)) in cert_key_pairs {
         // create a signature
         let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
-            .map_err(|e| certs_error(format!("unsupported private key types:{}, err:{:?}", domain, e)))?;
+            .map_err(|e| certs_error(format!("unsupported private key types:{domain}, err:{e:?}")))?;
 
         // create a CertifiedKey
         let certified_key = CertifiedKey::new(certs, signing_key);
@@ -175,7 +172,7 @@ pub fn create_multi_cert_resolver(
             // add certificate to resolver
             resolver
                 .add(&domain, certified_key)
-                .map_err(|e| certs_error(format!("failed to add a domain name certificate:{},err: {:?}", domain, e)))?;
+                .map_err(|e| certs_error(format!("failed to add a domain name certificate:{domain},err: {e:?}")))?;
         }
     }
 
@@ -343,10 +340,10 @@ mod tests {
         ];
 
         for (input, _expected_pattern) in test_cases {
-            let error1 = certs_error(format!("failed to open test.pem: {}", input));
+            let error1 = certs_error(format!("failed to open test.pem: {input}"));
             assert!(error1.to_string().contains(input));
 
-            let error2 = certs_error(format!("failed to open key.pem: {}", input));
+            let error2 = certs_error(format!("failed to open key.pem: {input}"));
             assert!(error2.to_string().contains(input));
         }
     }
@@ -455,6 +452,6 @@ mod tests {
         let error_size = mem::size_of_val(&error);
 
         // Error should not be excessively large
-        assert!(error_size < 1024, "Error size should be reasonable, got {} bytes", error_size);
+        assert!(error_size < 1024, "Error size should be reasonable, got {error_size} bytes");
     }
 }

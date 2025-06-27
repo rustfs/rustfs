@@ -119,7 +119,7 @@ impl Clone for Error {
         match self {
             Error::PolicyError(e) => Error::StringError(e.to_string()), // Convert to string since PolicyError may not be cloneable
             Error::StringError(s) => Error::StringError(s.clone()),
-            Error::CryptoError(e) => Error::StringError(format!("crypto: {}", e)), // Convert to string
+            Error::CryptoError(e) => Error::StringError(format!("crypto: {e}")), // Convert to string
             Error::NoSuchUser(s) => Error::NoSuchUser(s.clone()),
             Error::NoSuchAccount(s) => Error::NoSuchAccount(s.clone()),
             Error::NoSuchServiceAccount(s) => Error::NoSuchServiceAccount(s.clone()),
@@ -137,7 +137,7 @@ impl Clone for Error {
             Error::InvalidSecretKeyLength => Error::InvalidSecretKeyLength,
             Error::ContainsReservedChars => Error::ContainsReservedChars,
             Error::GroupNameContainsReservedChars => Error::GroupNameContainsReservedChars,
-            Error::JWTError(e) => Error::StringError(format!("jwt err {}", e)), // Convert to string
+            Error::JWTError(e) => Error::StringError(format!("jwt err {e}")), // Convert to string
             Error::NoAccessKey => Error::NoAccessKey,
             Error::InvalidToken => Error::InvalidToken,
             Error::InvalidAccessKey => Error::InvalidAccessKey,

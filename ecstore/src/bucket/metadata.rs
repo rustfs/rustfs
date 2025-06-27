@@ -285,7 +285,7 @@ impl BucketMetadata {
                 self.bucket_targets_config_json = data.clone();
                 self.bucket_targets_config_updated_at = updated;
             }
-            _ => return Err(Error::other(format!("config file not found : {}", config_file))),
+            _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
 
         Ok(updated)

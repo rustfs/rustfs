@@ -71,7 +71,7 @@ impl std::fmt::Display for SizeCategory {
             SizeCategory::SizeGreaterThan1GiB => "SizeGreaterThan1GiB",
             SizeCategory::SizeLastElemMarker => "SizeLastElemMarker",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(elem.n, cloned.n);
 
         // Test Debug trait
-        let debug_str = format!("{:?}", elem);
+        let debug_str = format!("{elem:?}");
         assert!(debug_str.contains("100"));
         assert!(debug_str.contains("200"));
         assert!(debug_str.contains("5"));
@@ -755,8 +755,7 @@ mod tests {
 
             assert_eq!(
                 test_latency.totals[expected_idx].n, 1,
-                "Failed for timestamp {} (expected index {})",
-                timestamp, expected_idx
+                "Failed for timestamp {timestamp} (expected index {expected_idx})"
             );
         }
     }
@@ -796,7 +795,7 @@ mod tests {
             n: 789,
         };
 
-        let debug_str = format!("{:?}", elem);
+        let debug_str = format!("{elem:?}");
         assert!(debug_str.contains("123"));
         assert!(debug_str.contains("456"));
         assert!(debug_str.contains("789"));

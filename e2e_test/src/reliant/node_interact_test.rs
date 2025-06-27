@@ -52,9 +52,9 @@ async fn ping() -> Result<(), Box<dyn Error>> {
     // Print response
     let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
     if let Err(e) = ping_response_body {
-        eprintln!("{}", e);
+        eprintln!("{e}");
     } else {
-        println!("ping_resp:body(flatbuffer): {:?}", ping_response_body);
+        println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
     }
 
     Ok(())
@@ -93,7 +93,7 @@ async fn list_volumes() -> Result<(), Box<dyn Error>> {
         .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
         .collect();
 
-    println!("{:?}", volume_infos);
+    println!("{volume_infos:?}");
     Ok(())
 }
 
@@ -127,7 +127,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
                         println!("{}", resp.error_info.unwrap_or("".to_string()));
                     }
                     let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-                        .map_err(|_e| std::io::Error::other(format!("Unexpected response: {:?}", response)))
+                        .map_err(|_e| std::io::Error::other(format!("Unexpected response: {response:?}")))
                         .unwrap();
                     out.write_obj(&entry).await.unwrap();
                 }
@@ -136,7 +136,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
                     break;
                 }
                 _ => {
-                    println!("Unexpected response: {:?}", response);
+                    println!("Unexpected response: {response:?}");
                     let _ = out.close().await;
                     break;
                 }
@@ -146,7 +146,7 @@ async fn walk_dir() -> Result<(), Box<dyn Error>> {
     let job2 = spawn(async move {
         let mut reader = MetacacheReader::new(rd);
         while let Ok(Some(entry)) = reader.peek().await {
-            println!("{:?}", entry);
+            println!("{entry:?}");
         }
     });
 
@@ -168,7 +168,7 @@ async fn read_all() -> Result<(), Box<dyn Error>> {
     let volume_infos = response.data;
 
     println!("{}", response.success);
-    println!("{:?}", volume_infos);
+    println!("{volume_infos:?}");
     Ok(())
 }
 
@@ -187,6 +187,6 @@ async fn storage_info() -> Result<(), Box<dyn Error>> {
 
     let mut buf = Deserializer::new(Cursor::new(info));
     let storage_info: madmin::StorageInfo = Deserialize::deserialize(&mut buf).unwrap();
-    println!("{:?}", storage_info);
+    println!("{storage_info:?}");
     Ok(())
 }

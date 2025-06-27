@@ -74,7 +74,7 @@ fn test_jwt_decode_invalid_token_format() {
 
     for invalid_token in &invalid_tokens {
         let result = decode(invalid_token, secret);
-        assert!(result.is_err(), "Invalid token '{}' should fail to decode", invalid_token);
+        assert!(result.is_err(), "Invalid token '{invalid_token}' should fail to decode");
     }
 }
 
@@ -207,7 +207,7 @@ fn test_jwt_token_structure() {
 
     // Each part should be non-empty
     for (i, part) in parts.iter().enumerate() {
-        assert!(!part.is_empty(), "JWT part {} should not be empty", i);
+        assert!(!part.is_empty(), "JWT part {i} should not be empty");
     }
 }
 

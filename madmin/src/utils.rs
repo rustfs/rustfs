@@ -16,22 +16,22 @@ mod test {
     fn test_parse_dur() {
         let s = String::from("3s");
         let dur = parse_duration(&s);
-        println!("{:?}", dur);
+        println!("{dur:?}");
         assert_eq!(Ok(Duration::from_secs(3)), dur);
 
         let s = String::from("3ms");
         let dur = parse_duration(&s);
-        println!("{:?}", dur);
+        println!("{dur:?}");
         assert_eq!(Ok(Duration::from_millis(3)), dur);
 
         let s = String::from("3m");
         let dur = parse_duration(&s);
-        println!("{:?}", dur);
+        println!("{dur:?}");
         assert_eq!(Ok(Duration::from_secs(3 * 60)), dur);
 
         let s = String::from("3h");
         let dur = parse_duration(&s);
-        println!("{:?}", dur);
+        println!("{dur:?}");
         assert_eq!(Ok(Duration::from_secs(3 * 60 * 60)), dur);
     }
 }

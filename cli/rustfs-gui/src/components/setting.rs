@@ -49,7 +49,7 @@ pub fn Setting() -> Element {
             let config = config.read().clone();
             spawn(async move {
                 if let Err(e) = service.read().restart(config).await {
-                    ServiceManager::show_error(&format!("发送重启命令失败：{}", e));
+                    ServiceManager::show_error(&format!("发送重启命令失败：{e}"));
                 }
                 // reset the status when you're done
                 loading.set(false);

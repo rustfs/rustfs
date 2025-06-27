@@ -111,7 +111,7 @@ pub fn get_available_port() -> u16 {
 pub fn must_get_local_ips() -> std::io::Result<Vec<IpAddr>> {
     match netif::up() {
         Ok(up) => Ok(up.map(|x| x.address().to_owned()).collect()),
-        Err(err) => Err(std::io::Error::other(format!("Unable to get IP addresses of this host: {}", err))),
+        Err(err) => Err(std::io::Error::other(format!("Unable to get IP addresses of this host: {err}"))),
     }
 }
 
@@ -260,7 +260,7 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
         let port_str = port;
         let port: u16 = port_str
             .parse()
-            .map_err(|e| std::io::Error::other(format!("Invalid port format: {}, err:{:?}", addr_str, e)))?;
+            .map_err(|e| std::io::Error::other(format!("Invalid port format: {addr_str}, err:{e:?}")))?;
         let final_port = if port == 0 {
             get_available_port() // assume get_available_port is available here
         } else {
@@ -342,7 +342,7 @@ mod test {
 
         for (addr, expected) in test_cases {
             let result = is_socket_addr(addr);
-            assert_eq!(expected, result, "addr: '{}', expected: {}, got: {}", addr, expected, result);
+            assert_eq!(expected, result, "addr: '{addr}', expected: {expected}, got: {result}");
         }
     }
 
@@ -353,7 +353,7 @@ mod test {
 
         for addr in valid_cases {
             let result = check_local_server_addr(addr);
-            assert!(result.is_ok(), "Expected '{}' to be valid, but got error: {:?}", addr, result);
+            assert!(result.is_ok(), "Expected '{addr}' to be valid, but got error: {result:?}");
         }
 
         // Test invalid addresses
@@ -368,15 +368,12 @@ mod test {
 
         for (addr, expected_error_pattern) in invalid_cases {
             let result = check_local_server_addr(addr);
-            assert!(result.is_err(), "Expected '{}' to be invalid, but it was accepted: {:?}", addr, result);
+            assert!(result.is_err(), "Expected '{addr}' to be invalid, but it was accepted: {result:?}");
 
             let error_msg = result.unwrap_err().to_string();
             assert!(
                 error_msg.contains(expected_error_pattern) || error_msg.contains("invalid socket address"),
-                "Error message '{}' doesn't contain expected pattern '{}' for address '{}'",
-                error_msg,
-                expected_error_pattern,
-                addr
+                "Error message '{error_msg}' doesn't contain expected pattern '{expected_error_pattern}' for address '{addr}'"
             );
         }
     }

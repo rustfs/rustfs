@@ -130,7 +130,7 @@ impl ListPathOptions {
     pub fn parse_marker(&mut self) {
         if let Some(marker) = &self.marker {
             let s = marker.clone();
-            if !s.contains(format!("[rustfs_cache:{}", MARKER_TAG_VERSION).as_str()) {
+            if !s.contains(format!("[rustfs_cache:{MARKER_TAG_VERSION}").as_str()) {
                 return;
             }
 
@@ -188,7 +188,7 @@ impl ListPathOptions {
                 self.pool_idx.unwrap_or_default(),
             )
         } else {
-            format!("{}[rustfs_cache:{},return:]", marker, MARKER_TAG_VERSION)
+            format!("{marker}[rustfs_cache:{MARKER_TAG_VERSION},return:]")
         }
     }
 }

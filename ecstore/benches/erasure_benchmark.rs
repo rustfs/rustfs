@@ -250,7 +250,7 @@ fn bench_shard_size_impact(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(total_data_size as u64));
 
         // Test SIMD implementation
-        group.bench_with_input(BenchmarkId::new("simd", format!("shard_{}B", shard_size)), &data, |b, data| {
+        group.bench_with_input(BenchmarkId::new("simd", format!("shard_{shard_size}B")), &data, |b, data| {
             let erasure = Erasure::new(data_shards, parity_shards, total_data_size);
             b.iter(|| {
                 let shards = erasure.encode_data(black_box(data)).unwrap();
@@ -282,7 +282,7 @@ fn bench_coding_configurations(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
 
     for (data_shards, parity_shards) in configs {
-        let config_name = format!("{}+{}", data_shards, parity_shards);
+        let config_name = format!("{data_shards}+{parity_shards}");
 
         group.bench_with_input(BenchmarkId::new("encode", &config_name), &data, |b, data| {
             let erasure = Erasure::new(data_shards, parity_shards, data_size);

@@ -111,7 +111,7 @@ impl Operation for AssumeRoleHandle {
         info!("AssumeRole get claims {:?}", &claims);
 
         let mut new_cred = get_new_credentials_with_metadata(&claims, &secret)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get new cred failed {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get new cred failed {e}")))?;
 
         new_cred.parent_user = cred.access_key.clone();
 
@@ -147,13 +147,13 @@ impl Operation for AssumeRoleHandle {
 pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str) -> S3Result<()> {
     if !policy.is_empty() {
         let session_policy = Policy::parse_config(policy.as_bytes())
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse policy err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse policy err {e}")))?;
         if session_policy.version.is_empty() {
             return Err(s3_error!(InvalidRequest, "invalid policy"));
         }
 
         let policy_buf = serde_json::to_vec(&session_policy)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal policy err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal policy err {e}")))?;
 
         if policy_buf.len() > 2048 {
             return Err(s3_error!(InvalidRequest, "policy too large"));

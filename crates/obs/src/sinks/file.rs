@@ -108,7 +108,7 @@ impl FileSink {
 #[async_trait]
 impl Sink for FileSink {
     async fn write(&self, entry: &UnifiedLogEntry) {
-        let line = format!("{:?}\n", entry);
+        let line = format!("{entry:?}\n");
         let mut writer = self.writer.lock().await;
 
         if let Err(e) = writer.write_all(line.as_bytes()).await {
@@ -156,7 +156,7 @@ impl Drop for FileSink {
             rt.block_on(async {
                 let mut writer = writer.lock().await;
                 if let Err(e) = writer.flush().await {
-                    eprintln!("Failed to flush log file {}: {}", path, e);
+                    eprintln!("Failed to flush log file {path}: {e}");
                 }
             });
         });

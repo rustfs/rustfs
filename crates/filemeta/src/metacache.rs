@@ -463,7 +463,7 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
 
     pub async fn init(&mut self) -> Result<()> {
         if !self.created {
-            rmp::encode::write_u8(&mut self.buf, METACACHE_STREAM_VERSION).map_err(|e| Error::other(format!("{:?}", e)))?;
+            rmp::encode::write_u8(&mut self.buf, METACACHE_STREAM_VERSION).map_err(|e| Error::other(format!("{e:?}")))?;
             self.flush().await?;
             self.created = true;
         }
@@ -491,16 +491,16 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
     pub async fn write_obj(&mut self, obj: &MetaCacheEntry) -> Result<()> {
         self.init().await?;
 
-        rmp::encode::write_bool(&mut self.buf, true).map_err(|e| Error::other(format!("{:?}", e)))?;
-        rmp::encode::write_str(&mut self.buf, &obj.name).map_err(|e| Error::other(format!("{:?}", e)))?;
-        rmp::encode::write_bin(&mut self.buf, &obj.metadata).map_err(|e| Error::other(format!("{:?}", e)))?;
+        rmp::encode::write_bool(&mut self.buf, true).map_err(|e| Error::other(format!("{e:?}")))?;
+        rmp::encode::write_str(&mut self.buf, &obj.name).map_err(|e| Error::other(format!("{e:?}")))?;
+        rmp::encode::write_bin(&mut self.buf, &obj.metadata).map_err(|e| Error::other(format!("{e:?}")))?;
         self.flush().await?;
 
         Ok(())
     }
 
     pub async fn close(&mut self) -> Result<()> {
-        rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{:?}", e)))?;
+        rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
         self.flush().await?;
         Ok(())
     }
@@ -559,7 +559,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             let ver = match rmp::decode::read_u8(&mut self.read_more(2).await?) {
                 Ok(res) => res,
                 Err(err) => {
-                    self.err = Some(Error::other(format!("{:?}", err)));
+                    self.err = Some(Error::other(format!("{err:?}")));
                     0
                 }
             };
@@ -852,7 +852,7 @@ mod tests {
         let mut objs = Vec::new();
         for i in 0..10 {
             let info = MetaCacheEntry {
-                name: format!("item{}", i),
+                name: format!("item{i}"),
                 metadata: vec![0u8, 10],
                 cached: None,
                 reusable: false,

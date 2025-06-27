@@ -101,7 +101,7 @@ impl TryFrom<&str> for Endpoint {
                     is_local = true;
                     url_parse_from_file_path(value)?
                 }
-                _ => return Err(Error::other(format!("invalid URL endpoint format: {}", e))),
+                _ => return Err(Error::other(format!("invalid URL endpoint format: {e}"))),
             },
         };
 
@@ -163,8 +163,8 @@ impl Endpoint {
 
     pub fn host_port(&self) -> String {
         match (self.url.host(), self.url.port()) {
-            (Some(host), Some(port)) => format!("{}:{}", host, port),
-            (Some(host), None) => format!("{}", host),
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => format!("{host}"),
             _ => String::new(),
         }
     }
@@ -191,7 +191,7 @@ fn url_parse_from_file_path(value: &str) -> Result<Url> {
 
     let file_path = match Path::new(value).absolutize() {
         Ok(path) => path,
-        Err(err) => return Err(Error::other(format!("absolute path failed: {}", err))),
+        Err(err) => return Err(Error::other(format!("absolute path failed: {err}"))),
     };
 
     match Url::from_file_path(file_path) {
@@ -377,12 +377,12 @@ mod test {
     fn test_endpoint_display() {
         // Test file path display
         let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
-        let display_str = format!("{}", file_endpoint);
+        let display_str = format!("{file_endpoint}");
         assert_eq!(display_str, "/tmp/data");
 
         // Test URL display
         let url_endpoint = Endpoint::try_from("http://example.com:9000/path").unwrap();
-        let display_str = format!("{}", url_endpoint);
+        let display_str = format!("{url_endpoint}");
         assert_eq!(display_str, "http://example.com:9000/path");
     }
 

@@ -63,7 +63,7 @@ impl Operation for AddUser {
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("decrypt_data err {}", e)))?;
 
         let args: AddOrUpdateUserReq = serde_json::from_slice(&body)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("unmarshal body err {e}")))?;
 
         if args.secret_key.is_empty() {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
@@ -111,7 +111,7 @@ impl Operation for AddUser {
         iam_store
             .create_user(ak, &args)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("create_user err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("create_user err {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -156,7 +156,7 @@ impl Operation for SetUserStatus {
         iam_store
             .set_user_status(ak, status)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("set_user_status err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("set_user_status err {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -201,7 +201,7 @@ impl Operation for ListUsers {
         };
 
         let data = serde_json::to_vec(&users)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {e}")))?;
 
         // let Some(input_cred) = req.credentials else {
         //     return Err(s3_error!(InvalidRequest, "get cred failed"));
@@ -242,7 +242,7 @@ impl Operation for RemoveUser {
         let (is_temp, _) = iam_store
             .is_temp_user(ak)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("is_temp_user err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("is_temp_user err {e}")))?;
 
         if is_temp {
             return Err(s3_error!(InvalidArgument, "can't remove temp user"));
@@ -269,7 +269,7 @@ impl Operation for RemoveUser {
         iam_store
             .delete_user(ak, true)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("delete_user err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("delete_user err {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -332,7 +332,7 @@ impl Operation for GetUserInfo {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let data = serde_json::to_vec(&info)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal user err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal user err {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());

@@ -472,9 +472,9 @@ impl Drop for NotificationSystem {
 pub async fn load_config_from_file(path: &str, system: &NotificationSystem) -> Result<(), NotificationError> {
     let config_data = tokio::fs::read(path)
         .await
-        .map_err(|e| NotificationError::Configuration(format!("Failed to read config file: {}", e)))?;
+        .map_err(|e| NotificationError::Configuration(format!("Failed to read config file: {e}")))?;
 
     let config = Config::unmarshal(config_data.as_slice())
-        .map_err(|e| NotificationError::Configuration(format!("Failed to parse config: {}", e)))?;
+        .map_err(|e| NotificationError::Configuration(format!("Failed to parse config: {e}")))?;
     system.reload_config(config).await
 }

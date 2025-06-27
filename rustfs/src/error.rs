@@ -268,7 +268,7 @@ mod tests {
             source: Some(Box::new(IoError::new(ErrorKind::NotFound, "file not found"))),
         };
 
-        let debug_str = format!("{:?}", api_error);
+        let debug_str = format!("{api_error:?}");
         assert!(debug_str.contains("NoSuchKey"));
         assert!(debug_str.contains("Object not found"));
     }

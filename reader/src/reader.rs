@@ -149,7 +149,7 @@ where
                             let got = hash.sum();
                             let src = hex.as_str();
                             if src != got.as_str() {
-                                println!("sha256 err src:{},got:{}", src, got);
+                                println!("sha256 err src:{src},got:{got}");
                                 return Poll::Ready(Some(Err(Box::new(ReaderError::SHA256Mismatch(src.to_string(), got)))));
                             }
                         }
@@ -161,7 +161,7 @@ where
                             let src = hex.as_str();
                             if src != got.as_str() {
                                 // TODO: ERR
-                                println!("md5 err src:{},got:{}", src, got);
+                                println!("md5 err src:{src},got:{got}");
                                 return Poll::Ready(Some(Err(Box::new(ReaderError::ChecksumMismatch(src.to_string(), got)))));
                             }
                         }
@@ -435,7 +435,7 @@ mod test {
                         println!("bytes: {}, {:?}", bytes.len(), bytes);
                     }
                     Err(err) => {
-                        println!("err:{:?}", err);
+                        println!("err:{err:?}");
                         break;
                     }
                 },
@@ -483,7 +483,7 @@ mod test {
                         println!("bytes: {}, {:?}", bytes.len(), bytes);
                     }
                     Err(err) => {
-                        println!("err:{:?}", err);
+                        println!("err:{err:?}");
                         break;
                     }
                 },
@@ -533,7 +533,7 @@ mod test {
                         println!("bytes: {}, {:?}", bytes.len(), bytes);
                     }
                     Err(err) => {
-                        println!("err:{:?}", err);
+                        println!("err:{err:?}");
                         break;
                     }
                 },

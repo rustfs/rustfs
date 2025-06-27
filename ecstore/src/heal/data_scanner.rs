@@ -487,7 +487,7 @@ impl CurrentScannerCycle {
                         Deserialize::deserialize(&mut Deserializer::new(&buf[..])).expect("Deserialization failed");
                     self.cycle_completed = u;
                 }
-                name => return Err(Error::other(format!("not support field name {}", name))),
+                name => return Err(Error::other(format!("not support field name {name}"))),
             }
         }
 

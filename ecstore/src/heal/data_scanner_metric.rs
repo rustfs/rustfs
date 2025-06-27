@@ -372,7 +372,7 @@ impl ScannerMetrics {
 
         for (disk, tracker) in paths.iter() {
             let path = tracker.get_path().await;
-            result.push(format!("{}/{}", disk, path));
+            result.push(format!("{disk}/{path}"));
         }
 
         result

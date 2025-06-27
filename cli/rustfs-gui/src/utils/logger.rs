@@ -94,7 +94,7 @@ mod tests {
 
         // We can't actually build it without creating directories,
         // but we can verify the builder pattern works
-        let debug_str = format!("{:?}", builder);
+        let debug_str = format!("{builder:?}");
         // The actual debug format might be different, so just check it's not empty
         assert!(!debug_str.is_empty());
         // Check that it contains some expected parts
@@ -112,10 +112,10 @@ mod tests {
         let never = Rotation::NEVER;
 
         // Test that rotation types can be created and formatted
-        assert!(!format!("{:?}", daily).is_empty());
-        assert!(!format!("{:?}", hourly).is_empty());
-        assert!(!format!("{:?}", minutely).is_empty());
-        assert!(!format!("{:?}", never).is_empty());
+        assert!(!format!("{daily:?}").is_empty());
+        assert!(!format!("{hourly:?}").is_empty());
+        assert!(!format!("{minutely:?}").is_empty());
+        assert!(!format!("{never:?}").is_empty());
     }
 
     #[test]
@@ -159,10 +159,10 @@ mod tests {
         let error_filter = tracing_subscriber::EnvFilter::new("error");
 
         // Test that filters can be created
-        assert!(!format!("{:?}", info_filter).is_empty());
-        assert!(!format!("{:?}", debug_filter).is_empty());
-        assert!(!format!("{:?}", warn_filter).is_empty());
-        assert!(!format!("{:?}", error_filter).is_empty());
+        assert!(!format!("{info_filter:?}").is_empty());
+        assert!(!format!("{debug_filter:?}").is_empty());
+        assert!(!format!("{warn_filter:?}").is_empty());
+        assert!(!format!("{error_filter:?}").is_empty());
     }
 
     #[test]
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(suffix, "log");
 
         // Test that these would create valid filenames
-        let sample_filename = format!("{}.2024-01-01.{}", prefix, suffix);
+        let sample_filename = format!("{prefix}.2024-01-01.{suffix}");
         assert_eq!(sample_filename, "rustfs-cli.2024-01-01.log");
     }
 
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(logs_dir_name, "logs");
 
         // Test path joining
-        let combined = format!("{}/{}", rustfs_dir_name, logs_dir_name);
+        let combined = format!("{rustfs_dir_name}/{logs_dir_name}");
         assert_eq!(combined, "rustfs/logs");
     }
 

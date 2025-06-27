@@ -98,7 +98,7 @@ impl ReedSolomonEncoder {
                         warn!("Failed to reset SIMD encoder: {:?}, creating new one", e);
                         // 如果reset失败，创建新的encoder
                         reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
-                            .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {:?}", e)))?
+                            .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?
                     } else {
                         cached_encoder
                     }
@@ -106,7 +106,7 @@ impl ReedSolomonEncoder {
                 None => {
                     // 第一次使用，创建新encoder
                     reed_solomon_simd::ReedSolomonEncoder::new(self.data_shards, self.parity_shards, shard_len)
-                        .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {:?}", e)))?
+                        .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?
                 }
             }
         };
@@ -115,13 +115,13 @@ impl ReedSolomonEncoder {
         for (i, shard) in shards_vec.iter().enumerate().take(self.data_shards) {
             encoder
                 .add_original_shard(shard)
-                .map_err(|e| io::Error::other(format!("Failed to add shard {}: {:?}", i, e)))?;
+                .map_err(|e| io::Error::other(format!("Failed to add shard {i}: {e:?}")))?;
         }
 
         // 编码并获取恢复shards
         let result = encoder
             .encode()
-            .map_err(|e| io::Error::other(format!("SIMD encoding failed: {:?}", e)))?;
+            .map_err(|e| io::Error::other(format!("SIMD encoding failed: {e:?}")))?;
 
         // 将恢复shards复制到输出缓冲区
         for (i, recovery_shard) in result.recovery_iter().enumerate() {
@@ -176,7 +176,7 @@ impl ReedSolomonEncoder {
                         warn!("Failed to reset SIMD decoder: {:?}, creating new one", e);
                         // 如果reset失败，创建新的decoder
                         reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
-                            .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {:?}", e)))?
+                            .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?
                     } else {
                         cached_decoder
                     }
@@ -184,7 +184,7 @@ impl ReedSolomonEncoder {
                 None => {
                     // 第一次使用，创建新decoder
                     reed_solomon_simd::ReedSolomonDecoder::new(self.data_shards, self.parity_shards, shard_len)
-                        .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {:?}", e)))?
+                        .map_err(|e| io::Error::other(format!("Failed to create SIMD decoder: {e:?}")))?
                 }
             }
         };
@@ -195,19 +195,19 @@ impl ReedSolomonEncoder {
                 if i < self.data_shards {
                     decoder
                         .add_original_shard(i, shard)
-                        .map_err(|e| io::Error::other(format!("Failed to add original shard for reconstruction: {:?}", e)))?;
+                        .map_err(|e| io::Error::other(format!("Failed to add original shard for reconstruction: {e:?}")))?;
                 } else {
                     let recovery_idx = i - self.data_shards;
                     decoder
                         .add_recovery_shard(recovery_idx, shard)
-                        .map_err(|e| io::Error::other(format!("Failed to add recovery shard for reconstruction: {:?}", e)))?;
+                        .map_err(|e| io::Error::other(format!("Failed to add recovery shard for reconstruction: {e:?}")))?;
                 }
             }
         }
 
         let result = decoder
             .decode()
-            .map_err(|e| io::Error::other(format!("SIMD decode error: {:?}", e)))?;
+            .map_err(|e| io::Error::other(format!("SIMD decode error: {e:?}")))?;
 
         // Fill in missing data shards from reconstruction result
         for (i, shard_opt) in shards.iter_mut().enumerate() {
@@ -596,11 +596,11 @@ mod tests {
     fn test_shard_file_offset() {
         let erasure = Erasure::new(8, 8, 1024 * 1024);
         let offset = erasure.shard_file_offset(0, 86, 86);
-        println!("offset={}", offset);
+        println!("offset={offset}");
         assert!(offset > 0);
 
         let total_length = erasure.shard_file_size(86);
-        println!("total_length={}", total_length);
+        println!("total_length={total_length}");
         assert!(total_length > 0);
     }
 
@@ -746,7 +746,7 @@ mod tests {
 
             // Verify that all data shards are zeros
             for (i, shard) in encoded_shards.iter().enumerate().take(data_shards) {
-                assert!(shard.iter().all(|&x| x == 0), "Data shard {} should be all zeros", i);
+                assert!(shard.iter().all(|&x| x == 0), "Data shard {i} should be all zeros");
             }
 
             // Test recovery with some shards missing
@@ -839,7 +839,7 @@ mod tests {
                     }
                 }
                 Err(e) => {
-                    println!("SIMD encoding failed with small shard size: {}", e);
+                    println!("SIMD encoding failed with small shard size: {e}");
                     // This is expected for very small shard sizes
                 }
             }
@@ -909,19 +909,19 @@ mod tests {
                                 recovered.extend_from_slice(shard.as_ref().unwrap());
                             }
                             recovered.truncate(small_data.len());
-                            println!("recovered: {:?}", recovered);
-                            println!("small_data: {:?}", small_data);
+                            println!("recovered: {recovered:?}");
+                            println!("small_data: {small_data:?}");
                             assert_eq!(&recovered, &small_data);
                             println!("✅ Data recovery successful with SIMD");
                         }
                         Err(e) => {
-                            println!("❌ SIMD decode failed: {}", e);
+                            println!("❌ SIMD decode failed: {e}");
                             // For very small data, decode failure might be acceptable
                         }
                     }
                 }
                 Err(e) => {
-                    println!("❌ SIMD encode failed: {}", e);
+                    println!("❌ SIMD encode failed: {e}");
                     // For very small data or configuration issues, encoding might fail
                 }
             }
@@ -953,7 +953,7 @@ mod tests {
             let shards = erasure.encode_data(&data).unwrap();
             let encode_duration = start.elapsed();
 
-            println!("⏱️  Encoding completed in: {:?}", encode_duration);
+            println!("⏱️  Encoding completed in: {encode_duration:?}");
             println!("📦 Generated {} shards, each shard size: {}KB", shards.len(), shards[0].len() / 1024);
 
             assert_eq!(shards.len(), data_shards + parity_shards);
@@ -977,7 +977,7 @@ mod tests {
             erasure.decode_data(&mut shards_opt).unwrap();
             let decode_duration = start.elapsed();
 
-            println!("⏱️  Decoding completed in: {:?}", decode_duration);
+            println!("⏱️  Decoding completed in: {decode_duration:?}");
 
             // 验证恢复的数据完整性
             let mut recovered = Vec::new();

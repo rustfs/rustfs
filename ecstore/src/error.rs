@@ -806,7 +806,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
     }
 
     if is_network_or_host_down(&err.to_string(), false) {
-        return std::io::Error::other(ObjectApiError::BackendDown(format!("{}", err)));
+        return std::io::Error::other(ObjectApiError::BackendDown(format!("{err}")));
     }
 
     let r_err = err;
@@ -1118,7 +1118,7 @@ mod tests {
                 // For errors with parameters, we only check the variant type
                 assert_eq!(std::mem::discriminant(&original_error), std::mem::discriminant(&recovered_error));
             } else {
-                panic!("Failed to recover error from code: {:#x}", code);
+                panic!("Failed to recover error from code: {code:#x}");
             }
         }
     }
@@ -1211,7 +1211,7 @@ mod tests {
                     assert_eq!(inner_io.kind(), kind);
                     assert!(inner_io.to_string().contains(message));
                 }
-                _ => panic!("Expected StorageError::Io variant for kind: {:?}", kind),
+                _ => panic!("Expected StorageError::Io variant for kind: {kind:?}"),
             }
         }
     }

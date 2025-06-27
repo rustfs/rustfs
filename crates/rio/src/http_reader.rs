@@ -26,7 +26,7 @@ static HTTP_DEBUG_LOG: bool = false;
 #[inline(always)]
 fn http_debug_log(args: std::fmt::Arguments) {
     if HTTP_DEBUG_LOG {
-        println!("{}", args);
+        println!("{args}");
     }
 }
 macro_rules! http_log {
@@ -87,7 +87,7 @@ impl HttpReader {
         let resp = request
             .send()
             .await
-            .map_err(|e| Error::other(format!("HttpReader HTTP request error: {}", e)))?;
+            .map_err(|e| Error::other(format!("HttpReader HTTP request error: {e}")))?;
 
         if resp.status().is_success().not() {
             return Err(Error::other(format!(
@@ -98,7 +98,7 @@ impl HttpReader {
 
         let stream = resp
             .bytes_stream()
-            .map_err(|e| Error::other(format!("HttpReader stream error: {}", e)));
+            .map_err(|e| Error::other(format!("HttpReader stream error: {e}")));
 
         Ok(Self {
             inner: StreamReader::new(Box::pin(stream)),
@@ -250,8 +250,8 @@ impl HttpWriter {
                 }
                 Err(e) => {
                     // http_log!("[HttpWriter::spawn] HTTP request error: {e}");
-                    let _ = err_tx.send(Error::other(format!("HTTP request failed: {}", e)));
-                    return Err(Error::other(format!("HTTP request failed: {}", e)));
+                    let _ = err_tx.send(Error::other(format!("HTTP request failed: {e}")));
+                    return Err(Error::other(format!("HTTP request failed: {e}")));
                 }
             }
 
@@ -298,7 +298,7 @@ impl AsyncWrite for HttpWriter {
 
         self.sender
             .try_send(Some(Bytes::copy_from_slice(buf)))
-            .map_err(|e| Error::other(format!("HttpWriter send error: {}", e)))?;
+            .map_err(|e| Error::other(format!("HttpWriter send error: {e}")))?;
 
         Poll::Ready(Ok(buf.len()))
     }
@@ -315,7 +315,7 @@ impl AsyncWrite for HttpWriter {
             // http_log!("[HttpWriter::poll_shutdown] url: {}, method: {:?}", url, method);
             self.sender
                 .try_send(None)
-                .map_err(|e| Error::other(format!("HttpWriter shutdown error: {}", e)))?;
+                .map_err(|e| Error::other(format!("HttpWriter shutdown error: {e}")))?;
             // http_log!(
             //     "[HttpWriter::poll_shutdown] sent shutdown signal to HTTP request, url: {}, method: {:?}",
             //     url,
@@ -336,7 +336,7 @@ impl AsyncWrite for HttpWriter {
             }
             Poll::Ready(Err(e)) => {
                 // http_log!("[HttpWriter::poll_shutdown] HTTP request failed: {e}, url: {}, method: {:?}", url, method);
-                return Poll::Ready(Err(Error::other(format!("HTTP request failed: {}", e))));
+                return Poll::Ready(Err(Error::other(format!("HTTP request failed: {e}"))));
             }
             Poll::Pending => {
                 // http_log!("[HttpWriter::poll_shutdown] HTTP request pending, url: {}, method: {:?}", url, method);

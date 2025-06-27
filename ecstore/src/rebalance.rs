@@ -95,7 +95,7 @@ impl fmt::Display for RebalStatus {
             RebalStatus::Stopped => "Stopped",
             RebalStatus::Failed => "Failed",
         };
-        write!(f, "{}", status)
+        write!(f, "{status}")
     }
 }
 
@@ -172,11 +172,11 @@ impl RebalanceMeta {
         // Read header
         match u16::from_le_bytes([data[0], data[1]]) {
             REBAL_META_FMT => {}
-            fmt => return Err(Error::other(format!("rebalanceMeta load_with_opts: unknown format: {}", fmt))),
+            fmt => return Err(Error::other(format!("rebalanceMeta load_with_opts: unknown format: {fmt}"))),
         }
         match u16::from_le_bytes([data[2], data[3]]) {
             REBAL_META_VER => {}
-            ver => return Err(Error::other(format!("rebalanceMeta load_with_opts: unknown version: {}", ver))),
+            ver => return Err(Error::other(format!("rebalanceMeta load_with_opts: unknown version: {ver}"))),
         }
 
         let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))?;
@@ -586,16 +586,16 @@ impl ECStore {
                         let state = match result {
                             Ok(_) => {
                                 info!("rebalance_buckets: completed");
-                                msg = format!("Rebalance completed at {:?}", now);
+                                msg = format!("Rebalance completed at {now:?}");
                                 RebalStatus::Completed},
                             Err(err) => {
                                 info!("rebalance_buckets: error: {:?}", err);
                                 // TODO: check stop
                                 if err.to_string().contains("canceled") {
-                                    msg = format!("Rebalance stopped at {:?}", now);
+                                    msg = format!("Rebalance stopped at {now:?}");
                                     RebalStatus::Stopped
                                 } else {
-                                    msg = format!("Rebalance stopped at {:?} with err {:?}", now, err);
+                                    msg = format!("Rebalance stopped at {now:?} with err {err:?}");
                                     RebalStatus::Failed
                                 }
                             }
@@ -616,7 +616,7 @@ impl ECStore {
                     }
                     _ = timer.tick() => {
                         let now = OffsetDateTime::now_utc();
-                        msg = format!("Saving rebalance metadata at {:?}", now);
+                        msg = format!("Saving rebalance metadata at {now:?}");
                     }
                 }
 

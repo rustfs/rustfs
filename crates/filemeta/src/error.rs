@@ -178,7 +178,7 @@ impl From<uuid::Error> for Error {
 
 impl From<rmp::decode::MarkerReadError> for Error {
     fn from(e: rmp::decode::MarkerReadError) -> Self {
-        let serr = format!("{:?}", e);
+        let serr = format!("{e:?}");
         Error::RmpDecodeMarkerRead(serr)
     }
 }
@@ -423,7 +423,7 @@ mod tests {
         ];
 
         for kind in io_error_kinds {
-            let io_error = IoError::new(kind, format!("test error for {:?}", kind));
+            let io_error = IoError::new(kind, format!("test error for {kind:?}"));
             let filemeta_error: Error = io_error.into();
 
             match filemeta_error {
@@ -434,7 +434,7 @@ mod tests {
                     assert_eq!(extracted_io_error.kind(), kind);
                     assert!(extracted_io_error.to_string().contains("test error"));
                 }
-                _ => panic!("Expected Io variant for kind {:?}", kind),
+                _ => panic!("Expected Io variant for kind {kind:?}"),
             }
         }
     }

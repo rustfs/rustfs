@@ -174,7 +174,7 @@ impl FS {
             let f = match entry {
                 Ok(f) => f,
                 Err(e) => {
-                    println!("Error reading entry: {}", e);
+                    println!("Error reading entry: {e}");
                     return Err(s3_error!(InvalidArgument, "Error reading entry {:?}", e));
                 }
             };
@@ -187,12 +187,12 @@ impl FS {
                 let mut fpath = fpath.to_string_lossy().to_string();
 
                 if !prefix.is_empty() {
-                    fpath = format!("{}/{}", prefix, fpath);
+                    fpath = format!("{prefix}/{fpath}");
                 }
 
                 let mut size = f.header().size().unwrap_or_default() as i64;
 
-                println!("Extracted: {}, size {}", fpath, size);
+                println!("Extracted: {fpath}, size {size}");
 
                 let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(f));
 
@@ -202,10 +202,10 @@ impl FS {
 
                 if is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64 {
                     metadata.insert(
-                        format!("{}compression", RESERVED_METADATA_PREFIX_LOWER),
+                        format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
                         CompressionAlgorithm::default().to_string(),
                     );
-                    metadata.insert(format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER,), size.to_string());
+                    metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
                     let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
 
@@ -372,10 +372,10 @@ impl S3 for FS {
 
         if is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64 {
             compress_metadata.insert(
-                format!("{}compression", RESERVED_METADATA_PREFIX_LOWER),
+                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
                 CompressionAlgorithm::default().to_string(),
             );
-            compress_metadata.insert(format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER,), actual_size.to_string());
+            compress_metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), actual_size.to_string());
 
             let hrd = EtagReader::new(reader, None);
 
@@ -386,13 +386,13 @@ impl S3 for FS {
         } else {
             src_info
                 .user_defined
-                .remove(&format!("{}compression", RESERVED_METADATA_PREFIX_LOWER));
+                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"));
             src_info
                 .user_defined
-                .remove(&format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER));
+                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"));
             src_info
                 .user_defined
-                .remove(&format!("{}compression-size", RESERVED_METADATA_PREFIX_LOWER));
+                .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
         }
 
         let hrd = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
@@ -1067,10 +1067,10 @@ impl S3 for FS {
 
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             metadata.insert(
-                format!("{}compression", RESERVED_METADATA_PREFIX_LOWER),
+                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
                 CompressionAlgorithm::default().to_string(),
             );
-            metadata.insert(format!("{}actual-size", RESERVED_METADATA_PREFIX_LOWER,), size.to_string());
+            metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
             let hrd = HashReader::new(reader, size as i64, size as i64, None, false).map_err(ApiError::from)?;
 
@@ -1157,7 +1157,7 @@ impl S3 for FS {
 
         if is_compressible(&req.headers, &key) {
             metadata.insert(
-                format!("{}compression", RESERVED_METADATA_PREFIX_LOWER),
+                format!("{RESERVED_METADATA_PREFIX_LOWER}compression"),
                 CompressionAlgorithm::default().to_string(),
             );
         }
@@ -1230,7 +1230,7 @@ impl S3 for FS {
 
         let is_compressible = fi
             .user_defined
-            .contains_key(format!("{}compression", RESERVED_METADATA_PREFIX_LOWER).as_str());
+            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}compression").as_str());
 
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
@@ -2166,7 +2166,7 @@ impl S3 for FS {
         };
 
         if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
         }
 
         let grants = vec![Grant {
@@ -2201,7 +2201,7 @@ impl S3 for FS {
             .get_object_reader(&bucket, &key, None, HeaderMap::new(), &ObjectOptions::default())
             .await
         {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
         }
 
         Ok(S3Response::new(GetObjectAttributesOutput {
@@ -2225,7 +2225,7 @@ impl S3 for FS {
         };
 
         if let Err(e) = store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{}", e)));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")));
         }
 
         if let Some(canned_acl) = acl {

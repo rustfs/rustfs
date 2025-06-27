@@ -191,7 +191,7 @@ mod tests {
 
         // Extract ETag using our generic system
         let extracted_etag = resolve_etag_generic(&mut compress_reader);
-        println!("📋 Extracted ETag: {:?}", extracted_etag);
+        println!("📋 Extracted ETag: {extracted_etag:?}");
 
         assert_eq!(extracted_etag, Some("real_world_etag".to_string()));
 
@@ -206,7 +206,7 @@ mod tests {
         let mut compress_reader2 = CompressReader::new(encrypt_reader2, CompressionAlgorithm::Zstd);
 
         let trait_etag = resolve_etag_generic(&mut compress_reader2);
-        println!("📋 Trait-based ETag: {:?}", trait_etag);
+        println!("📋 Trait-based ETag: {trait_etag:?}");
 
         assert_eq!(trait_etag, Some("core_etag".to_string()));
 

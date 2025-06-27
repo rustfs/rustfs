@@ -115,7 +115,7 @@ impl MQTTTarget {
                     error = %e,
                     "Failed to open store for MQTT target"
                 );
-                return Err(TargetError::Storage(format!("{}", e)));
+                return Err(TargetError::Storage(format!("{e}")));
             }
             Some(Box::new(store) as Box<dyn Store<Event, Error = StoreError, Key = Key> + Send + Sync>)
         } else {
@@ -172,7 +172,7 @@ impl MQTTTarget {
 
                 if let Err(e) = new_client.subscribe(&args_clone.topic, args_clone.qos).await {
                     error!(target_id = %target_id_clone, error = %e, "Failed to subscribe to MQTT topic during init");
-                    return Err(TargetError::Network(format!("MQTT subscribe failed: {}", e)));
+                    return Err(TargetError::Network(format!("MQTT subscribe failed: {e}")));
                 }
 
                 let mut rx_guard = bg_task_manager.initial_cancel_rx.lock().await;
@@ -231,7 +231,7 @@ impl MQTTTarget {
             .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
 
         let object_name = urlencoding::decode(&event.s3.object.key)
-            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {}", e)))?;
+            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
 
         let key = format!("{}/{}", event.s3.bucket.name, object_name);
 
@@ -242,11 +242,11 @@ impl MQTTTarget {
         };
 
         let data =
-            serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {}", e)))?;
+            serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
 
         // Vec<u8> Convert to String, only for printing logs
         let data_string = String::from_utf8(data.clone())
-            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {}", e)))?;
+            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {e}")))?;
         debug!("Sending event to mqtt target: {}, event log: {}", self.id, data_string);
 
         client
@@ -258,7 +258,7 @@ impl MQTTTarget {
                     warn!(target_id = %self.id, error = %e, "Publish failed due to connection issue, marking as not connected.");
                     TargetError::NotConnected
                 } else {
-                    TargetError::Request(format!("Failed to publish message: {}", e))
+                    TargetError::Request(format!("Failed to publish message: {e}"))
                 }
             })?;
 
@@ -476,7 +476,7 @@ impl Target for MQTTTarget {
                 }
                 Err(e) => {
                     error!(target_id = %self.id, error = %e, "Failed to save event to store");
-                    return Err(TargetError::Storage(format!("Failed to save event to store: {}", e)));
+                    return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
                 }
             }
         } else {
@@ -547,7 +547,7 @@ impl Target for MQTTTarget {
                     error = %e,
                     "Failed to get event from store"
                 );
-                return Err(TargetError::Storage(format!("Failed to get event from store: {}", e)));
+                return Err(TargetError::Storage(format!("Failed to get event from store: {e}")));
             }
         };
 
@@ -571,7 +571,7 @@ impl Target for MQTTTarget {
             }
             Err(e) => {
                 error!(target_id = %self.id, error = %e, "Failed to delete event from store after send.");
-                return Err(TargetError::Storage(format!("Failed to delete event from store: {}", e)));
+                return Err(TargetError::Storage(format!("Failed to delete event from store: {e}")));
             }
         }
 

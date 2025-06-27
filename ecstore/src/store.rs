@@ -1446,7 +1446,7 @@ impl StorageAPI for ECStore {
         // TODO: replication opts.srdelete_op
 
         // 删除 meta
-        self.delete_all(RUSTFS_META_BUCKET, format!("{}/{}", BUCKET_META_PREFIX, bucket).as_str())
+        self.delete_all(RUSTFS_META_BUCKET, format!("{BUCKET_META_PREFIX}/{bucket}").as_str())
             .await?;
         Ok(())
     }
@@ -2096,7 +2096,7 @@ impl StorageAPI for ECStore {
         if pool_idx < self.pools.len() && set_idx < self.pools[pool_idx].disk_set.len() {
             self.pools[pool_idx].disk_set[set_idx].get_disks(0, 0).await
         } else {
-            Err(Error::other(format!("pool idx {}, set idx {}, not found", pool_idx, set_idx)))
+            Err(Error::other(format!("pool idx {pool_idx}, set idx {set_idx}, not found")))
         }
     }
 
@@ -2458,11 +2458,11 @@ async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, po
 
     if peer_set.is_empty() {
         if !host.is_empty() {
-            *GLOBAL_Local_Node_Name.write().await = format!("{}:{}", host, port);
+            *GLOBAL_Local_Node_Name.write().await = format!("{host}:{port}");
             return;
         }
 
-        *GLOBAL_Local_Node_Name.write().await = format!("127.0.0.1:{}", port);
+        *GLOBAL_Local_Node_Name.write().await = format!("127.0.0.1:{port}");
         return;
     }
 
@@ -2599,7 +2599,7 @@ fn check_new_multipart_args(bucket: &str, object: &str) -> Result<()> {
 
 fn check_multipart_object_args(bucket: &str, object: &str, upload_id: &str) -> Result<()> {
     if let Err(e) = base64_decode(upload_id.as_bytes()) {
-        return Err(StorageError::MalformedUploadID(format!("{}/{}-{},err:{}", bucket, object, upload_id, e)));
+        return Err(StorageError::MalformedUploadID(format!("{bucket}/{object}-{upload_id},err:{e}")));
     };
     check_object_args(bucket, object)
 }

@@ -498,7 +498,7 @@ impl Operation for ListServiceAccount {
             .collect();
 
         let data = serde_json::to_vec(&ListServiceAccountsResp { accounts })
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {e}")))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());

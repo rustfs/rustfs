@@ -40,16 +40,16 @@ mod tests {
         assert!(ip.is_some(), "Should be able to get local IP address");
 
         if let Some(ip_addr) = ip {
-            println!("Local IP address: {}", ip_addr);
+            println!("Local IP address: {ip_addr}");
             // Verify that the returned IP address is valid
             match ip_addr {
                 IpAddr::V4(ipv4) => {
                     assert!(!ipv4.is_unspecified(), "IPv4 should not be unspecified (0.0.0.0)");
-                    println!("Got IPv4 address: {}", ipv4);
+                    println!("Got IPv4 address: {ipv4}");
                 }
                 IpAddr::V6(ipv6) => {
                     assert!(!ipv6.is_unspecified(), "IPv6 should not be unspecified (::)");
-                    println!("Got IPv6 address: {}", ipv6);
+                    println!("Got IPv6 address: {ipv6}");
                 }
             }
         }
@@ -63,9 +63,9 @@ mod tests {
 
         // Verify that the returned string can be parsed as a valid IP address
         let parsed_ip: Result<IpAddr, _> = ip_string.parse();
-        assert!(parsed_ip.is_ok(), "Returned string should be a valid IP address: {}", ip_string);
+        assert!(parsed_ip.is_ok(), "Returned string should be a valid IP address: {ip_string}");
 
-        println!("Local IP with default: {}", ip_string);
+        println!("Local IP with default: {ip_string}");
     }
 
     #[test]
@@ -91,22 +91,22 @@ mod tests {
             match ip {
                 IpAddr::V4(ipv4) => {
                     // Test IPv4 address properties
-                    println!("IPv4 address: {}", ipv4);
+                    println!("IPv4 address: {ipv4}");
                     assert!(!ipv4.is_multicast(), "Local IP should not be multicast");
                     assert!(!ipv4.is_broadcast(), "Local IP should not be broadcast");
 
                     // Check if it's a private address (usually local IP is private)
                     let is_private = ipv4.is_private();
                     let is_loopback = ipv4.is_loopback();
-                    println!("IPv4 is private: {}, is loopback: {}", is_private, is_loopback);
+                    println!("IPv4 is private: {is_private}, is loopback: {is_loopback}");
                 }
                 IpAddr::V6(ipv6) => {
                     // Test IPv6 address properties
-                    println!("IPv6 address: {}", ipv6);
+                    println!("IPv6 address: {ipv6}");
                     assert!(!ipv6.is_multicast(), "Local IP should not be multicast");
 
                     let is_loopback = ipv6.is_loopback();
-                    println!("IPv6 is loopback: {}", is_loopback);
+                    println!("IPv6 is loopback: {is_loopback}");
                 }
             }
         }
@@ -126,7 +126,7 @@ mod tests {
         let back_to_string = parsed_ip.to_string();
 
         // For standard IP addresses, round-trip conversion should be consistent
-        println!("Original: {}, Parsed back: {}", ip_string, back_to_string);
+        println!("Original: {ip_string}, Parsed back: {back_to_string}");
     }
 
     #[test]
@@ -186,7 +186,7 @@ mod tests {
 
                     // If it's not a loopback address, it should be routable
                     if !ipv4.is_loopback() {
-                        println!("Got routable IPv4: {}", ipv4);
+                        println!("Got routable IPv4: {ipv4}");
                     }
                 }
                 IpAddr::V6(ipv6) => {
@@ -194,7 +194,7 @@ mod tests {
                     assert!(!ipv6.is_unspecified(), "Should not be ::");
 
                     if !ipv6.is_loopback() {
-                        println!("Got routable IPv6: {}", ipv6);
+                        println!("Got routable IPv6: {ipv6}");
                     }
                 }
             }

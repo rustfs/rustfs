@@ -396,7 +396,7 @@ mod tests {
 
         let expected = format!("{:x}", hasher.finalize());
 
-        println!("expected: {}", expected);
+        println!("expected: {expected}");
 
         let reader = Cursor::new(data.clone());
         let reader = BufReader::new(reader);
@@ -485,8 +485,7 @@ mod tests {
 
         // 验证 etag（注意：压缩会改变数据，所以这里的 etag 验证可能需要调整）
         println!(
-            "Test completed successfully with compression: {}, encryption: {}",
-            is_compress, is_encrypt
+            "Test completed successfully with compression: {is_compress}, encryption: {is_encrypt}"
         );
     }
 
@@ -549,7 +548,7 @@ mod tests {
         ];
 
         for algorithm in algorithms {
-            println!("\nTesting algorithm: {:?}", algorithm);
+            println!("\nTesting algorithm: {algorithm:?}");
 
             let reader = BufReader::new(Cursor::new(data.clone()));
             let reader = Box::new(WarpReader::new(reader));
@@ -576,7 +575,7 @@ mod tests {
             // Verify
             assert_eq!(decompressed_data.len(), data.len());
             assert_eq!(&decompressed_data, &data);
-            println!("  ✓ Algorithm {:?} test passed", algorithm);
+            println!("  ✓ Algorithm {algorithm:?} test passed");
         }
     }
 }

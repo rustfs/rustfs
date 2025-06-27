@@ -33,7 +33,7 @@ mod tests {
     fn test_rustfs_dialect_debug() {
         let dialect = RustFsDialect;
 
-        let debug_str = format!("{:?}", dialect);
+        let debug_str = format!("{dialect:?}");
         assert!(!debug_str.is_empty(), "Debug output should not be empty");
         assert!(debug_str.contains("RustFsDialect"), "Debug output should contain dialect name");
     }
@@ -195,15 +195,13 @@ mod tests {
         for start_char in valid_starts {
             assert!(
                 dialect.is_identifier_start(start_char),
-                "Character '{}' should be valid identifier start",
-                start_char
+                "Character '{start_char}' should be valid identifier start"
             );
 
             for part_char in valid_parts {
                 assert!(
                     dialect.is_identifier_part(part_char),
-                    "Character '{}' should be valid identifier part",
-                    part_char
+                    "Character '{part_char}' should be valid identifier part"
                 );
             }
         }
@@ -240,10 +238,9 @@ mod tests {
         for ch in unicode_letters {
             assert!(
                 dialect.is_identifier_start(ch),
-                "Unicode letter '{}' should be valid identifier start",
-                ch
+                "Unicode letter '{ch}' should be valid identifier start"
             );
-            assert!(dialect.is_identifier_part(ch), "Unicode letter '{}' should be valid identifier part", ch);
+            assert!(dialect.is_identifier_part(ch), "Unicode letter '{ch}' should be valid identifier part");
         }
     }
 
@@ -255,13 +252,11 @@ mod tests {
         for digit in '0'..='9' {
             assert!(
                 !dialect.is_identifier_start(digit),
-                "ASCII digit '{}' should not be valid identifier start",
-                digit
+                "ASCII digit '{digit}' should not be valid identifier start"
             );
             assert!(
                 dialect.is_identifier_part(digit),
-                "ASCII digit '{}' should be valid identifier part",
-                digit
+                "ASCII digit '{digit}' should be valid identifier part"
             );
         }
     }
@@ -279,8 +274,7 @@ mod tests {
             if dialect.is_identifier_start(ch) {
                 assert!(
                     dialect.is_identifier_part(ch),
-                    "Character '{}' that is valid identifier start should also be valid identifier part",
-                    ch
+                    "Character '{ch}' that is valid identifier start should also be valid identifier part"
                 );
             }
         }

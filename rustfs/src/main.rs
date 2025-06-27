@@ -158,8 +158,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     }
 
     // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("http://{}:{}", local_ip, server_port);
-    let localhost_endpoint = format!("http://127.0.0.1:{}", server_port);
+    let api_endpoints = format!("http://{local_ip}:{server_port}");
+    let localhost_endpoint = format!("http://127.0.0.1:{server_port}");
     info!("   API: {}  {}", api_endpoints, localhost_endpoint);
     info!("   RootUser: {}", opt.access_key.clone());
     info!("   RootPass: {}", opt.secret_key.clone());
@@ -264,8 +264,8 @@ async fn run(opt: config::Opt) -> Result<()> {
             }
             _ => {
                 // 2. If the synthesis fails, fall back to the traditional document certificate mode (backward compatible)
-                let key_path = format!("{}/{}", tls_path, RUSTFS_TLS_KEY);
-                let cert_path = format!("{}/{}", tls_path, RUSTFS_TLS_CERT);
+                let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
+                let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
                 let has_single_cert =
                     tokio::try_join!(tokio::fs::metadata(key_path.clone()), tokio::fs::metadata(cert_path.clone())).is_ok();
 

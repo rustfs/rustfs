@@ -116,7 +116,7 @@ async fn new_and_save_server_config<S: StorageAPI>(api: Arc<S>) -> Result<Config
 }
 
 fn get_config_file() -> String {
-    format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, CONFIG_FILE)
+    format!("{CONFIG_PREFIX}{SLASH_SEPARATOR}{CONFIG_FILE}")
 }
 
 /// Handle the situation where the configuration file does not exist, create and save a new configuration

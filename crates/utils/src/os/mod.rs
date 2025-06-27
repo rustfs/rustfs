@@ -60,7 +60,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let info = get_info(temp_dir.path()).unwrap();
 
-        println!("Disk Info: {:?}", info);
+        println!("Disk Info: {info:?}");
 
         assert!(info.total > 0);
         assert!(info.free > 0);
@@ -98,7 +98,7 @@ mod tests {
         let result = same_disk(path1, path2).unwrap();
         // Since both temporary directories are created in the same file system,
         // they should be on the same disk in most cases
-        println!("Path1: {}, Path2: {}, Same disk: {}", path1, path2, result);
+        println!("Path1: {path1}, Path2: {path2}, Same disk: {result}");
         // Test passes if the function doesn't panic - the actual result depends on test environment
     }
 

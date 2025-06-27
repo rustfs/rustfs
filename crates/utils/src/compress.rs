@@ -44,7 +44,7 @@ impl std::str::FromStr for CompressionAlgorithm {
             "brotli" => Ok(CompressionAlgorithm::Brotli),
             "snappy" => Ok(CompressionAlgorithm::Snappy),
             "none" => Ok(CompressionAlgorithm::None),
-            _ => Err(std::io::Error::other(format!("Unsupported compression algorithm: {}", s))),
+            _ => Err(std::io::Error::other(format!("Unsupported compression algorithm: {s}"))),
         }
     }
 }
@@ -243,7 +243,7 @@ mod tests {
 
         println!("Compression results:");
         for (name, dur, size) in &times {
-            println!("{}: {} bytes, {:?}", name, size, dur);
+            println!("{name}: {size} bytes, {dur:?}");
         }
         // All should decompress to the original
         assert_eq!(decompress_block(&gzip, CompressionAlgorithm::Gzip).unwrap(), data);

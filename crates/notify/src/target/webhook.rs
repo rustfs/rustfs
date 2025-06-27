@@ -111,19 +111,19 @@ impl WebhookTarget {
         if !args.client_cert.is_empty() && !args.client_key.is_empty() {
             // Add client certificate
             let cert = std::fs::read(&args.client_cert)
-                .map_err(|e| TargetError::Configuration(format!("Failed to read client cert: {}", e)))?;
+                .map_err(|e| TargetError::Configuration(format!("Failed to read client cert: {e}")))?;
             let key = std::fs::read(&args.client_key)
-                .map_err(|e| TargetError::Configuration(format!("Failed to read client key: {}", e)))?;
+                .map_err(|e| TargetError::Configuration(format!("Failed to read client key: {e}")))?;
 
             let identity = reqwest::Identity::from_pem(&[cert, key].concat())
-                .map_err(|e| TargetError::Configuration(format!("Failed to create identity: {}", e)))?;
+                .map_err(|e| TargetError::Configuration(format!("Failed to create identity: {e}")))?;
             client_builder = client_builder.identity(identity);
         }
 
         let http_client = Arc::new(
             client_builder
                 .build()
-                .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {}", e)))?,
+                .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))?,
         );
 
         // Build storage
@@ -138,7 +138,7 @@ impl WebhookTarget {
 
             if let Err(e) = store.open() {
                 error!("Failed to open store for Webhook target {}: {}", target_id.id, e);
-                return Err(TargetError::Storage(format!("{}", e)));
+                return Err(TargetError::Storage(format!("{e}")));
             }
 
             // Make sure that the Store trait implemented by QueueStore matches the expected error type
@@ -154,7 +154,7 @@ impl WebhookTarget {
                 .endpoint
                 .port()
                 .unwrap_or_else(|| if args.endpoint.scheme() == "https" { 443 } else { 80 });
-            format!("{}:{}", host, port)
+            format!("{host}:{port}")
         };
 
         // Create a cancel channel
@@ -196,7 +196,7 @@ impl WebhookTarget {
     async fn send(&self, event: &Event) -> Result<(), TargetError> {
         info!("Webhook Sending event to webhook target: {}", self.id);
         let object_name = urlencoding::decode(&event.s3.object.key)
-            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {}", e)))?;
+            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
 
         let key = format!("{}/{}", event.s3.bucket.name, object_name);
 
@@ -207,11 +207,11 @@ impl WebhookTarget {
         };
 
         let data =
-            serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {}", e)))?;
+            serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
 
         // Vec<u8> Convert to String
         let data_string = String::from_utf8(data.clone())
-            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {}", e)))?;
+            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {e}")))?;
         debug!("Sending event to webhook target: {}, event log: {}", self.id, data_string);
 
         // build request
@@ -243,7 +243,7 @@ impl WebhookTarget {
             if e.is_timeout() || e.is_connect() {
                 TargetError::NotConnected
             } else {
-                TargetError::Request(format!("Failed to send request: {}", e))
+                TargetError::Request(format!("Failed to send request: {e}"))
             }
         })?;
 
@@ -275,7 +275,7 @@ impl Target for WebhookTarget {
     async fn is_active(&self) -> Result<bool, TargetError> {
         let socket_addr = lookup_host(&self.addr)
             .await
-            .map_err(|e| TargetError::Network(format!("Failed to resolve host: {}", e)))?
+            .map_err(|e| TargetError::Network(format!("Failed to resolve host: {e}")))?
             .next()
             .ok_or_else(|| TargetError::Network("No address found".to_string()))?;
         debug!("is_active socket addr: {},target id:{}", socket_addr, self.id.id);
@@ -289,7 +289,7 @@ impl Target for WebhookTarget {
                 if e.kind() == std::io::ErrorKind::ConnectionRefused {
                     Err(TargetError::NotConnected)
                 } else {
-                    Err(TargetError::Network(format!("Connection failed: {}", e)))
+                    Err(TargetError::Network(format!("Connection failed: {e}")))
                 }
             }
             Err(_) => Err(TargetError::Timeout("Connection timed out".to_string())),
@@ -301,7 +301,7 @@ impl Target for WebhookTarget {
             // Call the store method directly, no longer need to acquire the lock
             store
                 .put(event)
-                .map_err(|e| TargetError::Storage(format!("Failed to save event to store: {}", e)))?;
+                .map_err(|e| TargetError::Storage(format!("Failed to save event to store: {e}")))?;
             debug!("Event saved to store for target: {}", self.id);
             Ok(())
         } else {
@@ -338,7 +338,7 @@ impl Target for WebhookTarget {
             Ok(event) => event,
             Err(StoreError::NotFound) => return Ok(()),
             Err(e) => {
-                return Err(TargetError::Storage(format!("Failed to get event from store: {}", e)));
+                return Err(TargetError::Storage(format!("Failed to get event from store: {e}")));
             }
         };
 
@@ -355,7 +355,7 @@ impl Target for WebhookTarget {
             Ok(_) => debug!("Event deleted from store for target: {}, key:{}, end", self.id, key.to_string()),
             Err(e) => {
                 error!("Failed to delete event from store: {}", e);
-                return Err(TargetError::Storage(format!("Failed to delete event from store: {}", e)));
+                return Err(TargetError::Storage(format!("Failed to delete event from store: {e}")));
             }
         }
 

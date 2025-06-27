@@ -147,8 +147,7 @@ async fn heal_fresh_disk(endpoint: &Endpoint) -> Result<()> {
         Some(disk) => disk,
         None => {
             return Err(Error::other(format!(
-                "Unexpected error disk must be initialized by now after formatting: {}",
-                endpoint
+                "Unexpected error disk must be initialized by now after formatting: {endpoint}"
             )));
         }
     };

@@ -201,7 +201,7 @@ pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
                 }
                 block.as_u64() as usize
             } else {
-                return Err(Error::other(format!("parse {} format failed", INLINE_BLOCK_ENV)));
+                return Err(Error::other(format!("parse {INLINE_BLOCK_ENV} format failed")));
             }
         } else {
             DEFAULT_INLINE_BLOCK
@@ -223,8 +223,7 @@ pub fn parse_storage_class(env: &str) -> Result<StorageClass> {
     // only two elements allowed in the string - "scheme" and "number of parity drives"
     if s.len() != 2 {
         return Err(Error::other(format!(
-            "Invalid storage class format: {}. Expected 'Scheme:Number of parity drives'.",
-            env
+            "Invalid storage class format: {env}. Expected 'Scheme:Number of parity drives'."
         )));
     }
 
@@ -300,8 +299,7 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
 
     if ss_parity > 0 && rrs_parity > 0 && ss_parity < rrs_parity {
         return Err(Error::other(format!(
-            "Standard storage class parity drives {} should be greater than or equal to Reduced redundancy storage class parity drives {}",
-            ss_parity, rrs_parity
+            "Standard storage class parity drives {ss_parity} should be greater than or equal to Reduced redundancy storage class parity drives {rrs_parity}"
         )));
     }
     Ok(())

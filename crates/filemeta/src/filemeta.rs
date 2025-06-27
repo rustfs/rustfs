@@ -929,15 +929,13 @@ impl FileMetaVersion {
     }
 
     pub fn get_data_dir(&self) -> Option<Uuid> {
-        self.valid()
-            .then(|| {
+        if self.valid() { {
                 if self.version_type == VersionType::Object {
                     self.object.as_ref().map(|v| v.data_dir).unwrap_or_default()
                 } else {
                     None
                 }
-            })
-            .unwrap_or_default()
+            } } else { Default::default() }
     }
 
     pub fn get_version_id(&self) -> Option<Uuid> {
@@ -1028,7 +1026,7 @@ impl FileMetaVersion {
                 "v" => {
                     self.write_version = rmp::decode::read_int(&mut cur)?;
                 }
-                name => return Err(Error::other(format!("not suport field name {}", name))),
+                name => return Err(Error::other(format!("not suport field name {name}"))),
             }
         }
 
@@ -1325,7 +1323,7 @@ impl FileMetaVersionHeader {
         let mut cur = Cursor::new(buf);
         let alen = rmp::decode::read_array_len(&mut cur)?;
         if alen != 7 {
-            return Err(Error::other(format!("version header array len err need 7 got {}", alen)));
+            return Err(Error::other(format!("version header array len err need 7 got {alen}")));
         }
 
         // version_id
@@ -1709,7 +1707,7 @@ impl MetaObject {
                     }
                 }
 
-                name => return Err(Error::other(format!("not suport field name {}", name))),
+                name => return Err(Error::other(format!("not suport field name {name}"))),
             }
         }
 
@@ -1938,19 +1936,19 @@ impl MetaObject {
 
     pub fn set_transition(&mut self, fi: &FileInfo) {
         self.meta_sys.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITION_STATUS),
+            format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"),
             fi.transition_status.as_bytes().to_vec(),
         );
         self.meta_sys.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITIONED_OBJECTNAME),
+            format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}"),
             fi.transitioned_objname.as_bytes().to_vec(),
         );
         self.meta_sys.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITIONED_VERSION_ID),
+            format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}"),
             fi.transition_version_id.unwrap().as_bytes().to_vec(),
         );
         self.meta_sys.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITION_TIER),
+            format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}"),
             fi.transition_tier.as_bytes().to_vec(),
         );
     }
@@ -1968,12 +1966,12 @@ impl MetaObject {
 
     pub fn inlinedata(&self) -> bool {
         self.meta_sys
-            .contains_key(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).as_str())
+            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str())
     }
 
     pub fn reset_inline_data(&mut self) {
         self.meta_sys
-            .remove(format!("{}inline-data", RESERVED_METADATA_PREFIX_LOWER).as_str());
+            .remove(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str());
     }
 
     /// Remove restore headers
@@ -2001,7 +1999,7 @@ impl MetaObject {
         }
         if let Some(status) = self
             .meta_sys
-            .get(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITION_STATUS))
+            .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_STATUS}"))
         {
             if *status == TRANSITION_COMPLETE.as_bytes().to_vec() {
                 let vid = Uuid::parse_str(&fi.tier_free_version_id());
@@ -2027,10 +2025,10 @@ impl MetaObject {
                     .meta_sys
                     .as_mut()
                     .unwrap()
-                    .insert(format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, FREE_VERSION), vec![]);
-                let tier_key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITION_TIER);
-                let tier_obj_key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITIONED_OBJECTNAME);
-                let tier_obj_vid_key = format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, TRANSITIONED_VERSION_ID);
+                    .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{FREE_VERSION}"), vec![]);
+                let tier_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITION_TIER}");
+                let tier_obj_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_OBJECTNAME}");
+                let tier_obj_vid_key = format!("{RESERVED_METADATA_PREFIX_LOWER}{TRANSITIONED_VERSION_ID}");
 
                 let aa = [tier_key, tier_obj_key, tier_obj_vid_key];
                 for (k, v) in &self.meta_sys {
@@ -2192,7 +2190,7 @@ impl MetaDeleteMarker {
 
                     self.meta_sys = Some(map);
                 }
-                name => return Err(Error::other(format!("not suport field name {}", name))),
+                name => return Err(Error::other(format!("not suport field name {name}"))),
             }
         }
 
@@ -2913,9 +2911,9 @@ mod test {
         let serialization_time = start.elapsed();
 
         println!("性能测试结果：");
-        println!("  创建时间：{:?}", creation_time);
-        println!("  解析时间：{:?}", parsing_time);
-        println!("  序列化时间：{:?}", serialization_time);
+        println!("  创建时间：{creation_time:?}");
+        println!("  解析时间：{parsing_time:?}");
+        println!("  序列化时间：{serialization_time:?}");
 
         // 基本性能断言（这些值可能需要根据实际性能调整）
         assert!(parsing_time.as_millis() < 100, "解析时间应该小于 100ms");
@@ -2986,7 +2984,7 @@ mod test {
         for i in 0..10 {
             let fm_clone: Arc<Mutex<FileMeta>> = Arc::clone(&fm);
             let handle = tokio::spawn(async move {
-                let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{}", i), 2, 1);
+                let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{i}"), 2, 1);
                 fi.version_id = Some(Uuid::new_v4());
                 fi.mod_time = Some(OffsetDateTime::now_utc());
 
@@ -3013,19 +3011,19 @@ mod test {
         // 测试空结构体的内存占用
         let empty_fm = FileMeta::new();
         let empty_size = mem::size_of_val(&empty_fm);
-        println!("Empty FileMeta size: {} bytes", empty_size);
+        println!("Empty FileMeta size: {empty_size} bytes");
 
         // 测试包含大量版本的内存占用
         let mut large_fm = FileMeta::new();
         for i in 0..100 {
-            let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{}", i), 2, 1);
+            let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{i}"), 2, 1);
             fi.version_id = Some(Uuid::new_v4());
             fi.mod_time = Some(OffsetDateTime::now_utc());
             large_fm.add_version(fi).unwrap();
         }
 
         let large_size = mem::size_of_val(&large_fm);
-        println!("Large FileMeta size: {} bytes", large_size);
+        println!("Large FileMeta size: {large_size} bytes");
 
         // 验证内存使用是合理的（注意：size_of_val 只计算栈上的大小，不包括堆分配）
         // 对于包含 Vec 的结构体，size_of_val 可能相同，因为 Vec 的容量在堆上
@@ -3041,7 +3039,7 @@ mod test {
         // 添加相同时间戳的版本
         let same_time = OffsetDateTime::now_utc();
         for i in 0..5 {
-            let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{}", i), 2, 1);
+            let mut fi = crate::fileinfo::FileInfo::new(&format!("test-{i}"), 2, 1);
             fi.version_id = Some(Uuid::new_v4());
             fi.mod_time = Some(same_time);
             fm.add_version(fi).unwrap();
@@ -3122,7 +3120,7 @@ mod test {
         // 测试适量用户元数据
         for i in 0..10 {
             obj.meta_user
-                .insert(format!("key-{:04}", i), format!("value-{:04}-{}", i, "x".repeat(10)));
+                .insert(format!("key-{i:04}"), format!("value-{:04}-{}", i, "x".repeat(10)));
         }
 
         // 验证可以序列化元数据
@@ -3146,7 +3144,7 @@ mod test {
 
         // 添加对象版本
         for i in 0..object_count {
-            let mut fi = crate::fileinfo::FileInfo::new(&format!("obj-{}", i), 2, 1);
+            let mut fi = crate::fileinfo::FileInfo::new(&format!("obj-{i}"), 2, 1);
             fi.version_id = Some(Uuid::new_v4());
             fi.mod_time = Some(OffsetDateTime::now_utc());
             fm.add_version(fi).unwrap();
@@ -3240,11 +3238,11 @@ mod test {
 
         // 创建两组不同的版本
         for i in 0..3 {
-            let mut fi1 = crate::fileinfo::FileInfo::new(&format!("test1-{}", i), 2, 1);
+            let mut fi1 = crate::fileinfo::FileInfo::new(&format!("test1-{i}"), 2, 1);
             fi1.version_id = Some(Uuid::new_v4());
             fi1.mod_time = Some(OffsetDateTime::from_unix_timestamp(1000 + i * 10).unwrap());
 
-            let mut fi2 = crate::fileinfo::FileInfo::new(&format!("test2-{}", i), 2, 1);
+            let mut fi2 = crate::fileinfo::FileInfo::new(&format!("test2-{i}"), 2, 1);
             fi2.version_id = Some(Uuid::new_v4());
             fi2.mod_time = Some(OffsetDateTime::from_unix_timestamp(1005 + i * 10).unwrap());
 

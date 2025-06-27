@@ -693,7 +693,7 @@ mod tests {
             source: io_error,
         };
 
-        let display_str = format!("{}", context_error);
+        let display_str = format!("{context_error}");
         assert!(display_str.contains("/test/path"));
         assert!(display_str.contains("file access denied"));
     }
@@ -701,11 +701,11 @@ mod tests {
     #[test]
     fn test_error_debug_format() {
         let error = DiskError::FileNotFound;
-        let debug_str = format!("{:?}", error);
+        let debug_str = format!("{error:?}");
         assert_eq!(debug_str, "FileNotFound");
 
         let io_error = DiskError::other("test error");
-        let debug_str = format!("{:?}", io_error);
+        let debug_str = format!("{io_error:?}");
         assert!(debug_str.contains("Io"));
     }
 

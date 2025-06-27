@@ -261,11 +261,11 @@ fn fmt() {
             if status.success() {
                 println!("cargo fmt executed successfully.");
             } else {
-                eprintln!("cargo fmt failed with status: {:?}", status);
+                eprintln!("cargo fmt failed with status: {status:?}");
             }
         }
         Err(e) => {
-            eprintln!("Failed to execute cargo fmt: {}", e);
+            eprintln!("Failed to execute cargo fmt: {e}");
         }
     }
 }

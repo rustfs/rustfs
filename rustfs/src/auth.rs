@@ -69,7 +69,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         let (u, ok) = iam_store
             .check_key(access_key)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {}", e)))?;
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {e}")))?;
 
         if !ok {
             if let Some(u) = u {
@@ -89,7 +89,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     }
 
     let claims = check_claims_from_token(session_token, &cred)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {}", e)))?;
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {e}")))?;
 
     cred.claims = if !claims.is_empty() { Some(claims) } else { None };
 
