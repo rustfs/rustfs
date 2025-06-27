@@ -178,7 +178,7 @@ mod tests {
     fn test_observability_config_debug_format() {
         let config = ObservabilityConfig::new();
 
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(!debug_str.is_empty(), "Debug output should not be empty");
         assert!(debug_str.contains("ObservabilityConfig"), "Debug output should contain struct name");
         assert!(debug_str.contains("otel"), "Debug output should contain otel field");

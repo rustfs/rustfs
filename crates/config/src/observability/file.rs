@@ -47,7 +47,7 @@ fn default_path() -> String {
     let temp_dir = env::temp_dir().join("rustfs");
 
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        eprintln!("Failed to create log directory: {}", e);
+        eprintln!("Failed to create log directory: {e}");
         return "rustfs/rustfs.log".to_string();
     }
 
