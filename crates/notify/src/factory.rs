@@ -71,8 +71,7 @@ impl TargetFactory for WebhookTargetFactory {
             .map_err(|e| TargetError::Configuration(format!("Invalid endpoint URL: {} (value: '{}')", e, endpoint)))?;
 
         let auth_token = get(ENV_WEBHOOK_AUTH_TOKEN, WEBHOOK_AUTH_TOKEN).unwrap_or_default();
-        let queue_dir = get(ENV_WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_DIR)
-            .unwrap_or(DEFAULT_DIR.to_string());
+        let queue_dir = get(ENV_WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_DIR).unwrap_or(DEFAULT_DIR.to_string());
 
         let queue_limit = get(ENV_WEBHOOK_QUEUE_LIMIT, WEBHOOK_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
