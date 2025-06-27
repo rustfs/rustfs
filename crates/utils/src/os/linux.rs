@@ -1,5 +1,5 @@
 use nix::sys::stat::{self, stat};
-use nix::sys::statfs::{self, statfs, FsType};
+use nix::sys::statfs::{self, FsType, statfs};
 use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind};
 use std::path::Path;
