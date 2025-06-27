@@ -140,12 +140,12 @@ pub fn get_user_agent(service: ServiceType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use rustfs_config::VERSION;
     #[test]
     fn test_user_agent_format_basis() {
         let ua = get_user_agent(ServiceType::Basis);
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("RustFS/1.0.0"));
+        assert!(ua.contains(&format!("RustFS/{}", VERSION).to_string()));
         println!("User-Agent: {}", ua);
     }
 
@@ -153,7 +153,7 @@ mod tests {
     fn test_user_agent_format_core() {
         let ua = get_user_agent(ServiceType::Core);
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("RustFS/1.0.0 (core)"));
+        assert!(ua.contains(&format!("RustFS/{} (core)", VERSION).to_string()));
         println!("User-Agent: {}", ua);
     }
 
@@ -161,7 +161,7 @@ mod tests {
     fn test_user_agent_format_event() {
         let ua = get_user_agent(ServiceType::Event);
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("RustFS/1.0.0 (event)"));
+        assert!(ua.contains(&format!("RustFS/{} (event)", VERSION).to_string()));
         println!("User-Agent: {}", ua);
     }
 
@@ -169,7 +169,7 @@ mod tests {
     fn test_user_agent_format_logger() {
         let ua = get_user_agent(ServiceType::Logger);
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("RustFS/1.0.0 (logger)"));
+        assert!(ua.contains(&format!("RustFS/{} (logger)", VERSION).to_string()));
         println!("User-Agent: {}", ua);
     }
 
@@ -177,7 +177,7 @@ mod tests {
     fn test_user_agent_format_custom() {
         let ua = get_user_agent(ServiceType::Custom("monitor".to_string()));
         assert!(ua.starts_with("Mozilla/5.0"));
-        assert!(ua.contains("RustFS/1.0.0 (monitor)"));
+        assert!(ua.contains(&format!("RustFS/{} (monitor)", VERSION).to_string()));
         println!("User-Agent: {}", ua);
     }
 

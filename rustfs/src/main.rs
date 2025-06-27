@@ -324,14 +324,6 @@ async fn run(opt: config::Opt) -> Result<()> {
             (sigterm_inner, sigint_inner)
         };
 
-        #[cfg(not(unix))]
-        let (mut sigterm_inner, mut sigint_inner) = {
-            // Windows platform uses Ctrl+C as the only signal source
-            // Create two never-finished futures as placeholders
-            info!("Running on Windows, only Ctrl+C signal will be handled");
-            (std::pin::pin!(std::future::pending::<()>()), std::pin::pin!(std::future::pending::<()>()))
-        };
-
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
                 .layer(
@@ -392,38 +384,69 @@ async fn run(opt: config::Opt) -> Result<()> {
         loop {
             debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
             // Wait for a connection
-            let (socket, _) = tokio::select! {
-                res = listener.accept() => {
-                    match res {
-                        Ok(conn) => conn,
-                        Err(err) => {
-                            error!("error accepting connection: {err}");
-                            continue;
+            // Wait for a connection
+            let (socket, _) = {
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        res = listener.accept() => {
+                            match res {
+                                Ok(conn) => conn,
+                                Err(err) => {
+                                    error!("error accepting connection: {err}");
+                                    continue;
+                                }
+                            }
+                        }
+
+                        _ = ctrl_c.as_mut() => {
+                            info!("Ctrl-C received in worker thread");
+                            let _ = shutdown_tx_clone.send(());
+                            break;
+                        }
+
+                       Some(_) = sigint_inner.recv() => {
+                           info!("SIGINT received in worker thread");
+                           let _ = shutdown_tx_clone.send(());
+                           break;
+                       }
+
+                       Some(_) = sigterm_inner.recv() => {
+                           info!("SIGTERM received in worker thread");
+                           let _ = shutdown_tx_clone.send(());
+                           break;
+                       }
+
+                        _ = shutdown_rx.recv() => {
+                            info!("Shutdown signal received in worker thread");
+                            break;
                         }
                     }
                 }
+                #[cfg(not(unix))]
+                {
+                    tokio::select! {
+                        res = listener.accept() => {
+                            match res {
+                                Ok(conn) => conn,
+                                Err(err) => {
+                                    error!("error accepting connection: {err}");
+                                    continue;
+                                }
+                            }
+                        }
 
-                _ = ctrl_c.as_mut() => {
-                    info!("Ctrl-C received in worker thread");
-                    let _ = shutdown_tx_clone.send(());
-                    break;
-                }
+                        _ = ctrl_c.as_mut() => {
+                            info!("Ctrl-C received in worker thread");
+                            let _ = shutdown_tx_clone.send(());
+                            break;
+                        }
 
-               Some(_) = sigint_inner.recv() => {
-                   info!("SIGINT received in worker thread");
-                   let _ = shutdown_tx_clone.send(());
-                   break;
-               }
-
-               Some(_) = sigterm_inner.recv() => {
-                   info!("SIGTERM received in worker thread");
-                   let _ = shutdown_tx_clone.send(());
-                   break;
-               }
-
-                _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received in worker thread");
-                    break;
+                        _ = shutdown_rx.recv() => {
+                            info!("Shutdown signal received in worker thread");
+                            break;
+                        }
+                    }
                 }
             };
 

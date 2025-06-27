@@ -1,9 +1,7 @@
 use atomic_enum::atomic_enum;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
-#[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 
 // a configurable shutdown timeout
@@ -11,7 +9,7 @@ pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(target_os = "linux")]
 fn notify_systemd(state: &str) {
-    use libsystemd::daemon::{NotifyState, notify};
+    use libsystemd::daemon::{notify, NotifyState};
     use tracing::{debug, error};
     let notify_state = match state {
         "ready" => NotifyState::Ready,
@@ -51,7 +49,9 @@ pub(crate) enum ServiceState {
     Stopped,
 }
 
+#[cfg(unix)]
 pub(crate) async fn wait_for_shutdown() -> ShutdownSignal {
+    use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to create SIGTERM signal handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to create SIGINT signal handler");
 
@@ -67,6 +67,16 @@ pub(crate) async fn wait_for_shutdown() -> ShutdownSignal {
         _ = sigterm.recv() => {
             info!("Received SIGTERM signal");
             ShutdownSignal::Sigterm
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn wait_for_shutdown() -> ShutdownSignal {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl-C signal");
+            ShutdownSignal::CtrlC
         }
     }
 }
