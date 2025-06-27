@@ -20,13 +20,13 @@ pub mod target;
 // Re-exports
 pub use error::{NotificationError, StoreError, TargetError};
 pub use event::{Event, EventArgs, EventLog, EventName};
-pub use global::{initialize, notification_system};
+pub use global::{initialize, is_notification_system_initialized, notification_system};
 pub use integration::NotificationSystem;
 pub use rules::BucketNotificationConfig;
 use std::io::IsTerminal;
 pub use target::Target;
 
-use tracing_subscriber::{EnvFilter, fmt, prelude::*, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, prelude::*, util::SubscriberInitExt, EnvFilter};
 
 /// Initialize the tracing log system
 ///

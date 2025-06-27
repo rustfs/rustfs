@@ -40,3 +40,25 @@ pub(crate) async fn init_event_notifier() {
         }
     });
 }
+
+/// Shuts down the event notifier system gracefully
+pub async fn shutdown_event_notifier() {
+    info!("Shutting down event notifier system...");
+
+    if !rustfs_notify::is_notification_system_initialized() {
+        info!("Event notifier system is not initialized, nothing to shut down.");
+        return;
+    }
+
+    let system = match rustfs_notify::notification_system() {
+        Some(sys) => sys,
+        None => {
+            error!("Event notifier system is not initialized.");
+            return;
+        }
+    };
+
+    // Call the shutdown function from the rustfs_notify module
+    system.shutdown().await;
+    info!("Event notifier system shut down successfully.");
+}

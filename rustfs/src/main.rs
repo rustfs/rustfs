@@ -14,6 +14,7 @@ mod storage;
 use crate::auth::IAMAuth;
 use crate::console::{init_console_cfg, CONSOLE_CONFIG};
 // Ensure the correct path for parse_license is imported
+use crate::event::shutdown_event_notifier;
 use crate::server::{wait_for_shutdown, ServiceState, ServiceStateManager, ShutdownSignal, SHUTDOWN_TIMEOUT};
 use bytes::Bytes;
 use chrono::Datelike;
@@ -324,14 +325,13 @@ async fn run(opt: config::Opt) -> Result<()> {
         };
 
         #[cfg(not(unix))]
-        let (mut sigterm_future, mut sigint_future) = {
+        let (mut sigterm_inner, mut sigint_inner) = {
             // Windows platform uses Ctrl+C as the only signal source
             // Create two never-finished futures as placeholders
+            info!("Running on Windows, only Ctrl+C signal will be handled");
             (std::pin::pin!(std::future::pending::<()>()), std::pin::pin!(std::future::pending::<()>()))
         };
 
-        let mut sigterm_inner = sigterm_inner;
-        let mut sigint_inner = sigint_inner;
         let hybrid_service = TowerToHyperService::new(
             tower::ServiceBuilder::new()
                 .layer(
@@ -402,24 +402,25 @@ async fn run(opt: config::Opt) -> Result<()> {
                         }
                     }
                 }
+
                 _ = ctrl_c.as_mut() => {
                     info!("Ctrl-C received in worker thread");
                     let _ = shutdown_tx_clone.send(());
                     break;
                 }
 
-                #[cfg(unix)]
-                _ = sigint_inner.recv() => {
-                    info!("SIGINT received in worker thread");
-                    let _ = shutdown_tx_clone.send(());
-                    break;
-                }
-                #[cfg(unix)]
-                _ = sigterm_inner.recv() => {
-                    info!("SIGTERM received in worker thread");
-                    let _ = shutdown_tx_clone.send(());
-                    break;
-                }
+               Some(_) = sigint_inner.recv() => {
+                   info!("SIGINT received in worker thread");
+                   let _ = shutdown_tx_clone.send(());
+                   break;
+               }
+
+               Some(_) = sigterm_inner.recv() => {
+                   info!("SIGTERM received in worker thread");
+                   let _ = shutdown_tx_clone.send(());
+                   break;
+               }
+
                 _ = shutdown_rx.recv() => {
                     info!("Shutdown signal received in worker thread");
                     break;
@@ -592,14 +593,8 @@ async fn run(opt: config::Opt) -> Result<()> {
             // update the status to stopping first
             state_manager.update(ServiceState::Stopping);
 
-            // // Stop the notification system
-            // if rustfs_event::is_ready() {
-            //     // stop event notifier
-            //     rustfs_event::shutdown().await.map_err(|err| {
-            //         error!("Failed to shut down the notification system: {}", err);
-            //         Error::from_string(err.to_string())
-            //     })?;
-            // }
+            // Stop the notification system
+            shutdown_event_notifier().await;
 
             info!("Server is stopping...");
             let _ = shutdown_tx.send(());
