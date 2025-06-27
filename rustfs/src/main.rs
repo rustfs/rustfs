@@ -610,7 +610,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
     match wait_for_shutdown().await {
-        ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
+        ShutdownSignal::CtrlC
+        #[cfg(unix)]
+        | ShutdownSignal::Sigint
+        #[cfg(unix)]
+        | ShutdownSignal::Sigterm => {
             info!("Shutdown signal received in main thread");
             // update the status to stopping first
             state_manager.update(ServiceState::Stopping);
