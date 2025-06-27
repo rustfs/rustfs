@@ -36,7 +36,9 @@ fn notify_systemd(state: &str) {
 #[derive(Debug)]
 pub enum ShutdownSignal {
     CtrlC,
+    #[cfg(unix)]
     Sigterm,
+    #[cfg(unix)]
     Sigint,
 }
 

@@ -384,7 +384,6 @@ async fn run(opt: config::Opt) -> Result<()> {
         loop {
             debug!("waiting for SIGINT or SIGTERM has_tls_certs: {}", has_tls_certs);
             // Wait for a connection
-            // Wait for a connection
             let (socket, _) = {
                 #[cfg(unix)]
                 {
