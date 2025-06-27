@@ -8,6 +8,7 @@ use super::{DiskInfo, IOStats};
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
+    let path_display = p.as_ref().display();
     let stat_fs = statfs(p.as_ref())?;
 
     let bsize = stat_fs.block_size() as u64;
@@ -19,7 +20,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         Some(reserved) => reserved,
         None => {
             return Err(Error::other(format!(
-                "detected f_bavail space ({bavail}) > f_bfree space ({bfree}), fs corruption at ({p.as_ref().display()}). please run 'fsck'"
+                "detected f_bavail space ({bavail}) > f_bfree space ({bfree}), fs corruption at ({path_display}). please run 'fsck'"
             )));
         }
     };
@@ -28,7 +29,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         Some(total) => total * bsize,
         None => {
             return Err(Error::other(format!(
-                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({p.as_ref().display()}). please run 'fsck'"
+                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({path_display}). please run 'fsck'"
             )));
         }
     };
@@ -38,7 +39,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         Some(used) => used,
         None => {
             return Err(Error::other(format!(
-                "detected free space ({free}) > total drive space ({total}), fs corruption at ({p.as_ref().display()}). please run 'fsck'"
+                "detected free space ({free}) > total drive space ({total}), fs corruption at ({path_display}). please run 'fsck'"
             )));
         }
     };
