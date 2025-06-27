@@ -484,9 +484,7 @@ mod tests {
         }
 
         // 验证 etag（注意：压缩会改变数据，所以这里的 etag 验证可能需要调整）
-        println!(
-            "Test completed successfully with compression: {is_compress}, encryption: {is_encrypt}"
-        );
+        println!("Test completed successfully with compression: {is_compress}, encryption: {is_encrypt}");
     }
 
     #[tokio::test]

@@ -67,10 +67,7 @@ fn get_mapped_policy_path(name: &str, user_type: UserType, is_group: bool) -> St
         return path_join_buf(&[&IAM_CONFIG_POLICY_DB_GROUPS_PREFIX, format!("{name}.json").as_str()]);
     }
     match user_type {
-        UserType::Svc => path_join_buf(&[
-            &IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX,
-            format!("{name}.json").as_str(),
-        ]),
+        UserType::Svc => path_join_buf(&[&IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX, format!("{name}.json").as_str()]),
         UserType::Sts => path_join_buf(&[&IAM_CONFIG_POLICY_DB_STS_USERS_PREFIX, format!("{name}.json").as_str()]),
         _ => path_join_buf(&[&IAM_CONFIG_POLICY_DB_USERS_PREFIX, format!("{name}.json").as_str()]),
     }

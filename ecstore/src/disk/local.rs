@@ -672,14 +672,8 @@ impl LocalDisk {
 
         let volume_dir = self.get_bucket_path(volume)?;
 
-        self.write_all_private(
-            volume,
-            format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
-            buf.into(),
-            true,
-            &volume_dir,
-        )
-        .await?;
+        self.write_all_private(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), buf.into(), true, &volume_dir)
+            .await?;
 
         Ok(())
     }
@@ -1399,8 +1393,7 @@ impl DiskAPI for LocalDisk {
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
 
-        self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta)
-            .await?;
+        self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
 
         if let Some(parent) = src_file_path.parent() {
             self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await?;
@@ -2077,9 +2070,8 @@ impl DiskAPI for LocalDisk {
         // opts.undo_write && opts.old_data_dir.is_some_and(f)
         if let Some(old_data_dir) = opts.old_data_dir {
             if opts.undo_write {
-                let src_path = file_path.join(Path::new(
-                    format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str(),
-                ));
+                let src_path =
+                    file_path.join(Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()));
                 let dst_path = file_path.join(Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()));
                 return rename_all(src_path, dst_path, file_path).await;
             }

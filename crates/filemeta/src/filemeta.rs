@@ -929,13 +929,17 @@ impl FileMetaVersion {
     }
 
     pub fn get_data_dir(&self) -> Option<Uuid> {
-        if self.valid() { {
+        if self.valid() {
+            {
                 if self.version_type == VersionType::Object {
                     self.object.as_ref().map(|v| v.data_dir).unwrap_or_default()
                 } else {
                     None
                 }
-            } } else { Default::default() }
+            }
+        } else {
+            Default::default()
+        }
     }
 
     pub fn get_version_id(&self) -> Option<Uuid> {

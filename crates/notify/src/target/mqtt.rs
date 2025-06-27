@@ -241,8 +241,7 @@ impl MQTTTarget {
             records: vec![event.clone()],
         };
 
-        let data =
-            serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+        let data = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
 
         // Vec<u8> Convert to String, only for printing logs
         let data_string = String::from_utf8(data.clone())

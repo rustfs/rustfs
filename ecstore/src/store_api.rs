@@ -455,10 +455,7 @@ impl ObjectInfo {
         }
 
         if self.is_compressed() {
-            if let Some(size_str) = self
-                .user_defined
-                .get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size"))
-            {
+            if let Some(size_str) = self.user_defined.get(&format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size")) {
                 if !size_str.is_empty() {
                     // Todo: deal with error
                     let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;

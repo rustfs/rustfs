@@ -22,9 +22,7 @@ pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| certs_error(format!("certificate file {filename} format error:{e:?}")))?;
     if certs.is_empty() {
-        return Err(certs_error(format!(
-            "No valid certificate was found in the certificate file {filename}"
-        )));
+        return Err(certs_error(format!("No valid certificate was found in the certificate file {filename}")));
     }
     Ok(certs)
 }

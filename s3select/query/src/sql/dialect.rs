@@ -236,10 +236,7 @@ mod tests {
         let unicode_letters = ['α', 'β', 'γ', 'Α', 'Β', 'Γ', '中', '文', '日', '本', 'ñ', 'ü', 'ç'];
 
         for ch in unicode_letters {
-            assert!(
-                dialect.is_identifier_start(ch),
-                "Unicode letter '{ch}' should be valid identifier start"
-            );
+            assert!(dialect.is_identifier_start(ch), "Unicode letter '{ch}' should be valid identifier start");
             assert!(dialect.is_identifier_part(ch), "Unicode letter '{ch}' should be valid identifier part");
         }
     }
@@ -254,10 +251,7 @@ mod tests {
                 !dialect.is_identifier_start(digit),
                 "ASCII digit '{digit}' should not be valid identifier start"
             );
-            assert!(
-                dialect.is_identifier_part(digit),
-                "ASCII digit '{digit}' should be valid identifier part"
-            );
+            assert!(dialect.is_identifier_part(digit), "ASCII digit '{digit}' should be valid identifier part");
         }
     }
 
