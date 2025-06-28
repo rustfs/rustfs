@@ -25,7 +25,8 @@ pub const TRANSITION_PENDING: &str = "pending";
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration allows a maximum of 1000 rules";
 const ERR_LIFECYCLE_NO_RULE: &str = "Lifecycle configuration should have at least one rule";
 const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID for more than one rule";
-const ERR_XML_NOT_WELL_FORMED: &str = "The XML you provided was not well-formed or did not validate against our published schema";
+const _ERR_XML_NOT_WELL_FORMED: &str =
+    "The XML you provided was not well-formed or did not validate against our published schema";
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket";
 
@@ -697,19 +698,6 @@ pub struct ExpirationOptions {
     pub expire: bool,
 }
 
-impl ExpirationOptions {
-    fn marshal_msg(&self, b: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-        todo!();
-    }
-
-    fn unmarshal_msg(&self, bts: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-        todo!();
-    }
-
-    fn msg_size(&self) -> i64 {
-        1 + 7 + 10
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct TransitionOptions {

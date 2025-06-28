@@ -17,13 +17,10 @@ impl BucketObjectLockSys {
     }
 
     pub async fn get(bucket: &str) -> Option<DefaultRetention> {
-        if let Some(object_lock_rule) = get_object_lock_config(bucket)
-            .await
-            .expect("get_object_lock_config err!")
-            .0
-            .rule
-        {
-            return object_lock_rule.default_retention;
+        if let Ok(object_lock_config) = get_object_lock_config(bucket).await {
+            if let Some(object_lock_rule) = object_lock_config.0.rule {
+                return object_lock_rule.default_retention;
+            }
         }
         None
     }

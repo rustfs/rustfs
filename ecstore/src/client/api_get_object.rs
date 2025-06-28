@@ -61,6 +61,7 @@ impl TransitionClient {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct GetRequest {
     pub buffer: Vec<u8>,
     pub offset: i64,
@@ -72,6 +73,7 @@ pub struct GetRequest {
     pub setting_object_info: bool,
 }
 
+#[allow(dead_code)]
 pub struct GetResponse {
     pub size: i64,
     //pub error:       error,

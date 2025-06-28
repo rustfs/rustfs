@@ -17,6 +17,7 @@ use crate::global::GLOBAL_TierConfigMgr;
 static XXHASH_SEED: u64 = 0;
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct ObjSweeper {
     object: String,
     bucket: String,
@@ -29,6 +30,7 @@ struct ObjSweeper {
     remote_object: String,
 }
 
+#[allow(dead_code)]
 impl ObjSweeper {
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(bucket: &str, object: &str) -> Result<Self, std::io::Error> {
@@ -103,6 +105,7 @@ impl ObjSweeper {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused_assignments)]
 pub struct Jentry {
     obj_name: String,
     version_id: String,

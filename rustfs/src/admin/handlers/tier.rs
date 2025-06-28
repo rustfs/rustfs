@@ -1,6 +1,7 @@
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
 use http::{HeaderMap, StatusCode};
+use time::OffsetDateTime;
 //use iam::get_global_action_cred;
 use matchit::Params;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
@@ -55,12 +56,11 @@ pub struct AddTierQuery {
 pub struct AddTier {}
 #[async_trait::async_trait]
 impl Operation for AddTier {
-    #[tracing::instrument(level = "debug", skip(self))]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
                 input
             } else {
                 AddTierQuery::default()
@@ -119,39 +119,36 @@ impl Operation for AddTier {
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         //tier_config_mgr.reload(api);
         match tier_config_mgr.add(args, force).await {
-            Err(ERR_TIER_ALREADY_EXISTS) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierNameAlreadyExist".into()),
-                    "tier name already exists!",
-                ));
-            }
-            Err(ERR_TIER_NAME_NOT_UPPERCASE) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierNameNotUppercase".into()),
-                    "tier name not uppercase!",
-                ));
-            }
-            Err(ERR_TIER_BACKEND_IN_USE) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierNameBackendInUse!".into()),
-                    "tier name backend in use!",
-                ));
-            }
-            Err(ERR_TIER_CONNECT_ERR) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierConnectError".into()),
-                    "tier connect error!",
-                ));
-            }
-            Err(ERR_TIER_INVALID_CREDENTIALS) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom(ERR_TIER_INVALID_CREDENTIALS.code.into()),
-                    ERR_TIER_INVALID_CREDENTIALS.message,
-                ));
-            }
-            Err(e) => {
-                warn!("tier_config_mgr add failed, e: {:?}", e);
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierAddFailed".into()), "tier add failed"));
+            Err(err) => {
+                if err.code == ERR_TIER_ALREADY_EXISTS.code {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("TierNameAlreadyExist".into()),
+                        "tier name already exists!",
+                    ));
+                } else if err.code == ERR_TIER_NAME_NOT_UPPERCASE.code {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("TierNameNotUppercase".into()),
+                        "tier name not uppercase!",
+                    ));
+                } else if err.code == ERR_TIER_BACKEND_IN_USE.code {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("TierNameBackendInUse!".into()),
+                        "tier name backend in use!",
+                    ));
+                } else if err.code == ERR_TIER_CONNECT_ERR.code {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("TierConnectError".into()),
+                        "tier connect error!",
+                    ));
+                } else if err.code == ERR_TIER_INVALID_CREDENTIALS.code {
+                    return Err(S3Error::with_message(S3ErrorCode::Custom(err.code.clone().into()), err.message.clone()));
+                } else {
+                    warn!("tier_config_mgr add failed, e: {:?}", err);
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("TierAddFailed".into()),
+                        format!("tier add failed. {}", err.to_string()),
+                    ));
+                }
             }
             Ok(_) => (),
         }
@@ -159,7 +156,6 @@ impl Operation for AddTier {
             warn!("tier_config_mgr save failed, e: {:?}", e);
             return Err(S3Error::with_message(S3ErrorCode::Custom("TierAddFailed".into()), "tier save failed"));
         }
-        //globalNotificationSys.LoadTransitionTierConfig(ctx);
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -175,7 +171,7 @@ impl Operation for EditTier {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
                 input
             } else {
                 AddTierQuery::default()
@@ -189,9 +185,6 @@ impl Operation for EditTier {
         let (cred, _owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        //{"accesskey":"gggggg","secretkey":"jjjjjjj"}
-        //{"detailedMessage":"failed to perform PUT: The Access Key Id you provided does not exist in our records.","message":"an error occurred, please try again"}
-        //200 OK
         let mut input = req.input;
         let body = match input.store_all_unlimited().await {
             Ok(b) => b,
@@ -211,18 +204,21 @@ impl Operation for EditTier {
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         //tier_config_mgr.reload(api);
         match tier_config_mgr.edit(&tier_name, creds).await {
-            Err(ERR_TIER_NOT_FOUND) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found!"));
-            }
-            Err(ERR_TIER_MISSING_CREDENTIALS) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierMissingCredentials".into()),
-                    "tier missing credentials!",
-                ));
-            }
-            Err(e) => {
-                warn!("tier_config_mgr edit failed, e: {:?}", e);
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierEditFailed".into()), "tier edit failed"));
+            Err(err) => {
+                if err.code == ERR_TIER_NOT_FOUND.code {
+                    return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found!"));
+                } else if err.code == ERR_TIER_MISSING_CREDENTIALS.code {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("TierMissingCredentials".into()),
+                        "tier missing credentials!",
+                    ));
+                } else {
+                    warn!("tier_config_mgr edit failed, e: {:?}", err);
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("TierEditFailed".into()),
+                        format!("tier edit failed. {}", err.to_string()),
+                    ));
+                }
             }
             Ok(_) => (),
         }
@@ -230,7 +226,6 @@ impl Operation for EditTier {
             warn!("tier_config_mgr save failed, e: {:?}", e);
             return Err(S3Error::with_message(S3ErrorCode::Custom("TierEditFailed".into()), "tier save failed"));
         }
-        //globalNotificationSys.LoadTransitionTierConfig(ctx);
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -252,14 +247,13 @@ impl Operation for ListTiers {
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: BucketQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
                 input
             } else {
                 BucketQuery::default()
             }
         };
 
-        //{"items":[{"minio":{"accesskey":"minioadmin","bucket":"mblock2","endpoint":"http://192.168.1.11:9020","name":"COLDTIER","objects":"0","prefix":"mypre/","secretkey":"REDACTED","usage":"0 B","versions":"0"},"status":true,"type":"minio"}]}
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
         let tiers = tier_config_mgr.list_tiers();
 
@@ -277,12 +271,10 @@ pub struct RemoveTier {}
 #[async_trait::async_trait]
 impl Operation for RemoveTier {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RemoveTier");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
                 input
             } else {
                 AddTierQuery::default()
@@ -313,18 +305,18 @@ impl Operation for RemoveTier {
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         //tier_config_mgr.reload(api);
         match tier_config_mgr.remove(&tier_name, force).await {
-            Err(ERR_TIER_NOT_FOUND) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found."));
-            }
-            Err(ERR_TIER_BACKEND_NOT_EMPTY) => {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNameBackendInUse".into()), "tier is used."));
-            }
-            Err(e) => {
-                warn!("tier_config_mgr remove failed, e: {:?}", e);
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierRemoveFailed".into()),
-                    "tier remove failed",
-                ));
+            Err(err) => {
+                if err.code == ERR_TIER_NOT_FOUND.code {
+                    return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found."));
+                } else if err.code == ERR_TIER_BACKEND_NOT_EMPTY.code {
+                    return Err(S3Error::with_message(S3ErrorCode::Custom("TierNameBackendInUse".into()), "tier is used."));
+                } else {
+                    warn!("tier_config_mgr remove failed, e: {:?}", err);
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::Custom("TierRemoveFailed".into()),
+                        format!("tier remove failed. {}", err.to_string()),
+                    ));
+                }
             }
             Ok(_) => (),
         }
@@ -332,7 +324,6 @@ impl Operation for RemoveTier {
             warn!("tier_config_mgr save failed, e: {:?}", e);
             return Err(S3Error::with_message(S3ErrorCode::Custom("TierRemoveFailed".into()), "tier save failed"));
         }
-        //globalNotificationSys.LoadTransitionTierConfig(ctx);
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -345,12 +336,10 @@ pub struct VerifyTier {}
 #[async_trait::async_trait]
 impl Operation for VerifyTier {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle RemoveTier");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
                 input
             } else {
                 AddTierQuery::default()
@@ -381,19 +370,17 @@ pub struct GetTierInfo {}
 #[async_trait::async_trait]
 impl Operation for GetTierInfo {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle GetTierInfo");
-
         let query = {
             if let Some(query) = req.uri.query() {
                 let input: AddTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed"))?;
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
                 input
             } else {
                 AddTierQuery::default()
             }
         };
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
+        let tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
         let info = tier_config_mgr.get(&query.tier.unwrap());
 
         let data = serde_json::to_vec(&info)
@@ -403,5 +390,72 @@ impl Operation for GetTierInfo {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+    }
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct ClearTierQuery {
+    pub rand: Option<String>,
+    pub force: String,
+}
+
+pub struct ClearTier {}
+#[async_trait::async_trait]
+impl Operation for ClearTier {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let query = {
+            if let Some(query) = req.uri.query() {
+                let input: ClearTierQuery =
+                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
+                input
+            } else {
+                ClearTierQuery::default()
+            }
+        };
+
+        //let Some(input_cred) = req.credentials else {
+        //    return Err(s3_error!(InvalidRequest, "get cred failed"));
+        //};
+
+        //let (cred, _owner) =
+        //    check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        let mut force: bool = false;
+        let force_str = query.force;
+        if force_str != "" {
+            force = force_str.parse().unwrap();
+        }
+
+        let t = OffsetDateTime::now_utc();
+        let mut rand = "AGD1R25GI3I1GJGUGJFD7FBS4DFAASDF".to_string();
+        rand.insert_str(3, &t.day().to_string());
+        rand.insert_str(17, &t.month().to_string());
+        rand.insert_str(23, &t.year().to_string());
+        warn!("tier_config_mgr rand: {}", rand);
+        if query.rand != Some(rand) {
+            return Err(s3_error!(InvalidRequest, "get rand failed"));
+        };
+
+        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        //tier_config_mgr.reload(api);
+        match tier_config_mgr.clear_tier(force).await {
+            Err(err) => {
+                warn!("tier_config_mgr clear failed, e: {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierClearFailed".into()),
+                    format!("tier clear failed. {}", err.to_string()),
+                ));
+            }
+            Ok(_) => (),
+        }
+        if let Err(e) = tier_config_mgr.save().await {
+            warn!("tier_config_mgr save failed, e: {:?}", e);
+            return Err(S3Error::with_message(S3ErrorCode::Custom("TierEditFailed".into()), "tier save failed"));
+        }
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }

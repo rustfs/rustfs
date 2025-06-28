@@ -1,29 +1,21 @@
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
-
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use http::request;
 use hyper::Uri;
 use std::collections::HashMap;
 use std::fmt::Write;
-use time::{OffsetDateTime, format_description, macros::format_description};
-
-use rustfs_utils::crypto::{base64_encode, hex, hmac_sha1};
+use time::{OffsetDateTime, format_description};
 
 use super::utils::get_host_addr;
+use rustfs_utils::crypto::{base64_encode, hex, hmac_sha1};
 
-const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
 
-fn encode_url2path(req: &request::Builder, virtual_host: bool) -> String {
-    let mut path = "".to_string();
+fn encode_url2path(req: &request::Builder, _virtual_host: bool) -> String {
+    
 
     //path = serde_urlencoded::to_string(req.uri_ref().unwrap().path().unwrap()).unwrap();
-    path = req.uri_ref().unwrap().path().to_string();
+    let path = req.uri_ref().unwrap().path().to_string();
     path
 }
 
@@ -34,7 +26,7 @@ pub fn pre_sign_v2(
     expires: i64,
     virtual_host: bool,
 ) -> request::Builder {
-    if access_key_id == "" || secret_access_key == "" {
+    if access_key_id.is_empty() || secret_access_key.is_empty() {
         return req;
     }
 
@@ -42,7 +34,7 @@ pub fn pre_sign_v2(
     let d = d.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
     let epoch_expires = d.unix_timestamp() + expires;
 
-    let mut headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut().expect("headers_mut err");
     let expires_str = headers.get("Expires");
     if expires_str.is_none() {
         headers.insert("Expires", format!("{:010}", epoch_expires).parse().unwrap());
@@ -68,24 +60,24 @@ pub fn pre_sign_v2(
             .parse()
             .unwrap(),
     );
-    let req = req.uri(Uri::from_parts(parts).unwrap());
+    
 
-    req
+    req.uri(Uri::from_parts(parts).unwrap())
 }
 
-fn post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> String {
-    let signature = hex(hmac_sha1(secret_access_key, policy_base64));
-    signature
+fn _post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> String {
+    
+    hex(hmac_sha1(secret_access_key, policy_base64))
 }
 
 pub fn sign_v2(
     mut req: request::Builder,
-    content_len: i64,
+    _content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     virtual_host: bool,
 ) -> request::Builder {
-    if access_key_id == "" || secret_access_key == "" {
+    if access_key_id.is_empty() || secret_access_key.is_empty() {
         return req;
     }
 
@@ -93,7 +85,7 @@ pub fn sign_v2(
     let d2 = d.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
 
     let string_to_sign = string_to_sign_v2(&req, virtual_host);
-    let mut headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut().expect("err");
 
     let date = headers.get("Date").unwrap();
     if date.to_str().unwrap() == "" {
@@ -107,7 +99,7 @@ pub fn sign_v2(
         );
     }
 
-    let mut auth_header = format!("{} {}:", SIGN_V2_ALGORITHM, access_key_id);
+    let auth_header = format!("{} {}:", SIGN_V2_ALGORITHM, access_key_id);
     let auth_header = format!("{}{}", auth_header, base64_encode(&hmac_sha1(secret_access_key, string_to_sign)));
 
     headers.insert("Authorization", auth_header.parse().unwrap());
@@ -117,9 +109,9 @@ pub fn sign_v2(
 
 fn pre_string_to_sign_v2(req: &request::Builder, virtual_host: bool) -> String {
     let mut buf = BytesMut::new();
-    write_pre_sign_v2_headers(&mut buf, &req);
-    write_canonicalized_headers(&mut buf, &req);
-    write_canonicalized_resource(&mut buf, &req, virtual_host);
+    write_pre_sign_v2_headers(&mut buf, req);
+    write_canonicalized_headers(&mut buf, req);
+    write_canonicalized_resource(&mut buf, req, virtual_host);
     String::from_utf8(buf.to_vec()).unwrap()
 }
 
@@ -136,9 +128,9 @@ fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Builder) {
 
 fn string_to_sign_v2(req: &request::Builder, virtual_host: bool) -> String {
     let mut buf = BytesMut::new();
-    write_sign_v2_headers(&mut buf, &req);
-    write_canonicalized_headers(&mut buf, &req);
-    write_canonicalized_resource(&mut buf, &req, virtual_host);
+    write_sign_v2_headers(&mut buf, req);
+    write_canonicalized_headers(&mut buf, req);
+    write_canonicalized_resource(&mut buf, req, virtual_host);
     String::from_utf8(buf.to_vec()).unwrap()
 }
 
@@ -214,10 +206,10 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Builder, virt
     if request_url.query().unwrap() != "" {
         let mut n: i64 = 0;
         let result = serde_urlencoded::from_str::<HashMap<String, Vec<String>>>(req.uri_ref().unwrap().query().unwrap());
-        let mut vals = result.unwrap_or_default();
+        let vals = result.unwrap_or_default();
         for resource in INCLUDED_QUERY {
             let vv = &vals[*resource];
-            if vv.len() > 0 {
+            if !vv.is_empty() {
                 n += 1;
                 match n {
                     1 => {
@@ -226,7 +218,7 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Builder, virt
                     _ => {
                         let _ = buf.write_char('&');
                         let _ = buf.write_str(resource);
-                        if vv[0].len() > 0 {
+                        if !vv[0].is_empty() {
                             let _ = buf.write_char('=');
                             let _ = buf.write_str(&vv[0]);
                         }

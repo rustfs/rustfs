@@ -141,28 +141,6 @@ impl ErrorResponse {
     }
 }
 
-struct Error {
-    code: String,
-    message: String,
-    bucket_name: String,
-    key: String,
-    resource: String,
-    request_id: String,
-    host_id: String,
-    region: String,
-    server: String,
-    status_code: i64,
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if self.message == "" {
-            return write!(f, "{}", format!("Error response code {}.", self.code));
-        }
-        write!(f, "{}", self.message)
-    }
-}
-
 pub fn xml_decoder<T>(body: &[u8]) -> Result<T, std::io::Error> {
     todo!();
 }

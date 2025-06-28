@@ -1,0 +1,25 @@
+[package]
+name = "rustfs-signer"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+tracing.workspace = true
+lazy_static.workspace = true
+bytes = { workspace = true }
+http.workspace = true
+time.workspace = true
+hyper.workspace = true
+serde.workspace = true
+serde_urlencoded.workspace = true
+rustfs-utils = {workspace = true, features=["full"]}
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+
+[lints]
+workspace = true

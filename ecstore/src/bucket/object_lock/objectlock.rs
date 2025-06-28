@@ -4,21 +4,15 @@ use time::{OffsetDateTime, format_description};
 use s3s::dto::{Date, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode};
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 
-//const AMZ_OBJECTLOCK_BYPASS_RET_GOVERNANCE: &str = "X-Amz-Bypass-Governance-Retention";
-//const AMZ_OBJECTLOCK_RETAIN_UNTIL_DATE: &str     = "X-Amz-Object-Lock-Retain-Until-Date";
-//const AMZ_OBJECTLOCK_MODE: &str                  = "X-Amz-Object-Lock-Mode";
-//const AMZ_OBJECTLOCK_LEGALHOLD: &str             = "X-Amz-Object-Lock-Legal-Hold";
-
-// Commented out unused constants to avoid dead code warnings
-// const ERR_MALFORMED_BUCKET_OBJECT_CONFIG: &str = "invalid bucket object lock config";
-// const ERR_INVALID_RETENTION_DATE: &str = "date must be provided in ISO 8601 format";
-// const ERR_PAST_OBJECTLOCK_RETAIN_DATE: &str = "the retain until date must be in the future";
-// const ERR_UNKNOWN_WORMMODE_DIRECTIVE: &str = "unknown WORM mode directive";
-// const ERR_OBJECTLOCK_MISSING_CONTENT_MD5: &str =
-//     "content-MD5 HTTP header is required for Put Object requests with Object Lock parameters";
-// const ERR_OBJECTLOCK_INVALID_HEADERS: &str =
-//     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
-// const ERR_MALFORMED_XML: &str = "the XML you provided was not well-formed or did not validate against our published schema";
+const _ERR_MALFORMED_BUCKET_OBJECT_CONFIG: &str = "invalid bucket object lock config";
+const _ERR_INVALID_RETENTION_DATE: &str = "date must be provided in ISO 8601 format";
+const _ERR_PAST_OBJECTLOCK_RETAIN_DATE: &str = "the retain until date must be in the future";
+const _ERR_UNKNOWN_WORMMODE_DIRECTIVE: &str = "unknown WORM mode directive";
+const _ERR_OBJECTLOCK_MISSING_CONTENT_MD5: &str =
+    "content-MD5 HTTP header is required for Put Object requests with Object Lock parameters";
+const _ERR_OBJECTLOCK_INVALID_HEADERS: &str =
+    "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
+const _ERR_MALFORMED_XML: &str = "the XML you provided was not well-formed or did not validate against our published schema";
 
 pub fn utc_now_ntp() -> OffsetDateTime {
     OffsetDateTime::now_utc()

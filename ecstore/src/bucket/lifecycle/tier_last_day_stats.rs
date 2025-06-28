@@ -65,6 +65,7 @@ impl LastDayTierStats {
         }
     }
 
+    #[allow(dead_code)]
     fn merge(&self, m: LastDayTierStats) -> LastDayTierStats {
         let mut cl = self.clone();
         let mut cm = m.clone();

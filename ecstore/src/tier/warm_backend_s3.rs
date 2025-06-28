@@ -95,15 +95,6 @@ impl WarmBackendS3 {
         })
     }
 
-    fn to_object_err(&self, err: ErrorResponse, params: Vec<&str>) -> std::io::Error {
-        let mut object = "";
-        if params.len() >= 1 {
-            object = params.first().cloned().unwrap_or_default();
-        }
-
-        error_resp_to_object_err(err, vec![&self.bucket, &self.get_dest(object)])
-    }
-
     pub fn get_dest(&self, object: &str) -> String {
         let mut dest_obj = object.to_string();
         if self.prefix != "" {

@@ -12,7 +12,7 @@ use std::{collections::HashMap, sync::Arc};
 use time::{Duration, OffsetDateTime, macros::format_description};
 use tracing::{error, info, warn};
 
-use reader::hasher::Hasher;
+use rustfs_utils::hasher::Hasher;
 use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus};
 use s3s::header::{
     X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
@@ -124,6 +124,7 @@ impl Default for PutObjectOptions {
     }
 }
 
+#[allow(dead_code)]
 impl PutObjectOptions {
     fn set_matche_tag(&mut self, etag: &str) {
         if etag == "*" {

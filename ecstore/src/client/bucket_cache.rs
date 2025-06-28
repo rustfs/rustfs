@@ -17,9 +17,8 @@ use crate::client::{
     api_error_response::{http_resp_to_error_response, to_error_response},
     transition_api::{Document, TransitionClient},
 };
-use crate::signer;
-use reader::hasher::{Hasher, Sha256};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use rustfs_utils::hasher::{Hasher, Sha256};
 use s3s::Body;
 use s3s::S3ErrorCode;
 
@@ -151,7 +150,7 @@ impl TransitionClient {
         }
 
         if signer_type == SignatureType::SignatureV2 {
-            let req_builder = signer::sign_v2(req_builder, 0, &access_key_id, &secret_access_key, is_virtual_style);
+            let req_builder = rustfs_signer::sign_v2(req_builder, 0, &access_key_id, &secret_access_key, is_virtual_style);
             let req = match req_builder.body(Body::empty()) {
                 Ok(req) => return Ok(req),
                 Err(err) => {
@@ -169,7 +168,7 @@ impl TransitionClient {
             .headers_mut()
             .expect("err")
             .insert("X-Amz-Content-Sha256", content_sha256.parse().unwrap());
-        let req_builder = signer::sign_v4(req_builder, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
+        let req_builder = rustfs_signer::sign_v4(req_builder, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
         let req = match req_builder.body(Body::empty()) {
             Ok(req) => return Ok(req),
             Err(err) => {

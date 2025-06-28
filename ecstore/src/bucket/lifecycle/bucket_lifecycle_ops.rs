@@ -25,6 +25,8 @@ use tracing::{error, info};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
+//use rustfs_notify::{BucketNotificationConfig, Event, EventName, LogLevel, NotificationError, init_logger};
+//use rustfs_notify::{initialize, notification_system};
 use super::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
 use super::lifecycle::{self, ExpirationOptions, IlmAction, Lifecycle, TransitionOptions};
 use super::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
@@ -109,6 +111,7 @@ struct ExpiryStats {
     workers: AtomicI64,
 }
 
+#[allow(dead_code)]
 impl ExpiryStats {
     pub fn missed_tasks(&self) -> i64 {
         self.missed_expiry_tasks.load(Ordering::SeqCst)
@@ -408,10 +411,6 @@ pub struct TransitionState {
     last_day_stats: Arc<Mutex<HashMap<String, LastDayTierStats>>>,
 }
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-//type RetKill = impl Future<Output = Option<()>> + Send + 'static;
-//type RetTransitionTask = impl Future<Output = Option<Option<TransitionTask>>> + Send + 'static;
-
 impl TransitionState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {
@@ -567,32 +566,6 @@ impl TransitionState {
     }
 }
 
-struct AuditTierOp {
-    tier: String,
-    time_to_responsens: i64,
-    output_bytes: i64,
-    error: String,
-}
-
-impl AuditTierOp {
-    #[allow(clippy::new_ret_no_self)]
-    pub async fn new() -> Result<Self, std::io::Error> {
-        Ok(Self {
-            tier: String::from("tier"),
-            time_to_responsens: 0,
-            output_bytes: 0,
-            error: String::from(""),
-        })
-    }
-
-    pub fn string(&self) -> String {
-        format!(
-            "tier:{},respNS:{},tx:{},err:{}",
-            self.tier, self.time_to_responsens, self.output_bytes, self.error
-        )
-    }
-}
-
 pub async fn init_background_expiry(api: Arc<ECStore>) {
     let mut workers = num_cpus::get() / 2;
     //globalILMConfig.getExpirationWorkers()
@@ -717,6 +690,16 @@ pub async fn expire_transitioned_object(
         host: GLOBAL_LocalNodeName.to_string(),
         ..Default::default()
     });
+    /*let system = match notification_system() {
+        Some(sys) => sys,
+        None => {
+            let config = Config::new();
+            initialize(config).await?;
+            notification_system().expect("Failed to initialize notification system")
+        }
+    };
+    let event = Arc::new(Event::new_test_event("my-bucket", "document.pdf", EventName::ObjectCreatedPut));
+    system.send_event(event).await;*/
 
     Ok(dobj)
 }
@@ -845,4 +828,4 @@ pub struct RestoreObjectRequest {
     pub output_location: OutputLocation,
 }
 
-const MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;
+const _MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;

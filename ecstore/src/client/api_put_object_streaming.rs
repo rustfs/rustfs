@@ -27,7 +27,7 @@ use crate::client::{
     constants::ISO8601_DATEFORMAT,
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
-use reader::hasher::Hasher;
+use rustfs_utils::hasher::Hasher;
 use rustfs_utils::{crypto::base64_encode, path::trim_etag};
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 

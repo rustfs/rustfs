@@ -809,7 +809,9 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         return std::io::Error::other(ObjectApiError::BackendDown(format!("{err}")));
     }
 
+    let err_ = std::io::Error::other(err.to_string());
     let r_err = err;
+    let err;
     let bucket = bucket.to_string();
     let object = object.to_string();
     let version_id = version_id.to_string();
@@ -830,48 +832,62 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         /*S3ErrorCode::BucketAlreadyOwnedByYou => {
             err = Error::from(StorageError::BucketAlreadyOwnedByYou);
         }*/
-        S3ErrorCode::BucketNotEmpty => std::io::Error::other(StorageError::BucketNotEmpty("".to_string()).to_string()),
+        S3ErrorCode::BucketNotEmpty => {
+            err = std::io::Error::other(StorageError::BucketNotEmpty("".to_string()).to_string());
+        }
         /*S3ErrorCode::NoSuchBucketPolicy => {
             err = Error::from(StorageError::BucketPolicyNotFound);
         }*/
         /*S3ErrorCode::NoSuchLifecycleConfiguration => {
             err = Error::from(StorageError::BucketLifecycleNotFound);
         }*/
-        S3ErrorCode::InvalidBucketName => std::io::Error::other(StorageError::BucketNameInvalid(bucket)),
-        S3ErrorCode::InvalidPart => {
-            std::io::Error::other(StorageError::InvalidPart(0, bucket, object /* , version_id */))
+        S3ErrorCode::InvalidBucketName => {
+            err = std::io::Error::other(StorageError::BucketNameInvalid(bucket));
         }
-        S3ErrorCode::NoSuchBucket => std::io::Error::other(StorageError::BucketNotFound(bucket)),
+        S3ErrorCode::InvalidPart => {
+            err = std::io::Error::other(StorageError::InvalidPart(0, bucket, object /* , version_id */));
+        }
+        S3ErrorCode::NoSuchBucket => {
+            err = std::io::Error::other(StorageError::BucketNotFound(bucket));
+        }
         S3ErrorCode::NoSuchKey => {
-            if !object.is_empty() {
-                std::io::Error::other(StorageError::ObjectNotFound(bucket, object))
+            if object != "" {
+                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object));
             } else {
-                std::io::Error::other(StorageError::BucketNotFound(bucket))
+                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
             }
         }
         S3ErrorCode::NoSuchVersion => {
-            if !object.is_empty() {
-                std::io::Error::other(StorageError::ObjectNotFound(bucket, object)) //, version_id);
+            if object != "" {
+                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object)); //, version_id);
             } else {
-                std::io::Error::other(StorageError::BucketNotFound(bucket))
+                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
             }
         }
         /*S3ErrorCode::XRustFsInvalidObjectName => {
             err = Error::from(StorageError::ObjectNameInvalid(bucket, object));
         }*/
-        S3ErrorCode::AccessDenied => std::io::Error::other(StorageError::PrefixAccessDenied(bucket, object)),
+        S3ErrorCode::AccessDenied => {
+            err = std::io::Error::other(StorageError::PrefixAccessDenied(bucket, object));
+        }
         /*S3ErrorCode::XAmzContentSHA256Mismatch => {
             err = hash.SHA256Mismatch{};
         }*/
-        S3ErrorCode::NoSuchUpload => std::io::Error::other(StorageError::InvalidUploadID(bucket, object, version_id)),
+        S3ErrorCode::NoSuchUpload => {
+            err = std::io::Error::other(StorageError::InvalidUploadID(bucket, object, version_id));
+        }
         /*S3ErrorCode::EntityTooSmall => {
             err = std::io::Error::other(StorageError::PartTooSmall);
         }*/
         /*S3ErrorCode::ReplicationPermissionCheck => {
             err = std::io::Error::other(StorageError::ReplicationPermissionCheck);
         }*/
-        _ => std::io::Error::other("err"),
+        _ => {
+            err = err_;
+        }
     }
+
+    err
 }
 
 pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {

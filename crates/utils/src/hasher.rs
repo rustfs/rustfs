@@ -1,6 +1,6 @@
 use md5::{Digest as Md5Digest, Md5};
 use sha2::{
-    Digest, Sha256 as sha_sha256,
+    Sha256 as sha_sha256,
     digest::{Reset, Update},
 };
 pub trait Hasher {
@@ -125,7 +125,7 @@ impl Default for MD5 {
 
 impl Hasher for MD5 {
     fn write(&mut self, bytes: &[u8]) {
-        self.hasher.update(bytes);
+        Md5Digest::update(&mut self.hasher, bytes);
     }
 
     fn reset(&mut self) {}

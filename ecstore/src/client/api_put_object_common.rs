@@ -14,8 +14,6 @@ use crate::client::{
     transition_api::TransitionClient,
 };
 
-const NULL_VERSION_ID: &str = "null";
-
 pub fn is_object(reader: &ReaderImpl) -> bool {
     todo!();
 }

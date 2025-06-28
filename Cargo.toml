@@ -13,6 +13,7 @@ members = [
     "crates/rio", # Rust I/O utilities and abstractions
     "crates/utils", # Utility functions and helpers
     "crates/zip", # ZIP file handling and compression
+    "crates/signer", # client signer
     "crypto", # Cryptography and security features
     "ecstore", # Erasure coding storage implementation
     "e2e_test", # End-to-end test suite
@@ -21,7 +22,6 @@ members = [
     "rustfs", # Core file system implementation
     "s3select/api", # S3 Select API interface
     "s3select/query", # S3 Select query engine
-    "reader",
 ]
 resolver = "2"
 
@@ -58,8 +58,8 @@ rustfs-notify = { path = "crates/notify", version = "0.0.1" }
 rustfs-utils = { path = "crates/utils", version = "0.0.1" }
 rustfs-rio = { path = "crates/rio", version = "0.0.1" }
 rustfs-filemeta = { path = "crates/filemeta", version = "0.0.1" }
+rustfs-signer = { path = "crates/signer", version = "0.0.1" }
 workers = { path = "./common/workers", version = "0.0.1" }
-reader = { path = "./reader", version = "0.0.1" }
 aes-gcm = { version = "0.10.3", features = ["std"] }
 arc-swap = "1.7.1"
 argon2 = { version = "0.5.3", features = ["std"] }

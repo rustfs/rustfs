@@ -34,7 +34,6 @@ pub mod checksum;
 pub mod client;
 pub mod event;
 pub mod event_notification;
-pub mod signer;
 pub mod tier;
 
 pub use global::new_object_layer_fn;

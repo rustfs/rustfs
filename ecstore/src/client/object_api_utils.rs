@@ -24,13 +24,9 @@ pub struct PutObjReader {
     //pub sealMD5Fn: SealMD5CurrFn,
 }
 
+#[allow(dead_code)]
 impl PutObjReader {
     pub fn new(raw_reader: HashReader) -> Self {
-        todo!();
-    }
-
-    fn size(&self) -> usize {
-        //self.reader.size()
         todo!();
     }
 
