@@ -404,6 +404,9 @@ pub fn sign_v4_trailer(
 
 #[cfg(test)]
 mod tests {
+    use http::request;
+    use time::macros::datetime;
+
     use super::*;
 
     #[test]
@@ -417,7 +420,7 @@ mod tests {
         let service = "s3";
         let path = "/";
 
-        let mut req = Request::builder()
+        let mut req = request::Request::builder()
             .method(http::Method::GET)
             .uri("http://examplebucket.s3.amazonaws.com/?");
         let mut headers = req.headers_mut().expect("err");
@@ -489,7 +492,7 @@ mod tests {
         let service = "s3";
         let path = "/mblock2/";
 
-        let mut req = Request::builder()
+        let mut req = request::Request::builder()
             .method(http::Method::GET)
             .uri("http://192.168.1.11:9020/mblock2/?");
 
@@ -562,7 +565,7 @@ mod tests {
         let service = "s3";
         let path = "/mblock2/";
 
-        let mut req = Request::builder().method(http::Method::GET).uri("http://192.168.1.11:9020/mblock2/?list-type=2&encoding-type=url&prefix=mypre&delimiter=%2F&fetch-owner=true&max-keys=1");
+        let mut req = request::Request::builder().method(http::Method::GET).uri("http://192.168.1.11:9020/mblock2/?list-type=2&encoding-type=url&prefix=mypre&delimiter=%2F&fetch-owner=true&max-keys=1");
 
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "192.168.1.11:9020".parse().unwrap());
@@ -574,19 +577,6 @@ mod tests {
         );
         headers.insert("x-amz-date", timestamp.parse().unwrap());
 
-        /*let uri = req.uri_ref().unwrap().clone();
-        println!("{:?}", uri);
-        let mut canonical_query_string = "".to_string();
-        if let Some(q) = uri.query() {
-            let result = serde_urlencoded::from_str::<Vec<String>>(q);
-            let mut query = result.unwrap_or_default();
-            query.sort();
-            canonical_query_string = query.join("&");
-            canonical_query_string.replace("+", "%20");
-        }
-        let mut parts = req.uri_ref().unwrap().clone().into_parts();
-        parts.path_and_query = Some(format!("{}?{}", uri.path(), canonical_query_string).parse().unwrap());
-        let req = req.uri(Uri::from_parts(parts).unwrap());*/
         println!("{:?}", req.uri_ref().unwrap().query());
         let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
         println!("canonical_request: \n{}\n", canonical_request);
@@ -628,8 +618,6 @@ mod tests {
 
     #[test]
     fn example_presigned_url() {
-        use hyper::Uri;
-
         let access_key_id = "AKIAIOSFODNN7EXAMPLE";
         let secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
         let timestamp = "20130524T000000Z";
@@ -640,7 +628,7 @@ mod tests {
         let path = "/";
         let session_token = "";
 
-        let mut req = Request::builder()
+        let mut req = request::Request::builder()
             .method(http::Method::GET)
             .uri("http://examplebucket.s3.amazonaws.com/test.txt");
 
@@ -677,8 +665,6 @@ mod tests {
 
     #[test]
     fn example_presigned_url2() {
-        use hyper::Uri;
-
         let access_key_id = "rustfsadmin";
         let secret_access_key = "rustfsadmin";
         let timestamp = "20130524T000000Z";
@@ -689,7 +675,7 @@ mod tests {
         let path = "/mblock2/";
         let session_token = "";
 
-        let mut req = Request::builder().method(http::Method::GET).uri("http://192.168.1.11:9020/mblock2/test.txt?delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2");
+        let mut req = request::Request::builder().method(http::Method::GET).uri("http://192.168.1.11:9020/mblock2/test.txt?delimiter=%2F&fetch-owner=true&prefix=mypre&encoding-type=url&max-keys=1&list-type=2");
 
         let mut headers = req.headers_mut().expect("err");
         headers.insert("host", "192.168.1.11:9020".parse().unwrap());
