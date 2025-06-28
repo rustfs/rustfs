@@ -809,6 +809,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         return std::io::Error::other(ObjectApiError::BackendDown(format!("{err}")));
     }
 
+    let err_ = std::io::Error::other(err.to_string());
     let r_err = err;
     let err;
     let bucket = bucket.to_string();
@@ -852,7 +853,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         }
         S3ErrorCode::NoSuchVersion => {
             if !object.is_empty() {
-                std::io::Error::other(StorageError::ObjectNotFound(bucket, object)) //, version_id);
+                std::io::Error::other(StorageError::ObjectNotFound(bucket, object));
             } else {
                 std::io::Error::other(StorageError::BucketNotFound(bucket))
             }
@@ -875,6 +876,9 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
             err = err_;
         }
     }
+
+    err
+}
 
 pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
     let storage_err = &err;
