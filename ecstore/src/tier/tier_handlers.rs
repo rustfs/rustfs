@@ -8,43 +8,36 @@ lazy_static! {
         message: "Specified remote tier already exists".to_string(),
         status_code: StatusCode::CONFLICT,
     };
-
     pub static ref ERR_TIER_NOT_FOUND: AdminError = AdminError {
         code: "XRustFSAdminTierNotFound".to_string(),
         message: "Specified remote tier was not found".to_string(),
         status_code: StatusCode::NOT_FOUND,
     };
-
     pub static ref ERR_TIER_NAME_NOT_UPPERCASE: AdminError = AdminError {
         code: "XRustFSAdminTierNameNotUpperCase".to_string(),
         message: "Tier name must be in uppercase".to_string(),
         status_code: StatusCode::BAD_REQUEST,
     };
-
     pub static ref ERR_TIER_BUCKET_NOT_FOUND: AdminError = AdminError {
         code: "XRustFSAdminTierBucketNotFound".to_string(),
         message: "Remote tier bucket not found".to_string(),
         status_code: StatusCode::BAD_REQUEST,
     };
-
     pub static ref ERR_TIER_INVALID_CREDENTIALS: AdminError = AdminError {
         code: "XRustFSAdminTierInvalidCredentials".to_string(),
         message: "Invalid remote tier credentials".to_string(),
         status_code: StatusCode::BAD_REQUEST,
     };
-
     pub static ref ERR_TIER_RESERVED_NAME: AdminError = AdminError {
         code: "XRustFSAdminTierReserved".to_string(),
         message: "Cannot use reserved tier name".to_string(),
         status_code: StatusCode::BAD_REQUEST,
     };
-
     pub static ref ERR_TIER_PERM_ERR: AdminError = AdminError {
         code: "TierPermErr".to_string(),
         message: "Tier Perm Err".to_string(),
         status_code: StatusCode::OK,
     };
-
     pub static ref ERR_TIER_CONNECT_ERR: AdminError = AdminError {
         code: "TierConnectErr".to_string(),
         message: "Tier Connect Err".to_string(),

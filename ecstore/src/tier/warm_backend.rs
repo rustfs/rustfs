@@ -5,9 +5,6 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
-use std::collections::HashMap;
-use http::StatusCode;
 use crate::client::{
     admin_handler_utils::AdminError,
     transition_api::{ReadCloser, ReaderImpl},
@@ -21,6 +18,9 @@ use crate::tier::{
     warm_backend_rustfs::WarmBackendRustFS,
     warm_backend_s3::WarmBackendS3,
 };
+use bytes::Bytes;
+use http::StatusCode;
+use std::collections::HashMap;
 use tracing::{info, warn};
 
 pub type WarmBackendImpl = Box<dyn WarmBackend + Send + Sync + 'static>;

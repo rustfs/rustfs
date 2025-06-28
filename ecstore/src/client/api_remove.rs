@@ -24,8 +24,8 @@ use crate::{
     disk::DiskAPI,
     store_api::{GetObjectReader, ObjectInfo, StorageAPI},
 };
-use rustfs_utils::hasher::{sum_md5_base64, sum_sha256_hex};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use rustfs_utils::hasher::{sum_md5_base64, sum_sha256_hex};
 
 pub struct RemoveBucketOptions {
     _forced_elete: bool,

@@ -1,4 +1,4 @@
-use http::{request, HeaderValue};
+use http::{HeaderValue, request};
 use time::{OffsetDateTime, macros::format_description};
 
 pub fn streaming_unsigned_v4(

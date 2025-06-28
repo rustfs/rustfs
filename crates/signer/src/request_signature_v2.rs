@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use time::{OffsetDateTime, format_description};
 
-use rustfs_utils::crypto::{base64_encode, hex, hmac_sha1};
 use super::utils::get_host_addr;
+use rustfs_utils::crypto::{base64_encode, hex, hmac_sha1};
 
 const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";

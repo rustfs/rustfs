@@ -61,25 +61,21 @@ lazy_static! {
         message: "Specified remote credentials are empty".to_string(),
         status_code: StatusCode::FORBIDDEN,
     };
-
     pub static ref ERR_TIER_BACKEND_IN_USE: AdminError = AdminError {
         code: "XRustFSAdminTierBackendInUse".to_string(),
         message: "Specified remote tier is already in use".to_string(),
         status_code: StatusCode::CONFLICT,
     };
-
     pub static ref ERR_TIER_TYPE_UNSUPPORTED: AdminError = AdminError {
         code: "XRustFSAdminTierTypeUnsupported".to_string(),
         message: "Specified tier type is unsupported".to_string(),
         status_code: StatusCode::BAD_REQUEST,
     };
-
     pub static ref ERR_TIER_BACKEND_NOT_EMPTY: AdminError = AdminError {
         code: "XRustFSAdminTierBackendNotEmpty".to_string(),
         message: "Specified remote backend is not empty".to_string(),
         status_code: StatusCode::BAD_REQUEST,
     };
-
     pub static ref ERR_TIER_INVALID_CONFIG: AdminError = AdminError {
         code: "XRustFSAdminTierInvalidConfig".to_string(),
         message: "Unable to setup remote tier, check tier configuration".to_string(),

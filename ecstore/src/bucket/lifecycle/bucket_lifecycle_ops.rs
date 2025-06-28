@@ -411,10 +411,6 @@ pub struct TransitionState {
     last_day_stats: Arc<Mutex<HashMap<String, LastDayTierStats>>>,
 }
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-//type RetKill = impl Future<Output = Option<()>> + Send + 'static;
-//type RetTransitionTask = impl Future<Output = Option<Option<TransitionTask>>> + Send + 'static;
-
 impl TransitionState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {

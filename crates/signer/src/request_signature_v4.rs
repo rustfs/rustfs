@@ -8,10 +8,10 @@ use std::fmt::Write;
 use time::{OffsetDateTime, macros::format_description};
 use tracing::debug;
 
-use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
+use super::constants::UNSIGNED_PAYLOAD;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
 use super::utils::{get_host_addr, sign_v4_trim_all};
-use super::constants::UNSIGNED_PAYLOAD;
+use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
 
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE_TYPE_S3: &str = "s3";

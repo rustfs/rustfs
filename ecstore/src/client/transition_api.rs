@@ -46,8 +46,8 @@ use crate::client::{
     credentials::{CredContext, Credentials, SignatureType, Static},
 };
 use crate::{checksum::ChecksumMode, store_api::GetObjectReader};
-use rustfs_utils::hasher::{MD5, Sha256};
 use rustfs_rio::HashReader;
+use rustfs_utils::hasher::{MD5, Sha256};
 use rustfs_utils::{
     net::get_endpoint_url,
     retry::{MAX_RETRY, new_retry_timer},
@@ -431,8 +431,13 @@ impl TransitionClient {
                 }
             }
             if signer_type == SignatureType::SignatureV2 {
-                req_builder =
-                    rustfs_signer::pre_sign_v2(req_builder, &access_key_id, &secret_access_key, metadata.expires, is_virtual_host);
+                req_builder = rustfs_signer::pre_sign_v2(
+                    req_builder,
+                    &access_key_id,
+                    &secret_access_key,
+                    metadata.expires,
+                    is_virtual_host,
+                );
             } else if signer_type == SignatureType::SignatureV4 {
                 req_builder = rustfs_signer::pre_sign_v4(
                     req_builder,

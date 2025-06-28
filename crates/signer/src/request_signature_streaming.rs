@@ -1,10 +1,10 @@
-use http::{request, HeaderMap, HeaderValue};
+use http::{HeaderMap, HeaderValue, request};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 use time::{OffsetDateTime, macros::format_description};
 
-use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use super::request_signature_v4::{SERVICE_TYPE_S3, get_scope, get_signature, get_signing_key};
+use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
 const STREAMING_SIGN_ALGORITHM: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 const STREAMING_SIGN_TRAILER_ALGORITHM: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
@@ -67,7 +67,10 @@ pub fn streaming_sign_v4(
     if trailer.is_empty() {
         headers.append("X-Amz-Content-Sha256", HeaderValue::from_str(STREAMING_SIGN_ALGORITHM).expect("err"));
     } else {
-        headers.append("X-Amz-Content-Sha256", HeaderValue::from_str(STREAMING_SIGN_TRAILER_ALGORITHM).expect("err"));
+        headers.append(
+            "X-Amz-Content-Sha256",
+            HeaderValue::from_str(STREAMING_SIGN_TRAILER_ALGORITHM).expect("err"),
+        );
         for (k, _) in &trailer {
             headers.append("X-Amz-Trailer", k.as_str().to_lowercase().parse().unwrap());
         }
