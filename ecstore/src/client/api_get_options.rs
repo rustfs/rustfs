@@ -14,6 +14,7 @@ use tracing::warn;
 use crate::client::api_error_response::err_invalid_argument;
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct AdvancedGetOptions {
     replication_deletemarker: bool,
     is_replication_ready_for_deletemarker: bool,
@@ -29,8 +30,6 @@ pub struct GetObjectOptions {
     pub checksum: bool,
     pub internal: AdvancedGetOptions,
 }
-
-type StatObjectOptions = GetObjectOptions;
 
 impl Default for GetObjectOptions {
     fn default() -> Self {

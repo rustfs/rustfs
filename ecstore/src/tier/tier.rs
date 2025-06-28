@@ -53,41 +53,39 @@ pub const TIER_CONFIG_FORMAT: u16 = 1;
 pub const TIER_CONFIG_V1: u16 = 1;
 pub const TIER_CONFIG_VERSION: u16 = 1;
 
+const _TIER_CFG_REFRESH_AT_HDR: &str = "X-RustFS-TierCfg-RefreshedAt";
+
 lazy_static! {
-    //pub static ref TIER_CONFIG_PATH: PathBuf = path_join(&[PathBuf::from(RUSTFS_CONFIG_PREFIX), PathBuf::from(TIER_CONFIG_FILE)]);
+    pub static ref ERR_TIER_MISSING_CREDENTIALS: AdminError = AdminError {
+        code: "XRustFSAdminTierMissingCredentials".to_string(),
+        message: "Specified remote credentials are empty".to_string(),
+        status_code: StatusCode::FORBIDDEN,
+    };
+
+    pub static ref ERR_TIER_BACKEND_IN_USE: AdminError = AdminError {
+        code: "XRustFSAdminTierBackendInUse".to_string(),
+        message: "Specified remote tier is already in use".to_string(),
+        status_code: StatusCode::CONFLICT,
+    };
+
+    pub static ref ERR_TIER_TYPE_UNSUPPORTED: AdminError = AdminError {
+        code: "XRustFSAdminTierTypeUnsupported".to_string(),
+        message: "Specified tier type is unsupported".to_string(),
+        status_code: StatusCode::BAD_REQUEST,
+    };
+
+    pub static ref ERR_TIER_BACKEND_NOT_EMPTY: AdminError = AdminError {
+        code: "XRustFSAdminTierBackendNotEmpty".to_string(),
+        message: "Specified remote backend is not empty".to_string(),
+        status_code: StatusCode::BAD_REQUEST,
+    };
+
+    pub static ref ERR_TIER_INVALID_CONFIG: AdminError = AdminError {
+        code: "XRustFSAdminTierInvalidConfig".to_string(),
+        message: "Unable to setup remote tier, check tier configuration".to_string(),
+        status_code: StatusCode::BAD_REQUEST,
+    };
 }
-
-const TIER_CFG_REFRESH_AT_HDR: &str = "X-RustFS-TierCfg-RefreshedAt";
-
-pub const ERR_TIER_MISSING_CREDENTIALS: AdminError = AdminError {
-    code: "XRustFSAdminTierMissingCredentials",
-    message: "Specified remote credentials are empty",
-    status_code: StatusCode::FORBIDDEN,
-};
-
-pub const ERR_TIER_BACKEND_IN_USE: AdminError = AdminError {
-    code: "XRustFSAdminTierBackendInUse",
-    message: "Specified remote tier is already in use",
-    status_code: StatusCode::CONFLICT,
-};
-
-pub const ERR_TIER_TYPE_UNSUPPORTED: AdminError = AdminError {
-    code: "XRustFSAdminTierTypeUnsupported",
-    message: "Specified tier type is unsupported",
-    status_code: StatusCode::BAD_REQUEST,
-};
-
-pub const ERR_TIER_BACKEND_NOT_EMPTY: AdminError = AdminError {
-    code: "XRustFSAdminTierBackendNotEmpty",
-    message: "Specified remote backend is not empty",
-    status_code: StatusCode::BAD_REQUEST,
-};
-
-pub const ERR_TIER_INVALID_CONFIG: AdminError = AdminError {
-    code: "XRustFSAdminTierInvalidConfig",
-    message: "Unable to setup remote tier, check tier configuration",
-    status_code: StatusCode::BAD_REQUEST,
-};
 
 #[derive(Serialize, Deserialize)]
 pub struct TierConfigMgr {
@@ -108,19 +106,12 @@ impl TierConfigMgr {
 
     pub fn unmarshal(data: &[u8]) -> std::result::Result<TierConfigMgr, std::io::Error> {
         let cfg: TierConfigMgr = serde_json::from_slice(data)?;
-        //let mut cfg = TierConfigMgr(m);
-        //let mut cfg = m;
         Ok(cfg)
     }
 
     pub fn marshal(&self) -> std::result::Result<Bytes, std::io::Error> {
         let data = serde_json::to_vec(&self)?;
-
-        //let mut data = Vec<u8>::with_capacity(self.msg_size()+4);
         let mut data = Bytes::from(data);
-
-        //LittleEndian::write_u16(&mut data[0..2], TIER_CONFIG_FORMAT);
-        //LittleEndian::write_u16(&mut data[2..4], TIER_CONFIG_VERSION);
 
         Ok(data)
     }
@@ -144,12 +135,12 @@ impl TierConfigMgr {
     pub async fn add(&mut self, tier: TierConfig, force: bool) -> std::result::Result<(), AdminError> {
         let tier_name = &tier.name;
         if tier_name != tier_name.to_uppercase().as_str() {
-            return Err(ERR_TIER_NAME_NOT_UPPERCASE);
+            return Err(ERR_TIER_NAME_NOT_UPPERCASE.clone());
         }
 
         let (_, b) = self.is_tier_name_in_use(tier_name);
         if b {
-            return Err(ERR_TIER_ALREADY_EXISTS);
+            return Err(ERR_TIER_ALREADY_EXISTS.clone());
         }
 
         let d = new_warm_backend(&tier, true).await?;
@@ -159,19 +150,22 @@ impl TierConfigMgr {
             match in_use {
                 Ok(b) => {
                     if b {
-                        return Err(ERR_TIER_BACKEND_IN_USE);
+                        return Err(ERR_TIER_BACKEND_IN_USE.clone());
                     }
                 }
                 Err(err) => {
                     warn!("tier add failed, err: {:?}", err);
                     if err.to_string().contains("connect") {
-                        return Err(ERR_TIER_CONNECT_ERR);
+                        return Err(ERR_TIER_CONNECT_ERR.clone());
                     } else if err.to_string().contains("authorization") {
-                        return Err(ERR_TIER_INVALID_CREDENTIALS);
+                        return Err(ERR_TIER_INVALID_CREDENTIALS.clone());
                     } else if err.to_string().contains("bucket") {
-                        return Err(ERR_TIER_BUCKET_NOT_FOUND);
+                        return Err(ERR_TIER_BUCKET_NOT_FOUND.clone());
                     }
-                    return Err(ERR_TIER_PERM_ERR);
+                    let mut e = ERR_TIER_PERM_ERR.clone();
+                    e.message.push('.');
+                    e.message.push_str(&err.to_string());
+                    return Err(e);
                 }
             }
         }
@@ -185,21 +179,21 @@ impl TierConfigMgr {
     pub async fn remove(&mut self, tier_name: &str, force: bool) -> std::result::Result<(), AdminError> {
         let d = self.get_driver(tier_name).await;
         if let Err(err) = d {
-            match err {
-                ERR_TIER_NOT_FOUND => {
-                    return Ok(());
-                }
-                _ => {
-                    return Err(err);
-                }
+            if err.code == ERR_TIER_NOT_FOUND.code {
+                return Ok(());
+            } else {
+                return Err(err);
             }
         }
         if !force {
             let inuse = d.expect("err").in_use().await;
             if let Err(err) = inuse {
-                return Err(ERR_TIER_PERM_ERR);
+                let mut e = ERR_TIER_PERM_ERR.clone();
+                e.message.push('.');
+                e.message.push_str(&err.to_string());
+                return Err(e);
             } else if inuse.expect("err") {
-                return Err(ERR_TIER_BACKEND_NOT_EMPTY);
+                return Err(ERR_TIER_BACKEND_NOT_EMPTY.clone());
             }
         }
         self.tiers.remove(tier_name);
@@ -254,7 +248,7 @@ impl TierConfigMgr {
     pub async fn edit(&mut self, tier_name: &str, creds: TierCreds) -> std::result::Result<(), AdminError> {
         let (tier_type, exists) = self.is_tier_name_in_use(tier_name);
         if !exists {
-            return Err(ERR_TIER_NOT_FOUND);
+            return Err(ERR_TIER_NOT_FOUND.clone());
         }
 
         let mut cfg = self.tiers[tier_name].clone();
@@ -276,7 +270,7 @@ impl TierConfigMgr {
             TierType::RustFS => {
                 let mut rustfs = cfg.rustfs.as_mut().expect("err");
                 if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS);
+                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
                 }
                 rustfs.access_key = creds.access_key;
                 rustfs.secret_key = creds.secret_key;
@@ -284,7 +278,7 @@ impl TierConfigMgr {
             TierType::MinIO => {
                 let mut minio = cfg.minio.as_mut().expect("err");
                 if creds.access_key == "" || creds.secret_key == "" {
-                    return Err(ERR_TIER_MISSING_CREDENTIALS);
+                    return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
                 }
                 minio.access_key = creds.access_key;
                 minio.secret_key = creds.secret_key;
@@ -304,7 +298,7 @@ impl TierConfigMgr {
             Entry::Vacant(e) => {
                 let t = self.tiers.get(tier_name);
                 if t.is_none() {
-                    return Err(ERR_TIER_NOT_FOUND);
+                    return Err(ERR_TIER_NOT_FOUND.clone());
                 }
                 let d = new_warm_backend(t.expect("err"), false).await?;
                 e.insert(d)
@@ -329,6 +323,12 @@ impl TierConfigMgr {
             self.tiers.insert(tier, cfg);
         }
         self.last_refreshed_at = OffsetDateTime::now_utc();
+        Ok(())
+    }
+
+    pub async fn clear_tier(&mut self, force: bool) -> std::result::Result<(), AdminError> {
+        self.tiers.clear();
+        self.driver_cache.clear();
         Ok(())
     }
 

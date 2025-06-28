@@ -22,7 +22,7 @@ use crate::tier::{
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
 const MAX_PARTS_COUNT: i64 = 10000;
-const MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
+const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
 pub struct WarmBackendRustFS(WarmBackendS3);

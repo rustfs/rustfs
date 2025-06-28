@@ -147,6 +147,7 @@ impl TierStats {
 }
 
 #[allow(dead_code)]
+#[allow(dead_code)]
 struct AllTierStats {
     tiers: HashMap<String, TierStats>,
 }

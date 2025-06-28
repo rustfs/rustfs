@@ -258,6 +258,7 @@ impl TransitionClient {
     }
 }
 
+#[allow(dead_code)]
 pub struct ListObjectsOptions {
     reverse_versions: bool,
     with_versions: bool,

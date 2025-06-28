@@ -43,6 +43,7 @@ pub struct ListBucketV2Result {
     pub start_after: String,
 }
 
+#[allow(dead_code)]
 pub struct Version {
     etag: String,
     is_latest: bool,
@@ -70,12 +71,6 @@ pub struct ListVersionsResult {
     version_id_marker: String,
     next_key_marker: String,
     next_version_id_marker: String,
-}
-
-impl ListVersionsResult {
-    fn unmarshal_xml() -> Result<(), std::io::Error> {
-        todo!();
-    }
 }
 
 pub struct ListBucketResult {

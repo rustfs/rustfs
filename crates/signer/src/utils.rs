@@ -11,7 +11,7 @@ pub fn get_host_addr(req: &request::Builder) -> String {
     }
     if let Some(host) = host {
         if req_host != *host.to_str().unwrap() {
-            return host.to_str().unwrap().to_string();
+            return (*host.to_str().unwrap()).to_string();
         }
     }
     /*if req.uri_ref().unwrap().host().is_some() {

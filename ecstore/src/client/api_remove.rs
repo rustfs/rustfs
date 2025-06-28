@@ -24,14 +24,15 @@ use crate::{
     disk::DiskAPI,
     store_api::{GetObjectReader, ObjectInfo, StorageAPI},
 };
-use reader::hasher::{sum_md5_base64, sum_sha256_hex};
+use rustfs_utils::hasher::{sum_md5_base64, sum_sha256_hex};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
 pub struct RemoveBucketOptions {
-    forced_elete: bool,
+    _forced_elete: bool,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct AdvancedRemoveOptions {
     replication_delete_marker: bool,
     replication_status: ReplicationStatus,
@@ -426,8 +427,10 @@ impl TransitionClient {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct RemoveObjectError {
     object_name: String,
+    #[allow(dead_code)]
     version_id: String,
     err: Option<std::io::Error>,
 }

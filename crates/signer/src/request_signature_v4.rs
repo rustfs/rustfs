@@ -1,28 +1,17 @@
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
-
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use http::HeaderMap;
 use http::Uri;
-use http::header::TRAILER;
-use http::request::{self, Request};
+use http::request;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::fmt::Write;
-use time::{OffsetDateTime, format_description, macros::datetime, macros::format_description};
-use tracing::{debug, error, info, warn};
+use time::{OffsetDateTime, macros::format_description};
+use tracing::debug;
 
-use super::ordered_qs::OrderedQs;
-use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
-use super::utils::stable_sort_by_first;
-use super::utils::{get_host_addr, sign_v4_trim_all};
-use crate::client::constants::UNSIGNED_PAYLOAD;
 use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
-use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
+use super::utils::{get_host_addr, sign_v4_trim_all};
+use super::constants::UNSIGNED_PAYLOAD;
 
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE_TYPE_S3: &str = "s3";
@@ -58,7 +47,7 @@ pub fn get_scope(location: &str, t: OffsetDateTime, service_type: &str) -> Strin
     let mut ans = String::from("");
     ans.push_str(&t.format(&format).unwrap().to_string());
     ans.push('/');
-    ans.push_str(location); // TODO: use a `Region` type
+    ans.push_str(location);
     ans.push('/');
     ans.push_str(service_type);
     ans.push_str("/aws4_request");
@@ -221,11 +210,6 @@ pub fn pre_sign_v4(
         return req;
     }
 
-    //let t = OffsetDateTime::now_utc();
-    //let date = AmzDate::parse(timestamp).unwrap();
-    let t2 = t.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
-
-    //let credential = get_scope(location, t, SERVICE_TYPE_S3);
     let credential = get_credential(access_key_id, location, t, SERVICE_TYPE_S3);
     let signed_headers = get_signed_headers(&req, &v4_ignored_headers);
 
@@ -277,13 +261,13 @@ pub fn pre_sign_v4(
     req
 }
 
-fn post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_access_key: &str, location: &str) -> String {
+fn _post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_access_key: &str, location: &str) -> String {
     let signing_key = get_signing_key(secret_access_key, location, t, SERVICE_TYPE_S3);
     let signature = get_signature(signing_key, policy_base64);
     signature
 }
 
-fn sign_v4_sts(mut req: request::Builder, access_key_id: &str, secret_access_key: &str, location: &str) -> request::Builder {
+fn _sign_v4_sts(req: request::Builder, access_key_id: &str, secret_access_key: &str, location: &str) -> request::Builder {
     sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new())
 }
 
@@ -304,7 +288,7 @@ fn sign_v4_inner(
     let t = OffsetDateTime::now_utc();
     let t2 = t.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
 
-    let mut headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut().expect("err");
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
     headers.insert("X-Amz-Date", t.format(&format).unwrap().to_string().parse().unwrap());
 
@@ -334,7 +318,7 @@ fn sign_v4_inner(
     let signature = get_signature(signing_key, &string_to_sign);
     //debug!("\n\ncanonical_request: \n{}\nstring_to_sign: \n{}\nsignature: \n{}\n\n", &canonical_request, &string_to_sign, &signature);
 
-    let mut headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut().expect("err");
 
     let auth = format!(
         "{} Credential={}, SignedHeaders={}, Signature={}",
@@ -352,14 +336,14 @@ fn sign_v4_inner(
     req
 }
 
-fn unsigned_trailer(mut req: request::Builder, content_len: i64, trailer: HeaderMap) {
+fn _unsigned_trailer(mut req: request::Builder, content_len: i64, trailer: HeaderMap) {
     if trailer.len() > 0 {
         return;
     }
     let t = OffsetDateTime::now_utc();
     let t = t.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
 
-    let mut headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut().expect("err");
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
     headers.insert("X-Amz-Date", t.format(&format).unwrap().to_string().parse().unwrap());
 
@@ -379,7 +363,7 @@ fn unsigned_trailer(mut req: request::Builder, content_len: i64, trailer: Header
 }
 
 pub fn sign_v4(
-    mut req: request::Builder,
+    req: request::Builder,
     content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,

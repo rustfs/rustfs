@@ -1,10 +1,3 @@
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
-
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use tracing::info;
@@ -12,9 +5,6 @@ use tracing::info;
 const C_TIER_CONFIG_VER: &str = "v1";
 
 const ERR_TIER_NAME_EMPTY: &str = "remote tier name empty";
-const ERR_TIER_INVALID_CONFIG: &str = "invalid tier config";
-const ERR_TIER_INVALID_CONFIG_VERSION: &str = "invalid tier config version";
-const ERR_TIER_TYPE_UNSUPPORTED: &str = "unsupported tier type";
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub enum TierType {
@@ -128,20 +118,8 @@ impl Clone for TierConfig {
     }
 }
 
+#[allow(dead_code)]
 impl TierConfig {
-    pub fn unmarshal(data: &[u8]) -> Result<TierConfig, std::io::Error> {
-        /*let m: HashMap<String, HashMap<String, KVS>> = serde_json::from_slice(data)?;
-        let mut cfg = TierConfig(m);
-        cfg.set_defaults();
-        Ok(cfg)*/
-        todo!();
-    }
-
-    pub fn marshal(&self) -> Result<Vec<u8>, std::io::Error> {
-        let data = serde_json::to_vec(&self)?;
-        Ok(data)
-    }
-
     fn endpoint(&self) -> String {
         match self.tier_type {
             TierType::S3 => self.s3.as_ref().expect("err").endpoint.clone(),
@@ -198,14 +176,14 @@ impl TierConfig {
 pub struct TierS3 {
     pub name: String,
     pub endpoint: String,
-    #[serde(rename = "accesskey")]
+    #[serde(rename = "accessKey")]
     pub access_key: String,
-    #[serde(rename = "secretkey")]
+    #[serde(rename = "secretKey")]
     pub secret_key: String,
     pub bucket: String,
     pub prefix: String,
     pub region: String,
-    #[serde(rename = "storageclass")]
+    #[serde(rename = "storageClass")]
     pub storage_class: String,
     #[serde(skip)]
     pub aws_role: bool,
@@ -220,6 +198,7 @@ pub struct TierS3 {
 }
 
 impl TierS3 {
+    #[allow(dead_code)]
     fn new<F>(name: &str, access_key: &str, secret_key: &str, bucket: &str, options: Vec<F>) -> Result<TierConfig, std::io::Error>
     where
         F: Fn(TierS3) -> Box<Result<(), std::io::Error>> + Send + Sync + 'static,
@@ -258,14 +237,14 @@ impl TierS3 {
 pub struct TierRustFS {
     pub name: String,
     pub endpoint: String,
-    #[serde(rename = "accesskey")]
+    #[serde(rename = "accessKey")]
     pub access_key: String,
-    #[serde(rename = "secretkey")]
+    #[serde(rename = "secretKey")]
     pub secret_key: String,
     pub bucket: String,
     pub prefix: String,
     pub region: String,
-    #[serde(rename = "storageclass")]
+    #[serde(rename = "storageClass")]
     pub storage_class: String,
 }
 
@@ -274,9 +253,9 @@ pub struct TierRustFS {
 pub struct TierMinIO {
     pub name: String,
     pub endpoint: String,
-    #[serde(rename = "accesskey")]
+    #[serde(rename = "accessKey")]
     pub access_key: String,
-    #[serde(rename = "secretkey")]
+    #[serde(rename = "secretKey")]
     pub secret_key: String,
     pub bucket: String,
     pub prefix: String,
@@ -284,6 +263,7 @@ pub struct TierMinIO {
 }
 
 impl TierMinIO {
+    #[allow(dead_code)]
     fn new<F>(
         name: &str,
         endpoint: &str,

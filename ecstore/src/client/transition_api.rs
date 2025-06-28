@@ -45,9 +45,8 @@ use crate::client::{
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
 };
-use crate::signer;
 use crate::{checksum::ChecksumMode, store_api::GetObjectReader};
-use reader::hasher::{MD5, Sha256};
+use rustfs_utils::hasher::{MD5, Sha256};
 use rustfs_rio::HashReader;
 use rustfs_utils::{
     net::get_endpoint_url,
@@ -57,7 +56,7 @@ use s3s::S3ErrorCode;
 use s3s::dto::ReplicationStatus;
 use s3s::{Body, dto::Owner};
 
-const C_USER_AGENT_PREFIX: &str = "RustFS (linux; x86)";
+const _C_USER_AGENT_PREFIX: &str = "RustFS (linux; x86)";
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
 
 const SUCCESS_STATUS: [StatusCode; 3] = [StatusCode::OK, StatusCode::NO_CONTENT, StatusCode::PARTIAL_CONTENT];
@@ -433,9 +432,9 @@ impl TransitionClient {
             }
             if signer_type == SignatureType::SignatureV2 {
                 req_builder =
-                    signer::pre_sign_v2(req_builder, &access_key_id, &secret_access_key, metadata.expires, is_virtual_host);
+                    rustfs_signer::pre_sign_v2(req_builder, &access_key_id, &secret_access_key, metadata.expires, is_virtual_host);
             } else if signer_type == SignatureType::SignatureV4 {
-                req_builder = signer::pre_sign_v4(
+                req_builder = rustfs_signer::pre_sign_v4(
                     req_builder,
                     &access_key_id,
                     &secret_access_key,
@@ -486,7 +485,7 @@ impl TransitionClient {
 
         if signer_type == SignatureType::SignatureV2 {
             req_builder =
-                signer::sign_v2(req_builder, metadata.content_length, &access_key_id, &secret_access_key, is_virtual_host);
+                rustfs_signer::sign_v2(req_builder, metadata.content_length, &access_key_id, &secret_access_key, is_virtual_host);
         } else if metadata.stream_sha256 && !self.secure {
             if metadata.trailer.len() > 0 {
                 //req.Trailer = metadata.trailer;
@@ -494,7 +493,7 @@ impl TransitionClient {
                     req_builder = req_builder.header(http::header::TRAILER, v.clone());
                 }
             }
-            //req_builder = signer::streaming_sign_v4(req_builder, &access_key_id,
+            //req_builder = rustfs_signer::streaming_sign_v4(req_builder, &access_key_id,
             //  &secret_access_key, &session_token, &location, metadata.content_length, OffsetDateTime::now_utc(), self.sha256_hasher());
         } else {
             let mut sha_header = UNSIGNED_PAYLOAD.to_string();
@@ -509,7 +508,7 @@ impl TransitionClient {
             req_builder = req_builder
                 .header::<HeaderName, HeaderValue>("X-Amz-Content-Sha256".parse().unwrap(), sha_header.parse().expect("err"));
 
-            req_builder = signer::sign_v4_trailer(
+            req_builder = rustfs_signer::sign_v4_trailer(
                 req_builder,
                 &access_key_id,
                 &secret_access_key,
@@ -611,23 +610,6 @@ impl TransitionClient {
             //client: http_client,
             endpoint: self.endpoint_url.to_string(),
         }
-    }
-}
-
-struct LockedRandSource {
-    src: u64, //rand.Source,
-}
-
-impl LockedRandSource {
-    fn int63(&self) -> i64 {
-        /*let n = self.src.int63();
-        n*/
-        todo!();
-    }
-
-    fn seed(&self, seed: i64) {
-        //self.src.seed(seed);
-        todo!();
     }
 }
 

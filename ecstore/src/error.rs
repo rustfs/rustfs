@@ -810,6 +810,7 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
     }
 
     let r_err = err;
+    let err;
     let bucket = bucket.to_string();
     let object = object.to_string();
     let version_id = version_id.to_string();
@@ -870,9 +871,10 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
         /*S3ErrorCode::ReplicationPermissionCheck => {
             err = std::io::Error::other(StorageError::ReplicationPermissionCheck);
         }*/
-        _ => std::io::Error::other("err"),
+        _ => {
+            err = err_;
+        }
     }
-}
 
 pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
     let storage_err = &err;

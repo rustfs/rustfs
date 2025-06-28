@@ -343,6 +343,11 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
         AdminOperation(&tier::EditTier {}),
     )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/clear").as_str(),
+        AdminOperation(&tier::ClearTier {}),
+    )?;
 
     Ok(())
 }

@@ -18,7 +18,7 @@ use tracing::{error, info};
 use url::form_urlencoded::Serializer;
 use uuid::Uuid;
 
-use reader::hasher::Hasher;
+use rustfs_utils::hasher::Hasher;
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 use s3s::{Body, dto::StreamingBlob};
 //use crate::disk::{Reader, BufferReader};

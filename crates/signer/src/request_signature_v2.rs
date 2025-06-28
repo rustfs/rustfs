@@ -1,26 +1,18 @@
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
-
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use http::request;
 use hyper::Uri;
 use std::collections::HashMap;
 use std::fmt::Write;
-use time::{OffsetDateTime, format_description, macros::format_description};
+use time::{OffsetDateTime, format_description};
 
 use rustfs_utils::crypto::{base64_encode, hex, hmac_sha1};
-
 use super::utils::get_host_addr;
 
-const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
 
-fn encode_url2path(req: &request::Builder, virtual_host: bool) -> String {
-    let mut path = "".to_string();
+fn encode_url2path(req: &request::Builder, _virtual_host: bool) -> String {
+    let path;
 
     //path = serde_urlencoded::to_string(req.uri_ref().unwrap().path().unwrap()).unwrap();
     path = req.uri_ref().unwrap().path().to_string();
@@ -42,7 +34,7 @@ pub fn pre_sign_v2(
     let d = d.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
     let epoch_expires = d.unix_timestamp() + expires;
 
-    let mut headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut().expect("headers_mut err");
     let expires_str = headers.get("Expires");
     if expires_str.is_none() {
         headers.insert("Expires", format!("{:010}", epoch_expires).parse().unwrap());
@@ -73,14 +65,14 @@ pub fn pre_sign_v2(
     req
 }
 
-fn post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> String {
+fn _post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> String {
     let signature = hex(hmac_sha1(secret_access_key, policy_base64));
     signature
 }
 
 pub fn sign_v2(
     mut req: request::Builder,
-    content_len: i64,
+    _content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     virtual_host: bool,
@@ -93,7 +85,7 @@ pub fn sign_v2(
     let d2 = d.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
 
     let string_to_sign = string_to_sign_v2(&req, virtual_host);
-    let mut headers = req.headers_mut().expect("err");
+    let headers = req.headers_mut().expect("err");
 
     let date = headers.get("Date").unwrap();
     if date.to_str().unwrap() == "" {
@@ -107,7 +99,7 @@ pub fn sign_v2(
         );
     }
 
-    let mut auth_header = format!("{} {}:", SIGN_V2_ALGORITHM, access_key_id);
+    let auth_header = format!("{} {}:", SIGN_V2_ALGORITHM, access_key_id);
     let auth_header = format!("{}{}", auth_header, base64_encode(&hmac_sha1(secret_access_key, string_to_sign)));
 
     headers.insert("Authorization", auth_header.parse().unwrap());
@@ -214,7 +206,7 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Builder, virt
     if request_url.query().unwrap() != "" {
         let mut n: i64 = 0;
         let result = serde_urlencoded::from_str::<HashMap<String, Vec<String>>>(req.uri_ref().unwrap().query().unwrap());
-        let mut vals = result.unwrap_or_default();
+        let vals = result.unwrap_or_default();
         for resource in INCLUDED_QUERY {
             let vv = &vals[*resource];
             if vv.len() > 0 {

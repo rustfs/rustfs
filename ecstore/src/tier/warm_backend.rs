@@ -7,14 +7,14 @@
 
 use bytes::Bytes;
 use std::collections::HashMap;
-
+use http::StatusCode;
 use crate::client::{
     admin_handler_utils::AdminError,
     transition_api::{ReadCloser, ReaderImpl},
 };
 use crate::error::is_err_bucket_not_found;
 use crate::tier::{
-    tier::{ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
+    tier::ERR_TIER_TYPE_UNSUPPORTED,
     tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_minio::WarmBackendMinIO,
@@ -54,7 +54,7 @@ pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), Admin
         .put(PROBE_OBJECT, ReaderImpl::Body(Bytes::from("RustFS".as_bytes().to_vec())), 5)
         .await;
     if let Err(err) = remote_version_id {
-        return Err(ERR_TIER_PERM_ERR);
+        return Err(ERR_TIER_PERM_ERR.clone());
     }
 
     let r = w.get(PROBE_OBJECT, "", WarmBackendGetOpts::default()).await;
@@ -67,11 +67,11 @@ pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), Admin
             return Err(ERR_TIER_MISSING_CREDENTIALS);
         }*/
         //else {
-        return Err(ERR_TIER_PERM_ERR);
+        return Err(ERR_TIER_PERM_ERR.clone());
         //}
     }
     if let Err(err) = w.remove(PROBE_OBJECT, &remote_version_id.expect("err")).await {
-        return Err(ERR_TIER_PERM_ERR);
+        return Err(ERR_TIER_PERM_ERR.clone());
     };
     Ok(())
 }
@@ -82,8 +82,12 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
         TierType::S3 => {
             let dd = WarmBackendS3::new(tier.s3.as_ref().expect("err"), &tier.name).await;
             if let Err(err) = dd {
-                info!("{}", err);
-                return Err(ERR_TIER_INVALID_CONFIG);
+                warn!("{}", err);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
             }
             d = Some(Box::new(dd.expect("err")));
         }
@@ -91,7 +95,11 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
             let dd = WarmBackendRustFS::new(tier.rustfs.as_ref().expect("err"), &tier.name).await;
             if let Err(err) = dd {
                 warn!("{}", err);
-                return Err(ERR_TIER_INVALID_CONFIG);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
             }
             d = Some(Box::new(dd.expect("err")));
         }
@@ -99,12 +107,16 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
             let dd = WarmBackendMinIO::new(tier.minio.as_ref().expect("err"), &tier.name).await;
             if let Err(err) = dd {
                 warn!("{}", err);
-                return Err(ERR_TIER_INVALID_CONFIG);
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
             }
             d = Some(Box::new(dd.expect("err")));
         }
         _ => {
-            return Err(ERR_TIER_TYPE_UNSUPPORTED);
+            return Err(ERR_TIER_TYPE_UNSUPPORTED.clone());
         }
     }
 

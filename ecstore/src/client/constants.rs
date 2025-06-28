@@ -1,4 +1,3 @@
-#![allow(clippy::map_entry)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
@@ -28,4 +27,4 @@ pub const ISO8601_DATEFORMAT: &[FormatItem<'_>] =
 
 pub const GET_OBJECT_ATTRIBUTES_TAGS: &str = "ETag,Checksum,StorageClass,ObjectSize,ObjectParts";
 pub const GET_OBJECT_ATTRIBUTES_MAX_PARTS: i64 = 1000;
-const RUSTFS_BUCKET_SOURCE_MTIME: &str = "X-RustFs-Source-Mtime";
+const _RUSTFS_BUCKET_SOURCE_MTIME: &str = "X-RustFs-Source-Mtime";

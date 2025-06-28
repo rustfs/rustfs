@@ -1,4 +1,4 @@
-pub mod ordered_qs;
+pub mod constants;
 pub mod request_signature_streaming;
 pub mod request_signature_streaming_unsigned_trailer;
 pub mod request_signature_v2;
