@@ -63,7 +63,6 @@ pub struct Opt {
     pub console_fs_endpoint: Option<String>,
 
     /// Observability configuration file
-    /// Default value: config/obs.toml
     #[arg(long, default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(), env = "RUSTFS_OBS_ENDPOINT")]
     pub obs_endpoint: String,
 
