@@ -393,7 +393,7 @@ impl Operation for GetTierInfo {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, serde::Deserialize, Default)]
 pub struct ClearTierQuery {
     pub rand: Option<String>,
     pub force: String,
