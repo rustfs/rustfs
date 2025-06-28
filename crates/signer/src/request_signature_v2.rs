@@ -12,10 +12,10 @@ const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
 
 fn encode_url2path(req: &request::Builder, _virtual_host: bool) -> String {
-    let path;
+    
 
     //path = serde_urlencoded::to_string(req.uri_ref().unwrap().path().unwrap()).unwrap();
-    path = req.uri_ref().unwrap().path().to_string();
+    let path = req.uri_ref().unwrap().path().to_string();
     path
 }
 
@@ -26,7 +26,7 @@ pub fn pre_sign_v2(
     expires: i64,
     virtual_host: bool,
 ) -> request::Builder {
-    if access_key_id == "" || secret_access_key == "" {
+    if access_key_id.is_empty() || secret_access_key.is_empty() {
         return req;
     }
 
@@ -60,14 +60,14 @@ pub fn pre_sign_v2(
             .parse()
             .unwrap(),
     );
-    let req = req.uri(Uri::from_parts(parts).unwrap());
+    
 
-    req
+    req.uri(Uri::from_parts(parts).unwrap())
 }
 
 fn _post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> String {
-    let signature = hex(hmac_sha1(secret_access_key, policy_base64));
-    signature
+    
+    hex(hmac_sha1(secret_access_key, policy_base64))
 }
 
 pub fn sign_v2(
@@ -77,7 +77,7 @@ pub fn sign_v2(
     secret_access_key: &str,
     virtual_host: bool,
 ) -> request::Builder {
-    if access_key_id == "" || secret_access_key == "" {
+    if access_key_id.is_empty() || secret_access_key.is_empty() {
         return req;
     }
 
@@ -109,9 +109,9 @@ pub fn sign_v2(
 
 fn pre_string_to_sign_v2(req: &request::Builder, virtual_host: bool) -> String {
     let mut buf = BytesMut::new();
-    write_pre_sign_v2_headers(&mut buf, &req);
-    write_canonicalized_headers(&mut buf, &req);
-    write_canonicalized_resource(&mut buf, &req, virtual_host);
+    write_pre_sign_v2_headers(&mut buf, req);
+    write_canonicalized_headers(&mut buf, req);
+    write_canonicalized_resource(&mut buf, req, virtual_host);
     String::from_utf8(buf.to_vec()).unwrap()
 }
 
@@ -128,9 +128,9 @@ fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Builder) {
 
 fn string_to_sign_v2(req: &request::Builder, virtual_host: bool) -> String {
     let mut buf = BytesMut::new();
-    write_sign_v2_headers(&mut buf, &req);
-    write_canonicalized_headers(&mut buf, &req);
-    write_canonicalized_resource(&mut buf, &req, virtual_host);
+    write_sign_v2_headers(&mut buf, req);
+    write_canonicalized_headers(&mut buf, req);
+    write_canonicalized_resource(&mut buf, req, virtual_host);
     String::from_utf8(buf.to_vec()).unwrap()
 }
 
@@ -209,7 +209,7 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Builder, virt
         let vals = result.unwrap_or_default();
         for resource in INCLUDED_QUERY {
             let vv = &vals[*resource];
-            if vv.len() > 0 {
+            if !vv.is_empty() {
                 n += 1;
                 match n {
                     1 => {
@@ -218,7 +218,7 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Builder, virt
                     _ => {
                         let _ = buf.write_char('&');
                         let _ = buf.write_str(resource);
-                        if vv[0].len() > 0 {
+                        if !vv[0].is_empty() {
                             let _ = buf.write_char('=');
                             let _ = buf.write_str(&vv[0]);
                         }

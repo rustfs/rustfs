@@ -74,12 +74,12 @@ pub fn streaming_sign_v4(
         for (k, _) in &trailer {
             headers.append("X-Amz-Trailer", k.as_str().to_lowercase().parse().unwrap());
         }
-        let chunked_value = HeaderValue::from_str(&vec!["aws-chunked"].join(",")).expect("err");
+        let chunked_value = HeaderValue::from_str(&["aws-chunked"].join(",")).expect("err");
         headers.insert(http::header::TRANSFER_ENCODING, chunked_value);
     }
 
     if !session_token.is_empty() {
-        headers.insert("X-Amz-Security-Token", HeaderValue::from_str(&session_token).expect("err"));
+        headers.insert("X-Amz-Security-Token", HeaderValue::from_str(session_token).expect("err"));
     }
 
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
