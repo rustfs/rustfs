@@ -851,14 +851,14 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
             err = std::io::Error::other(StorageError::BucketNotFound(bucket));
         }
         S3ErrorCode::NoSuchKey => {
-            if object != "" {
+            if !object.is_empty() {
                 err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object));
             } else {
                 err = std::io::Error::other(StorageError::BucketNotFound(bucket));
             }
         }
         S3ErrorCode::NoSuchVersion => {
-            if object != "" {
+            if !object.is_empty() {
                 err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object)); //, version_id);
             } else {
                 err = std::io::Error::other(StorageError::BucketNotFound(bucket));
