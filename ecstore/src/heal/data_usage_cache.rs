@@ -146,13 +146,10 @@ impl TierStats {
     }
 }
 
-#[allow(dead_code)]
-#[allow(dead_code)]
 struct AllTierStats {
     tiers: HashMap<String, TierStats>,
 }
 
-#[allow(dead_code)]
 impl AllTierStats {
     pub fn new() -> Self {
         Self { tiers: HashMap::new() }
