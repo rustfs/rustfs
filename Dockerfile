@@ -10,18 +10,16 @@ RUN apk add --no-cache \
 RUN addgroup -g 1000 rustfs && \
     adduser -D -s /bin/sh -u 1000 -G rustfs rustfs
 
-WORKDIR /app
-
 # Create data directories
-RUN mkdir -p /data/rustfs{0,1,2,3} && \
-    chown -R rustfs:rustfs /data /app
+RUN mkdir -p /data/rustfs && \
+    chown -R rustfs:rustfs /data 
 
 # Copy binary based on target architecture
 COPY --chown=rustfs:rustfs \
   target/*/release/rustfs \
-  /app/rustfs
+  /usr/local/bin/rustfs
 
-RUN chmod +x /app/rustfs
+RUN chmod +x /usr/local/bin/rustfs
 
 # Switch to non-root user
 USER rustfs
@@ -29,9 +27,7 @@ USER rustfs
 # Expose ports
 EXPOSE 9000 9001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
+VOLUME /data
 
 # Set default command
-CMD ["/app/rustfs"]
+CMD ["rustfs", "/data"]
