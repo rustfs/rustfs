@@ -60,7 +60,6 @@ impl WarmBackendRustFS {
         let default_port = if scheme == "https" { 443 } else { 80 };
         let client =
             TransitionClient::new(&format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)), opts).await?;
-        //client.set_appinfo(format!("rustfs-tier-{}", tier), ReleaseTag);
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));

@@ -11,11 +11,6 @@ use std::{
 };
 use transform_stream::AsyncTryStream;
 use url::{Host, Url};
-//use hyper::{client::conn::http2::Builder, rt::Executor};
-//use tonic::{SharedExec, UserAgent};
-//use hyper_util::rt::TokioTimer;
-
-use s3s::header::X_AMZ_STORAGE_CLASS;
 
 lazy_static! {
     static ref LOCAL_IPS: Vec<IpAddr> = must_get_local_ips().unwrap();
@@ -140,84 +135,12 @@ pub fn new_remotetarget_http_transport(_insecure: bool) -> Builder<TokioExecutor
     todo!();
 }
 
-lazy_static! {
-    static ref SUPPORTED_QUERY_VALUES: HashMap<String, bool> = {
-        let mut m = HashMap::new();
-        m.insert("attributes".to_string(), true);
-        m.insert("partNumber".to_string(), true);
-        m.insert("versionId".to_string(), true);
-        m.insert("response-cache-control".to_string(), true);
-        m.insert("response-content-disposition".to_string(), true);
-        m.insert("response-content-encoding".to_string(), true);
-        m.insert("response-content-language".to_string(), true);
-        m.insert("response-content-type".to_string(), true);
-        m.insert("response-expires".to_string(), true);
-        m
-    };
-    static ref SUPPORTED_HEADERS: HashMap<String, bool> = {
-        let mut m = HashMap::new();
-        m.insert("content-type".to_string(), true);
-        m.insert("cache-control".to_string(), true);
-        m.insert("content-encoding".to_string(), true);
-        m.insert("content-disposition".to_string(), true);
-        m.insert("content-language".to_string(), true);
-        m.insert("x-amz-website-redirect-location".to_string(), true);
-        m.insert("x-amz-object-lock-mode".to_string(), true);
-        m.insert("x-amz-metadata-directive".to_string(), true);
-        m.insert("x-amz-object-lock-retain-until-date".to_string(), true);
-        m.insert("expires".to_string(), true);
-        m.insert("x-amz-replication-status".to_string(), true);
-        m
-    };
-    static ref SSE_HEADERS: HashMap<String, bool> = {
-        let mut m = HashMap::new();
-        m.insert("x-amz-server-side-encryption".to_string(), true);
-        m.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), true);
-        m.insert("x-amz-server-side-encryption-context".to_string(), true);
-        m.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), true);
-        m.insert("x-amz-server-side-encryption-customer-key".to_string(), true);
-        m.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), true);
-        m
-    };
-}
 
-pub fn is_standard_query_value(qs_key: &str) -> bool {
-    SUPPORTED_QUERY_VALUES[qs_key]
-}
 
 const ALLOWED_CUSTOM_QUERY_PREFIX: &str = "x-";
 
 pub fn is_custom_query_value(qs_key: &str) -> bool {
     qs_key.starts_with(ALLOWED_CUSTOM_QUERY_PREFIX)
-}
-
-pub fn is_storageclass_header(header_key: &str) -> bool {
-    header_key.to_lowercase() == X_AMZ_STORAGE_CLASS.as_str().to_lowercase()
-}
-
-pub fn is_standard_header(header_key: &str) -> bool {
-    *SUPPORTED_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
-}
-
-pub fn is_sse_header(header_key: &str) -> bool {
-    *SSE_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
-}
-
-pub fn is_amz_header(header_key: &str) -> bool {
-    let key = header_key.to_lowercase();
-    key.starts_with("x-amz-meta-")
-        || key.starts_with("x-amz-grant-")
-        || key == "x-amz-acl"
-        || is_sse_header(header_key)
-        || key.starts_with("x-amz-checksum-")
-}
-
-pub fn is_rustfs_header(header_key: &str) -> bool {
-    header_key.to_lowercase().starts_with("x-rustfs-")
-}
-
-pub fn is_rustfs_header(header_key: &str) -> bool {
-    header_key.to_lowercase().starts_with("x-rustfs-")
 }
 
 #[derive(Debug, Clone)]

@@ -110,8 +110,6 @@ impl Clone for TierConfig {
             tier_type: self.tier_type.clone(),
             name: self.name.clone(),
             s3,
-            //azure:   az,
-            //gcs:     gcs,
             rustfs: r,
             minio: m,
         }

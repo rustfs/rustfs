@@ -817,30 +817,9 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
     let version_id = version_id.to_string();
 
     match r_err.code {
-        /*S3ErrorCode::SlowDownWrite => {
-            err = StorageError::InsufficientWriteQuorum;//{bucket: bucket, object: object};
-        }*/
-        /*S3ErrorCode::SlowDown/* SlowDownRead */ => {
-            err = std::io::Error::other(StorageError::InsufficientReadQuorum.to_string());
-        }*/
-        /*S3ErrorCode::PreconditionFailed => {
-            err = Error::from(StorageError::PreConditionFailed);
-        }*/
-        /*S3ErrorCode::InvalidRange => {
-            err = Error::from(StorageError::InvalidRange);
-        }*/
-        /*S3ErrorCode::BucketAlreadyOwnedByYou => {
-            err = Error::from(StorageError::BucketAlreadyOwnedByYou);
-        }*/
         S3ErrorCode::BucketNotEmpty => {
             err = std::io::Error::other(StorageError::BucketNotEmpty("".to_string()).to_string());
         }
-        /*S3ErrorCode::NoSuchBucketPolicy => {
-            err = Error::from(StorageError::BucketPolicyNotFound);
-        }*/
-        /*S3ErrorCode::NoSuchLifecycleConfiguration => {
-            err = Error::from(StorageError::BucketLifecycleNotFound);
-        }*/
         S3ErrorCode::InvalidBucketName => {
             err = std::io::Error::other(StorageError::BucketNameInvalid(bucket));
         }
@@ -864,24 +843,12 @@ pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::i
                 err = std::io::Error::other(StorageError::BucketNotFound(bucket));
             }
         }
-        /*S3ErrorCode::XRustFsInvalidObjectName => {
-            err = Error::from(StorageError::ObjectNameInvalid(bucket, object));
-        }*/
         S3ErrorCode::AccessDenied => {
             err = std::io::Error::other(StorageError::PrefixAccessDenied(bucket, object));
         }
-        /*S3ErrorCode::XAmzContentSHA256Mismatch => {
-            err = hash.SHA256Mismatch{};
-        }*/
         S3ErrorCode::NoSuchUpload => {
             err = std::io::Error::other(StorageError::InvalidUploadID(bucket, object, version_id));
         }
-        /*S3ErrorCode::EntityTooSmall => {
-            err = std::io::Error::other(StorageError::PartTooSmall);
-        }*/
-        /*S3ErrorCode::ReplicationPermissionCheck => {
-            err = std::io::Error::other(StorageError::ReplicationPermissionCheck);
-        }*/
         _ => {
             err = err_;
         }
