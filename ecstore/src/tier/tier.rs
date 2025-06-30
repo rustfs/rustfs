@@ -220,7 +220,7 @@ impl TierConfigMgr {
         if cfg.is_none() {
             return "internal".to_string();
         }
-        cfg.expect("err").tier_type.to_string()
+        cfg.expect("err").tier_type.as_lowercase()
     }
 
     pub fn list_tiers(&self) -> Vec<TierConfig> {

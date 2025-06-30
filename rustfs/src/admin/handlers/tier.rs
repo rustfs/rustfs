@@ -118,39 +118,36 @@ impl Operation for AddTier {
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         //tier_config_mgr.reload(api);
-        match tier_config_mgr.add(args, force).await {
-            Err(err) => {
-                if err.code == ERR_TIER_ALREADY_EXISTS.code {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("TierNameAlreadyExist".into()),
-                        "tier name already exists!",
-                    ));
-                } else if err.code == ERR_TIER_NAME_NOT_UPPERCASE.code {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("TierNameNotUppercase".into()),
-                        "tier name not uppercase!",
-                    ));
-                } else if err.code == ERR_TIER_BACKEND_IN_USE.code {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("TierNameBackendInUse!".into()),
-                        "tier name backend in use!",
-                    ));
-                } else if err.code == ERR_TIER_CONNECT_ERR.code {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("TierConnectError".into()),
-                        "tier connect error!",
-                    ));
-                } else if err.code == ERR_TIER_INVALID_CREDENTIALS.code {
-                    return Err(S3Error::with_message(S3ErrorCode::Custom(err.code.clone().into()), err.message.clone()));
-                } else {
-                    warn!("tier_config_mgr add failed, e: {:?}", err);
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("TierAddFailed".into()),
-                        format!("tier add failed. {}", err.to_string()),
-                    ));
-                }
+        if let Err(err) = tier_config_mgr.add(args, force).await {
+            if err.code == ERR_TIER_ALREADY_EXISTS.code {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierNameAlreadyExist".into()),
+                    "tier name already exists!",
+                ));
+            } else if err.code == ERR_TIER_NAME_NOT_UPPERCASE.code {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierNameNotUppercase".into()),
+                    "tier name not uppercase!",
+                ));
+            } else if err.code == ERR_TIER_BACKEND_IN_USE.code {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierNameBackendInUse!".into()),
+                    "tier name backend in use!",
+                ));
+            } else if err.code == ERR_TIER_CONNECT_ERR.code {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierConnectError".into()),
+                    "tier connect error!",
+                ));
+            } else if err.code == ERR_TIER_INVALID_CREDENTIALS.code {
+                return Err(S3Error::with_message(S3ErrorCode::Custom(err.code.clone().into()), err.message.clone()));
+            } else {
+                warn!("tier_config_mgr add failed, e: {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierAddFailed".into()),
+                    format!("tier add failed. {}", err),
+                ));
             }
-            Ok(_) => (),
         }
         if let Err(e) = tier_config_mgr.save().await {
             warn!("tier_config_mgr save failed, e: {:?}", e);
@@ -203,24 +200,21 @@ impl Operation for EditTier {
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         //tier_config_mgr.reload(api);
-        match tier_config_mgr.edit(&tier_name, creds).await {
-            Err(err) => {
-                if err.code == ERR_TIER_NOT_FOUND.code {
-                    return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found!"));
-                } else if err.code == ERR_TIER_MISSING_CREDENTIALS.code {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("TierMissingCredentials".into()),
-                        "tier missing credentials!",
-                    ));
-                } else {
-                    warn!("tier_config_mgr edit failed, e: {:?}", err);
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("TierEditFailed".into()),
-                        format!("tier edit failed. {}", err.to_string()),
-                    ));
-                }
+        if let Err(err) = tier_config_mgr.edit(&tier_name, creds).await {
+            if err.code == ERR_TIER_NOT_FOUND.code {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found!"));
+            } else if err.code == ERR_TIER_MISSING_CREDENTIALS.code {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierMissingCredentials".into()),
+                    "tier missing credentials!",
+                ));
+            } else {
+                warn!("tier_config_mgr edit failed, e: {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierEditFailed".into()),
+                    format!("tier edit failed. {}", err),
+                ));
             }
-            Ok(_) => (),
         }
         if let Err(e) = tier_config_mgr.save().await {
             warn!("tier_config_mgr save failed, e: {:?}", e);
@@ -304,22 +298,20 @@ impl Operation for RemoveTier {
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         //tier_config_mgr.reload(api);
-        match tier_config_mgr.remove(&tier_name, force).await {
-            Err(err) => {
-                if err.code == ERR_TIER_NOT_FOUND.code {
-                    return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found."));
-                } else if err.code == ERR_TIER_BACKEND_NOT_EMPTY.code {
-                    return Err(S3Error::with_message(S3ErrorCode::Custom("TierNameBackendInUse".into()), "tier is used."));
-                } else {
-                    warn!("tier_config_mgr remove failed, e: {:?}", err);
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::Custom("TierRemoveFailed".into()),
-                        format!("tier remove failed. {}", err.to_string()),
-                    ));
-                }
+        if let Err(err) = tier_config_mgr.remove(&tier_name, force).await {
+            if err.code == ERR_TIER_NOT_FOUND.code {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found."));
+            } else if err.code == ERR_TIER_BACKEND_NOT_EMPTY.code {
+                return Err(S3Error::with_message(S3ErrorCode::Custom("TierNameBackendInUse".into()), "tier is used."));
+            } else {
+                warn!("tier_config_mgr remove failed, e: {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("TierRemoveFailed".into()),
+                    format!("tier remove failed. {}", err),
+                ));
             }
-            Ok(_) => (),
         }
+
         if let Err(e) = tier_config_mgr.save().await {
             warn!("tier_config_mgr save failed, e: {:?}", e);
             return Err(S3Error::with_message(S3ErrorCode::Custom("TierRemoveFailed".into()), "tier save failed"));
@@ -422,7 +414,7 @@ impl Operation for ClearTier {
 
         let mut force: bool = false;
         let force_str = query.force;
-        if force_str != "" {
+        if !force_str.is_empty() {
             force = force_str.parse().unwrap();
         }
 
@@ -438,15 +430,12 @@ impl Operation for ClearTier {
 
         let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
         //tier_config_mgr.reload(api);
-        match tier_config_mgr.clear_tier(force).await {
-            Err(err) => {
-                warn!("tier_config_mgr clear failed, e: {:?}", err);
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierClearFailed".into()),
-                    format!("tier clear failed. {}", err.to_string()),
-                ));
-            }
-            Ok(_) => (),
+        if let Err(err) = tier_config_mgr.clear_tier(force).await {
+            warn!("tier_config_mgr clear failed, e: {:?}", err);
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("TierClearFailed".into()),
+                format!("tier clear failed. {}", err),
+            ));
         }
         if let Err(e) = tier_config_mgr.save().await {
             warn!("tier_config_mgr save failed, e: {:?}", e);
