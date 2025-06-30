@@ -166,7 +166,7 @@ impl FS {
 
         let prefix = req
             .headers
-            .get("X-Amz-Meta-RustFs-Snowball-Prefix")
+            .get("X-Amz-Meta-Rustfs-Snowball-Prefix")
             .map(|v| v.to_str().unwrap_or_default())
             .unwrap_or_default();
 

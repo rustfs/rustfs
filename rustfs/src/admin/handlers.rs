@@ -769,8 +769,6 @@ fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
     params
 }
 
-//disable encrypto from client because rustfs use len 8 Nonce but rustfs use 12 len Nonce
-
 #[allow(dead_code)]
 fn is_local_host(_host: String) -> bool {
     false

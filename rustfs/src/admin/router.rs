@@ -16,7 +16,6 @@ use s3s::s3_error;
 use tracing::error;
 
 use super::ADMIN_PREFIX;
-use super::RUSTFS_ADMIN_PREFIX;
 use super::rpc::RPC_PREFIX;
 
 pub struct S3Router<T> {
@@ -66,7 +65,7 @@ where
             }
         }
 
-        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX) || uri.path().starts_with(RUSTFS_ADMIN_PREFIX)
+        uri.path().starts_with(ADMIN_PREFIX) || uri.path().starts_with(RPC_PREFIX)
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {

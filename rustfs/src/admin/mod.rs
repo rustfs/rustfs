@@ -17,7 +17,6 @@ use rpc::register_rpc_route;
 use s3s::route::S3Route;
 
 const ADMIN_PREFIX: &str = "/rustfs/admin";
-const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin";
 
 pub fn make_admin_route() -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new();
@@ -243,7 +242,7 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
 
     r.insert(
         Method::GET,
-        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
         AdminOperation(&ListRemoteTargetHandler {}),
     )?;
 
@@ -255,7 +254,7 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
 
     r.insert(
         Method::GET,
-        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
         AdminOperation(&GetReplicationMetricsHandler {}),
     )?;
 
@@ -267,7 +266,7 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
 
     r.insert(
         Method::PUT,
-        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/set-remote-target").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-remote-target").as_str(),
         AdminOperation(&SetRemoteTargetHandler {}),
     )?;
     r.insert(
@@ -278,7 +277,7 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
 
     r.insert(
         Method::DELETE,
-        format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
         AdminOperation(&RemoveRemoteTargetHandler {}),
     )?;
 
