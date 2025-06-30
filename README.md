@@ -1,121 +1,122 @@
-# RustFS
+[![RustFS](https://github.com/user-attachments/assets/547d72f7-d1f4-4763-b9a8-6040bad9251a)](https://rustfs.com)
 
-## English Documentation |[中文文档](README_ZH.md)
 
-### Prerequisites
+<p align="center">RustFS is a high-performance distributed object storage software built using Rust</p>
 
-| Package | Version | Download Link                                                                                                                    |
-|---------|---------|----------------------------------------------------------------------------------------------------------------------------------|
-| Rust    | 1.8.5+  | [rust-lang.org/tools/install](https://www.rust-lang.org/tools/install)                                                           |
-| protoc  | 31.1+   | [protoc-31.1-linux-x86_64.zip](https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protoc-31.1-linux-x86_64.zip) |
-| flatc   | 24.0+   | [Linux.flatc.binary.g++-13.zip](https://github.com/google/flatbuffers/releases/download/v25.2.10/Linux.flatc.binary.g++-13.zip)  |
+<p align="center">
+  <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
+  <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/rustfs/rustfs"/>
+  <img alt="Github Last Commit" src="https://img.shields.io/github/last-commit/rustfs/rustfs"/>
+  <img alt="Github Contributors" src="https://img.shields.io/github/contributors/rustfs/rustfs"/>
+  <img alt="GitHub closed issues" src="https://img.shields.io/github/issues-closed/rustfs/rustfs"/>
+  <img alt="Discord" src="https://img.shields.io/discord/1107178041848909847?label=discord"/>
+</p>
 
-### Building RustFS
+<p align="center">
+  <a href="https://docs.rustfs.com/quickstart">Getting Started</a>
+  · <a href="https://docs.rustfs.com">Docs</a>
+  · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
+  · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
+</p>
 
-#### Generate Protobuf Code
+<p align="center">
+English | <a href="https://github.com/rustfs/rustfs/blob/main/README-CN.md">简体中文</a>
+</p>
 
-```bash
-cargo run --bin gproto
-```
+RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature, support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation, RustFS provides faster speed and safer distributed features for high-performance object storage.
 
-#### Using Docker for Prerequisites
+## Features
 
-```yaml
-- uses: arduino/setup-protoc@v3
-  with:
-    version: "30.2"
+- **High Performance**: Built with Rust, ensuring speed and efficiency.
+- **Distributed Architecture**: Scalable and fault-tolerant design for large-scale deployments.
+- **S3 Compatibility**: Seamless integration with existing S3-compatible applications.
+- **Data Lake Support**: Optimized for big data and AI workloads.
+- **Open Source**: Licensed under Apache 2.0, encouraging community contributions and transparency.
+- **User-Friendly**: Designed with simplicity in mind, making it easy to deploy and manage.
 
-- uses: Nugine/setup-flatc@v1
-  with:
-    version: "25.2.10"
-```
+## RustFS vs MinIO 
 
-#### Adding Console Web UI
+Stress test server parameters
 
-1. Download the latest console UI:
+|  Type  |  parameter   | Remark |
+| - | - | - |
+|CPU | 2 Core | Intel Xeon(Sapphire Rapids) Platinum 8475B , 2.7/3.2 GHz|   |
+|Memory| 4GB |     |
+|Network | 15Gbp |      |
+|Driver  | 40GB x 4 |   IOPS 3800 / Driver |
+
+
+https://github.com/user-attachments/assets/8cdc78f3-5ccb-413b-aa08-ff005022cf52
+
+
+### RustFS vs Other object storage
+
+| RustFS | Other object storage|
+| - | - |
+| Powerful Console | Simple and useless Console |
+| Developed based on Rust language, memory is safer | Developed in Go or C, with potential issues like memory GC/leaks |
+| Does not report logs to third-party countries  | Reporting logs to other third countries may violate national security laws |
+| Licensed under Apache, more business-friendly  | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
+| Comprehensive S3 support, works with domestic and international cloud providers  | Full support for S3, but no local cloud vendor support |
+| Rust-based development, strong support for secure and innovative devices  | Poor support for edge gateways and secure innovative devices|
+| Stable commercial prices, free community support | High pricing, with costs up to $250,000 for 1PiB |
+| No risk | Intellectual property risks and risks of prohibited uses |
+
+## Quickstart
+
+To get started with RustFS, follow these steps:
+
+1. **Install RustFS**: Download the latest release from our [GitHub Releases](https://github.com/rustfs/rustfs/releases).
+2. **Run RustFS**: Use the provided binary to start the server.
+
    ```bash
-   wget https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip
-   ```
-2. Create the static directory:
-   ```bash
-   mkdir -p ./rustfs/static
-   ```
-3. Extract and compile RustFS:
-   ```bash
-   unzip rustfs-console-latest.zip -d ./rustfs/static
-   cargo build
-   ```
-
-### Running RustFS
-
-#### Configuration
-
-Set the required environment variables:
-
-```bash
-# Basic config
-export RUSTFS_VOLUMES="./target/volume/test"
-export RUSTFS_ADDRESS="0.0.0.0:9000"
-export RUSTFS_CONSOLE_ENABLE=true
-export RUSTFS_CONSOLE_ADDRESS="0.0.0.0:9001"
-
-# Observability config
-export RUSTFS_OBS_ENDPOINT="http://localhost:4317"
-
-# Event message configuration
-#export RUSTFS_EVENT_CONFIG="./deploy/config/event.toml"
-
-```
-
-#### Start the service
-
-```bash
-./rustfs /data/rustfs
-```
-
-## Observability Stack Otel and OpenObserve
-
-### OpenTelemetry Collector 和 Jaeger、Grafana、Prometheus、Loki
-
-1. Navigate to the observability directory:
-   ```bash
-   cd .docker/observability
+   ./rustfs  /data
    ```
 
-2. Start the observability stack:
-   ```bash
-   docker compose -f docker-compose.yml  up -d
-   ```
+3. **Access the Console**: Open your web browser and navigate to `http://localhost:9001` to access the RustFS console.
+4. **Create a Bucket**: Use the console to create a new bucket for your objects.
+5. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs to interact with your RustFS instance.
 
-#### Access Monitoring Dashboards
+## Documentation
 
-- Grafana: `http://localhost:3000` (credentials: `admin`/`admin`)
-- Jaeger: `http://localhost:16686`
-- Prometheus: `http://localhost:9090`
+For detailed documentation, including configuration options, API references, and advanced usage, please visit our [Documentation](https://docs.rustfs.com).
 
-#### Configure observability
+## Getting Help
 
-```
-OpenTelemetry Collector address(endpoint):  http://localhost:4317 
-```
+If you have any questions or need assistance, you can:
 
----
+- Check the [FAQ](https://docs.rustfs.com/faq) for common issues and solutions.
+- Join our [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) to ask questions and share your experiences.
+- Open an issue on our [GitHub Issues](https://github.com/rustfs/rustfs/issues) page for bug reports or feature requests.
 
-### OpenObserve and OpenTelemetry Collector
+## Links
 
-1. Navigate to the OpenObserve and OpenTelemetry directory:
-   ```bash
-   cd .docker/openobserve-otel
-   ```
-2. Start the OpenObserve and OpenTelemetry Collector services:
-   ```bash
-    docker compose -f docker-compose.yml up -d
-    ```
-3. Access the OpenObserve UI:
-   OpenObserve UI: `http://localhost:5080`
-    - Default credentials:
-        - Username: `root@rustfs.com`
-        - Password: `rustfs123`
-    - Exposed ports:
-        - 5080: HTTP API and UI
-        - 5081: OTLP gRPC
+- [Documentation](https://docs.rustfs.com) - The manual you should read
+- [Changelog](https://docs.rustfs.com/changelog) - What we broke and fixed
+- [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) - Where the community lives
+
+## Contributing
+
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full spiel.
+
+## Contact
+
+- **Bugs**: [GitHub Issues](https://github.com/rustfs/rustfs/issues)
+- **Business**: <hello@rustfs.com>
+- **Jobs**: <jobs@rustfs.com>
+- **General Discussion**: [GitHub Discussions](https://github.com/rustfs/rustfs/discussions)
+
+## Contributors
+
+RustFS is a community-driven project, and we appreciate all contributions. Check out the [Contributors](https://github.com/rustfs/rustfs/graphs/contributors) page to see the amazing people who have helped make RustFS better.
+
+<a href="https://github.com/rustfs/rustfs/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=rustfs/rustfs" />
+</a>
+
+
+## License
+
+[Apache 2.0](https://opensource.org/licenses/Apache-2.0)
+
+**RustFS** is a trademark of RustFS, Inc. All other trademarks are the property of their respective owners.
