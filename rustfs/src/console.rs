@@ -100,13 +100,18 @@ impl Config {
         serde_json::to_string(self).unwrap_or_default()
     }
 
-    pub(crate) fn version(&self) -> String {
+    pub(crate) fn version_info(&self) -> String {
         format!(
-            "RELEASE.{} (rust {} {})",
+            "RELEASE.{}@{} (rust {} {})",
             self.release.date.clone(),
+            self.release.version.clone().trim_start_matches('@'),
             build::RUST_VERSION,
             build::BUILD_TARGET
         )
+    }
+
+    pub(crate) fn version(&self) -> String {
+        self.release.version.clone()
     }
 
     pub(crate) fn license(&self) -> String {

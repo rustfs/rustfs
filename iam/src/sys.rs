@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::manager::IamCache;
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
+use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
@@ -59,6 +60,10 @@ impl<T: Store> IamSys<T> {
         self.store.group_notification_handler(name).await
     }
 
+    pub async fn load_groups(&self, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+        self.store.api.load_groups(m).await
+    }
+
     pub async fn load_policy(&self, name: &str) -> Result<()> {
         self.store.policy_notification_handler(name).await
     }
@@ -71,6 +76,11 @@ impl<T: Store> IamSys<T> {
 
     pub async fn load_user(&self, name: &str, user_type: UserType) -> Result<()> {
         self.store.user_notification_handler(name, user_type).await
+    }
+
+    pub async fn load_users(&self, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+        self.store.api.load_users(user_type, m).await?;
+        Ok(())
     }
 
     pub async fn load_service_account(&self, name: &str) -> Result<()> {
@@ -104,6 +114,15 @@ impl<T: Store> IamSys<T> {
             create_date: d.create_date,
             update_date: d.update_date,
         })
+    }
+
+    pub async fn load_mapped_policys(
+        &self,
+        user_type: UserType,
+        is_group: bool,
+        m: &mut HashMap<String, MappedPolicy>,
+    ) -> Result<()> {
+        self.store.api.load_mapped_policys(user_type, is_group, m).await
     }
 
     pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {

@@ -231,6 +231,18 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
 
     r.insert(
         Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/export-iam").as_str(),
+        AdminOperation(&user::ExportIam {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/import-iam").as_str(),
+        AdminOperation(&user::ImportIam {}),
+    )?;
+
+    r.insert(
+        Method::GET,
         format!("{}{}", RUSTFS_ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
         AdminOperation(&ListRemoteTargetHandler {}),
     )?;
