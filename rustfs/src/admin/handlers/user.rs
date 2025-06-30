@@ -5,7 +5,10 @@ use crate::{
 use ecstore::global::get_global_action_cred;
 use http::{HeaderMap, StatusCode};
 use iam::store::UserType;
-use madmin::{AccountStatus, AddOrUpdateUserReq, SRSessionPolicy, SRSvcAccCreate};
+use madmin::{
+    AccountStatus, AddOrUpdateUserReq,
+    user::{SRSessionPolicy, SRSvcAccCreate},
+};
 use matchit::Params;
 use policy::policy::{
     Args,

@@ -143,7 +143,6 @@ async fn run(opt: config::Opt) -> Result<()> {
     let (endpoint_pools, setup_type) =
         EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone()).map_err(Error::other)?;
 
-    // Print RustFS-style logging for pool formatting
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
             "Formatting {}st pool, {} set(s), {} drives per set.",
