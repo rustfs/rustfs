@@ -1,5 +1,5 @@
 use super::pattern;
-use crate::arn::{ARN, ArnError, TargetIDError};
+use crate::arn::{ArnError, TargetIDError, ARN};
 use crate::event::EventName;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

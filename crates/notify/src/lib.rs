@@ -1,7 +1,7 @@
 //! RustFS Notify - A flexible and extensible event notification system for object storage.
 //!
-//! This library provides a Rust implementation of a storage bucket notification system,
-//! similar to RustFS's notification system. It supports sending events to various targets
+//! This library provides a Rust implementation of a storage bucket notification system.
+//! It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
 pub mod arn;
@@ -26,7 +26,7 @@ pub use rules::BucketNotificationConfig;
 use std::io::IsTerminal;
 pub use target::Target;
 
-use tracing_subscriber::{EnvFilter, fmt, prelude::*, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, prelude::*, util::SubscriberInitExt, EnvFilter};
 
 /// Initialize the tracing log system
 ///

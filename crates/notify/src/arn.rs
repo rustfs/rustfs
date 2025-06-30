@@ -95,7 +95,7 @@ pub struct ARN {
     pub region: String,
     // Service types, such as "sqs", "sns", "lambda", etc. This defaults to "sqs" to match the Go example.
     pub service: String,
-    // Partitions such as "aws", "aws-cn", or customizations such as "rustfs","rustfs", etc.
+    // Partitions such as "aws", "aws-cn", or customizations such as "rustfs", etc.
     pub partition: String,
 }
 
