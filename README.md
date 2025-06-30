@@ -95,9 +95,6 @@ If you have any questions or need assistance, you can:
 - [Changelog](https://docs.rustfs.com/changelog) - What we broke and fixed
 - [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) - Where the community lives
 
-## Contributing
-
-Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full spiel.
 
 ## Contact
 
@@ -105,6 +102,7 @@ Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full spiel
 - **Business**: <hello@rustfs.com>
 - **Jobs**: <jobs@rustfs.com>
 - **General Discussion**: [GitHub Discussions](https://github.com/rustfs/rustfs/discussions)
+- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Contributors
 
