@@ -451,6 +451,11 @@ impl Event {
         let key_name = form_urlencoded::byte_serialize(args.object.name.as_bytes()).collect::<String>();
         let principal_id = args.req_params.get("principalId").unwrap_or(&String::new()).to_string();
 
+        let version_id = match args.object.version_id {
+            Some(id) => Some(id.to_string()),
+            None => Some(args.version_id.clone()),
+        };
+
         let mut s3_metadata = Metadata {
             schema_version: "1.0".to_string(),
             configuration_id: "Config".to_string(), // or from args
@@ -463,7 +468,7 @@ impl Event {
             },
             object: Object {
                 key: key_name,
-                version_id: Some(args.object.version_id.unwrap().to_string()),
+                version_id,
                 sequencer: unique_id,
                 ..Default::default()
             },
@@ -531,6 +536,7 @@ pub struct EventArgs {
     pub object: ecstore::store_api::ObjectInfo,
     pub req_params: HashMap<String, String>,
     pub resp_elements: HashMap<String, String>,
+    pub version_id: String,
     pub host: String,
     pub user_agent: String,
 }
