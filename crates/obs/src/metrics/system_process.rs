@@ -1,5 +1,6 @@
 /// process related metric descriptors
-use crate::metrics::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
+use crate::metrics::{new_counter_md, new_gauge_md, subsystems, MetricDescriptor, MetricName};
+
 
 lazy_static::lazy_static! {
     pub static ref PROCESS_LOCKS_READ_TOTAL_MD: MetricDescriptor =
