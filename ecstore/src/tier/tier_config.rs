@@ -51,7 +51,7 @@ impl TierType {
         }
     }
 
-    pub fn to_string(&self) -> String {
+    pub fn as_lowercase(&self) -> String {
         match self {
             TierType::S3 => "s3".to_string(),
             TierType::RustFS => "rustfs".to_string(),
@@ -199,11 +199,17 @@ pub struct TierS3 {
 
 impl TierS3 {
     #[allow(dead_code)]
-    fn new<F>(name: &str, access_key: &str, secret_key: &str, bucket: &str, options: Vec<F>) -> Result<TierConfig, std::io::Error>
+    fn create<F>(
+        name: &str,
+        access_key: &str,
+        secret_key: &str,
+        bucket: &str,
+        options: Vec<F>,
+    ) -> Result<TierConfig, std::io::Error>
     where
         F: Fn(TierS3) -> Box<Result<(), std::io::Error>> + Send + Sync + 'static,
     {
-        if name == "" {
+        if name.is_empty() {
             return Err(std::io::Error::other(ERR_TIER_NAME_EMPTY));
         }
         let sc = TierS3 {
@@ -264,7 +270,7 @@ pub struct TierMinIO {
 
 impl TierMinIO {
     #[allow(dead_code)]
-    fn new<F>(
+    fn create<F>(
         name: &str,
         endpoint: &str,
         access_key: &str,
@@ -275,7 +281,7 @@ impl TierMinIO {
     where
         F: Fn(TierMinIO) -> Box<Result<(), std::io::Error>> + Send + Sync + 'static,
     {
-        if name == "" {
+        if name.is_empty() {
             return Err(std::io::Error::other(ERR_TIER_NAME_EMPTY));
         }
         let m = TierMinIO {

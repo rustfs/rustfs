@@ -34,7 +34,7 @@ pub fn get_signing_key(secret: &str, loc: &str, t: OffsetDateTime, service_type:
     let date = hmac_sha256(s.into_bytes(), t.format(&format).unwrap().into_bytes());
     let location = hmac_sha256(date, loc);
     let service = hmac_sha256(location, service_type);
-    
+
     hmac_sha256(service, "aws4_request")
 }
 
@@ -166,22 +166,20 @@ fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<Strin
         query_params.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Build canonical query string
-        let sorted_params: Vec<String> = query_params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v) )
-            .collect();
+        let sorted_params: Vec<String> = query_params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
 
         canonical_query_string = sorted_params.join("&");
         canonical_query_string = canonical_query_string.replace("+", "%20");
     }
 
-    let mut canonical_request = <Vec<String>>::new();
-    canonical_request.push(req.method_ref().unwrap().to_string());
-    canonical_request.push(req.uri_ref().unwrap().path().to_string());
-    canonical_request.push(canonical_query_string);
-    canonical_request.push(get_canonical_headers(req, ignored_headers));
-    canonical_request.push(get_signed_headers(req, ignored_headers));
-    canonical_request.push(hashed_payload.to_string());
+    let canonical_request = [
+        req.method_ref().unwrap().to_string(),
+        req.uri_ref().unwrap().path().to_string(),
+        canonical_query_string,
+        get_canonical_headers(req, ignored_headers),
+        get_signed_headers(req, ignored_headers),
+        hashed_payload.to_string(),
+    ];
     canonical_request.join("\n")
 }
 
@@ -256,14 +254,13 @@ pub fn pre_sign_v4(
         .parse()
         .unwrap(),
     );
-    
 
     req.uri(Uri::from_parts(parts).unwrap())
 }
 
 fn _post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_access_key: &str, location: &str) -> String {
     let signing_key = get_signing_key(secret_access_key, location, t, SERVICE_TYPE_S3);
-    
+
     get_signature(signing_key, policy_base64)
 }
 
@@ -271,6 +268,7 @@ fn _sign_v4_sts(req: request::Builder, access_key_id: &str, secret_access_key: &
     sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_v4_inner(
     mut req: request::Builder,
     content_len: i64,
@@ -403,6 +401,7 @@ pub fn sign_v4_trailer(
 }
 
 #[cfg(test)]
+#[allow(unused_variables, unused_mut)]
 mod tests {
     use http::request;
     use time::macros::datetime;
@@ -433,9 +432,10 @@ mod tests {
         );
         headers.insert("x-amz-date", timestamp.parse().unwrap());
 
-        let mut query = <Vec<(String, String)>>::new();
-        query.push(("max-keys".to_string(), "2".to_string()));
-        query.push(("prefix".to_string(), "J".to_string()));
+        let query = vec![
+            ("max-keys".to_string(), "2".to_string()),
+            ("prefix".to_string(), "J".to_string()),
+        ];
         let uri = req.uri_ref().unwrap().clone();
         let mut parts = req.uri_ref().unwrap().clone().into_parts();
         parts.path_and_query = Some(

@@ -692,7 +692,6 @@ pub struct ExpirationOptions {
     pub expire: bool,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct TransitionOptions {
     pub status: String,
