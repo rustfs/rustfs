@@ -32,7 +32,7 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/health"]
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -142,25 +142,6 @@ services:
     profiles:
       - observability
 
-  # MinIO for S3 API testing
-  minio:
-    image: minio/minio:latest
-    container_name: minio-test
-    ports:
-      - "9020:9000"
-      - "9021:9001"
-    environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
-    volumes:
-      - minio_data:/data
-    command: server /data --console-address ":9001"
-    networks:
-      - rustfs-network
-    restart: unless-stopped
-    profiles:
-      - testing
-
   # Redis for caching (optional)
   redis:
     image: redis:7-alpine
@@ -214,8 +195,6 @@ volumes:
   prometheus_data:
     driver: local
   grafana_data:
-    driver: local
-  minio_data:
     driver: local
   redis_data:
     driver: local
