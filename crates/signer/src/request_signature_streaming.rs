@@ -52,6 +52,7 @@ fn _build_chunk_signature(
     get_signature(signing_key, &chunk_string_to_sign)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn streaming_sign_v4(
     mut req: request::Builder,
     _access_key_id: &str,
