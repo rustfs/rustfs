@@ -12,8 +12,6 @@ const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
 
 fn encode_url2path(req: &request::Builder, _virtual_host: bool) -> String {
-    
-
     //path = serde_urlencoded::to_string(req.uri_ref().unwrap().path().unwrap()).unwrap();
     let path = req.uri_ref().unwrap().path().to_string();
     path
@@ -60,13 +58,11 @@ pub fn pre_sign_v2(
             .parse()
             .unwrap(),
     );
-    
 
     req.uri(Uri::from_parts(parts).unwrap())
 }
 
 fn _post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> String {
-    
     hex(hmac_sha1(secret_access_key, policy_base64))
 }
 

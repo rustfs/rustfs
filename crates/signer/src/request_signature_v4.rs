@@ -34,7 +34,7 @@ pub fn get_signing_key(secret: &str, loc: &str, t: OffsetDateTime, service_type:
     let date = hmac_sha256(s.into_bytes(), t.format(&format).unwrap().into_bytes());
     let location = hmac_sha256(date, loc);
     let service = hmac_sha256(location, service_type);
-    
+
     hmac_sha256(service, "aws4_request")
 }
 
@@ -166,10 +166,7 @@ fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<Strin
         query_params.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Build canonical query string
-        let sorted_params: Vec<String> = query_params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v) )
-            .collect();
+        let sorted_params: Vec<String> = query_params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
 
         canonical_query_string = sorted_params.join("&");
         canonical_query_string = canonical_query_string.replace("+", "%20");
@@ -256,14 +253,13 @@ pub fn pre_sign_v4(
         .parse()
         .unwrap(),
     );
-    
 
     req.uri(Uri::from_parts(parts).unwrap())
 }
 
 fn _post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_access_key: &str, location: &str) -> String {
     let signing_key = get_signing_key(secret_access_key, location, t, SERVICE_TYPE_S3);
-    
+
     get_signature(signing_key, policy_base64)
 }
 
