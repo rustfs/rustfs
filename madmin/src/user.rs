@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
@@ -260,6 +261,194 @@ pub struct BucketDetails {
 pub struct AccountAccess {
     pub read: bool,
     pub write: bool,
+}
+
+/// SRSessionPolicy - represents a session policy to be replicated.
+#[derive(Debug, Clone)]
+pub struct SRSessionPolicy(Option<Box<RawValue>>);
+
+impl SRSessionPolicy {
+    pub fn new() -> Self {
+        SRSessionPolicy(None)
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        if json == "null" {
+            Ok(SRSessionPolicy(None))
+        } else {
+            let raw_value = serde_json::from_str(json)?;
+            Ok(SRSessionPolicy(Some(raw_value)))
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        self.0.as_ref().map(|v| v.get())
+    }
+}
+
+impl Default for SRSessionPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for SRSessionPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ref().map(|v| v.get()) == other.0.as_ref().map(|v| v.get())
+    }
+}
+
+impl Serialize for SRSessionPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match &self.0 {
+            Some(raw_value) => raw_value.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SRSessionPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw_value: Option<Box<RawValue>> = Option::deserialize(deserializer)?;
+        Ok(SRSessionPolicy(raw_value))
+    }
+}
+
+/// SRSvcAccCreate - create operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SRSvcAccCreate {
+    pub parent: String,
+
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
+
+    pub groups: Vec<String>,
+
+    pub claims: HashMap<String, serde_json::Value>,
+
+    #[serde(rename = "sessionPolicy")]
+    pub session_policy: SRSessionPolicy,
+
+    pub status: String,
+
+    pub name: String,
+
+    pub description: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiration: Option<OffsetDateTime>,
+
+    #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+}
+
+/// ImportIAMResult - represents the structure iam import response
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ImportIAMResult {
+    /// Skipped entries while import
+    /// This could be due to groups, policies etc missing for
+    /// imported entries. We dont fail hard in this case and
+    pub skipped: IAMEntities,
+
+    /// Removed entries - this mostly happens for policies
+    /// where empty might be getting imported and that's invalid
+    pub removed: IAMEntities,
+
+    /// Newly added entries
+    pub added: IAMEntities,
+
+    /// Failed entries while import. This would have details of
+    /// failed entities with respective errors
+    pub failed: IAMErrEntities,
+}
+
+/// IAMEntities - represents different IAM entities
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct IAMEntities {
+    /// List of policy names
+    pub policies: Vec<String>,
+
+    /// List of user names
+    pub users: Vec<String>,
+
+    /// List of group names
+    pub groups: Vec<String>,
+
+    /// List of Service Account names
+    #[serde(rename = "serviceAccounts")]
+    pub service_accounts: Vec<String>,
+
+    /// List of user policies, each entry in map represents list of policies
+    /// applicable to the user
+    #[serde(rename = "userPolicies")]
+    pub user_policies: Vec<HashMap<String, Vec<String>>>,
+
+    /// List of group policies, each entry in map represents list of policies
+    /// applicable to the group
+    #[serde(rename = "groupPolicies")]
+    pub group_policies: Vec<HashMap<String, Vec<String>>>,
+
+    /// List of STS policies, each entry in map represents list of policies
+    /// applicable to the STS
+    #[serde(rename = "stsPolicies")]
+    pub sts_policies: Vec<HashMap<String, Vec<String>>>,
+}
+
+/// IAMErrEntities - represents errored out IAM entries while import with error
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IAMErrEntities {
+    /// List of errored out policies with errors
+    pub policies: Vec<IAMErrEntity>,
+
+    /// List of errored out users with errors
+    pub users: Vec<IAMErrEntity>,
+
+    /// List of errored out groups with errors
+    pub groups: Vec<IAMErrEntity>,
+
+    /// List of errored out service accounts with errors
+    #[serde(rename = "serviceAccounts")]
+    pub service_accounts: Vec<IAMErrEntity>,
+
+    /// List of errored out user policies with errors
+    #[serde(rename = "userPolicies")]
+    pub user_policies: Vec<IAMErrPolicyEntity>,
+
+    /// List of errored out group policies with errors
+    #[serde(rename = "groupPolicies")]
+    pub group_policies: Vec<IAMErrPolicyEntity>,
+
+    /// List of errored out STS policies with errors
+    #[serde(rename = "stsPolicies")]
+    pub sts_policies: Vec<IAMErrPolicyEntity>,
+}
+
+/// IAMErrEntity - represents an errored IAM entity with error details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IAMErrEntity {
+    pub name: String,
+    pub error: String,
+}
+
+/// IAMErrPolicyEntity - represents an errored policy entity with error details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IAMErrPolicyEntity {
+    pub name: String,
+    pub policies: Vec<String>,
+    pub error: String,
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ mod logging;
 mod server;
 mod service;
 mod storage;
+mod update_checker;
 
 use crate::auth::IAMAuth;
 use crate::console::{CONSOLE_CONFIG, init_console_cfg};
@@ -94,7 +95,7 @@ fn print_server_info() {
     info!("RustFS Object Storage Server");
     info!("Copyright: 2024-{} RustFS, Inc", current_year);
     info!("License: {}", cfg.license());
-    info!("Version: {}", cfg.version());
+    info!("Version: {}", cfg.version_info());
     info!("Docs: {}", cfg.doc());
 }
 
@@ -585,9 +586,39 @@ async fn run(opt: config::Opt) -> Result<()> {
     print_server_info();
     init_bucket_replication_pool().await;
 
-    init_console_cfg(local_ip, server_port);
-
     print_server_info();
+
+    // Async update check (optional)
+    tokio::spawn(async {
+        use crate::update_checker::{UpdateCheckError, check_updates};
+
+        match check_updates().await {
+            Ok(result) => {
+                if result.update_available {
+                    if let Some(latest) = &result.latest_version {
+                        info!(
+                            "🚀 New version available: {} -> {} (current: {})",
+                            result.current_version, latest.version, result.current_version
+                        );
+                        if let Some(notes) = &latest.release_notes {
+                            info!("📝 Release notes: {}", notes);
+                        }
+                        if let Some(url) = &latest.download_url {
+                            info!("🔗 Download URL: {}", url);
+                        }
+                    }
+                } else {
+                    debug!("✅ Current version is up to date: {}", result.current_version);
+                }
+            }
+            Err(UpdateCheckError::HttpError(e)) => {
+                debug!("Version check network error (this is normal): {}", e);
+            }
+            Err(e) => {
+                debug!("Version check failed (this is normal): {}", e);
+            }
+        }
+    });
 
     if opt.console_enable {
         debug!("console is enabled");

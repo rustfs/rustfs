@@ -8221,6 +8221,7 @@ dependencies = [
  "protos",
  "query",
  "regex",
+ "reqwest",
  "rmp-serde",
  "rust-embed",
  "rustfs-config",
@@ -8254,6 +8255,7 @@ dependencies = [
  "transform-stream",
  "urlencoding",
  "uuid",
+ "zip",
 ]
 
 [[package]]
