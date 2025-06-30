@@ -187,22 +187,8 @@ impl VersionChecker {
         let current_parts = self.parse_version_parts(current)?;
         let latest_parts = self.parse_version_parts(latest)?;
 
-        // Compare major version
-        if latest_parts.0 > current_parts.0 {
-            return Ok(true);
-        } else if latest_parts.0 < current_parts.0 {
-            return Ok(false);
-        }
-
-        // Compare minor version
-        if latest_parts.1 > current_parts.1 {
-            return Ok(true);
-        } else if latest_parts.1 < current_parts.1 {
-            return Ok(false);
-        }
-
-        // Compare patch version
-        Ok(latest_parts.2 > current_parts.2)
+        // Use tuple comparison for lexicographic ordering
+        Ok(latest_parts > current_parts)
     }
 
     /// Parse version parts (major, minor, patch)
