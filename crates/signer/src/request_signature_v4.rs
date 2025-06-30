@@ -168,7 +168,7 @@ fn get_canonical_request(req: &request::Builder, ignored_headers: &HashMap<Strin
         // Build canonical query string
         let sorted_params: Vec<String> = query_params
             .iter()
-            .map(|(k, v)| if v.is_empty() { k.clone() } else { format!("{}={}", k, v) })
+            .map(|(k, v)| format!("{}={}", k, v) )
             .collect();
 
         canonical_query_string = sorted_params.join("&");
