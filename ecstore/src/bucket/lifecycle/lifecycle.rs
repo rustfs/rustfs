@@ -161,7 +161,7 @@ pub trait Lifecycle {
     async fn has_transition(&self) -> bool;
     fn has_expiry(&self) -> bool;
     async fn has_active_rules(&self, prefix: &str) -> bool;
-    async fn validate(&self, lr: &ObjectLockConfiguration) -> Result<(), std::io::Error>;
+    async fn validate(&self, lr_retention: bool) -> Result<(), std::io::Error>;
     async fn filter_rules(&self, obj: &ObjectOpts) -> Option<Vec<LifecycleRule>>;
     async fn eval(&self, obj: &ObjectOpts) -> Event;
     async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime) -> Event;
@@ -242,7 +242,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         false
     }
 
-    async fn validate(&self, lr: &ObjectLockConfiguration) -> Result<(), std::io::Error> {
+    async fn validate(&self, lr_retention: bool) -> Result<(), std::io::Error> {
         if self.rules.len() > 1000 {
             return Err(std::io::Error::other(ERR_LIFECYCLE_TOO_MANY_RULES));
         }
@@ -252,17 +252,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
         for r in &self.rules {
             r.validate()?;
-            if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref() {
-                if let Some(expiration) = r.expiration.as_ref() {
-                    if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
-                        if object_lock_enabled.as_str() == ObjectLockEnabled::ENABLED && (!expired_object_delete_marker) {
-                            return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
-                        }
-                    } /*else {
-                    if object_lock_enabled.as_str() == ObjectLockEnabled::ENABLED {
-                    return Err(Error::msg(ERR_LIFECYCLE_BUCKET_LOCKED));
+            if let Some(expiration) = r.expiration.as_ref() {
+                if let Some(expired_object_delete_marker) = expiration.expired_object_delete_marker {
+                    if lr_retention && (!expired_object_delete_marker) {
+                        return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
                     }
-                    }*/
                 }
             }
         }

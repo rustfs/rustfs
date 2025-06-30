@@ -1715,20 +1715,25 @@ impl S3 for FS {
             ..
         } = req.input;
 
+        let mut lr_retention = false;
         let rcfg = metadata_sys::get_object_lock_config(&bucket).await;
-        if rcfg.is_err() {
-            return Err(S3Error::with_message(
-                S3ErrorCode::Custom("BucketLockIsNotExist".into()),
-                "bucket lock is not exist.",
-            ));
+        if let Ok(rcfg) = rcfg {
+            if let Some(rule) = rcfg.0.rule {
+                if let Some(retention) = rule.default_retention {
+                    if let Some(mode) = retention.mode {
+                        if mode == ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE) {
+                            lr_retention = true;
+                        }
+                    }
+                }
+            }
         }
-        let rcfg = rcfg.expect("get_lifecycle_config err!").0;
 
         //info!("lifecycle_configuration: {:?}", &lifecycle_configuration);
 
         let Some(input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
 
-        if let Err(err) = input_cfg.validate(&rcfg).await {
+        if let Err(err) = input_cfg.validate(lr_retention).await {
             //return Err(S3Error::with_message(S3ErrorCode::Custom("BucketLockValidateFailed".into()), "bucket lock validate failed."));
             return Err(S3Error::with_message(S3ErrorCode::Custom("ValidateFailed".into()), err.to_string()));
         }
