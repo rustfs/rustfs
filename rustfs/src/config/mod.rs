@@ -51,7 +51,7 @@ pub struct Opt {
     pub secret_key: String,
 
     /// Enable console server
-    #[arg(long, default_value_t = false, env = "RUSTFS_CONSOLE_ENABLE")]
+    #[arg(long, default_value_t = true, env = "RUSTFS_CONSOLE_ENABLE")]
     pub console_enable: bool,
 
     /// Console server bind address
