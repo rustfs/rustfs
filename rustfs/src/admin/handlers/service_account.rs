@@ -576,7 +576,7 @@ impl Operation for DeleteServiceAccount {
             }
         }
 
-        iam_store.delete_service_account(&query.access_key).await.map_err(|e| {
+        iam_store.delete_service_account(&query.access_key, true).await.map_err(|e| {
             debug!("delete service account failed, e: {:?}", e);
             s3_error!(InternalError, "delete service account failed")
         })?;

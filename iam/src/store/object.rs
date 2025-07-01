@@ -445,6 +445,7 @@ impl Store for ObjectStore {
             UserType::Reg => IAM_CONFIG_USERS_PREFIX.as_str(),
             UserType::Svc => IAM_CONFIG_SERVICE_ACCOUNTS_PREFIX.as_str(),
             UserType::Sts => IAM_CONFIG_STS_PREFIX.as_str(),
+            UserType::None => "",
         };
 
         let (ctx_tx, ctx_rx) = broadcast::channel(1);

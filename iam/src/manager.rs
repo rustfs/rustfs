@@ -1549,6 +1549,7 @@ where
                     );
                 }
             }
+            UserType::None => {}
         }
 
         Ok(())
