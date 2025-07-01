@@ -416,7 +416,7 @@ impl<T: Store> IamSys<T> {
         extract_jwt_claims(&u)
     }
 
-    pub async fn delete_service_account(&self, access_key: &str) -> Result<()> {
+    pub async fn delete_service_account(&self, access_key: &str, _notify: bool) -> Result<()> {
         let Some(u) = self.store.get_user(access_key).await else {
             return Ok(());
         };

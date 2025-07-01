@@ -59,6 +59,7 @@ pub enum UserType {
     Svc,
     Sts,
     Reg,
+    None,
 }
 
 impl UserType {
@@ -67,6 +68,7 @@ impl UserType {
             UserType::Svc => "service-accounts/",
             UserType::Sts => "sts/",
             UserType::Reg => "users/",
+            UserType::None => "",
         }
     }
 }
