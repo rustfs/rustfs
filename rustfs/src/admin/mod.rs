@@ -5,7 +5,7 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
-    group, policys, pools, rebalance,
+    bucket_meta, group, policys, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
 };
@@ -119,11 +119,85 @@ pub fn make_admin_route() -> std::io::Result<impl S3Route> {
         format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
         AdminOperation(&handlers::BackgroundHealStatusHandler {}),
     )?;
-    // }
+
+    // ?
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
+        AdminOperation(&tier::ListTiers {}),
+    )?;
+    // ?
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier-stats").as_str(),
+        AdminOperation(&tier::GetTierInfo {}),
+    )?;
+    // ?force=xxx
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
+        AdminOperation(&tier::RemoveTier {}),
+    )?;
+    // ?force=xxx
+    // body: AddOrUpdateTierReq
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
+        AdminOperation(&tier::AddTier {}),
+    )?;
+    // ?
+    // body: AddOrUpdateTierReq
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
+        AdminOperation(&tier::EditTier {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/clear").as_str(),
+        AdminOperation(&tier::ClearTier {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/export-bucket-metadata").as_str(),
+        AdminOperation(&bucket_meta::ExportBucketMetadata {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/import-bucket-metadata").as_str(),
+        AdminOperation(&bucket_meta::ImportBucketMetadata {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
+        AdminOperation(&ListRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
+        AdminOperation(&GetReplicationMetricsHandler {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-remote-target").as_str(),
+        AdminOperation(&SetRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
+        AdminOperation(&RemoveRemoteTargetHandler {}),
+    )?;
 
     Ok(r)
 }
 
+/// user router
 fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     // 1
     r.insert(
@@ -240,30 +314,6 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         AdminOperation(&user::ImportIam {}),
     )?;
 
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/list-remote-targets").as_str(),
-        AdminOperation(&ListRemoteTargetHandler {}),
-    )?;
-
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/replicationmetrics").as_str(),
-        AdminOperation(&GetReplicationMetricsHandler {}),
-    )?;
-
-    r.insert(
-        Method::PUT,
-        format!("{}{}", ADMIN_PREFIX, "/v3/set-remote-target").as_str(),
-        AdminOperation(&SetRemoteTargetHandler {}),
-    )?;
-
-    r.insert(
-        Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
-        AdminOperation(&RemoveRemoteTargetHandler {}),
-    )?;
-
     // list-canned-policies?bucket=xxx
     r.insert(
         Method::GET,
@@ -297,44 +347,6 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-or-group-policy").as_str(),
         AdminOperation(&policys::SetPolicyForUserOrGroup {}),
-    )?;
-
-    // ?
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
-        AdminOperation(&tier::ListTiers {}),
-    )?;
-    // ?
-    r.insert(
-        Method::GET,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier-stats").as_str(),
-        AdminOperation(&tier::GetTierInfo {}),
-    )?;
-    // ?force=xxx
-    r.insert(
-        Method::DELETE,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
-        AdminOperation(&tier::RemoveTier {}),
-    )?;
-    // ?force=xxx
-    // body: AddOrUpdateTierReq
-    r.insert(
-        Method::PUT,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
-        AdminOperation(&tier::AddTier {}),
-    )?;
-    // ?
-    // body: AddOrUpdateTierReq
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
-        AdminOperation(&tier::EditTier {}),
-    )?;
-    r.insert(
-        Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/tier/clear").as_str(),
-        AdminOperation(&tier::ClearTier {}),
     )?;
 
     Ok(())
