@@ -5,7 +5,7 @@ use hyper::client::conn::http2::Builder;
 use hyper_util::rt::TokioExecutor;
 use lazy_static::lazy_static;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt::Display,
     net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
 };
@@ -134,8 +134,6 @@ pub const DEFAULT_DIAL_TIMEOUT: i64 = 5;
 pub fn new_remotetarget_http_transport(_insecure: bool) -> Builder<TokioExecutor> {
     todo!();
 }
-
-
 
 const ALLOWED_CUSTOM_QUERY_PREFIX: &str = "x-";
 

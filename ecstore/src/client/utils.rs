@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use s3s::header::X_AMZ_STORAGE_CLASS;
 

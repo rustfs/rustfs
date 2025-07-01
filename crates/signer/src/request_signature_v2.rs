@@ -13,8 +13,8 @@ const SIGN_V2_ALGORITHM: &str = "AWS";
 
 fn encode_url2path(req: &request::Builder, _virtual_host: bool) -> String {
     //path = serde_urlencoded::to_string(req.uri_ref().unwrap().path().unwrap()).unwrap();
-    let path = req.uri_ref().unwrap().path().to_string();
-    path
+
+    req.uri_ref().unwrap().path().to_string()
 }
 
 pub fn pre_sign_v2(
