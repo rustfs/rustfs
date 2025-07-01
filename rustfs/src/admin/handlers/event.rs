@@ -3,9 +3,9 @@ use crate::auth::{check_key_valid, get_session_token};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
-use rustfs_notify::rules::{BucketNotificationConfig, PatternRules};
 use rustfs_notify::EventName;
-use s3s::{header::CONTENT_TYPE, s3_error, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use rustfs_notify::rules::{BucketNotificationConfig, PatternRules};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ impl Operation for SetNotificationTarget {
             .map_err(|e| s3_error!(InvalidArgument, "invalid query parameters: {}", e))?;
 
         let target_type = query.target_type.to_lowercase();
-        if target_type != NOTIFY_WEBHOOK_SUB_SYS.to_string() && target_type != NOTIFY_MQTT_SUB_SYS.to_string() {
+        if target_type != *NOTIFY_WEBHOOK_SUB_SYS && target_type != *NOTIFY_MQTT_SUB_SYS {
             return Err(s3_error!(InvalidArgument, "unsupported target type: {}", query.target_type));
         }
 

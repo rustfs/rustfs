@@ -151,7 +151,6 @@ async fn run(opt: config::Opt) -> Result<()> {
             eps.drives_per_set
         );
 
-        // Add warning for host with multiple drives in a set (similar to RustFS)
         if eps.drives_per_set > 1 {
             warn!("WARNING: Host local has more than 0 drives of set. A host failure will result in data becoming unavailable.");
         }
