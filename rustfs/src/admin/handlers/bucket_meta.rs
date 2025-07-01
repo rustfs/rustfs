@@ -8,6 +8,7 @@ use crate::{
     admin::router::Operation,
     auth::{check_key_valid, get_session_token},
 };
+
 use ecstore::{
     StorageAPI,
     bucket::{
@@ -22,7 +23,10 @@ use ecstore::{
     new_object_layer_fn,
     store_api::BucketOptions,
 };
-use ecstore::{bucket::utils::serialize, store_api::MakeBucketOptions};
+use ecstore::{
+    bucket::utils::{deserialize, serialize},
+    store_api::MakeBucketOptions,
+};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -33,6 +37,7 @@ use s3s::{
 };
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
+use time::OffsetDateTime;
 use tracing::warn;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -119,16 +124,17 @@ impl Operation for ExportBucketMetadata {
                             .map_err(|e| s3_error!(InternalError, "write file failed: {e}"))?;
                     }
                     BUCKET_NOTIFICATION_CONFIG => {
-                        let config = match metadata_sys::get_notification_config(&bucket.name).await {
-                            Ok(Some(res)) => res,
-                            Err(e) => {
-                                if e == StorageError::ConfigNotFound {
-                                    continue;
+                        let config: s3s::dto::NotificationConfiguration =
+                            match metadata_sys::get_notification_config(&bucket.name).await {
+                                Ok(Some(res)) => res,
+                                Err(e) => {
+                                    if e == StorageError::ConfigNotFound {
+                                        continue;
+                                    }
+                                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
                                 }
-                                return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
-                            }
-                            Ok(None) => continue,
-                        };
+                                Ok(None) => continue,
+                            };
 
                         let config_xml =
                             serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
@@ -407,6 +413,8 @@ impl Operation for ImportBucketMetadata {
             return Err(s3_error!(InvalidRequest, "object store not init"));
         };
 
+        let update_at = OffsetDateTime::now_utc();
+
         // Second pass: process file contents
         for (file_path, content) in file_contents {
             let file_path_split = file_path.split(SLASH_SEPARATOR).collect::<Vec<&str>>();
@@ -439,10 +447,35 @@ impl Operation for ImportBucketMetadata {
                 bucket_metadatas.insert(bucket_name.to_string(), metadata.clone());
             }
 
-            if conf_name == BUCKET_POLICY_CONFIG {
-                let _config: policy::policy::BucketPolicy =
-                    serde_json::from_slice(&content).map_err(|e| s3_error!(InternalError, "deserialize config failed: {e}"))?;
-                // TODO: Apply the configuration
+            match conf_name {
+                BUCKET_POLICY_CONFIG => {
+                    let config: policy::policy::BucketPolicy = match serde_json::from_slice(&content) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            warn!("deserialize config failed: {e}");
+                            continue;
+                        }
+                    };
+
+                    if config.version.is_empty() {
+                        continue;
+                    }
+
+                    // let mut metadata = bucket_metadatas.get_mut(bucket_name).unwrap().clone();
+                    // metadata.policy_config_json = content;
+                    // metadata.policy_config_updated_at = update_at;
+                }
+                BUCKET_NOTIFICATION_CONFIG => {
+                    if let Err(e) = deserialize::<s3s::dto::NotificationConfiguration>(&content) {
+                        warn!("deserialize config failed: {e}");
+                        continue;
+                    }
+
+                    // let mut metadata = bucket_metadatas.get_mut(bucket_name).unwrap().clone();
+                    // metadata.notification_config_xml = content;
+                    // metadata.notification_config_updated_at = update_at;
+                }
+                _ => {}
             }
         }
 

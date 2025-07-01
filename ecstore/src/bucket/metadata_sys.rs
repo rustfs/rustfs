@@ -56,7 +56,7 @@ pub async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<(
     Ok(())
 }
 
-pub(crate) async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
+pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
     let sys = get_bucket_metadata_sys()?;
     let lock = sys.read().await;
     lock.get(bucket).await
