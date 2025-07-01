@@ -90,6 +90,33 @@ impl KVS {
 
         None
     }
+
+    ///Check if KVS is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns a list of all keys for the current KVS.
+    /// If the "comment" key does not exist, it will be added.
+    pub fn keys(&self) -> Vec<String> {
+        let mut found_comment = false;
+        let mut keys: Vec<String> = self
+            .0
+            .iter()
+            .map(|kv| {
+                if kv.key == COMMENT_KEY {
+                    found_comment = true;
+                }
+                kv.key.clone()
+            })
+            .collect();
+
+        if !found_comment {
+            keys.push(COMMENT_KEY.to_owned());
+        }
+
+        keys
+    }
 }
 
 #[derive(Debug, Clone)]

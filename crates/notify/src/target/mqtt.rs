@@ -103,8 +103,7 @@ impl MQTTTarget {
         let target_id = TargetID::new(id.clone(), ChannelTargetType::Mqtt.as_str().to_string());
         let queue_store = if !args.queue_dir.is_empty() {
             let base_path = PathBuf::from(&args.queue_dir);
-            let unique_dir_name =
-                format!("rustfs-{}-{}-{}", ChannelTargetType::Mqtt.as_str(), target_id.name, target_id.id).replace(":", "_");
+            let unique_dir_name = format!("rustfs-{}-{}", ChannelTargetType::Mqtt.as_str(), target_id.id).replace(":", "_");
             // Ensure the directory name is valid for filesystem
             let specific_queue_path = base_path.join(unique_dir_name);
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");

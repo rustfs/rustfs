@@ -128,12 +128,8 @@ impl WebhookTarget {
 
         // Build storage
         let queue_store = if !args.queue_dir.is_empty() {
-            let queue_dir = PathBuf::from(&args.queue_dir).join(format!(
-                "rustfs-{}-{}-{}",
-                ChannelTargetType::Webhook.as_str(),
-                target_id.name,
-                target_id.id
-            ));
+            let queue_dir =
+                PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::Webhook.as_str(), target_id.id));
             let store = crate::store::QueueStore::<Event>::new(queue_dir, args.queue_limit, STORE_EXTENSION);
 
             if let Err(e) = store.open() {

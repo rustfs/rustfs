@@ -112,8 +112,18 @@ impl Operation for ListNotificationTargets {
         // 3. Get the list of activity targets
         let active_targets = ns.get_active_targets().await;
 
+        let region = match req.region.clone() {
+            Some(region) => region,
+            None => return Err(s3_error!(InvalidRequest, "region not found")),
+        };
+        let mut data_target_arn_list = Vec::new();
+        for target_id in active_targets.iter() {
+            let target_arn = target_id.to_arn(&region);
+            data_target_arn_list.push(target_arn.to_string());
+        }
+
         // 4. Serialize and return the result
-        let data = serde_json::to_vec(&active_targets)
+        let data = serde_json::to_vec(&data_target_arn_list)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize targets: {}", e)))?;
         debug!("ListNotificationTargets call end, response data length: {}", data.len(),);
         let mut header = HeaderMap::new();
