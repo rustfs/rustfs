@@ -2,10 +2,11 @@ use super::pattern;
 use super::target_id_set::TargetIdSet;
 use crate::arn::TargetID;
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 
 /// PatternRules - Event rule that maps object name patterns to TargetID collections.
 /// `event.Rules` (map[string]TargetIDSet) in the Go code
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PatternRules {
     pub(crate) rules: HashMap<String, TargetIdSet>,
 }

@@ -66,6 +66,11 @@ impl EventNotifier {
         info!("Added rules for bucket: {}", bucket_name);
     }
 
+    /// Gets the rules map for a specific bucket.
+    pub fn get_rules_map(&self, bucket_name: &str) -> Option<RulesMap> {
+        self.bucket_rules_map.get(bucket_name).map(|r| r.clone())
+    }
+
     /// Removes notification rules for a bucket
     pub async fn remove_notification(&self, bucket_name: &str) {
         self.bucket_rules_map.remove(bucket_name);

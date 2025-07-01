@@ -1,17 +1,17 @@
 use super::rules_map::RulesMap;
-// Keep for existing structure if any, or remove if not used
 use super::xml_config::ParseConfigError as BucketNotificationConfigError;
 use crate::EventName;
 use crate::arn::TargetID;
 use crate::rules::NotificationConfiguration;
 use crate::rules::pattern_rules;
 use crate::rules::target_id_set;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 
 /// Configuration for bucket notifications.
 /// This struct now holds the parsed and validated rules in the new RulesMap format.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BucketNotificationConfig {
     pub region: String,  // Region where this config is applicable
     pub rules: RulesMap, // The new, more detailed RulesMap

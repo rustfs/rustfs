@@ -2,6 +2,7 @@ use super::error::{Error, Result};
 use path_absolutize::Absolutize;
 use rustfs_utils::{is_local_host, is_socket_addr};
 use std::{fmt::Display, path::Path};
+use tracing::debug;
 use url::{ParseError, Url};
 
 /// enum for endpoint type.
@@ -74,6 +75,8 @@ impl TryFrom<&str> for Endpoint {
                 // As a special case make sure to trim the separator.
                 #[cfg(windows)]
                 let path = Path::new(&path[1..]).absolutize()?;
+
+                debug!("endpoint try_from: path={}", path.display());
 
                 if path.parent().is_none() || Path::new("").eq(&path) {
                     return Err(Error::other("empty or root path is not supported in URL endpoint"));
@@ -155,26 +158,40 @@ impl Endpoint {
     /// returns the host to be used for grid connections.
     pub fn grid_host(&self) -> String {
         match (self.url.host(), self.url.port()) {
-            (Some(host), Some(port)) => format!("{}://{}:{}", self.url.scheme(), host, port),
-            (Some(host), None) => format!("{}://{}", self.url.scheme(), host),
+            (Some(host), Some(port)) => {
+                debug!("grid_host scheme={}: host={}, port={}", self.url.scheme(), host, port);
+                format!("{}://{}:{}", self.url.scheme(), host, port)
+            }
+            (Some(host), None) => {
+                debug!("grid_host scheme={}: host={}", self.url.scheme(), host);
+                format!("{}://{}", self.url.scheme(), host)
+            }
             _ => String::new(),
         }
     }
 
     pub fn host_port(&self) -> String {
         match (self.url.host(), self.url.port()) {
-            (Some(host), Some(port)) => format!("{host}:{port}"),
-            (Some(host), None) => format!("{host}"),
+            (Some(host), Some(port)) => {
+                debug!("host_port host={}, port={}", host, port);
+                format!("{host}:{port}")
+            }
+            (Some(host), None) => {
+                debug!("host_port host={}, port={}", host, self.url.port().unwrap_or(0));
+                format!("{host}")
+            }
             _ => String::new(),
         }
     }
 
     pub fn get_file_path(&self) -> &str {
         let path = self.url.path();
-
         #[cfg(windows)]
-        let path = &path[1..];
-
+        if self.url.scheme() == "file" {
+            let stripped = path.strip_prefix('/').unwrap_or(path);
+            debug!("get_file_path windows: path={}", stripped);
+            return stripped;
+        }
         path
     }
 }

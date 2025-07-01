@@ -130,7 +130,16 @@ impl Debug for LocalDisk {
 
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
-        let root = fs::canonicalize(ep.get_file_path()).await?;
+        debug!("Creating local disk");
+        let root = match fs::canonicalize(ep.get_file_path()).await {
+            Ok(path) => path,
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    return Err(DiskError::VolumeNotFound.into());
+                }
+                return Err(to_file_error(e).into());
+            }
+        };
 
         if cleanup {
             // TODO: 删除 tmp 数据
@@ -140,7 +149,7 @@ impl LocalDisk {
             .join(Path::new(super::FORMAT_CONFIG_FILE))
             .absolutize_virtually(&root)?
             .into_owned();
-
+        debug!("format_path: {:?}", format_path);
         let (format_data, format_meta) = read_file_exists(&format_path).await?;
 
         let mut id = None;
@@ -245,7 +254,7 @@ impl LocalDisk {
 
         let root = disk.root.clone();
         tokio::spawn(Self::cleanup_deleted_objects_loop(root, exit_rx));
-
+        debug!("LocalDisk created: {:?}", disk);
         Ok(disk)
     }
 

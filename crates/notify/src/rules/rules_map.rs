@@ -2,11 +2,12 @@ use super::pattern_rules::PatternRules;
 use super::target_id_set::TargetIdSet;
 use crate::arn::TargetID;
 use crate::event::EventName;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// RulesMap - Rule mapping organized by event name。
 /// `event.RulesMap` (map[Name]Rules) in the corresponding Go code
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RulesMap {
     map: HashMap<EventName, PatternRules>,
     /// A bitmask that represents the union of all event types in this map.
