@@ -16,8 +16,6 @@ default = []
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
 async-trait.workspace = true
-backon.workspace = true
-blake2 = { workspace = true }
 bytes.workspace = true
 byteorder = { workspace = true }
 common.workspace = true
@@ -33,35 +31,22 @@ time.workspace = true
 bytesize.workspace = true
 serde_json.workspace = true
 serde-xml-rs.workspace = true
-serde_urlencoded.workspace = true
-tracing-error.workspace = true
 s3s.workspace = true
 http.workspace = true
-http-body-util = "0.1.1"
-highway = { workspace = true }
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
-reed-solomon-simd = { version = "3.0.0" }
-transform-stream = "0.3.1"
+reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
 lock.workspace = true
 regex = { workspace = true }
-netif = { workspace = true }
-nix = { workspace = true }
 path-absolutize = { workspace = true }
 protos.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
-crc32fast = { workspace = true }
-siphasher = { workspace = true }
-base64-simd = { workspace = true }
-
 base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
-sha1 = { workspace = true }
-
 hex-simd = { workspace = true }
 path-clean = { workspace = true }
 tempfile.workspace = true
@@ -75,9 +60,7 @@ tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower.workspace = true
 async-channel.workspace = true
-num = "0.4.3"
-enumset = "1.1.5"
-std-next.workspace = true
+enumset = { workspace = true }
 num_cpus = { workspace = true }
 rand.workspace = true
 pin-project-lite.workspace = true
