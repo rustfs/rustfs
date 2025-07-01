@@ -9,7 +9,7 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::C
 use serde::{Deserialize, Serialize};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Deserialize)]
 struct TargetQuery {
@@ -95,6 +95,8 @@ pub struct ListNotificationTargets {}
 #[async_trait::async_trait]
 impl Operation for ListNotificationTargets {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        debug!("ListNotificationTargets call start request params: {:?}", req.uri.query());
+
         // 1. Permission verification
         let Some(input_cred) = &req.credentials else {
             return Err(s3_error!(InvalidRequest, "credentials not found"));
@@ -113,7 +115,7 @@ impl Operation for ListNotificationTargets {
         // 4. Serialize and return the result
         let data = serde_json::to_vec(&active_targets)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize targets: {}", e)))?;
-
+        debug!("ListNotificationTargets call end, response data length: {}", data.len(),);
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))

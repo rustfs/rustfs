@@ -5,6 +5,7 @@ pub mod utils;
 
 // use ecstore::global::{is_dist_erasure, is_erasure};
 use handlers::{
+    event::{ListNotificationTargets, RemoveNotificationTarget, SetNotificationTarget},
     group, policys, pools, rebalance,
     service_account::{AddServiceAccount, DeleteServiceAccount, InfoServiceAccount, ListServiceAccount, UpdateServiceAccount},
     sts, tier, user,
@@ -335,6 +336,24 @@ fn register_user_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> 
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/tier/clear").as_str(),
         AdminOperation(&tier::ClearTier {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-list").as_str(),
+        AdminOperation(&ListNotificationTargets {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-set").as_str(),
+        AdminOperation(&SetNotificationTarget {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/target-remove").as_str(),
+        AdminOperation(&RemoveNotificationTarget {}),
     )?;
 
     Ok(())
