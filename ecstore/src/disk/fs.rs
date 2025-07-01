@@ -5,8 +5,6 @@ use tokio::{
     io,
 };
 
-pub const SLASH_SEPARATOR: &str = "/";
-
 #[cfg(not(windows))]
 pub fn same_file(f1: &Metadata, f2: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -521,10 +519,5 @@ mod tests {
 
         // Should be different files
         assert!(!same_file(&metadata1, &metadata2));
-    }
-
-    #[test]
-    fn test_slash_separator() {
-        assert_eq!(SLASH_SEPARATOR, "/");
     }
 }

@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::Arc};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{error, warn};
+use tracing::error;
 
 use super::metadata::{BucketMetadata, load_bucket_metadata};
 use super::quota::BucketQuota;
@@ -56,7 +56,7 @@ pub async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<(
     Ok(())
 }
 
-pub(crate) async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
+pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
     let sys = get_bucket_metadata_sys()?;
     let lock = sys.read().await;
     lock.get(bucket).await
@@ -74,6 +74,27 @@ pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
     let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
     bucket_meta_sys.delete(bucket, config_file).await
+}
+
+pub async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_bucket_policy(bucket).await
+}
+
+pub async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_quota_config(bucket).await
+}
+
+pub async fn get_bucket_targets_config(bucket: &str) -> Result<BucketTargets> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_bucket_targets_config(bucket).await
 }
 
 pub async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
@@ -340,7 +361,6 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_config_from_disk(&self, bucket: &str) -> Result<BucketMetadata> {
-        println!("load data from disk");
         if is_meta_bucketname(bucket) {
             return Err(Error::other("errInvalidArgument"));
         }
@@ -381,7 +401,6 @@ impl BucketMetadataSys {
         let bm = match self.get_config(bucket).await {
             Ok((res, _)) => res,
             Err(err) => {
-                warn!("get_versioning_config err {:?}", &err);
                 return if err == Error::ConfigNotFound {
                     Ok((VersioningConfiguration::default(), OffsetDateTime::UNIX_EPOCH))
                 } else {
@@ -445,7 +464,6 @@ impl BucketMetadataSys {
         let bm = match self.get_config(bucket).await {
             Ok((bm, _)) => bm.notification_config.clone(),
             Err(err) => {
-                warn!("get_notification_config err {:?}", &err);
                 if err == Error::ConfigNotFound {
                     None
                 } else {
