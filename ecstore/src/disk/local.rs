@@ -135,7 +135,7 @@ impl LocalDisk {
             Ok(path) => path,
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
-                    return Err(DiskError::VolumeNotFound.into());
+                    return Err(DiskError::VolumeNotFound);
                 }
                 return Err(to_file_error(e).into());
             }
@@ -162,7 +162,7 @@ impl LocalDisk {
             let (set_idx, disk_idx) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
 
             if set_idx as i32 != ep.set_idx || disk_idx as i32 != ep.disk_idx {
-                return Err(Error::from(DiskError::InconsistentDisk));
+                return Err(DiskError::InconsistentDisk);
             }
 
             id = Some(fm.erasure.this);
