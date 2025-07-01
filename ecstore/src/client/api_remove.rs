@@ -64,9 +64,6 @@ pub struct RemoveObjectOptions {
 impl TransitionClient {
     pub async fn remove_bucket_with_options(&self, bucket_name: &str, opts: &RemoveBucketOptions) -> Result<(), std::io::Error> {
         let headers = HeaderMap::new();
-        /*if opts.force_delete {
-            headers.insert(rustFSForceDelete, "true");
-        }*/
 
         let resp = self
             .execute_method(

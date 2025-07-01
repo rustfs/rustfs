@@ -28,10 +28,10 @@ use crate::client::{
     constants::{ISO8601_DATEFORMAT, MAX_MULTIPART_PUT_OBJECT_SIZE, MIN_PART_SIZE, TOTAL_WORKERS},
     credentials::SignatureType,
     transition_api::{ReaderImpl, TransitionClient, UploadInfo},
+    utils::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header},
 };
 use rustfs_utils::{
     crypto::base64_encode,
-    net::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header},
 };
 
 #[derive(Debug, Clone)]
